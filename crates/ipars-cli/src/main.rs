@@ -3870,6 +3870,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_load_balancer_scope(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3918,6 +3924,22 @@ fn kubernetes_service_annotation_controls_listener_protocol(key: &str) -> bool {
         || key.contains("backend-protocol-version")
         || key.contains("listener")
         || key.contains("alpn-policy")
+}
+
+fn kubernetes_service_annotation_controls_load_balancer_scope(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("load-balancer-scheme")
+        || key.contains("loadbalancer-scheme")
+        || key.contains("load-balancer-internal")
+        || key.contains("loadbalancer-internal")
+        || key.contains("internal-load-balancer")
+        || key.contains("load-balancer-type")
+        || key.contains("loadbalancer-type")
+        || key.contains("load-balancer-address-type")
+        || key.contains("loadbalancer-address-type")
+        || key.contains("load-balancer-class")
+        || key.contains("loadbalancerclass")
+        || key.contains("nlb-target-type")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11386,8 +11408,8 @@ fi
             agent_api_session_affinity_timeout_seconds: Some(600),
             agent_api_external_traffic_policy: "Local".to_string(),
             agent_api_service_annotations: vec![KeyValueArg {
-                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
-                value: "nlb,ip".to_string(),
+                key: "example.com/lb-profile".to_string(),
+                value: "public,api".to_string(),
             }],
             expose_relay: true,
             relay_service_type: "LoadBalancer".to_string(),
@@ -11498,7 +11520,7 @@ fi
             "--set-string 'agent.apiService.loadBalancerSourceRanges[0]=198.51.100.0/24'"
         ));
         assert!(plan.commands[2].contains(
-            "--set-string 'agent.apiService.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type=nlb\\,ip'"
+            "--set-string 'agent.apiService.annotations.example\\.com/lb-profile=public\\,api'"
         ));
         assert!(plan.commands[2].contains("--set agent.relayService.enabled=true"));
         assert!(plan.commands[2].contains("--set networkPolicy.relay.enabled=true"));
@@ -11625,8 +11647,8 @@ fi
     fn k8s_install_validates_service_annotations_from_plan_args() -> anyhow::Result<()> {
         let mut missing_agent_exposure = base_k8s_install_args();
         missing_agent_exposure.agent_api_service_annotations = vec![KeyValueArg {
-            key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
-            value: "nlb".to_string(),
+            key: "example.com/lb-profile".to_string(),
+            value: "public".to_string(),
         }];
         let error = match k8s_install_plan(missing_agent_exposure) {
             Ok(_) => panic!("agent API Service annotations should require exposed service"),
@@ -11734,6 +11756,20 @@ fi
         };
         assert!(error.contains(
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-ssl-cert must not configure LoadBalancer TLS, listeners, or backend protocols"
+        ));
+
+        let mut agent_lb_scope_annotation = base_k8s_install_args();
+        agent_lb_scope_annotation.expose_agent_api = true;
+        agent_lb_scope_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-scheme".to_string(),
+            value: "internet-facing".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_lb_scope_annotation) {
+            Ok(_) => panic!("agent API LoadBalancer scope annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-scheme must not configure LoadBalancer scope or implementation type"
         ));
 
         let mut invalid_relay_value = base_k8s_install_args();
@@ -11875,6 +11911,22 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-backend-protocol must not configure LoadBalancer TLS, listeners, or backend protocols"
+        ));
+
+        let mut relay_lb_type_annotation = base_k8s_install_args();
+        relay_lb_type_annotation.expose_relay = true;
+        relay_lb_type_annotation.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        relay_lb_type_annotation.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        relay_lb_type_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "cloud.google.com/load-balancer-type".to_string(),
+            value: "Internal".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_lb_type_annotation) {
+            Ok(_) => panic!("relay LoadBalancer type annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key cloud.google.com/load-balancer-type must not configure LoadBalancer scope or implementation type"
         ));
 
         Ok(())
@@ -12697,6 +12749,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead"
         ));
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));
@@ -14475,7 +14530,7 @@ fi
             "--agent-api-external-traffic-policy",
             "Cluster",
             "--agent-api-service-annotation",
-            "service.beta.kubernetes.io/aws-load-balancer-type=nlb",
+            "example.com/lb-profile=public",
             "--expose-relay",
             "--relay-service-type",
             "LoadBalancer",
@@ -14809,8 +14864,8 @@ fi
             assert_eq!(
                 args.agent_api_service_annotations,
                 vec![KeyValueArg {
-                    key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
-                    value: "nlb".to_string(),
+                    key: "example.com/lb-profile".to_string(),
+                    value: "public".to_string(),
                 }]
             );
             assert!(args.expose_relay);
@@ -17793,10 +17848,10 @@ fi
         assert!(parse_kubernetes_load_balancer_class("Example.com/internal-api").is_err());
         assert!(parse_kubernetes_load_balancer_class("example.com/internal/api").is_err());
         assert_eq!(
-            parse_key_value("service.beta.kubernetes.io/aws-load-balancer-type=nlb"),
+            parse_key_value("example.com/lb-profile=public"),
             Ok(KeyValueArg {
-                key: "service.beta.kubernetes.io/aws-load-balancer-type".to_string(),
-                value: "nlb".to_string(),
+                key: "example.com/lb-profile".to_string(),
+                value: "public".to_string(),
             })
         );
         assert_eq!(
@@ -17818,8 +17873,8 @@ fi
         );
         assert!(parse_key_value(&oversized_annotation).is_err());
         assert_eq!(
-            helm_set_key("service.beta.kubernetes.io/aws-load-balancer-type"),
-            "service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
+            helm_set_key("example.com/lb-profile"),
+            "example\\.com/lb-profile"
         );
         assert_eq!(helm_set_string_value("nlb,ip"), "nlb\\,ip");
         assert_eq!(shell_word("charts/ipars"), "charts/ipars");
