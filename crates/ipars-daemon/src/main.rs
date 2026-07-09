@@ -1195,6 +1195,21 @@ fn preflight_agent_runtime_with_path_and_checks(
             .context("userspace WireGuard command preflight requested without command")?;
         ensure_runtime_program_ready(command, path)?;
     }
+    if needs.cap_net_admin {
+        (checks.cap_net_admin)()?;
+    }
+    if needs.cap_net_raw {
+        (checks.cap_net_raw)()?;
+    }
+    if needs.cap_sys_admin {
+        (checks.cap_sys_admin)()?;
+    }
+    if needs.cap_perfmon {
+        (checks.cap_perfmon)()?;
+    }
+    if needs.cap_bpf {
+        (checks.cap_bpf)()?;
+    }
     if needs.route_netlink {
         (checks.netlink)(RuntimeNetlinkProtocol::Route)?;
     }
@@ -1227,21 +1242,6 @@ fn preflight_agent_runtime_with_path_and_checks(
     }
     if needs.ipv6_forwarding {
         (checks.ipv6_forwarding)()?;
-    }
-    if needs.cap_net_admin {
-        (checks.cap_net_admin)()?;
-    }
-    if needs.cap_net_raw {
-        (checks.cap_net_raw)()?;
-    }
-    if needs.cap_sys_admin {
-        (checks.cap_sys_admin)()?;
-    }
-    if needs.cap_perfmon {
-        (checks.cap_perfmon)()?;
-    }
-    if needs.cap_bpf {
-        (checks.cap_bpf)()?;
     }
     if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
         let config = EbpfRingbufConfig::from_args(args)?;
@@ -19418,6 +19418,14 @@ exec sleep 60
         anyhow::bail!("blocked test net.ipv6.conf.all.forwarding")
     }
 
+    fn preflight_fail_cap_net_admin() -> anyhow::Result<()> {
+        anyhow::bail!("blocked test CAP_NET_ADMIN")
+    }
+
+    fn preflight_fail_cap_net_raw() -> anyhow::Result<()> {
+        anyhow::bail!("blocked test CAP_NET_RAW")
+    }
+
     fn preflight_fail_cap_sys_admin() -> anyhow::Result<()> {
         anyhow::bail!("blocked test CAP_SYS_ADMIN")
     }
@@ -19485,6 +19493,102 @@ exec sleep 60
 
     fn preflight_noop_netlink(_protocol: RuntimeNetlinkProtocol) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    #[test]
+    fn runtime_preflight_checks_capabilities_before_kernel_probes() -> anyhow::Result<()> {
+        let kernel_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "kernel-netlink",
+            "--route-backend",
+            "kernel-netlink",
+        ])?;
+
+        if let Command::Agent(args) = kernel_cli.command {
+            let mut cap_admin_checks = test_preflight_checks(preflight_fail_generic_netlink);
+            cap_admin_checks.cap_net_admin = preflight_fail_cap_net_admin;
+            let cap_admin_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                cap_admin_checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful CAP_NET_ADMIN preflight"),
+                Err(error) => error,
+            };
+            assert!(
+                cap_admin_error
+                    .to_string()
+                    .contains("blocked test CAP_NET_ADMIN"),
+                "expected CAP_NET_ADMIN preflight failure, got {cap_admin_error}"
+            );
+            assert!(
+                !cap_admin_error
+                    .to_string()
+                    .contains("blocked test NETLINK_GENERIC"),
+                "capability preflight should run before generic netlink probes: {cap_admin_error}"
+            );
+
+            let mut cap_raw_checks = test_preflight_checks(preflight_fail_generic_netlink);
+            cap_raw_checks.cap_net_raw = preflight_fail_cap_net_raw;
+            let cap_raw_error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                cap_raw_checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful CAP_NET_RAW preflight"),
+                Err(error) => error,
+            };
+            assert!(
+                cap_raw_error
+                    .to_string()
+                    .contains("blocked test CAP_NET_RAW"),
+                "expected CAP_NET_RAW preflight failure, got {cap_raw_error}"
+            );
+            assert!(
+                !cap_raw_error
+                    .to_string()
+                    .contains("blocked test NETLINK_GENERIC"),
+                "CAP_NET_RAW preflight should run before generic netlink probes: {cap_raw_error}"
+            );
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let conntrack_cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "conntrack-netlink",
+        ])?;
+
+        if let Command::Agent(args) = conntrack_cli.command {
+            let mut checks = test_preflight_checks(preflight_fail_netfilter_netlink);
+            checks.cap_net_admin = preflight_fail_cap_net_admin;
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful conntrack CAP preflight"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("blocked test CAP_NET_ADMIN"),
+                "expected CAP_NET_ADMIN preflight failure, got {error}"
+            );
+            assert!(
+                !error.to_string().contains("blocked test NETLINK_NETFILTER"),
+                "capability preflight should run before netfilter netlink probes: {error}"
+            );
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
     }
 
     #[test]
