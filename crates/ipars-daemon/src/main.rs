@@ -112,6 +112,9 @@ const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_DOCKER_API_NETWORKS: usize = 1024;
+const MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK: usize = 64;
+const MAX_DOCKER_API_SUBNET_BYTES: usize = 128;
 const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -7264,7 +7267,10 @@ async fn read_docker_api_networks_response(
         ensure_docker_api_networks_response_size(next_len)?;
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).context("failed to decode Docker networks response")
+    let networks: Vec<DockerApiNetwork> =
+        serde_json::from_slice(&body).context("failed to decode Docker networks response")?;
+    validate_docker_api_networks_shape(&networks)?;
+    Ok(networks)
 }
 
 fn ensure_docker_api_networks_response_size(size: u64) -> anyhow::Result<()> {
@@ -7484,6 +7490,7 @@ fn docker_discovered_routes(
     networks: &[DockerApiNetwork],
     filters: &[String],
 ) -> anyhow::Result<DockerDiscoveredRoutes> {
+    validate_docker_api_networks_shape(networks)?;
     let mut network_names = BTreeSet::new();
     let mut network_ids = BTreeSet::new();
     let mut cidrs = Vec::<ipnet::IpNet>::new();
@@ -7605,6 +7612,39 @@ fn docker_discovered_routes(
         network_names: network_names.into_iter().collect(),
         cidrs,
     })
+}
+
+fn validate_docker_api_networks_shape(networks: &[DockerApiNetwork]) -> anyhow::Result<()> {
+    if networks.len() > MAX_DOCKER_API_NETWORKS {
+        anyhow::bail!(
+            "Docker networks API returned {} networks, exceeding maximum of {}",
+            networks.len(),
+            MAX_DOCKER_API_NETWORKS
+        );
+    }
+    for network in networks {
+        if network.ipam.config.len() > MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK {
+            anyhow::bail!(
+                "Docker network `{}` returned {} IPAM configs, exceeding maximum of {}",
+                docker_network_identity(network),
+                network.ipam.config.len(),
+                MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK
+            );
+        }
+        for config in &network.ipam.config {
+            let Some(subnet) = config.subnet.as_deref() else {
+                continue;
+            };
+            if subnet.len() > MAX_DOCKER_API_SUBNET_BYTES {
+                anyhow::bail!(
+                    "Docker network `{}` returned subnet longer than {} bytes",
+                    docker_network_identity(network),
+                    MAX_DOCKER_API_SUBNET_BYTES
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn docker_network_identity(network: &DockerApiNetwork) -> String {
@@ -22293,6 +22333,64 @@ exec sleep 60
             Err(error) => error.to_string(),
         };
         assert!(error.contains("duplicate network name `compose_default`"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_rejects_unbounded_network_shapes() -> anyhow::Result<()> {
+        let too_many_networks = (0..=MAX_DOCKER_API_NETWORKS)
+            .map(|index| {
+                docker_api_network(
+                    &format!("network-{index}"),
+                    &format!("compose_{index}"),
+                    "bridge",
+                    &[],
+                )
+            })
+            .collect::<Vec<_>>();
+        let error = match docker_discovered_routes(&too_many_networks, &[]) {
+            Ok(_) => anyhow::bail!("unbounded Docker network count should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("exceeding maximum"));
+        assert!(error.contains(&MAX_DOCKER_API_NETWORKS.to_string()));
+
+        let too_many_ipam_configs = vec![DockerApiNetwork {
+            id: "default-id".to_string(),
+            name: "compose_default".to_string(),
+            driver: "bridge".to_string(),
+            ipam: DockerApiIpam {
+                config: (0..=MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK)
+                    .map(|index| DockerApiIpamConfig {
+                        subnet: Some(format!("172.18.{index}.0/24")),
+                    })
+                    .collect(),
+            },
+        }];
+        let error = match docker_discovered_routes(&too_many_ipam_configs, &[]) {
+            Ok(_) => anyhow::bail!("unbounded Docker IPAM config count should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("IPAM configs"));
+        assert!(error.contains(&MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK.to_string()));
+
+        let oversized_subnet = "1".repeat(MAX_DOCKER_API_SUBNET_BYTES + 1);
+        let oversized_subnet_networks = vec![DockerApiNetwork {
+            id: "default-id".to_string(),
+            name: "compose_default".to_string(),
+            driver: "bridge".to_string(),
+            ipam: DockerApiIpam {
+                config: vec![DockerApiIpamConfig {
+                    subnet: Some(oversized_subnet),
+                }],
+            },
+        }];
+        let error = match docker_discovered_routes(&oversized_subnet_networks, &[]) {
+            Ok(_) => anyhow::bail!("oversized Docker subnet string should fail discovery"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("subnet longer than"));
+        assert!(error.contains(&MAX_DOCKER_API_SUBNET_BYTES.to_string()));
         Ok(())
     }
 
