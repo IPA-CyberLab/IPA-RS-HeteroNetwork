@@ -1820,6 +1820,7 @@ pub mod api {
         #[serde(alias = "opensearch")]
         OpenSearch,
         Solr,
+        Git,
         Ike,
         Ipsec,
         IpTunnel,
@@ -1833,7 +1834,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 76] = [
+        pub const ALL: [Self; 77] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1901,6 +1902,7 @@ pub mod api {
             Self::Elasticsearch,
             Self::OpenSearch,
             Self::Solr,
+            Self::Git,
             Self::Ike,
             Self::Ipsec,
             Self::IpTunnel,
@@ -1981,6 +1983,7 @@ pub mod api {
                 Self::Elasticsearch => "elasticsearch",
                 Self::OpenSearch => "opensearch",
                 Self::Solr => "solr",
+                Self::Git => "git",
                 Self::Ike => "ike",
                 Self::Ipsec => "ipsec",
                 Self::IpTunnel => "ip_tunnel",
@@ -2327,6 +2330,9 @@ pub mod api {
             }
             if self.involves_port(873) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Rsync;
+            }
+            if self.involves_port(9418) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Git;
             }
             if (self.involves_port(25) || self.involves_port(465) || self.involves_port(587))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
@@ -2715,6 +2721,7 @@ pub mod api {
                 .or_else(|| pop3_payload(payload).then_some(AgentPacketFlowApplication::Pop3))
                 .or_else(|| ftp_payload(payload).then_some(AgentPacketFlowApplication::Ftp))
                 .or_else(|| rsync_payload(payload).then_some(AgentPacketFlowApplication::Rsync))
+                .or_else(|| git_payload(payload).then_some(AgentPacketFlowApplication::Git))
                 .or_else(|| {
                     postgres_payload(payload).then_some(AgentPacketFlowApplication::Postgres)
                 })
@@ -3032,6 +3039,11 @@ pub mod api {
         b"/v3lockpb.Lock/",
         b"/v3electionpb.Election/",
     ];
+    const GIT_SMART_SERVICES: [&[u8]; 3] = [
+        b"git-upload-pack",
+        b"git-receive-pack",
+        b"git-upload-archive",
+    ];
 
     fn http_payload_application(payload: &[u8]) -> Option<AgentPacketFlowApplication> {
         if let Some(application) = http_payload_hint_application(payload) {
@@ -3120,6 +3132,9 @@ pub mod api {
             }
             if solr_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Solr);
+            }
+            if git_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Git);
             }
             if path_starts_with_any(
                 path,
@@ -3492,6 +3507,81 @@ pub mod api {
         path_starts_with_api_prefix(path, b"/solr")
             || path_starts_with_api_prefix(path, b"/api/collections")
             || path_starts_with_api_prefix(path, b"/api/cores")
+    }
+
+    fn git_http_api_path(path: &[u8]) -> bool {
+        git_http_info_refs_path(path) || git_http_rpc_path(path)
+    }
+
+    fn git_http_info_refs_path(path: &[u8]) -> bool {
+        let Some(query_start) = path.iter().position(|byte| *byte == b'?') else {
+            return false;
+        };
+        let resource = &path[..query_start];
+        resource.ends_with(b".git/info/refs")
+            && git_http_query_has_service(path.get(query_start + 1..).unwrap_or_default())
+    }
+
+    fn git_http_rpc_path(path: &[u8]) -> bool {
+        let resource = http_path_without_query(path);
+        let marker = b".git/";
+        let Some(mut offset) = find_subslice(resource, marker).map(|index| index + marker.len())
+        else {
+            return false;
+        };
+
+        loop {
+            let tail = &resource[offset..];
+            if GIT_SMART_SERVICES
+                .iter()
+                .any(|service| git_http_service_path_tail(tail, service))
+            {
+                return true;
+            }
+            let Some(next_marker) = find_subslice(tail, marker) else {
+                return false;
+            };
+            offset += next_marker + marker.len();
+        }
+    }
+
+    fn git_http_query_has_service(mut query: &[u8]) -> bool {
+        loop {
+            let delimiter = query.iter().position(|byte| *byte == b'&');
+            let (param, tail) = match delimiter {
+                Some(index) => (&query[..index], &query[index + 1..]),
+                None => (query, &[][..]),
+            };
+            if param
+                .strip_prefix(b"service=")
+                .is_some_and(git_service_name)
+            {
+                return true;
+            }
+            if tail.is_empty() {
+                return false;
+            }
+            query = tail;
+        }
+    }
+
+    fn git_http_service_path_tail(tail: &[u8], service: &[u8]) -> bool {
+        tail.get(..service.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(service))
+            && matches!(tail.get(service.len()), None | Some(b'/'))
+    }
+
+    fn git_service_name(value: &[u8]) -> bool {
+        GIT_SMART_SERVICES
+            .iter()
+            .any(|service| value.eq_ignore_ascii_case(service))
+    }
+
+    fn http_path_without_query(path: &[u8]) -> &[u8] {
+        match path.iter().position(|byte| *byte == b'?') {
+            Some(query_start) => &path[..query_start],
+            None => path,
+        }
     }
 
     fn cri_grpc_path(path: &[u8]) -> bool {
@@ -4960,6 +5050,14 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"solr") {
             return Some(AgentPacketFlowApplication::Solr);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"git")
+            || tls_sni_hostname_has_label_prefix(hostname, b"gitea")
+            || tls_sni_hostname_has_label_prefix(hostname, b"gitlab")
+            || tls_sni_hostname_has_label_prefix(hostname, b"github")
+            || tls_sni_hostname_has_label_prefix(hostname, b"bitbucket")
+        {
+            return Some(AgentPacketFlowApplication::Git);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"elasticsearch")
             || tls_sni_hostname_has_label_prefix(hostname, b"elastic")
         {
@@ -5269,6 +5367,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"rsync") || protocol.eq_ignore_ascii_case(b"rsyncd") {
             return Some(AgentPacketFlowApplication::Rsync);
+        }
+        if protocol.eq_ignore_ascii_case(b"git") || git_service_name(protocol) {
+            return Some(AgentPacketFlowApplication::Git);
         }
         if protocol.eq_ignore_ascii_case(b"smtp")
             || protocol.eq_ignore_ascii_case(b"esmtp")
@@ -8059,6 +8160,43 @@ pub mod api {
     fn rsync_printable_line(line: &[u8]) -> bool {
         line.iter()
             .all(|byte| *byte == b'\t' || *byte == b' ' || byte.is_ascii_graphic())
+    }
+
+    fn git_payload(payload: &[u8]) -> bool {
+        let Some(line_len) = git_pkt_line_len(payload) else {
+            return false;
+        };
+        if line_len < 4 || line_len > 65_520 {
+            return false;
+        }
+        let available_end = line_len.min(payload.len());
+        let Some(line) = payload.get(4..available_end) else {
+            return false;
+        };
+        git_service_request_line(line)
+    }
+
+    fn git_pkt_line_len(payload: &[u8]) -> Option<usize> {
+        let prefix = payload.get(..4)?;
+        let mut value = 0_usize;
+        for byte in prefix {
+            let digit = match *byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => return None,
+            };
+            value = value.checked_mul(16)?.checked_add(digit as usize)?;
+        }
+        Some(value)
+    }
+
+    fn git_service_request_line(line: &[u8]) -> bool {
+        GIT_SMART_SERVICES.iter().any(|service| {
+            line.get(..service.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(service))
+                && matches!(line.get(service.len()), Some(b' ' | b'\0' | b'\n' | b'\r'))
+        })
     }
 
     fn tftp_payload(payload: &[u8]) -> bool {
@@ -13496,6 +13634,15 @@ pub mod api {
             .any(|needle| path.windows(needle.len()).any(|window| window == *needle))
     }
 
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     fn contains_ascii_case_insensitive(payload: &[u8], needle: &[u8]) -> bool {
         payload
             .windows(needle.len())
@@ -14987,6 +15134,13 @@ mod tests {
         };
         assert_eq!(solr.application(), api::AgentPacketFlowApplication::Solr);
 
+        let git = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(9418),
+            ..Default::default()
+        };
+        assert_eq!(git.application(), api::AgentPacketFlowApplication::Git);
+
         let elasticsearch = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(9200),
@@ -15151,6 +15305,20 @@ mod tests {
                 (handshake_len & 0xff) as u8,
             ]);
             payload.extend_from_slice(&body);
+            payload
+        }
+
+        fn git_pkt_line(service: &[u8], repository: &[u8]) -> Vec<u8> {
+            let mut line = Vec::new();
+            line.extend_from_slice(service);
+            line.push(b' ');
+            line.extend_from_slice(repository);
+            line.push(0);
+            line.extend_from_slice(b"host=git.example");
+
+            let len = line.len() + 4;
+            let mut payload = format!("{len:04x}").into_bytes();
+            payload.extend_from_slice(&line);
             payload
         }
 
@@ -17648,6 +17816,52 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(
+                b"GET /team/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Git
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /team/repo.git/git-receive-pack HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Git
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /team/repo.git/git-upload-archive HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Git
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /team/repo/info/refs?service=git-upload-pack HTTP/1.1\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(
+                b"GET /team/repo.git/info/refs?service=git-upload-packish HTTP/1.1\r\n"
+            )
+            .application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
+            observation_for_payload(&git_pkt_line(b"git-upload-pack", b"/team/repo.git"))
+                .application(),
+            api::AgentPacketFlowApplication::Git
+        );
+        assert_eq!(
+            observation_for_payload(&git_pkt_line(b"git-receive-pack", b"/team/repo.git"))
+                .application(),
+            api::AgentPacketFlowApplication::Git
+        );
+        assert_eq!(
+            observation_for_payload(b"zzzzgit-upload-pack /team/repo.git\0host=git.example")
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(b"GET /v1/agent/self HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Consul
         );
@@ -18130,6 +18344,7 @@ mod tests {
                 "solr-cloud.search.svc",
                 api::AgentPacketFlowApplication::Solr,
             ),
+            ("gitlab-code.scm.svc", api::AgentPacketFlowApplication::Git),
             (
                 "postgres-primary.db.svc",
                 api::AgentPacketFlowApplication::Postgres,
@@ -18304,6 +18519,14 @@ mod tests {
             (
                 &[b"rsync".as_slice()][..],
                 api::AgentPacketFlowApplication::Rsync,
+            ),
+            (
+                &[b"git".as_slice()][..],
+                api::AgentPacketFlowApplication::Git,
+            ),
+            (
+                &[b"git-upload-pack".as_slice()][..],
+                api::AgentPacketFlowApplication::Git,
             ),
             (
                 &[b"submission".as_slice()][..],

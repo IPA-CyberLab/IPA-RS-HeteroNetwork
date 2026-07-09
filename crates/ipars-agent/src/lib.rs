@@ -543,6 +543,7 @@ pub struct AgentRuntime {
     packet_flow_application_elasticsearch_count: AtomicU64,
     packet_flow_application_opensearch_count: AtomicU64,
     packet_flow_application_solr_count: AtomicU64,
+    packet_flow_application_git_count: AtomicU64,
     packet_flow_application_ike_count: AtomicU64,
     packet_flow_application_ipsec_count: AtomicU64,
     packet_flow_application_ip_tunnel_count: AtomicU64,
@@ -1192,6 +1193,7 @@ impl AgentRuntime {
             packet_flow_application_elasticsearch_count: AtomicU64::new(0),
             packet_flow_application_opensearch_count: AtomicU64::new(0),
             packet_flow_application_solr_count: AtomicU64::new(0),
+            packet_flow_application_git_count: AtomicU64::new(0),
             packet_flow_application_ike_count: AtomicU64::new(0),
             packet_flow_application_ipsec_count: AtomicU64::new(0),
             packet_flow_application_ip_tunnel_count: AtomicU64::new(0),
@@ -1978,6 +1980,7 @@ impl AgentRuntime {
                 &self.packet_flow_application_opensearch_count
             }
             AgentPacketFlowApplication::Solr => &self.packet_flow_application_solr_count,
+            AgentPacketFlowApplication::Git => &self.packet_flow_application_git_count,
             AgentPacketFlowApplication::Ike => &self.packet_flow_application_ike_count,
             AgentPacketFlowApplication::Ipsec => &self.packet_flow_application_ipsec_count,
             AgentPacketFlowApplication::IpTunnel => &self.packet_flow_application_ip_tunnel_count,
@@ -7977,6 +7980,11 @@ mod tests {
                 AgentPacketFlowApplication::Solr,
                 TransportProtocol::Tcp,
                 b"HTTP/1.1 200 OK\r\nX-Solr-Version: 9.6.1\r\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Git,
+                TransportProtocol::Tcp,
+                b"GET /team/repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n".to_vec(),
             ),
             (
                 AgentPacketFlowApplication::Vnc,
