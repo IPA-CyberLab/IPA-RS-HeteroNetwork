@@ -13811,18 +13811,88 @@ pub mod api {
 
         if !matches!(version_byte, 0x03..=0x05 | 0x83..=0x85)
             || !(3..=5).contains(&version)
-            || flags != 0
             || body_len > 16_777_216
         {
             return false;
         }
 
         let is_response = version_byte & 0x80 != 0;
+        let Some(message_offset) = cassandra_frame_message_offset(
+            version,
+            is_response,
+            opcode,
+            flags,
+            body_len,
+            body_prefix,
+        ) else {
+            return false;
+        };
+        let Some(message_body_len) = body_len.checked_sub(message_offset) else {
+            return false;
+        };
+        let Some(message_body_prefix) = body_prefix.get(message_offset..) else {
+            return false;
+        };
         if is_response {
-            cassandra_response_body(opcode, body_len, body_prefix)
+            cassandra_response_body(opcode, message_body_len, message_body_prefix)
         } else {
-            cassandra_request_body(version, opcode, body_len, body_prefix)
+            cassandra_request_body(version, opcode, message_body_len, message_body_prefix)
         }
+    }
+
+    fn cassandra_frame_message_offset(
+        version: u8,
+        is_response: bool,
+        opcode: u8,
+        flags: u8,
+        body_len: usize,
+        body_prefix: &[u8],
+    ) -> Option<usize> {
+        if flags == 0 {
+            return Some(0);
+        }
+        // The payload-prefix classifier only inspects uncompressed frame bodies.
+        if flags & 0x01 != 0 {
+            return None;
+        }
+        let supported_flags = match version {
+            3 => 0x02,
+            4 => 0x0e,
+            5 => 0x1e,
+            _ => return None,
+        };
+        if flags & !supported_flags != 0 {
+            return None;
+        }
+
+        let has_tracing = flags & 0x02 != 0;
+        let has_custom_payload = flags & 0x04 != 0;
+        let has_warnings = flags & 0x08 != 0;
+        let uses_beta = flags & 0x10 != 0;
+        if uses_beta && (version != 5 || is_response) {
+            return None;
+        }
+        if has_warnings && !is_response {
+            return None;
+        }
+        if has_custom_payload && !is_response && !matches!(opcode, 0x07 | 0x09 | 0x0a | 0x0d) {
+            return None;
+        }
+
+        let mut offset = 0_usize;
+        if is_response && has_tracing {
+            offset = offset.checked_add(16)?;
+            if offset > body_len || offset > body_prefix.len() {
+                return None;
+            }
+        }
+        if is_response && has_warnings {
+            offset = cassandra_string_list_field(body_prefix, offset, body_len)?;
+        }
+        if has_custom_payload {
+            offset = cassandra_bytes_map_field(body_prefix, offset, body_len)?;
+        }
+        Some(offset)
     }
 
     fn cassandra_request_body(
@@ -14583,24 +14653,54 @@ pub mod api {
         Some(value_end)
     }
 
+    fn cassandra_bytes_map_field(payload: &[u8], offset: usize, body_len: usize) -> Option<usize> {
+        let count = read_u16_be(payload, offset)? as usize;
+        if count > 64 {
+            return None;
+        }
+        let mut offset = offset.checked_add(2)?;
+        if offset > body_len {
+            return None;
+        }
+        for _ in 0..count {
+            let (_key, next_offset) = cassandra_string_field(payload, offset)?;
+            if next_offset > body_len {
+                return None;
+            }
+            offset = cassandra_bytes_field(payload, next_offset, body_len, false)?;
+        }
+        Some(offset)
+    }
+
     fn cassandra_string_list_body(body_len: usize, body_prefix: &[u8]) -> bool {
         if body_len < 2 || body_prefix.len() < body_len {
             return false;
         }
-        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
-            return false;
-        };
+        cassandra_string_list_field(body_prefix, 0, body_len)
+            .is_some_and(|offset| offset == body_len)
+    }
+
+    fn cassandra_string_list_field(
+        payload: &[u8],
+        offset: usize,
+        body_len: usize,
+    ) -> Option<usize> {
+        let count = read_u16_be(payload, offset)? as usize;
         if count == 0 || count > 64 {
-            return false;
+            return None;
         }
-        let mut offset = 2;
+        let mut offset = offset.checked_add(2)?;
+        if offset > body_len {
+            return None;
+        }
         for _ in 0..count {
-            let Some((_value, next_offset)) = cassandra_string_field(body_prefix, offset) else {
-                return false;
-            };
+            let (_value, next_offset) = cassandra_string_field(payload, offset)?;
+            if next_offset > body_len {
+                return None;
+            }
             offset = next_offset;
         }
-        offset == body_len
+        Some(offset)
     }
 
     fn cassandra_string_body(body_len: usize, body_prefix: &[u8]) -> bool {
@@ -17779,14 +17879,32 @@ mod tests {
         }
 
         fn cassandra_request_frame(opcode: u8, body: &[u8]) -> Vec<u8> {
-            let mut payload = vec![0x04, 0, 0, 0, opcode];
+            cassandra_request_frame_with_flags(0x04, 0, opcode, body)
+        }
+
+        fn cassandra_request_frame_with_flags(
+            version: u8,
+            flags: u8,
+            opcode: u8,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut payload = vec![version, flags, 0, 0, opcode];
             payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
             payload.extend_from_slice(body);
             payload
         }
 
         fn cassandra_response_frame(opcode: u8, body: &[u8]) -> Vec<u8> {
-            let mut payload = vec![0x84, 0, 0, 0, opcode];
+            cassandra_response_frame_with_flags(0x84, 0, opcode, body)
+        }
+
+        fn cassandra_response_frame_with_flags(
+            version: u8,
+            flags: u8,
+            opcode: u8,
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut payload = vec![version, flags, 0, 0, opcode];
             payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
             payload.extend_from_slice(body);
             payload
@@ -17795,6 +17913,29 @@ mod tests {
         fn cassandra_string(value: &[u8]) -> Vec<u8> {
             let mut encoded = (value.len() as u16).to_be_bytes().to_vec();
             encoded.extend_from_slice(value);
+            encoded
+        }
+
+        fn cassandra_string_list(values: &[&[u8]]) -> Vec<u8> {
+            let mut encoded = (values.len() as u16).to_be_bytes().to_vec();
+            for value in values {
+                encoded.extend_from_slice(&cassandra_string(value));
+            }
+            encoded
+        }
+
+        fn cassandra_bytes_map(entries: &[(&[u8], Option<&[u8]>)]) -> Vec<u8> {
+            let mut encoded = (entries.len() as u16).to_be_bytes().to_vec();
+            for (key, value) in entries {
+                encoded.extend_from_slice(&cassandra_string(key));
+                match value {
+                    Some(value) => {
+                        encoded.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                        encoded.extend_from_slice(value);
+                    }
+                    None => encoded.extend_from_slice(&(-1_i32).to_be_bytes()),
+                }
+            }
             encoded
         }
 
@@ -23088,6 +23229,108 @@ mod tests {
         cassandra_tracing_flag_query[1] = 0x02;
         assert_eq!(
             observation_for_payload(&cassandra_tracing_flag_query).application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_compressed_query = cassandra_query_frame(b"SELECT 1", 0x0001, 0, &[]);
+        cassandra_compressed_query[1] = 0x01;
+        assert_eq!(
+            observation_for_payload(&cassandra_compressed_query).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_warning_flag_query = cassandra_query_frame(b"SELECT 1", 0x0001, 0, &[]);
+        cassandra_warning_flag_query[1] = 0x08;
+        assert_eq!(
+            observation_for_payload(&cassandra_warning_flag_query).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_custom_payload_query = cassandra_bytes_map(&[(b"tenant", Some(b"edge"))]);
+        cassandra_custom_payload_query
+            .extend_from_slice(&cassandra_query_frame(b"SELECT 1", 0x0001, 0, &[])[9..]);
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame_with_flags(
+                0x04,
+                0x04,
+                0x07,
+                &cassandra_custom_payload_query
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_startup_with_custom_payload =
+            cassandra_bytes_map(&[(b"tenant", Some(b"edge"))]);
+        cassandra_startup_with_custom_payload.extend_from_slice(&[
+            0, 1, 0, 11, b'C', b'Q', b'L', b'_', b'V', b'E', b'R', b'S', b'I', b'O', b'N', 0, 5,
+            b'3', b'.', b'0', b'.', b'0',
+        ]);
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame_with_flags(
+                0x04,
+                0x04,
+                0x01,
+                &cassandra_startup_with_custom_payload
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_request_frame_with_flags(0x05, 0x10, 0x05, &[]))
+                .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(0x85, 0x10, 0x02, &[]))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_traced_result = vec![0x11; 16];
+        cassandra_traced_result.extend_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x84,
+                0x02,
+                0x08,
+                &cassandra_traced_result
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_warned_result = cassandra_string_list(&[b"slow query"]);
+        cassandra_warned_result.extend_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x84,
+                0x08,
+                0x08,
+                &cassandra_warned_result
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_custom_warned_result = vec![0x22; 16];
+        cassandra_custom_warned_result.extend_from_slice(&cassandra_string_list(&[b"slow query"]));
+        cassandra_custom_warned_result
+            .extend_from_slice(&cassandra_bytes_map(&[(b"tenant", Some(b"edge"))]));
+        cassandra_custom_warned_result.extend_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x84,
+                0x0e,
+                0x08,
+                &cassandra_custom_warned_result
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_bad_warning_result = 0_u16.to_be_bytes().to_vec();
+        cassandra_bad_warning_result.extend_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x84,
+                0x08,
+                0x08,
+                &cassandra_bad_warning_result
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
