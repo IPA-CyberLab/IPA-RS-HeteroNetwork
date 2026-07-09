@@ -12703,7 +12703,9 @@ pub mod api {
             let Some(payload_start) = properties_offset.checked_add(properties_len) else {
                 return false;
             };
-            if payload_start > remaining_end {
+            if payload_start > remaining_end
+                || !mqtt_v5_connect_properties(payload, properties_offset, payload_start)
+            {
                 return false;
             }
             payload_start
@@ -13096,6 +13098,87 @@ pub mod api {
                 let (_value, next_offset) = mqtt_utf8_field(payload, value_offset, properties_end)?;
                 Some(next_offset)
             }
+            _ => None,
+        }
+    }
+
+    fn mqtt_v5_connect_properties(
+        payload: &[u8],
+        mut offset: usize,
+        properties_end: usize,
+    ) -> bool {
+        let mut property_count = 0_usize;
+        let mut seen_single = 0_u128;
+        while offset < properties_end {
+            property_count += 1;
+            if property_count > 64 {
+                return false;
+            }
+            let Some((property_id, value_offset)) =
+                mqtt_variable_integer_until(payload, offset, properties_end)
+            else {
+                return false;
+            };
+            offset = value_offset;
+            if property_id != 0x26 {
+                let Some(property_bit) = 1_u128.checked_shl(property_id as u32) else {
+                    return false;
+                };
+                if seen_single & property_bit != 0 {
+                    return false;
+                }
+                seen_single |= property_bit;
+            }
+            let Some(next_offset) =
+                mqtt_v5_connect_property(payload, offset, properties_end, property_id)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == properties_end
+    }
+
+    fn mqtt_v5_connect_property(
+        payload: &[u8],
+        offset: usize,
+        properties_end: usize,
+        property_id: usize,
+    ) -> Option<usize> {
+        match property_id {
+            0x11 | 0x27 => {
+                let next_offset = offset.checked_add(4)?;
+                let value = read_u32_be(payload, offset)?;
+                (next_offset <= properties_end && (property_id != 0x27 || value != 0))
+                    .then_some(next_offset)
+            }
+            0x21 => {
+                let next_offset = offset.checked_add(2)?;
+                let value = read_u16_be(payload, offset)?;
+                (next_offset <= properties_end && value != 0).then_some(next_offset)
+            }
+            0x22 => {
+                let next_offset = offset.checked_add(2)?;
+                payload
+                    .get(offset..next_offset)
+                    .filter(|_| next_offset <= properties_end)
+                    .map(|_| next_offset)
+            }
+            0x17 | 0x19 => {
+                let value = *payload.get(offset)?;
+                let next_offset = offset.checked_add(1)?;
+                (next_offset <= properties_end && matches!(value, 0 | 1)).then_some(next_offset)
+            }
+            0x15 => {
+                let (_value, next_offset) = mqtt_utf8_field(payload, offset, properties_end)?;
+                Some(next_offset)
+            }
+            0x16 => {
+                let (_value, next_offset) =
+                    mqtt_len_prefixed_field(payload, offset, properties_end)?;
+                Some(next_offset)
+            }
+            0x26 => mqtt_v5_user_property(payload, offset, properties_end),
             _ => None,
         }
     }
@@ -17162,6 +17245,15 @@ mod tests {
             connect_flags: u8,
             payload_fields: &[Vec<u8>],
         ) -> Vec<u8> {
+            mqtt_connect_packet_with_properties(protocol_level, connect_flags, &[], payload_fields)
+        }
+
+        fn mqtt_connect_packet_with_properties(
+            protocol_level: u8,
+            connect_flags: u8,
+            properties: &[u8],
+            payload_fields: &[Vec<u8>],
+        ) -> Vec<u8> {
             let mut body = vec![
                 0,
                 4,
@@ -17175,7 +17267,8 @@ mod tests {
                 60,
             ];
             if protocol_level == 5 {
-                body.push(0);
+                body.extend_from_slice(&mqtt_remaining_length(properties.len()));
+                body.extend_from_slice(properties);
             }
             for field in payload_fields {
                 body.extend_from_slice(field);
@@ -21793,6 +21886,23 @@ mod tests {
             .application(),
             api::AgentPacketFlowApplication::Mqtt
         );
+        let mut mqtt_v5_connect_properties = vec![0x11];
+        mqtt_v5_connect_properties.extend_from_slice(&30_u32.to_be_bytes());
+        mqtt_v5_connect_properties.push(0x21);
+        mqtt_v5_connect_properties.extend_from_slice(&64_u16.to_be_bytes());
+        mqtt_v5_connect_properties.push(0x26);
+        mqtt_v5_connect_properties.extend_from_slice(&mqtt_field(b"source"));
+        mqtt_v5_connect_properties.extend_from_slice(&mqtt_field(b"agent"));
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x02,
+                &mqtt_v5_connect_properties,
+                &[mqtt_field(b"agent")]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
         assert_eq!(
             observation_for_payload(&mqtt_connect_packet(
                 4,
@@ -21967,6 +22077,40 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mqtt_connect_packet(4, 0x02, &[mqtt_field(&[0xff])]))
                 .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x02,
+                &[0x01],
+                &[mqtt_field(b"agent")]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut mqtt_duplicate_connect_property = vec![0x11];
+        mqtt_duplicate_connect_property.extend_from_slice(&30_u32.to_be_bytes());
+        mqtt_duplicate_connect_property.push(0x11);
+        mqtt_duplicate_connect_property.extend_from_slice(&60_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x02,
+                &mqtt_duplicate_connect_property,
+                &[mqtt_field(b"agent")]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_connect_packet_with_properties(
+                5,
+                0x02,
+                &[0x17, 0x02],
+                &[mqtt_field(b"agent")]
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
