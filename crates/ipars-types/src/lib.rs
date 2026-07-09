@@ -13237,6 +13237,9 @@ pub mod api {
         if filter.is_empty() || filter.len() > 1024 || !mqtt_utf8_string(filter) {
             return false;
         }
+        if filter.starts_with(b"$share/") && !mqtt_shared_topic_filter(filter) {
+            return false;
+        }
         let mut tokens = filter.split(|byte| *byte == b'/').peekable();
         while let Some(token) = tokens.next() {
             if token.contains(&b'#') {
@@ -13249,6 +13252,20 @@ pub mod api {
             }
         }
         true
+    }
+
+    fn mqtt_shared_topic_filter(filter: &[u8]) -> bool {
+        let Some(shared_tail) = filter.strip_prefix(b"$share/") else {
+            return false;
+        };
+        let Some(separator) = shared_tail.iter().position(|byte| *byte == b'/') else {
+            return false;
+        };
+        let share_name = &shared_tail[..separator];
+        let topic_filter = &shared_tail[separator + 1..];
+        !share_name.is_empty()
+            && !topic_filter.is_empty()
+            && !share_name.iter().any(|byte| matches!(*byte, b'+' | b'#'))
     }
 
     fn mqtt_subscription_options(options: u8) -> bool {
@@ -21595,6 +21612,23 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
+            observation_for_payload(&mqtt_subscribe_packet(
+                12,
+                &[(b"$share//sensors/#".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_v5_packet(
+                12,
+                &[],
+                &[(b"$share/+/sensors/#".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(&mqtt_unsubscribe_packet(0, &[b"sensors/+/temp".as_slice()]))
                 .application(),
             api::AgentPacketFlowApplication::Unknown
@@ -21602,6 +21636,14 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mqtt_unsubscribe_packet(13, &[b"sensors/temp#".as_slice()]))
                 .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_packet(
+                13,
+                &[b"$share/workers".as_slice()]
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
