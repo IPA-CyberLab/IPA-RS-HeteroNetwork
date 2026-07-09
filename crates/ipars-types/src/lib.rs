@@ -1819,6 +1819,7 @@ pub mod api {
         Elasticsearch,
         #[serde(alias = "opensearch")]
         OpenSearch,
+        Solr,
         Ike,
         Ipsec,
         IpTunnel,
@@ -1832,7 +1833,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 75] = [
+        pub const ALL: [Self; 76] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1899,6 +1900,7 @@ pub mod api {
             Self::MongoDb,
             Self::Elasticsearch,
             Self::OpenSearch,
+            Self::Solr,
             Self::Ike,
             Self::Ipsec,
             Self::IpTunnel,
@@ -1978,6 +1980,7 @@ pub mod api {
                 Self::MongoDb => "mongodb",
                 Self::Elasticsearch => "elasticsearch",
                 Self::OpenSearch => "opensearch",
+                Self::Solr => "solr",
                 Self::Ike => "ike",
                 Self::Ipsec => "ipsec",
                 Self::IpTunnel => "ip_tunnel",
@@ -2533,6 +2536,11 @@ pub mod api {
             }
             if self.involves_port(27017) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::MongoDb;
+            }
+            if (self.involves_port(8983) || self.involves_port(8984))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Solr;
             }
             if (self.involves_port(9200) || self.involves_port(9300))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
@@ -3110,6 +3118,9 @@ pub mod api {
             if opensearch_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::OpenSearch);
             }
+            if solr_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Solr);
+            }
             if path_starts_with_any(
                 path,
                 &[
@@ -3208,6 +3219,9 @@ pub mod api {
             || http_header_value_contains(headers, b"x-opensearch-product", b"opensearch")
         {
             return Some(AgentPacketFlowApplication::OpenSearch);
+        }
+        if http_header_name_has_prefix(headers, b"x-solr-") {
+            return Some(AgentPacketFlowApplication::Solr);
         }
         if http_header_value_contains(headers, b"x-elastic-product", b"elasticsearch") {
             return Some(AgentPacketFlowApplication::Elasticsearch);
@@ -3405,6 +3419,9 @@ pub mod api {
         if contains_ascii_case_insensitive(payload, b"\r\nx-opensearch-") {
             return Some(AgentPacketFlowApplication::OpenSearch);
         }
+        if contains_ascii_case_insensitive(payload, b"\r\nx-solr-") {
+            return Some(AgentPacketFlowApplication::Solr);
+        }
         if contains_ascii_case_insensitive(payload, b"\r\nx-clickhouse-") {
             return Some(AgentPacketFlowApplication::ClickHouse);
         }
@@ -3469,6 +3486,12 @@ pub mod api {
     fn opensearch_http_api_path(path: &[u8]) -> bool {
         path_starts_with_api_prefix(path, b"/_plugins")
             || path_starts_with_api_prefix(path, b"/_opendistro")
+    }
+
+    fn solr_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/solr")
+            || path_starts_with_api_prefix(path, b"/api/collections")
+            || path_starts_with_api_prefix(path, b"/api/cores")
     }
 
     fn cri_grpc_path(path: &[u8]) -> bool {
@@ -4934,6 +4957,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"opensearch") {
             return Some(AgentPacketFlowApplication::OpenSearch);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"solr") {
+            return Some(AgentPacketFlowApplication::Solr);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"elasticsearch")
             || tls_sni_hostname_has_label_prefix(hostname, b"elastic")
         {
@@ -5292,6 +5318,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"opensearch") {
             return Some(AgentPacketFlowApplication::OpenSearch);
+        }
+        if protocol.eq_ignore_ascii_case(b"solr") {
+            return Some(AgentPacketFlowApplication::Solr);
         }
         if protocol.eq_ignore_ascii_case(b"elasticsearch")
             || protocol.eq_ignore_ascii_case(b"elastic")
@@ -14951,6 +14980,13 @@ mod tests {
             api::AgentPacketFlowApplication::MongoDb
         );
 
+        let solr = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8983),
+            ..Default::default()
+        };
+        assert_eq!(solr.application(), api::AgentPacketFlowApplication::Solr);
+
         let elasticsearch = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(9200),
@@ -17599,6 +17635,19 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(b"GET /solr/admin/collections?action=LIST HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Solr
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /api/collections HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Solr
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /solrfoo/admin HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(b"GET /v1/agent/self HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Consul
         );
@@ -17744,6 +17793,10 @@ mod tests {
             observation_for_payload(b"HTTP/1.1 200 OK\r\nX-OpenSearch-Version: 2.15.0\r\n")
                 .application(),
             api::AgentPacketFlowApplication::OpenSearch
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Solr-Version: 9.6.1\r\n").application(),
+            api::AgentPacketFlowApplication::Solr
         );
         assert_eq!(
             observation_for_payload(b"HTTP/1.1 200 OK\r\nX-ClickHouse-Summary: {}\r\n")
@@ -18074,6 +18127,10 @@ mod tests {
                 api::AgentPacketFlowApplication::OpenSearch,
             ),
             (
+                "solr-cloud.search.svc",
+                api::AgentPacketFlowApplication::Solr,
+            ),
+            (
                 "postgres-primary.db.svc",
                 api::AgentPacketFlowApplication::Postgres,
             ),
@@ -18215,6 +18272,10 @@ mod tests {
             (
                 &[b"opensearch".as_slice()][..],
                 api::AgentPacketFlowApplication::OpenSearch,
+            ),
+            (
+                &[b"solr".as_slice()][..],
+                api::AgentPacketFlowApplication::Solr,
             ),
             (
                 &[b"influxdb-http".as_slice()][..],
