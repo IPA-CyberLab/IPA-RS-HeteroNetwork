@@ -96,12 +96,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered base Compose config unexpectedly mounted the Docker API socket in the agent container"
     );
 
-    let multi_network_compose = ComposeProject {
+    let rootful_discovery_compose = ComposeProject {
         repo_root: repo_root.clone(),
         project_name: format!("ipars-config-{}", unique_suffix()?),
         compose_files: vec![
             PathBuf::from("docker/compose.yaml"),
-            PathBuf::from("docker/compose.rootless.yaml"),
             PathBuf::from("docker/compose.docker-discovery.yaml"),
         ],
         docker_socket,
@@ -192,14 +191,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ),
         ],
     };
-    let rendered = run_compose(&multi_network_compose, ["config"])?;
+    let rendered = run_compose(&rootful_discovery_compose, ["config"])?;
     let rendered =
         String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
     assert_rendered_compose_env(
         &rendered,
         &[
-            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
-            ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
+            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
+            ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
             ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
             ("IPARS_DOCKER_NETWORKS", "edge_default,edge_apps"),
             ("IPARS_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
@@ -235,19 +234,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         ],
     )?;
     anyhow::ensure!(
-        !rendered.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES: \"true\""),
-        "rendered rootless Compose config allowed Docker route application to remain enabled"
-    );
-    anyhow::ensure!(
-        !rendered.contains("IPARS_DOCKER_DISCOVER_NETWORKS: \"true\""),
-        "rendered rootless Compose config allowed Docker network discovery to remain enabled"
-    );
-    anyhow::ensure!(
         rendered.contains("target: /run/ipars/docker.sock"),
         "rendered Docker discovery Compose config did not mount the Docker API socket"
     );
     anyhow::ensure!(
-        rendered.contains(&format!("source: {}", multi_network_compose.docker_socket.display())),
+        rendered.contains(&format!(
+            "source: {}",
+            rootful_discovery_compose.docker_socket.display()
+        )),
         "rendered Docker discovery Compose config did not bind the requested host Docker API socket"
     );
     anyhow::ensure!(
@@ -258,6 +252,115 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         rendered.contains("create_host_path: false"),
         "rendered Docker discovery Compose config could create a missing host Docker API socket path"
     );
+
+    let rootless_compose = ComposeProject {
+        repo_root: repo_root.clone(),
+        project_name: format!("ipars-config-{}", unique_suffix()?),
+        compose_files: vec![
+            PathBuf::from("docker/compose.yaml"),
+            PathBuf::from("docker/compose.rootless.yaml"),
+        ],
+        docker_socket: temp_dir.join("rootless-docker.sock"),
+        extra_env: vec![
+            (
+                "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_API_SOCKET".to_string(),
+                "/run/ipars/docker.sock".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_NETWORKS".to_string(),
+                "edge_default,edge_apps".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+                "compose-edge".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+                "br-edge".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
+                "172.31.0.0/16".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+                "15".to_string(),
+            ),
+            (
+                "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+                "command".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+                "wireguard-go".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+                "ipars0".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+                "30".to_string(),
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+                "20".to_string(),
+            ),
+            (
+                "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+                "relay-fw".to_string(),
+            ),
+        ],
+    };
+    let rendered = run_compose(&rootless_compose, ["config"])?;
+    let rendered =
+        String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
+    assert_rendered_compose_env(
+        &rendered,
+        &[
+            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
+            ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-command"),
+            ("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND", "wireguard-go"),
+            ("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS", "ipars0"),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
+                "30",
+            ),
+            (
+                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
+                "20",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "IPARS_DOCKER_API_SOCKET:",
+        "IPARS_DOCKER_NETWORKS:",
+        "IPARS_DOCKER_CONTAINER_NAMESPACE:",
+        "IPARS_DOCKER_CONTAINER_CIDRS:",
+        "IPARS_DOCKER_HOST_INTERFACE:",
+        "IPARS_DOCKER_EXPOSE_HOST_ROUTES:",
+        "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:",
+        "IPARS_AGENT_RELAY_FORWARDER_NETNS:",
+        "target: /run/ipars/docker.sock",
+    ] {
+        anyhow::ensure!(
+            !rendered.contains(forbidden),
+            "rendered rootless Compose config retained forbidden Docker or namespace setting {forbidden}\n{rendered}"
+        );
+    }
     anyhow::ensure!(
         !rendered.contains("cap_add"),
         "rendered rootless Compose config unexpectedly kept Linux capability additions"

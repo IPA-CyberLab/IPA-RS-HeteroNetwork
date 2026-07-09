@@ -10724,9 +10724,18 @@ fi
         assert!(discovery_compose.contains("create_host_path: false"));
         assert!(rootless_compose.contains("cap_add: !reset []"));
         assert!(rootless_compose.contains("devices: !reset []"));
-        assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND: userspace-command"));
-        assert!(rootless_compose.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES: \"false\""));
-        assert!(rootless_compose.contains("IPARS_DOCKER_DISCOVER_NETWORKS: \"false\""));
+        assert!(rootless_compose.contains("environment: !override"));
+        assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND=userspace-command"));
+        assert!(rootless_compose.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=false"));
+        assert!(rootless_compose.contains("IPARS_DOCKER_DISCOVER_NETWORKS=false"));
+        assert!(rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
+        assert!(
+            rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS")
+        );
+        assert!(!rootless_compose.contains("IPARS_DOCKER_NETWORKS"));
+        assert!(!rootless_compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
+        assert!(!rootless_compose.contains("IPARS_DOCKER_API_SOCKET"));
+        assert!(!rootless_compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
         Ok(())
     }
 
