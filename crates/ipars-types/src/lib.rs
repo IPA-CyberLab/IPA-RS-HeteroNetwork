@@ -13337,7 +13337,7 @@ pub mod api {
         };
         match frame_type {
             1 => amqp_method_frame_payload(channel, frame_size, frame_body),
-            2 => channel != 0 && (14..=131_072).contains(&frame_size),
+            2 => amqp_content_header_frame_payload(channel, frame_size, frame_body),
             3 => channel != 0 && frame_size <= 16_777_216,
             8 => channel == 0 && frame_size == 0,
             _ => false,
@@ -13356,6 +13356,109 @@ pub mod api {
             channel != 0
         };
         channel_ok && amqp_known_method_id(class_id, method_id)
+    }
+
+    fn amqp_content_header_frame_payload(
+        channel: u16,
+        frame_size: usize,
+        frame_body: &[u8],
+    ) -> bool {
+        if channel == 0 || !(14..=131_072).contains(&frame_size) || frame_body.len() != frame_size {
+            return false;
+        }
+        let Some(class_id) = read_u16_be(frame_body, 0) else {
+            return false;
+        };
+        let Some(weight) = read_u16_be(frame_body, 2) else {
+            return false;
+        };
+        if class_id != 60 || weight != 0 || frame_body.get(4..12).is_none() {
+            return false;
+        }
+        let Some(property_flags) = read_u16_be(frame_body, 12) else {
+            return false;
+        };
+        if property_flags & 0x0003 != 0 {
+            return false;
+        }
+        amqp_basic_property_values(frame_body, 14, property_flags)
+    }
+
+    fn amqp_basic_property_values(
+        frame_body: &[u8],
+        mut offset: usize,
+        property_flags: u16,
+    ) -> bool {
+        let properties = [
+            (0x8000, AmqpBasicPropertyKind::ShortString),
+            (0x4000, AmqpBasicPropertyKind::ShortString),
+            (0x2000, AmqpBasicPropertyKind::FieldTable),
+            (0x1000, AmqpBasicPropertyKind::Octet),
+            (0x0800, AmqpBasicPropertyKind::Octet),
+            (0x0400, AmqpBasicPropertyKind::ShortString),
+            (0x0200, AmqpBasicPropertyKind::ShortString),
+            (0x0100, AmqpBasicPropertyKind::ShortString),
+            (0x0080, AmqpBasicPropertyKind::ShortString),
+            (0x0040, AmqpBasicPropertyKind::LongLong),
+            (0x0020, AmqpBasicPropertyKind::ShortString),
+            (0x0010, AmqpBasicPropertyKind::ShortString),
+            (0x0008, AmqpBasicPropertyKind::ShortString),
+            (0x0004, AmqpBasicPropertyKind::ShortString),
+        ];
+        for (flag, kind) in properties {
+            if property_flags & flag == 0 {
+                continue;
+            }
+            let Some(next_offset) = amqp_basic_property_value(frame_body, offset, kind) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == frame_body.len()
+    }
+
+    #[derive(Clone, Copy)]
+    enum AmqpBasicPropertyKind {
+        ShortString,
+        FieldTable,
+        Octet,
+        LongLong,
+    }
+
+    fn amqp_basic_property_value(
+        frame_body: &[u8],
+        offset: usize,
+        kind: AmqpBasicPropertyKind,
+    ) -> Option<usize> {
+        match kind {
+            AmqpBasicPropertyKind::ShortString => {
+                let len = *frame_body.get(offset)? as usize;
+                let start = offset.checked_add(1)?;
+                let end = start.checked_add(len)?;
+                frame_body.get(start..end)?;
+                Some(end)
+            }
+            AmqpBasicPropertyKind::FieldTable => {
+                let len = read_u32_be(frame_body, offset)? as usize;
+                if len > 65_536 {
+                    return None;
+                }
+                let start = offset.checked_add(4)?;
+                let end = start.checked_add(len)?;
+                frame_body.get(start..end)?;
+                Some(end)
+            }
+            AmqpBasicPropertyKind::Octet => {
+                let end = offset.checked_add(1)?;
+                frame_body.get(offset..end)?;
+                Some(end)
+            }
+            AmqpBasicPropertyKind::LongLong => {
+                let end = offset.checked_add(8)?;
+                frame_body.get(offset..end)?;
+                Some(end)
+            }
+        }
     }
 
     fn amqp_known_method_id(class_id: u16, method_id: u16) -> bool {
@@ -16744,6 +16847,37 @@ mod tests {
                     break;
                 }
             }
+            encoded
+        }
+
+        fn amqp_frame(frame_type: u8, channel: u16, body: &[u8]) -> Vec<u8> {
+            let mut payload = vec![frame_type];
+            payload.extend_from_slice(&channel.to_be_bytes());
+            payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            payload.extend_from_slice(body);
+            payload.push(0xce);
+            payload
+        }
+
+        fn amqp_content_header_body(
+            class_id: u16,
+            weight: u16,
+            body_size: u64,
+            property_flags: u16,
+            properties: &[u8],
+        ) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&class_id.to_be_bytes());
+            body.extend_from_slice(&weight.to_be_bytes());
+            body.extend_from_slice(&body_size.to_be_bytes());
+            body.extend_from_slice(&property_flags.to_be_bytes());
+            body.extend_from_slice(properties);
+            body
+        }
+
+        fn amqp_short_string(value: &[u8]) -> Vec<u8> {
+            let mut encoded = vec![value.len() as u8];
+            encoded.extend_from_slice(value);
             encoded
         }
 
@@ -21715,6 +21849,26 @@ mod tests {
             api::AgentPacketFlowApplication::Amqp
         );
         assert_eq!(
+            observation_for_payload(&amqp_frame(
+                2,
+                1,
+                &amqp_content_header_body(60, 0, 0, 0, &[])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        let mut amqp_basic_properties = amqp_short_string(b"text/plain");
+        amqp_basic_properties.extend_from_slice(&[2, 0]);
+        assert_eq!(
+            observation_for_payload(&amqp_frame(
+                2,
+                1,
+                &amqp_content_header_body(60, 0, 42, 0x9800, &amqp_basic_properties)
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Amqp
+        );
+        assert_eq!(
             observation_for_payload(&[8, 0, 0, 0, 0, 0, 0, 0xce]).application(),
             api::AgentPacketFlowApplication::Amqp
         );
@@ -21732,6 +21886,42 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[1, 0, 0, 0, 0, 0, 4, 0, 20, 0, 10, 0xce]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&amqp_frame(
+                2,
+                1,
+                &amqp_content_header_body(40, 0, 0, 0, &[])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&amqp_frame(
+                2,
+                1,
+                &amqp_content_header_body(60, 1, 0, 0, &[])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&amqp_frame(
+                2,
+                1,
+                &amqp_content_header_body(60, 0, 0, 0x0001, &[])
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&amqp_frame(
+                2,
+                1,
+                &amqp_content_header_body(60, 0, 0, 0x8000, &[])
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
