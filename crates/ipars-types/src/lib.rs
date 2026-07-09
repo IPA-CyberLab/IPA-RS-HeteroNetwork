@@ -15722,6 +15722,8 @@ pub mod api {
         if value_end > document_end || payload.get(value_end.checked_sub(1)?) != Some(&0) {
             return None;
         }
+        let utf8_end = value_end.checked_sub(1)?;
+        std::str::from_utf8(payload.get(value_offset..utf8_end)?).ok()?;
         Some(value_end)
     }
 
@@ -18959,6 +18961,17 @@ mod tests {
             binary.extend_from_slice(&declared_len.to_le_bytes());
             binary.extend_from_slice(value);
             mongodb_binary_document(name, 0x02, &binary)
+        }
+
+        fn mongodb_string_document(name: &[u8], value: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(0x02);
+            body.extend_from_slice(name);
+            body.push(0);
+            body.extend_from_slice(&(value.len() as u32 + 1).to_le_bytes());
+            body.extend_from_slice(value);
+            body.push(0);
+            mongodb_bson_document_from_body(&body)
         }
 
         fn mongodb_regex_document(name: &[u8], pattern: &[u8], options: &[u8]) -> Vec<u8> {
@@ -25137,6 +25150,7 @@ mod tests {
             mongodb_document_with_array(b"items", &mongodb_i32_document(&[(b"0", 1), (b"1", 2)]));
         let mongodb_regex_binary_document = mongodb_regex_document(b"filter", b"^ipars", b"ims");
         let mongodb_valid_old_binary_document = mongodb_old_binary_document(b"payload", 3, b"abc");
+        let mongodb_string_value_document = mongodb_string_document(b"name", b"ipars");
         let mut mongodb_op_msg = Vec::new();
         mongodb_op_msg.extend_from_slice(&0_u32.to_le_bytes());
         mongodb_op_msg.push(0);
@@ -25189,6 +25203,18 @@ mod tests {
                     &[mongodb_op_msg_body_section(
                         &mongodb_valid_old_binary_document,
                     )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::MongoDb
+        );
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_string_value_document)],
                     None
                 )
             ))
@@ -25415,6 +25441,19 @@ mod tests {
                     &[mongodb_op_msg_body_section(
                         &mongodb_array_with_leading_zero
                     )],
+                    None
+                )
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mongodb_invalid_utf8_string = mongodb_string_document(b"name", &[0xff]);
+        assert_eq!(
+            observation_for_payload(&mongodb_message(
+                2013,
+                &mongodb_op_msg_body(
+                    0,
+                    &[mongodb_op_msg_body_section(&mongodb_invalid_utf8_string)],
                     None
                 )
             ))
