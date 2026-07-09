@@ -551,6 +551,17 @@ template_fails agent-api-dns-publication-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.external-dns\.alpha\.kubernetes\.io/hostname=api.example.com'
 
+template_fails relay-address-pool-annotation \
+  "agent.relayService.annotations annotation key \"metallb.universe.tf/address-pool\" must not configure LoadBalancer resource identity, tags, or address pools" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.annotations.metallb\.universe\.tf/address-pool=public'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \

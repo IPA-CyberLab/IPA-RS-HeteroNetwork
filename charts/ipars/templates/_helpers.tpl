@@ -589,6 +589,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead" $path .key) -}}
 {{- else if or (contains "external-dns" $key) (contains "dns-name" $key) (contains "dns-label" $key) (contains "load-balancer-hostname" $key) (contains "loadbalancer-hostname" $key) (contains "domain-name" $key) (contains "domainname" $key) (contains "fqdn" $key) -}}
 {{- fail (printf "%s annotation key %q must not publish LoadBalancer DNS names; use relayAdvertisement values and explicit Service exposure controls instead" $path .key) -}}
+{{- else if or (contains "load-balancer-name" $key) (contains "loadbalancer-name" $key) (contains "target-group-name" $key) (contains "targetgroup-name" $key) (contains "resource-tags" $key) (contains "additional-resource-tags" $key) (contains "pip-tags" $key) (contains "address-pool" $key) (contains "addresspool" $key) (contains "ip-pool" $key) (contains "ippool" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 

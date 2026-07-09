@@ -3900,6 +3900,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_resource_selection(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -4010,6 +4016,21 @@ fn kubernetes_service_annotation_controls_dns_publication(key: &str) -> bool {
         || key.contains("domain-name")
         || key.contains("domainname")
         || key.contains("fqdn")
+}
+
+fn kubernetes_service_annotation_controls_resource_selection(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("load-balancer-name")
+        || key.contains("loadbalancer-name")
+        || key.contains("target-group-name")
+        || key.contains("targetgroup-name")
+        || key.contains("resource-tags")
+        || key.contains("additional-resource-tags")
+        || key.contains("pip-tags")
+        || key.contains("address-pool")
+        || key.contains("addresspool")
+        || key.contains("ip-pool")
+        || key.contains("ippool")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11509,7 +11530,7 @@ fi
             relay_session_affinity_timeout_seconds: Some(900),
             relay_external_traffic_policy: "Local".to_string(),
             relay_service_annotations: vec![KeyValueArg {
-                key: "metallb.universe.tf/address-pool".to_string(),
+                key: "example.com/relay-profile".to_string(),
                 value: "public".to_string(),
             }],
             relay_admission_bearer_token_secret: Some("relay-admission-token".to_string()),
@@ -11651,7 +11672,7 @@ fi
         assert!(plan.commands[2]
             .contains("--set-string agent.relayAdmissionBearerTokenSecret.key=token"));
         assert!(plan.commands[2].contains(
-            "--set-string 'agent.relayService.annotations.metallb\\.universe\\.tf/address-pool=public'"
+            "--set-string 'agent.relayService.annotations.example\\.com/relay-profile=public'"
         ));
         assert!(plan.commands[2].contains("--set agent.relayForwarder.enabled=true"));
         assert!(
@@ -11898,6 +11919,20 @@ fi
             "--agent-api-service-annotation annotation key external-dns.alpha.kubernetes.io/hostname must not publish LoadBalancer DNS names"
         ));
 
+        let mut agent_resource_name_annotation = base_k8s_install_args();
+        agent_resource_name_annotation.expose_agent_api = true;
+        agent_resource_name_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-name".to_string(),
+            value: "edge-api".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_resource_name_annotation) {
+            Ok(_) => panic!("agent API LoadBalancer resource name annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-name must not configure LoadBalancer resource identity, tags, or address pools"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12124,6 +12159,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-dns-label-name must not publish LoadBalancer DNS names"
+        ));
+
+        let mut relay_address_pool_annotation = base_k8s_install_args();
+        relay_address_pool_annotation.expose_relay = true;
+        relay_address_pool_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_address_pool_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_address_pool_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "metallb.universe.tf/address-pool".to_string(),
+            value: "public".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_address_pool_annotation) {
+            Ok(_) => panic!("relay address pool annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key metallb.universe.tf/address-pool must not configure LoadBalancer resource identity, tags, or address pools"
         ));
 
         Ok(())
@@ -12912,6 +12965,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not publish LoadBalancer DNS names; use relayAdvertisement values and explicit Service exposure controls instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead"
         ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
@@ -14778,7 +14834,7 @@ fi
             "--relay-external-traffic-policy",
             "Local",
             "--relay-service-annotation",
-            "metallb.universe.tf/address-pool=public",
+            "example.com/relay-profile=public",
             "--relay-admission-bearer-token-secret",
             "relay-admission-token",
             "--relay-admission-bearer-token-key",
@@ -15117,7 +15173,7 @@ fi
             assert_eq!(
                 args.relay_service_annotations,
                 vec![KeyValueArg {
-                    key: "metallb.universe.tf/address-pool".to_string(),
+                    key: "example.com/relay-profile".to_string(),
                     value: "public".to_string(),
                 }]
             );
