@@ -111,6 +111,9 @@ const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_KUBERNETES_SERVICES: usize = 8192;
+const MAX_KUBERNETES_CLUSTER_IPS_PER_SERVICE: usize = 8;
+const MAX_KUBERNETES_CLUSTER_IP_BYTES: usize = 64;
 const MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCKER_API_NETWORKS: usize = 1024;
 const MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK: usize = 64;
@@ -8170,7 +8173,10 @@ async fn read_kubernetes_services_response(
         ensure_kubernetes_services_response_size(next_len)?;
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).context("failed to decode Kubernetes services response")
+    let services: KubernetesServiceList =
+        serde_json::from_slice(&body).context("failed to decode Kubernetes services response")?;
+    validate_kubernetes_services_shape(&services)?;
+    Ok(services)
 }
 
 fn ensure_kubernetes_services_response_size(size: u64) -> anyhow::Result<()> {
@@ -8375,6 +8381,7 @@ fn ensure_kubernetes_service_account_token_size(size: u64, path: &Path) -> anyho
 fn kubernetes_service_route_cidrs(
     services: &KubernetesServiceList,
 ) -> anyhow::Result<Vec<ipnet::IpNet>> {
+    validate_kubernetes_services_shape(services)?;
     let mut cidrs = Vec::new();
     for service in &services.items {
         for cluster_ip in kubernetes_service_cluster_ips(service) {
@@ -8384,6 +8391,39 @@ fn kubernetes_service_route_cidrs(
     cidrs.sort();
     cidrs.dedup();
     Ok(cidrs)
+}
+
+fn validate_kubernetes_services_shape(services: &KubernetesServiceList) -> anyhow::Result<()> {
+    if services.items.len() > MAX_KUBERNETES_SERVICES {
+        anyhow::bail!(
+            "Kubernetes services API returned {} Services, exceeding maximum of {}",
+            services.items.len(),
+            MAX_KUBERNETES_SERVICES
+        );
+    }
+    for (index, service) in services.items.iter().enumerate() {
+        if service.spec.cluster_ips.len() > MAX_KUBERNETES_CLUSTER_IPS_PER_SERVICE {
+            anyhow::bail!(
+                "Kubernetes Service index {index} returned {} clusterIPs, exceeding maximum of {}",
+                service.spec.cluster_ips.len(),
+                MAX_KUBERNETES_CLUSTER_IPS_PER_SERVICE
+            );
+        }
+        for value in service
+            .spec
+            .cluster_ips
+            .iter()
+            .chain(service.spec.cluster_ip.iter())
+        {
+            if value.len() > MAX_KUBERNETES_CLUSTER_IP_BYTES {
+                anyhow::bail!(
+                    "Kubernetes Service index {index} returned cluster IP value longer than {} bytes",
+                    MAX_KUBERNETES_CLUSTER_IP_BYTES
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn kubernetes_service_cluster_ips(service: &KubernetesService) -> Vec<IpAddr> {
@@ -21235,6 +21275,55 @@ exec sleep 60
         tokio::time::timeout(Duration::from_secs(5), oversized_server)
             .await
             .context("timed out waiting for oversized Kubernetes services response server")???;
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_services_response_rejects_unbounded_shapes() -> anyhow::Result<()> {
+        let too_many_services = KubernetesServiceList {
+            items: (0..=MAX_KUBERNETES_SERVICES)
+                .map(|_| kubernetes_service(Some("10.96.0.10"), &[]))
+                .collect(),
+        };
+        let error = match kubernetes_service_route_cidrs(&too_many_services) {
+            Ok(_) => anyhow::bail!("unbounded Kubernetes Service count should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Services, exceeding maximum"));
+        assert!(error.contains(&MAX_KUBERNETES_SERVICES.to_string()));
+
+        let too_many_cluster_ips = KubernetesServiceList {
+            items: vec![KubernetesService {
+                spec: KubernetesServiceSpec {
+                    cluster_ip: Some("10.96.0.10".to_string()),
+                    cluster_ips: (0..=MAX_KUBERNETES_CLUSTER_IPS_PER_SERVICE)
+                        .map(|index| format!("10.96.0.{index}"))
+                        .collect(),
+                },
+            }],
+        };
+        let error = match kubernetes_service_route_cidrs(&too_many_cluster_ips) {
+            Ok(_) => anyhow::bail!("unbounded Kubernetes clusterIPs should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("clusterIPs, exceeding maximum"));
+        assert!(error.contains(&MAX_KUBERNETES_CLUSTER_IPS_PER_SERVICE.to_string()));
+
+        let oversized_cluster_ip = "1".repeat(MAX_KUBERNETES_CLUSTER_IP_BYTES + 1);
+        let oversized_cluster_ip_services = KubernetesServiceList {
+            items: vec![KubernetesService {
+                spec: KubernetesServiceSpec {
+                    cluster_ip: Some(oversized_cluster_ip),
+                    cluster_ips: Vec::new(),
+                },
+            }],
+        };
+        let error = match kubernetes_service_route_cidrs(&oversized_cluster_ip_services) {
+            Ok(_) => anyhow::bail!("oversized Kubernetes cluster IP should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cluster IP value longer than"));
+        assert!(error.contains(&MAX_KUBERNETES_CLUSTER_IP_BYTES.to_string()));
         Ok(())
     }
 
