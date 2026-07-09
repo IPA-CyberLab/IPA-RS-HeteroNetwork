@@ -562,6 +562,14 @@ template_fails relay-address-pool-annotation \
   --set agent.relayService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.relayService.annotations.metallb\.universe\.tf/address-pool=public'
 
+template_fails agent-api-private-link-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/azure-pls-create\" must not configure LoadBalancer Private Link or endpoint-service publishing" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/azure-pls-create=true'
+
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \
   --set agent.apiService.enabled=true \

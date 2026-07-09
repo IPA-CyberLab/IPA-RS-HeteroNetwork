@@ -591,6 +591,8 @@
 {{- fail (printf "%s annotation key %q must not publish LoadBalancer DNS names; use relayAdvertisement values and explicit Service exposure controls instead" $path .key) -}}
 {{- else if or (contains "load-balancer-name" $key) (contains "loadbalancer-name" $key) (contains "target-group-name" $key) (contains "targetgroup-name" $key) (contains "resource-tags" $key) (contains "additional-resource-tags" $key) (contains "pip-tags" $key) (contains "address-pool" $key) (contains "addresspool" $key) (contains "ip-pool" $key) (contains "ippool" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead" $path .key) -}}
+{{- else if or (contains "azure-pls" $key) (contains "private-link" $key) (contains "privatelink" $key) (contains "private-service-connect" $key) (contains "endpoint-service" $key) (contains "service-attachment" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relayAdvertisement values instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 

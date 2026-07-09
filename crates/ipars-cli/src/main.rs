@@ -3906,6 +3906,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_private_link(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relay advertisement instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -4031,6 +4037,16 @@ fn kubernetes_service_annotation_controls_resource_selection(key: &str) -> bool 
         || key.contains("addresspool")
         || key.contains("ip-pool")
         || key.contains("ippool")
+}
+
+fn kubernetes_service_annotation_controls_private_link(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("azure-pls")
+        || key.contains("private-link")
+        || key.contains("privatelink")
+        || key.contains("private-service-connect")
+        || key.contains("endpoint-service")
+        || key.contains("service-attachment")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11933,6 +11949,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-name must not configure LoadBalancer resource identity, tags, or address pools"
         ));
 
+        let mut agent_private_link_annotation = base_k8s_install_args();
+        agent_private_link_annotation.expose_agent_api = true;
+        agent_private_link_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-pls-create".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_private_link_annotation) {
+            Ok(_) => panic!("agent API Private Link annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-pls-create must not configure LoadBalancer Private Link or endpoint-service publishing"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12177,6 +12207,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key metallb.universe.tf/address-pool must not configure LoadBalancer resource identity, tags, or address pools"
+        ));
+
+        let mut relay_service_attachment_annotation = base_k8s_install_args();
+        relay_service_attachment_annotation.expose_relay = true;
+        relay_service_attachment_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_service_attachment_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_service_attachment_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "networking.gke.io/service-attachment".to_string(),
+            value: "psc-relay".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_service_attachment_annotation) {
+            Ok(_) => panic!("relay service attachment annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key networking.gke.io/service-attachment must not configure LoadBalancer Private Link or endpoint-service publishing"
         ));
 
         Ok(())
@@ -12968,6 +13016,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relayAdvertisement values instead"
         ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
