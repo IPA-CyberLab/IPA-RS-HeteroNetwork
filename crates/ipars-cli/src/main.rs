@@ -3949,6 +3949,9 @@ fn kubernetes_service_annotation_controls_fixed_addresses(key: &str) -> bool {
         || key.contains("ip-address")
         || key.contains("private-ipv4-address")
         || key.contains("pip-name")
+        || key.contains("pip-prefix")
+        || key.contains("public-ip-prefix")
+        || key.contains("public-ips")
         || key.contains("lb-ipam-ips")
 }
 
@@ -4057,8 +4060,11 @@ fn kubernetes_service_annotation_controls_resource_selection(key: &str) -> bool 
         || key.contains("loadbalancer-name")
         || key.contains("target-group-name")
         || key.contains("targetgroup-name")
+        || key.contains("load-balancer-configuration")
+        || key.contains("load-balancer-mode")
         || key.contains("resource-tags")
         || key.contains("additional-resource-tags")
+        || key.contains("pip-ip-tags")
         || key.contains("pip-tags")
         || key.contains("address-pool")
         || key.contains("addresspool")
@@ -11880,6 +11886,20 @@ fi
             "--agent-api-service-annotation annotation key metallb.io/loadBalancerIPs must not configure LoadBalancer fixed addresses"
         ));
 
+        let mut agent_pip_prefix_annotation = base_k8s_install_args();
+        agent_pip_prefix_annotation.expose_agent_api = true;
+        agent_pip_prefix_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-pip-prefix-id".to_string(),
+            value: "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/edge/providers/Microsoft.Network/publicIPPrefixes/prefix".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_pip_prefix_annotation) {
+            Ok(_) => panic!("agent API public IP prefix annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-pip-prefix-id must not configure LoadBalancer fixed addresses"
+        ));
+
         let mut agent_proxy_protocol_annotation = base_k8s_install_args();
         agent_proxy_protocol_annotation.expose_agent_api = true;
         agent_proxy_protocol_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -12063,6 +12083,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-name must not configure LoadBalancer resource identity, tags, or address pools"
         ));
 
+        let mut agent_load_balancer_mode_annotation = base_k8s_install_args();
+        agent_load_balancer_mode_annotation.expose_agent_api = true;
+        agent_load_balancer_mode_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-load-balancer-mode".to_string(),
+            value: "__auto__".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_load_balancer_mode_annotation) {
+            Ok(_) => panic!("agent API LoadBalancer mode annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-mode must not configure LoadBalancer resource identity, tags, or address pools"
+        ));
+
         let mut agent_private_link_annotation = base_k8s_install_args();
         agent_private_link_annotation.expose_agent_api = true;
         agent_private_link_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -12189,6 +12223,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-eip-allocations must not configure LoadBalancer fixed addresses"
+        ));
+
+        let mut relay_additional_public_ips_annotation = base_k8s_install_args();
+        relay_additional_public_ips_annotation.expose_relay = true;
+        relay_additional_public_ips_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_additional_public_ips_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_additional_public_ips_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-additional-public-ips".to_string(),
+            value: "198.51.100.80".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_additional_public_ips_annotation) {
+            Ok(_) => panic!("relay additional public IPs annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-additional-public-ips must not configure LoadBalancer fixed addresses"
         ));
 
         let mut relay_proxy_protocol_annotation = base_k8s_install_args();
@@ -12384,6 +12436,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key metallb.universe.tf/address-pool must not configure LoadBalancer resource identity, tags, or address pools"
+        ));
+
+        let mut relay_lb_configuration_annotation = base_k8s_install_args();
+        relay_lb_configuration_annotation.expose_relay = true;
+        relay_lb_configuration_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_lb_configuration_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_lb_configuration_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-load-balancer-configurations".to_string(),
+            value: "edge-lb".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_lb_configuration_annotation) {
+            Ok(_) => panic!("relay LoadBalancer configuration annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-configurations must not configure LoadBalancer resource identity, tags, or address pools"
         ));
 
         let mut relay_service_attachment_annotation = base_k8s_install_args();

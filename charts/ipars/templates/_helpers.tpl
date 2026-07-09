@@ -571,7 +571,7 @@
 {{- $path := .path -}}
 {{- if or (contains "source-range" $key) (contains "inbound-cidr" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer source ranges; use loadBalancerSourceRanges values instead" $path .key) -}}
-{{- else if or (contains "load-balancer-ip" $key) (contains "loadbalancerip" $key) (contains "load-balancer-eip" $key) (contains "eip-allocations" $key) (contains "static-ip" $key) (contains "ip-address" $key) (contains "private-ipv4-address" $key) (contains "pip-name" $key) (contains "lb-ipam-ips" $key) -}}
+{{- else if or (contains "load-balancer-ip" $key) (contains "loadbalancerip" $key) (contains "load-balancer-eip" $key) (contains "eip-allocations" $key) (contains "static-ip" $key) (contains "ip-address" $key) (contains "private-ipv4-address" $key) (contains "pip-name" $key) (contains "pip-prefix" $key) (contains "public-ip-prefix" $key) (contains "public-ips" $key) (contains "lb-ipam-ips" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer fixed addresses; use loadBalancerIP or externalIPs values instead" $path .key) -}}
 {{- else if or (contains "proxy-protocol" $key) (contains "proxyprotocol" $key) -}}
 {{- fail (printf "%s annotation key %q must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers" $path .key) -}}
@@ -589,7 +589,7 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead" $path .key) -}}
 {{- else if or (contains "external-dns" $key) (contains "dns-name" $key) (contains "dns-label" $key) (contains "load-balancer-hostname" $key) (contains "loadbalancer-hostname" $key) (contains "domain-name" $key) (contains "domainname" $key) (contains "fqdn" $key) -}}
 {{- fail (printf "%s annotation key %q must not publish LoadBalancer DNS names; use relayAdvertisement values and explicit Service exposure controls instead" $path .key) -}}
-{{- else if or (contains "load-balancer-name" $key) (contains "loadbalancer-name" $key) (contains "target-group-name" $key) (contains "targetgroup-name" $key) (contains "resource-tags" $key) (contains "additional-resource-tags" $key) (contains "pip-tags" $key) (contains "address-pool" $key) (contains "addresspool" $key) (contains "ip-pool" $key) (contains "ippool" $key) -}}
+{{- else if or (contains "load-balancer-name" $key) (contains "loadbalancer-name" $key) (contains "target-group-name" $key) (contains "targetgroup-name" $key) (contains "load-balancer-configuration" $key) (contains "load-balancer-mode" $key) (contains "resource-tags" $key) (contains "additional-resource-tags" $key) (contains "pip-ip-tags" $key) (contains "pip-tags" $key) (contains "address-pool" $key) (contains "addresspool" $key) (contains "ip-pool" $key) (contains "ippool" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer resource identity, tags, or address pools; use typed Service exposure controls and explicit fixed-address values instead" $path .key) -}}
 {{- else if or (contains "azure-pls" $key) (contains "private-link" $key) (contains "privatelink" $key) (contains "private-service-connect" $key) (contains "endpoint-service" $key) (contains "service-attachment" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relayAdvertisement values instead" $path .key) -}}
