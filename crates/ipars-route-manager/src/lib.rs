@@ -1660,11 +1660,21 @@ fn command_timeout_label(timeout: Duration) -> String {
 }
 
 fn command_label(program: &str, args: &[String]) -> String {
+    let program = command_label_component(program);
     if args.is_empty() {
-        program.to_string()
+        program
     } else {
-        format!("{} {}", program, args.join(" "))
+        let args = args
+            .iter()
+            .map(|arg| command_label_component(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{program} {args}")
     }
+}
+
+fn command_label_component(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2206,6 +2216,22 @@ mod tests {
             Ok(()) => {}
             Err(error) => panic!("route command environment should be sanitized: {error}"),
         }
+    }
+
+    #[test]
+    fn route_command_label_escapes_control_characters() {
+        let label = command_label(
+            "ip",
+            &[
+                "route\nreplace".to_string(),
+                "table\t100".to_string(),
+                r"via\peer".to_string(),
+            ],
+        );
+
+        assert_eq!(label, r"ip route\nreplace table\t100 via\\peer");
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\t'));
     }
 
     #[cfg(unix)]

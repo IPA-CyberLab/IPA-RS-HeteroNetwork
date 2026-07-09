@@ -2948,11 +2948,21 @@ fn command_timeout_label(timeout: Duration) -> String {
 }
 
 fn command_label(program: &str, args: &[String]) -> String {
+    let program = command_label_component(program);
     if args.is_empty() {
-        program.to_string()
+        program
     } else {
-        format!("{} {}", program, args.join(" "))
+        let args = args
+            .iter()
+            .map(|arg| command_label_component(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{program} {args}")
     }
+}
+
+fn command_label_component(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -4148,6 +4158,22 @@ mod tests {
             Ok(()) => {}
             Err(error) => panic!("command environment should be sanitized: {error}"),
         }
+    }
+
+    #[test]
+    fn command_label_escapes_control_characters() {
+        let label = command_label(
+            "wg",
+            &[
+                "set\npeer".to_string(),
+                "tab\targ".to_string(),
+                r"slash\arg".to_string(),
+            ],
+        );
+
+        assert_eq!(label, r"wg set\npeer tab\targ slash\\arg");
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\t'));
     }
 
     #[cfg(unix)]
