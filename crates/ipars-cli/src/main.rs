@@ -3858,6 +3858,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_health_checks(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer health checks; use typed Service health-check controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3883,6 +3889,14 @@ fn kubernetes_service_annotation_controls_fixed_addresses(key: &str) -> bool {
 fn kubernetes_service_annotation_controls_proxy_protocol(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.contains("proxy-protocol") || key.contains("proxyprotocol")
+}
+
+fn kubernetes_service_annotation_controls_health_checks(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("healthcheck")
+        || key.contains("health-check")
+        || key.contains("health_probe")
+        || key.contains("health-probe")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11673,6 +11687,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-proxy-protocol must not enable PROXY protocol"
         ));
 
+        let mut agent_health_check_annotation = base_k8s_install_args();
+        agent_health_check_annotation.expose_agent_api = true;
+        agent_health_check_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-healthcheck-port".to_string(),
+            value: "traffic-port".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_health_check_annotation) {
+            Ok(_) => panic!("agent API health-check annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-healthcheck-port must not configure LoadBalancer health checks"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -11775,6 +11803,25 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key haproxy.org/proxy-protocol must not enable PROXY protocol"
+        ));
+
+        let mut relay_health_probe_annotation = base_k8s_install_args();
+        relay_health_probe_annotation.expose_relay = true;
+        relay_health_probe_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_health_probe_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_health_probe_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path"
+                .to_string(),
+            value: "/healthz".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_health_probe_annotation) {
+            Ok(_) => panic!("relay health-probe annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path must not configure LoadBalancer health checks"
         ));
 
         Ok(())
@@ -12591,6 +12638,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer health checks; use typed Service health-check controls instead"
         ));
         assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));

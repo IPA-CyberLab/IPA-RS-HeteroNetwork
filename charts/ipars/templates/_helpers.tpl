@@ -575,6 +575,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer fixed addresses; use loadBalancerIP or externalIPs values instead" $path .key) -}}
 {{- else if or (contains "proxy-protocol" $key) (contains "proxyprotocol" $key) -}}
 {{- fail (printf "%s annotation key %q must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers" $path .key) -}}
+{{- else if or (contains "healthcheck" $key) (contains "health-check" $key) (contains "health_probe" $key) (contains "health-probe" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer health checks; use typed Service health-check controls instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 
