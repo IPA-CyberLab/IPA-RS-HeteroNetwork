@@ -12781,6 +12781,40 @@ pub mod api {
         }
         offset += 2;
 
+        mqtt_subscribe_filters_payload(payload, offset, remaining_end)
+            || mqtt_v5_subscribe_tail_payload(payload, offset, remaining_end)
+    }
+
+    fn mqtt_unsubscribe_packet_payload(payload: &[u8]) -> bool {
+        if payload.len() < 7 || payload[0] != 0xa2 {
+            return false;
+        }
+        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
+            return false;
+        };
+        let Some(remaining_end) = offset.checked_add(remaining_len) else {
+            return false;
+        };
+        if remaining_end != payload.len() || remaining_len < 5 {
+            return false;
+        }
+        let Some(packet_id) = read_u16_be(payload, offset) else {
+            return false;
+        };
+        if packet_id == 0 {
+            return false;
+        }
+        offset += 2;
+
+        mqtt_unsubscribe_filters_payload(payload, offset, remaining_end)
+            || mqtt_v5_unsubscribe_tail_payload(payload, offset, remaining_end)
+    }
+
+    fn mqtt_subscribe_filters_payload(
+        payload: &[u8],
+        mut offset: usize,
+        remaining_end: usize,
+    ) -> bool {
         let mut filter_count = 0_usize;
         while offset < remaining_end {
             let Some((filter, options_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
@@ -12806,27 +12840,11 @@ pub mod api {
         filter_count > 0
     }
 
-    fn mqtt_unsubscribe_packet_payload(payload: &[u8]) -> bool {
-        if payload.len() < 7 || payload[0] != 0xa2 {
-            return false;
-        }
-        let Some((remaining_len, mut offset)) = mqtt_variable_integer(payload, 1) else {
-            return false;
-        };
-        let Some(remaining_end) = offset.checked_add(remaining_len) else {
-            return false;
-        };
-        if remaining_end != payload.len() || remaining_len < 5 {
-            return false;
-        }
-        let Some(packet_id) = read_u16_be(payload, offset) else {
-            return false;
-        };
-        if packet_id == 0 {
-            return false;
-        }
-        offset += 2;
-
+    fn mqtt_unsubscribe_filters_payload(
+        payload: &[u8],
+        mut offset: usize,
+        remaining_end: usize,
+    ) -> bool {
         let mut filter_count = 0_usize;
         while offset < remaining_end {
             let Some((filter, next_offset)) = mqtt_utf8_field(payload, offset, remaining_end)
@@ -12843,6 +12861,38 @@ pub mod api {
             offset = next_offset;
         }
         filter_count > 0
+    }
+
+    fn mqtt_v5_subscribe_tail_payload(payload: &[u8], offset: usize, remaining_end: usize) -> bool {
+        let Some((properties_len, properties_start)) =
+            mqtt_variable_integer_until(payload, offset, remaining_end)
+        else {
+            return false;
+        };
+        let Some(filters_offset) = properties_start.checked_add(properties_len) else {
+            return false;
+        };
+        filters_offset <= remaining_end
+            && mqtt_v5_subscribe_properties(payload, properties_start, filters_offset)
+            && mqtt_subscribe_filters_payload(payload, filters_offset, remaining_end)
+    }
+
+    fn mqtt_v5_unsubscribe_tail_payload(
+        payload: &[u8],
+        offset: usize,
+        remaining_end: usize,
+    ) -> bool {
+        let Some((properties_len, properties_start)) =
+            mqtt_variable_integer_until(payload, offset, remaining_end)
+        else {
+            return false;
+        };
+        let Some(filters_offset) = properties_start.checked_add(properties_len) else {
+            return false;
+        };
+        filters_offset <= remaining_end
+            && mqtt_v5_unsubscribe_properties(payload, properties_start, filters_offset)
+            && mqtt_unsubscribe_filters_payload(payload, filters_offset, remaining_end)
     }
 
     fn mqtt_variable_integer(payload: &[u8], offset: usize) -> Option<(usize, usize)> {
@@ -13007,6 +13057,99 @@ pub mod api {
             }
             _ => None,
         }
+    }
+
+    fn mqtt_v5_subscribe_properties(
+        payload: &[u8],
+        mut offset: usize,
+        properties_end: usize,
+    ) -> bool {
+        let mut property_count = 0_usize;
+        while offset < properties_end {
+            property_count += 1;
+            if property_count > 64 {
+                return false;
+            }
+            let Some((property_id, value_offset)) =
+                mqtt_variable_integer_until(payload, offset, properties_end)
+            else {
+                return false;
+            };
+            offset = value_offset;
+            let Some(next_offset) =
+                mqtt_v5_subscribe_property(payload, offset, properties_end, property_id)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == properties_end
+    }
+
+    fn mqtt_v5_unsubscribe_properties(
+        payload: &[u8],
+        mut offset: usize,
+        properties_end: usize,
+    ) -> bool {
+        let mut property_count = 0_usize;
+        while offset < properties_end {
+            property_count += 1;
+            if property_count > 64 {
+                return false;
+            }
+            let Some((property_id, value_offset)) =
+                mqtt_variable_integer_until(payload, offset, properties_end)
+            else {
+                return false;
+            };
+            offset = value_offset;
+            let Some(next_offset) =
+                mqtt_v5_unsubscribe_property(payload, offset, properties_end, property_id)
+            else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        offset == properties_end
+    }
+
+    fn mqtt_v5_subscribe_property(
+        payload: &[u8],
+        offset: usize,
+        properties_end: usize,
+        property_id: usize,
+    ) -> Option<usize> {
+        match property_id {
+            0x0b => {
+                let (subscription_id, next_offset) =
+                    mqtt_variable_integer_until(payload, offset, properties_end)?;
+                (subscription_id != 0).then_some(next_offset)
+            }
+            0x26 => mqtt_v5_user_property(payload, offset, properties_end),
+            _ => None,
+        }
+    }
+
+    fn mqtt_v5_unsubscribe_property(
+        payload: &[u8],
+        offset: usize,
+        properties_end: usize,
+        property_id: usize,
+    ) -> Option<usize> {
+        match property_id {
+            0x26 => mqtt_v5_user_property(payload, offset, properties_end),
+            _ => None,
+        }
+    }
+
+    fn mqtt_v5_user_property(
+        payload: &[u8],
+        offset: usize,
+        properties_end: usize,
+    ) -> Option<usize> {
+        let (_key, value_offset) = mqtt_utf8_field(payload, offset, properties_end)?;
+        let (_value, next_offset) = mqtt_utf8_field(payload, value_offset, properties_end)?;
+        Some(next_offset)
     }
 
     fn mqtt_connect_payload(
@@ -16654,8 +16797,43 @@ mod tests {
             packet
         }
 
+        fn mqtt_subscribe_v5_packet(
+            packet_id: u16,
+            properties: &[u8],
+            filters: &[(&[u8], u8)],
+        ) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&mqtt_remaining_length(properties.len()));
+            body.extend_from_slice(properties);
+            for (filter, options) in filters {
+                body.extend_from_slice(&mqtt_field(filter));
+                body.push(*options);
+            }
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&mqtt_remaining_length(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+
         fn mqtt_unsubscribe_packet(packet_id: u16, filters: &[&[u8]]) -> Vec<u8> {
             let mut body = packet_id.to_be_bytes().to_vec();
+            for filter in filters {
+                body.extend_from_slice(&mqtt_field(filter));
+            }
+            let mut packet = vec![0xa2];
+            packet.extend_from_slice(&mqtt_remaining_length(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+
+        fn mqtt_unsubscribe_v5_packet(
+            packet_id: u16,
+            properties: &[u8],
+            filters: &[&[u8]],
+        ) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&mqtt_remaining_length(properties.len()));
+            body.extend_from_slice(properties);
             for filter in filters {
                 body.extend_from_slice(&mqtt_field(filter));
             }
@@ -21237,10 +21415,52 @@ mod tests {
             .application(),
             api::AgentPacketFlowApplication::Mqtt
         );
+        let mut mqtt_v5_subscribe_properties = vec![0x0b, 0x2a, 0x26];
+        mqtt_v5_subscribe_properties.extend_from_slice(&mqtt_field(b"source"));
+        mqtt_v5_subscribe_properties.extend_from_slice(&mqtt_field(b"agent"));
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_v5_packet(
+                14,
+                &[],
+                &[(b"sensors/+/humidity".as_slice(), 2)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_v5_packet(
+                15,
+                &mqtt_v5_subscribe_properties,
+                &[(b"$share/workers/sensors/#".as_slice(), 0)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
         assert_eq!(
             observation_for_payload(&mqtt_unsubscribe_packet(
                 13,
                 &[b"sensors/+/temp".as_slice(), b"$SYS/broker/#".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        let mut mqtt_v5_unsubscribe_properties = vec![0x26];
+        mqtt_v5_unsubscribe_properties.extend_from_slice(&mqtt_field(b"source"));
+        mqtt_v5_unsubscribe_properties.extend_from_slice(&mqtt_field(b"agent"));
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_v5_packet(
+                16,
+                &[],
+                &[b"sensors/+/humidity".as_slice()]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Mqtt
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_v5_packet(
+                17,
+                &mqtt_v5_unsubscribe_properties,
+                &[b"$share/workers/sensors/#".as_slice()]
             ))
             .application(),
             api::AgentPacketFlowApplication::Mqtt
@@ -21341,6 +21561,24 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
+            observation_for_payload(&mqtt_subscribe_v5_packet(
+                12,
+                &[0x01],
+                &[(b"sensors/+/temp".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_subscribe_v5_packet(
+                12,
+                &[0x0b, 0x00],
+                &[(b"sensors/+/temp".as_slice(), 1)]
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
             observation_for_payload(&mqtt_unsubscribe_packet(0, &[b"sensors/+/temp".as_slice()]))
                 .application(),
             api::AgentPacketFlowApplication::Unknown
@@ -21348,6 +21586,15 @@ mod tests {
         assert_eq!(
             observation_for_payload(&mqtt_unsubscribe_packet(13, &[b"sensors/temp#".as_slice()]))
                 .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&mqtt_unsubscribe_v5_packet(
+                13,
+                &[0x0b, 0x01],
+                &[b"sensors/+/temp".as_slice()]
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let mut mqtt_unsubscribe_wrong_flags =
