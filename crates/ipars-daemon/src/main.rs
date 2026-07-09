@@ -140,6 +140,7 @@ const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
+const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_RUNTIME_COMMAND_LOCALE: &str = "C";
@@ -6453,7 +6454,27 @@ fn resolve_userspace_wireguard_spawn_command(
             runtime_command_path_to_string(&inner_program, "userspace WireGuard netns command")?;
     }
 
+    validate_userspace_wireguard_spawn_command(&resolved)?;
     Ok(resolved)
+}
+
+fn validate_userspace_wireguard_spawn_command(command: &LinuxCommand) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        command.args.len() <= MAX_USERSPACE_WIREGUARD_SPAWN_ARGS,
+        "userspace WireGuard spawn command has too many arguments: {} > {MAX_USERSPACE_WIREGUARD_SPAWN_ARGS}",
+        command.args.len()
+    );
+    for (index, argument) in command.args.iter().enumerate() {
+        anyhow::ensure!(
+            argument.len() <= MAX_USERSPACE_WIREGUARD_ARG_BYTES,
+            "userspace WireGuard spawn command argument {index} exceeds {MAX_USERSPACE_WIREGUARD_ARG_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            !argument.as_bytes().contains(&0),
+            "userspace WireGuard spawn command argument {index} must not contain NUL bytes"
+        );
+    }
+    Ok(())
 }
 
 fn runtime_command_path_to_string(path: &Path, label: &str) -> anyhow::Result<String> {
@@ -18481,6 +18502,39 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(label, r"wireguard-go iface\nname arg\tvalue path\\part");
         assert!(!label.contains('\n'));
         assert!(!label.contains('\t'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn userspace_wireguard_spawn_command_revalidates_final_argv() -> anyhow::Result<()> {
+        let temp_dir = unique_trusted_test_dir("userspace-wg-spawn-argv")?;
+        let command_path = temp_dir.join("userspace-wg-spawn-argv");
+        write_trusted_test_executable(&command_path, "#!/bin/sh\nexit 0\n")?;
+
+        let nul_error = match resolve_userspace_wireguard_spawn_command(&LinuxCommand::new(
+            command_path.display().to_string(),
+            ["ok".to_string(), "bad\0arg".to_string()],
+        )) {
+            Ok(_) => anyhow::bail!("unexpected valid NUL-containing userspace argv"),
+            Err(error) => error,
+        };
+        assert!(nul_error
+            .to_string()
+            .contains("argument 1 must not contain NUL bytes"));
+
+        let too_many_error = match resolve_userspace_wireguard_spawn_command(&LinuxCommand::new(
+            command_path.display().to_string(),
+            std::iter::repeat_n("arg".to_string(), MAX_USERSPACE_WIREGUARD_SPAWN_ARGS + 1),
+        )) {
+            Ok(_) => anyhow::bail!("unexpected valid oversized userspace argv"),
+            Err(error) => error,
+        };
+        assert!(too_many_error
+            .to_string()
+            .contains("userspace WireGuard spawn command has too many arguments"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[test]
