@@ -13929,7 +13929,7 @@ pub mod api {
             0x02 => body_len == 0,
             0x03 => cassandra_string_body(body_len, body_prefix),
             0x06 => cassandra_supported_body(body_len, body_prefix),
-            0x08 => cassandra_result_body(body_len, body_prefix),
+            0x08 => cassandra_result_body(version, body_len, body_prefix),
             0x0c => cassandra_event_body(version, body_len, body_prefix),
             0x0e | 0x10 => cassandra_auth_bytes_body(body_len, body_prefix),
             _ => false,
@@ -14267,7 +14267,7 @@ pub mod api {
             .is_some_and(|(_table, next_offset)| next_offset == body_len)
     }
 
-    fn cassandra_result_body(body_len: usize, body_prefix: &[u8]) -> bool {
+    fn cassandra_result_body(version: u8, body_len: usize, body_prefix: &[u8]) -> bool {
         if body_len < 4 || body_prefix.len() < 4 {
             return false;
         }
@@ -14276,17 +14276,17 @@ pub mod api {
         };
         match kind {
             0x0001 => body_len == 4,
-            0x0002 => cassandra_rows_result_body(body_len, body_prefix),
+            0x0002 => cassandra_rows_result_body(version, body_len, body_prefix),
             0x0003 => cassandra_set_keyspace_result_body(body_len, body_prefix),
-            0x0004 => cassandra_prepared_result_body(body_len, body_prefix),
+            0x0004 => cassandra_prepared_result_body(version, body_len, body_prefix),
             0x0005 => cassandra_schema_change_result_body(body_len, body_prefix),
             _ => false,
         }
     }
 
-    fn cassandra_rows_result_body(body_len: usize, body_prefix: &[u8]) -> bool {
+    fn cassandra_rows_result_body(version: u8, body_len: usize, body_prefix: &[u8]) -> bool {
         let Some((metadata_offset, columns_count)) =
-            cassandra_result_metadata(body_prefix, 4, body_len)
+            cassandra_result_metadata(version, body_prefix, 4, body_len)
         else {
             return false;
         };
@@ -14330,19 +14330,25 @@ pub mod api {
         cassandra_string_field(body, 4).is_some_and(|(_keyspace, offset)| offset == body_len)
     }
 
-    fn cassandra_prepared_result_body(body_len: usize, body_prefix: &[u8]) -> bool {
+    fn cassandra_prepared_result_body(version: u8, body_len: usize, body_prefix: &[u8]) -> bool {
         let Some(body) = body_prefix.get(..body_len) else {
             return false;
         };
-        let Some(offset) = cassandra_short_bytes_field(body, 4, body_len) else {
+        let Some(mut offset) = cassandra_short_bytes_field(body, 4, body_len) else {
             return false;
         };
-        let Some((offset, _parameters_count)) = cassandra_result_metadata(body, offset, body_len)
+        if version == 5 {
+            let Some(next_offset) = cassandra_short_bytes_field(body, offset, body_len) else {
+                return false;
+            };
+            offset = next_offset;
+        }
+        let Some((offset, _parameters_count)) = cassandra_prepared_metadata(body, offset, body_len)
         else {
             return false;
         };
         let Some((offset, _result_columns_count)) =
-            cassandra_result_metadata(body, offset, body_len)
+            cassandra_result_metadata(version, body, offset, body_len)
         else {
             return false;
         };
@@ -14356,22 +14362,86 @@ pub mod api {
         cassandra_schema_change_details(body, 4, body_len)
     }
 
-    fn cassandra_result_metadata(
+    fn cassandra_prepared_metadata(
         body_prefix: &[u8],
         offset: usize,
         body_len: usize,
     ) -> Option<(usize, usize)> {
+        let header_end = offset.checked_add(12)?;
+        if header_end > body_len {
+            return None;
+        }
         let flags = read_u32_be(body_prefix, offset)?;
         let columns_count = read_u32_be(body_prefix, offset.checked_add(4)?)? as usize;
-        if flags & !0x0007 != 0 || columns_count > 4096 {
+        let pk_count = read_u32_be(body_prefix, offset.checked_add(8)?)? as usize;
+        if flags & !0x0001 != 0 || columns_count > 4096 || pk_count > columns_count {
+            return None;
+        }
+
+        let mut offset = header_end;
+        let mut seen_pk_indices = vec![false; columns_count];
+        for _ in 0..pk_count {
+            let pk_index = read_u16_be(body_prefix, offset)? as usize;
+            if pk_index >= columns_count || seen_pk_indices[pk_index] {
+                return None;
+            }
+            seen_pk_indices[pk_index] = true;
+            offset = offset.checked_add(2)?;
+        }
+
+        let global_spec = if flags & 0x0001 != 0 {
+            let (_keyspace, next_offset) = cassandra_string_field(body_prefix, offset)?;
+            let (_table, next_offset) = cassandra_string_field(body_prefix, next_offset)?;
+            offset = next_offset;
+            true
+        } else {
+            false
+        };
+        for _ in 0..columns_count {
+            if !global_spec {
+                let (_keyspace, next_offset) = cassandra_string_field(body_prefix, offset)?;
+                let (_table, next_offset) = cassandra_string_field(body_prefix, next_offset)?;
+                offset = next_offset;
+            }
+            let (_name, next_offset) = cassandra_string_field(body_prefix, offset)?;
+            offset = cassandra_type_option(body_prefix, next_offset, body_len)?;
+        }
+        Some((offset, columns_count))
+    }
+
+    fn cassandra_result_metadata(
+        version: u8,
+        body_prefix: &[u8],
+        offset: usize,
+        body_len: usize,
+    ) -> Option<(usize, usize)> {
+        let header_end = offset.checked_add(8)?;
+        if header_end > body_len {
+            return None;
+        }
+        let flags = read_u32_be(body_prefix, offset)?;
+        let columns_count = read_u32_be(body_prefix, offset.checked_add(4)?)? as usize;
+        let supported_flags = match version {
+            3 | 4 => 0x0007,
+            5 => 0x000f,
+            _ => return None,
+        };
+        if flags & !supported_flags != 0 || columns_count > 4096 {
             return None;
         }
         let global_tables_spec = flags & 0x0001 != 0;
         let has_more_pages = flags & 0x0002 != 0;
         let no_metadata = flags & 0x0004 != 0;
-        let mut offset = offset.checked_add(8)?;
+        let metadata_changed = flags & 0x0008 != 0;
+        if metadata_changed && no_metadata {
+            return None;
+        }
+        let mut offset = header_end;
         if has_more_pages {
             offset = cassandra_bytes_field(body_prefix, offset, body_len, false)?;
+        }
+        if metadata_changed {
+            offset = cassandra_short_bytes_field(body_prefix, offset, body_len)?;
         }
         if no_metadata {
             return Some((offset, columns_count));
@@ -18328,6 +18398,69 @@ mod tests {
         fn cassandra_string(value: &[u8]) -> Vec<u8> {
             let mut encoded = (value.len() as u16).to_be_bytes().to_vec();
             encoded.extend_from_slice(value);
+            encoded
+        }
+
+        fn cassandra_short_bytes(value: &[u8]) -> Vec<u8> {
+            let mut encoded = (value.len() as u16).to_be_bytes().to_vec();
+            encoded.extend_from_slice(value);
+            encoded
+        }
+
+        fn cassandra_prepared_metadata_body(
+            flags: u32,
+            pk_indices: &[u16],
+            global_table: Option<(&[u8], &[u8])>,
+            columns: &[(&[u8], &[u8], &[u8], u16)],
+        ) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&flags.to_be_bytes());
+            encoded.extend_from_slice(&(columns.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(&(pk_indices.len() as u32).to_be_bytes());
+            for pk_index in pk_indices {
+                encoded.extend_from_slice(&pk_index.to_be_bytes());
+            }
+            if let Some((keyspace, table)) = global_table {
+                encoded.extend_from_slice(&cassandra_string(keyspace));
+                encoded.extend_from_slice(&cassandra_string(table));
+            }
+            for (keyspace, table, name, type_id) in columns {
+                if global_table.is_none() {
+                    encoded.extend_from_slice(&cassandra_string(keyspace));
+                    encoded.extend_from_slice(&cassandra_string(table));
+                }
+                encoded.extend_from_slice(&cassandra_string(name));
+                encoded.extend_from_slice(&type_id.to_be_bytes());
+            }
+            encoded
+        }
+
+        fn cassandra_result_metadata_body(
+            flags: u32,
+            metadata_id: Option<&[u8]>,
+            global_table: Option<(&[u8], &[u8])>,
+            columns: &[(&[u8], &[u8], &[u8], u16)],
+        ) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&flags.to_be_bytes());
+            encoded.extend_from_slice(&(columns.len() as u32).to_be_bytes());
+            if flags & 0x0008 != 0 {
+                encoded.extend_from_slice(&cassandra_short_bytes(metadata_id.unwrap_or(b"mid")));
+            }
+            if flags & 0x0004 == 0 {
+                if let Some((keyspace, table)) = global_table {
+                    encoded.extend_from_slice(&cassandra_string(keyspace));
+                    encoded.extend_from_slice(&cassandra_string(table));
+                }
+                for (keyspace, table, name, type_id) in columns {
+                    if global_table.is_none() {
+                        encoded.extend_from_slice(&cassandra_string(keyspace));
+                        encoded.extend_from_slice(&cassandra_string(table));
+                    }
+                    encoded.extend_from_slice(&cassandra_string(name));
+                    encoded.extend_from_slice(&type_id.to_be_bytes());
+                }
+            }
             encoded
         }
 
@@ -23789,16 +23922,66 @@ mod tests {
             .application(),
             api::AgentPacketFlowApplication::Cassandra
         );
+        let mut cassandra_rows_v5_metadata_changed = 2_u32.to_be_bytes().to_vec();
+        cassandra_rows_v5_metadata_changed.extend_from_slice(&cassandra_result_metadata_body(
+            0x0009,
+            Some(b"mid"),
+            Some((b"ks", b"tbl")),
+            &[(b"ks", b"tbl", b"id", 0x0009)],
+        ));
+        cassandra_rows_v5_metadata_changed.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x85,
+                0,
+                0x08,
+                &cassandra_rows_v5_metadata_changed
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
         let mut cassandra_prepared_result = 4_u32.to_be_bytes().to_vec();
-        cassandra_prepared_result.extend_from_slice(&3_u16.to_be_bytes());
-        cassandra_prepared_result.extend_from_slice(b"pid");
-        cassandra_prepared_result.extend_from_slice(&4_u32.to_be_bytes());
-        cassandra_prepared_result.extend_from_slice(&0_u32.to_be_bytes());
-        cassandra_prepared_result.extend_from_slice(&4_u32.to_be_bytes());
-        cassandra_prepared_result.extend_from_slice(&0_u32.to_be_bytes());
+        cassandra_prepared_result.extend_from_slice(&cassandra_short_bytes(b"pid"));
+        cassandra_prepared_result.extend_from_slice(&cassandra_prepared_metadata_body(
+            0x0001,
+            &[0],
+            Some((b"ks", b"tbl")),
+            &[(b"ks", b"tbl", b"id", 0x0009)],
+        ));
+        cassandra_prepared_result.extend_from_slice(&cassandra_result_metadata_body(
+            0x0004,
+            None,
+            None,
+            &[],
+        ));
         assert_eq!(
             observation_for_payload(&cassandra_response_frame(0x08, &cassandra_prepared_result))
                 .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_prepared_result_v5 = 4_u32.to_be_bytes().to_vec();
+        cassandra_prepared_result_v5.extend_from_slice(&cassandra_short_bytes(b"pid"));
+        cassandra_prepared_result_v5.extend_from_slice(&cassandra_short_bytes(b"rid"));
+        cassandra_prepared_result_v5.extend_from_slice(&cassandra_prepared_metadata_body(
+            0x0001,
+            &[0],
+            Some((b"ks", b"tbl")),
+            &[(b"ks", b"tbl", b"id", 0x0009)],
+        ));
+        cassandra_prepared_result_v5.extend_from_slice(&cassandra_result_metadata_body(
+            0x0004,
+            None,
+            None,
+            &[],
+        ));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x85,
+                0,
+                0x08,
+                &cassandra_prepared_result_v5
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Cassandra
         );
         let mut cassandra_schema_change_result = 5_u32.to_be_bytes().to_vec();
@@ -24011,6 +24194,81 @@ mod tests {
         assert_eq!(
             observation_for_payload(&cassandra_response_frame(0x08, &0x9999_u32.to_be_bytes()))
                 .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_rows_v4_metadata_changed = 2_u32.to_be_bytes().to_vec();
+        cassandra_rows_v4_metadata_changed.extend_from_slice(&cassandra_result_metadata_body(
+            0x0008,
+            Some(b"mid"),
+            Some((b"ks", b"tbl")),
+            &[(b"ks", b"tbl", b"id", 0x0009)],
+        ));
+        cassandra_rows_v4_metadata_changed.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x08,
+                &cassandra_rows_v4_metadata_changed
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_prepared_legacy_metadata_shape = 4_u32.to_be_bytes().to_vec();
+        cassandra_prepared_legacy_metadata_shape.extend_from_slice(&cassandra_short_bytes(b"pid"));
+        cassandra_prepared_legacy_metadata_shape.extend_from_slice(&4_u32.to_be_bytes());
+        cassandra_prepared_legacy_metadata_shape.extend_from_slice(&0_u32.to_be_bytes());
+        cassandra_prepared_legacy_metadata_shape.extend_from_slice(&4_u32.to_be_bytes());
+        cassandra_prepared_legacy_metadata_shape.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x08,
+                &cassandra_prepared_legacy_metadata_shape
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_v5_prepared_missing_result_metadata_id = 4_u32.to_be_bytes().to_vec();
+        cassandra_v5_prepared_missing_result_metadata_id
+            .extend_from_slice(&cassandra_short_bytes(b"pid"));
+        cassandra_v5_prepared_missing_result_metadata_id.extend_from_slice(
+            &cassandra_prepared_metadata_body(
+                0x0001,
+                &[0],
+                Some((b"ks", b"tbl")),
+                &[(b"ks", b"tbl", b"id", 0x0009)],
+            ),
+        );
+        cassandra_v5_prepared_missing_result_metadata_id
+            .extend_from_slice(&cassandra_result_metadata_body(0x0004, None, None, &[]));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x85,
+                0,
+                0x08,
+                &cassandra_v5_prepared_missing_result_metadata_id
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_prepared_bad_pk_index = 4_u32.to_be_bytes().to_vec();
+        cassandra_prepared_bad_pk_index.extend_from_slice(&cassandra_short_bytes(b"pid"));
+        cassandra_prepared_bad_pk_index.extend_from_slice(&cassandra_prepared_metadata_body(
+            0x0001,
+            &[1],
+            Some((b"ks", b"tbl")),
+            &[(b"ks", b"tbl", b"id", 0x0009)],
+        ));
+        cassandra_prepared_bad_pk_index.extend_from_slice(&cassandra_result_metadata_body(
+            0x0004,
+            None,
+            None,
+            &[],
+        ));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x08,
+                &cassandra_prepared_bad_pk_index
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
