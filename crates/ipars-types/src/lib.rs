@@ -12559,7 +12559,13 @@ pub mod api {
             return false;
         };
         let json = trim_ascii_space(rest);
-        json.len() >= 2 && json.first() == Some(&b'{') && json.last() == Some(&b'}')
+        if json.len() < 2 || json.first() != Some(&b'{') || json.last() != Some(&b'}') {
+            return false;
+        }
+        matches!(
+            serde_json::from_slice::<serde_json::Value>(json),
+            Ok(serde_json::Value::Object(_))
+        )
     }
 
     fn nats_subject(field: &[u8]) -> bool {
@@ -21707,6 +21713,14 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(b"CONNECT not-json\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"CONNECT {bad-json}\r\n").application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(b"INFO []\r\n").application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
