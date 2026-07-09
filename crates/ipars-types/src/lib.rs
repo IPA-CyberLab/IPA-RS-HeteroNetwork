@@ -13919,7 +13919,7 @@ pub mod api {
             0x00 => cassandra_error_body(body_len, body_prefix),
             0x02 => body_len == 0,
             0x03 => cassandra_string_body(body_len, body_prefix),
-            0x06 => body_len >= 2 && body_prefix.len() >= 2,
+            0x06 => cassandra_supported_body(body_len, body_prefix),
             0x08 => cassandra_result_body(body_len, body_prefix),
             0x0c => cassandra_string_prefix_body(body_len, body_prefix),
             0x0e | 0x10 => cassandra_auth_bytes_body(body_len, body_prefix),
@@ -13933,6 +13933,62 @@ pub mod api {
         }
         cassandra_bytes_field(body_prefix, 0, body_len, false)
             .is_some_and(|offset| offset == body_len)
+    }
+
+    fn cassandra_supported_body(body_len: usize, body_prefix: &[u8]) -> bool {
+        if body_len < 2 || body_prefix.len() < body_len {
+            return false;
+        }
+        let Some(count) = read_u16_be(body_prefix, 0).map(|count| count as usize) else {
+            return false;
+        };
+        if count == 0 || count > 64 {
+            return false;
+        }
+
+        let mut offset = 2_usize;
+        let mut has_startup_option = false;
+        let mut has_cql_version = false;
+        let mut has_compression = false;
+        let mut has_protocol_versions = false;
+        for _ in 0..count {
+            let Some((key, next_offset)) = cassandra_string_field(body_prefix, offset) else {
+                return false;
+            };
+            if next_offset > body_len {
+                return false;
+            }
+            let key_is_cql_version = key.eq_ignore_ascii_case(b"CQL_VERSION");
+            let key_is_compression = key.eq_ignore_ascii_case(b"COMPRESSION");
+            let key_is_protocol_versions = key.eq_ignore_ascii_case(b"PROTOCOL_VERSIONS");
+            if (key_is_cql_version && has_cql_version)
+                || (key_is_compression && has_compression)
+                || (key_is_protocol_versions && has_protocol_versions)
+            {
+                return false;
+            }
+            let min_values = if key_is_compression { 0 } else { 1 };
+            let Some(next_offset) = cassandra_string_list_field_with_min(
+                body_prefix,
+                next_offset,
+                body_len,
+                min_values,
+            ) else {
+                return false;
+            };
+            if key_is_cql_version {
+                has_cql_version = true;
+                has_startup_option = true;
+            } else if key_is_compression {
+                has_compression = true;
+                has_startup_option = true;
+            } else if key_is_protocol_versions {
+                has_protocol_versions = true;
+                has_startup_option = true;
+            }
+            offset = next_offset;
+        }
+        offset == body_len && has_startup_option
     }
 
     fn cassandra_error_body(body_len: usize, body_prefix: &[u8]) -> bool {
@@ -14872,8 +14928,17 @@ pub mod api {
         offset: usize,
         body_len: usize,
     ) -> Option<usize> {
+        cassandra_string_list_field_with_min(payload, offset, body_len, 1)
+    }
+
+    fn cassandra_string_list_field_with_min(
+        payload: &[u8],
+        offset: usize,
+        body_len: usize,
+        min_count: usize,
+    ) -> Option<usize> {
         let count = read_u16_be(payload, offset)? as usize;
-        if count == 0 || count > 64 {
+        if count < min_count || count > 64 {
             return None;
         }
         let mut offset = offset.checked_add(2)?;
@@ -23326,6 +23391,29 @@ mod tests {
             observation_for_payload(&[0x84, 0, 0, 0, 0x02, 0, 0, 0, 0]).application(),
             api::AgentPacketFlowApplication::Cassandra
         );
+        let mut cassandra_supported = 2_u16.to_be_bytes().to_vec();
+        cassandra_supported.extend_from_slice(&cassandra_string(b"CQL_VERSION"));
+        cassandra_supported.extend_from_slice(&cassandra_string_list(&[b"3.0.0"]));
+        cassandra_supported.extend_from_slice(&cassandra_string(b"COMPRESSION"));
+        cassandra_supported.extend_from_slice(&cassandra_string_list(&[]));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(0x06, &cassandra_supported))
+                .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
+        let mut cassandra_supported_v5 = 1_u16.to_be_bytes().to_vec();
+        cassandra_supported_v5.extend_from_slice(&cassandra_string(b"PROTOCOL_VERSIONS"));
+        cassandra_supported_v5.extend_from_slice(&cassandra_string_list(&[b"5/v5-beta"]));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame_with_flags(
+                0x85,
+                0,
+                0x06,
+                &cassandra_supported_v5
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Cassandra
+        );
         let mut cassandra_error = 0_u32.to_be_bytes().to_vec();
         cassandra_error.extend_from_slice(&cassandra_string(b"server unavailable"));
         assert_eq!(
@@ -23448,6 +23536,46 @@ mod tests {
         );
         assert_eq!(
             observation_for_payload(&[0x04, 0, 0, 0, 0x07, 0, 0, 0, 0]).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(0x06, &1_u16.to_be_bytes()))
+                .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_supported_unknown_only = 1_u16.to_be_bytes().to_vec();
+        cassandra_supported_unknown_only.extend_from_slice(&cassandra_string(b"UNKNOWN_OPTION"));
+        cassandra_supported_unknown_only.extend_from_slice(&cassandra_string_list(&[b"value"]));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x06,
+                &cassandra_supported_unknown_only
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_supported_empty_cql_version = 1_u16.to_be_bytes().to_vec();
+        cassandra_supported_empty_cql_version.extend_from_slice(&cassandra_string(b"CQL_VERSION"));
+        cassandra_supported_empty_cql_version.extend_from_slice(&cassandra_string_list(&[]));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x06,
+                &cassandra_supported_empty_cql_version
+            ))
+            .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut cassandra_supported_duplicate = 2_u16.to_be_bytes().to_vec();
+        cassandra_supported_duplicate.extend_from_slice(&cassandra_string(b"CQL_VERSION"));
+        cassandra_supported_duplicate.extend_from_slice(&cassandra_string_list(&[b"3.0.0"]));
+        cassandra_supported_duplicate.extend_from_slice(&cassandra_string(b"CQL_VERSION"));
+        cassandra_supported_duplicate.extend_from_slice(&cassandra_string_list(&[b"3.0.0"]));
+        assert_eq!(
+            observation_for_payload(&cassandra_response_frame(
+                0x06,
+                &cassandra_supported_duplicate
+            ))
+            .application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
