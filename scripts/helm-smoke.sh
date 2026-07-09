@@ -505,6 +505,14 @@ template_fails agent-api-tls-listener-annotation \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-ssl-cert=arn:aws:acm:us-east-1:123456789012:certificate/abcdef'
 
+template_fails agent-api-ha-ports-annotation \
+  "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/azure-load-balancer-enable-high-availability-ports\" must not configure LoadBalancer TLS, listeners, or backend protocols" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/azure-load-balancer-enable-high-availability-ports=true'
+
 template_fails relay-load-balancer-type-annotation \
   "agent.relayService.annotations annotation key \"cloud.google.com/load-balancer-type\" must not configure LoadBalancer scope or implementation type" \
   --set agent.relayAdvertisement.enabled=true \
@@ -523,6 +531,14 @@ template_fails agent-api-global-access-annotation \
   --set agent.apiService.exposureAcknowledged=true \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.networking\.gke\.io/load-balancer-allow-global-access=true'
+
+template_fails agent-api-l4-rbs-annotation \
+  "agent.apiService.annotations annotation key \"cloud.google.com/l4-rbs\" must not configure LoadBalancer scope or implementation type" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=LoadBalancer \
+  --set agent.apiService.exposureAcknowledged=true \
+  --set agent.apiService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.apiService.annotations.cloud\.google\.com/l4-rbs=enabled'
 
 template_fails agent-api-security-group-annotation \
   "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/aws-load-balancer-security-groups\" must not configure LoadBalancer firewall or security groups" \
@@ -604,6 +620,17 @@ template_fails agent-api-source-nat-annotation \
   --set agent.apiService.exposureAcknowledged=true \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
   --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/azure-disable-load-balancer-snat=true'
+
+template_fails relay-traffic-distribution-annotation \
+  "agent.relayService.annotations annotation key \"networking.gke.io/weighted-load-balancing\" must not configure LoadBalancer traffic distribution" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=LoadBalancer \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.allowUnrestrictedLoadBalancer=true \
+  --set-string 'agent.relayService.annotations.networking\.gke\.io/weighted-load-balancing=pods-per-node'
 
 template_fails agent-api-external-ip-reuses-load-balancer-ip \
   "agent.apiService.externalIPs entry \"198.51.100.20\" must not reuse fixed external IP assigned by agent.apiService.loadBalancerIP" \

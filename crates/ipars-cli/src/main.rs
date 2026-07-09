@@ -3924,6 +3924,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_traffic_distribution(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer traffic distribution; use internal/externalTrafficPolicy and trafficDistribution controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -3970,8 +3976,13 @@ fn kubernetes_service_annotation_controls_listener_protocol(key: &str) -> bool {
         || key.contains("certificate")
         || key.contains("backend-protocol")
         || key.contains("backend-protocol-version")
+        || key.contains("app-protocol")
+        || key.contains("app_protocol")
         || key.contains("listener")
         || key.contains("alpn-policy")
+        || key.contains("high-availability-ports")
+        || key.contains("ha-ports")
+        || key.contains("enable-icmp")
 }
 
 fn kubernetes_service_annotation_controls_load_balancer_scope(key: &str) -> bool {
@@ -3988,6 +3999,7 @@ fn kubernetes_service_annotation_controls_load_balancer_scope(key: &str) -> bool
         || key.contains("load-balancer-class")
         || key.contains("loadbalancerclass")
         || key.contains("nlb-target-type")
+        || key.contains("l4-rbs")
         || key.contains("global-access")
         || key.contains("allow-global-access")
 }
@@ -4080,6 +4092,18 @@ fn kubernetes_service_annotation_controls_source_nat(key: &str) -> bool {
         || key.contains("disable-load-balancer-snat")
         || key.contains("disable-snat")
         || key.contains("outbound-snat")
+}
+
+fn kubernetes_service_annotation_controls_traffic_distribution(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("traffic-distribution")
+        || key.contains("traffic_distribution")
+        || key.contains("weighted-load-balancing")
+        || key.contains("load-balancing-policy")
+        || key.contains("loadbalancing-policy")
+        || key.contains("load-balancing-algorithm")
+        || key.contains("traffic-policy")
+        || key.contains("traffic_policy")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -11898,6 +11922,21 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-ssl-cert must not configure LoadBalancer TLS, listeners, or backend protocols"
         ));
 
+        let mut agent_ha_ports_annotation = base_k8s_install_args();
+        agent_ha_ports_annotation.expose_agent_api = true;
+        agent_ha_ports_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-load-balancer-enable-high-availability-ports"
+                .to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_ha_ports_annotation) {
+            Ok(_) => panic!("agent API high-availability ports annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-load-balancer-enable-high-availability-ports must not configure LoadBalancer TLS, listeners, or backend protocols"
+        ));
+
         let mut agent_lb_scope_annotation = base_k8s_install_args();
         agent_lb_scope_annotation.expose_agent_api = true;
         agent_lb_scope_annotation.agent_api_service_annotations = vec![KeyValueArg {
@@ -11924,6 +11963,20 @@ fi
         };
         assert!(error.contains(
             "--agent-api-service-annotation annotation key networking.gke.io/load-balancer-allow-global-access must not configure LoadBalancer scope or implementation type"
+        ));
+
+        let mut agent_l4_rbs_annotation = base_k8s_install_args();
+        agent_l4_rbs_annotation.expose_agent_api = true;
+        agent_l4_rbs_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "cloud.google.com/l4-rbs".to_string(),
+            value: "enabled".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_l4_rbs_annotation) {
+            Ok(_) => panic!("agent API L4 RBS annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key cloud.google.com/l4-rbs must not configure LoadBalancer scope or implementation type"
         ));
 
         let mut agent_security_group_annotation = base_k8s_install_args();
@@ -12385,6 +12438,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat must not configure LoadBalancer source NAT behavior"
+        ));
+
+        let mut relay_traffic_distribution_annotation = base_k8s_install_args();
+        relay_traffic_distribution_annotation.expose_relay = true;
+        relay_traffic_distribution_annotation.relay_public_endpoint =
+            Some("203.0.113.10:51820".to_string());
+        relay_traffic_distribution_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_traffic_distribution_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "networking.gke.io/weighted-load-balancing".to_string(),
+            value: "pods-per-node".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_traffic_distribution_annotation) {
+            Ok(_) => panic!("relay traffic-distribution annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key networking.gke.io/weighted-load-balancing must not configure LoadBalancer traffic distribution"
         ));
 
         Ok(())
@@ -13185,6 +13256,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer source NAT behavior; use internal/externalTrafficPolicy, source ranges, and NetworkPolicy values instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer traffic distribution; use internal/externalTrafficPolicy and trafficDistribution values instead"
         ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));
