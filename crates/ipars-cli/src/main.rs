@@ -3918,6 +3918,12 @@ fn validate_kubernetes_service_annotation_args(
                 annotation.key
             );
         }
+        if kubernetes_service_annotation_controls_source_nat(&annotation.key) {
+            anyhow::bail!(
+                "{flag} annotation key {} must not configure LoadBalancer source NAT behavior; use internal/externalTrafficPolicy, source ranges, and NetworkPolicy controls instead",
+                annotation.key
+            );
+        }
     }
     Ok(())
 }
@@ -4066,6 +4072,14 @@ fn kubernetes_service_annotation_controls_backend_target_selection(key: &str) ->
         || key.contains("backend-node-selector")
         || key.contains("node-selector")
         || key.contains("node-labels")
+}
+
+fn kubernetes_service_annotation_controls_source_nat(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("source-nat")
+        || key.contains("disable-load-balancer-snat")
+        || key.contains("disable-snat")
+        || key.contains("outbound-snat")
 }
 
 fn validate_kubernetes_resource_quantity(value: &str, label: &str) -> Result<(), String> {
@@ -12024,6 +12038,20 @@ fi
             "--agent-api-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-target-node-labels must not configure LoadBalancer backend target selection"
         ));
 
+        let mut agent_source_nat_annotation = base_k8s_install_args();
+        agent_source_nat_annotation.expose_agent_api = true;
+        agent_source_nat_annotation.agent_api_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/azure-disable-load-balancer-snat".to_string(),
+            value: "true".to_string(),
+        }];
+        let error = match k8s_install_plan(agent_source_nat_annotation) {
+            Ok(_) => panic!("agent API source NAT annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--agent-api-service-annotation annotation key service.beta.kubernetes.io/azure-disable-load-balancer-snat must not configure LoadBalancer source NAT behavior"
+        ));
+
         let mut invalid_relay_value = base_k8s_install_args();
         invalid_relay_value.expose_relay = true;
         invalid_relay_value.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12339,6 +12367,24 @@ fi
         };
         assert!(error.contains(
             "--relay-service-annotation annotation key example.com/backend-node-selector must not configure LoadBalancer backend target selection"
+        ));
+
+        let mut relay_source_nat_annotation = base_k8s_install_args();
+        relay_source_nat_annotation.expose_relay = true;
+        relay_source_nat_annotation.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        relay_source_nat_annotation.relay_admission_url =
+            Some("http://203.0.113.10:9580".to_string());
+        relay_source_nat_annotation.relay_service_annotations = vec![KeyValueArg {
+            key: "service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat"
+                .to_string(),
+            value: "on".to_string(),
+        }];
+        let error = match k8s_install_plan(relay_source_nat_annotation) {
+            Ok(_) => panic!("relay source NAT annotation should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(
+            "--relay-service-annotation annotation key service.beta.kubernetes.io/aws-load-balancer-enable-prefix-for-ipv6-source-nat must not configure LoadBalancer source NAT behavior"
         ));
 
         Ok(())
@@ -13136,6 +13182,9 @@ fi
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer backend target selection; use DaemonSet scheduling, externalTrafficPolicy values, and typed Service exposure controls instead"
+        ));
+        assert!(helpers_template.contains(
+            "must not configure LoadBalancer source NAT behavior; use internal/externalTrafficPolicy, source ranges, and NetworkPolicy values instead"
         ));
         assert!(service_template
             .contains("(ne .Values.agent.apiService.externalTrafficPolicy \"Local\")"));

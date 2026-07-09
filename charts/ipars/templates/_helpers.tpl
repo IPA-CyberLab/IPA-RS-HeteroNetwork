@@ -595,6 +595,8 @@
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer Private Link or endpoint-service publishing; use typed Service exposure controls and relayAdvertisement values instead" $path .key) -}}
 {{- else if or (contains "target-node-label" $key) (contains "target-node-selector" $key) (contains "backend-node-label" $key) (contains "backend-node-selector" $key) (contains "node-selector" $key) (contains "node-labels" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer backend target selection; use DaemonSet scheduling, externalTrafficPolicy values, and typed Service exposure controls instead" $path .key) -}}
+{{- else if or (contains "source-nat" $key) (contains "disable-load-balancer-snat" $key) (contains "disable-snat" $key) (contains "outbound-snat" $key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer source NAT behavior; use internal/externalTrafficPolicy, source ranges, and NetworkPolicy values instead" $path .key) -}}
 {{- end -}}
 {{- end -}}
 
