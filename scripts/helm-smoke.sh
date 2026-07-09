@@ -267,6 +267,18 @@ template_ok relay-service \
   --set agent.relayService.enabled=true \
   --set agent.relayService.type=ClusterIP
 
+template_fails relay-advertisement-loopback-public-endpoint \
+  "agent.relayAdvertisement.publicEndpoint host value \"127.0.0.1\" must not be a loopback address" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=127.0.0.1:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580
+
+template_fails relay-advertisement-link-local-admission-url \
+  "agent.relayAdvertisement.admissionUrl host value \"169.254.169.254\" must not be a link-local address" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://169.254.169.254:9580
+
 template_ok service-traffic-controls \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP \

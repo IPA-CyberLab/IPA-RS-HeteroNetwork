@@ -6526,16 +6526,16 @@ fn validate_k8s_relay_advertisement(args: &K8sInstallArgs) -> anyhow::Result<()>
         .relay_public_endpoint
         .as_deref()
         .context("--expose-relay requires --relay-public-endpoint")?;
-    validate_relay_public_endpoint_arg(public_endpoint, "--relay-public-endpoint")?;
+    validate_k8s_relay_advertised_public_endpoint_arg(public_endpoint, "--relay-public-endpoint")?;
 
     let admission_url = args
         .relay_admission_url
         .as_deref()
         .context("--expose-relay requires --relay-admission-url")?;
-    validate_relay_http_url_arg(admission_url, "--relay-admission-url")?;
+    validate_k8s_relay_advertised_http_url_arg(admission_url, "--relay-admission-url")?;
 
     if let Some(status_url) = args.relay_status_url.as_deref() {
-        validate_relay_http_url_arg(status_url, "--relay-status-url")?;
+        validate_k8s_relay_advertised_http_url_arg(status_url, "--relay-status-url")?;
     }
 
     Ok(())
@@ -6655,6 +6655,17 @@ fn validate_relay_public_endpoint_arg(value: &str, flag: &str) -> anyhow::Result
     Ok(())
 }
 
+fn validate_k8s_relay_advertised_public_endpoint_arg(
+    value: &str,
+    flag: &str,
+) -> anyhow::Result<()> {
+    validate_relay_public_endpoint_arg(value, flag)?;
+    let endpoint = value.parse::<SocketAddr>().with_context(|| {
+        format!("{flag} must be an IPv4 host:port or [IPv6]:port socket address")
+    })?;
+    validate_k8s_relay_advertised_ip(endpoint.ip(), flag)
+}
+
 fn validate_relay_forwarder_bind_arg(value: &str, flag: &str) -> anyhow::Result<()> {
     let endpoint = value.parse::<SocketAddr>().with_context(|| {
         format!("{flag} must be an IPv4 host:port or [IPv6]:port bind socket address")
@@ -6686,6 +6697,35 @@ fn validate_relay_http_url_arg(value: &str, flag: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_k8s_relay_advertised_http_url_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    validate_relay_http_url_arg(value, flag)?;
+    let url =
+        reqwest::Url::parse(value).with_context(|| format!("{flag} must be an absolute URL"))?;
+    if let Some(host) = url.host_str() {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            validate_k8s_relay_advertised_ip(ip, &format!("{flag} host"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_k8s_relay_advertised_ip(ip: IpAddr, flag: &str) -> anyhow::Result<()> {
+    if let Some(reason) = k8s_relay_advertised_ip_rejection_reason(ip) {
+        anyhow::bail!("{flag} must not use {reason} address {ip}");
+    }
+    Ok(())
+}
+
+fn k8s_relay_advertised_ip_rejection_reason(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(ip) if ip.is_loopback() => Some("loopback"),
+        IpAddr::V4(ip) if ip.is_link_local() => Some("link-local"),
+        IpAddr::V6(ip) if ip.is_loopback() => Some("loopback"),
+        IpAddr::V6(ip) if ip.is_unicast_link_local() => Some("link-local"),
+        _ => None,
+    }
 }
 
 fn validate_k8s_service_account_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
@@ -12757,6 +12797,16 @@ fi
         };
         assert!(error.contains("usable nonzero"));
 
+        let mut loopback_public_endpoint = base_k8s_install_args();
+        loopback_public_endpoint.expose_relay = true;
+        loopback_public_endpoint.relay_public_endpoint = Some("127.0.0.1:51820".to_string());
+        loopback_public_endpoint.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        let error = match k8s_install_plan(loopback_public_endpoint) {
+            Ok(_) => panic!("loopback relay public endpoint should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("--relay-public-endpoint must not use loopback address 127.0.0.1"));
+
         let mut unusable_admission_url = base_k8s_install_args();
         unusable_admission_url.expose_relay = true;
         unusable_admission_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
@@ -12766,6 +12816,18 @@ fi
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-admission-url must use a nonzero port"));
+
+        let mut loopback_admission_url = base_k8s_install_args();
+        loopback_admission_url.expose_relay = true;
+        loopback_admission_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        loopback_admission_url.relay_admission_url = Some("http://127.0.0.1:9580".to_string());
+        let error = match k8s_install_plan(loopback_admission_url) {
+            Ok(_) => panic!("loopback relay admission URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-admission-url host must not use loopback address 127.0.0.1")
+        );
 
         let mut invalid_status_url = base_k8s_install_args();
         invalid_status_url.expose_relay = true;
@@ -12777,6 +12839,18 @@ fi
             Err(error) => error.to_string(),
         };
         assert!(error.contains("--relay-status-url must use http or https"));
+
+        let mut link_local_status_url = base_k8s_install_args();
+        link_local_status_url.expose_relay = true;
+        link_local_status_url.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        link_local_status_url.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        link_local_status_url.relay_status_url = Some("http://169.254.169.254:9580".to_string());
+        let error = match k8s_install_plan(link_local_status_url) {
+            Ok(_) => panic!("link-local relay status URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error
+            .contains("--relay-status-url host must not use link-local address 169.254.169.254"));
 
         let mut valid_ipv6 = base_k8s_install_args();
         valid_ipv6.expose_relay = true;
@@ -13195,6 +13269,7 @@ fi
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(helpers.contains("define \"ipars.validateSocketAddress\""));
+        assert!(helpers.contains("define \"ipars.validateAdvertisedSocketAddress\""));
         assert!(helpers.contains("define \"ipars.validateBindSocketAddress\""));
         assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port socket address"));
         assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port bind socket address"));
@@ -13204,7 +13279,7 @@ fi
         assert!(daemonset
             .contains("ipars.validateSocketAddress\" (dict \"path\" \"cluster.stunEndpoint\""));
         assert!(daemonset.contains(
-            "ipars.validateSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
+            "ipars.validateAdvertisedSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
         ));
         assert!(daemonset.contains(
             "ipars.validateBindSocketAddress\" (dict \"path\" \"agent.relayForwarder.bind\""
@@ -13243,6 +13318,7 @@ fi
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(helpers.contains("define \"ipars.validateHttpEndpointURL\""));
+        assert!(helpers.contains("define \"ipars.validateAdvertisedHttpEndpointURL\""));
         assert!(helpers.contains("must be an absolute HTTP(S) URL with a host"));
         assert!(helpers.contains("must not include userinfo"));
         assert!(helpers.contains("port must be between 1 and 65535"));
@@ -13255,10 +13331,10 @@ fi
         assert!(daemonset
             .contains("ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.signalUrl\""));
         assert!(daemonset.contains(
-            "ipars.validateHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.admissionUrl\""
+            "ipars.validateAdvertisedHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.admissionUrl\""
         ));
         assert!(daemonset.contains(
-            "ipars.validateHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.statusUrl\""
+            "ipars.validateAdvertisedHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.statusUrl\""
         ));
         assert!(!daemonset.contains("$clusterUrlPattern"));
         Ok(())

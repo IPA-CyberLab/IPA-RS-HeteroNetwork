@@ -593,13 +593,13 @@
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
 {{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayAdvertisement.publicEndpoint" "value" .Values.agent.relayAdvertisement.publicEndpoint) -}}
+{{- include "ipars.validateAdvertisedSocketAddress" (dict "path" "agent.relayAdvertisement.publicEndpoint" "value" .Values.agent.relayAdvertisement.publicEndpoint) -}}
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.admissionUrl" "value" .Values.agent.relayAdvertisement.admissionUrl) -}}
+{{- include "ipars.validateAdvertisedHttpEndpointURL" (dict "path" "agent.relayAdvertisement.admissionUrl" "value" .Values.agent.relayAdvertisement.admissionUrl) -}}
 {{- if .Values.agent.relayAdvertisement.statusUrl -}}
-{{- include "ipars.validateHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
+{{- include "ipars.validateAdvertisedHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
 {{- end -}}
 {{- $relayAdvertisementMaxSessions := printf "%v" .Values.agent.relayAdvertisement.maxSessions -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxSessions" "value" $relayAdvertisementMaxSessions "max" 4294967295) -}}

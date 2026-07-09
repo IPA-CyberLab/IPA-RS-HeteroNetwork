@@ -299,6 +299,24 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "ipars.validateAdvertisedHttpEndpointURL" -}}
+{{- include "ipars.validateHttpEndpointURL" . -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- $authorityWithScheme := regexFind "^https?://[^/[:space:]?#]+" $value -}}
+{{- $authority := trimPrefix "https://" (trimPrefix "http://" $authorityWithScheme) -}}
+{{- if hasPrefix "[" $authority -}}
+{{- $host := trimSuffix "]" (trimPrefix "[" (regexFind "^\\[[^\\]]+\\]" $authority)) -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- else -}}
+{{- $host := regexFind "^[^:]+" $authority -}}
+{{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
+{{- if regexMatch (printf "^%s\\.%s\\.%s\\.%s$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $host -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ipars.validateSocketAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
@@ -331,6 +349,19 @@
 {{- if regexMatch "^[Ff][Ff]" $host -}}
 {{- fail (printf "%s value %q must not use a multicast address" $path $value) -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ipars.validateAdvertisedSocketAddress" -}}
+{{- include "ipars.validateSocketAddress" . -}}
+{{- $value := printf "%v" .value -}}
+{{- $path := .path -}}
+{{- if hasPrefix "[" $value -}}
+{{- $host := trimSuffix "]" (trimPrefix "[" (regexFind "^\\[[^\\]]+\\]" $value)) -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- else -}}
+{{- $host := regexFind "^[^:]+" $value -}}
+{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
 {{- end -}}
 {{- end -}}
 
