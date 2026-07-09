@@ -13338,7 +13338,7 @@ pub mod api {
         match frame_type {
             1 => amqp_method_frame_payload(channel, frame_size, frame_body),
             2 => amqp_content_header_frame_payload(channel, frame_size, frame_body),
-            3 => channel != 0 && frame_size <= 16_777_216,
+            3 => false,
             8 => channel == 0 && frame_size == 0,
             _ => false,
         }
@@ -21922,6 +21922,10 @@ mod tests {
                 &amqp_content_header_body(60, 0, 0, 0x8000, &[])
             ))
             .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&amqp_frame(3, 1, b"opaque broker payload")).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(
