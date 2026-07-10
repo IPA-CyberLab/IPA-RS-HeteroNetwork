@@ -494,14 +494,7 @@ impl LoadReport {
                 }
                 validate_control_plane_lifecycle_counters_idle(
                     "daemon load scenario control-plane",
-                    self.daemon_control_plane_wireguard_key_rotation_success_count_min,
-                    self.daemon_control_plane_wireguard_key_rotation_success_count_max,
-                    self.daemon_control_plane_wireguard_key_rotation_failure_count_min,
-                    self.daemon_control_plane_wireguard_key_rotation_failure_count_max,
-                    self.daemon_control_plane_node_removal_success_count_min,
-                    self.daemon_control_plane_node_removal_success_count_max,
-                    self.daemon_control_plane_node_removal_failure_count_min,
-                    self.daemon_control_plane_node_removal_failure_count_max,
+                    &ControlPlaneLifecycleMetricsMeasurement::from_report(self),
                 )?;
                 if self.daemon_control_plane_relay_candidates_min != self.relay_count
                     || self.daemon_control_plane_relay_candidates_max != self.relay_count
@@ -695,14 +688,7 @@ impl LoadReport {
                     }
                     validate_control_plane_lifecycle_counters_idle(
                         "daemon load scenario failover control-plane",
-                        self.daemon_control_plane_failover_wireguard_key_rotation_success_count_min,
-                        self.daemon_control_plane_failover_wireguard_key_rotation_success_count_max,
-                        self.daemon_control_plane_failover_wireguard_key_rotation_failure_count_min,
-                        self.daemon_control_plane_failover_wireguard_key_rotation_failure_count_max,
-                        self.daemon_control_plane_failover_node_removal_success_count_min,
-                        self.daemon_control_plane_failover_node_removal_success_count_max,
-                        self.daemon_control_plane_failover_node_removal_failure_count_min,
-                        self.daemon_control_plane_failover_node_removal_failure_count_max,
+                        &ControlPlaneLifecycleMetricsMeasurement::from_failover_report(self),
                     )?;
                     if self.daemon_control_plane_failover_relay_candidates_min != self.relay_count
                         || self.daemon_control_plane_failover_relay_candidates_max
@@ -1672,37 +1658,21 @@ impl LoadReport {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_control_plane_lifecycle_counters_idle(
     context: &str,
-    wireguard_rotation_success_min: u64,
-    wireguard_rotation_success_max: u64,
-    wireguard_rotation_failure_min: u64,
-    wireguard_rotation_failure_max: u64,
-    node_removal_success_min: u64,
-    node_removal_success_max: u64,
-    node_removal_failure_min: u64,
-    node_removal_failure_max: u64,
+    measurement: &ControlPlaneLifecycleMetricsMeasurement,
 ) -> anyhow::Result<()> {
-    if wireguard_rotation_success_min != 0
-        || wireguard_rotation_success_max != 0
-        || wireguard_rotation_failure_min != 0
-        || wireguard_rotation_failure_max != 0
-        || node_removal_success_min != 0
-        || node_removal_success_max != 0
-        || node_removal_failure_min != 0
-        || node_removal_failure_max != 0
-    {
+    if !measurement.is_idle() {
         bail!(
             "{context} lifecycle-operation metrics are non-idle: WireGuard key rotation success min/max={}/{}, failure min/max={}/{}, node removal success min/max={}/{}, failure min/max={}/{}",
-            wireguard_rotation_success_min,
-            wireguard_rotation_success_max,
-            wireguard_rotation_failure_min,
-            wireguard_rotation_failure_max,
-            node_removal_success_min,
-            node_removal_success_max,
-            node_removal_failure_min,
-            node_removal_failure_max
+            measurement.wireguard_key_rotation_success_count_min,
+            measurement.wireguard_key_rotation_success_count_max,
+            measurement.wireguard_key_rotation_failure_count_min,
+            measurement.wireguard_key_rotation_failure_count_max,
+            measurement.node_removal_success_count_min,
+            measurement.node_removal_success_count_max,
+            measurement.node_removal_failure_count_min,
+            measurement.node_removal_failure_count_max
         );
     }
     Ok(())
@@ -4458,6 +4428,17 @@ impl ControlPlaneLifecycleMetricsMeasurement {
         }
     }
 
+    fn is_idle(&self) -> bool {
+        self.wireguard_key_rotation_success_count_min == 0
+            && self.wireguard_key_rotation_success_count_max == 0
+            && self.wireguard_key_rotation_failure_count_min == 0
+            && self.wireguard_key_rotation_failure_count_max == 0
+            && self.node_removal_success_count_min == 0
+            && self.node_removal_success_count_max == 0
+            && self.node_removal_failure_count_min == 0
+            && self.node_removal_failure_count_max == 0
+    }
+
     fn from_counts(
         wireguard_key_rotation_success_count_min: u64,
         wireguard_key_rotation_success_count_max: u64,
@@ -6626,17 +6607,6 @@ impl ControlPlaneHealthSummary {
         }
 
         Ok(summary)
-    }
-
-    fn lifecycle_counters_idle(&self) -> bool {
-        self.wireguard_key_rotation_success_count_min == 0
-            && self.wireguard_key_rotation_success_count_max == 0
-            && self.wireguard_key_rotation_failure_count_min == 0
-            && self.wireguard_key_rotation_failure_count_max == 0
-            && self.node_removal_success_count_min == 0
-            && self.node_removal_success_count_max == 0
-            && self.node_removal_failure_count_min == 0
-            && self.node_removal_failure_count_max == 0
     }
 
     fn metrics_consistent(&self) -> bool {
@@ -9596,7 +9566,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert_eq!(consistent.wireguard_key_rotation_success_count_max, 0);
         assert_eq!(consistent.node_removal_failure_count_min, 0);
         assert_eq!(consistent.node_removal_failure_count_max, 0);
-        assert!(consistent.lifecycle_counters_idle());
+        assert!(ControlPlaneLifecycleMetricsMeasurement::from_summary(&consistent).is_idle());
         assert!(consistent.metrics_consistent());
 
         let mut lifecycle_first = control_plane_metrics(2, 6, 6, 3, 0, 0);
@@ -9615,7 +9585,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert_eq!(lifecycle.node_removal_success_count_max, 4);
         assert_eq!(lifecycle.node_removal_failure_count_min, 0);
         assert_eq!(lifecycle.node_removal_failure_count_max, 2);
-        assert!(!lifecycle.lifecycle_counters_idle());
+        assert!(!ControlPlaneLifecycleMetricsMeasurement::from_summary(&lifecycle).is_idle());
         assert!(lifecycle.metrics_consistent());
 
         let skewed = ControlPlaneHealthSummary::from_metrics(&[
