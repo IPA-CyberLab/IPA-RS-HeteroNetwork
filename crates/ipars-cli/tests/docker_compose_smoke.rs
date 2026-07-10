@@ -555,6 +555,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
       IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_RUNTIME_BACKEND: dry-run
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
       IPARS_DOCKER_DISCOVER_NETWORKS: "false"
       IPARS_AGENT_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
@@ -569,8 +570,6 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - 0.0.0.0:{agent_port}
       - --state-path
       - /var/lib/ipars/agent.json
-      - --runtime-backend
-      - dry-run
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
@@ -601,6 +600,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
       IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_RUNTIME_BACKEND: dry-run
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
       IPARS_DOCKER_DISCOVER_NETWORKS: "false"
     command:
@@ -609,8 +609,6 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - 0.0.0.0:{agent_b_port}
       - --state-path
       - /var/lib/ipars/agent-b.json
-      - --runtime-backend
-      - dry-run
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
