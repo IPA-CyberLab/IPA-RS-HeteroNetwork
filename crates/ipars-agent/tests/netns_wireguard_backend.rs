@@ -1,10 +1,11 @@
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipars_agent::{KernelWireGuardBackend, WireGuardBackend, WireGuardPeerConfig};
 use ipars_crypto::WireGuardKeyPair;
 use ipars_route_manager::LinuxNetworkNamespace;
-use ipars_types::NodeId;
+use ipars_types::{NodeId, VpnIp};
 
 #[tokio::test]
 async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
@@ -43,6 +44,41 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
         ],
     )?;
     assert!(link.contains(interface));
+
+    let local_key = WireGuardKeyPair::generate();
+    backend
+        .configure_interface_private_key(&local_key.private_key_b64)
+        .await?;
+    backend
+        .configure_interface_address(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 99, 1))))
+        .await?;
+    let local_address = command_output(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "-o",
+            "-4",
+            "addr",
+            "show",
+            "dev",
+            interface,
+        ],
+    )?;
+    assert!(local_address.contains("100.64.99.1/32"));
+    let configured_private_key = command_output(
+        "ip",
+        [
+            "netns",
+            "exec",
+            namespace_name.as_str(),
+            "wg",
+            "show",
+            interface,
+            "private-key",
+        ],
+    )?;
+    assert_eq!(configured_private_key.trim(), local_key.private_key_b64);
 
     let peer = NodeId::from_string("wg-netns-peer");
     let peer_key = WireGuardKeyPair::generate();

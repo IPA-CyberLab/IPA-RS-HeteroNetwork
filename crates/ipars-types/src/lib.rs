@@ -1572,6 +1572,8 @@ pub mod api {
         pub node_id: NodeId,
         pub identity_public_key: String,
         pub wireguard_public_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub vpn_ip: Option<VpnIp>,
         pub candidate_count: usize,
         pub candidates: Vec<EndpointCandidate>,
         pub nat_classification: Option<NatClassification>,

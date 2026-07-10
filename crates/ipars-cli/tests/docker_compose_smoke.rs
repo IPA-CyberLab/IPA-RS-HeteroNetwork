@@ -861,6 +861,7 @@ fn assert_compose_agent_status(
             ensure_json_string_nonempty(value, "node_id")?;
             ensure_json_string_nonempty(value, "identity_public_key")?;
             ensure_json_string_nonempty(value, "wireguard_public_key")?;
+            ensure_json_string_nonempty(value, "vpn_ip")?;
             let candidate_count = json_u64_field(value, "candidate_count")?;
             let candidates = value
                 .get("candidates")

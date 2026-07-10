@@ -38,7 +38,7 @@ use ipars_types::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -64,6 +64,7 @@ const MAX_LINUX_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_LINUX_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_COMMAND_ARG_BYTES: usize = 128 * 1024;
 const MAX_LINUX_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
+const MAX_LINUX_COMMAND_STDIN_BYTES: usize = 64 * 1024;
 const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -108,6 +109,8 @@ pub struct AgentNodeState {
     pub identity_public_key_b64: String,
     pub wireguard_private_key_b64: String,
     pub wireguard_public_key_b64: String,
+    #[serde(default)]
+    pub vpn_ip: Option<VpnIp>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -122,6 +125,7 @@ impl AgentNodeState {
             identity_public_key_b64: identity.public_key_b64(),
             wireguard_private_key_b64: wireguard.private_key_b64,
             wireguard_public_key_b64: wireguard.public_key_b64,
+            vpn_ip: None,
             created_at: now,
             updated_at: now,
         }
@@ -1319,6 +1323,7 @@ impl AgentRuntime {
             node_id: state.node_id,
             identity_public_key: state.identity_public_key_b64,
             wireguard_public_key: state.wireguard_public_key_b64,
+            vpn_ip: state.vpn_ip,
             candidate_count: candidates.len(),
             candidates,
             nat_classification,
@@ -2252,14 +2257,34 @@ pub struct WireGuardPeerConfig {
 
 #[async_trait]
 pub trait WireGuardBackend: Send + Sync {
+    async fn configure_private_key(&self, _private_key_b64: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
+
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError>;
     async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LinuxCommand {
     pub program: String,
     pub args: Vec<String>,
+    pub stdin: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for LinuxCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stdin = self
+            .stdin
+            .as_ref()
+            .map(|stdin| format!("<redacted {} bytes>", stdin.len()));
+        formatter
+            .debug_struct("LinuxCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("stdin", &stdin)
+            .finish()
+    }
 }
 
 impl LinuxCommand {
@@ -2270,12 +2295,22 @@ impl LinuxCommand {
         Self {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
+            stdin: None,
         }
+    }
+
+    pub fn with_stdin(mut self, stdin: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(stdin.into());
+        self
     }
 
     pub fn in_namespace(self, namespace: &LinuxNetworkNamespace) -> Self {
         let (program, args) = namespace.wrap_program_args(&self.program, &self.args);
-        Self { program, args }
+        Self {
+            program,
+            args,
+            stdin: self.stdin,
+        }
     }
 }
 
@@ -2501,6 +2536,14 @@ fn validate_linux_command(command: &LinuxCommand) -> Result<(), AgentError> {
         if total_bytes > MAX_LINUX_COMMAND_ARGV_BYTES {
             return Err(AgentError::WireGuard(format!(
                 "invalid linux command: argv exceeds {MAX_LINUX_COMMAND_ARGV_BYTES} bytes"
+            )));
+        }
+    }
+
+    if let Some(stdin) = &command.stdin {
+        if stdin.len() > MAX_LINUX_COMMAND_STDIN_BYTES {
+            return Err(AgentError::WireGuard(format!(
+                "invalid linux command: stdin exceeds {MAX_LINUX_COMMAND_STDIN_BYTES} bytes"
             )));
         }
     }
@@ -2853,9 +2896,26 @@ async fn collect_bounded_command_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if command.stdin.is_some() {
+        child_command.stdin(Stdio::piped());
+    } else {
+        child_command.stdin(Stdio::null());
+    }
     configure_command_process_group(&mut child_command);
 
     let mut child = child_command.spawn().map_err(AgentError::Io)?;
+    let stdin_task = if let Some(stdin) = command.stdin {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AgentError::Io(std::io::Error::other("child stdin was not piped")))?;
+        Some(tokio::spawn(async move {
+            child_stdin.write_all(&stdin).await?;
+            child_stdin.shutdown().await
+        }))
+    } else {
+        None
+    };
 
     let stdout = child
         .stdout
@@ -2872,6 +2932,9 @@ async fn collect_bounded_command_output(
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
+            if let Some(task) = stdin_task {
+                task.abort();
+            }
             stdout_task.abort();
             stderr_task.abort();
             return Err(AgentError::Io(error));
@@ -2879,6 +2942,9 @@ async fn collect_bounded_command_output(
         Err(_) => {
             let kill_error = kill_timed_out_child(&mut child);
             let _ = child.wait().await;
+            if let Some(task) = stdin_task {
+                task.abort();
+            }
             stdout_task.abort();
             stderr_task.abort();
             let mut message = format!(
@@ -2894,6 +2960,17 @@ async fn collect_bounded_command_output(
 
     let _stdout = collect_command_output_task(stdout_task).await?;
     let stderr = collect_command_output_task(stderr_task).await?;
+    if let Some(task) = stdin_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(AgentError::Io(error)),
+            Err(error) => {
+                return Err(AgentError::WireGuard(format!(
+                    "command stdin writer task failed: {error}"
+                )))
+            }
+        }
+    }
 
     Ok(BoundedCommandOutput { status, stderr })
 }
@@ -3116,6 +3193,33 @@ where
             .await
     }
 
+    pub async fn configure_interface_address(&self, vpn_ip: VpnIp) -> Result<(), AgentError> {
+        self.runner
+            .run(LinuxCommand::new(
+                "ip",
+                [
+                    "address".to_string(),
+                    "replace".to_string(),
+                    overlay_interface_cidr(vpn_ip),
+                    "dev".to_string(),
+                    self.interface.clone(),
+                ],
+            ))
+            .await
+    }
+
+    pub async fn configure_interface_private_key(
+        &self,
+        private_key_b64: &str,
+    ) -> Result<(), AgentError> {
+        self.runner
+            .run(wireguard_private_key_command(
+                &self.interface,
+                private_key_b64,
+            )?)
+            .await
+    }
+
     fn upsert_command(&self, config: &WireGuardPeerConfig) -> LinuxCommand {
         wireguard_upsert_peer_command(&self.interface, config)
     }
@@ -3126,6 +3230,10 @@ impl<R> WireGuardBackend for LinuxWireGuardBackend<R>
 where
     R: LinuxCommandRunner,
 {
+    async fn configure_private_key(&self, private_key_b64: &str) -> Result<(), AgentError> {
+        self.configure_interface_private_key(private_key_b64).await
+    }
+
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
         self.runner.run(self.upsert_command(&config)).await?;
         self.peer_public_keys
@@ -3175,6 +3283,18 @@ where
             .run(LinuxCommand::new("wg", ["show", self.interface.as_str()]))
             .await
     }
+
+    pub async fn configure_interface_private_key(
+        &self,
+        private_key_b64: &str,
+    ) -> Result<(), AgentError> {
+        self.runner
+            .run(wireguard_private_key_command(
+                &self.interface,
+                private_key_b64,
+            )?)
+            .await
+    }
 }
 
 #[async_trait]
@@ -3182,6 +3302,10 @@ impl<R> WireGuardBackend for UserspaceWireGuardBackend<R>
 where
     R: LinuxCommandRunner,
 {
+    async fn configure_private_key(&self, private_key_b64: &str) -> Result<(), AgentError> {
+        self.configure_interface_private_key(private_key_b64).await
+    }
+
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
         self.runner
             .run(wireguard_upsert_peer_command(&self.interface, &config))
@@ -3229,6 +3353,29 @@ fn wireguard_upsert_peer_command(interface: &str, config: &WireGuardPeerConfig) 
         args.push(keepalive.to_string());
     }
     LinuxCommand::new("wg", args)
+}
+
+fn wireguard_private_key_command(
+    interface: &str,
+    private_key_b64: &str,
+) -> Result<LinuxCommand, AgentError> {
+    let mut stdin = validated_wireguard_private_key(private_key_b64)?;
+    stdin.push(b'\n');
+    Ok(LinuxCommand::new("wg", ["set", interface, "private-key", "/dev/stdin"]).with_stdin(stdin))
+}
+
+fn validated_wireguard_private_key(value: &str) -> Result<Vec<u8>, AgentError> {
+    let trimmed = value.trim();
+    let decoded = BASE64_STANDARD.decode(trimmed).map_err(|error| {
+        AgentError::WireGuard(format!("invalid WireGuard private key base64: {error}"))
+    })?;
+    if decoded.len() != 32 {
+        return Err(AgentError::WireGuard(format!(
+            "WireGuard private key decoded to {} bytes, expected 32",
+            decoded.len()
+        )));
+    }
+    Ok(trimmed.as_bytes().to_vec())
 }
 
 fn wireguard_remove_peer_command(interface: &str, public_key: &str) -> LinuxCommand {
@@ -3318,17 +3465,101 @@ impl KernelWireGuardBackend {
             })
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn configure_interface_address(&self, vpn_ip: VpnIp) -> Result<(), AgentError> {
+        let (connection, handle, _) = with_netlink_namespace(self.namespace.as_ref(), || {
+            rtnetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+        })
+        .map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to open route netlink connection for WireGuard interface {}{}: {error}",
+                self.interface,
+                wireguard_namespace_suffix(self.namespace.as_ref())
+            ))
+        })?;
+        tokio::spawn(connection);
+
+        let index = find_link_index(&handle, &self.interface)
+            .await?
+            .ok_or_else(|| {
+                AgentError::WireGuard(format!(
+                    "WireGuard interface {} was not visible before assigning local VPN address",
+                    self.interface
+                ))
+            })?;
+        let prefix_len = overlay_interface_prefix_len(vpn_ip.0);
+        handle
+            .address()
+            .add(index, vpn_ip.0, prefix_len)
+            .replace()
+            .execute()
+            .await
+            .map_err(|error| {
+                AgentError::WireGuard(format!(
+                    "failed to assign local VPN address {}/{} to WireGuard interface {} through rtnetlink: {error}",
+                    vpn_ip.0, prefix_len, self.interface
+                ))
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn configure_interface_private_key(
+        &self,
+        private_key_b64: &str,
+    ) -> Result<(), AgentError> {
+        apply_wireguard_netlink(
+            &self.interface,
+            self.namespace.as_ref(),
+            vec![WireguardAttribute::PrivateKey(parse_wireguard_private_key(
+                private_key_b64,
+            )?)],
+        )
+        .await
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub async fn ensure_interface(&self) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
             "kernel WireGuard netlink backend is only supported on Linux".to_string(),
         ))
     }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn configure_interface_address(&self, _vpn_ip: VpnIp) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn configure_interface_private_key(
+        &self,
+        _private_key_b64: &str,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+}
+
+fn overlay_interface_cidr(vpn_ip: VpnIp) -> String {
+    format!("{}/{}", vpn_ip.0, overlay_interface_prefix_len(vpn_ip.0))
+}
+
+fn overlay_interface_prefix_len(vpn_ip: IpAddr) -> u8 {
+    match vpn_ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
 }
 
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl WireGuardBackend for KernelWireGuardBackend {
+    async fn configure_private_key(&self, private_key_b64: &str) -> Result<(), AgentError> {
+        self.configure_interface_private_key(private_key_b64).await
+    }
+
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
         let public_key = parse_wireguard_public_key(&config.public_key)?;
         let peer = netlink_peer_config(&config, public_key)?;
@@ -3370,6 +3601,10 @@ impl WireGuardBackend for KernelWireGuardBackend {
 #[cfg(not(target_os = "linux"))]
 #[async_trait]
 impl WireGuardBackend for KernelWireGuardBackend {
+    async fn configure_private_key(&self, private_key_b64: &str) -> Result<(), AgentError> {
+        self.configure_interface_private_key(private_key_b64).await
+    }
+
     async fn upsert_peer(&self, _config: WireGuardPeerConfig) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
             "kernel WireGuard netlink backend is only supported on Linux".to_string(),
@@ -3412,6 +3647,21 @@ fn parse_wireguard_public_key(value: &str) -> Result<[u8; 32], AgentError> {
     decoded.try_into().map_err(|decoded: Vec<u8>| {
         AgentError::WireGuard(format!(
             "WireGuard public key decoded to {} bytes, expected 32",
+            decoded.len()
+        ))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_wireguard_private_key(value: &str) -> Result<[u8; 32], AgentError> {
+    let decoded = BASE64_STANDARD
+        .decode(validated_wireguard_private_key(value)?)
+        .map_err(|error| {
+            AgentError::WireGuard(format!("invalid WireGuard private key base64: {error}"))
+        })?;
+    decoded.try_into().map_err(|decoded: Vec<u8>| {
+        AgentError::WireGuard(format!(
+            "WireGuard private key decoded to {} bytes, expected 32",
             decoded.len()
         ))
     })
@@ -3663,6 +3913,9 @@ where
         peer_map: PeerMap,
     ) -> Result<PeerMapApplySummary, AgentError> {
         if let Some(runtime) = &self.lazy_runtime {
+            self.wireguard
+                .configure_private_key(&runtime.state().wireguard_private_key_b64)
+                .await?;
             runtime
                 .observe_peer_map_for_lazy_connect(&peer_map.peers)
                 .await;
@@ -4093,7 +4346,8 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
     use ipars_route_manager::{
-        DockerNetworkIntent, KubernetesUnderlayIntent, RouteManager, RouteManagerError, RoutePlan,
+        DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent, RouteManager,
+        RouteManagerError, RoutePlan,
     };
     use ipars_stun::{BindingStunServer, Rfc5780StunServer};
     use ipars_types::api::{
@@ -4235,6 +4489,27 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_system_command_runner_passes_bounded_stdin() -> Result<(), AgentError> {
+        let runner = TimedSystemCommandRunner::new(Duration::from_secs(1));
+        let shell = trusted_test_shell();
+
+        runner
+            .run(
+                LinuxCommand::new(
+                    shell,
+                    [
+                        "-c",
+                        "IFS= read -r secret; test \"$secret\" = wireguard-secret",
+                    ],
+                )
+                .with_stdin(b"wireguard-secret\n".to_vec()),
+            )
+            .await?;
+        Ok(())
+    }
+
     #[test]
     fn command_label_escapes_control_characters() {
         let label = command_label(
@@ -4249,6 +4524,16 @@ mod tests {
         assert_eq!(label, r"wg set\npeer tab\targ slash\\arg");
         assert!(!label.contains('\n'));
         assert!(!label.contains('\t'));
+    }
+
+    #[test]
+    fn linux_command_debug_redacts_stdin() {
+        let command = LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
+            .with_stdin(b"private-key-material".to_vec());
+        let debug = format!("{command:?}");
+
+        assert!(debug.contains("<redacted 20 bytes>"));
+        assert!(!debug.contains("private-key-material"));
     }
 
     #[test]
@@ -6345,6 +6630,87 @@ mod tests {
                 LinuxCommand::new("ip", ["link", "show", "dev", "ipars0"]),
                 LinuxCommand::new("ip", ["link", "add", "dev", "ipars0", "type", "wireguard"],),
                 LinuxCommand::new("ip", ["link", "set", "up", "dev", "ipars0"]),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_wireguard_backend_assigns_local_vpn_ip_to_interface() -> Result<(), AgentError> {
+        let runner = RecordingRunner::default();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
+
+        backend
+            .configure_interface_address(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))))
+            .await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![LinuxCommand::new(
+                "ip",
+                ["address", "replace", "100.64.0.2/32", "dev", "ipars0"],
+            )]
+        );
+        assert_eq!(
+            overlay_interface_cidr(VpnIp(IpAddr::V6(std::net::Ipv6Addr::new(
+                0xfd00, 0, 0, 0, 0, 0, 0, 2,
+            )))),
+            "fd00::2/128"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_wireguard_backend_configures_private_key_without_argv_leakage(
+    ) -> Result<(), AgentError> {
+        let runner = RecordingRunner::default();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
+        let private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+        backend.configure_interface_private_key(private_key).await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"],)
+                    .with_stdin(format!("{private_key}\n").into_bytes())
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_application_refreshes_rotated_local_private_key() -> Result<(), AgentError> {
+        let first_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let second_private_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.wireguard_private_key_b64 = first_private_key.to_string();
+        let runtime = Arc::new(AgentRuntime::new(state.clone(), ClusterPolicy::default()));
+        let runner = RecordingRunner::default();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            LinuxWireGuardBackend::new("ipars0", runner.clone()),
+            DryRunLinuxRouteManager,
+        )
+        .with_lazy_connect_runtime(runtime.clone());
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: Vec::new(),
+            generated_at: Utc::now(),
+        };
+
+        applier.apply_peer_map(peer_map.clone()).await?;
+        state.wireguard_private_key_b64 = second_private_key.to_string();
+        runtime.replace_state(state);
+        applier.apply_peer_map(peer_map).await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
+                    .with_stdin(format!("{first_private_key}\n").into_bytes()),
+                LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
+                    .with_stdin(format!("{second_private_key}\n").into_bytes()),
             ]
         );
         Ok(())
@@ -8693,6 +9059,25 @@ mod tests {
             let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn file_state_store_persists_registered_vpn_ip() -> Result<(), AgentError> {
+        let dir = temp_state_dir("state-vpn-ip");
+        let path = dir.join("state.json");
+        let store = FileAgentStateStore::new(&path);
+        let mut state = store.load_or_create(Utc::now())?;
+        assert_eq!(state.vpn_ip, None);
+
+        state.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))));
+        store.save(&state)?;
+
+        assert_eq!(
+            store.load()?.vpn_ip,
+            Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))))
+        );
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }

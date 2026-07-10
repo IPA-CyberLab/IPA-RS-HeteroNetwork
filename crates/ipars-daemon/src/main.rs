@@ -80,7 +80,7 @@ use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpointKind,
     ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
     NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
-    Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
+    Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -6170,6 +6170,17 @@ async fn run_agent(
     } else {
         None
     };
+    if let Some(node) = registered_node.as_ref() {
+        let mut persisted_state = runtime.state();
+        if persisted_state.vpn_ip.as_ref() != Some(&node.vpn_ip) {
+            persisted_state.vpn_ip = Some(node.vpn_ip.clone());
+            persisted_state.updated_at = chrono::Utc::now();
+            store
+                .save(&persisted_state)
+                .context("failed to persist registered agent VPN IP")?;
+            runtime.replace_state(persisted_state);
+        }
+    }
     let control_plane_bases = agent_control_plane_base_urls(
         join_token.as_ref(),
         args.control_plane_url.as_deref(),
@@ -6208,6 +6219,10 @@ async fn run_agent(
             !control_plane_bases.is_empty(),
             "control-plane URL is required when --apply-peer-map is set"
         );
+        runtime
+            .state()
+            .vpn_ip
+            .context("local VPN IP is required when --apply-peer-map is set; join the control plane first or retain the agent state file")?;
         Some(start_peer_map_sync(&args, runtime.clone(), control_plane_bases.clone()).await?)
     } else {
         None
@@ -6546,6 +6561,7 @@ fn resolve_userspace_wireguard_spawn_command(
     let mut resolved = LinuxCommand {
         program: runtime_command_path_to_string(&resolved_program, "userspace WireGuard command")?,
         args: command.args.clone(),
+        stdin: command.stdin.clone(),
     };
 
     if runtime_command_program_name(&original_program) == Some("ip")
@@ -8762,6 +8778,12 @@ where
 {
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
+    wireguard
+        .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
+        .await?;
     let route_manager = LinuxRouteManager::new(route_runner);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
@@ -8792,6 +8814,12 @@ where
 {
     let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace);
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
+    wireguard
+        .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
+        .await?;
     let route_manager = LinuxRouteManager::new(route_runner);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
@@ -8822,6 +8850,12 @@ where
 {
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
+    wireguard
+        .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
+        .await?;
     let route_manager = linux_netlink_route_manager(namespace);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
@@ -8854,6 +8888,9 @@ where
     let wireguard =
         UserspaceWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
     tracing::info!(
@@ -8879,6 +8916,12 @@ async fn start_peer_map_sync_with_kernel_backends(
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace.clone());
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
+    wireguard
+        .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
+        .await?;
     let route_manager = linux_netlink_route_manager(namespace);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
@@ -8905,6 +8948,22 @@ fn kernel_wireguard_backend(
         Some(namespace) => KernelWireGuardBackend::new_in_namespace(interface, namespace),
         None => KernelWireGuardBackend::new(interface),
     }
+}
+
+fn runtime_local_vpn_ip(runtime: &AgentRuntime) -> anyhow::Result<VpnIp> {
+    runtime
+        .state()
+        .vpn_ip
+        .context("local VPN IP is unavailable while configuring the WireGuard interface")
+}
+
+fn runtime_wireguard_private_key(runtime: &AgentRuntime) -> anyhow::Result<String> {
+    let private_key = runtime.state().wireguard_private_key_b64;
+    anyhow::ensure!(
+        !private_key.trim().is_empty(),
+        "local WireGuard private key is unavailable while configuring the WireGuard interface"
+    );
+    Ok(private_key)
 }
 
 fn linux_netlink_route_manager(
@@ -13113,6 +13172,7 @@ mod tests {
             node_id: NodeId::from_string(node_id),
             identity_public_key: format!("identity-{node_id}"),
             wireguard_public_key: format!("wg-{node_id}"),
+            vpn_ip: None,
             candidate_count: candidates.len(),
             candidates,
             nat_classification: None,
@@ -23760,6 +23820,7 @@ exec sleep 60
             node_id: local.clone(),
             identity_public_key: "identity-local".to_string(),
             wireguard_public_key: "wg-local".to_string(),
+            vpn_ip: None,
             candidate_count: 2,
             candidates: vec![
                 candidate("local", EndpointCandidateKind::LocalUdp, 1),
@@ -23812,6 +23873,7 @@ exec sleep 60
             node_id: local.clone(),
             identity_public_key: "identity-local".to_string(),
             wireguard_public_key: "wg-local".to_string(),
+            vpn_ip: None,
             candidate_count: 1,
             candidates: vec![EndpointCandidate {
                 node_id: local.clone(),
@@ -24251,6 +24313,7 @@ exec sleep 60
             node_id: local.clone(),
             identity_public_key: "identity-local".to_string(),
             wireguard_public_key: "wg-local".to_string(),
+            vpn_ip: None,
             candidate_count: 1,
             candidates: vec![EndpointCandidate {
                 node_id: local,
@@ -24377,6 +24440,7 @@ exec sleep 60
             node_id: local.clone(),
             identity_public_key: "identity-local".to_string(),
             wireguard_public_key: "wg-local".to_string(),
+            vpn_ip: None,
             candidate_count: 1,
             candidates: vec![EndpointCandidate {
                 node_id: local,
@@ -24480,6 +24544,7 @@ exec sleep 60
             node_id: local.clone(),
             identity_public_key: "identity-local".to_string(),
             wireguard_public_key: "wg-local".to_string(),
+            vpn_ip: None,
             candidate_count: 1,
             candidates: vec![EndpointCandidate {
                 node_id: local,
