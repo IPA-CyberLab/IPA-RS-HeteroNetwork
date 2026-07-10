@@ -543,6 +543,7 @@ pub struct AgentRuntime {
     packet_flow_application_amqp_count: AtomicU64,
     packet_flow_application_cassandra_count: AtomicU64,
     packet_flow_application_mongodb_count: AtomicU64,
+    packet_flow_application_neo4j_count: AtomicU64,
     packet_flow_application_elasticsearch_count: AtomicU64,
     packet_flow_application_opensearch_count: AtomicU64,
     packet_flow_application_solr_count: AtomicU64,
@@ -1196,6 +1197,7 @@ impl AgentRuntime {
             packet_flow_application_amqp_count: AtomicU64::new(0),
             packet_flow_application_cassandra_count: AtomicU64::new(0),
             packet_flow_application_mongodb_count: AtomicU64::new(0),
+            packet_flow_application_neo4j_count: AtomicU64::new(0),
             packet_flow_application_elasticsearch_count: AtomicU64::new(0),
             packet_flow_application_opensearch_count: AtomicU64::new(0),
             packet_flow_application_solr_count: AtomicU64::new(0),
@@ -2019,6 +2021,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Amqp => &self.packet_flow_application_amqp_count,
             AgentPacketFlowApplication::Cassandra => &self.packet_flow_application_cassandra_count,
             AgentPacketFlowApplication::MongoDb => &self.packet_flow_application_mongodb_count,
+            AgentPacketFlowApplication::Neo4j => &self.packet_flow_application_neo4j_count,
             AgentPacketFlowApplication::Elasticsearch => {
                 &self.packet_flow_application_elasticsearch_count
             }
@@ -8076,6 +8079,14 @@ mod tests {
                 AgentPacketFlowApplication::MongoDb,
                 TransportProtocol::Tcp,
                 mongodb_op_msg(),
+            ),
+            (
+                AgentPacketFlowApplication::Neo4j,
+                TransportProtocol::Tcp,
+                vec![
+                    0x60, 0x60, 0xb0, 0x17, 0x00, 0x00, 0x01, 0xff, 0x00, 0x03, 0x03, 0x04, 0x00,
+                    0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x03,
+                ],
             ),
             (
                 AgentPacketFlowApplication::ClickHouse,

@@ -1870,6 +1870,7 @@ pub mod api {
         Amqp,
         Cassandra,
         MongoDb,
+        Neo4j,
         Elasticsearch,
         #[serde(alias = "opensearch")]
         OpenSearch,
@@ -1888,7 +1889,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 78] = [
+        pub const ALL: [Self; 79] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1954,6 +1955,7 @@ pub mod api {
             Self::Amqp,
             Self::Cassandra,
             Self::MongoDb,
+            Self::Neo4j,
             Self::Elasticsearch,
             Self::OpenSearch,
             Self::Solr,
@@ -2036,6 +2038,7 @@ pub mod api {
                 Self::Amqp => "amqp",
                 Self::Cassandra => "cassandra",
                 Self::MongoDb => "mongodb",
+                Self::Neo4j => "neo4j",
                 Self::Elasticsearch => "elasticsearch",
                 Self::OpenSearch => "opensearch",
                 Self::Solr => "solr",
@@ -2604,6 +2607,11 @@ pub mod api {
             if self.involves_port(27017) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::MongoDb;
             }
+            if (self.involves_port(7687) || self.involves_port(7474) || self.involves_port(7473))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Neo4j;
+            }
             if (self.involves_port(8983) || self.involves_port(8984))
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
@@ -2811,6 +2819,9 @@ pub mod api {
                     cassandra_payload(payload).then_some(AgentPacketFlowApplication::Cassandra)
                 })
                 .or_else(|| mongodb_payload(payload).then_some(AgentPacketFlowApplication::MongoDb))
+                .or_else(|| {
+                    neo4j_bolt_payload(payload).then_some(AgentPacketFlowApplication::Neo4j)
+                })
                 .or_else(|| {
                     elasticsearch_transport_payload(payload)
                         .then_some(AgentPacketFlowApplication::Elasticsearch)
@@ -3188,6 +3199,9 @@ pub mod api {
             }
             if grpc_http_payload(payload) {
                 return Some(AgentPacketFlowApplication::Grpc);
+            }
+            if neo4j_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Neo4j);
             }
             if pulsar_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::Pulsar);
@@ -3589,6 +3603,32 @@ pub mod api {
         PREFIXES
             .iter()
             .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn neo4j_http_api_path(path: &[u8]) -> bool {
+        path_starts_with_api_prefix(path, b"/db/data") || neo4j_scoped_db_http_api_path(path)
+    }
+
+    fn neo4j_scoped_db_http_api_path(path: &[u8]) -> bool {
+        let path = http_path_without_query(path);
+        let Some(tail) = path.strip_prefix(b"/db/") else {
+            return false;
+        };
+        let Some(database_end) = tail.iter().position(|byte| *byte == b'/') else {
+            return false;
+        };
+        let database = &tail[..database_end];
+        if database.is_empty()
+            || database.len() > 128
+            || !database
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.'))
+        {
+            return false;
+        }
+        let api_tail = tail.get(database_end + 1..).unwrap_or_default();
+        path_starts_with_api_prefix(api_tail, b"tx")
+            || path_starts_with_api_prefix(api_tail, b"query/v2")
     }
 
     fn git_http_api_path(path: &[u8]) -> bool {
@@ -5132,6 +5172,11 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::MongoDb);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"neo4j")
+            || tls_sni_hostname_has_label_prefix(hostname, b"bolt")
+        {
+            return Some(AgentPacketFlowApplication::Neo4j);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"opensearch") {
             return Some(AgentPacketFlowApplication::OpenSearch);
         }
@@ -5508,6 +5553,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"mongodb") || protocol.eq_ignore_ascii_case(b"mongo") {
             return Some(AgentPacketFlowApplication::MongoDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"neo4j") || protocol.eq_ignore_ascii_case(b"bolt") {
+            return Some(AgentPacketFlowApplication::Neo4j);
         }
         if protocol.eq_ignore_ascii_case(b"opensearch") {
             return Some(AgentPacketFlowApplication::OpenSearch);
@@ -15472,6 +15520,45 @@ pub mod api {
         Some((value, value_end))
     }
 
+    fn neo4j_bolt_payload(payload: &[u8]) -> bool {
+        const BOLT_HANDSHAKE_LEN: usize = 20;
+        if payload.len() < BOLT_HANDSHAKE_LEN || payload.get(..4) != Some(&[0x60, 0x60, 0xb0, 0x17])
+        {
+            return false;
+        }
+
+        let mut saw_supported_version = false;
+        for offset in [4_usize, 8, 12, 16] {
+            let Some(version) = read_u32_be(payload, offset) else {
+                return false;
+            };
+            if version == 0 {
+                continue;
+            }
+            if !neo4j_bolt_version_offer(version) {
+                return false;
+            }
+            saw_supported_version = true;
+        }
+        saw_supported_version
+    }
+
+    fn neo4j_bolt_version_offer(version: u32) -> bool {
+        if version == 0x0000_01ff {
+            return true;
+        }
+        let reserved = (version >> 24) as u8;
+        let range = ((version >> 16) & 0xff) as u8;
+        let minor = ((version >> 8) & 0xff) as u8;
+        let major = (version & 0xff) as u8;
+
+        reserved == 0
+            && (1..=16).contains(&major)
+            && minor <= 64
+            && range <= minor
+            && (range == 0 || major >= 4)
+    }
+
     fn mongodb_payload(payload: &[u8]) -> bool {
         if payload.len() < 16 {
             return false;
@@ -17817,6 +17904,23 @@ mod tests {
         assert_eq!(
             mongodb.application(),
             api::AgentPacketFlowApplication::MongoDb
+        );
+
+        let neo4j = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(7687),
+            ..Default::default()
+        };
+        assert_eq!(neo4j.application(), api::AgentPacketFlowApplication::Neo4j);
+
+        let neo4j_http = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(7474),
+            ..Default::default()
+        };
+        assert_eq!(
+            neo4j_http.application(),
+            api::AgentPacketFlowApplication::Neo4j
         );
 
         let solr = api::AgentPacketFlowObservation {
@@ -20876,6 +20980,18 @@ mod tests {
             api::AgentPacketFlowApplication::Pulsar
         );
         assert_eq!(
+            observation_for_payload(b"POST /db/neo4j/tx/commit HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Neo4j
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /db/neo4j/query/v2 HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Neo4j
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /db//tx HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(b"GET /metrics/cadvisor HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Kubelet
         );
@@ -21587,6 +21703,7 @@ mod tests {
                 "mongo-router.db.svc",
                 api::AgentPacketFlowApplication::MongoDb,
             ),
+            ("neo4j-core.db.svc", api::AgentPacketFlowApplication::Neo4j),
             (
                 "opensearch-data.search.svc",
                 api::AgentPacketFlowApplication::OpenSearch,
@@ -21802,6 +21919,10 @@ mod tests {
             (
                 &[b"pulsar".as_slice()][..],
                 api::AgentPacketFlowApplication::Pulsar,
+            ),
+            (
+                &[b"bolt".as_slice()][..],
+                api::AgentPacketFlowApplication::Neo4j,
             ),
             (
                 &[b"zookeeper".as_slice()][..],
@@ -25538,6 +25659,39 @@ mod tests {
                 &0_u32.to_be_bytes()
             ))
             .application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let neo4j_bolt_handshake = [
+            0x60, 0x60, 0xb0, 0x17, 0x00, 0x00, 0x01, 0xff, 0x00, 0x03, 0x03, 0x04, 0x00, 0x00,
+            0x01, 0x04, 0x00, 0x00, 0x00, 0x03,
+        ];
+        assert_eq!(
+            observation_for_payload(&neo4j_bolt_handshake).application(),
+            api::AgentPacketFlowApplication::Neo4j
+        );
+        let mut neo4j_bolt_with_trailing_message = neo4j_bolt_handshake.to_vec();
+        neo4j_bolt_with_trailing_message.extend_from_slice(&[0x00, 0x02, 0xb0, 0x01, 0x00, 0x00]);
+        assert_eq!(
+            observation_for_payload(&neo4j_bolt_with_trailing_message).application(),
+            api::AgentPacketFlowApplication::Neo4j
+        );
+        let mut neo4j_bolt_bad_magic = neo4j_bolt_handshake;
+        neo4j_bolt_bad_magic[3] = 0x16;
+        assert_eq!(
+            observation_for_payload(&neo4j_bolt_bad_magic).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut neo4j_bolt_all_zero_versions = neo4j_bolt_handshake;
+        neo4j_bolt_all_zero_versions[4..].fill(0);
+        assert_eq!(
+            observation_for_payload(&neo4j_bolt_all_zero_versions).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let mut neo4j_bolt_bad_version_range = neo4j_bolt_handshake;
+        neo4j_bolt_bad_version_range[5] = 0x05;
+        neo4j_bolt_bad_version_range[6] = 0x01;
+        assert_eq!(
+            observation_for_payload(&neo4j_bolt_bad_version_range).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         let empty_bson = mongodb_empty_document();
