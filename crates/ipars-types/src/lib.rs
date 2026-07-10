@@ -1863,6 +1863,7 @@ pub mod api {
         Zipkin,
         Grpc,
         Kafka,
+        Pulsar,
         Nats,
         Mqtt,
         Coap,
@@ -1887,7 +1888,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 77] = [
+        pub const ALL: [Self; 78] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1946,6 +1947,7 @@ pub mod api {
             Self::Zipkin,
             Self::Grpc,
             Self::Kafka,
+            Self::Pulsar,
             Self::Nats,
             Self::Mqtt,
             Self::Coap,
@@ -2027,6 +2029,7 @@ pub mod api {
                 Self::Zipkin => "zipkin",
                 Self::Grpc => "grpc",
                 Self::Kafka => "kafka",
+                Self::Pulsar => "pulsar",
                 Self::Nats => "nats",
                 Self::Mqtt => "mqtt",
                 Self::Coap => "coap",
@@ -2569,6 +2572,11 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Kafka;
             }
+            if (self.involves_port(6650) || self.involves_port(6651))
+                && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Pulsar;
+            }
             if self.involves_port(4222) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Nats;
             }
@@ -2794,6 +2802,7 @@ pub mod api {
                 .or_else(|| {
                     memcached_payload(payload).then_some(AgentPacketFlowApplication::Memcached)
                 })
+                .or_else(|| pulsar_payload(payload).then_some(AgentPacketFlowApplication::Pulsar))
                 .or_else(|| kafka_payload(payload).then_some(AgentPacketFlowApplication::Kafka))
                 .or_else(|| nats_payload(payload).then_some(AgentPacketFlowApplication::Nats))
                 .or_else(|| mqtt_payload(payload).then_some(AgentPacketFlowApplication::Mqtt))
@@ -3179,6 +3188,9 @@ pub mod api {
             }
             if grpc_http_payload(payload) {
                 return Some(AgentPacketFlowApplication::Grpc);
+            }
+            if pulsar_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Pulsar);
             }
             if opensearch_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::OpenSearch);
@@ -3569,6 +3581,14 @@ pub mod api {
         path_starts_with_api_prefix(path, b"/solr")
             || path_starts_with_api_prefix(path, b"/api/collections")
             || path_starts_with_api_prefix(path, b"/api/cores")
+    }
+
+    fn pulsar_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 4] = [b"/admin/v2", b"/admin/v3", b"/lookup/v2", b"/ws/v2"];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
     }
 
     fn git_http_api_path(path: &[u8]) -> bool {
@@ -5083,6 +5103,12 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"pulsar")
+            || tls_sni_hostname_has_label_prefix(hostname, b"pulsar-broker")
+            || tls_sni_hostname_has_label_prefix(hostname, b"pulsar-proxy")
+        {
+            return Some(AgentPacketFlowApplication::Pulsar);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"nats") {
             return Some(AgentPacketFlowApplication::Nats);
         }
@@ -5453,6 +5479,10 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
+        }
+        if protocol.eq_ignore_ascii_case(b"pulsar") || protocol.eq_ignore_ascii_case(b"pulsar+ssl")
+        {
+            return Some(AgentPacketFlowApplication::Pulsar);
         }
         if protocol.eq_ignore_ascii_case(b"nats") {
             return Some(AgentPacketFlowApplication::Nats);
@@ -12402,6 +12432,174 @@ pub mod api {
         payload.len() < 10
     }
 
+    const PULSAR_MAX_FRAME_SIZE: usize = 5 * 1024 * 1024;
+
+    fn pulsar_payload(payload: &[u8]) -> bool {
+        let mut offset = 0_usize;
+        let mut frame_count = 0_usize;
+        while offset < payload.len() {
+            if payload.len().saturating_sub(offset) < 8 {
+                return frame_count > 0;
+            }
+            match pulsar_frame_payload(payload, offset) {
+                Some(PulsarFrameParse::Complete(next_offset)) => {
+                    frame_count += 1;
+                    if frame_count > 16 {
+                        return false;
+                    }
+                    offset = next_offset;
+                }
+                Some(PulsarFrameParse::Incomplete) => return true,
+                None => return false,
+            }
+        }
+        frame_count > 0
+    }
+
+    enum PulsarFrameParse {
+        Complete(usize),
+        Incomplete,
+    }
+
+    fn pulsar_frame_payload(payload: &[u8], offset: usize) -> Option<PulsarFrameParse> {
+        let frame_size = read_u32_be(payload, offset)? as usize;
+        if !(6..=PULSAR_MAX_FRAME_SIZE).contains(&frame_size) {
+            return None;
+        }
+        let frame_payload_offset = offset.checked_add(4)?;
+        let frame_end = frame_payload_offset.checked_add(frame_size)?;
+        let command_size = read_u32_be(payload, frame_payload_offset)? as usize;
+        if !(2..=PULSAR_MAX_FRAME_SIZE).contains(&command_size)
+            || command_size > frame_size.saturating_sub(4)
+        {
+            return None;
+        }
+        let command_offset = frame_payload_offset.checked_add(4)?;
+        let command_end = command_offset.checked_add(command_size)?;
+        if payload.len() < command_offset.checked_add(2)? {
+            return None;
+        }
+        let observed_command_end = payload.len().min(command_end);
+        let command = payload.get(command_offset..observed_command_end)?;
+        if !pulsar_base_command_payload(command, command_size) {
+            return None;
+        }
+        if payload.len() < frame_end {
+            Some(PulsarFrameParse::Incomplete)
+        } else {
+            Some(PulsarFrameParse::Complete(frame_end))
+        }
+    }
+
+    fn pulsar_base_command_payload(command: &[u8], command_size: usize) -> bool {
+        let Some((field_key, type_offset)) = protobuf_varint(command, 0) else {
+            return false;
+        };
+        if field_key != 0x08 {
+            return false;
+        }
+        let Some((command_type, mut offset)) = protobuf_varint(command, type_offset) else {
+            return false;
+        };
+        if !pulsar_known_command_type(command_type) {
+            return false;
+        }
+
+        let incomplete = command.len() < command_size;
+        let mut saw_matching_command_body = false;
+        let mut field_count = 0_usize;
+        while offset < command.len() {
+            field_count += 1;
+            if field_count > 64 {
+                return false;
+            }
+            let Some((field_key, next_offset)) = protobuf_varint(command, offset) else {
+                return incomplete && protobuf_varint_incomplete(&command[offset..]);
+            };
+            let field_number = field_key >> 3;
+            let wire_type = field_key & 0x07;
+            if field_number == 0 {
+                return false;
+            }
+            if field_number == command_type {
+                saw_matching_command_body = true;
+            }
+            offset = next_offset;
+            match wire_type {
+                0 => {
+                    let Some((_, next_offset)) = protobuf_varint(command, offset) else {
+                        return incomplete && protobuf_varint_incomplete(&command[offset..]);
+                    };
+                    offset = next_offset;
+                }
+                1 => {
+                    let Some(next_offset) = offset.checked_add(8) else {
+                        return false;
+                    };
+                    if next_offset > command.len() {
+                        return incomplete;
+                    }
+                    offset = next_offset;
+                }
+                2 => {
+                    let Some((len, value_offset)) = protobuf_varint(command, offset) else {
+                        return incomplete && protobuf_varint_incomplete(&command[offset..]);
+                    };
+                    if len > PULSAR_MAX_FRAME_SIZE as u64 {
+                        return false;
+                    }
+                    let Some(value_end) = value_offset.checked_add(len as usize) else {
+                        return false;
+                    };
+                    if value_end > command.len() {
+                        return incomplete;
+                    }
+                    offset = value_end;
+                }
+                5 => {
+                    let Some(next_offset) = offset.checked_add(4) else {
+                        return false;
+                    };
+                    if next_offset > command.len() {
+                        return incomplete;
+                    }
+                    offset = next_offset;
+                }
+                _ => return false,
+            }
+        }
+
+        incomplete || saw_matching_command_body || matches!(command_type, 18 | 19)
+    }
+
+    fn pulsar_known_command_type(command_type: u64) -> bool {
+        matches!(command_type, 2..=40 | 50..=68 | 70..=81)
+    }
+
+    fn protobuf_varint(payload: &[u8], offset: usize) -> Option<(u64, usize)> {
+        let mut value = 0_u64;
+        let tail = payload.get(offset..)?;
+        for (index, byte) in tail.iter().take(10).enumerate() {
+            value |= ((byte & 0x7f) as u64).checked_shl((7 * index) as u32)?;
+            if byte & 0x80 == 0 {
+                return Some((value, offset + index + 1));
+            }
+        }
+        None
+    }
+
+    fn protobuf_varint_incomplete(payload: &[u8]) -> bool {
+        if payload.is_empty() {
+            return true;
+        }
+        for byte in payload.iter().take(10) {
+            if byte & 0x80 == 0 {
+                return false;
+            }
+        }
+        payload.len() < 10
+    }
+
     fn nats_payload(payload: &[u8]) -> bool {
         let mut offset = 0_usize;
         let mut frame_count = 0_usize;
@@ -17560,6 +17758,26 @@ mod tests {
         };
         assert_eq!(kafka.application(), api::AgentPacketFlowApplication::Kafka);
 
+        let pulsar = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6650),
+            ..Default::default()
+        };
+        assert_eq!(
+            pulsar.application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+
+        let pulsar_tls = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(6651),
+            ..Default::default()
+        };
+        assert_eq!(
+            pulsar_tls.application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+
         let nats = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(4222),
@@ -18534,6 +18752,23 @@ mod tests {
                 }
             }
             encoded
+        }
+
+        fn pulsar_frame(command: &[u8], tail: &[u8]) -> Vec<u8> {
+            let frame_size = 4 + command.len() + tail.len();
+            let mut payload = (frame_size as u32).to_be_bytes().to_vec();
+            payload.extend_from_slice(&(command.len() as u32).to_be_bytes());
+            payload.extend_from_slice(command);
+            payload.extend_from_slice(tail);
+            payload
+        }
+
+        fn pulsar_connect_command() -> Vec<u8> {
+            let mut connect = vec![0x0a, 13];
+            connect.extend_from_slice(b"Pulsar Client");
+            let mut command = vec![0x08, 0x02, 0x12, connect.len() as u8];
+            command.extend_from_slice(&connect);
+            command
         }
 
         fn amqp_frame(frame_type: u8, channel: u16, body: &[u8]) -> Vec<u8> {
@@ -20636,6 +20871,11 @@ mod tests {
             api::AgentPacketFlowApplication::Prometheus
         );
         assert_eq!(
+            observation_for_payload(b"GET /admin/v2/persistent/public/default/topic HTTP/1.1\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+        assert_eq!(
             observation_for_payload(b"GET /metrics/cadvisor HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Kubelet
         );
@@ -21311,6 +21551,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Kafka,
             ),
             (
+                "pulsar-broker.messaging.svc",
+                api::AgentPacketFlowApplication::Pulsar,
+            ),
+            (
                 "nats-leaf.messaging.svc",
                 api::AgentPacketFlowApplication::Nats,
             ),
@@ -21554,6 +21798,10 @@ mod tests {
             (
                 &[b"kafka".as_slice()][..],
                 api::AgentPacketFlowApplication::Kafka,
+            ),
+            (
+                &[b"pulsar".as_slice()][..],
+                api::AgentPacketFlowApplication::Pulsar,
             ),
             (
                 &[b"zookeeper".as_slice()][..],
@@ -24113,6 +24361,40 @@ mod tests {
         mqtt_connack_trailing.push(0);
         assert_eq!(
             observation_for_payload(&mqtt_connack_trailing).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        let pulsar_connect = pulsar_frame(&pulsar_connect_command(), &[]);
+        assert_eq!(
+            observation_for_payload(&pulsar_connect).application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+        assert_eq!(
+            observation_for_payload(&pulsar_frame(&[0x08, 0x12], &[])).application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+        let pulsar_connect_with_metadata = pulsar_frame(&pulsar_connect_command(), &[0, 0, 0, 0]);
+        assert_eq!(
+            observation_for_payload(&pulsar_connect_with_metadata).application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+        let mut pulsar_connect_truncated = pulsar_connect.clone();
+        pulsar_connect_truncated.truncate(12);
+        assert_eq!(
+            observation_for_payload(&pulsar_connect_truncated).application(),
+            api::AgentPacketFlowApplication::Pulsar
+        );
+        let mut pulsar_unknown_type = pulsar_frame(&[0x08, 0x01], &[]);
+        assert_eq!(
+            observation_for_payload(&pulsar_unknown_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        pulsar_unknown_type[7] = 3;
+        assert_eq!(
+            observation_for_payload(&pulsar_unknown_type).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+        assert_eq!(
+            observation_for_payload(&pulsar_frame(&[0x10, 0x02], &[])).application(),
             api::AgentPacketFlowApplication::Unknown
         );
         assert_eq!(

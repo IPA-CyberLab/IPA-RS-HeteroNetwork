@@ -536,6 +536,7 @@ pub struct AgentRuntime {
     packet_flow_application_zipkin_count: AtomicU64,
     packet_flow_application_grpc_count: AtomicU64,
     packet_flow_application_kafka_count: AtomicU64,
+    packet_flow_application_pulsar_count: AtomicU64,
     packet_flow_application_nats_count: AtomicU64,
     packet_flow_application_mqtt_count: AtomicU64,
     packet_flow_application_coap_count: AtomicU64,
@@ -1188,6 +1189,7 @@ impl AgentRuntime {
             packet_flow_application_zipkin_count: AtomicU64::new(0),
             packet_flow_application_grpc_count: AtomicU64::new(0),
             packet_flow_application_kafka_count: AtomicU64::new(0),
+            packet_flow_application_pulsar_count: AtomicU64::new(0),
             packet_flow_application_nats_count: AtomicU64::new(0),
             packet_flow_application_mqtt_count: AtomicU64::new(0),
             packet_flow_application_coap_count: AtomicU64::new(0),
@@ -2010,6 +2012,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::Zipkin => &self.packet_flow_application_zipkin_count,
             AgentPacketFlowApplication::Grpc => &self.packet_flow_application_grpc_count,
             AgentPacketFlowApplication::Kafka => &self.packet_flow_application_kafka_count,
+            AgentPacketFlowApplication::Pulsar => &self.packet_flow_application_pulsar_count,
             AgentPacketFlowApplication::Nats => &self.packet_flow_application_nats_count,
             AgentPacketFlowApplication::Mqtt => &self.packet_flow_application_mqtt_count,
             AgentPacketFlowApplication::Coap => &self.packet_flow_application_coap_count,
@@ -7624,6 +7627,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(kafka_match.peer, peer_b_id);
+        let pulsar_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 49)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(6650),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(pulsar_match.peer, peer_b_id);
         let memcached_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 30)),
@@ -7759,8 +7776,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 59);
-        assert_eq!(metrics.packet_flow_match_count, 57);
+        assert_eq!(metrics.packet_flow_observation_count, 60);
+        assert_eq!(metrics.packet_flow_match_count, 58);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -7772,7 +7789,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            57
+            58
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -7845,6 +7862,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Tempo), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Zipkin), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Kafka), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Pulsar), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Memcached), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Grpc), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
