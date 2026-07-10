@@ -1856,6 +1856,7 @@ pub mod api {
         Couchbase,
         Prometheus,
         OpenTelemetry,
+        Grafana,
         Syslog,
         Snmp,
         Jaeger,
@@ -1890,7 +1891,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 80] = [
+        pub const ALL: [Self; 81] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1942,6 +1943,7 @@ pub mod api {
             Self::Couchbase,
             Self::Prometheus,
             Self::OpenTelemetry,
+            Self::Grafana,
             Self::Syslog,
             Self::Snmp,
             Self::Jaeger,
@@ -2026,6 +2028,7 @@ pub mod api {
                 Self::Couchbase => "couchbase",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
+                Self::Grafana => "grafana",
                 Self::Syslog => "syslog",
                 Self::Snmp => "snmp",
                 Self::Jaeger => "jaeger",
@@ -2522,6 +2525,9 @@ pub mod api {
                 && protocol_is(self.protocol, TransportProtocol::Tcp)
             {
                 return AgentPacketFlowApplication::OpenTelemetry;
+            }
+            if self.involves_port(3000) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Grafana;
             }
             if self.involves_port(514)
                 && matches!(self.protocol, None | Some(TransportProtocol::Udp))
@@ -3195,6 +3201,9 @@ pub mod api {
             if path_starts_with_any(path, &[b"/v1/traces", b"/v1/metrics", b"/v1/logs"]) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
+            if grafana_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Grafana);
+            }
             if opentelemetry_grpc_path(path) {
                 return Some(AgentPacketFlowApplication::OpenTelemetry);
             }
@@ -3370,6 +3379,9 @@ pub mod api {
             || http_header_contains(headers, b"grpc-status")
         {
             return Some(AgentPacketFlowApplication::Grpc);
+        }
+        if http_header_name_has_prefix(headers, b"x-grafana-") {
+            return Some(AgentPacketFlowApplication::Grafana);
         }
         None
     }
@@ -3648,6 +3660,26 @@ pub mod api {
             b"/ui/index.html",
             b"/settings/web",
             b"/controller/rebalance",
+        ];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn grafana_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 11] = [
+            b"/api/datasources",
+            b"/api/ds/query",
+            b"/api/dashboards",
+            b"/api/folders",
+            b"/api/annotations",
+            b"/api/plugins",
+            b"/api/frontend",
+            b"/api/live",
+            b"/api/org",
+            b"/api/user",
+            b"/api/teams",
         ];
 
         PREFIXES
@@ -5190,6 +5222,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"grpc") {
             return Some(AgentPacketFlowApplication::Grpc);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"grafana") {
+            return Some(AgentPacketFlowApplication::Grafana);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
         }
@@ -5574,6 +5609,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"grpc") || protocol.eq_ignore_ascii_case(b"grpc-exp") {
             return Some(AgentPacketFlowApplication::Grpc);
+        }
+        if protocol.eq_ignore_ascii_case(b"grafana") {
+            return Some(AgentPacketFlowApplication::Grafana);
         }
         if protocol.eq_ignore_ascii_case(b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
@@ -17796,6 +17834,16 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
 
+        let grafana = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(3000),
+            ..Default::default()
+        };
+        assert_eq!(
+            grafana.application(),
+            api::AgentPacketFlowApplication::Grafana
+        );
+
         let syslog_udp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(514),
@@ -21127,6 +21175,22 @@ mod tests {
             api::AgentPacketFlowApplication::OpenTelemetry
         );
         assert_eq!(
+            observation_for_payload(b"GET /api/datasources HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Grafana
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /api/ds/query HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Grafana
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Grafana-Org-Id: 1\r\n").application(),
+            api::AgentPacketFlowApplication::Grafana
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /login HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(
                 b"POST /package.Service/Method HTTP/1.1\r\ncontent-type: application/grpc\r\n"
             )
@@ -21750,6 +21814,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Zipkin,
             ),
             (
+                "grafana-observability.svc",
+                api::AgentPacketFlowApplication::Grafana,
+            ),
+            (
                 "clickhouse-0.analytics.svc",
                 api::AgentPacketFlowApplication::ClickHouse,
             ),
@@ -21954,6 +22022,10 @@ mod tests {
             (
                 &[b"zipkin-grpc".as_slice()][..],
                 api::AgentPacketFlowApplication::Zipkin,
+            ),
+            (
+                &[b"grafana".as_slice()][..],
+                api::AgentPacketFlowApplication::Grafana,
             ),
             (
                 &[b"clickhouse-native".as_slice()][..],
