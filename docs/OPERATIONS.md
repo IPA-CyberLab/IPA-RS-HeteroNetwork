@@ -83,9 +83,10 @@ ipars docker install \
 ```
 
 Set `--agent-runtime-backend dry-run` for rootful Compose validation that must not
-create host networking resources. Rootless deployments require the default
-`linux-command` backend because their Compose override starts a userspace
-WireGuard process.
+create host networking resources. Rootless deployments are always forced to the
+same `dry-run` backend because their Compose override intentionally removes the
+TUN device and kernel capabilities required by a WireGuard data plane. Use a
+rootful agent for production WireGuard connectivity.
 
 Run the repeatable Compose smoke with:
 

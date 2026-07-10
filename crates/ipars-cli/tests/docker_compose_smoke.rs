@@ -340,19 +340,10 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
             ("IPARS_AGENT_STUN_BIND", "0.0.0.0:51821"),
             ("IPARS_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
-            ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
+            ("IPARS_AGENT_RUNTIME_BACKEND", "dry-run"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
-            ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-command"),
-            ("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND", "wireguard-go"),
-            ("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS", "ipars0"),
-            (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
-                "30",
-            ),
-            (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
-                "20",
-            ),
+            ("IPARS_AGENT_WIREGUARD_BACKEND", "command"),
+            ("IPARS_AGENT_ROUTE_BACKEND", "command"),
         ],
     )?;
     for forbidden in [
@@ -363,7 +354,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "IPARS_DOCKER_HOST_INTERFACE:",
         "IPARS_DOCKER_EXPOSE_HOST_ROUTES:",
         "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:",
-        "IPARS_AGENT_RELAY_FORWARDER_NETNS:",
+        "IPARS_AGENT_RELAY_FORWARDER_",
+        "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND:",
+        "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS:",
+        "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS:",
+        "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS:",
         "target: /run/ipars/docker.sock",
     ] {
         anyhow::ensure!(

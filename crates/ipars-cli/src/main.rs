@@ -65,6 +65,8 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
 const DEFAULT_DOCKER_HOST_INTERFACE: &str = "docker0";
 const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 const DOCKER_NETWORK_DRIVER_TEMPLATE: &str = "'{{.Driver}}'";
@@ -458,12 +460,12 @@ struct DockerInstallArgs {
     userspace_wireguard_args: Vec<String>,
     #[arg(
         long = "userspace-wireguard-ready-timeout-seconds",
-        default_value_t = 10
+        default_value_t = DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS
     )]
     userspace_wireguard_ready_timeout_seconds: u64,
     #[arg(
         long = "userspace-wireguard-shutdown-timeout-seconds",
-        default_value_t = 5
+        default_value_t = DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS
     )]
     userspace_wireguard_shutdown_timeout_seconds: u64,
     #[arg(long = "relay-public-endpoint")]
@@ -4843,8 +4845,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
                 .to_string(),
         );
         prerequisites.push(
-            "A userspace WireGuard implementation launched by --userspace-wireguard-command"
-                .to_string(),
+            "Rootless mode is limited to non-mutating control-plane and peer-map validation; use a rootful agent for a WireGuard data plane".to_string(),
         );
     } else {
         prerequisites.push("net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string());
@@ -4867,7 +4868,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     }
     let mut notes = Vec::new();
     if args.rootless {
-        notes.push("The rootless agent service runs with host networking for colocated service access, but Docker route application is disabled because docker/compose.rootless.yaml removes Linux capabilities and /dev/net/tun mounts".to_string());
+        notes.push("The rootless agent service runs with host networking for colocated service access, but docker/compose.rootless.yaml forces the non-mutating dry-run backend because it removes Linux capabilities and /dev/net/tun mounts".to_string());
     } else {
         notes.push("The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string());
     }
@@ -4889,8 +4890,8 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     }
     if args.rootless {
         notes.push("Rootless Docker install plans add docker/compose.rootless.yaml so the agent and relay services do not request kernel capabilities or /dev/net/tun device mounts from rootless Docker".to_string());
-        notes.push("Rootless Docker install plans select the userspace-command WireGuard backend and start the configured userspace WireGuard process before peer-map sync".to_string());
-        notes.push("Use a separate rootful route-provider agent for Docker container CIDR reachability; rootless install plans reject Docker route and Docker API discovery settings instead of emitting an unusable route loop".to_string());
+        notes.push("Rootless Docker install plans reject userspace WireGuard process settings rather than advertising a data plane that cannot create a TUN interface without host capabilities".to_string());
+        notes.push("Use a separate rootful agent for WireGuard data-plane and Docker container CIDR reachability; rootless install plans reject Docker route, Docker API discovery, and userspace WireGuard process settings instead of emitting an unusable runtime".to_string());
     } else {
         notes.push("For rootless Docker container CIDR reachability, run a separate rootful route-provider agent or an equivalent userspace routing layer instead of the rootless Compose override".to_string());
     }
@@ -5051,14 +5052,18 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
     if !args.rootless {
         return Ok(());
     }
-    if args.userspace_wireguard_command.is_none() {
+    if args.userspace_wireguard_command.is_some() || !args.userspace_wireguard_args.is_empty() {
         anyhow::bail!(
-            "--rootless requires --userspace-wireguard-command because the rootless Compose override cannot create kernel WireGuard devices"
+            "--rootless does not support --userspace-wireguard-command or --userspace-wireguard-arg because docker/compose.rootless.yaml cannot create a TUN interface"
         );
     }
-    if args.agent_runtime_backend != "linux-command" {
+    if args.userspace_wireguard_ready_timeout_seconds
+        != DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS
+        || args.userspace_wireguard_shutdown_timeout_seconds
+            != DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS
+    {
         anyhow::bail!(
-            "--rootless requires --agent-runtime-backend linux-command because the rootless Compose override uses a userspace WireGuard process"
+            "--rootless does not support userspace WireGuard lifecycle timeout settings because docker/compose.rootless.yaml uses the dry-run backend"
         );
     }
     let has_docker_route_settings = args.docker_discover_networks
@@ -5078,6 +5083,23 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
     if args.relay_forwarder_netns.is_some() {
         anyhow::bail!(
             "--rootless cannot be combined with --relay-forwarder-netns because docker/compose.rootless.yaml removes the CAP_SYS_ADMIN and host namespace access required for namespaced relay forwarders"
+        );
+    }
+    let has_relay_forwarder_settings = args.relay_forwarder_endpoint.is_some()
+        || args.relay_forwarder_bind.is_some()
+        || args.relay_forwarder_wireguard_endpoint.is_some()
+        || args.relay_forwarder_max_sessions != DEFAULT_RELAY_FORWARDER_MAX_SESSIONS
+        || args.relay_forwarder_restart_backoff_seconds
+            != DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS
+        || args.relay_forwarder_crash_window_seconds
+            != DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS
+        || args.relay_forwarder_max_crashes_per_window
+            != DEFAULT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW
+        || args.relay_forwarder_crash_cooldown_seconds
+            != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS;
+    if has_relay_forwarder_settings {
+        anyhow::bail!(
+            "--rootless cannot be combined with relay forwarder settings because docker/compose.rootless.yaml uses the in-memory dry-run WireGuard backend"
         );
     }
     Ok(())
@@ -5426,10 +5448,15 @@ fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
 
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
     let apply_docker_routes = !args.rootless;
+    let agent_runtime_backend = if args.rootless {
+        "dry-run"
+    } else {
+        args.agent_runtime_backend.as_str()
+    };
     let mut environment = vec![
         InstallEnvironment {
             name: "IPARS_AGENT_RUNTIME_BACKEND".to_string(),
-            value: args.agent_runtime_backend.clone(),
+            value: agent_runtime_backend.to_string(),
         },
         InstallEnvironment {
             name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
@@ -5503,7 +5530,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             });
         }
     }
-    if args.rootless || args.userspace_wireguard_command.is_some() {
+    if args.userspace_wireguard_command.is_some() {
         environment.push(InstallEnvironment {
             name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
             value: "userspace-command".to_string(),
@@ -5521,7 +5548,7 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             value: args.userspace_wireguard_args.join(","),
         });
     }
-    if args.rootless || args.userspace_wireguard_command.is_some() {
+    if args.userspace_wireguard_command.is_some() {
         environment.push(InstallEnvironment {
             name: "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
             value: args.userspace_wireguard_ready_timeout_seconds.to_string(),
@@ -5534,7 +5561,9 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         });
     }
     append_docker_relay_advertisement_environment(&mut environment, args);
-    append_docker_relay_forwarder_environment(&mut environment, args);
+    if !args.rootless {
+        append_docker_relay_forwarder_environment(&mut environment, args);
+    }
     environment
 }
 
@@ -11109,7 +11138,7 @@ fi
     }
 
     #[test]
-    fn docker_install_plan_wires_runtime_backend_and_rejects_rootless_dry_run() -> anyhow::Result<()>
+    fn docker_install_plan_wires_runtime_backend_and_forces_rootless_dry_run() -> anyhow::Result<()>
     {
         let plan = docker_install_plan(DockerInstallArgs {
             agent_runtime_backend: "dry-run".to_string(),
@@ -11129,18 +11158,14 @@ fi
         ])
         .is_err());
 
-        let error = match docker_install_plan(DockerInstallArgs {
+        let rootless = docker_install_plan(DockerInstallArgs {
             rootless: true,
-            agent_runtime_backend: "dry-run".to_string(),
-            userspace_wireguard_command: Some("wireguard-go".to_string()),
             ..docker_install_test_args()
-        }) {
-            Ok(_) => anyhow::bail!("rootless dry-run backend should be rejected"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("--rootless requires --agent-runtime-backend linux-command"));
+        })?;
+        assert_eq!(
+            environment_value(&rootless, "IPARS_AGENT_RUNTIME_BACKEND"),
+            Some("dry-run")
+        );
         Ok(())
     }
 
@@ -11421,7 +11446,7 @@ fi
     }
 
     #[test]
-    fn docker_install_plan_exports_rootless_userspace_settings_without_docker_routes(
+    fn docker_install_plan_exports_rootless_dry_run_settings_without_docker_routes(
     ) -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose.yaml"),
@@ -11437,10 +11462,12 @@ fi
             docker_route_interval_seconds: DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
-            userspace_wireguard_command: Some("wireguard-go".to_string()),
-            userspace_wireguard_args: vec!["ipars0".to_string()],
-            userspace_wireguard_ready_timeout_seconds: 30,
-            userspace_wireguard_shutdown_timeout_seconds: 20,
+            userspace_wireguard_command: None,
+            userspace_wireguard_args: Vec::new(),
+            userspace_wireguard_ready_timeout_seconds:
+                DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS,
+            userspace_wireguard_shutdown_timeout_seconds:
+                DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS,
             relay_public_endpoint: None,
             relay_admission_url: None,
             relay_status_url: None,
@@ -11470,7 +11497,7 @@ fi
         assert!(plan
             .prerequisites
             .iter()
-            .any(|requirement| requirement.contains("userspace WireGuard")));
+            .any(|requirement| requirement.contains("non-mutating control-plane")));
         assert!(!plan
             .prerequisites
             .iter()
@@ -11491,33 +11518,33 @@ fi
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
-            Some("userspace-command")
+            None
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_RUNTIME_BACKEND"),
-            Some("linux-command")
+            Some("dry-run")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"),
-            Some("wireguard-go")
+            None
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"),
-            Some("ipars0")
+            None
         );
         assert_eq!(
             environment_value(
                 &plan,
                 "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"
             ),
-            Some("30")
+            None
         );
         assert_eq!(
             environment_value(
                 &plan,
                 "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"
             ),
-            Some("20")
+            None
         );
         assert_eq!(
             environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
@@ -11538,19 +11565,18 @@ fi
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("userspace-command WireGuard backend")));
+            .any(|note| note.contains("non-mutating dry-run backend")));
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("Docker route application is disabled")));
+            .any(|note| note.contains("do not request kernel capabilities")));
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("rootful route-provider agent")));
+            .any(|note| note.contains("separate rootful agent")));
 
         let namespaced_forwarder = match docker_install_plan(DockerInstallArgs {
             rootless: true,
-            userspace_wireguard_command: Some("wireguard-go".to_string()),
             relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
             relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
             relay_forwarder_netns: Some("relay-fw".to_string()),
@@ -11564,6 +11590,31 @@ fi
         assert!(namespaced_forwarder
             .to_string()
             .contains("--rootless cannot be combined with --relay-forwarder-netns"));
+
+        let relay_forwarder = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            relay_forwarder_bind: Some("0.0.0.0:45182".to_string()),
+            relay_forwarder_wireguard_endpoint: Some("127.0.0.1:51820".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("rootless relay forwarder should be rejected"),
+            Err(error) => error,
+        };
+        assert!(relay_forwarder
+            .to_string()
+            .contains("--rootless cannot be combined with relay forwarder settings"));
+
+        let userspace_command = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("rootless userspace WireGuard command should be rejected"),
+            Err(error) => error,
+        };
+        assert!(userspace_command
+            .to_string()
+            .contains("--rootless does not support --userspace-wireguard-command"));
         Ok(())
     }
 
@@ -11654,16 +11705,17 @@ fi
         assert!(rootless_compose.contains("cap_add: !reset []"));
         assert!(rootless_compose.contains("devices: !reset []"));
         assert!(rootless_compose.contains("environment: !override"));
-        assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND=userspace-command"));
+        assert!(rootless_compose.contains("IPARS_AGENT_RUNTIME_BACKEND=dry-run"));
+        assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND=command"));
+        assert!(rootless_compose.contains("IPARS_AGENT_ROUTE_BACKEND=command"));
         assert!(rootless_compose.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=false"));
         assert!(rootless_compose.contains("IPARS_DOCKER_DISCOVER_NETWORKS=false"));
-        assert!(rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
-        assert!(
-            rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS")
-        );
+        assert!(!rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
+        assert!(!rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
         assert!(!rootless_compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(!rootless_compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
         assert!(!rootless_compose.contains("IPARS_DOCKER_API_SOCKET"));
+        assert!(!rootless_compose.contains("IPARS_AGENT_RELAY_FORWARDER_"));
         assert!(rootless_compose.contains(
             "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
         ));
@@ -12414,7 +12466,6 @@ fi
             rootless: true,
             docker_container_namespace: Some("compose-edge".to_string()),
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
-            userspace_wireguard_command: Some("wireguard-go".to_string()),
             ..docker_install_test_args()
         }) {
             Ok(_) => anyhow::bail!("rootless static Docker routes should be rejected"),
@@ -12428,7 +12479,6 @@ fi
             rootless: true,
             docker_discover_networks: true,
             docker_networks: vec!["edge_default".to_string()],
-            userspace_wireguard_command: Some("wireguard-go".to_string()),
             ..docker_install_test_args()
         }) {
             Ok(_) => anyhow::bail!("rootless Docker discovery should be rejected"),
@@ -12438,16 +12488,17 @@ fi
             .to_string()
             .contains("--rootless cannot be combined with Docker route or discovery settings"));
 
-        let missing_userspace = match docker_install_plan(DockerInstallArgs {
+        let userspace_command = match docker_install_plan(DockerInstallArgs {
             rootless: true,
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
             ..docker_install_test_args()
         }) {
-            Ok(_) => anyhow::bail!("rootless plan without userspace WireGuard should be rejected"),
+            Ok(_) => anyhow::bail!("rootless userspace WireGuard command should be rejected"),
             Err(error) => error,
         };
-        assert!(missing_userspace
+        assert!(userspace_command
             .to_string()
-            .contains("--rootless requires --userspace-wireguard-command"));
+            .contains("--rootless does not support --userspace-wireguard-command"));
         Ok(())
     }
 
