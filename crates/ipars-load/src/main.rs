@@ -1255,6 +1255,61 @@ impl LoadReport {
                 expected_stun_final_metrics
             );
         }
+        let expected_agent_status_metrics = AgentStatusMetricsMeasurement::from_report(self);
+        let expected_agent_path_metrics = AgentPathMetricsMeasurement::from_report(self);
+        let expected_failover_agent_status_metrics =
+            AgentStatusMetricsMeasurement::from_failover_report(self);
+        let expected_failover_agent_path_metrics =
+            AgentPathMetricsMeasurement::from_failover_report(self);
+        let expected_peer_map_metrics = ControlPlanePeerMapMetricsMeasurement::from_report(self);
+        let expected_failover_peer_map_metrics =
+            ControlPlanePeerMapMetricsMeasurement::from_failover_report(self);
+        let expected_control_plane_health_metrics =
+            ControlPlaneHealthMetricsMeasurement::from_report(self);
+        let expected_failover_control_plane_health_metrics =
+            ControlPlaneHealthMetricsMeasurement::from_failover_report(self);
+        let expected_path_status_metrics =
+            ControlPlanePathStatusMetricsMeasurement::from_report(self);
+        let expected_failover_path_status_metrics =
+            ControlPlanePathStatusMetricsMeasurement::from_failover_report(self);
+        if measurement.agent_status_metrics != expected_agent_status_metrics
+            || measurement.agent_path_metrics != expected_agent_path_metrics
+            || measurement.agent_failover_status_metrics != expected_failover_agent_status_metrics
+            || measurement.agent_failover_path_metrics != expected_failover_agent_path_metrics
+            || measurement.control_plane_peer_map_metrics != expected_peer_map_metrics
+            || measurement.control_plane_failover_peer_map_metrics
+                != expected_failover_peer_map_metrics
+            || measurement.control_plane_health_metrics != expected_control_plane_health_metrics
+            || measurement.control_plane_failover_health_metrics
+                != expected_failover_control_plane_health_metrics
+            || measurement.control_plane_path_status_metrics != expected_path_status_metrics
+            || measurement.control_plane_failover_path_status_metrics
+                != expected_failover_path_status_metrics
+        {
+            bail!(
+                "daemon load scenario retained manifest endpoint summary measurement does not match report: agent status {:?}/{:?}, agent paths {:?}/{:?}, failover agent status {:?}/{:?}, failover agent paths {:?}/{:?}, peer maps {:?}/{:?}, failover peer maps {:?}/{:?}, control-plane health {:?}/{:?}, failover control-plane health {:?}/{:?}, path status {:?}/{:?}, failover path status {:?}/{:?}",
+                measurement.agent_status_metrics,
+                expected_agent_status_metrics,
+                measurement.agent_path_metrics,
+                expected_agent_path_metrics,
+                measurement.agent_failover_status_metrics,
+                expected_failover_agent_status_metrics,
+                measurement.agent_failover_path_metrics,
+                expected_failover_agent_path_metrics,
+                measurement.control_plane_peer_map_metrics,
+                expected_peer_map_metrics,
+                measurement.control_plane_failover_peer_map_metrics,
+                expected_failover_peer_map_metrics,
+                measurement.control_plane_health_metrics,
+                expected_control_plane_health_metrics,
+                measurement.control_plane_failover_health_metrics,
+                expected_failover_control_plane_health_metrics,
+                measurement.control_plane_path_status_metrics,
+                expected_path_status_metrics,
+                measurement.control_plane_failover_path_status_metrics,
+                expected_failover_path_status_metrics
+            );
+        }
         let expected_lifecycle_metrics = ControlPlaneLifecycleMetricsMeasurement::from_report(self);
         let expected_failover_lifecycle_metrics =
             ControlPlaneLifecycleMetricsMeasurement::from_failover_report(self);
@@ -3138,6 +3193,73 @@ async fn run_daemon_scenario(
         relay_final_metrics: RelayFinalMetricsMeasurement::from_status(&status),
         signal_health_metrics: SignalHealthMetricsMeasurement::from_metrics(&signal_metrics),
         stun_final_metrics: StunFinalMetricsMeasurement::from_daemon_stun_report(&daemon_stun),
+        agent_status_metrics: AgentStatusMetricsMeasurement::from_summary(agent_status_summary),
+        agent_path_metrics: AgentPathMetricsMeasurement::from_summary(agent_path_summary),
+        agent_failover_status_metrics: AgentStatusMetricsMeasurement::from_counts(
+            failover_agent_status_endpoints,
+            failover_agent_candidate_count_min,
+            failover_agent_candidate_count_max,
+        ),
+        agent_failover_path_metrics: AgentPathMetricsMeasurement::from_counts(
+            failover_agent_path_status_endpoints,
+            failover_agent_paths_total,
+            failover_agent_reachable_paths_total,
+            failover_agent_path_count_min,
+            failover_agent_path_count_max,
+        ),
+        control_plane_peer_map_metrics: ControlPlanePeerMapMetricsMeasurement::from_summary(
+            peer_map_summary,
+        ),
+        control_plane_failover_peer_map_metrics: ControlPlanePeerMapMetricsMeasurement::from_counts(
+            failover_survivor_endpoints,
+            failover_peer_map_edges_min,
+            failover_peer_map_edges_max,
+            failover_peer_maps_consistent,
+        ),
+        control_plane_health_metrics: ControlPlaneHealthMetricsMeasurement::from_counts(
+            control_summary.endpoint_count,
+            control_summary.relay_candidate_count_min,
+            control_summary.relay_candidate_count_max,
+            control_path_summary.path_count_min,
+            control_path_summary.path_count_max,
+            control_path_summary.reachable_path_count_min,
+            control_path_summary.reachable_path_count_max,
+            control_summary.healthy_node_count_min,
+            control_summary.healthy_node_count_max,
+            control_summary.degraded_node_count_min,
+            control_summary.degraded_node_count_max,
+            control_summary.unhealthy_node_count_min,
+            control_summary.unhealthy_node_count_max,
+            control_summary.metrics_consistent(),
+        ),
+        control_plane_failover_health_metrics: ControlPlaneHealthMetricsMeasurement::from_counts(
+            failover_metrics_endpoints,
+            failover_relay_candidates_min,
+            failover_relay_candidates_max,
+            failover_path_count_min,
+            failover_path_count_max,
+            failover_reachable_path_count_min,
+            failover_reachable_path_count_max,
+            failover_healthy_nodes_min,
+            failover_healthy_nodes_max,
+            failover_degraded_nodes_min,
+            failover_degraded_nodes_max,
+            failover_unhealthy_nodes_min,
+            failover_unhealthy_nodes_max,
+            failover_metrics_consistent,
+        ),
+        control_plane_path_status_metrics: ControlPlanePathStatusMetricsMeasurement::from_summary(
+            control_path_status_summary,
+        ),
+        control_plane_failover_path_status_metrics:
+            ControlPlanePathStatusMetricsMeasurement::from_counts(
+                failover_path_status_requests,
+                failover_path_status_count_min,
+                failover_path_status_count_max,
+                failover_path_status_reachable_count_min,
+                failover_path_status_reachable_count_max,
+                failover_path_status_stale_count_max,
+            ),
         control_plane_failover_checked: failover_checked,
         control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
         control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_summary(
@@ -3926,6 +4048,317 @@ impl StunFinalMetricsMeasurement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentStatusMetricsMeasurement {
+    endpoint_count: usize,
+    candidate_count_min: usize,
+    candidate_count_max: usize,
+}
+
+impl AgentStatusMetricsMeasurement {
+    fn from_summary(summary: DaemonAgentStatusSummary) -> Self {
+        Self {
+            endpoint_count: summary.endpoint_count,
+            candidate_count_min: summary.candidate_count_min,
+            candidate_count_max: summary.candidate_count_max,
+        }
+    }
+
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_agent_status_endpoints,
+            candidate_count_min: report.daemon_agent_candidate_count_min,
+            candidate_count_max: report.daemon_agent_candidate_count_max,
+        }
+    }
+
+    fn from_failover_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_agent_failover_status_endpoints,
+            candidate_count_min: report.daemon_agent_failover_candidate_count_min,
+            candidate_count_max: report.daemon_agent_failover_candidate_count_max,
+        }
+    }
+
+    fn from_counts(
+        endpoint_count: usize,
+        candidate_count_min: usize,
+        candidate_count_max: usize,
+    ) -> Self {
+        Self {
+            endpoint_count,
+            candidate_count_min,
+            candidate_count_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentPathMetricsMeasurement {
+    endpoint_count: usize,
+    path_count_total: usize,
+    reachable_path_count_total: usize,
+    path_count_min: usize,
+    path_count_max: usize,
+}
+
+impl AgentPathMetricsMeasurement {
+    fn from_summary(summary: DaemonAgentPathSummary) -> Self {
+        Self {
+            endpoint_count: summary.endpoint_count,
+            path_count_total: summary.path_count_total,
+            reachable_path_count_total: summary.reachable_path_count_total,
+            path_count_min: summary.path_count_min,
+            path_count_max: summary.path_count_max,
+        }
+    }
+
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_agent_path_status_endpoints,
+            path_count_total: report.daemon_agent_paths_total,
+            reachable_path_count_total: report.daemon_agent_reachable_paths_total,
+            path_count_min: report.daemon_agent_path_count_min,
+            path_count_max: report.daemon_agent_path_count_max,
+        }
+    }
+
+    fn from_failover_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_agent_failover_path_status_endpoints,
+            path_count_total: report.daemon_agent_failover_paths_total,
+            reachable_path_count_total: report.daemon_agent_failover_reachable_paths_total,
+            path_count_min: report.daemon_agent_failover_path_count_min,
+            path_count_max: report.daemon_agent_failover_path_count_max,
+        }
+    }
+
+    fn from_counts(
+        endpoint_count: usize,
+        path_count_total: usize,
+        reachable_path_count_total: usize,
+        path_count_min: usize,
+        path_count_max: usize,
+    ) -> Self {
+        Self {
+            endpoint_count,
+            path_count_total,
+            reachable_path_count_total,
+            path_count_min,
+            path_count_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlPlanePeerMapMetricsMeasurement {
+    endpoint_count: usize,
+    edge_count_min: usize,
+    edge_count_max: usize,
+    maps_consistent: bool,
+}
+
+impl ControlPlanePeerMapMetricsMeasurement {
+    fn from_summary(summary: DaemonPeerMapSummary) -> Self {
+        Self {
+            endpoint_count: summary.endpoint_count,
+            edge_count_min: summary.edge_count_min,
+            edge_count_max: summary.edge_count_max,
+            maps_consistent: summary.maps_consistent,
+        }
+    }
+
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_control_plane_peer_map_endpoints,
+            edge_count_min: report.daemon_control_plane_peer_map_edges_min,
+            edge_count_max: report.daemon_control_plane_peer_map_edges_max,
+            maps_consistent: report.daemon_control_plane_peer_maps_consistent,
+        }
+    }
+
+    fn from_failover_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_control_plane_failover_survivor_endpoints,
+            edge_count_min: report.daemon_control_plane_failover_peer_map_edges_min,
+            edge_count_max: report.daemon_control_plane_failover_peer_map_edges_max,
+            maps_consistent: report.daemon_control_plane_failover_peer_maps_consistent,
+        }
+    }
+
+    fn from_counts(
+        endpoint_count: usize,
+        edge_count_min: usize,
+        edge_count_max: usize,
+        maps_consistent: bool,
+    ) -> Self {
+        Self {
+            endpoint_count,
+            edge_count_min,
+            edge_count_max,
+            maps_consistent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlPlaneHealthMetricsMeasurement {
+    endpoint_count: usize,
+    relay_candidate_count_min: usize,
+    relay_candidate_count_max: usize,
+    path_count_min: usize,
+    path_count_max: usize,
+    reachable_path_count_min: usize,
+    reachable_path_count_max: usize,
+    healthy_node_count_min: usize,
+    healthy_node_count_max: usize,
+    degraded_node_count_min: usize,
+    degraded_node_count_max: usize,
+    unhealthy_node_count_min: usize,
+    unhealthy_node_count_max: usize,
+    metrics_consistent: bool,
+}
+
+impl ControlPlaneHealthMetricsMeasurement {
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_control_plane_metrics_endpoints,
+            relay_candidate_count_min: report.daemon_control_plane_relay_candidates_min,
+            relay_candidate_count_max: report.daemon_control_plane_relay_candidates_max,
+            path_count_min: report.daemon_control_plane_path_count_min,
+            path_count_max: report.daemon_control_plane_path_count_max,
+            reachable_path_count_min: report.daemon_control_plane_reachable_path_count_min,
+            reachable_path_count_max: report.daemon_control_plane_reachable_path_count_max,
+            healthy_node_count_min: report.daemon_control_plane_healthy_nodes_min,
+            healthy_node_count_max: report.daemon_control_plane_healthy_nodes_max,
+            degraded_node_count_min: report.daemon_control_plane_degraded_nodes_min,
+            degraded_node_count_max: report.daemon_control_plane_degraded_nodes_max,
+            unhealthy_node_count_min: report.daemon_control_plane_unhealthy_nodes_min,
+            unhealthy_node_count_max: report.daemon_control_plane_unhealthy_nodes_max,
+            metrics_consistent: report.daemon_control_plane_metrics_consistent,
+        }
+    }
+
+    fn from_failover_report(report: &LoadReport) -> Self {
+        Self {
+            endpoint_count: report.daemon_control_plane_failover_metrics_endpoints,
+            relay_candidate_count_min: report.daemon_control_plane_failover_relay_candidates_min,
+            relay_candidate_count_max: report.daemon_control_plane_failover_relay_candidates_max,
+            path_count_min: report.daemon_control_plane_failover_path_count_min,
+            path_count_max: report.daemon_control_plane_failover_path_count_max,
+            reachable_path_count_min: report.daemon_control_plane_failover_reachable_path_count_min,
+            reachable_path_count_max: report.daemon_control_plane_failover_reachable_path_count_max,
+            healthy_node_count_min: report.daemon_control_plane_failover_healthy_nodes_min,
+            healthy_node_count_max: report.daemon_control_plane_failover_healthy_nodes_max,
+            degraded_node_count_min: report.daemon_control_plane_failover_degraded_nodes_min,
+            degraded_node_count_max: report.daemon_control_plane_failover_degraded_nodes_max,
+            unhealthy_node_count_min: report.daemon_control_plane_failover_unhealthy_nodes_min,
+            unhealthy_node_count_max: report.daemon_control_plane_failover_unhealthy_nodes_max,
+            metrics_consistent: report.daemon_control_plane_failover_metrics_consistent,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_counts(
+        endpoint_count: usize,
+        relay_candidate_count_min: usize,
+        relay_candidate_count_max: usize,
+        path_count_min: usize,
+        path_count_max: usize,
+        reachable_path_count_min: usize,
+        reachable_path_count_max: usize,
+        healthy_node_count_min: usize,
+        healthy_node_count_max: usize,
+        degraded_node_count_min: usize,
+        degraded_node_count_max: usize,
+        unhealthy_node_count_min: usize,
+        unhealthy_node_count_max: usize,
+        metrics_consistent: bool,
+    ) -> Self {
+        Self {
+            endpoint_count,
+            relay_candidate_count_min,
+            relay_candidate_count_max,
+            path_count_min,
+            path_count_max,
+            reachable_path_count_min,
+            reachable_path_count_max,
+            healthy_node_count_min,
+            healthy_node_count_max,
+            degraded_node_count_min,
+            degraded_node_count_max,
+            unhealthy_node_count_min,
+            unhealthy_node_count_max,
+            metrics_consistent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlPlanePathStatusMetricsMeasurement {
+    request_count: usize,
+    path_count_min: usize,
+    path_count_max: usize,
+    reachable_path_count_min: usize,
+    reachable_path_count_max: usize,
+    stale_path_count_max: usize,
+}
+
+impl ControlPlanePathStatusMetricsMeasurement {
+    fn from_summary(summary: DaemonControlPlanePathStatusSummary) -> Self {
+        Self {
+            request_count: summary.request_count,
+            path_count_min: summary.path_count_min,
+            path_count_max: summary.path_count_max,
+            reachable_path_count_min: summary.reachable_path_count_min,
+            reachable_path_count_max: summary.reachable_path_count_max,
+            stale_path_count_max: summary.stale_path_count_max,
+        }
+    }
+
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            request_count: report.daemon_control_plane_path_status_requests,
+            path_count_min: report.daemon_control_plane_path_status_count_min,
+            path_count_max: report.daemon_control_plane_path_status_count_max,
+            reachable_path_count_min: report.daemon_control_plane_path_status_reachable_count_min,
+            reachable_path_count_max: report.daemon_control_plane_path_status_reachable_count_max,
+            stale_path_count_max: report.daemon_control_plane_path_status_stale_count_max,
+        }
+    }
+
+    fn from_failover_report(report: &LoadReport) -> Self {
+        Self {
+            request_count: report.daemon_control_plane_failover_path_status_requests,
+            path_count_min: report.daemon_control_plane_failover_path_status_count_min,
+            path_count_max: report.daemon_control_plane_failover_path_status_count_max,
+            reachable_path_count_min: report
+                .daemon_control_plane_failover_path_status_reachable_count_min,
+            reachable_path_count_max: report
+                .daemon_control_plane_failover_path_status_reachable_count_max,
+            stale_path_count_max: report.daemon_control_plane_failover_path_status_stale_count_max,
+        }
+    }
+
+    fn from_counts(
+        request_count: usize,
+        path_count_min: usize,
+        path_count_max: usize,
+        reachable_path_count_min: usize,
+        reachable_path_count_max: usize,
+        stale_path_count_max: usize,
+    ) -> Self {
+        Self {
+            request_count,
+            path_count_min,
+            path_count_max,
+            reachable_path_count_min,
+            reachable_path_count_max,
+            stale_path_count_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlPlaneLifecycleMetricsMeasurement {
     wireguard_key_rotation_success_count_min: u64,
     wireguard_key_rotation_success_count_max: u64,
@@ -4040,6 +4473,16 @@ struct DaemonRuntimeManifestMeasurement {
     relay_final_metrics: RelayFinalMetricsMeasurement,
     signal_health_metrics: SignalHealthMetricsMeasurement,
     stun_final_metrics: StunFinalMetricsMeasurement,
+    agent_status_metrics: AgentStatusMetricsMeasurement,
+    agent_path_metrics: AgentPathMetricsMeasurement,
+    agent_failover_status_metrics: AgentStatusMetricsMeasurement,
+    agent_failover_path_metrics: AgentPathMetricsMeasurement,
+    control_plane_peer_map_metrics: ControlPlanePeerMapMetricsMeasurement,
+    control_plane_failover_peer_map_metrics: ControlPlanePeerMapMetricsMeasurement,
+    control_plane_health_metrics: ControlPlaneHealthMetricsMeasurement,
+    control_plane_failover_health_metrics: ControlPlaneHealthMetricsMeasurement,
+    control_plane_path_status_metrics: ControlPlanePathStatusMetricsMeasurement,
+    control_plane_failover_path_status_metrics: ControlPlanePathStatusMetricsMeasurement,
     control_plane_failover_checked: bool,
     control_plane_failover_survivor_endpoints: usize,
     control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement,
@@ -7708,6 +8151,36 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert!(error.contains("final snapshot measurement"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_endpoint_summary_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_endpoint_summary_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_endpoint_summary_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_endpoint_summary_measurement.daemon_runtime_manifest =
+            Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(measurement) = manifest.measurement.as_mut() {
+                measurement.agent_path_metrics.reachable_path_count_total -= 1;
+            }
+        })?;
+        let error = match mismatched_endpoint_summary_measurement.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with mismatched endpoint summary should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("endpoint summary measurement"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut mismatched_lifecycle_measurement = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &mismatched_lifecycle_measurement,
@@ -10266,6 +10739,46 @@ fi
             StunFinalMetricsMeasurement::from_report(&report)
         );
         assert_eq!(
+            manifest_measurement.agent_status_metrics,
+            AgentStatusMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.agent_path_metrics,
+            AgentPathMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.agent_failover_status_metrics,
+            AgentStatusMetricsMeasurement::from_failover_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.agent_failover_path_metrics,
+            AgentPathMetricsMeasurement::from_failover_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_peer_map_metrics,
+            ControlPlanePeerMapMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_failover_peer_map_metrics,
+            ControlPlanePeerMapMetricsMeasurement::from_failover_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_health_metrics,
+            ControlPlaneHealthMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_failover_health_metrics,
+            ControlPlaneHealthMetricsMeasurement::from_failover_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_path_status_metrics,
+            ControlPlanePathStatusMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_failover_path_status_metrics,
+            ControlPlanePathStatusMetricsMeasurement::from_failover_report(&report)
+        );
+        assert_eq!(
             manifest_measurement.control_plane_lifecycle_metrics,
             ControlPlaneLifecycleMetricsMeasurement::from_report(&report)
         );
@@ -10882,6 +11395,53 @@ fi
                 socket_receive_errors_reported: 0,
                 socket_send_errors_reported: 0,
             },
+            agent_status_metrics: AgentStatusMetricsMeasurement {
+                endpoint_count: 2,
+                candidate_count_min: 1,
+                candidate_count_max: 1,
+            },
+            agent_path_metrics: AgentPathMetricsMeasurement {
+                endpoint_count: 2,
+                path_count_total: 6,
+                reachable_path_count_total: 6,
+                path_count_min: 3,
+                path_count_max: 3,
+            },
+            agent_failover_status_metrics: AgentStatusMetricsMeasurement {
+                endpoint_count: 2,
+                candidate_count_min: 1,
+                candidate_count_max: 1,
+            },
+            agent_failover_path_metrics: AgentPathMetricsMeasurement {
+                endpoint_count: 2,
+                path_count_total: 6,
+                reachable_path_count_total: 6,
+                path_count_min: 3,
+                path_count_max: 3,
+            },
+            control_plane_peer_map_metrics: ControlPlanePeerMapMetricsMeasurement {
+                endpoint_count: 2,
+                edge_count_min: 6,
+                edge_count_max: 6,
+                maps_consistent: true,
+            },
+            control_plane_failover_peer_map_metrics: ControlPlanePeerMapMetricsMeasurement {
+                endpoint_count: 1,
+                edge_count_min: 6,
+                edge_count_max: 6,
+                maps_consistent: true,
+            },
+            control_plane_health_metrics: ControlPlaneHealthMetricsMeasurement::from_counts(
+                2, 1, 1, 6, 6, 6, 6, 3, 3, 0, 0, 0, 0, true,
+            ),
+            control_plane_failover_health_metrics:
+                ControlPlaneHealthMetricsMeasurement::from_counts(
+                    1, 1, 1, 6, 6, 6, 6, 3, 3, 0, 0, 0, 0, true,
+                ),
+            control_plane_path_status_metrics:
+                ControlPlanePathStatusMetricsMeasurement::from_counts(6, 6, 6, 6, 6, 0),
+            control_plane_failover_path_status_metrics:
+                ControlPlanePathStatusMetricsMeasurement::from_counts(3, 6, 6, 6, 6, 0),
             control_plane_failover_checked: true,
             control_plane_failover_survivor_endpoints: 1,
             control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_counts(
@@ -10930,76 +11490,97 @@ fi
         }
 
         let updated_at = Utc::now();
-        let manifest = DaemonRuntimeManifest {
-            scenario: report.scenario,
-            phase,
-            workload: DaemonRuntimeManifestWorkload {
-                scenario_node_count: report.node_count,
-                scenario_relay_node_count: report.relay_count,
-                scenario_route_provider_count: report.route_provider_count,
-                scenario_active_pair_count: report.active_pair_count,
-                daemon_control_plane_processes: report.daemon_control_plane_processes,
-                daemon_agent_processes: report.daemon_agent_processes,
-                daemon_http_readiness_timeout_seconds: 5,
-                daemon_agent_readiness_timeout_seconds: 15,
-                relay_packets_per_session: report.relay_packets_per_session,
-                relay_payload_bytes: report.relay_payload_bytes_per_packet,
-            },
-            measurement: Some(DaemonRuntimeManifestMeasurement {
-                relay_udp_packets_sent: report.relay_udp_packets_sent,
-                relay_udp_packets_received: report.relay_udp_packets_received,
-                relay_udp_payload_bytes_sent: report.relay_udp_payload_bytes_sent,
-                relay_udp_payload_bytes_received: report.relay_udp_payload_bytes_received,
-                failover_relay_udp_packets_sent: report.daemon_failover_relay_udp_packets_sent,
-                failover_relay_udp_packets_received: report
-                    .daemon_failover_relay_udp_packets_received,
-                failover_relay_udp_payload_bytes_sent: report
-                    .daemon_failover_relay_udp_payload_bytes_sent,
-                failover_relay_udp_payload_bytes_received: report
-                    .daemon_failover_relay_udp_payload_bytes_received,
-                relay_dataplane_datagrams_received_reported: report
-                    .relay_dataplane_datagrams_received_reported,
-                relay_dataplane_datagrams_forwarded_reported: report
-                    .relay_dataplane_datagrams_forwarded_reported,
-                relay_dataplane_datagrams_dropped_reported: report
-                    .relay_dataplane_datagrams_dropped_reported,
-                relay_dataplane_invalid_session_credential_drops_reported: report
-                    .relay_dataplane_invalid_session_credential_drops_reported,
-                relay_dataplane_invalid_session_credential_drops_prometheus_reported: report
-                    .relay_dataplane_invalid_session_credential_drops_prometheus_reported,
-                relay_forwarded_bytes_reported: report.relay_forwarded_bytes_reported,
-                relay_active_sessions_reported: report.relay_active_sessions_reported,
-                relay_final_metrics: RelayFinalMetricsMeasurement::from_report(report),
-                signal_health_metrics: SignalHealthMetricsMeasurement::from_report(report),
-                stun_final_metrics: StunFinalMetricsMeasurement::from_report(report),
-                control_plane_failover_checked: report.daemon_control_plane_failover_checked,
-                control_plane_failover_survivor_endpoints: report
-                    .daemon_control_plane_failover_survivor_endpoints,
-                control_plane_lifecycle_metrics:
-                    ControlPlaneLifecycleMetricsMeasurement::from_report(report),
-                control_plane_failover_lifecycle_metrics:
-                    ControlPlaneLifecycleMetricsMeasurement::from_failover_report(report),
-            }),
-            runtime_dir: runtime_dir.clone(),
-            iparsd_binary: synthetic_daemon_binary_identity(),
-            control_plane_urls: (0..report.daemon_control_plane_processes)
-                .map(|index| format!("http://127.0.0.1:31{index:03}"))
-                .collect(),
-            signal_url: "http://127.0.0.1:32000".to_string(),
-            relay_http_url: "http://127.0.0.1:32001".to_string(),
-            stun_http_url: "http://127.0.0.1:32002".to_string(),
-            relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_002),
-            stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_003),
-            stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_004),
-            agent_urls: (0..report.daemon_agent_processes)
-                .map(|index| format!("http://127.0.0.1:33{index:03}"))
-                .collect(),
-            keep_runtime_dir: true,
-            started_at,
-            updated_at,
-            generated_at: updated_at,
-            children,
-        };
+        let manifest =
+            DaemonRuntimeManifest {
+                scenario: report.scenario,
+                phase,
+                workload: DaemonRuntimeManifestWorkload {
+                    scenario_node_count: report.node_count,
+                    scenario_relay_node_count: report.relay_count,
+                    scenario_route_provider_count: report.route_provider_count,
+                    scenario_active_pair_count: report.active_pair_count,
+                    daemon_control_plane_processes: report.daemon_control_plane_processes,
+                    daemon_agent_processes: report.daemon_agent_processes,
+                    daemon_http_readiness_timeout_seconds: 5,
+                    daemon_agent_readiness_timeout_seconds: 15,
+                    relay_packets_per_session: report.relay_packets_per_session,
+                    relay_payload_bytes: report.relay_payload_bytes_per_packet,
+                },
+                measurement: Some(DaemonRuntimeManifestMeasurement {
+                    relay_udp_packets_sent: report.relay_udp_packets_sent,
+                    relay_udp_packets_received: report.relay_udp_packets_received,
+                    relay_udp_payload_bytes_sent: report.relay_udp_payload_bytes_sent,
+                    relay_udp_payload_bytes_received: report.relay_udp_payload_bytes_received,
+                    failover_relay_udp_packets_sent: report.daemon_failover_relay_udp_packets_sent,
+                    failover_relay_udp_packets_received: report
+                        .daemon_failover_relay_udp_packets_received,
+                    failover_relay_udp_payload_bytes_sent: report
+                        .daemon_failover_relay_udp_payload_bytes_sent,
+                    failover_relay_udp_payload_bytes_received: report
+                        .daemon_failover_relay_udp_payload_bytes_received,
+                    relay_dataplane_datagrams_received_reported: report
+                        .relay_dataplane_datagrams_received_reported,
+                    relay_dataplane_datagrams_forwarded_reported: report
+                        .relay_dataplane_datagrams_forwarded_reported,
+                    relay_dataplane_datagrams_dropped_reported: report
+                        .relay_dataplane_datagrams_dropped_reported,
+                    relay_dataplane_invalid_session_credential_drops_reported: report
+                        .relay_dataplane_invalid_session_credential_drops_reported,
+                    relay_dataplane_invalid_session_credential_drops_prometheus_reported: report
+                        .relay_dataplane_invalid_session_credential_drops_prometheus_reported,
+                    relay_forwarded_bytes_reported: report.relay_forwarded_bytes_reported,
+                    relay_active_sessions_reported: report.relay_active_sessions_reported,
+                    relay_final_metrics: RelayFinalMetricsMeasurement::from_report(report),
+                    signal_health_metrics: SignalHealthMetricsMeasurement::from_report(report),
+                    stun_final_metrics: StunFinalMetricsMeasurement::from_report(report),
+                    agent_status_metrics: AgentStatusMetricsMeasurement::from_report(report),
+                    agent_path_metrics: AgentPathMetricsMeasurement::from_report(report),
+                    agent_failover_status_metrics:
+                        AgentStatusMetricsMeasurement::from_failover_report(report),
+                    agent_failover_path_metrics: AgentPathMetricsMeasurement::from_failover_report(
+                        report,
+                    ),
+                    control_plane_peer_map_metrics:
+                        ControlPlanePeerMapMetricsMeasurement::from_report(report),
+                    control_plane_failover_peer_map_metrics:
+                        ControlPlanePeerMapMetricsMeasurement::from_failover_report(report),
+                    control_plane_health_metrics: ControlPlaneHealthMetricsMeasurement::from_report(
+                        report,
+                    ),
+                    control_plane_failover_health_metrics:
+                        ControlPlaneHealthMetricsMeasurement::from_failover_report(report),
+                    control_plane_path_status_metrics:
+                        ControlPlanePathStatusMetricsMeasurement::from_report(report),
+                    control_plane_failover_path_status_metrics:
+                        ControlPlanePathStatusMetricsMeasurement::from_failover_report(report),
+                    control_plane_failover_checked: report.daemon_control_plane_failover_checked,
+                    control_plane_failover_survivor_endpoints: report
+                        .daemon_control_plane_failover_survivor_endpoints,
+                    control_plane_lifecycle_metrics:
+                        ControlPlaneLifecycleMetricsMeasurement::from_report(report),
+                    control_plane_failover_lifecycle_metrics:
+                        ControlPlaneLifecycleMetricsMeasurement::from_failover_report(report),
+                }),
+                runtime_dir: runtime_dir.clone(),
+                iparsd_binary: synthetic_daemon_binary_identity(),
+                control_plane_urls: (0..report.daemon_control_plane_processes)
+                    .map(|index| format!("http://127.0.0.1:31{index:03}"))
+                    .collect(),
+                signal_url: "http://127.0.0.1:32000".to_string(),
+                relay_http_url: "http://127.0.0.1:32001".to_string(),
+                stun_http_url: "http://127.0.0.1:32002".to_string(),
+                relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_002),
+                stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_003),
+                stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32_004),
+                agent_urls: (0..report.daemon_agent_processes)
+                    .map(|index| format!("http://127.0.0.1:33{index:03}"))
+                    .collect(),
+                keep_runtime_dir: true,
+                started_at,
+                updated_at,
+                generated_at: updated_at,
+                children,
+            };
         let manifest_path = write_daemon_runtime_manifest(&runtime_dir, manifest)?;
         Ok((runtime_dir, manifest_path))
     }
