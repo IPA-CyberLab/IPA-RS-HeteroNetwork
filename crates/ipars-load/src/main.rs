@@ -1238,6 +1238,23 @@ impl LoadReport {
                 self.daemon_control_plane_failover_checked
             );
         }
+        let expected_relay_final_metrics = RelayFinalMetricsMeasurement::from_report(self);
+        let expected_signal_health_metrics = SignalHealthMetricsMeasurement::from_report(self);
+        let expected_stun_final_metrics = StunFinalMetricsMeasurement::from_report(self);
+        if measurement.relay_final_metrics != expected_relay_final_metrics
+            || measurement.signal_health_metrics != expected_signal_health_metrics
+            || measurement.stun_final_metrics != expected_stun_final_metrics
+        {
+            bail!(
+                "daemon load scenario retained manifest final snapshot measurement does not match report: relay {:?}/{:?}, signal {:?}/{:?}, STUN {:?}/{:?}",
+                measurement.relay_final_metrics,
+                expected_relay_final_metrics,
+                measurement.signal_health_metrics,
+                expected_signal_health_metrics,
+                measurement.stun_final_metrics,
+                expected_stun_final_metrics
+            );
+        }
         let expected_lifecycle_metrics = ControlPlaneLifecycleMetricsMeasurement::from_report(self);
         let expected_failover_lifecycle_metrics =
             ControlPlaneLifecycleMetricsMeasurement::from_failover_report(self);
@@ -3118,6 +3135,9 @@ async fn run_daemon_scenario(
             prometheus_invalid_credential_drops,
         relay_forwarded_bytes_reported: forwarded_bytes,
         relay_active_sessions_reported: status.capability.active_sessions as usize,
+        relay_final_metrics: RelayFinalMetricsMeasurement::from_status(&status),
+        signal_health_metrics: SignalHealthMetricsMeasurement::from_metrics(&signal_metrics),
+        stun_final_metrics: StunFinalMetricsMeasurement::from_daemon_stun_report(&daemon_stun),
         control_plane_failover_checked: failover_checked,
         control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
         control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_summary(
@@ -3805,6 +3825,107 @@ struct DaemonRuntimeManifestWorkload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RelayFinalMetricsMeasurement {
+    available_sessions_reported: usize,
+    max_sessions_reported: usize,
+    max_mbps_reported: u32,
+    enabled_by_policy_reported: bool,
+    e2e_only_reported: bool,
+    admission_attempts_reported: u64,
+    admission_successes_reported: u64,
+    admission_failures_reported: u64,
+}
+
+impl RelayFinalMetricsMeasurement {
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            available_sessions_reported: report.relay_available_sessions_reported,
+            max_sessions_reported: report.relay_max_sessions_reported,
+            max_mbps_reported: report.relay_max_mbps_reported,
+            enabled_by_policy_reported: report.relay_enabled_by_policy_reported,
+            e2e_only_reported: report.relay_e2e_only_reported,
+            admission_attempts_reported: report.relay_admission_attempts_reported,
+            admission_successes_reported: report.relay_admission_successes_reported,
+            admission_failures_reported: report.relay_admission_failures_reported,
+        }
+    }
+
+    fn from_status(status: &RelayStatusResponse) -> Self {
+        Self {
+            available_sessions_reported: status.capability.available_capacity() as usize,
+            max_sessions_reported: status.capability.max_sessions as usize,
+            max_mbps_reported: status.capability.max_mbps,
+            enabled_by_policy_reported: status.capability.enabled_by_policy,
+            e2e_only_reported: status.capability.e2e_only,
+            admission_attempts_reported: status.admission_attempt_count,
+            admission_successes_reported: status.admission_success_count,
+            admission_failures_reported: status.admission_failure_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SignalHealthMetricsMeasurement {
+    health_reports: usize,
+    healthy_nodes: usize,
+    degraded_nodes: usize,
+    unhealthy_nodes: usize,
+}
+
+impl SignalHealthMetricsMeasurement {
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            health_reports: report.daemon_signal_health_reports,
+            healthy_nodes: report.daemon_signal_healthy_nodes,
+            degraded_nodes: report.daemon_signal_degraded_nodes,
+            unhealthy_nodes: report.daemon_signal_unhealthy_nodes,
+        }
+    }
+
+    fn from_metrics(metrics: &SignalMetricsResponse) -> Self {
+        Self {
+            health_reports: metrics.health_report_count,
+            healthy_nodes: metrics.healthy_node_count,
+            degraded_nodes: metrics.degraded_node_count,
+            unhealthy_nodes: metrics.unhealthy_node_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct StunFinalMetricsMeasurement {
+    metrics_endpoints: usize,
+    listen_matches_expected: bool,
+    alternate_listen_matches_expected: bool,
+    prometheus_alternate_listener_reported: bool,
+    binding_requests_reported: u64,
+    binding_responses_reported: u64,
+    invalid_packets_reported: u64,
+    socket_receive_errors_reported: u64,
+    socket_send_errors_reported: u64,
+}
+
+impl StunFinalMetricsMeasurement {
+    fn from_report(report: &LoadReport) -> Self {
+        Self::from_daemon_stun_report(&report.daemon_stun)
+    }
+
+    fn from_daemon_stun_report(report: &DaemonStunReport) -> Self {
+        Self {
+            metrics_endpoints: report.metrics_endpoints,
+            listen_matches_expected: report.listen_matches_expected,
+            alternate_listen_matches_expected: report.alternate_listen_matches_expected,
+            prometheus_alternate_listener_reported: report.prometheus_alternate_listener_reported,
+            binding_requests_reported: report.binding_requests_reported,
+            binding_responses_reported: report.binding_responses_reported,
+            invalid_packets_reported: report.invalid_packets_reported,
+            socket_receive_errors_reported: report.socket_receive_errors_reported,
+            socket_send_errors_reported: report.socket_send_errors_reported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlPlaneLifecycleMetricsMeasurement {
     wireguard_key_rotation_success_count_min: u64,
     wireguard_key_rotation_success_count_max: u64,
@@ -3916,6 +4037,9 @@ struct DaemonRuntimeManifestMeasurement {
     relay_dataplane_invalid_session_credential_drops_prometheus_reported: u64,
     relay_forwarded_bytes_reported: u64,
     relay_active_sessions_reported: usize,
+    relay_final_metrics: RelayFinalMetricsMeasurement,
+    signal_health_metrics: SignalHealthMetricsMeasurement,
+    stun_final_metrics: StunFinalMetricsMeasurement,
     control_plane_failover_checked: bool,
     control_plane_failover_survivor_endpoints: usize,
     control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement,
@@ -7555,6 +7679,35 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert!(error.contains("measurement summary"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_final_snapshot_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_final_snapshot_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_final_snapshot_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_final_snapshot_measurement.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(measurement) = manifest.measurement.as_mut() {
+                measurement.signal_health_metrics.healthy_nodes -= 1;
+            }
+        })?;
+        let error = match mismatched_final_snapshot_measurement.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with mismatched final snapshot should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("final snapshot measurement"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut mismatched_lifecycle_measurement = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &mismatched_lifecycle_measurement,
@@ -10101,6 +10254,18 @@ fi
             report.daemon_failover_relay_udp_payload_bytes_received
         );
         assert_eq!(
+            manifest_measurement.relay_final_metrics,
+            RelayFinalMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.signal_health_metrics,
+            SignalHealthMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.stun_final_metrics,
+            StunFinalMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
             manifest_measurement.control_plane_lifecycle_metrics,
             ControlPlaneLifecycleMetricsMeasurement::from_report(&report)
         );
@@ -10690,6 +10855,33 @@ fi
             relay_dataplane_invalid_session_credential_drops_prometheus_reported: 1,
             relay_forwarded_bytes_reported: 384,
             relay_active_sessions_reported: 6,
+            relay_final_metrics: RelayFinalMetricsMeasurement {
+                available_sessions_reported: 9_994,
+                max_sessions_reported: 10_000,
+                max_mbps_reported: 10_000,
+                enabled_by_policy_reported: true,
+                e2e_only_reported: true,
+                admission_attempts_reported: 6,
+                admission_successes_reported: 6,
+                admission_failures_reported: 0,
+            },
+            signal_health_metrics: SignalHealthMetricsMeasurement {
+                health_reports: 3,
+                healthy_nodes: 3,
+                degraded_nodes: 0,
+                unhealthy_nodes: 0,
+            },
+            stun_final_metrics: StunFinalMetricsMeasurement {
+                metrics_endpoints: 1,
+                listen_matches_expected: true,
+                alternate_listen_matches_expected: true,
+                prometheus_alternate_listener_reported: true,
+                binding_requests_reported: 3,
+                binding_responses_reported: 3,
+                invalid_packets_reported: 0,
+                socket_receive_errors_reported: 0,
+                socket_send_errors_reported: 0,
+            },
             control_plane_failover_checked: true,
             control_plane_failover_survivor_endpoints: 1,
             control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_counts(
@@ -10777,6 +10969,9 @@ fi
                     .relay_dataplane_invalid_session_credential_drops_prometheus_reported,
                 relay_forwarded_bytes_reported: report.relay_forwarded_bytes_reported,
                 relay_active_sessions_reported: report.relay_active_sessions_reported,
+                relay_final_metrics: RelayFinalMetricsMeasurement::from_report(report),
+                signal_health_metrics: SignalHealthMetricsMeasurement::from_report(report),
+                stun_final_metrics: StunFinalMetricsMeasurement::from_report(report),
                 control_plane_failover_checked: report.daemon_control_plane_failover_checked,
                 control_plane_failover_survivor_endpoints: report
                     .daemon_control_plane_failover_survivor_endpoints,
