@@ -90,6 +90,18 @@ Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders
 scripts/helm-smoke.sh
 ```
 
+Run the live Kubernetes integration smoke against a cluster where the IPARS image is
+already pullable. It creates a disposable namespace, starts a control-plane and signal
+pair, installs the Helm DaemonSet with a signed join token, and verifies agent
+registration, Service discovery RBAC, peer-map synchronization, and control-plane
+metrics before deleting the namespace:
+
+```bash
+IPARS_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/ipars \
+IPARS_K8S_SMOKE_IMAGE_TAG=ci \
+scripts/k8s-live-smoke.sh
+```
+
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay
 HTTP admission plus UDP forwarding with `--transport relay-udp`, or across spawned `iparsd`

@@ -98,6 +98,22 @@ Render and validate common chart modes with:
 scripts/helm-smoke.sh
 ```
 
+For a live Kubernetes cluster integration gate, provide an image that the cluster can
+pull and run the disposable-namespace smoke. It verifies Helm's DaemonSet against a
+real control-plane/signal pair, signed token registration, namespace-scoped Service
+discovery RBAC, agent peer-map synchronization, and control-plane health metrics:
+
+```bash
+IPARS_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/ipars \
+IPARS_K8S_SMOKE_IMAGE_TAG=ci \
+scripts/k8s-live-smoke.sh
+```
+
+The runner requires `kubectl`, `helm`, `jq`, and either `IPARS_K8S_SMOKE_IPARS_BIN`
+or Cargo. It refuses an existing namespace, removes its generated namespace by default,
+and never writes the signed token to command-line arguments. Set
+`IPARS_K8S_SMOKE_KEEP_RESOURCES=1` only when retaining diagnostics is required.
+
 ## Health Checks
 
 Common probes:
