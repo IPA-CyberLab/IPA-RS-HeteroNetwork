@@ -9,6 +9,7 @@ ipars_bin="${IPARS_K8S_SMOKE_IPARS_BIN:-}"
 image_repository="${IPARS_K8S_SMOKE_IMAGE_REPOSITORY:-}"
 image_tag="${IPARS_K8S_SMOKE_IMAGE_TAG:-}"
 image_pull_policy="${IPARS_K8S_SMOKE_IMAGE_PULL_POLICY:-IfNotPresent}"
+agent_runtime_backend="${IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
 timeout_seconds="${IPARS_K8S_SMOKE_TIMEOUT_SECONDS:-300}"
 keep_resources="${IPARS_K8S_SMOKE_KEEP_RESOURCES:-0}"
 suffix="$$-$(date +%s%N)"
@@ -170,6 +171,10 @@ if [[ ! "$image_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
 fi
 if [[ ! "$image_pull_policy" =~ ^(Always|IfNotPresent|Never)$ ]]; then
   echo "IPARS_K8S_SMOKE_IMAGE_PULL_POLICY must be Always, IfNotPresent, or Never" >&2
+  exit 1
+fi
+if [[ "$agent_runtime_backend" != "linux-command" && "$agent_runtime_backend" != "dry-run" ]]; then
+  echo "IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
   exit 1
 fi
 if [[ ! "$timeout_seconds" =~ ^[0-9]+$ || "$timeout_seconds" -lt 1 || "$timeout_seconds" -gt 1800 ]]; then
@@ -341,6 +346,7 @@ agent_state_path="/var/lib/ipars-live/${release}"
   --set-string "image.pullPolicy=${image_pull_policy}" \
   --set-string "agent.joinTokenSecretName=${token_secret}" \
   --set-string "agent.joinTokenSecretKey=token" \
+  --set-string "agent.runtimeBackend=${agent_runtime_backend}" \
   --set agent.hostNetwork=false \
   --set-string "agent.dnsPolicy=ClusterFirst" \
   --set-string "agent.state.hostPath=${agent_state_path}" \

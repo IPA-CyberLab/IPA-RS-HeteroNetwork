@@ -68,6 +68,16 @@ helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 
 template_ok default
 
+template_ok agent-runtime-dry-run \
+  --set-string agent.runtimeBackend=dry-run
+
+assert_rendered_contains agent-runtime-dry-run "- --runtime-backend"
+assert_rendered_contains agent-runtime-dry-run '- "dry-run"'
+
+template_fails agent-runtime-invalid \
+  "agent.runtimeBackend must be linux-command or dry-run" \
+  --set-string agent.runtimeBackend=invalid
+
 template_ok cluster-endpoints \
   --set-string cluster.controlPlaneUrl=https://control.example.com:8443 \
   --set-string cluster.signalUrl=https://signal.example.com:9443 \

@@ -636,6 +636,12 @@ struct K8sInstallArgs {
     kubernetes_route_provider: Option<String>,
     #[arg(long, default_value_t = 60)]
     kubernetes_route_interval_seconds: u64,
+    #[arg(
+        long = "agent-runtime-backend",
+        default_value = "linux-command",
+        value_parser = parse_agent_runtime_backend
+    )]
+    agent_runtime_backend: String,
     #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
     route_backend: String,
     #[arg(long = "disable-agent-peer-map", default_value_t = false)]
@@ -2675,6 +2681,15 @@ fn parse_route_backend(value: &str) -> Result<String, String> {
         "command" | "kernel-netlink" => Ok(value.to_string()),
         _ => Err(format!(
             "route backend must be command or kernel-netlink; got {value}"
+        )),
+    }
+}
+
+fn parse_agent_runtime_backend(value: &str) -> Result<String, String> {
+    match value {
+        "linux-command" | "dry-run" => Ok(value.to_string()),
+        _ => Err(format!(
+            "agent runtime backend must be linux-command or dry-run; got {value}"
         )),
     }
 }
@@ -6135,6 +6150,10 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
     if args.disable_rbac {
         command.push_str(" --set rbac.create=false");
     }
+    command.push_str(&format!(
+        " --set agent.runtimeBackend={}",
+        args.agent_runtime_backend
+    ));
     command.push_str(&format!(" --set agent.routeBackend={}", args.route_backend));
     command.push_str(&format!(
         " --set serviceExposure.discoverApiServer={}",
@@ -6629,6 +6648,7 @@ fn append_k8s_label_selector_expression_values(
 }
 
 fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    parse_agent_runtime_backend(&args.agent_runtime_backend).map_err(anyhow::Error::msg)?;
     let mut namespaces = BTreeSet::new();
     for namespace in &args.kubernetes_namespaces {
         validate_kubernetes_namespace(namespace)?;
@@ -12463,6 +12483,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -14610,7 +14631,9 @@ fi
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
         assert!(values.contains("routeBackend: command"));
+        assert!(values.contains("runtimeBackend: linux-command"));
         assert!(!values.contains("  apiServer:"));
+        assert!(daemonset.contains("agent.runtimeBackend must be linux-command or dry-run"));
         assert!(daemonset.contains("agent.routeBackend must be command or kernel-netlink"));
         assert!(daemonset.contains(
             "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs"
@@ -14643,6 +14666,8 @@ fi
         assert!(daemonset.contains("- {{ $agentPeerMapPollIntervalSeconds | quote }}"));
         assert!(daemonset.contains("- --route-backend"));
         assert!(daemonset.contains("- {{ $agentRouteBackend | quote }}"));
+        assert!(daemonset.contains("- --runtime-backend"));
+        assert!(daemonset.contains("- {{ $agentRuntimeBackend | quote }}"));
         Ok(())
     }
 
@@ -14751,6 +14776,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -14899,6 +14925,7 @@ fi
         args.kubernetes_service_label_selector = Some("ipars.io/expose=true".to_string());
         args.kubernetes_route_provider = Some("route-provider-a".to_string());
         args.kubernetes_route_interval_seconds = 15;
+        args.agent_runtime_backend = "dry-run".to_string();
         args.route_backend = "kernel-netlink".to_string();
         args.agent_peer_map_poll_interval_seconds = 45;
         args.disable_rbac = true;
@@ -14907,6 +14934,7 @@ fi
         let helm = &plan.commands[2];
 
         assert!(helm.contains("--set rbac.create=false"));
+        assert!(helm.contains("--set agent.runtimeBackend=dry-run"));
         assert!(helm.contains("--set agent.routeBackend=kernel-netlink"));
         assert!(helm.contains("--set agent.peerMap.pollIntervalSeconds=45"));
         assert!(helm.contains("--set serviceExposure.discoverServices=true"));
@@ -14943,6 +14971,21 @@ fi
         assert!(
             Cli::try_parse_from(["ipars", "k8s", "install", "--route-backend", "invalid"]).is_err()
         );
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-runtime-backend",
+            "invalid",
+        ])
+        .is_err());
+
+        let mut invalid_runtime_backend = base_k8s_install_args();
+        invalid_runtime_backend.agent_runtime_backend = "invalid".to_string();
+        let error = k8s_install_plan(invalid_runtime_backend).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("agent runtime backend must be linux-command or dry-run"));
     }
 
     #[test]
@@ -16211,6 +16254,8 @@ fi
             "route-provider-a",
             "--kubernetes-route-interval-seconds",
             "15",
+            "--agent-runtime-backend",
+            "dry-run",
             "--route-backend",
             "kernel-netlink",
             "--disable-agent-peer-map",
@@ -16446,6 +16491,7 @@ fi
                 Some("route-provider-a")
             );
             assert_eq!(args.kubernetes_route_interval_seconds, 15);
+            assert_eq!(args.agent_runtime_backend, "dry-run");
             assert_eq!(args.route_backend, "kernel-netlink");
             assert!(args.disable_agent_peer_map);
             assert_eq!(args.agent_peer_map_poll_interval_seconds, 45);
@@ -16768,6 +16814,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -16938,6 +16985,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -18458,6 +18506,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -18615,6 +18664,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -18906,6 +18956,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -19068,6 +19119,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -19225,6 +19277,7 @@ fi
             kubernetes_service_label_selector: None,
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,

@@ -113,6 +113,8 @@ The runner requires `kubectl`, `helm`, `jq`, and either `IPARS_K8S_SMOKE_IPARS_B
 or Cargo. It refuses an existing namespace, removes its generated namespace by default,
 and never writes the signed token to command-line arguments. Set
 `IPARS_K8S_SMOKE_KEEP_RESOURCES=1` only when retaining diagnostics is required.
+Set `IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND=dry-run` only for clusters where the
+real WireGuard backend is intentionally unavailable; the default is `linux-command`.
 
 ## Health Checks
 

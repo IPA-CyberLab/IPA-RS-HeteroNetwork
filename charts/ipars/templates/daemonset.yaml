@@ -38,6 +38,7 @@
 {{- $agentFsGroup := printf "%v" .Values.agent.podSecurityContext.fsGroup -}}
 {{- $agentFsGroupChangePolicy := printf "%v" .Values.agent.podSecurityContext.fsGroupChangePolicy -}}
 {{- $agentDnsPolicy := .Values.agent.dnsPolicy -}}
+{{- $agentRuntimeBackend := printf "%v" .Values.agent.runtimeBackend -}}
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
 {{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
@@ -96,6 +97,9 @@
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if not (or (eq $agentRuntimeBackend "linux-command") (eq $agentRuntimeBackend "dry-run")) -}}
+{{- fail "agent.runtimeBackend must be linux-command or dry-run" -}}
 {{- end -}}
 {{- if not (or (eq $agentRouteBackend "command") (eq $agentRouteBackend "kernel-netlink")) -}}
 {{- fail "agent.routeBackend must be command or kernel-netlink" -}}
@@ -987,6 +991,8 @@ spec:
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
             - --wireguard-interface
             - {{ .Values.agent.interfaceName | quote }}
+            - --runtime-backend
+            - {{ $agentRuntimeBackend | quote }}
             - --join-token-path
             - {{ printf "%s/token/%s" $agentStateMountPath .Values.agent.joinTokenSecretKey | quote }}
             {{- if eq $agentPeerMapEnabled "true" }}

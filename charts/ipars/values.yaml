@@ -23,6 +23,7 @@ serviceAccount:
 
 agent:
   interfaceName: ipars0
+  runtimeBackend: linux-command
   routeBackend: command
   peerMap:
     enabled: true
