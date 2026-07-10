@@ -32,6 +32,14 @@ iparsd agent \
   --apply-peer-map
 ```
 
+For a real `--apply-peer-map` runtime, keep `--stun-bind` and
+`--wireguard-listen-port` on the same nonzero UDP port. The agent performs its
+initial STUN probe before configuring the WireGuard interface, then configures
+the interface to listen on that same port. For example, use
+`--stun-bind 0.0.0.0:51820 --wireguard-listen-port 51820`. This preserves the
+local-port relationship needed by port-preserving NATs; relay fallback remains
+required where direct traversal is not possible.
+
 For validation without host route mutation:
 
 ```bash
@@ -44,6 +52,13 @@ iparsd agent \
 ## Docker
 
 The base Compose stack starts PostgreSQL, control plane, signal, STUN, relay, and agent services. The agent continuously applies its peer map after joining so the selected WireGuard and route backends configure the data plane. Docker Engine API access is not mounted into the agent unless the discovery override is used; the override mounts the selected Docker socket read-only and does not create a missing host socket path.
+
+The bundled agent uses `IPARS_AGENT_STUN_BIND=0.0.0.0:51821` and
+`IPARS_AGENT_WIREGUARD_LISTEN_PORT=51821`, deliberately separate from the
+bundled relay UDP listener on `51820`. Override the two variables together with
+the same nonzero port for a real data-plane deployment. The Compose smoke uses
+an ephemeral STUN bind only because its two host-network agents run with the
+non-mutating `dry-run` backend.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait
@@ -81,6 +96,10 @@ scripts/docker-smoke.sh
 ## Kubernetes
 
 The Helm chart deploys a node-underlay VPN agent, not a CNI. It can advertise Kubernetes Service/API routes through a route-provider agent and optional RBAC-backed Service discovery.
+
+Its production defaults set `agent.wireguardListenPort: 51820` and
+`agent.stunBind: "0.0.0.0:51820"`. Helm rejects zero ports and mismatched values
+before rendering the DaemonSet.
 
 ```bash
 ipars k8s install \

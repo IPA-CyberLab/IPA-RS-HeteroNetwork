@@ -69,6 +69,28 @@ helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 template_ok default
 
 assert_rendered_contains default "mountPath: /dev/net/tun"
+assert_rendered_contains default "- --wireguard-listen-port"
+assert_rendered_contains default '- "51820"'
+assert_rendered_contains default "- --stun-bind"
+assert_rendered_contains default '- "0.0.0.0:51820"'
+
+template_ok agent-listen-port \
+  --set agent.wireguardListenPort=51830 \
+  --set-string agent.stunBind=0.0.0.0:51830
+
+assert_rendered_contains agent-listen-port "- --wireguard-listen-port"
+assert_rendered_contains agent-listen-port '- "51830"'
+assert_rendered_contains agent-listen-port "- --stun-bind"
+assert_rendered_contains agent-listen-port '- "0.0.0.0:51830"'
+
+template_fails agent-listen-port-zero \
+  "agent.wireguardListenPort must be between 1 and 65535" \
+  --set agent.wireguardListenPort=0
+
+template_fails agent-listen-port-mismatch \
+  "agent.stunBind port must equal agent.wireguardListenPort" \
+  --set agent.wireguardListenPort=51820 \
+  --set-string agent.stunBind=0.0.0.0:51821
 
 template_ok agent-runtime-dry-run \
   --set-string agent.runtimeBackend=dry-run

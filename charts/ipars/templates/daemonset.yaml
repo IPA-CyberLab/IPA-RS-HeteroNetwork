@@ -42,6 +42,8 @@
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
 {{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
+{{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
+{{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
 {{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
@@ -97,6 +99,15 @@
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.wireguardListenPort" "value" $agentWireguardListenPortValue "max" 65535) -}}
+{{- if lt (int $agentWireguardListenPortValue) 1 -}}
+{{- fail "agent.wireguardListenPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.stunBind" "value" $agentStunBind) -}}
+{{- $agentStunBindPort := int (regexFind "[0-9]+$" $agentStunBind) -}}
+{{- if ne $agentStunBindPort (int $agentWireguardListenPortValue) -}}
+{{- fail "agent.stunBind port must equal agent.wireguardListenPort" -}}
 {{- end -}}
 {{- if not (or (eq $agentRuntimeBackend "linux-command") (eq $agentRuntimeBackend "dry-run")) -}}
 {{- fail "agent.runtimeBackend must be linux-command or dry-run" -}}
@@ -991,6 +1002,10 @@ spec:
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
             - --wireguard-interface
             - {{ .Values.agent.interfaceName | quote }}
+            - --wireguard-listen-port
+            - {{ $agentWireguardListenPortValue | quote }}
+            - --stun-bind
+            - {{ $agentStunBind | quote }}
             - --runtime-backend
             - {{ $agentRuntimeBackend | quote }}
             - --join-token-path

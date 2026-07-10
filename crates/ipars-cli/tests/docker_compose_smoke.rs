@@ -202,6 +202,8 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         &rendered,
         &[
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
+            ("IPARS_AGENT_STUN_BIND", "0.0.0.0:51821"),
+            ("IPARS_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
             ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
             ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
@@ -336,6 +338,8 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         &rendered,
         &[
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("IPARS_AGENT_STUN_BIND", "0.0.0.0:51821"),
+            ("IPARS_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
             ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
             ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-command"),
@@ -559,6 +563,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
       IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_STUN_BIND: 0.0.0.0:0
       IPARS_AGENT_RUNTIME_BACKEND: dry-run
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
       IPARS_DOCKER_DISCOVER_NETWORKS: "false"
@@ -604,6 +609,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
       IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_STUN_BIND: 0.0.0.0:0
       IPARS_AGENT_RUNTIME_BACKEND: dry-run
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
       IPARS_DOCKER_DISCOVER_NETWORKS: "false"

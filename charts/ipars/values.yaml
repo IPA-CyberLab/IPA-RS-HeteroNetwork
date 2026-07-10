@@ -23,6 +23,8 @@ serviceAccount:
 
 agent:
   interfaceName: ipars0
+  wireguardListenPort: 51820
+  stunBind: "0.0.0.0:51820"
   runtimeBackend: linux-command
   routeBackend: command
   peerMap:

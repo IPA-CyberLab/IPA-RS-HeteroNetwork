@@ -14708,9 +14708,12 @@ fi
 
         assert!(values.contains("routeBackend: command"));
         assert!(values.contains("runtimeBackend: linux-command"));
+        assert!(values.contains("wireguardListenPort: 51820"));
+        assert!(values.contains("stunBind: \"0.0.0.0:51820\""));
         assert!(!values.contains("  apiServer:"));
         assert!(daemonset.contains("agent.runtimeBackend must be linux-command or dry-run"));
         assert!(daemonset.contains("agent.routeBackend must be command or kernel-netlink"));
+        assert!(daemonset.contains("agent.stunBind port must equal agent.wireguardListenPort"));
         assert!(daemonset.contains(
             "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs"
         ));
@@ -14744,6 +14747,10 @@ fi
         assert!(daemonset.contains("- {{ $agentRouteBackend | quote }}"));
         assert!(daemonset.contains("- --runtime-backend"));
         assert!(daemonset.contains("- {{ $agentRuntimeBackend | quote }}"));
+        assert!(daemonset.contains("- --wireguard-listen-port"));
+        assert!(daemonset.contains("- {{ $agentWireguardListenPortValue | quote }}"));
+        assert!(daemonset.contains("- --stun-bind"));
+        assert!(daemonset.contains("- {{ $agentStunBind | quote }}"));
         assert!(daemonset.contains("if eq $agentRuntimeBackend \"linux-command\""));
         assert!(daemonset.contains("mountPath: /dev/net/tun"));
         assert!(daemonset.contains("type: CharDevice"));

@@ -49,6 +49,7 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
     backend
         .configure_interface_private_key(&local_key.private_key_b64)
         .await?;
+    backend.configure_interface_listen_port(51820).await?;
     backend
         .configure_interface_address(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 99, 1))))
         .await?;
@@ -79,6 +80,19 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
         ],
     )?;
     assert_eq!(configured_private_key.trim(), local_key.private_key_b64);
+    let configured_listen_port = command_output(
+        "ip",
+        [
+            "netns",
+            "exec",
+            namespace_name.as_str(),
+            "wg",
+            "show",
+            interface,
+            "listen-port",
+        ],
+    )?;
+    assert_eq!(configured_listen_port.trim(), "51820");
 
     let peer = NodeId::from_string("wg-netns-peer");
     let peer_key = WireGuardKeyPair::generate();

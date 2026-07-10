@@ -3220,6 +3220,23 @@ where
             .await
     }
 
+    pub async fn configure_interface_listen_port(
+        &self,
+        listen_port: u16,
+    ) -> Result<(), AgentError> {
+        self.runner
+            .run(LinuxCommand::new(
+                "wg",
+                [
+                    "set".to_string(),
+                    self.interface.clone(),
+                    "listen-port".to_string(),
+                    listen_port.to_string(),
+                ],
+            ))
+            .await
+    }
+
     fn upsert_command(&self, config: &WireGuardPeerConfig) -> LinuxCommand {
         wireguard_upsert_peer_command(&self.interface, config)
     }
@@ -3293,6 +3310,23 @@ where
                 &self.interface,
                 private_key_b64,
             )?)
+            .await
+    }
+
+    pub async fn configure_interface_listen_port(
+        &self,
+        listen_port: u16,
+    ) -> Result<(), AgentError> {
+        self.runner
+            .run(LinuxCommand::new(
+                "wg",
+                [
+                    "set".to_string(),
+                    self.interface.clone(),
+                    "listen-port".to_string(),
+                    listen_port.to_string(),
+                ],
+            ))
             .await
     }
 }
@@ -3517,6 +3551,19 @@ impl KernelWireGuardBackend {
         .await
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn configure_interface_listen_port(
+        &self,
+        listen_port: u16,
+    ) -> Result<(), AgentError> {
+        apply_wireguard_netlink(
+            &self.interface,
+            self.namespace.as_ref(),
+            vec![WireguardAttribute::ListenPort(listen_port)],
+        )
+        .await
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub async fn ensure_interface(&self) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
@@ -3535,6 +3582,16 @@ impl KernelWireGuardBackend {
     pub async fn configure_interface_private_key(
         &self,
         _private_key_b64: &str,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn configure_interface_listen_port(
+        &self,
+        _listen_port: u16,
     ) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
             "kernel WireGuard netlink backend is only supported on Linux".to_string(),
@@ -6668,12 +6725,14 @@ mod tests {
         let private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
         backend.configure_interface_private_key(private_key).await?;
+        backend.configure_interface_listen_port(51820).await?;
 
         assert_eq!(
             runner.commands().await,
             vec![
                 LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"],)
-                    .with_stdin(format!("{private_key}\n").into_bytes())
+                    .with_stdin(format!("{private_key}\n").into_bytes()),
+                LinuxCommand::new("wg", ["set", "ipars0", "listen-port", "51820"]),
             ]
         );
         Ok(())

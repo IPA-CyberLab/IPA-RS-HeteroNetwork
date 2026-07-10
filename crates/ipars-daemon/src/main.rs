@@ -456,8 +456,14 @@ struct AgentArgs {
         value_delimiter = ','
     )]
     stun_servers: Vec<SocketAddr>,
-    #[arg(long, env = "IPARS_AGENT_STUN_BIND", default_value = "0.0.0.0:0")]
+    #[arg(long, env = "IPARS_AGENT_STUN_BIND", default_value = "0.0.0.0:51820")]
     stun_bind: SocketAddr,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_WIREGUARD_LISTEN_PORT",
+        default_value_t = 51820
+    )]
+    wireguard_listen_port: u16,
     #[arg(long, env = "IPARS_AGENT_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_SIGNAL_URL")]
@@ -1307,6 +1313,16 @@ fn preflight_agent_runtime_with_path_and_checks(
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_linux_interface_name(&args.wireguard_interface)?;
+    if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
+        anyhow::ensure!(
+            args.wireguard_listen_port > 0,
+            "--wireguard-listen-port must be greater than zero when --apply-peer-map uses the linux-command runtime backend"
+        );
+        anyhow::ensure!(
+            args.stun_bind.port() == args.wireguard_listen_port,
+            "--stun-bind port must equal --wireguard-listen-port when --apply-peer-map uses the linux-command runtime backend"
+        );
+    }
     if !args.disable_heartbeat {
         validate_positive_seconds(
             args.heartbeat_interval_seconds,
@@ -8782,6 +8798,9 @@ where
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
     wireguard
+        .configure_interface_listen_port(args.wireguard_listen_port)
+        .await?;
+    wireguard
         .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
         .await?;
     let route_manager = LinuxRouteManager::new(route_runner);
@@ -8818,6 +8837,9 @@ where
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
     wireguard
+        .configure_interface_listen_port(args.wireguard_listen_port)
+        .await?;
+    wireguard
         .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
         .await?;
     let route_manager = LinuxRouteManager::new(route_runner);
@@ -8852,6 +8874,9 @@ where
     wireguard.ensure_interface().await?;
     wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
+    wireguard
+        .configure_interface_listen_port(args.wireguard_listen_port)
         .await?;
     wireguard
         .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
@@ -8891,6 +8916,9 @@ where
     wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
+    wireguard
+        .configure_interface_listen_port(args.wireguard_listen_port)
+        .await?;
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
     tracing::info!(
@@ -8918,6 +8946,9 @@ async fn start_peer_map_sync_with_kernel_backends(
     wireguard.ensure_interface().await?;
     wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
+        .await?;
+    wireguard
+        .configure_interface_listen_port(args.wireguard_listen_port)
         .await?;
     wireguard
         .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
@@ -18168,6 +18199,78 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn linux_peer_map_runtime_requires_stun_and_wireguard_ports_to_match() -> anyhow::Result<()> {
+        let valid = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--stun-bind",
+            "0.0.0.0:51830",
+            "--wireguard-listen-port",
+            "51830",
+        ])?;
+        if let Command::Agent(args) = valid.command {
+            validate_agent_runtime_config(&args)?;
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let mismatch = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--stun-bind",
+            "0.0.0.0:51830",
+            "--wireguard-listen-port",
+            "51831",
+        ])?;
+        if let Command::Agent(args) = mismatch.command {
+            let error = validate_agent_runtime_config(&args).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("--stun-bind port must equal --wireguard-listen-port"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let zero_port = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--stun-bind",
+            "0.0.0.0:0",
+            "--wireguard-listen-port",
+            "0",
+        ])?;
+        if let Command::Agent(args) = zero_port.command {
+            let error = validate_agent_runtime_config(&args).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("--wireguard-listen-port must be greater than zero"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let dry_run = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--apply-peer-map",
+            "--stun-bind",
+            "0.0.0.0:0",
+            "--wireguard-listen-port",
+            "51830",
+        ])?;
+        if let Command::Agent(args) = dry_run.command {
+            validate_agent_runtime_config(&args)?;
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
