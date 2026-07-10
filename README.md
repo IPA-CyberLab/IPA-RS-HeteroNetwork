@@ -102,6 +102,13 @@ IPARS_K8S_SMOKE_IMAGE_TAG=ci \
 scripts/k8s-live-smoke.sh
 ```
 
+For a self-contained local kind cluster run that builds and loads the repository image,
+use the `dry-run` agent backend by default:
+
+```bash
+scripts/kind-k8s-smoke.sh
+```
+
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay
 HTTP admission plus UDP forwarding with `--transport relay-udp`, or across spawned `iparsd`

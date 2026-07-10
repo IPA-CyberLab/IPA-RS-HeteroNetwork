@@ -116,6 +116,18 @@ and never writes the signed token to command-line arguments. Set
 Set `IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND=dry-run` only for clusters where the
 real WireGuard backend is intentionally unavailable; the default is `linux-command`.
 
+For kind-based CI or a local disposable cluster, the wrapper creates a control-plane
+and worker node, builds and loads a local image, invokes the same live smoke with the
+`dry-run` backend, then removes the cluster and generated image:
+
+```bash
+scripts/kind-k8s-smoke.sh
+```
+
+It requires `docker`, `kind`, `kubectl`, `helm`, `jq`, and Cargo or
+`IPARS_K8S_SMOKE_IPARS_BIN`. Set `IPARS_KIND_K8S_SMOKE_KEEP_CLUSTER=1` to retain
+the cluster and live-smoke namespace for diagnostics.
+
 ## Health Checks
 
 Common probes:
