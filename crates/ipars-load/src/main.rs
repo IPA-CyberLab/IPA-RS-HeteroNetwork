@@ -1238,6 +1238,21 @@ impl LoadReport {
                 self.daemon_control_plane_failover_checked
             );
         }
+        let expected_lifecycle_metrics = ControlPlaneLifecycleMetricsMeasurement::from_report(self);
+        let expected_failover_lifecycle_metrics =
+            ControlPlaneLifecycleMetricsMeasurement::from_failover_report(self);
+        if measurement.control_plane_lifecycle_metrics != expected_lifecycle_metrics
+            || measurement.control_plane_failover_lifecycle_metrics
+                != expected_failover_lifecycle_metrics
+        {
+            bail!(
+                "daemon load scenario retained manifest lifecycle-operation measurement does not match report: control-plane {:?}/{:?}, failover {:?}/{:?}",
+                measurement.control_plane_lifecycle_metrics,
+                expected_lifecycle_metrics,
+                measurement.control_plane_failover_lifecycle_metrics,
+                expected_failover_lifecycle_metrics
+            );
+        }
         if manifest.control_plane_urls.len() != self.daemon_control_plane_processes {
             bail!(
                 "daemon load scenario retained manifest recorded {} control-plane URLs, expected {}",
@@ -3105,6 +3120,20 @@ async fn run_daemon_scenario(
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         control_plane_failover_checked: failover_checked,
         control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
+        control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_summary(
+            &control_summary,
+        ),
+        control_plane_failover_lifecycle_metrics:
+            ControlPlaneLifecycleMetricsMeasurement::from_counts(
+                failover_wireguard_key_rotation_success_count_min,
+                failover_wireguard_key_rotation_success_count_max,
+                failover_wireguard_key_rotation_failure_count_min,
+                failover_wireguard_key_rotation_failure_count_max,
+                failover_node_removal_success_count_min,
+                failover_node_removal_success_count_max,
+                failover_node_removal_failure_count_min,
+                failover_node_removal_failure_count_max,
+            ),
     };
     let completed_manifest_path =
         services.stop_all_for_completed_manifest(completed_measurement)?;
@@ -3776,6 +3805,101 @@ struct DaemonRuntimeManifestWorkload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlPlaneLifecycleMetricsMeasurement {
+    wireguard_key_rotation_success_count_min: u64,
+    wireguard_key_rotation_success_count_max: u64,
+    wireguard_key_rotation_failure_count_min: u64,
+    wireguard_key_rotation_failure_count_max: u64,
+    node_removal_success_count_min: u64,
+    node_removal_success_count_max: u64,
+    node_removal_failure_count_min: u64,
+    node_removal_failure_count_max: u64,
+}
+
+impl ControlPlaneLifecycleMetricsMeasurement {
+    fn from_summary(summary: &ControlPlaneHealthSummary) -> Self {
+        Self {
+            wireguard_key_rotation_success_count_min: summary
+                .wireguard_key_rotation_success_count_min,
+            wireguard_key_rotation_success_count_max: summary
+                .wireguard_key_rotation_success_count_max,
+            wireguard_key_rotation_failure_count_min: summary
+                .wireguard_key_rotation_failure_count_min,
+            wireguard_key_rotation_failure_count_max: summary
+                .wireguard_key_rotation_failure_count_max,
+            node_removal_success_count_min: summary.node_removal_success_count_min,
+            node_removal_success_count_max: summary.node_removal_success_count_max,
+            node_removal_failure_count_min: summary.node_removal_failure_count_min,
+            node_removal_failure_count_max: summary.node_removal_failure_count_max,
+        }
+    }
+
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            wireguard_key_rotation_success_count_min: report
+                .daemon_control_plane_wireguard_key_rotation_success_count_min,
+            wireguard_key_rotation_success_count_max: report
+                .daemon_control_plane_wireguard_key_rotation_success_count_max,
+            wireguard_key_rotation_failure_count_min: report
+                .daemon_control_plane_wireguard_key_rotation_failure_count_min,
+            wireguard_key_rotation_failure_count_max: report
+                .daemon_control_plane_wireguard_key_rotation_failure_count_max,
+            node_removal_success_count_min: report
+                .daemon_control_plane_node_removal_success_count_min,
+            node_removal_success_count_max: report
+                .daemon_control_plane_node_removal_success_count_max,
+            node_removal_failure_count_min: report
+                .daemon_control_plane_node_removal_failure_count_min,
+            node_removal_failure_count_max: report
+                .daemon_control_plane_node_removal_failure_count_max,
+        }
+    }
+
+    fn from_failover_report(report: &LoadReport) -> Self {
+        Self {
+            wireguard_key_rotation_success_count_min: report
+                .daemon_control_plane_failover_wireguard_key_rotation_success_count_min,
+            wireguard_key_rotation_success_count_max: report
+                .daemon_control_plane_failover_wireguard_key_rotation_success_count_max,
+            wireguard_key_rotation_failure_count_min: report
+                .daemon_control_plane_failover_wireguard_key_rotation_failure_count_min,
+            wireguard_key_rotation_failure_count_max: report
+                .daemon_control_plane_failover_wireguard_key_rotation_failure_count_max,
+            node_removal_success_count_min: report
+                .daemon_control_plane_failover_node_removal_success_count_min,
+            node_removal_success_count_max: report
+                .daemon_control_plane_failover_node_removal_success_count_max,
+            node_removal_failure_count_min: report
+                .daemon_control_plane_failover_node_removal_failure_count_min,
+            node_removal_failure_count_max: report
+                .daemon_control_plane_failover_node_removal_failure_count_max,
+        }
+    }
+
+    fn from_counts(
+        wireguard_key_rotation_success_count_min: u64,
+        wireguard_key_rotation_success_count_max: u64,
+        wireguard_key_rotation_failure_count_min: u64,
+        wireguard_key_rotation_failure_count_max: u64,
+        node_removal_success_count_min: u64,
+        node_removal_success_count_max: u64,
+        node_removal_failure_count_min: u64,
+        node_removal_failure_count_max: u64,
+    ) -> Self {
+        Self {
+            wireguard_key_rotation_success_count_min,
+            wireguard_key_rotation_success_count_max,
+            wireguard_key_rotation_failure_count_min,
+            wireguard_key_rotation_failure_count_max,
+            node_removal_success_count_min,
+            node_removal_success_count_max,
+            node_removal_failure_count_min,
+            node_removal_failure_count_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonRuntimeManifestMeasurement {
     relay_udp_packets_sent: usize,
     relay_udp_packets_received: usize,
@@ -3794,6 +3918,8 @@ struct DaemonRuntimeManifestMeasurement {
     relay_active_sessions_reported: usize,
     control_plane_failover_checked: bool,
     control_plane_failover_survivor_endpoints: usize,
+    control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement,
+    control_plane_failover_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7429,6 +7555,37 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert!(error.contains("measurement summary"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_lifecycle_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_lifecycle_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_lifecycle_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_lifecycle_measurement.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(measurement) = manifest.measurement.as_mut() {
+                measurement
+                    .control_plane_lifecycle_metrics
+                    .node_removal_failure_count_max = 1;
+            }
+        })?;
+        let error = match mismatched_lifecycle_measurement.validate_success() {
+            Ok(_) => bail!(
+                "retained manifest with mismatched lifecycle measurement should fail validation"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("lifecycle-operation measurement"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut missing_manifest_measurement = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &missing_manifest_measurement,
@@ -9943,6 +10100,14 @@ fi
             manifest_measurement.failover_relay_udp_payload_bytes_received,
             report.daemon_failover_relay_udp_payload_bytes_received
         );
+        assert_eq!(
+            manifest_measurement.control_plane_lifecycle_metrics,
+            ControlPlaneLifecycleMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.control_plane_failover_lifecycle_metrics,
+            ControlPlaneLifecycleMetricsMeasurement::from_failover_report(&report)
+        );
         assert_eq!(manifest.children.len(), report.daemon_processes);
         assert!(manifest
             .children
@@ -10527,6 +10692,11 @@ fi
             relay_active_sessions_reported: 6,
             control_plane_failover_checked: true,
             control_plane_failover_survivor_endpoints: 1,
+            control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_counts(
+                0, 0, 0, 0, 0, 0, 0, 0,
+            ),
+            control_plane_failover_lifecycle_metrics:
+                ControlPlaneLifecycleMetricsMeasurement::from_counts(0, 0, 0, 0, 0, 0, 0, 0),
         }
     }
 
@@ -10610,6 +10780,10 @@ fi
                 control_plane_failover_checked: report.daemon_control_plane_failover_checked,
                 control_plane_failover_survivor_endpoints: report
                     .daemon_control_plane_failover_survivor_endpoints,
+                control_plane_lifecycle_metrics:
+                    ControlPlaneLifecycleMetricsMeasurement::from_report(report),
+                control_plane_failover_lifecycle_metrics:
+                    ControlPlaneLifecycleMetricsMeasurement::from_failover_report(report),
             }),
             runtime_dir: runtime_dir.clone(),
             iparsd_binary: synthetic_daemon_binary_identity(),
