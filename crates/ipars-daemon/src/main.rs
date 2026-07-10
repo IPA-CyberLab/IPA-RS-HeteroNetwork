@@ -17027,6 +17027,9 @@ mod tests {
                 EbpfTracepointAttachSpec::parse(
                     "ipars_sys_enter_sendto:syscalls:sys_enter_sendto",
                 )?,
+                EbpfTracepointAttachSpec::parse(
+                    "ipars_sys_enter_sendmsg:syscalls:sys_enter_sendmsg",
+                )?,
             ],
         };
         ensure_ebpf_object_file_ready(&config.object_path)?;

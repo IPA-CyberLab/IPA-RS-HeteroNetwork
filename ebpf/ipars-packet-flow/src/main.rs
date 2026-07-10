@@ -21,7 +21,12 @@ const AF_INET6: u16 = 10;
 const SYSCALL_TRACEPOINT_ARGS_OFFSET: usize = 16;
 const SYSCALL_TRACEPOINT_ARG_SIZE: usize = 8;
 const CONNECT_SOCKADDR_ARG: usize = 1;
+const CONNECT_SOCKADDR_LEN_ARG: usize = 2;
 const SENDTO_SOCKADDR_ARG: usize = 4;
+const SENDTO_SOCKADDR_LEN_ARG: usize = 5;
+const SENDMSG_MSGHDR_ARG: usize = 1;
+const SOCKADDR_IN_LEN: u32 = 16;
+const SOCKADDR_IN6_LEN: u32 = 28;
 const RINGBUF_BYTES: u32 = 256 * 1024;
 
 #[repr(C)]
@@ -43,37 +48,76 @@ struct SockAddrIn6 {
     scope_id: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserMsghdr {
+    name: *const u8,
+    namelen: u32,
+    _padding: u32,
+}
+
 #[map]
 pub static IPARS_PACKET_FLOWS: RingBuf = RingBuf::with_byte_size(RINGBUF_BYTES, 0);
 
 #[tracepoint]
 pub fn ipars_sys_enter_connect(ctx: TracePointContext) -> u32 {
-    emit_sockaddr_arg(&ctx, CONNECT_SOCKADDR_ARG);
+    emit_sockaddr_arg(&ctx, CONNECT_SOCKADDR_ARG, CONNECT_SOCKADDR_LEN_ARG);
     0
 }
 
 #[tracepoint]
 pub fn ipars_sys_enter_sendto(ctx: TracePointContext) -> u32 {
-    emit_sockaddr_arg(&ctx, SENDTO_SOCKADDR_ARG);
+    emit_sockaddr_arg(&ctx, SENDTO_SOCKADDR_ARG, SENDTO_SOCKADDR_LEN_ARG);
     0
 }
 
-fn emit_sockaddr_arg(ctx: &TracePointContext, arg_index: usize) {
-    let Ok(sockaddr_addr) = read_syscall_arg(ctx, arg_index) else {
+#[tracepoint]
+pub fn ipars_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
+    emit_msghdr_name_arg(&ctx, SENDMSG_MSGHDR_ARG);
+    0
+}
+
+fn emit_sockaddr_arg(ctx: &TracePointContext, sockaddr_arg_index: usize, len_arg_index: usize) {
+    let Ok(sockaddr_addr) = read_syscall_arg(ctx, sockaddr_arg_index) else {
         return;
     };
-    if sockaddr_addr == 0 {
+    let Ok(sockaddr_len) = read_syscall_arg(ctx, len_arg_index) else {
+        return;
+    };
+    emit_sockaddr(
+        sockaddr_addr as *const u8,
+        sockaddr_len.min(u64::from(u32::MAX)) as u32,
+    );
+}
+
+fn emit_msghdr_name_arg(ctx: &TracePointContext, arg_index: usize) {
+    let Ok(msghdr_addr) = read_syscall_arg(ctx, arg_index) else {
+        return;
+    };
+    if msghdr_addr == 0 {
         return;
     }
+    let Ok(msghdr) = (unsafe { bpf_probe_read_user(msghdr_addr as *const UserMsghdr) }) else {
+        return;
+    };
+    emit_sockaddr(msghdr.name, msghdr.namelen);
+}
 
-    let sockaddr = sockaddr_addr as *const u8;
+fn emit_sockaddr(sockaddr: *const u8, sockaddr_len: u32) {
+    if sockaddr.is_null() || sockaddr_len < 2 {
+        return;
+    }
     let Ok(family) = (unsafe { bpf_probe_read_user(sockaddr as *const u16) }) else {
         return;
     };
 
     match family {
-        AF_INET => emit_sockaddr_in(sockaddr as *const SockAddrIn),
-        AF_INET6 => emit_sockaddr_in6(sockaddr as *const SockAddrIn6),
+        AF_INET if sockaddr_len >= SOCKADDR_IN_LEN => {
+            emit_sockaddr_in(sockaddr as *const SockAddrIn)
+        }
+        AF_INET6 if sockaddr_len >= SOCKADDR_IN6_LEN => {
+            emit_sockaddr_in6(sockaddr as *const SockAddrIn6)
+        }
         _ => {}
     }
 }
