@@ -198,6 +198,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         &rendered,
         &[
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
+            ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
             ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
             ("IPARS_DOCKER_NETWORKS", "edge_default,edge_apps"),
@@ -331,6 +332,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         &rendered,
         &[
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
             ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-command"),
             ("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND", "wireguard-go"),

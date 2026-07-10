@@ -444,6 +444,12 @@ struct DockerInstallArgs {
     disable_docker_expose_host_routes: bool,
     #[arg(long = "docker-route-interval-seconds", default_value_t = 60)]
     docker_route_interval_seconds: u64,
+    #[arg(
+        long = "agent-runtime-backend",
+        default_value = "linux-command",
+        value_parser = parse_agent_runtime_backend
+    )]
+    agent_runtime_backend: String,
     #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
     route_backend: String,
     #[arg(long)]
@@ -4958,6 +4964,7 @@ fn docker_network_filter_preflight_command(network: &str) -> String {
 }
 
 fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
+    parse_agent_runtime_backend(&args.agent_runtime_backend).map_err(anyhow::Error::msg)?;
     validate_linux_interface_name(&args.docker_host_interface)?;
     if let Some(namespace) = args.docker_container_namespace.as_deref() {
         validate_linux_namespace_name(namespace)?;
@@ -5047,6 +5054,11 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
     if args.userspace_wireguard_command.is_none() {
         anyhow::bail!(
             "--rootless requires --userspace-wireguard-command because the rootless Compose override cannot create kernel WireGuard devices"
+        );
+    }
+    if args.agent_runtime_backend != "linux-command" {
+        anyhow::bail!(
+            "--rootless requires --agent-runtime-backend linux-command because the rootless Compose override uses a userspace WireGuard process"
         );
     }
     let has_docker_route_settings = args.docker_discover_networks
@@ -5415,6 +5427,10 @@ fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
     let apply_docker_routes = !args.rootless;
     let mut environment = vec![
+        InstallEnvironment {
+            name: "IPARS_AGENT_RUNTIME_BACKEND".to_string(),
+            value: args.agent_runtime_backend.clone(),
+        },
         InstallEnvironment {
             name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
             value: apply_docker_routes.to_string(),
@@ -10833,6 +10849,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -10875,6 +10892,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11001,6 +11019,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11080,6 +11099,42 @@ fi
             Cli::try_parse_from(["ipars", "docker", "install", "--route-backend", "invalid"])
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_runtime_backend_and_rejects_rootless_dry_run() -> anyhow::Result<()>
+    {
+        let plan = docker_install_plan(DockerInstallArgs {
+            agent_runtime_backend: "dry-run".to_string(),
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RUNTIME_BACKEND"),
+            Some("dry-run")
+        );
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "docker",
+            "install",
+            "--agent-runtime-backend",
+            "invalid",
+        ])
+        .is_err());
+
+        let error = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            agent_runtime_backend: "dry-run".to_string(),
+            userspace_wireguard_command: Some("wireguard-go".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("rootless dry-run backend should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--rootless requires --agent-runtime-backend linux-command"));
         Ok(())
     }
 
@@ -11374,6 +11429,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: vec!["ipars0".to_string()],
@@ -11430,6 +11486,10 @@ fi
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
             Some("userspace-command")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_RUNTIME_BACKEND"),
+            Some("linux-command")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"),
@@ -11622,6 +11682,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11711,6 +11772,7 @@ fi
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11756,6 +11818,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11801,6 +11864,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11858,6 +11922,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -11921,6 +11986,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -12021,6 +12087,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
@@ -12066,6 +12133,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
@@ -12111,6 +12179,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
@@ -12158,6 +12227,7 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
             userspace_wireguard_args: Vec::new(),
