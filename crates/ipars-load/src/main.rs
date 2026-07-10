@@ -288,6 +288,14 @@ struct LoadReport {
     daemon_control_plane_failover_degraded_nodes_max: usize,
     daemon_control_plane_failover_unhealthy_nodes_min: usize,
     daemon_control_plane_failover_unhealthy_nodes_max: usize,
+    daemon_control_plane_failover_wireguard_key_rotation_success_count_min: u64,
+    daemon_control_plane_failover_wireguard_key_rotation_success_count_max: u64,
+    daemon_control_plane_failover_wireguard_key_rotation_failure_count_min: u64,
+    daemon_control_plane_failover_wireguard_key_rotation_failure_count_max: u64,
+    daemon_control_plane_failover_node_removal_success_count_min: u64,
+    daemon_control_plane_failover_node_removal_success_count_max: u64,
+    daemon_control_plane_failover_node_removal_failure_count_min: u64,
+    daemon_control_plane_failover_node_removal_failure_count_max: u64,
     daemon_control_plane_relay_candidates_min: usize,
     daemon_control_plane_relay_candidates_max: usize,
     daemon_control_plane_path_count_min: usize,
@@ -309,6 +317,14 @@ struct LoadReport {
     daemon_control_plane_unhealthy_nodes: usize,
     daemon_control_plane_unhealthy_nodes_min: usize,
     daemon_control_plane_unhealthy_nodes_max: usize,
+    daemon_control_plane_wireguard_key_rotation_success_count_min: u64,
+    daemon_control_plane_wireguard_key_rotation_success_count_max: u64,
+    daemon_control_plane_wireguard_key_rotation_failure_count_min: u64,
+    daemon_control_plane_wireguard_key_rotation_failure_count_max: u64,
+    daemon_control_plane_node_removal_success_count_min: u64,
+    daemon_control_plane_node_removal_success_count_max: u64,
+    daemon_control_plane_node_removal_failure_count_min: u64,
+    daemon_control_plane_node_removal_failure_count_max: u64,
     daemon_control_plane_metrics_consistent: bool,
     daemon_signal_health_reports: usize,
     daemon_signal_healthy_nodes: usize,
@@ -475,6 +491,17 @@ impl LoadReport {
                         self.daemon_control_plane_processes
                     );
                 }
+                validate_control_plane_lifecycle_counters_idle(
+                    "daemon load scenario control-plane",
+                    self.daemon_control_plane_wireguard_key_rotation_success_count_min,
+                    self.daemon_control_plane_wireguard_key_rotation_success_count_max,
+                    self.daemon_control_plane_wireguard_key_rotation_failure_count_min,
+                    self.daemon_control_plane_wireguard_key_rotation_failure_count_max,
+                    self.daemon_control_plane_node_removal_success_count_min,
+                    self.daemon_control_plane_node_removal_success_count_max,
+                    self.daemon_control_plane_node_removal_failure_count_min,
+                    self.daemon_control_plane_node_removal_failure_count_max,
+                )?;
                 if self.daemon_control_plane_relay_candidates_min != self.relay_count
                     || self.daemon_control_plane_relay_candidates_max != self.relay_count
                 {
@@ -657,6 +684,17 @@ impl LoadReport {
                             "daemon load scenario failover control-plane metrics are inconsistent"
                         );
                     }
+                    validate_control_plane_lifecycle_counters_idle(
+                        "daemon load scenario failover control-plane",
+                        self.daemon_control_plane_failover_wireguard_key_rotation_success_count_min,
+                        self.daemon_control_plane_failover_wireguard_key_rotation_success_count_max,
+                        self.daemon_control_plane_failover_wireguard_key_rotation_failure_count_min,
+                        self.daemon_control_plane_failover_wireguard_key_rotation_failure_count_max,
+                        self.daemon_control_plane_failover_node_removal_success_count_min,
+                        self.daemon_control_plane_failover_node_removal_success_count_max,
+                        self.daemon_control_plane_failover_node_removal_failure_count_min,
+                        self.daemon_control_plane_failover_node_removal_failure_count_max,
+                    )?;
                     if self.daemon_control_plane_failover_relay_candidates_min != self.relay_count
                         || self.daemon_control_plane_failover_relay_candidates_max
                             != self.relay_count
@@ -1526,6 +1564,42 @@ impl LoadReport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_control_plane_lifecycle_counters_idle(
+    context: &str,
+    wireguard_rotation_success_min: u64,
+    wireguard_rotation_success_max: u64,
+    wireguard_rotation_failure_min: u64,
+    wireguard_rotation_failure_max: u64,
+    node_removal_success_min: u64,
+    node_removal_success_max: u64,
+    node_removal_failure_min: u64,
+    node_removal_failure_max: u64,
+) -> anyhow::Result<()> {
+    if wireguard_rotation_success_min != 0
+        || wireguard_rotation_success_max != 0
+        || wireguard_rotation_failure_min != 0
+        || wireguard_rotation_failure_max != 0
+        || node_removal_success_min != 0
+        || node_removal_success_max != 0
+        || node_removal_failure_min != 0
+        || node_removal_failure_max != 0
+    {
+        bail!(
+            "{context} lifecycle-operation metrics are non-idle: WireGuard key rotation success min/max={}/{}, failure min/max={}/{}, node removal success min/max={}/{}, failure min/max={}/{}",
+            wireguard_rotation_success_min,
+            wireguard_rotation_success_max,
+            wireguard_rotation_failure_min,
+            wireguard_rotation_failure_max,
+            node_removal_success_min,
+            node_removal_success_max,
+            node_removal_failure_min,
+            node_removal_failure_max
+        );
+    }
+    Ok(())
+}
+
 fn validate_daemon_manifest_http_endpoint(
     value: &str,
     label: &str,
@@ -1941,6 +2015,14 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_failover_degraded_nodes_max: 0,
         daemon_control_plane_failover_unhealthy_nodes_min: 0,
         daemon_control_plane_failover_unhealthy_nodes_max: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_min: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_max: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_min: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_max: 0,
+        daemon_control_plane_failover_node_removal_success_count_min: 0,
+        daemon_control_plane_failover_node_removal_success_count_max: 0,
+        daemon_control_plane_failover_node_removal_failure_count_min: 0,
+        daemon_control_plane_failover_node_removal_failure_count_max: 0,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_path_count_min: 0,
@@ -1962,6 +2044,14 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_unhealthy_nodes: 0,
         daemon_control_plane_unhealthy_nodes_min: 0,
         daemon_control_plane_unhealthy_nodes_max: 0,
+        daemon_control_plane_wireguard_key_rotation_success_count_min: 0,
+        daemon_control_plane_wireguard_key_rotation_success_count_max: 0,
+        daemon_control_plane_wireguard_key_rotation_failure_count_min: 0,
+        daemon_control_plane_wireguard_key_rotation_failure_count_max: 0,
+        daemon_control_plane_node_removal_success_count_min: 0,
+        daemon_control_plane_node_removal_success_count_max: 0,
+        daemon_control_plane_node_removal_failure_count_min: 0,
+        daemon_control_plane_node_removal_failure_count_max: 0,
         daemon_control_plane_metrics_consistent: false,
         daemon_signal_health_reports: 0,
         daemon_signal_healthy_nodes: 0,
@@ -2178,6 +2268,14 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_failover_degraded_nodes_max: 0,
         daemon_control_plane_failover_unhealthy_nodes_min: 0,
         daemon_control_plane_failover_unhealthy_nodes_max: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_min: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_max: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_min: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_max: 0,
+        daemon_control_plane_failover_node_removal_success_count_min: 0,
+        daemon_control_plane_failover_node_removal_success_count_max: 0,
+        daemon_control_plane_failover_node_removal_failure_count_min: 0,
+        daemon_control_plane_failover_node_removal_failure_count_max: 0,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_path_count_min: 0,
@@ -2199,6 +2297,14 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_unhealthy_nodes: 0,
         daemon_control_plane_unhealthy_nodes_min: 0,
         daemon_control_plane_unhealthy_nodes_max: 0,
+        daemon_control_plane_wireguard_key_rotation_success_count_min: 0,
+        daemon_control_plane_wireguard_key_rotation_success_count_max: 0,
+        daemon_control_plane_wireguard_key_rotation_failure_count_min: 0,
+        daemon_control_plane_wireguard_key_rotation_failure_count_max: 0,
+        daemon_control_plane_node_removal_success_count_min: 0,
+        daemon_control_plane_node_removal_success_count_max: 0,
+        daemon_control_plane_node_removal_failure_count_min: 0,
+        daemon_control_plane_node_removal_failure_count_max: 0,
         daemon_control_plane_metrics_consistent: false,
         daemon_signal_health_reports: 0,
         daemon_signal_healthy_nodes: 0,
@@ -2412,6 +2518,14 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_failover_degraded_nodes_max: 0,
         daemon_control_plane_failover_unhealthy_nodes_min: 0,
         daemon_control_plane_failover_unhealthy_nodes_max: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_min: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_max: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_min: 0,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_max: 0,
+        daemon_control_plane_failover_node_removal_success_count_min: 0,
+        daemon_control_plane_failover_node_removal_success_count_max: 0,
+        daemon_control_plane_failover_node_removal_failure_count_min: 0,
+        daemon_control_plane_failover_node_removal_failure_count_max: 0,
         daemon_control_plane_relay_candidates_min: 0,
         daemon_control_plane_relay_candidates_max: 0,
         daemon_control_plane_path_count_min: 0,
@@ -2433,6 +2547,14 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_unhealthy_nodes: 0,
         daemon_control_plane_unhealthy_nodes_min: 0,
         daemon_control_plane_unhealthy_nodes_max: 0,
+        daemon_control_plane_wireguard_key_rotation_success_count_min: 0,
+        daemon_control_plane_wireguard_key_rotation_success_count_max: 0,
+        daemon_control_plane_wireguard_key_rotation_failure_count_min: 0,
+        daemon_control_plane_wireguard_key_rotation_failure_count_max: 0,
+        daemon_control_plane_node_removal_success_count_min: 0,
+        daemon_control_plane_node_removal_success_count_max: 0,
+        daemon_control_plane_node_removal_failure_count_min: 0,
+        daemon_control_plane_node_removal_failure_count_max: 0,
         daemon_control_plane_metrics_consistent: false,
         daemon_signal_health_reports: 0,
         daemon_signal_healthy_nodes: 0,
@@ -2792,6 +2914,14 @@ async fn run_daemon_scenario(
     let mut failover_degraded_nodes_max = 0;
     let mut failover_unhealthy_nodes_min = 0;
     let mut failover_unhealthy_nodes_max = 0;
+    let mut failover_wireguard_key_rotation_success_count_min = 0;
+    let mut failover_wireguard_key_rotation_success_count_max = 0;
+    let mut failover_wireguard_key_rotation_failure_count_min = 0;
+    let mut failover_wireguard_key_rotation_failure_count_max = 0;
+    let mut failover_node_removal_success_count_min = 0;
+    let mut failover_node_removal_success_count_max = 0;
+    let mut failover_node_removal_failure_count_min = 0;
+    let mut failover_node_removal_failure_count_max = 0;
     let mut failover_agent_status_endpoints = 0;
     let mut failover_agent_candidate_count_min = 0;
     let mut failover_agent_candidate_count_max = 0;
@@ -2914,6 +3044,22 @@ async fn run_daemon_scenario(
         failover_degraded_nodes_max = failover_control_summary.degraded_node_count_max;
         failover_unhealthy_nodes_min = failover_control_summary.unhealthy_node_count_min;
         failover_unhealthy_nodes_max = failover_control_summary.unhealthy_node_count_max;
+        failover_wireguard_key_rotation_success_count_min =
+            failover_control_summary.wireguard_key_rotation_success_count_min;
+        failover_wireguard_key_rotation_success_count_max =
+            failover_control_summary.wireguard_key_rotation_success_count_max;
+        failover_wireguard_key_rotation_failure_count_min =
+            failover_control_summary.wireguard_key_rotation_failure_count_min;
+        failover_wireguard_key_rotation_failure_count_max =
+            failover_control_summary.wireguard_key_rotation_failure_count_max;
+        failover_node_removal_success_count_min =
+            failover_control_summary.node_removal_success_count_min;
+        failover_node_removal_success_count_max =
+            failover_control_summary.node_removal_success_count_max;
+        failover_node_removal_failure_count_min =
+            failover_control_summary.node_removal_failure_count_min;
+        failover_node_removal_failure_count_max =
+            failover_control_summary.node_removal_failure_count_max;
         control_plane_http_requests += failover_control_summary.endpoint_count;
         let failover_path_status = daemon_control_plane_path_status_summary(
             &client,
@@ -3073,6 +3219,22 @@ async fn run_daemon_scenario(
         daemon_control_plane_failover_degraded_nodes_max: failover_degraded_nodes_max,
         daemon_control_plane_failover_unhealthy_nodes_min: failover_unhealthy_nodes_min,
         daemon_control_plane_failover_unhealthy_nodes_max: failover_unhealthy_nodes_max,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_min:
+            failover_wireguard_key_rotation_success_count_min,
+        daemon_control_plane_failover_wireguard_key_rotation_success_count_max:
+            failover_wireguard_key_rotation_success_count_max,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_min:
+            failover_wireguard_key_rotation_failure_count_min,
+        daemon_control_plane_failover_wireguard_key_rotation_failure_count_max:
+            failover_wireguard_key_rotation_failure_count_max,
+        daemon_control_plane_failover_node_removal_success_count_min:
+            failover_node_removal_success_count_min,
+        daemon_control_plane_failover_node_removal_success_count_max:
+            failover_node_removal_success_count_max,
+        daemon_control_plane_failover_node_removal_failure_count_min:
+            failover_node_removal_failure_count_min,
+        daemon_control_plane_failover_node_removal_failure_count_max:
+            failover_node_removal_failure_count_max,
         daemon_control_plane_relay_candidates_min: control_summary.relay_candidate_count_min,
         daemon_control_plane_relay_candidates_max: control_summary.relay_candidate_count_max,
         daemon_control_plane_path_count_min: control_path_summary.path_count_min,
@@ -3099,6 +3261,22 @@ async fn run_daemon_scenario(
         daemon_control_plane_unhealthy_nodes: control_summary.unhealthy_node_count_max,
         daemon_control_plane_unhealthy_nodes_min: control_summary.unhealthy_node_count_min,
         daemon_control_plane_unhealthy_nodes_max: control_summary.unhealthy_node_count_max,
+        daemon_control_plane_wireguard_key_rotation_success_count_min: control_summary
+            .wireguard_key_rotation_success_count_min,
+        daemon_control_plane_wireguard_key_rotation_success_count_max: control_summary
+            .wireguard_key_rotation_success_count_max,
+        daemon_control_plane_wireguard_key_rotation_failure_count_min: control_summary
+            .wireguard_key_rotation_failure_count_min,
+        daemon_control_plane_wireguard_key_rotation_failure_count_max: control_summary
+            .wireguard_key_rotation_failure_count_max,
+        daemon_control_plane_node_removal_success_count_min: control_summary
+            .node_removal_success_count_min,
+        daemon_control_plane_node_removal_success_count_max: control_summary
+            .node_removal_success_count_max,
+        daemon_control_plane_node_removal_failure_count_min: control_summary
+            .node_removal_failure_count_min,
+        daemon_control_plane_node_removal_failure_count_max: control_summary
+            .node_removal_failure_count_max,
         daemon_control_plane_metrics_consistent: control_summary.metrics_consistent(),
         daemon_signal_health_reports: signal_metrics.health_report_count,
         daemon_signal_healthy_nodes: signal_metrics.healthy_node_count,
@@ -5628,6 +5806,14 @@ struct ControlPlaneHealthSummary {
     degraded_node_count_max: usize,
     unhealthy_node_count_min: usize,
     unhealthy_node_count_max: usize,
+    wireguard_key_rotation_success_count_min: u64,
+    wireguard_key_rotation_success_count_max: u64,
+    wireguard_key_rotation_failure_count_min: u64,
+    wireguard_key_rotation_failure_count_max: u64,
+    node_removal_success_count_min: u64,
+    node_removal_success_count_max: u64,
+    node_removal_failure_count_min: u64,
+    node_removal_failure_count_max: u64,
 }
 
 impl ControlPlaneHealthSummary {
@@ -5649,6 +5835,14 @@ impl ControlPlaneHealthSummary {
             degraded_node_count_max: first.degraded_node_count,
             unhealthy_node_count_min: first.unhealthy_node_count,
             unhealthy_node_count_max: first.unhealthy_node_count,
+            wireguard_key_rotation_success_count_min: first.wireguard_key_rotation_success_count,
+            wireguard_key_rotation_success_count_max: first.wireguard_key_rotation_success_count,
+            wireguard_key_rotation_failure_count_min: first.wireguard_key_rotation_failure_count,
+            wireguard_key_rotation_failure_count_max: first.wireguard_key_rotation_failure_count,
+            node_removal_success_count_min: first.node_removal_success_count,
+            node_removal_success_count_max: first.node_removal_success_count,
+            node_removal_failure_count_min: first.node_removal_failure_count,
+            node_removal_failure_count_max: first.node_removal_failure_count,
         };
 
         for metrics in &metrics[1..] {
@@ -5683,9 +5877,44 @@ impl ControlPlaneHealthSummary {
             summary.unhealthy_node_count_max = summary
                 .unhealthy_node_count_max
                 .max(metrics.unhealthy_node_count);
+            summary.wireguard_key_rotation_success_count_min = summary
+                .wireguard_key_rotation_success_count_min
+                .min(metrics.wireguard_key_rotation_success_count);
+            summary.wireguard_key_rotation_success_count_max = summary
+                .wireguard_key_rotation_success_count_max
+                .max(metrics.wireguard_key_rotation_success_count);
+            summary.wireguard_key_rotation_failure_count_min = summary
+                .wireguard_key_rotation_failure_count_min
+                .min(metrics.wireguard_key_rotation_failure_count);
+            summary.wireguard_key_rotation_failure_count_max = summary
+                .wireguard_key_rotation_failure_count_max
+                .max(metrics.wireguard_key_rotation_failure_count);
+            summary.node_removal_success_count_min = summary
+                .node_removal_success_count_min
+                .min(metrics.node_removal_success_count);
+            summary.node_removal_success_count_max = summary
+                .node_removal_success_count_max
+                .max(metrics.node_removal_success_count);
+            summary.node_removal_failure_count_min = summary
+                .node_removal_failure_count_min
+                .min(metrics.node_removal_failure_count);
+            summary.node_removal_failure_count_max = summary
+                .node_removal_failure_count_max
+                .max(metrics.node_removal_failure_count);
         }
 
         Ok(summary)
+    }
+
+    fn lifecycle_counters_idle(&self) -> bool {
+        self.wireguard_key_rotation_success_count_min == 0
+            && self.wireguard_key_rotation_success_count_max == 0
+            && self.wireguard_key_rotation_failure_count_min == 0
+            && self.wireguard_key_rotation_failure_count_max == 0
+            && self.node_removal_success_count_min == 0
+            && self.node_removal_success_count_max == 0
+            && self.node_removal_failure_count_min == 0
+            && self.node_removal_failure_count_max == 0
     }
 
     fn metrics_consistent(&self) -> bool {
@@ -6888,6 +7117,26 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             Err(error) => error.to_string(),
         };
         assert!(error.contains("metrics endpoints"));
+
+        let mut unexpected_lifecycle_counter = daemon_report.clone();
+        unexpected_lifecycle_counter
+            .daemon_control_plane_wireguard_key_rotation_success_count_max = 1;
+        let error = match unexpected_lifecycle_counter.validate_success() {
+            Ok(_) => bail!("daemon report with lifecycle counter drift should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("lifecycle-operation metrics"));
+
+        let mut unexpected_failover_lifecycle_counter = daemon_report.clone();
+        unexpected_failover_lifecycle_counter
+            .daemon_control_plane_failover_node_removal_failure_count_max = 1;
+        let error = match unexpected_failover_lifecycle_counter.validate_success() {
+            Ok(_) => {
+                bail!("daemon report with failover lifecycle counter drift should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("failover control-plane lifecycle-operation metrics"));
 
         let mut missing_daemon_relay_candidate = daemon_report.clone();
         missing_daemon_relay_candidate.daemon_control_plane_relay_candidates_min = 0;
@@ -8484,7 +8733,31 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert_eq!(consistent.reachable_path_count_max, 6);
         assert_eq!(consistent.healthy_node_count_min, 3);
         assert_eq!(consistent.healthy_node_count_max, 3);
+        assert_eq!(consistent.wireguard_key_rotation_success_count_min, 0);
+        assert_eq!(consistent.wireguard_key_rotation_success_count_max, 0);
+        assert_eq!(consistent.node_removal_failure_count_min, 0);
+        assert_eq!(consistent.node_removal_failure_count_max, 0);
+        assert!(consistent.lifecycle_counters_idle());
         assert!(consistent.metrics_consistent());
+
+        let mut lifecycle_first = control_plane_metrics(2, 6, 6, 3, 0, 0);
+        lifecycle_first.wireguard_key_rotation_success_count = 1;
+        lifecycle_first.node_removal_failure_count = 2;
+        let mut lifecycle_second = control_plane_metrics(2, 6, 6, 3, 0, 0);
+        lifecycle_second.wireguard_key_rotation_failure_count = 3;
+        lifecycle_second.node_removal_success_count = 4;
+        let lifecycle =
+            ControlPlaneHealthSummary::from_metrics(&[lifecycle_first, lifecycle_second])?;
+        assert_eq!(lifecycle.wireguard_key_rotation_success_count_min, 0);
+        assert_eq!(lifecycle.wireguard_key_rotation_success_count_max, 1);
+        assert_eq!(lifecycle.wireguard_key_rotation_failure_count_min, 0);
+        assert_eq!(lifecycle.wireguard_key_rotation_failure_count_max, 3);
+        assert_eq!(lifecycle.node_removal_success_count_min, 0);
+        assert_eq!(lifecycle.node_removal_success_count_max, 4);
+        assert_eq!(lifecycle.node_removal_failure_count_min, 0);
+        assert_eq!(lifecycle.node_removal_failure_count_max, 2);
+        assert!(!lifecycle.lifecycle_counters_idle());
+        assert!(lifecycle.metrics_consistent());
 
         let skewed = ControlPlaneHealthSummary::from_metrics(&[
             control_plane_metrics(1, 4, 4, 2, 0, 0),
