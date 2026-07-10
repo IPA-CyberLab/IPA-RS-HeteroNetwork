@@ -1859,6 +1859,7 @@ pub mod api {
         Grafana,
         Statsd,
         Graphite,
+        Collectd,
         Syslog,
         Snmp,
         Jaeger,
@@ -1893,7 +1894,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 83] = [
+        pub const ALL: [Self; 84] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1948,6 +1949,7 @@ pub mod api {
             Self::Grafana,
             Self::Statsd,
             Self::Graphite,
+            Self::Collectd,
             Self::Syslog,
             Self::Snmp,
             Self::Jaeger,
@@ -2035,6 +2037,7 @@ pub mod api {
                 Self::Grafana => "grafana",
                 Self::Statsd => "statsd",
                 Self::Graphite => "graphite",
+                Self::Collectd => "collectd",
                 Self::Syslog => "syslog",
                 Self::Snmp => "snmp",
                 Self::Jaeger => "jaeger",
@@ -2551,6 +2554,11 @@ pub mod api {
             if self.involves_port(2004) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Graphite;
             }
+            if self.involves_port(25826)
+                && matches!(self.protocol, None | Some(TransportProtocol::Udp))
+            {
+                return AgentPacketFlowApplication::Collectd;
+            }
             if self.involves_port(514)
                 && matches!(self.protocol, None | Some(TransportProtocol::Udp))
             {
@@ -2786,6 +2794,11 @@ pub mod api {
                 return Some(AgentPacketFlowApplication::Snmp);
             }
             if matches!(self.protocol, None | Some(TransportProtocol::Udp))
+                && collectd_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Collectd);
+            }
+            if matches!(self.protocol, None | Some(TransportProtocol::Udp))
                 && statsd_payload(payload)
             {
                 return Some(AgentPacketFlowApplication::Statsd);
@@ -2918,6 +2931,7 @@ pub mod api {
             | AgentPacketFlowApplication::Ike
             | AgentPacketFlowApplication::Stun
             | AgentPacketFlowApplication::Statsd
+            | AgentPacketFlowApplication::Collectd
             | AgentPacketFlowApplication::Bfd
             | AgentPacketFlowApplication::Tftp
             | AgentPacketFlowApplication::Vxlan
@@ -5269,6 +5283,9 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::Graphite);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"collectd") {
+            return Some(AgentPacketFlowApplication::Collectd);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
         }
@@ -5662,6 +5679,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"graphite") || protocol.eq_ignore_ascii_case(b"carbon") {
             return Some(AgentPacketFlowApplication::Graphite);
+        }
+        if protocol.eq_ignore_ascii_case(b"collectd") {
+            return Some(AgentPacketFlowApplication::Collectd);
         }
         if protocol.eq_ignore_ascii_case(b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
@@ -7040,6 +7060,106 @@ pub mod api {
             integer = integer.checked_shl(8)?.checked_add(*byte as u32)?;
         }
         Some(integer)
+    }
+
+    fn collectd_payload(payload: &[u8]) -> bool {
+        if payload.len() < 4 || payload.len() > 4096 {
+            return false;
+        }
+        let mut offset = 0_usize;
+        let mut part_count = 0_usize;
+        let mut has_host = false;
+        let mut has_plugin = false;
+        let mut has_type = false;
+        let mut has_values = false;
+        while offset < payload.len() {
+            part_count += 1;
+            if part_count > 64 {
+                return false;
+            }
+            let Some(part_type) = read_u16_be(payload, offset) else {
+                return false;
+            };
+            let Some(part_len) = read_u16_be(payload, offset + 2) else {
+                return false;
+            };
+            let part_len = usize::from(part_len);
+            if part_len < 4 {
+                return false;
+            }
+            let Some(part_end) = offset.checked_add(part_len) else {
+                return false;
+            };
+            let Some(body) = payload.get(offset + 4..part_end) else {
+                return false;
+            };
+            match part_type {
+                0 => {
+                    if !collectd_identifier_part(body) {
+                        return false;
+                    }
+                    has_host = true;
+                }
+                1 | 7 | 8 | 9 => {
+                    if body.len() != 8 {
+                        return false;
+                    }
+                }
+                2 => {
+                    if !collectd_identifier_part(body) {
+                        return false;
+                    }
+                    has_plugin = true;
+                }
+                3 | 5 => {
+                    if !collectd_identifier_part(body) {
+                        return false;
+                    }
+                }
+                4 => {
+                    if !collectd_identifier_part(body) {
+                        return false;
+                    }
+                    has_type = true;
+                }
+                6 => {
+                    if !collectd_values_part(body) {
+                        return false;
+                    }
+                    has_values = true;
+                }
+                _ => return false,
+            }
+            offset = part_end;
+        }
+        has_host && has_plugin && has_type && has_values
+    }
+
+    fn collectd_identifier_part(value: &[u8]) -> bool {
+        value.len() >= 2
+            && value.len() <= 256
+            && value.last() == Some(&0)
+            && value[..value.len() - 1].iter().all(u8::is_ascii_graphic)
+    }
+
+    fn collectd_values_part(value: &[u8]) -> bool {
+        let Some(value_count) = read_u16_be(value, 0) else {
+            return false;
+        };
+        let value_count = usize::from(value_count);
+        if value_count == 0 || value_count > 32 {
+            return false;
+        }
+        let Some(expected_len) = 2_usize
+            .checked_add(value_count)
+            .and_then(|length| length.checked_add(value_count.checked_mul(8)?))
+        else {
+            return false;
+        };
+        value.len() == expected_len
+            && value[2..2 + value_count]
+                .iter()
+                .all(|value_type| matches!(*value_type, 0 | 1 | 2 | 3))
     }
 
     fn statsd_payload(payload: &[u8]) -> bool {
@@ -18173,6 +18293,26 @@ mod tests {
             api::AgentPacketFlowApplication::Graphite
         );
 
+        let collectd = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(25826),
+            ..Default::default()
+        };
+        assert_eq!(
+            collectd.application(),
+            api::AgentPacketFlowApplication::Collectd
+        );
+
+        let collectd_tcp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(25826),
+            ..Default::default()
+        };
+        assert_eq!(
+            collectd_tcp.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         let syslog_udp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(514),
@@ -21401,6 +21541,21 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let collectd_packet = vec![
+            0, 0, 0, 12, b'n', b'o', b'd', b'e', b'-', b'0', b'1', 0, 0, 2, 0, 8, b'c', b'p', b'u',
+            0, 0, 4, 0, 8, b'c', b'p', b'u', 0, 0, 6, 0, 15, 0, 1, 1, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            observation_for_udp_payload(&collectd_packet).application(),
+            api::AgentPacketFlowApplication::Collectd
+        );
+        let mut invalid_collectd_packet = collectd_packet.clone();
+        invalid_collectd_packet[34] = 4;
+        assert_eq!(
+            observation_for_udp_payload(&invalid_collectd_packet).application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         assert_eq!(
             observation_for_payload(b"GET /app HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -22196,6 +22351,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Statsd,
             ),
             (
+                "collectd-observability.svc",
+                api::AgentPacketFlowApplication::Collectd,
+            ),
+            (
                 "graphite-observability.svc",
                 api::AgentPacketFlowApplication::Graphite,
             ),
@@ -22416,6 +22575,10 @@ mod tests {
             (
                 &[b"statsd".as_slice()][..],
                 api::AgentPacketFlowApplication::Statsd,
+            ),
+            (
+                &[b"collectd".as_slice()][..],
+                api::AgentPacketFlowApplication::Collectd,
             ),
             (
                 &[b"carbon".as_slice()][..],
@@ -27212,6 +27375,18 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint statsd requires UDP protocol"));
+
+        let udp_collectd_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"collectd"}"#)?;
+        udp_collectd_hint.validate_transport_metadata()?;
+
+        let tcp_collectd_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"collectd"}"#)?;
+        let error = match tcp_collectd_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP collectd hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint collectd requires UDP protocol"));
 
         let udp_graphite_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"graphite"}"#)?;
