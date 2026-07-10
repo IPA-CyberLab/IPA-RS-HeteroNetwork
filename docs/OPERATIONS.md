@@ -102,6 +102,11 @@ Its production defaults set `agent.wireguardListenPort: 51820` and
 `agent.stunBind: "0.0.0.0:51820"`. Helm rejects zero ports and mismatched values
 before rendering the DaemonSet.
 
+`ipars k8s install` can override either side with
+`--agent-wireguard-listen-port` or `--agent-stun-bind`; the omitted value is
+derived from the supplied port, while conflicting explicit values are rejected
+before Helm is invoked.
+
 ```bash
 ipars k8s install \
   --release ipars \

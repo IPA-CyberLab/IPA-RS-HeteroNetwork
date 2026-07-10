@@ -650,6 +650,10 @@ struct K8sInstallArgs {
         value_parser = parse_agent_runtime_backend
     )]
     agent_runtime_backend: String,
+    #[arg(long = "agent-wireguard-listen-port", value_parser = parse_kubernetes_service_port)]
+    agent_wireguard_listen_port: Option<u16>,
+    #[arg(long = "agent-stun-bind", value_parser = parse_kubernetes_agent_stun_bind)]
+    agent_stun_bind: Option<String>,
     #[arg(long = "route-backend", default_value = "command", value_parser = parse_route_backend)]
     route_backend: String,
     #[arg(long = "disable-agent-peer-map", default_value_t = false)]
@@ -3468,6 +3472,12 @@ fn parse_kubernetes_stun_endpoint(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn parse_kubernetes_agent_stun_bind(value: &str) -> Result<String, String> {
+    validate_relay_forwarder_bind_arg(value, "agent STUN bind")
+        .map_err(|error| error.to_string())?;
+    Ok(value.to_string())
+}
+
 fn parse_kubernetes_http_probe_path(value: &str) -> Result<String, String> {
     validate_kubernetes_http_probe_path(value, "probe HTTP path")?;
     Ok(value.to_string())
@@ -5697,6 +5707,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_service_exposure(&args)?;
     validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
+    validate_k8s_agent_wireguard_endpoint_config(&args)?;
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
         "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={}",
@@ -6199,6 +6210,19 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
         " --set agent.runtimeBackend={}",
         args.agent_runtime_backend
     ));
+    let stun_bind_port = args
+        .agent_stun_bind
+        .as_deref()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+        .map(|address| address.port());
+    if let Some(port) = args.agent_wireguard_listen_port.or(stun_bind_port) {
+        command.push_str(&format!(" --set agent.wireguardListenPort={port}"));
+    }
+    if let Some(stun_bind) = args.agent_stun_bind.as_deref() {
+        append_helm_set_string(command, "agent.stunBind", stun_bind);
+    } else if let Some(port) = args.agent_wireguard_listen_port {
+        append_helm_set_string(command, "agent.stunBind", &format!("0.0.0.0:{port}"));
+    }
     command.push_str(&format!(" --set agent.routeBackend={}", args.route_backend));
     command.push_str(&format!(
         " --set serviceExposure.discoverApiServer={}",
@@ -6738,6 +6762,26 @@ fn validate_k8s_route_discovery(args: &K8sInstallArgs) -> anyhow::Result<()> {
         &args.kubernetes_service_cidrs,
         &mut route_cidrs,
     )?;
+    Ok(())
+}
+
+fn validate_k8s_agent_wireguard_endpoint_config(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    if let Some(port) = args.agent_wireguard_listen_port {
+        validate_kubernetes_service_port_value(port, "--agent-wireguard-listen-port")?;
+    }
+    let Some(stun_bind) = args.agent_stun_bind.as_deref() else {
+        return Ok(());
+    };
+    validate_relay_forwarder_bind_arg(stun_bind, "--agent-stun-bind")?;
+    let stun_bind = stun_bind.parse::<SocketAddr>().with_context(|| {
+        "--agent-stun-bind must be an IPv4 host:port or [IPv6]:port bind socket address"
+    })?;
+    if let Some(listen_port) = args.agent_wireguard_listen_port {
+        anyhow::ensure!(
+            listen_port == stun_bind.port(),
+            "--agent-stun-bind port must equal --agent-wireguard-listen-port"
+        );
+    }
     Ok(())
 }
 
@@ -12611,6 +12655,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -14914,6 +14960,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -15085,6 +15133,57 @@ fi
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_agent_wireguard_and_stun_bind_ports() -> anyhow::Result<()> {
+        let mut explicit = base_k8s_install_args();
+        explicit.agent_wireguard_listen_port = Some(51830);
+        explicit.agent_stun_bind = Some("0.0.0.0:51830".to_string());
+        let plan = k8s_install_plan(explicit)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.wireguardListenPort=51830"));
+        assert!(helm.contains("--set-string agent.stunBind=0.0.0.0:51830"));
+
+        let mut listen_only = base_k8s_install_args();
+        listen_only.agent_wireguard_listen_port = Some(51831);
+        let plan = k8s_install_plan(listen_only)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.wireguardListenPort=51831"));
+        assert!(helm.contains("--set-string agent.stunBind=0.0.0.0:51831"));
+
+        let mut bind_only = base_k8s_install_args();
+        bind_only.agent_stun_bind = Some("[::]:51832".to_string());
+        let plan = k8s_install_plan(bind_only)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.wireguardListenPort=51832"));
+        assert!(helm.contains("--set-string 'agent.stunBind=[::]:51832'"));
+
+        let mut mismatch = base_k8s_install_args();
+        mismatch.agent_wireguard_listen_port = Some(51833);
+        mismatch.agent_stun_bind = Some("0.0.0.0:51834".to_string());
+        let error = k8s_install_plan(mismatch).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--agent-stun-bind port must equal --agent-wireguard-listen-port"));
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-wireguard-listen-port",
+            "0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "k8s",
+            "install",
+            "--agent-stun-bind",
+            "239.1.1.1:51820",
+        ])
+        .is_err());
         Ok(())
     }
 
@@ -16952,6 +17051,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -17123,6 +17224,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -18644,6 +18747,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -18802,6 +18907,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -19094,6 +19201,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -19257,6 +19366,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
@@ -19415,6 +19526,8 @@ fi
             kubernetes_route_provider: None,
             kubernetes_route_interval_seconds: 60,
             agent_runtime_backend: "linux-command".to_string(),
+            agent_wireguard_listen_port: None,
+            agent_stun_bind: None,
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
