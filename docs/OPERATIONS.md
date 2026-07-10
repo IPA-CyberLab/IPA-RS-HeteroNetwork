@@ -114,7 +114,7 @@ ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 
 ipars stun probe --stun-server 127.0.0.1:3478
 ```
 
-Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
+Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
 
 ## Failure Behavior
 

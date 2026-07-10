@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -573,6 +574,56 @@ pub struct ControlPlane<S> {
     config: ControlPlaneConfig,
     store: Arc<S>,
     allocator: RwLock<VpnAllocator>,
+    operation_metrics: ControlPlaneOperationMetrics,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneOperationMetrics {
+    wireguard_key_rotation_success_count: AtomicU64,
+    wireguard_key_rotation_failure_count: AtomicU64,
+    node_removal_success_count: AtomicU64,
+    node_removal_failure_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ControlPlaneOperationMetricsSnapshot {
+    wireguard_key_rotation_success_count: u64,
+    wireguard_key_rotation_failure_count: u64,
+    node_removal_success_count: u64,
+    node_removal_failure_count: u64,
+}
+
+impl ControlPlaneOperationMetrics {
+    fn record_wireguard_key_rotation(&self, success: bool) {
+        let counter = if success {
+            &self.wireguard_key_rotation_success_count
+        } else {
+            &self.wireguard_key_rotation_failure_count
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_node_removal(&self, success: bool) {
+        let counter = if success {
+            &self.node_removal_success_count
+        } else {
+            &self.node_removal_failure_count
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ControlPlaneOperationMetricsSnapshot {
+        ControlPlaneOperationMetricsSnapshot {
+            wireguard_key_rotation_success_count: self
+                .wireguard_key_rotation_success_count
+                .load(Ordering::Relaxed),
+            wireguard_key_rotation_failure_count: self
+                .wireguard_key_rotation_failure_count
+                .load(Ordering::Relaxed),
+            node_removal_success_count: self.node_removal_success_count.load(Ordering::Relaxed),
+            node_removal_failure_count: self.node_removal_failure_count.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl<S> ControlPlane<S>
@@ -582,6 +633,7 @@ where
     pub fn new(config: ControlPlaneConfig, store: Arc<S>) -> Self {
         Self {
             allocator: RwLock::new(VpnAllocator::new(config.vpn_pool)),
+            operation_metrics: ControlPlaneOperationMetrics::default(),
             config,
             store,
         }
@@ -734,6 +786,15 @@ where
     }
 
     pub async fn remove_node(
+        &self,
+        request: RemoveNodeRequest,
+    ) -> Result<RemoveNodeResponse, ControlPlaneError> {
+        let result = self.remove_node_inner(request).await;
+        self.operation_metrics.record_node_removal(result.is_ok());
+        result
+    }
+
+    async fn remove_node_inner(
         &self,
         request: RemoveNodeRequest,
     ) -> Result<RemoveNodeResponse, ControlPlaneError> {
@@ -927,6 +988,16 @@ where
     }
 
     pub async fn rotate_wireguard_key(
+        &self,
+        request: RotateWireGuardKeyRequest,
+    ) -> Result<RotateWireGuardKeyResponse, ControlPlaneError> {
+        let result = self.rotate_wireguard_key_inner(request).await;
+        self.operation_metrics
+            .record_wireguard_key_rotation(result.is_ok());
+        result
+    }
+
+    async fn rotate_wireguard_key_inner(
         &self,
         request: RotateWireGuardKeyRequest,
     ) -> Result<RotateWireGuardKeyResponse, ControlPlaneError> {
@@ -1436,6 +1507,7 @@ where
         let vpn_pool_available_count =
             vpn_pool_total_count.saturating_sub(vpn_pool_allocated_count);
         let peer_map_metrics = peer_map_visibility_metrics(&nodes, &self.config.cluster_policy);
+        let operation_metrics = self.operation_metrics.snapshot();
 
         let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
         for node in &nodes {
@@ -1479,6 +1551,12 @@ where
             token_ledger_expired_count: 0,
             token_ledger_exhausted_count: 0,
             token_ledger_use_count: 0,
+            wireguard_key_rotation_success_count: operation_metrics
+                .wireguard_key_rotation_success_count,
+            wireguard_key_rotation_failure_count: operation_metrics
+                .wireguard_key_rotation_failure_count,
+            node_removal_success_count: operation_metrics.node_removal_success_count,
+            node_removal_failure_count: operation_metrics.node_removal_failure_count,
             peer_map_candidate_count: peer_map_metrics.peer_candidates,
             peer_map_visible_count: peer_map_metrics.visible_peers,
             peer_map_acl_denied_count: peer_map_metrics.acl_denied_peers,
@@ -2836,6 +2914,10 @@ mod tests {
         assert_eq!(metrics.path_count, 0);
         assert_eq!(metrics.vpn_pool_allocated_count, 1);
         assert_eq!(metrics.vpn_pool_available_count, 5);
+        assert_eq!(metrics.node_removal_success_count, 1);
+        assert_eq!(metrics.node_removal_failure_count, 2);
+        assert_eq!(metrics.wireguard_key_rotation_success_count, 0);
+        assert_eq!(metrics.wireguard_key_rotation_failure_count, 0);
 
         let replacement = plane
             .register_with_claims(claims(cluster_id), registration_request("node-c"))
@@ -3287,6 +3369,11 @@ mod tests {
             plane.rotate_wireguard_key(unsigned).await,
             Err(ControlPlaneError::NodeSignatureRequired(_))
         ));
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.wireguard_key_rotation_success_count, 1);
+        assert_eq!(metrics.wireguard_key_rotation_failure_count, 3);
+        assert_eq!(metrics.node_removal_success_count, 0);
+        assert_eq!(metrics.node_removal_failure_count, 0);
         Ok(())
     }
 

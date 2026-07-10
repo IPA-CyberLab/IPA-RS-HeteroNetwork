@@ -1283,6 +1283,14 @@ pub mod api {
         #[serde(default)]
         pub token_ledger_use_count: u64,
         #[serde(default)]
+        pub wireguard_key_rotation_success_count: u64,
+        #[serde(default)]
+        pub wireguard_key_rotation_failure_count: u64,
+        #[serde(default)]
+        pub node_removal_success_count: u64,
+        #[serde(default)]
+        pub node_removal_failure_count: u64,
+        #[serde(default)]
         pub peer_map_candidate_count: usize,
         #[serde(default)]
         pub peer_map_visible_count: usize,

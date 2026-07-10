@@ -428,6 +428,40 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_control_plane_wireguard_key_rotations_total Control-plane WireGuard key rotation requests by result."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_wireguard_key_rotations_total counter"
+    );
+    for (result, count) in [
+        ("success", metrics.wireguard_key_rotation_success_count),
+        ("failure", metrics.wireguard_key_rotation_failure_count),
+    ] {
+        prometheus_line!(
+            &mut body,
+            "ipars_control_plane_wireguard_key_rotations_total{{cluster_id=\"{cluster_id}\",result=\"{result}\"}} {count}"
+        );
+    }
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_node_removals_total Control-plane signed node removal requests by result."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_node_removals_total counter"
+    );
+    for (result, count) in [
+        ("success", metrics.node_removal_success_count),
+        ("failure", metrics.node_removal_failure_count),
+    ] {
+        prometheus_line!(
+            &mut body,
+            "ipars_control_plane_node_removals_total{{cluster_id=\"{cluster_id}\",result=\"{result}\"}} {count}"
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_control_plane_peer_map_candidates Source-target peer-map candidates before ACL filtering."
     );
     prometheus_line!(
@@ -1073,6 +1107,10 @@ mod tests {
         assert_eq!(metrics.token_ledger_expired_count, 0);
         assert_eq!(metrics.token_ledger_exhausted_count, 0);
         assert_eq!(metrics.token_ledger_use_count, 1);
+        assert_eq!(metrics.wireguard_key_rotation_success_count, 1);
+        assert_eq!(metrics.wireguard_key_rotation_failure_count, 0);
+        assert_eq!(metrics.node_removal_success_count, 0);
+        assert_eq!(metrics.node_removal_failure_count, 0);
 
         let mut peer_claims = claims(
             request_body.token.claims.cluster_id.clone(),
@@ -1163,6 +1201,8 @@ mod tests {
         assert!(body.contains("ipars_control_plane_join_tokens"));
         assert!(body.contains("ipars_control_plane_join_tokens_issued"));
         assert!(body.contains("ipars_control_plane_join_token_uses"));
+        assert!(body.contains("ipars_control_plane_wireguard_key_rotations_total"));
+        assert!(body.contains("ipars_control_plane_node_removals_total"));
         assert!(body.contains("ipars_control_plane_peer_map_candidates"));
         assert!(body.contains("ipars_control_plane_peer_map_visible"));
         assert!(body.contains("ipars_control_plane_peer_map_acl_denied"));
@@ -1230,6 +1270,8 @@ mod tests {
         assert_eq!(metrics.node_count, 1);
         assert_eq!(metrics.path_count, 0);
         assert_eq!(metrics.vpn_pool_allocated_count, 1);
+        assert_eq!(metrics.node_removal_success_count, 1);
+        assert_eq!(metrics.node_removal_failure_count, 1);
         let mut reclaim_claims = claims(
             cluster_id.clone(),
             issuer.node_id(),

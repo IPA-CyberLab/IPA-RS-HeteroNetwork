@@ -3870,6 +3870,8 @@ struct ControlPlaneOtelMetrics {
     join_tokens: Gauge<u64>,
     join_tokens_issued: Gauge<u64>,
     join_token_uses: Gauge<u64>,
+    wireguard_key_rotations: Gauge<u64>,
+    node_removals: Gauge<u64>,
     peer_map_candidates: Gauge<u64>,
     peer_map_visible: Gauge<u64>,
     peer_map_acl_denied: Gauge<u64>,
@@ -3942,6 +3944,14 @@ impl ControlPlaneOtelMetrics {
             join_token_uses: meter
                 .u64_gauge("ipars.control_plane.join_token_uses")
                 .with_description("Total accepted join-token uses recorded by the ledger.")
+                .build(),
+            wireguard_key_rotations: meter
+                .u64_gauge("ipars.control_plane.wireguard_key_rotations")
+                .with_description("Control-plane WireGuard key rotation requests by result.")
+                .build(),
+            node_removals: meter
+                .u64_gauge("ipars.control_plane.node_removals")
+                .with_description("Control-plane signed node removal requests by result.")
                 .build(),
             peer_map_candidates: meter
                 .u64_gauge("ipars.control_plane.peer_map.candidates")
@@ -4016,6 +4026,26 @@ impl ControlPlaneOtelMetrics {
             .record(metrics.token_ledger_issued_count, &cluster_attrs);
         self.join_token_uses
             .record(metrics.token_ledger_use_count, &cluster_attrs);
+        for (result, count) in [
+            ("success", metrics.wireguard_key_rotation_success_count),
+            ("failure", metrics.wireguard_key_rotation_failure_count),
+        ] {
+            let attrs = [
+                KeyValue::new("cluster_id", cluster_id.clone()),
+                KeyValue::new("result", result),
+            ];
+            self.wireguard_key_rotations.record(count, &attrs);
+        }
+        for (result, count) in [
+            ("success", metrics.node_removal_success_count),
+            ("failure", metrics.node_removal_failure_count),
+        ] {
+            let attrs = [
+                KeyValue::new("cluster_id", cluster_id.clone()),
+                KeyValue::new("result", result),
+            ];
+            self.node_removals.record(count, &attrs);
+        }
         self.peer_map_candidates
             .record(metrics.peer_map_candidate_count as u64, &cluster_attrs);
         self.peer_map_visible
@@ -13532,6 +13562,10 @@ mod tests {
             token_ledger_expired_count: 0,
             token_ledger_exhausted_count: 1,
             token_ledger_use_count: 7,
+            wireguard_key_rotation_success_count: 2,
+            wireguard_key_rotation_failure_count: 1,
+            node_removal_success_count: 1,
+            node_removal_failure_count: 3,
             peer_map_candidate_count: 2,
             peer_map_visible_count: 1,
             peer_map_acl_denied_count: 1,
