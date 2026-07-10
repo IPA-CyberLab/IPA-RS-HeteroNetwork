@@ -149,6 +149,8 @@ const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGV_BYTES: usize = 512 * 1024;
+const USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRIES: usize = 3;
+const USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRY_DELAY_MILLIS: u64 = 25;
 const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_RUNTIME_COMMAND_LOCALE: &str = "C";
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -6497,21 +6499,38 @@ fn spawn_userspace_wireguard_process(
     command: &LinuxCommand,
 ) -> anyhow::Result<tokio::process::Child> {
     let command = resolve_userspace_wireguard_spawn_command(command)?;
-    let mut child_command = tokio::process::Command::new(&command.program);
-    child_command
-        .args(&command.args)
-        .env_clear()
-        .env("PATH", SANITIZED_RUNTIME_COMMAND_PATH)
-        .env("LANG", SANITIZED_RUNTIME_COMMAND_LOCALE)
-        .env("LC_ALL", SANITIZED_RUNTIME_COMMAND_LOCALE)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    configure_userspace_wireguard_process_group(&mut child_command);
+    for attempt in 0..=USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRIES {
+        let mut child_command = tokio::process::Command::new(&command.program);
+        child_command
+            .args(&command.args)
+            .env_clear()
+            .env("PATH", SANITIZED_RUNTIME_COMMAND_PATH)
+            .env("LANG", SANITIZED_RUNTIME_COMMAND_LOCALE)
+            .env("LC_ALL", SANITIZED_RUNTIME_COMMAND_LOCALE)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        configure_userspace_wireguard_process_group(&mut child_command);
 
-    let child = child_command.spawn()?;
-    Ok(child)
+        match child_command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if userspace_wireguard_spawn_error_is_retryable(&error)
+                    && attempt < USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRIES =>
+            {
+                std::thread::sleep(Duration::from_millis(
+                    USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRY_DELAY_MILLIS,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("bounded userspace WireGuard spawn retry must return or fail")
+}
+
+fn userspace_wireguard_spawn_error_is_retryable(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ExecutableFileBusy
 }
 
 fn resolve_userspace_wireguard_spawn_command(
@@ -18915,6 +18934,18 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userspace_wireguard_spawn_retries_only_executable_file_busy() {
+        let executable_busy = std::io::Error::from_raw_os_error(26);
+        assert!(userspace_wireguard_spawn_error_is_retryable(
+            &executable_busy
+        ));
+        assert!(!userspace_wireguard_spawn_error_is_retryable(
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        ));
     }
 
     #[test]
