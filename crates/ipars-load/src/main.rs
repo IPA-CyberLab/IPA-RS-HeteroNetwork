@@ -265,6 +265,7 @@ struct LoadReport {
     daemon_control_plane_peer_maps_consistent: bool,
     daemon_control_plane_failover_checked: bool,
     daemon_control_plane_failover_survivor_endpoints: usize,
+    daemon_control_plane_failover_stopped_role: Option<String>,
     daemon_control_plane_failover_peer_map_edges_min: usize,
     daemon_control_plane_failover_peer_map_edges_max: usize,
     daemon_control_plane_failover_peer_maps_consistent: bool,
@@ -585,6 +586,14 @@ impl LoadReport {
                             self.daemon_control_plane_failover_survivor_endpoints
                         );
                     }
+                    if self.daemon_control_plane_failover_stopped_role.as_deref()
+                        != Some("control-plane-0")
+                    {
+                        bail!(
+                            "daemon load scenario failover stopped role {:?}, expected control-plane-0",
+                            self.daemon_control_plane_failover_stopped_role
+                        );
+                    }
                     if !self.daemon_control_plane_failover_peer_maps_consistent {
                         bail!(
                             "daemon load scenario failover control-plane peer maps are inconsistent"
@@ -770,6 +779,14 @@ impl LoadReport {
                         self.daemon_control_plane_degraded_nodes_max,
                         self.daemon_control_plane_unhealthy_nodes_max,
                         self.node_count
+                    );
+                }
+                if self.daemon_control_plane_processes <= 1
+                    && self.daemon_control_plane_failover_stopped_role.is_some()
+                {
+                    bail!(
+                        "daemon load scenario recorded failover stopped role {:?} without a multi-control-plane failover",
+                        self.daemon_control_plane_failover_stopped_role
                     );
                 }
                 if self.daemon_signal_health_reports < self.node_count
@@ -1217,9 +1234,11 @@ impl LoadReport {
                 != self.daemon_control_plane_failover_checked
             || measurement.control_plane_failover_survivor_endpoints
                 != self.daemon_control_plane_failover_survivor_endpoints
+            || measurement.control_plane_failover_stopped_role.as_deref()
+                != self.daemon_control_plane_failover_stopped_role.as_deref()
         {
             bail!(
-                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, dataplane drops {}/{}, invalid credential drops {}/{}, Prometheus invalid credential drops {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}",
+                "daemon load scenario retained manifest measurement summary does not match report: relay packets {}/{}, failover relay packets {}/{}, dataplane drops {}/{}, invalid credential drops {}/{}, Prometheus invalid credential drops {}/{}, forwarded bytes {}/{}, active sessions {}/{}, failover checked {}/{}, stopped role {:?}/{:?}",
                 measurement.relay_udp_packets_received,
                 self.relay_udp_packets_received,
                 measurement.failover_relay_udp_packets_received,
@@ -1235,7 +1254,9 @@ impl LoadReport {
                 measurement.relay_active_sessions_reported,
                 self.relay_active_sessions_reported,
                 measurement.control_plane_failover_checked,
-                self.daemon_control_plane_failover_checked
+                self.daemon_control_plane_failover_checked,
+                measurement.control_plane_failover_stopped_role.as_deref(),
+                self.daemon_control_plane_failover_stopped_role.as_deref()
             );
         }
         let expected_relay_final_metrics = RelayFinalMetricsMeasurement::from_report(self);
@@ -2079,6 +2100,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         daemon_control_plane_peer_maps_consistent: false,
         daemon_control_plane_failover_checked: false,
         daemon_control_plane_failover_survivor_endpoints: 0,
+        daemon_control_plane_failover_stopped_role: None,
         daemon_control_plane_failover_peer_map_edges_min: 0,
         daemon_control_plane_failover_peer_map_edges_max: 0,
         daemon_control_plane_failover_peer_maps_consistent: false,
@@ -2332,6 +2354,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         daemon_control_plane_peer_maps_consistent: false,
         daemon_control_plane_failover_checked: false,
         daemon_control_plane_failover_survivor_endpoints: 0,
+        daemon_control_plane_failover_stopped_role: None,
         daemon_control_plane_failover_peer_map_edges_min: 0,
         daemon_control_plane_failover_peer_map_edges_max: 0,
         daemon_control_plane_failover_peer_maps_consistent: false,
@@ -2582,6 +2605,7 @@ async fn run_relay_udp_scenario(
         daemon_control_plane_peer_maps_consistent: false,
         daemon_control_plane_failover_checked: false,
         daemon_control_plane_failover_survivor_endpoints: 0,
+        daemon_control_plane_failover_stopped_role: None,
         daemon_control_plane_failover_peer_map_edges_min: 0,
         daemon_control_plane_failover_peer_map_edges_max: 0,
         daemon_control_plane_failover_peer_maps_consistent: false,
@@ -2978,6 +3002,7 @@ async fn run_daemon_scenario(
         agent_statuses.len() + peer_map_requests + control_summary.endpoint_count;
     let mut failover_checked = false;
     let mut failover_survivor_endpoints = 0;
+    let mut failover_stopped_role = None;
     let mut failover_peer_map_edges_min = 0;
     let mut failover_peer_map_edges_max = 0;
     let mut failover_peer_maps_consistent = false;
@@ -3025,6 +3050,7 @@ async fn run_daemon_scenario(
         services.write_manifest(DaemonRuntimePhase::ControlPlaneFailover)?;
         let (stopped_role, survivor_urls) = services.stop_control_plane_for_failover(0)?;
         failover_survivor_endpoints = survivor_urls.len();
+        failover_stopped_role = Some(stopped_role.clone());
         let mut failover_agent_statuses = Vec::with_capacity(services.agent_urls.len());
         for (index, (url, previous_status)) in
             services.agent_urls.iter().zip(&agent_statuses).enumerate()
@@ -3262,6 +3288,7 @@ async fn run_daemon_scenario(
             ),
         control_plane_failover_checked: failover_checked,
         control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
+        control_plane_failover_stopped_role: failover_stopped_role.clone(),
         control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_summary(
             &control_summary,
         ),
@@ -3364,6 +3391,7 @@ async fn run_daemon_scenario(
         daemon_control_plane_peer_maps_consistent: peer_map_summary.maps_consistent,
         daemon_control_plane_failover_checked: failover_checked,
         daemon_control_plane_failover_survivor_endpoints: failover_survivor_endpoints,
+        daemon_control_plane_failover_stopped_role: failover_stopped_role,
         daemon_control_plane_failover_peer_map_edges_min: failover_peer_map_edges_min,
         daemon_control_plane_failover_peer_map_edges_max: failover_peer_map_edges_max,
         daemon_control_plane_failover_peer_maps_consistent: failover_peer_maps_consistent,
@@ -4453,7 +4481,7 @@ impl ControlPlaneLifecycleMetricsMeasurement {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonRuntimeManifestMeasurement {
     relay_udp_packets_sent: usize,
     relay_udp_packets_received: usize,
@@ -4485,6 +4513,7 @@ struct DaemonRuntimeManifestMeasurement {
     control_plane_failover_path_status_metrics: ControlPlanePathStatusMetricsMeasurement,
     control_plane_failover_checked: bool,
     control_plane_failover_survivor_endpoints: usize,
+    control_plane_failover_stopped_role: Option<String>,
     control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement,
     control_plane_failover_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement,
 }
@@ -8122,6 +8151,36 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert!(error.contains("measurement summary"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_failover_role_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_failover_role_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_failover_role_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_failover_role_measurement.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(measurement) = manifest.measurement.as_mut() {
+                measurement.control_plane_failover_stopped_role =
+                    Some("control-plane-1".to_string());
+            }
+        })?;
+        let error = match mismatched_failover_role_measurement.validate_success() {
+            Ok(_) => {
+                bail!("retained manifest with mismatched failover role should fail validation")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("stopped role"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut mismatched_final_snapshot_measurement = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &mismatched_final_snapshot_measurement,
@@ -9184,6 +9243,23 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         };
         assert!(error.contains("failover"));
 
+        let mut missing_failover_stopped_role = daemon_report.clone();
+        missing_failover_stopped_role.daemon_control_plane_failover_stopped_role = None;
+        let error = match missing_failover_stopped_role.validate_success() {
+            Ok(_) => bail!("daemon report without failover stopped role should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("stopped role"));
+
+        let mut mismatched_failover_stopped_role = daemon_report.clone();
+        mismatched_failover_stopped_role.daemon_control_plane_failover_stopped_role =
+            Some("control-plane-1".to_string());
+        let error = match mismatched_failover_stopped_role.validate_success() {
+            Ok(_) => bail!("daemon report with wrong failover stopped role should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("stopped role"));
+
         let mut skewed_failover = daemon_report.clone();
         skewed_failover.daemon_control_plane_failover_peer_map_edges_min -= 1;
         let error = match skewed_failover.validate_success() {
@@ -9669,7 +9745,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         )?);
 
         let measurement = synthetic_manifest_measurement();
-        let manifest_path = group.stop_all_for_completed_manifest(measurement)?;
+        let manifest_path = group.stop_all_for_completed_manifest(measurement.clone())?;
         let contents = std::fs::read_to_string(&manifest_path)?;
         let manifest: DaemonRuntimeManifest = serde_json::from_str(&contents)?;
 
@@ -10727,6 +10803,12 @@ fi
             report.daemon_failover_relay_udp_payload_bytes_received
         );
         assert_eq!(
+            manifest_measurement
+                .control_plane_failover_stopped_role
+                .as_deref(),
+            report.daemon_control_plane_failover_stopped_role.as_deref()
+        );
+        assert_eq!(
             manifest_measurement.relay_final_metrics,
             RelayFinalMetricsMeasurement::from_report(&report)
         );
@@ -11022,6 +11104,7 @@ fi
         report.daemon_control_plane_peer_maps_consistent = true;
         report.daemon_control_plane_failover_checked = true;
         report.daemon_control_plane_failover_survivor_endpoints = 1;
+        report.daemon_control_plane_failover_stopped_role = Some("control-plane-0".to_string());
         report.daemon_agent_failover_status_endpoints = report.daemon_agent_processes;
         report.daemon_agent_failover_candidate_count_min = 1;
         report.daemon_agent_failover_candidate_count_max = 1;
@@ -11444,6 +11527,7 @@ fi
                 ControlPlanePathStatusMetricsMeasurement::from_counts(3, 6, 6, 6, 6, 0),
             control_plane_failover_checked: true,
             control_plane_failover_survivor_endpoints: 1,
+            control_plane_failover_stopped_role: Some("control-plane-0".to_string()),
             control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_counts(
                 0, 0, 0, 0, 0, 0, 0, 0,
             ),
@@ -11556,6 +11640,9 @@ fi
                     control_plane_failover_checked: report.daemon_control_plane_failover_checked,
                     control_plane_failover_survivor_endpoints: report
                         .daemon_control_plane_failover_survivor_endpoints,
+                    control_plane_failover_stopped_role: report
+                        .daemon_control_plane_failover_stopped_role
+                        .clone(),
                     control_plane_lifecycle_metrics:
                         ControlPlaneLifecycleMetricsMeasurement::from_report(report),
                     control_plane_failover_lifecycle_metrics:
