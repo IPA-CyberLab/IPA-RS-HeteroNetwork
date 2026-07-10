@@ -1853,6 +1853,7 @@ pub mod api {
         InfluxDb,
         Redis,
         Memcached,
+        Couchbase,
         Prometheus,
         OpenTelemetry,
         Syslog,
@@ -1889,7 +1890,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 79] = [
+        pub const ALL: [Self; 80] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1938,6 +1939,7 @@ pub mod api {
             Self::InfluxDb,
             Self::Redis,
             Self::Memcached,
+            Self::Couchbase,
             Self::Prometheus,
             Self::OpenTelemetry,
             Self::Syslog,
@@ -2021,6 +2023,7 @@ pub mod api {
                 Self::InfluxDb => "influxdb",
                 Self::Redis => "redis",
                 Self::Memcached => "memcached",
+                Self::Couchbase => "couchbase",
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Syslog => "syslog",
@@ -2221,6 +2224,12 @@ pub mod api {
             }
             let payload_application = self.payload_prefix_application();
             if let Some(application) = payload_application {
+                if application == AgentPacketFlowApplication::Memcached
+                    && self.involves_couchbase_data_port()
+                    && protocol_is(self.protocol, TransportProtocol::Tcp)
+                {
+                    return AgentPacketFlowApplication::Couchbase;
+                }
                 if self.payload_prefix_application_overrides_port(application) {
                     return application;
                 }
@@ -2502,6 +2511,10 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Memcached;
             }
+            if self.involves_couchbase_port() && protocol_is(self.protocol, TransportProtocol::Tcp)
+            {
+                return AgentPacketFlowApplication::Couchbase;
+            }
             if self.involves_port(9090) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Prometheus;
             }
@@ -2635,6 +2648,18 @@ pub mod api {
 
         fn involves_port(&self, port: u16) -> bool {
             self.source_port == Some(port) || self.destination_port == Some(port)
+        }
+
+        fn involves_couchbase_port(&self) -> bool {
+            self.involves_couchbase_data_port()
+                || (8091..=8097).any(|port| self.involves_port(port))
+                || (18091..=18097).any(|port| self.involves_port(port))
+                || self.involves_port(9123)
+                || self.involves_port(9140)
+        }
+
+        fn involves_couchbase_data_port(&self) -> bool {
+            self.involves_port(11207) || self.involves_port(11210) || self.involves_port(11280)
         }
 
         fn payload_prefix_application_overrides_port(
@@ -3159,6 +3184,9 @@ pub mod api {
             if docker_http_api_path(path) {
                 return Some(AgentPacketFlowApplication::DockerApi);
             }
+            if couchbase_http_api_path(path) {
+                return Some(AgentPacketFlowApplication::Couchbase);
+            }
             if path_starts_with_any(path, &[b"/metrics", b"/federate"])
                 || path_contains_any(path, &[b"/api/v1/query", b"/api/v1/write"])
             {
@@ -3327,6 +3355,11 @@ pub mod api {
             || http_header_name_has_prefix(headers, b"x-influx-")
         {
             return Some(AgentPacketFlowApplication::InfluxDb);
+        }
+        if http_header_value_contains(headers, b"server", b"couchbase")
+            || http_header_name_has_prefix(headers, b"x-couchbase-")
+        {
+            return Some(AgentPacketFlowApplication::Couchbase);
         }
         if http_header_value_contains(headers, b"content-type", b"application/openmetrics-text")
             || http_header_value_contains(headers, b"content-type", b"text/plain; version=0.0.4")
@@ -3599,6 +3632,23 @@ pub mod api {
 
     fn pulsar_http_api_path(path: &[u8]) -> bool {
         const PREFIXES: [&[u8]; 4] = [b"/admin/v2", b"/admin/v3", b"/lookup/v2", b"/ws/v2"];
+
+        PREFIXES
+            .iter()
+            .any(|prefix| path_starts_with_api_prefix(path, prefix))
+    }
+
+    fn couchbase_http_api_path(path: &[u8]) -> bool {
+        const PREFIXES: [&[u8]; 8] = [
+            b"/pools",
+            b"/query/service",
+            b"/analytics/service",
+            b"/api/index",
+            b"/api/v1/functions",
+            b"/ui/index.html",
+            b"/settings/web",
+            b"/controller/rebalance",
+        ];
 
         PREFIXES
             .iter()
@@ -5172,6 +5222,9 @@ pub mod api {
         {
             return Some(AgentPacketFlowApplication::MongoDb);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"couchbase") {
+            return Some(AgentPacketFlowApplication::Couchbase);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"neo4j")
             || tls_sni_hostname_has_label_prefix(hostname, b"bolt")
         {
@@ -5553,6 +5606,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"mongodb") || protocol.eq_ignore_ascii_case(b"mongo") {
             return Some(AgentPacketFlowApplication::MongoDb);
+        }
+        if protocol.eq_ignore_ascii_case(b"couchbase") {
+            return Some(AgentPacketFlowApplication::Couchbase);
         }
         if protocol.eq_ignore_ascii_case(b"neo4j") || protocol.eq_ignore_ascii_case(b"bolt") {
             return Some(AgentPacketFlowApplication::Neo4j);
@@ -17690,6 +17746,36 @@ mod tests {
             api::AgentPacketFlowApplication::Memcached
         );
 
+        let couchbase_data = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(11210),
+            ..Default::default()
+        };
+        assert_eq!(
+            couchbase_data.application(),
+            api::AgentPacketFlowApplication::Couchbase
+        );
+
+        let couchbase_admin = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8091),
+            ..Default::default()
+        };
+        assert_eq!(
+            couchbase_admin.application(),
+            api::AgentPacketFlowApplication::Couchbase
+        );
+
+        let couchbase_tls_admin = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(18091),
+            ..Default::default()
+        };
+        assert_eq!(
+            couchbase_tls_admin.application(),
+            api::AgentPacketFlowApplication::Couchbase
+        );
+
         let prometheus = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Tcp),
             destination_port: Some(9090),
@@ -20992,6 +21078,23 @@ mod tests {
             api::AgentPacketFlowApplication::Http
         );
         assert_eq!(
+            observation_for_payload(b"GET /pools/default/buckets HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Couchbase
+        );
+        assert_eq!(
+            observation_for_payload(b"POST /query/service HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Couchbase
+        );
+        assert_eq!(
+            observation_for_payload(b"HTTP/1.1 200 OK\r\nServer: Couchbase Server\r\n")
+                .application(),
+            api::AgentPacketFlowApplication::Couchbase
+        );
+        assert_eq!(
+            observation_for_payload(b"GET /settings HTTP/1.1\r\n").application(),
+            api::AgentPacketFlowApplication::Http
+        );
+        assert_eq!(
             observation_for_payload(b"GET /metrics/cadvisor HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Kubelet
         );
@@ -21754,6 +21857,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Redis,
             ),
             (
+                "couchbase-data.cache.svc",
+                api::AgentPacketFlowApplication::Couchbase,
+            ),
+            (
                 "memcache-shard.cache.svc",
                 api::AgentPacketFlowApplication::Memcached,
             ),
@@ -21967,6 +22074,10 @@ mod tests {
             (
                 &[b"valkey".as_slice()][..],
                 api::AgentPacketFlowApplication::Redis,
+            ),
+            (
+                &[b"couchbase".as_slice()][..],
+                api::AgentPacketFlowApplication::Couchbase,
             ),
             (
                 &[b"kerberos".as_slice()][..],
@@ -23642,6 +23753,16 @@ mod tests {
             observation_for_payload(&memcached_binary_request(0x00, b"key", b"", b""))
                 .application(),
             api::AgentPacketFlowApplication::Memcached
+        );
+        let couchbase_binary_request = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(11210),
+            payload_prefix: memcached_binary_request(0x00, b"key", b"", b""),
+            ..Default::default()
+        };
+        assert_eq!(
+            couchbase_binary_request.application(),
+            api::AgentPacketFlowApplication::Couchbase
         );
         assert_eq!(
             observation_for_payload(&memcached_binary_request(

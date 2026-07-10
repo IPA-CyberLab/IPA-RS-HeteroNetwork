@@ -526,6 +526,7 @@ pub struct AgentRuntime {
     packet_flow_application_influxdb_count: AtomicU64,
     packet_flow_application_redis_count: AtomicU64,
     packet_flow_application_memcached_count: AtomicU64,
+    packet_flow_application_couchbase_count: AtomicU64,
     packet_flow_application_prometheus_count: AtomicU64,
     packet_flow_application_opentelemetry_count: AtomicU64,
     packet_flow_application_syslog_count: AtomicU64,
@@ -1180,6 +1181,7 @@ impl AgentRuntime {
             packet_flow_application_influxdb_count: AtomicU64::new(0),
             packet_flow_application_redis_count: AtomicU64::new(0),
             packet_flow_application_memcached_count: AtomicU64::new(0),
+            packet_flow_application_couchbase_count: AtomicU64::new(0),
             packet_flow_application_prometheus_count: AtomicU64::new(0),
             packet_flow_application_opentelemetry_count: AtomicU64::new(0),
             packet_flow_application_syslog_count: AtomicU64::new(0),
@@ -2000,6 +2002,7 @@ impl AgentRuntime {
             AgentPacketFlowApplication::InfluxDb => &self.packet_flow_application_influxdb_count,
             AgentPacketFlowApplication::Redis => &self.packet_flow_application_redis_count,
             AgentPacketFlowApplication::Memcached => &self.packet_flow_application_memcached_count,
+            AgentPacketFlowApplication::Couchbase => &self.packet_flow_application_couchbase_count,
             AgentPacketFlowApplication::Prometheus => {
                 &self.packet_flow_application_prometheus_count
             }
@@ -7658,6 +7661,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(memcached_match.peer, peer_b_id);
+        let couchbase_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 82)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Tcp),
+                    destination_port: Some(11210),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(couchbase_match.peer, peer_b_id);
         let grpc_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 31)),
@@ -7779,8 +7796,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 60);
-        assert_eq!(metrics.packet_flow_match_count, 58);
+        assert_eq!(metrics.packet_flow_observation_count, 61);
+        assert_eq!(metrics.packet_flow_match_count, 59);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -7792,7 +7809,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            58
+            59
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -7867,6 +7884,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Kafka), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Pulsar), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Memcached), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Couchbase), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Grpc), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Smb), 1);
@@ -8102,6 +8120,11 @@ mod tests {
                 AgentPacketFlowApplication::Memcached,
                 TransportProtocol::Tcp,
                 memcached_binary_get_response(b"value"),
+            ),
+            (
+                AgentPacketFlowApplication::Couchbase,
+                TransportProtocol::Tcp,
+                b"GET /pools/default/buckets HTTP/1.1\r\n".to_vec(),
             ),
             (
                 AgentPacketFlowApplication::OpenSearch,
