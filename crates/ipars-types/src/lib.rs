@@ -1857,6 +1857,7 @@ pub mod api {
         Prometheus,
         OpenTelemetry,
         Grafana,
+        Statsd,
         Syslog,
         Snmp,
         Jaeger,
@@ -1891,7 +1892,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 81] = [
+        pub const ALL: [Self; 82] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1944,6 +1945,7 @@ pub mod api {
             Self::Prometheus,
             Self::OpenTelemetry,
             Self::Grafana,
+            Self::Statsd,
             Self::Syslog,
             Self::Snmp,
             Self::Jaeger,
@@ -2029,6 +2031,7 @@ pub mod api {
                 Self::Prometheus => "prometheus",
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Grafana => "grafana",
+                Self::Statsd => "statsd",
                 Self::Syslog => "syslog",
                 Self::Snmp => "snmp",
                 Self::Jaeger => "jaeger",
@@ -2529,6 +2532,11 @@ pub mod api {
             if self.involves_port(3000) && protocol_is(self.protocol, TransportProtocol::Tcp) {
                 return AgentPacketFlowApplication::Grafana;
             }
+            if self.involves_port(8125)
+                && matches!(self.protocol, None | Some(TransportProtocol::Udp))
+            {
+                return AgentPacketFlowApplication::Statsd;
+            }
             if self.involves_port(514)
                 && matches!(self.protocol, None | Some(TransportProtocol::Udp))
             {
@@ -2763,6 +2771,11 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Snmp);
             }
+            if matches!(self.protocol, None | Some(TransportProtocol::Udp))
+                && statsd_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Statsd);
+            }
             if syslog_payload(payload, self.protocol) {
                 return Some(AgentPacketFlowApplication::Syslog);
             }
@@ -2883,6 +2896,7 @@ pub mod api {
             | AgentPacketFlowApplication::Dhcp
             | AgentPacketFlowApplication::Ike
             | AgentPacketFlowApplication::Stun
+            | AgentPacketFlowApplication::Statsd
             | AgentPacketFlowApplication::Bfd
             | AgentPacketFlowApplication::Tftp
             | AgentPacketFlowApplication::Vxlan
@@ -5225,6 +5239,9 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"grafana") {
             return Some(AgentPacketFlowApplication::Grafana);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"statsd") {
+            return Some(AgentPacketFlowApplication::Statsd);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
         }
@@ -5612,6 +5629,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"grafana") {
             return Some(AgentPacketFlowApplication::Grafana);
+        }
+        if protocol.eq_ignore_ascii_case(b"statsd") {
+            return Some(AgentPacketFlowApplication::Statsd);
         }
         if protocol.eq_ignore_ascii_case(b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
@@ -6990,6 +7010,143 @@ pub mod api {
             integer = integer.checked_shl(8)?.checked_add(*byte as u32)?;
         }
         Some(integer)
+    }
+
+    fn statsd_payload(payload: &[u8]) -> bool {
+        if payload.is_empty() || payload.len() > 4096 {
+            return false;
+        }
+        let mut metric_count = 0_usize;
+        let mut lines = payload.split(|byte| *byte == b'\n').peekable();
+        while let Some(raw_line) = lines.next() {
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if line.is_empty() {
+                return lines.peek().is_none() && payload.ends_with(b"\n") && metric_count > 0;
+            }
+            metric_count += 1;
+            if metric_count > 16 || !statsd_metric_line_payload(line) {
+                return false;
+            }
+        }
+        metric_count > 0
+    }
+
+    fn statsd_metric_line_payload(line: &[u8]) -> bool {
+        if line.is_empty() || line.len() > 512 {
+            return false;
+        }
+        let Some(name_end) = line.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let metric_name = &line[..name_end];
+        if !statsd_metric_name(metric_name) {
+            return false;
+        }
+        let mut fields = line[name_end + 1..].split(|byte| *byte == b'|');
+        let Some(value) = fields.next() else {
+            return false;
+        };
+        let Some(metric_type) = fields.next() else {
+            return false;
+        };
+        if !(metric_type == b"c"
+            || metric_type == b"g"
+            || metric_type == b"ms"
+            || metric_type == b"h"
+            || metric_type == b"s"
+            || metric_type == b"d")
+        {
+            return false;
+        }
+        if metric_type == b"s" {
+            if !statsd_set_value(value) {
+                return false;
+            }
+        } else if !statsd_numeric_value(value) {
+            return false;
+        }
+
+        let mut sample_rate_seen = false;
+        let mut tags_seen = false;
+        for field in fields {
+            if let Some(sample_rate) = field.strip_prefix(b"@") {
+                if sample_rate_seen || !statsd_sample_rate(sample_rate) {
+                    return false;
+                }
+                sample_rate_seen = true;
+            } else if let Some(tags) = field.strip_prefix(b"#") {
+                if tags_seen || !statsd_tags(tags) {
+                    return false;
+                }
+                tags_seen = true;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn statsd_metric_name(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+    }
+
+    fn statsd_set_value(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && *byte != b'|')
+    }
+
+    fn statsd_numeric_value(value: &[u8]) -> bool {
+        if value.is_empty() || value.len() > 128 {
+            return false;
+        }
+        let value = match value.first() {
+            Some(b'+' | b'-') => &value[1..],
+            _ => value,
+        };
+        let mut decimal_seen = false;
+        let mut digit_count = 0_usize;
+        for byte in value {
+            if byte.is_ascii_digit() {
+                digit_count += 1;
+            } else if *byte == b'.' && !decimal_seen {
+                decimal_seen = true;
+            } else {
+                return false;
+            }
+        }
+        digit_count > 0
+    }
+
+    fn statsd_sample_rate(value: &[u8]) -> bool {
+        if !statsd_numeric_value(value) {
+            return false;
+        }
+        let Ok(value) = std::str::from_utf8(value) else {
+            return false;
+        };
+        let Ok(sample_rate) = value.parse::<f64>() else {
+            return false;
+        };
+        sample_rate.is_finite() && sample_rate > 0.0 && sample_rate <= 1.0
+    }
+
+    fn statsd_tags(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 512
+            && value.split(|byte| *byte == b',').all(|tag| {
+                !tag.is_empty()
+                    && tag.iter().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(*byte, b'_' | b'.' | b'-' | b'/' | b':' | b'=')
+                    })
+            })
     }
 
     fn syslog_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -17844,6 +18001,26 @@ mod tests {
             api::AgentPacketFlowApplication::Grafana
         );
 
+        let statsd = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(8125),
+            ..Default::default()
+        };
+        assert_eq!(
+            statsd.application(),
+            api::AgentPacketFlowApplication::Statsd
+        );
+
+        let statsd_tcp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(8125),
+            ..Default::default()
+        };
+        assert_eq!(
+            statsd_tcp.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
+
         let syslog_udp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(514),
@@ -21186,6 +21363,33 @@ mod tests {
             observation_for_payload(b"HTTP/1.1 200 OK\r\nX-Grafana-Org-Id: 1\r\n").application(),
             api::AgentPacketFlowApplication::Grafana
         );
+        let statsd_metric = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            payload_prefix: b"api.request.count:1|c|@0.5|#region:iad,service:api\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            statsd_metric.application(),
+            api::AgentPacketFlowApplication::Statsd
+        );
+        let statsd_set_metric = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            payload_prefix: b"active.user:alice|s\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            statsd_set_metric.application(),
+            api::AgentPacketFlowApplication::Statsd
+        );
+        let invalid_statsd_metric = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            payload_prefix: b"api.request.count:1|unknown\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_statsd_metric.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         assert_eq!(
             observation_for_payload(b"GET /login HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -21818,6 +22022,10 @@ mod tests {
                 api::AgentPacketFlowApplication::Grafana,
             ),
             (
+                "statsd-observability.svc",
+                api::AgentPacketFlowApplication::Statsd,
+            ),
+            (
                 "clickhouse-0.analytics.svc",
                 api::AgentPacketFlowApplication::ClickHouse,
             ),
@@ -22026,6 +22234,10 @@ mod tests {
             (
                 &[b"grafana".as_slice()][..],
                 api::AgentPacketFlowApplication::Grafana,
+            ),
+            (
+                &[b"statsd".as_slice()][..],
+                api::AgentPacketFlowApplication::Statsd,
             ),
             (
                 &[b"clickhouse-native".as_slice()][..],
@@ -26806,6 +27018,18 @@ mod tests {
         let udp_ike_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"udp","application":"ike"}"#)?;
         udp_ike_hint.validate_transport_metadata()?;
+
+        let udp_statsd_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"statsd"}"#)?;
+        udp_statsd_hint.validate_transport_metadata()?;
+
+        let tcp_statsd_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"statsd"}"#)?;
+        let error = match tcp_statsd_hint.validate_transport_metadata() {
+            Ok(()) => return Err("TCP StatsD hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint statsd requires UDP protocol"));
 
         let tcp_ike_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"ike"}"#)?;

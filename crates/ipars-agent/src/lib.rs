@@ -530,6 +530,7 @@ pub struct AgentRuntime {
     packet_flow_application_prometheus_count: AtomicU64,
     packet_flow_application_opentelemetry_count: AtomicU64,
     packet_flow_application_grafana_count: AtomicU64,
+    packet_flow_application_statsd_count: AtomicU64,
     packet_flow_application_syslog_count: AtomicU64,
     packet_flow_application_snmp_count: AtomicU64,
     packet_flow_application_jaeger_count: AtomicU64,
@@ -1186,6 +1187,7 @@ impl AgentRuntime {
             packet_flow_application_prometheus_count: AtomicU64::new(0),
             packet_flow_application_opentelemetry_count: AtomicU64::new(0),
             packet_flow_application_grafana_count: AtomicU64::new(0),
+            packet_flow_application_statsd_count: AtomicU64::new(0),
             packet_flow_application_syslog_count: AtomicU64::new(0),
             packet_flow_application_snmp_count: AtomicU64::new(0),
             packet_flow_application_jaeger_count: AtomicU64::new(0),
@@ -2012,6 +2014,7 @@ impl AgentRuntime {
                 &self.packet_flow_application_opentelemetry_count
             }
             AgentPacketFlowApplication::Grafana => &self.packet_flow_application_grafana_count,
+            AgentPacketFlowApplication::Statsd => &self.packet_flow_application_statsd_count,
             AgentPacketFlowApplication::Syslog => &self.packet_flow_application_syslog_count,
             AgentPacketFlowApplication::Snmp => &self.packet_flow_application_snmp_count,
             AgentPacketFlowApplication::Jaeger => &self.packet_flow_application_jaeger_count,
@@ -7692,6 +7695,20 @@ mod tests {
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
         assert_eq!(grafana_match.peer, peer_b_id);
+        let statsd_match = runtime
+            .record_packet_flow_observation(
+                IpAddr::V4(Ipv4Addr::new(10, 42, 7, 84)),
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    destination_port: Some(8125),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_b_id.clone()))?;
+        assert_eq!(statsd_match.peer, peer_b_id);
         let grpc_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 31)),
@@ -7813,8 +7830,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 62);
-        assert_eq!(metrics.packet_flow_match_count, 60);
+        assert_eq!(metrics.packet_flow_observation_count, 63);
+        assert_eq!(metrics.packet_flow_match_count, 61);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -7826,7 +7843,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            60
+            61
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -7903,6 +7920,7 @@ mod tests {
         assert_eq!(application_count(AgentPacketFlowApplication::Memcached), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Couchbase), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Grafana), 1);
+        assert_eq!(application_count(AgentPacketFlowApplication::Statsd), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Grpc), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Ldap), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Smb), 1);
@@ -8148,6 +8166,11 @@ mod tests {
                 AgentPacketFlowApplication::Grafana,
                 TransportProtocol::Tcp,
                 b"GET /api/datasources HTTP/1.1\r\n".to_vec(),
+            ),
+            (
+                AgentPacketFlowApplication::Statsd,
+                TransportProtocol::Udp,
+                b"api.request.count:1|c\n".to_vec(),
             ),
             (
                 AgentPacketFlowApplication::OpenSearch,
