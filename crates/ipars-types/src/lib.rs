@@ -1858,6 +1858,7 @@ pub mod api {
         OpenTelemetry,
         Grafana,
         Statsd,
+        Graphite,
         Syslog,
         Snmp,
         Jaeger,
@@ -1892,7 +1893,7 @@ pub mod api {
     }
 
     impl AgentPacketFlowApplication {
-        pub const ALL: [Self; 82] = [
+        pub const ALL: [Self; 83] = [
             Self::Unknown,
             Self::Dns,
             Self::Dhcp,
@@ -1946,6 +1947,7 @@ pub mod api {
             Self::OpenTelemetry,
             Self::Grafana,
             Self::Statsd,
+            Self::Graphite,
             Self::Syslog,
             Self::Snmp,
             Self::Jaeger,
@@ -2032,6 +2034,7 @@ pub mod api {
                 Self::OpenTelemetry => "opentelemetry",
                 Self::Grafana => "grafana",
                 Self::Statsd => "statsd",
+                Self::Graphite => "graphite",
                 Self::Syslog => "syslog",
                 Self::Snmp => "snmp",
                 Self::Jaeger => "jaeger",
@@ -2537,6 +2540,17 @@ pub mod api {
             {
                 return AgentPacketFlowApplication::Statsd;
             }
+            if self.involves_port(2003)
+                && matches!(
+                    self.protocol,
+                    None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+                )
+            {
+                return AgentPacketFlowApplication::Graphite;
+            }
+            if self.involves_port(2004) && protocol_is(self.protocol, TransportProtocol::Tcp) {
+                return AgentPacketFlowApplication::Graphite;
+            }
             if self.involves_port(514)
                 && matches!(self.protocol, None | Some(TransportProtocol::Udp))
             {
@@ -2776,6 +2790,13 @@ pub mod api {
             {
                 return Some(AgentPacketFlowApplication::Statsd);
             }
+            if matches!(
+                self.protocol,
+                None | Some(TransportProtocol::Tcp) | Some(TransportProtocol::Udp)
+            ) && graphite_payload(payload)
+            {
+                return Some(AgentPacketFlowApplication::Graphite);
+            }
             if syslog_payload(payload, self.protocol) {
                 return Some(AgentPacketFlowApplication::Syslog);
             }
@@ -2958,6 +2979,7 @@ pub mod api {
             | AgentPacketFlowApplication::Memcached
             | AgentPacketFlowApplication::OpenVpn
             | AgentPacketFlowApplication::Coap
+            | AgentPacketFlowApplication::Graphite
             | AgentPacketFlowApplication::IparsRelay => require_packet_flow_application_protocol(
                 protocol,
                 application,
@@ -5242,6 +5264,11 @@ pub mod api {
         if tls_sni_hostname_has_label_prefix(hostname, b"statsd") {
             return Some(AgentPacketFlowApplication::Statsd);
         }
+        if tls_sni_hostname_has_label_prefix(hostname, b"graphite")
+            || tls_sni_hostname_has_label_prefix(hostname, b"carbon")
+        {
+            return Some(AgentPacketFlowApplication::Graphite);
+        }
         if tls_sni_hostname_has_label_prefix(hostname, b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
         }
@@ -5632,6 +5659,9 @@ pub mod api {
         }
         if protocol.eq_ignore_ascii_case(b"statsd") {
             return Some(AgentPacketFlowApplication::Statsd);
+        }
+        if protocol.eq_ignore_ascii_case(b"graphite") || protocol.eq_ignore_ascii_case(b"carbon") {
+            return Some(AgentPacketFlowApplication::Graphite);
         }
         if protocol.eq_ignore_ascii_case(b"kafka") {
             return Some(AgentPacketFlowApplication::Kafka);
@@ -7147,6 +7177,98 @@ pub mod api {
                             || matches!(*byte, b'_' | b'.' | b'-' | b'/' | b':' | b'=')
                     })
             })
+    }
+
+    fn graphite_payload(payload: &[u8]) -> bool {
+        if payload.is_empty() || payload.len() > 4096 {
+            return false;
+        }
+        let mut metric_count = 0_usize;
+        let mut lines = payload.split(|byte| *byte == b'\n').peekable();
+        while let Some(raw_line) = lines.next() {
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if line.is_empty() {
+                return lines.peek().is_none() && payload.ends_with(b"\n") && metric_count > 0;
+            }
+            metric_count += 1;
+            if metric_count > 16 || !graphite_metric_line_payload(line) {
+                return false;
+            }
+        }
+        metric_count > 0
+    }
+
+    fn graphite_metric_line_payload(line: &[u8]) -> bool {
+        if line.is_empty() || line.len() > 512 {
+            return false;
+        }
+        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        if !(fields.len() == 2 || fields.len() == 3)
+            || fields.iter().any(|field| field.is_empty())
+            || !graphite_metric_name(fields[0])
+            || !graphite_numeric_value(fields[1])
+        {
+            return false;
+        }
+        fields.len() == 2 || graphite_timestamp(fields[2])
+    }
+
+    fn graphite_metric_name(value: &[u8]) -> bool {
+        let mut segments = value.split(|byte| *byte == b';');
+        let Some(metric_name) = segments.next() else {
+            return false;
+        };
+        !metric_name.is_empty()
+            && metric_name.len() <= 128
+            && (metric_name.contains(&b'.') || value.contains(&b';'))
+            && metric_name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+            && segments.all(graphite_metric_tag)
+    }
+
+    fn graphite_metric_tag(value: &[u8]) -> bool {
+        let mut parts = value.split(|byte| *byte == b'=');
+        let Some(key) = parts.next() else {
+            return false;
+        };
+        let Some(tag_value) = parts.next() else {
+            return false;
+        };
+        parts.next().is_none()
+            && !key.is_empty()
+            && !tag_value.is_empty()
+            && key.len() <= 64
+            && tag_value.len() <= 128
+            && key
+                .iter()
+                .chain(tag_value)
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+    }
+
+    fn graphite_numeric_value(value: &[u8]) -> bool {
+        if value.is_empty()
+            || value.len() > 128
+            || !value.iter().all(|byte| {
+                byte.is_ascii_digit() || matches!(*byte, b'+' | b'-' | b'.' | b'e' | b'E')
+            })
+        {
+            return false;
+        }
+        std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(f64::is_finite)
+    }
+
+    fn graphite_timestamp(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.len() <= 20
+            && value.iter().all(|byte| byte.is_ascii_digit())
+            && std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some()
     }
 
     fn syslog_payload(payload: &[u8], protocol: Option<TransportProtocol>) -> bool {
@@ -18021,6 +18143,36 @@ mod tests {
             api::AgentPacketFlowApplication::Unknown
         );
 
+        let graphite_tcp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2003),
+            ..Default::default()
+        };
+        assert_eq!(
+            graphite_tcp.application(),
+            api::AgentPacketFlowApplication::Graphite
+        );
+
+        let graphite_udp = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            destination_port: Some(2003),
+            ..Default::default()
+        };
+        assert_eq!(
+            graphite_udp.application(),
+            api::AgentPacketFlowApplication::Graphite
+        );
+
+        let graphite_pickle = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            destination_port: Some(2004),
+            ..Default::default()
+        };
+        assert_eq!(
+            graphite_pickle.application(),
+            api::AgentPacketFlowApplication::Graphite
+        );
+
         let syslog_udp = api::AgentPacketFlowObservation {
             protocol: Some(TransportProtocol::Udp),
             destination_port: Some(514),
@@ -21390,6 +21542,24 @@ mod tests {
             invalid_statsd_metric.application(),
             api::AgentPacketFlowApplication::Unknown
         );
+        let graphite_metric = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Tcp),
+            payload_prefix: b"servers.web01.cpu.load;region=iad 1.5 1720051200\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            graphite_metric.application(),
+            api::AgentPacketFlowApplication::Graphite
+        );
+        let invalid_graphite_metric = api::AgentPacketFlowObservation {
+            protocol: Some(TransportProtocol::Udp),
+            payload_prefix: b"servers.web01.cpu.load 1.5 not-a-timestamp\n".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_graphite_metric.application(),
+            api::AgentPacketFlowApplication::Unknown
+        );
         assert_eq!(
             observation_for_payload(b"GET /login HTTP/1.1\r\n").application(),
             api::AgentPacketFlowApplication::Http
@@ -22026,6 +22196,14 @@ mod tests {
                 api::AgentPacketFlowApplication::Statsd,
             ),
             (
+                "graphite-observability.svc",
+                api::AgentPacketFlowApplication::Graphite,
+            ),
+            (
+                "carbon-relay.observability.svc",
+                api::AgentPacketFlowApplication::Graphite,
+            ),
+            (
                 "clickhouse-0.analytics.svc",
                 api::AgentPacketFlowApplication::ClickHouse,
             ),
@@ -22238,6 +22416,10 @@ mod tests {
             (
                 &[b"statsd".as_slice()][..],
                 api::AgentPacketFlowApplication::Statsd,
+            ),
+            (
+                &[b"carbon".as_slice()][..],
+                api::AgentPacketFlowApplication::Graphite,
             ),
             (
                 &[b"clickhouse-native".as_slice()][..],
@@ -27030,6 +27212,22 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("application hint statsd requires UDP protocol"));
+
+        let udp_graphite_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"udp","application":"graphite"}"#)?;
+        udp_graphite_hint.validate_transport_metadata()?;
+
+        let tcp_graphite_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"tcp","application":"graphite"}"#)?;
+        tcp_graphite_hint.validate_transport_metadata()?;
+
+        let gre_graphite_hint: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"protocol":"gre","application":"graphite"}"#)?;
+        let error = match gre_graphite_hint.validate_transport_metadata() {
+            Ok(()) => return Err("GRE Graphite hint should be rejected".into()),
+            Err(error) => error,
+        };
+        assert!(error.contains("application hint graphite requires TCP or UDP protocol"));
 
         let tcp_ike_hint: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"tcp","application":"ike"}"#)?;
