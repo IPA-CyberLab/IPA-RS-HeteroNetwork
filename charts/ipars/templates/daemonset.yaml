@@ -1199,8 +1199,10 @@ spec:
           volumeMounts:
             - name: agent-state
               mountPath: {{ $agentStateMountPath | quote }}
+            {{- if eq $agentRuntimeBackend "linux-command" }}
             - name: dev-net-tun
               mountPath: /dev/net/tun
+            {{- end }}
             - name: join-token
               mountPath: {{ printf "%s/token" $agentStateMountPath | quote }}
               readOnly: true
@@ -1214,10 +1216,12 @@ spec:
           hostPath:
             path: {{ $agentStateHostPath | quote }}
             type: {{ $agentStateHostPathType | quote }}
+        {{- if eq $agentRuntimeBackend "linux-command" }}
         - name: dev-net-tun
           hostPath:
             path: /dev/net/tun
             type: CharDevice
+        {{- end }}
         - name: join-token
           secret:
             secretName: {{ .Values.agent.joinTokenSecretName }}

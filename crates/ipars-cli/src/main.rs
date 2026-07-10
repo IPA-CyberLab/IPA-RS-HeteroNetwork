@@ -14668,6 +14668,9 @@ fi
         assert!(daemonset.contains("- {{ $agentRouteBackend | quote }}"));
         assert!(daemonset.contains("- --runtime-backend"));
         assert!(daemonset.contains("- {{ $agentRuntimeBackend | quote }}"));
+        assert!(daemonset.contains("if eq $agentRuntimeBackend \"linux-command\""));
+        assert!(daemonset.contains("mountPath: /dev/net/tun"));
+        assert!(daemonset.contains("type: CharDevice"));
         Ok(())
     }
 

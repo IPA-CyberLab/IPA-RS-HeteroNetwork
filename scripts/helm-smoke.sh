@@ -68,11 +68,15 @@ helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 
 template_ok default
 
+assert_rendered_contains default "mountPath: /dev/net/tun"
+
 template_ok agent-runtime-dry-run \
   --set-string agent.runtimeBackend=dry-run
 
 assert_rendered_contains agent-runtime-dry-run "- --runtime-backend"
 assert_rendered_contains agent-runtime-dry-run '- "dry-run"'
+assert_rendered_absent agent-runtime-dry-run "mountPath: /dev/net/tun"
+assert_rendered_absent agent-runtime-dry-run "name: dev-net-tun"
 
 template_fails agent-runtime-invalid \
   "agent.runtimeBackend must be linux-command or dry-run" \
