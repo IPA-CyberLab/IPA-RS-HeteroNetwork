@@ -11006,6 +11006,12 @@ fi
     }
 
     #[test]
+    fn docker_compose_enables_agent_peer_map_application() {
+        let compose = include_str!("../../../docker/compose.yaml");
+        assert!(compose.contains("      - --apply-peer-map\n"));
+    }
+
+    #[test]
     fn docker_install_plan_quotes_compose_manifest_path() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             compose_file: PathBuf::from("ops/compose file.yaml"),

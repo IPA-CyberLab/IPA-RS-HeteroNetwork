@@ -95,6 +95,10 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         !rendered.contains("target: /run/ipars/docker.sock"),
         "rendered base Compose config unexpectedly mounted the Docker API socket in the agent container"
     );
+    anyhow::ensure!(
+        rendered.contains("apply-peer-map"),
+        "rendered base Compose config did not enable agent peer-map application"
+    );
 
     let rootful_discovery_compose = ComposeProject {
         repo_root: repo_root.clone(),

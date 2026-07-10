@@ -43,7 +43,7 @@ iparsd agent \
 
 ## Docker
 
-The base Compose stack starts PostgreSQL, control plane, signal, STUN, relay, and agent services. Docker Engine API access is not mounted into the agent unless the discovery override is used; the override mounts the selected Docker socket read-only and does not create a missing host socket path.
+The base Compose stack starts PostgreSQL, control plane, signal, STUN, relay, and agent services. The agent continuously applies its peer map after joining so the selected WireGuard and route backends configure the data plane. Docker Engine API access is not mounted into the agent unless the discovery override is used; the override mounts the selected Docker socket read-only and does not create a missing host socket path.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait
