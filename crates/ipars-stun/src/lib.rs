@@ -102,7 +102,7 @@ impl UdpStunProbe {
         let Some(other_address) = baseline.other_address else {
             return Ok(Vec::new());
         };
-        let local_addr = socket.local_addr()?;
+        let local_addr = concrete_local_addr(socket.local_addr()?, stun_server).await?;
         let mut observations = vec![NatFilteringObservation {
             local_addr,
             stun_server,
@@ -337,6 +337,14 @@ async fn respond_to_binding_request(
     if let Some(stats) = stats {
         stats.record_binding_request();
     }
+    let response_origin = match response_origin {
+        Some(addr) => Some(concrete_local_addr(addr, peer).await?),
+        None => None,
+    };
+    let other_address = match other_address {
+        Some(addr) => Some(concrete_local_addr(addr, peer).await?),
+        None => None,
+    };
     let response = encode_binding_success_response_with_attrs(
         request.transaction_id,
         peer,
@@ -497,8 +505,8 @@ impl Rfc5780StunServer {
         } else {
             received_on
         };
-        let response_origin = response_socket.local_addr()?;
-        let other_address = other_socket.local_addr()?;
+        let response_origin = concrete_local_addr(response_socket.local_addr()?, peer).await?;
+        let other_address = concrete_local_addr(other_socket.local_addr()?, peer).await?;
         let response = encode_binding_success_response_with_attrs(
             request.transaction_id,
             peer,
@@ -567,7 +575,7 @@ async fn observe_binding_with_socket(
         observe_binding_details_with_socket(socket, stun_server, BindingRequestOptions::default())
             .await?;
     Ok(NatProbeObservation {
-        local_addr: socket.local_addr()?,
+        local_addr: concrete_local_addr(socket.local_addr()?, stun_server).await?,
         stun_server,
         reflexive_addr: response.mapped_addr,
         observed_at: Utc::now(),
@@ -616,7 +624,7 @@ async fn observe_filtering_probe_with_socket(
     };
 
     Ok(NatFilteringObservation {
-        local_addr: socket.local_addr()?,
+        local_addr: concrete_local_addr(socket.local_addr()?, stun_server).await?,
         stun_server,
         probe,
         response_origin: response.and_then(|response| response.response_origin),
@@ -625,6 +633,26 @@ async fn observe_filtering_probe_with_socket(
             .or(other_address),
         observed_at,
     })
+}
+
+async fn concrete_local_addr(
+    bound_addr: SocketAddr,
+    remote_addr: SocketAddr,
+) -> Result<SocketAddr, StunError> {
+    if !bound_addr.ip().is_unspecified() {
+        return Ok(bound_addr);
+    }
+
+    let route_bind = match remote_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let route_socket = UdpSocket::bind(route_bind).await?;
+    route_socket.connect(remote_addr).await?;
+    Ok(SocketAddr::new(
+        route_socket.local_addr()?.ip(),
+        bound_addr.port(),
+    ))
 }
 
 fn candidate_from_observation(
@@ -1128,6 +1156,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_probe_reports_concrete_local_address_for_wildcard_bind(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move { server.serve_once().await });
+
+        let observation = UdpStunProbe
+            .observe_binding(SocketAddr::from(([0, 0, 0, 0], 0)), server_addr)
+            .await?;
+        server_task.await??;
+
+        assert_eq!(observation.local_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(observation.local_addr.port(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn udp_probe_rejects_unusable_stun_servers_before_send() {
         let error = UdpStunProbe
             .probe(
@@ -1298,23 +1343,35 @@ mod tests {
     async fn udp_probe_observes_endpoint_independent_filtering_with_rfc5780_server(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let server = Rfc5780StunServer::bind(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::from(([0, 0, 0, 0], 0)),
         )
         .await?;
-        let primary_addr = server.primary_addr()?;
-        let alternate_addr = server.alternate_addr()?;
+        let primary_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server.primary_addr()?.port(),
+        );
+        let alternate_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server.alternate_addr()?.port(),
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
 
         let observations = UdpStunProbe
-            .observe_filtering(SocketAddr::from(([127, 0, 0, 1], 0)), primary_addr)
+            .observe_filtering(SocketAddr::from(([0, 0, 0, 0], 0)), primary_addr)
             .await?;
 
         shutdown_tx.send(true)?;
         server_task.await??;
 
         assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].local_addr.ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_ne!(observations[0].local_addr.port(), 0);
+        assert_eq!(observations[0].local_addr, observations[1].local_addr);
         assert_eq!(observations[0].probe, NatFilteringProbeKind::SameAddress);
         assert_eq!(observations[0].response_origin, Some(primary_addr));
         assert_eq!(observations[0].other_address, Some(alternate_addr));
