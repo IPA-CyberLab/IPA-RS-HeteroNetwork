@@ -219,7 +219,7 @@ Run the repeatable Compose smoke with:
 scripts/docker-smoke.sh
 ```
 
-The suite first validates the full management stack with non-mutating Agents, then starts a second stack with two production `linux-command` Agents in distinct Docker network namespaces and an isolated workload bridge behind each Agent. The production phase discovers the actual bridge CIDRs before signing a route-authorized token, requires kernel WireGuard support, and verifies each `ipars0` address, VPN and remote-workload `AllowedIPs`/routes, nonzero handshakes and transfer counters, plus bidirectional node-to-container, container-to-node, and container-to-container HTTP. It does not mount `/dev/net/tun`; that device is only needed when an operator deliberately selects a userspace WireGuard implementation that consumes TUN.
+The suite first validates the full management stack with non-mutating Agents, then starts a second stack with two concurrently initialized Control Planes sharing PostgreSQL and two production `linux-command` Agents in distinct Docker network namespaces. The production phase discovers isolated IPv4 and dual-stack IPv6 workload bridge CIDRs before signing a multi-bootstrap route-authorized token, requires kernel WireGuard support, and verifies each `ipars0` address, VPN and remote-workload `AllowedIPs`/routes, nonzero handshakes and transfer counters, plus bidirectional node-to-container, container-to-node, and container-to-container HTTP. It stops the primary Control Plane, repeats both address-family traffic checks, then changes a live Docker subnet and requires the surviving Control Plane to drive stale route removal and replacement through Agent heartbeat and peer-map failover. It does not mount `/dev/net/tun`; that device is only needed when an operator deliberately selects a userspace WireGuard implementation that consumes TUN.
 
 ## Kubernetes
 
@@ -326,11 +326,11 @@ Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and 
 ## Failure Behavior
 
 - Existing WireGuard data-plane state and relay sessions continue when the control plane is unavailable.
-- New joins, peer-map refreshes, policy changes, route changes, key rotations, and node removals require a reachable control plane.
+- New joins, peer-map refreshes, policy changes, route changes, key rotations, and node removals require at least one reachable control plane.
 - Agents keep ordered control-plane and signal endpoint lists and retry failover endpoints without stopping the local data-plane loop. Connect and whole-request deadlines bound each endpoint attempt, including peers that accept TCP but never return HTTP.
 - Signal failure prevents new path negotiation and hole-punch planning; existing selected paths remain in local runtime state until they expire or are replaced.
 - Relay failure causes affected relay paths to renew or renegotiate. If direct candidates are available, path scoring can promote back to direct.
-- Redundant control-plane instances can share durable SQL state. The load harness verifies peer-map, path-state, relay-candidate, and existing relay dataplane survival after one control-plane process is stopped.
+- Redundant control-plane instances can share durable SQL state. PostgreSQL schema initialization is transaction-locked so instances can start concurrently. The load harness verifies peer-map, path-state, relay-candidate, and existing relay dataplane survival after one process is stopped; the Docker gate additionally proves existing kernel-WireGuard IPv4/IPv6 traffic and post-failover Docker route reconciliation through the surviving instance.
 
 ## Smoke Gates
 

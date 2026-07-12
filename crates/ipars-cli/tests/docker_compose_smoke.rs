@@ -775,6 +775,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "180",
             "postgres",
             "control-plane",
+            "control-plane-b",
             "signal",
             "stun",
         ],
@@ -885,6 +886,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         &[
             "postgres",
             "control-plane",
+            "control-plane-b",
             "signal",
             "stun",
             "agent",
@@ -995,6 +997,40 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         route_a_cidr,
         ipv4_network_probe_address(route_a_cidr),
     )?;
+    assert_compose_bidirectional_workload_traffic(
+        &compose,
+        agent_vpn_ip,
+        agent_b_vpn_ip,
+        workload_a_ip,
+        workload_b_ip,
+        workload_a_v6_ip,
+        workload_b_v6_ip,
+    )?;
+
+    run_compose_with_diagnostics(&compose, ["stop", "--timeout", "1", "control-plane"])?;
+    assert_compose_service_not_running(&compose, "control-plane")?;
+    assert_compose_services_running(
+        &compose,
+        &[
+            "postgres",
+            "control-plane-b",
+            "signal",
+            "stun",
+            "agent",
+            "agent-b",
+            "workload-a",
+            "workload-b",
+            "workload-a-v6",
+            "workload-b-v6",
+        ],
+    )?;
+    wait_for_compose_http(
+        &compose,
+        "agent",
+        "http://control-plane-b:8443/healthz",
+        "secondary control-plane health",
+    )?;
+
     replace_docker_bridge_network(
         &route_b_network,
         &route_b_replacement_reservation,
@@ -1006,31 +1042,14 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         route_b_cidr,
         route_b_replacement_cidr,
     )?;
-    assert_compose_routed_workload_traffic(
+    assert_compose_bidirectional_workload_traffic(
         &compose,
-        "agent",
-        "workload-a",
-        agent_b_vpn_ip,
-        workload_b_ip,
-    )?;
-    assert_compose_routed_workload_traffic(
-        &compose,
-        "agent-b",
-        "workload-b",
         agent_vpn_ip,
+        agent_b_vpn_ip,
         workload_a_ip,
-    )?;
-    assert_compose_routed_ipv6_workload_traffic(
-        &compose,
-        "agent",
-        "workload-a-v6",
-        workload_b_v6_ip,
-    )?;
-    assert_compose_routed_ipv6_workload_traffic(
-        &compose,
-        "agent-b",
-        "workload-b-v6",
+        workload_b_ip,
         workload_a_v6_ip,
+        workload_b_v6_ip,
     )?;
     Ok(())
 }
@@ -1043,6 +1062,7 @@ fn generated_dataplane_join_token(
     allowed_routes: &[IpNet],
 ) -> Result<Value> {
     let control_plane = format!("http://{bootstrap_ip}:8443");
+    let control_plane_b = "http://control-plane-b:8443";
     let signal = format!("http://{bootstrap_ip}:9443");
     let stun = format!("udp://{bootstrap_ip}:3478");
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipars"));
@@ -1060,13 +1080,14 @@ fn generated_dataplane_join_token(
             "--unlimited-uses",
             "--allowed-route",
             "100.64.0.0/10",
-            "--control-plane-bootstrap",
-            &control_plane,
             "--signal-bootstrap",
             &signal,
             "--stun-bootstrap",
             &stun,
         ]);
+    for endpoint in [&control_plane, control_plane_b] {
+        command.arg("--control-plane-bootstrap").arg(endpoint);
+    }
     for route in allowed_routes {
         command.arg("--allowed-route").arg(route.to_string());
     }
@@ -1989,6 +2010,43 @@ fi
     }
 }
 
+fn assert_compose_bidirectional_workload_traffic(
+    compose: &ComposeProject,
+    agent_vpn_ip: IpAddr,
+    agent_b_vpn_ip: IpAddr,
+    workload_a_ip: Ipv4Addr,
+    workload_b_ip: Ipv4Addr,
+    workload_a_v6_ip: Ipv6Addr,
+    workload_b_v6_ip: Ipv6Addr,
+) -> Result<()> {
+    assert_compose_routed_workload_traffic(
+        compose,
+        "agent",
+        "workload-a",
+        agent_b_vpn_ip,
+        workload_b_ip,
+    )?;
+    assert_compose_routed_workload_traffic(
+        compose,
+        "agent-b",
+        "workload-b",
+        agent_vpn_ip,
+        workload_a_ip,
+    )?;
+    assert_compose_routed_ipv6_workload_traffic(
+        compose,
+        "agent",
+        "workload-a-v6",
+        workload_b_v6_ip,
+    )?;
+    assert_compose_routed_ipv6_workload_traffic(
+        compose,
+        "agent-b",
+        "workload-b-v6",
+        workload_a_v6_ip,
+    )
+}
+
 fn assert_compose_routed_workload_traffic(
     compose: &ComposeProject,
     local_agent: &str,
@@ -2235,6 +2293,27 @@ fn assert_compose_services_running(compose: &ComposeProject, expected: &[&str]) 
             );
         }
     }
+    Ok(())
+}
+
+fn assert_compose_service_not_running(compose: &ComposeProject, service: &str) -> Result<()> {
+    let output = run_compose(compose, ["ps", "--all", "--format", "json"])?;
+    let containers = parse_compose_ps(&output.stdout)?;
+    let container = containers
+        .iter()
+        .find(|container| json_string_field(container, &["Service", "service"]) == Some(service))
+        .with_context(|| {
+            format!(
+                "service {service} was missing from docker compose ps --all\n{}",
+                compose_diagnostics(compose)
+            )
+        })?;
+    let state = json_string_field(container, &["State", "state"]).unwrap_or_default();
+    anyhow::ensure!(
+        state != "running",
+        "service {service} unexpectedly remained running\n{}",
+        compose_diagnostics(compose)
+    );
     Ok(())
 }
 

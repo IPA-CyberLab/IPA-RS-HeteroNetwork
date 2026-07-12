@@ -466,6 +466,9 @@ pub struct PostgresControlPlaneStore {
     pool: PgPool,
 }
 
+// PostgreSQL can race internally even for concurrent `IF NOT EXISTS` DDL.
+const POSTGRES_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x4950_4152_534d_4947;
+
 impl PostgresControlPlaneStore {
     pub async fn connect(database_url: &str) -> Result<Self, ControlPlaneError> {
         let pool = PgPool::connect(database_url).await.map_err(sql_error)?;
@@ -481,7 +484,13 @@ impl PostgresControlPlaneStore {
     }
 
     async fn migrate(&self) -> Result<(), ControlPlaneError> {
-        self.pool
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(POSTGRES_MIGRATION_ADVISORY_LOCK_ID)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        transaction
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS nodes (
@@ -492,7 +501,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
-        self.pool
+        transaction
             .execute(
                 r#"
                 CREATE UNIQUE INDEX IF NOT EXISTS nodes_vpn_ip_unique
@@ -501,7 +510,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
-        self.pool
+        transaction
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS paths (
@@ -514,7 +523,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
-        self.pool
+        transaction
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS health (
@@ -525,7 +534,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
-        self.pool
+        transaction
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS tokens (
@@ -538,6 +547,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
 }
