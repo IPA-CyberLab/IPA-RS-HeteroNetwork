@@ -274,8 +274,8 @@ token_file="$tmp_dir/join-token.json"
 agent_api_token_file="$tmp_dir/agent-api.token"
 control_plane_operator_api_token_file="$tmp_dir/control-plane-operator-api.token"
 jq -ce '.join_token' "$init_output" >"$token_file"
-printf '%s\n' "$agent_api_token" >"$agent_api_token_file"
-printf '%s\n' "$control_plane_operator_api_token" >"$control_plane_operator_api_token_file"
+printf '%s' "$agent_api_token" >"$agent_api_token_file"
+printf '%s' "$control_plane_operator_api_token" >"$control_plane_operator_api_token_file"
 
 "$kubectl_bin" -n "$namespace" create secret generic "$token_secret" \
   --from-file=token="$token_file" \

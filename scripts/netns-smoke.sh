@@ -76,6 +76,14 @@ run_cargo_test() {
   env "${env_name}=1" "$cargo_bin" test --locked "$@" -- --nocapture
 }
 
+run_cargo_test_serial() {
+  local name="$1"
+  local env_name="$2"
+  shift 2
+  echo "running ${name} serially"
+  env "${env_name}=1" "$cargo_bin" test --locked "$@" -- --nocapture --test-threads=1
+}
+
 prepare_iparsd() {
   if [[ -z "${iparsd_bin}" ]]; then
     "$cargo_bin" build --locked -p ipars-daemon
@@ -165,7 +173,7 @@ else
   echo "skipping WireGuard netns smoke because 'wg' is not available"
 fi
 
-run_cargo_test hole-punch-netns IPARS_RUN_HOLE_PUNCH_NETNS_TESTS \
+run_cargo_test_serial hole-punch-netns IPARS_RUN_HOLE_PUNCH_NETNS_TESTS \
   -p ipars-agent --test netns_hole_punch
 
 run_cargo_test relay-fallback-netns IPARS_RUN_RELAY_NETNS_TESTS \

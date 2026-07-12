@@ -50,6 +50,7 @@ const SIGNAL_PLAN_ONE_SIDED_PORT_PRESERVING_NAT_TEST_NAME: &str =
     "udp_hole_puncher_uses_signal_plan_across_one_sided_port_preserving_public_peer_snat_network_namespaces";
 const SIGNAL_PLAN_ONE_SIDED_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_signal_plan_one_sided_address_port_dependent_snat_network_namespaces";
+const NAT_PUNCH_ATTEMPTS: usize = 20;
 
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
@@ -1154,9 +1155,15 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
     let left_ready = temp_file(format!("ipars-hp-{label}-ready-left-{suffix}"));
     let right_ready = temp_file(format!("ipars-hp-{label}-ready-right-{suffix}"));
     let start_file = temp_file(format!("ipars-hp-{label}-start-{suffix}"));
+    let left_mapping_ready = temp_file(format!("ipars-hp-{label}-mapped-left-{suffix}"));
+    let right_mapping_ready = temp_file(format!("ipars-hp-{label}-mapped-right-{suffix}"));
+    let mapping_continue = temp_file(format!("ipars-hp-{label}-mapped-continue-{suffix}"));
     let left_ready_str = left_ready.to_string_lossy().into_owned();
     let right_ready_str = right_ready.to_string_lossy().into_owned();
     let start_file_str = start_file.to_string_lossy().into_owned();
+    let left_mapping_ready_str = left_mapping_ready.to_string_lossy().into_owned();
+    let right_mapping_ready_str = right_mapping_ready.to_string_lossy().into_owned();
+    let mapping_continue_str = mapping_continue.to_string_lossy().into_owned();
     let left_bind = format!("{}:{}", left_ip, topology.left_bind_port);
     let right_bind = format!("{}:{}", right_ip, topology.right_bind_port);
     let source_reflexive = format!("{}:{}", left_public_ip, topology.left_reflexive_port);
@@ -1182,6 +1189,14 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
         ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
         ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
         ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            left_mapping_ready_str.as_str(),
+        ),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            mapping_continue_str.as_str(),
+        ),
     ];
     let mut right_env = vec![
         ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
@@ -1198,6 +1213,14 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
         ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
         ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
         ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            right_mapping_ready_str.as_str(),
+        ),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            mapping_continue_str.as_str(),
+        ),
     ];
     if let Some(plan_json) = plan_json {
         left_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
@@ -1209,6 +1232,9 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
     wait_for_file(&left_ready)?;
     wait_for_file(&right_ready)?;
     fs::write(&start_file, b"start")?;
+    wait_for_file(&left_mapping_ready)?;
+    wait_for_file(&right_mapping_ready)?;
+    fs::write(&mapping_continue, b"continue")?;
 
     assert_success("nat-left", left.wait_with_output()?)?;
     assert_success("nat-right", right.wait_with_output()?)?;
@@ -1216,6 +1242,9 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
     let _ = fs::remove_file(left_ready);
     let _ = fs::remove_file(right_ready);
     let _ = fs::remove_file(start_file);
+    let _ = fs::remove_file(left_mapping_ready);
+    let _ = fs::remove_file(right_mapping_ready);
+    let _ = fs::remove_file(mapping_continue);
     Ok(())
 }
 
@@ -1336,9 +1365,19 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
     let left_ready = temp_file(format!("ipars-hp-{}-ready-left-{suffix}", topology.label));
     let right_ready = temp_file(format!("ipars-hp-{}-ready-right-{suffix}", topology.label));
     let start_file = temp_file(format!("ipars-hp-{}-start-{suffix}", topology.label));
+    let left_mapping_ready = temp_file(format!("ipars-hp-{}-mapped-left-{suffix}", topology.label));
+    let right_mapping_ready =
+        temp_file(format!("ipars-hp-{}-mapped-right-{suffix}", topology.label));
+    let mapping_continue = temp_file(format!(
+        "ipars-hp-{}-mapped-continue-{suffix}",
+        topology.label
+    ));
     let left_ready_str = left_ready.to_string_lossy().into_owned();
     let right_ready_str = right_ready.to_string_lossy().into_owned();
     let start_file_str = start_file.to_string_lossy().into_owned();
+    let left_mapping_ready_str = left_mapping_ready.to_string_lossy().into_owned();
+    let right_mapping_ready_str = right_mapping_ready.to_string_lossy().into_owned();
+    let mapping_continue_str = mapping_continue.to_string_lossy().into_owned();
     let left_bind = format!("{}:{}", left_ip, topology.left_bind_port);
     let right_bind = format!("{}:{}", right_public_ip, topology.right_bind_port);
     let source_reflexive = format!("{}:{}", left_public_ip, topology.left_reflexive_port);
@@ -1369,6 +1408,14 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
         ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
         ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
         ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            left_mapping_ready_str.as_str(),
+        ),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            mapping_continue_str.as_str(),
+        ),
     ];
     let mut right_env = vec![
         ("IPARS_HOLE_PUNCH_CHILD_ROLE", right_child_role),
@@ -1385,6 +1432,14 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
         ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
         ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
         ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            right_mapping_ready_str.as_str(),
+        ),
+        (
+            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            mapping_continue_str.as_str(),
+        ),
     ];
     if let Some(plan_json) = plan_json {
         left_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
@@ -1396,6 +1451,9 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
     wait_for_file(&left_ready)?;
     wait_for_file(&right_ready)?;
     fs::write(&start_file, b"start")?;
+    wait_for_file(&left_mapping_ready)?;
+    wait_for_file(&right_mapping_ready)?;
+    fs::write(&mapping_continue, b"continue")?;
 
     assert_success("one-sided-nat-left", left.wait_with_output()?)?;
     assert_success("one-sided-nat-right", right.wait_with_output()?)?;
@@ -1403,6 +1461,9 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
     let _ = fs::remove_file(left_ready);
     let _ = fs::remove_file(right_ready);
     let _ = fs::remove_file(start_file);
+    let _ = fs::remove_file(left_mapping_ready);
+    let _ = fs::remove_file(right_mapping_ready);
+    let _ = fs::remove_file(mapping_continue);
     Ok(())
 }
 
@@ -1481,6 +1542,9 @@ async fn run_nat_duplex(expect_packet: bool) -> Result<(), Box<dyn std::error::E
     let expected_local = required_env("IPARS_HOLE_PUNCH_EXPECT_LOCAL")?;
     let ready_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_READY_FILE")?);
     let start_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_START_FILE")?);
+    let mapping_ready_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_MAPPING_READY_FILE")?);
+    let mapping_continue_file =
+        PathBuf::from(required_env("IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE")?);
     let socket = tokio::net::UdpSocket::bind(bind).await?;
     fs::write(&ready_file, b"ready")?;
     wait_for_file(&start_file)?;
@@ -1497,12 +1561,20 @@ async fn run_nat_duplex(expect_packet: bool) -> Result<(), Box<dyn std::error::E
         }
     };
 
+    let initial_sent = UdpHolePuncher::new(bind)
+        .with_attempts(1)
+        .with_interval(Duration::ZERO)
+        .execute_on_socket(&local_node, &plan, &socket)
+        .await?;
+    fs::write(&mapping_ready_file, b"mapped")?;
+    wait_for_file(&mapping_continue_file)?;
+
     let sent = UdpHolePuncher::new(bind)
-        .with_attempts(20)
+        .with_attempts(NAT_PUNCH_ATTEMPTS - initial_sent)
         .with_interval(Duration::from_millis(50))
         .execute_on_socket(&local_node, &plan, &socket)
         .await?;
-    assert_eq!(sent, 20);
+    assert_eq!(initial_sent + sent, NAT_PUNCH_ATTEMPTS);
 
     let mut buffer = [0_u8; 512];
     let received =
@@ -1680,6 +1752,26 @@ fn enable_snat_namespace(
         "ip",
         [
             "netns", "exec", namespace, "iptables", "-P", "FORWARD", "ACCEPT",
+        ],
+    )?;
+    // Unmatched public-side UDP is silently filtered by a NAT instead of rejected by its host.
+    command(
+        "ip",
+        [
+            "netns",
+            "exec",
+            namespace,
+            "iptables",
+            "-A",
+            "INPUT",
+            "-i",
+            public_interface,
+            "-p",
+            "udp",
+            "-d",
+            public_ip,
+            "-j",
+            "DROP",
         ],
     )?;
     let public_mapping = public_port
