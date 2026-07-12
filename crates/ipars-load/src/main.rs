@@ -49,6 +49,7 @@ const MAX_DAEMON_RUNTIME_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const DAEMON_RUNTIME_MANIFEST_FILE: &str = "run-manifest.json";
 const DAEMON_CONTROL_PLANE_SQLITE_FILE: &str = "control-plane.sqlite";
 const DAEMON_JOIN_TOKEN_FILE_SUFFIX: &str = ".join-token.json";
+const DAEMON_RELAY_ADMISSION_TOKEN_FILE_SUFFIX: &str = ".relay-admission.token";
 const DAEMON_AGENT_STATE_FILE_SUFFIX: &str = ".state.json";
 const DAEMON_REDACTED_ARG: &str = "<redacted>";
 const MAX_DAEMON_REDACTED_ARG_BYTES: usize = 4096;
@@ -57,6 +58,7 @@ const SANITIZED_DAEMON_CHILD_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_DAEMON_CHILD_LOCALE: &str = "C";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 60_000;
+const MAX_LOAD_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_DAEMON_CONTROL_PLANE_PROCESSES: usize = 8;
 const MAX_DAEMON_READINESS_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_LOAD_HTTP_JSON_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
@@ -67,6 +69,7 @@ const LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "ipars-load-control-plane-operator-token";
 const LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "ipars-load-signal-operator-api-token";
 const LOAD_RELAY_OPERATOR_API_BEARER_TOKEN: &str = "ipars-load-relay-operator-api-token";
+const LOAD_RELAY_ADMISSION_BEARER_TOKEN: &str = "ipars-load-relay-admission-bearer-token";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -1875,6 +1878,13 @@ fn validate_daemon_retained_runtime_entries(
                 entry.path().display()
             );
         }
+        if file_name.ends_with(DAEMON_RELAY_ADMISSION_TOKEN_FILE_SUFFIX) {
+            bail!(
+                "daemon load scenario retained runtime directory {} still contains relay admission token file {} after daemon startup",
+                runtime_dir.display(),
+                entry.path().display()
+            );
+        }
         if file_name.ends_with(DAEMON_AGENT_STATE_FILE_SUFFIX) {
             bail!(
                 "daemon load scenario retained runtime directory {} still contains agent state file {} after child shutdown",
@@ -2430,7 +2440,7 @@ async fn run_relay_udp_scenario(
     let mut payload_bytes_received = 0_u64;
     let mut first_admission = None;
     for pair_index in 0..scenario.active_pair_count {
-        let admission: RelayAdmissionResponse = post_json(
+        let admission: RelayAdmissionResponse = post_json_with_bearer(
             &client,
             format!("{}/v1/sessions", services.http_url),
             &RelayAdmissionRequest {
@@ -2440,6 +2450,7 @@ async fn run_relay_udp_scenario(
                 right_addr,
             },
             "relay session admission",
+            &services.admission_bearer_token,
         )
         .await?;
         first_admission.get_or_insert_with(|| admission.clone());
@@ -2849,7 +2860,7 @@ async fn run_daemon_scenario(
     let mut receive_buffer = vec![0_u8; relay_options.payload_bytes];
     let mut relay_admissions = Vec::with_capacity(active_pair_count);
     for pair_index in 0..active_pair_count {
-        let admission: RelayAdmissionResponse = post_json(
+        let admission: RelayAdmissionResponse = post_json_with_bearer(
             &client,
             format!("{}/v1/sessions", services.relay_http_url),
             &RelayAdmissionRequest {
@@ -2859,6 +2870,7 @@ async fn run_daemon_scenario(
                 right_addr,
             },
             "daemon relay admission",
+            &services.relay_admission_bearer_token,
         )
         .await?;
         relay_admissions.push(admission.clone());
@@ -3864,6 +3876,7 @@ impl Drop for NetworkedServices {
 struct RelayNetworkedServices {
     http_url: String,
     operator_api_bearer_token: String,
+    admission_bearer_token: String,
     udp_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     http_task: JoinHandle<std::io::Result<()>>,
@@ -3893,15 +3906,18 @@ impl RelayNetworkedServices {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
         let operator_api_bearer_token = LOAD_RELAY_OPERATOR_API_BEARER_TOKEN.to_string();
+        let admission_bearer_token = LOAD_RELAY_ADMISSION_BEARER_TOKEN.to_string();
         let app = relay_router(
             RelayHttpState::new(service)
-                .require_operator_api_bearer_token(operator_api_bearer_token.clone()),
+                .require_operator_api_bearer_token(operator_api_bearer_token.clone())
+                .require_admission_bearer_token(admission_bearer_token.clone()),
         );
         let http_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
         Ok(Self {
             http_url: format!("http://{http_addr}"),
             operator_api_bearer_token,
+            admission_bearer_token,
             udp_addr,
             shutdown_tx,
             http_task,
@@ -3925,6 +3941,7 @@ struct DaemonProcessGroup {
     signal_operator_api_bearer_token: String,
     relay_http_url: String,
     relay_operator_api_bearer_token: String,
+    relay_admission_bearer_token: String,
     relay_udp_addr: SocketAddr,
     stun_http_url: String,
     stun_operator_api_bearer_token: String,
@@ -4753,6 +4770,10 @@ impl DaemonProcessGroup {
         let control_plane_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let signal_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let relay_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
+        let relay_admission_bearer_token = IdentityKeyPair::generate().signing_key_b64();
+        let relay_admission_bearer_token_path =
+            write_daemon_relay_admission_token(&runtime_dir, &relay_admission_bearer_token)?;
+        startup.record_relay_admission_token_path(relay_admission_bearer_token_path.clone());
         let stun_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
@@ -4842,6 +4863,8 @@ impl DaemonProcessGroup {
                 "10000".to_string(),
                 "--max-mbps".to_string(),
                 "10000".to_string(),
+                "--admission-bearer-token-path".to_string(),
+                relay_admission_bearer_token_path.display().to_string(),
             ],
             "relay",
             &runtime_dir,
@@ -4951,6 +4974,8 @@ impl DaemonProcessGroup {
                 "1".to_string(),
                 "--signal-path-interval-seconds".to_string(),
                 "1".to_string(),
+                "--relay-admission-bearer-token-path".to_string(),
+                relay_admission_bearer_token_path.display().to_string(),
             ];
             if index < scenario.relay_count {
                 agent_args.extend([
@@ -5028,6 +5053,7 @@ impl DaemonProcessGroup {
         )
         .await?;
         startup.remove_join_token_files()?;
+        startup.remove_relay_admission_token_files()?;
         manifest_seed.write(
             DaemonRuntimePhase::StartupReady,
             &agent_urls,
@@ -5042,6 +5068,7 @@ impl DaemonProcessGroup {
             signal_operator_api_bearer_token,
             relay_http_url,
             relay_operator_api_bearer_token,
+            relay_admission_bearer_token,
             relay_udp_addr,
             stun_http_url,
             stun_operator_api_bearer_token,
@@ -5174,6 +5201,7 @@ struct DaemonStartupGuard {
     runtime_dir: PathBuf,
     children: Vec<DaemonChild>,
     join_token_paths: Vec<PathBuf>,
+    relay_admission_token_paths: Vec<PathBuf>,
     agent_state_paths: Vec<PathBuf>,
     active: bool,
     keep_runtime_dir: bool,
@@ -5185,6 +5213,7 @@ impl DaemonStartupGuard {
             runtime_dir,
             children: Vec::new(),
             join_token_paths: Vec::new(),
+            relay_admission_token_paths: Vec::new(),
             agent_state_paths: Vec::new(),
             active: true,
             keep_runtime_dir,
@@ -5195,6 +5224,10 @@ impl DaemonStartupGuard {
         self.join_token_paths.push(path);
     }
 
+    fn record_relay_admission_token_path(&mut self, path: PathBuf) {
+        self.relay_admission_token_paths.push(path);
+    }
+
     fn record_agent_state_path(&mut self, path: PathBuf) {
         self.agent_state_paths.push(path);
     }
@@ -5203,9 +5236,17 @@ impl DaemonStartupGuard {
         remove_daemon_join_token_files(&self.runtime_dir, &mut self.join_token_paths)
     }
 
+    fn remove_relay_admission_token_files(&mut self) -> anyhow::Result<()> {
+        remove_daemon_relay_admission_token_files(
+            &self.runtime_dir,
+            &mut self.relay_admission_token_paths,
+        )
+    }
+
     fn finish(mut self) -> (Vec<DaemonChild>, Vec<PathBuf>) {
         self.active = false;
         self.join_token_paths.clear();
+        self.relay_admission_token_paths.clear();
         (
             std::mem::take(&mut self.children),
             std::mem::take(&mut self.agent_state_paths),
@@ -5218,6 +5259,10 @@ impl Drop for DaemonStartupGuard {
         if self.active {
             kill_daemon_children(&mut self.children);
             let _ = remove_daemon_join_token_files(&self.runtime_dir, &mut self.join_token_paths);
+            let _ = remove_daemon_relay_admission_token_files(
+                &self.runtime_dir,
+                &mut self.relay_admission_token_paths,
+            );
             let _ = remove_daemon_agent_state_files(&self.runtime_dir, &mut self.agent_state_paths);
             let _ = secure_daemon_retained_runtime_file_modes(&self.runtime_dir);
             if !self.keep_runtime_dir {
@@ -6114,6 +6159,55 @@ fn write_daemon_join_token<Token: Serialize>(
     Ok(token_path)
 }
 
+fn write_daemon_relay_admission_token(runtime_dir: &Path, token: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !token.is_empty()
+            && token.len() <= MAX_LOAD_RELAY_ADMISSION_BEARER_TOKEN_BYTES
+            && token.bytes().all(|byte| byte.is_ascii_graphic()),
+        "daemon relay admission token must be 1-{MAX_LOAD_RELAY_ADMISSION_BEARER_TOKEN_BYTES} printable non-whitespace ASCII bytes"
+    );
+    let token_path = runtime_dir.join(format!("daemon{DAEMON_RELAY_ADMISSION_TOKEN_FILE_SUFFIX}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).private_on_unix();
+    let mut file = options.open(&token_path).with_context(|| {
+        format!(
+            "failed to create daemon relay admission token {}",
+            token_path.display()
+        )
+    })?;
+    file.write_all(token.as_bytes()).with_context(|| {
+        format!(
+            "failed to write daemon relay admission token {}",
+            token_path.display()
+        )
+    })?;
+    file.write_all(b"\n").with_context(|| {
+        format!(
+            "failed to finalize daemon relay admission token {}",
+            token_path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed to sync daemon relay admission token {}",
+            token_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set daemon relay admission token permissions on {}",
+                    token_path.display()
+                )
+            })?;
+    }
+    validate_daemon_relay_admission_token_file(runtime_dir, &token_path)?;
+    Ok(token_path)
+}
+
 fn daemon_join_token_path(runtime_dir: &Path, agent_index: usize) -> PathBuf {
     runtime_dir.join(format!(
         "agent-{agent_index:04}{DAEMON_JOIN_TOKEN_FILE_SUFFIX}"
@@ -6136,6 +6230,19 @@ fn remove_daemon_join_token_files(
         "join token",
         DAEMON_JOIN_TOKEN_FILE_SUFFIX,
         "after agent startup",
+    )
+}
+
+fn remove_daemon_relay_admission_token_files(
+    runtime_dir: &Path,
+    token_paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    remove_daemon_runtime_files(
+        runtime_dir,
+        token_paths,
+        "relay admission token",
+        DAEMON_RELAY_ADMISSION_TOKEN_FILE_SUFFIX,
+        "after daemon startup",
     )
 }
 
@@ -6272,39 +6379,54 @@ fn daemon_runtime_cleanup_path_exists(
 }
 
 fn validate_daemon_join_token_file(runtime_dir: &Path, token_path: &Path) -> anyhow::Result<()> {
+    validate_daemon_private_runtime_file(runtime_dir, token_path, "join token")
+}
+
+fn validate_daemon_relay_admission_token_file(
+    runtime_dir: &Path,
+    token_path: &Path,
+) -> anyhow::Result<()> {
+    validate_daemon_private_runtime_file(runtime_dir, token_path, "relay admission token")
+}
+
+fn validate_daemon_private_runtime_file(
+    runtime_dir: &Path,
+    token_path: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(token_path).with_context(|| {
         format!(
-            "daemon join token {} is not accessible after creation",
+            "daemon {label} {} is not accessible after creation",
             token_path.display()
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!(
-            "daemon join token {} must be a regular file",
+            "daemon {label} {} must be a regular file",
             token_path.display()
         );
     }
     let canonical_runtime_dir = runtime_dir.canonicalize().with_context(|| {
         format!(
-            "daemon join token runtime directory {} cannot be canonicalized",
+            "daemon {label} runtime directory {} cannot be canonicalized",
             runtime_dir.display()
         )
     })?;
     let canonical_token_path = token_path.canonicalize().with_context(|| {
         format!(
-            "daemon join token {} cannot be canonicalized",
+            "daemon {label} {} cannot be canonicalized",
             token_path.display()
         )
     })?;
     if !canonical_token_path.starts_with(&canonical_runtime_dir) {
         bail!(
-            "daemon join token {} is outside runtime directory {}",
+            "daemon {label} {} is outside runtime directory {}",
             canonical_token_path.display(),
             canonical_runtime_dir.display()
         );
     }
     if metadata.len() == 0 {
-        bail!("daemon join token {} is empty", token_path.display());
+        bail!("daemon {label} {} is empty", token_path.display());
     }
     #[cfg(unix)]
     {
@@ -6312,7 +6434,7 @@ fn validate_daemon_join_token_file(runtime_dir: &Path, token_path: &Path) -> any
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o600 {
             bail!(
-                "daemon join token {} permissions are {mode:o}; expected 600",
+                "daemon {label} {} permissions are {mode:o}; expected 600",
                 token_path.display()
             );
         }
@@ -7416,6 +7538,29 @@ where
     read_bounded_json_response(response, context, MAX_LOAD_HTTP_JSON_RESPONSE_BYTES).await
 }
 
+async fn post_json_with_bearer<Request, Response>(
+    client: &reqwest::Client,
+    url: String,
+    request: &Request,
+    context: &str,
+    bearer_token: &str,
+) -> anyhow::Result<Response>
+where
+    Request: Serialize + ?Sized,
+    Response: DeserializeOwned,
+{
+    let response = client
+        .post(url)
+        .bearer_auth(bearer_token)
+        .json(request)
+        .send()
+        .await
+        .with_context(|| format!("failed to send {context} request"))?
+        .error_for_status()
+        .with_context(|| format!("{context} request was rejected"))?;
+    read_bounded_json_response(response, context, MAX_LOAD_HTTP_JSON_RESPONSE_BYTES).await
+}
+
 async fn put_json<Request, Response>(
     client: &reqwest::Client,
     url: String,
@@ -8187,6 +8332,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         retained_manifest.validate_success()?;
         let retained_contents = std::fs::read_to_string(&retained_manifest_path)?;
         assert!(!retained_contents.contains(DAEMON_JOIN_TOKEN_FILE_SUFFIX));
+        assert!(!retained_contents.contains(DAEMON_RELAY_ADMISSION_TOKEN_FILE_SUFFIX));
         let retained_decoded: DaemonRuntimeManifest = serde_json::from_str(&retained_contents)?;
         assert_ne!(
             retained_decoded.stun_addr,
@@ -8206,6 +8352,17 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             .redacted_argv
             .windows(2)
             .any(|window| window[0] == "--join-token-path" && window[1] == DAEMON_REDACTED_ARG));
+        assert!(agent_command.redacted_argv.windows(2).any(|window| {
+            window[0] == "--relay-admission-bearer-token-path" && window[1] == DAEMON_REDACTED_ARG
+        }));
+        let relay_command = retained_decoded
+            .children
+            .iter()
+            .find(|child| child.role == "relay")
+            .context("synthetic retained manifest did not include a relay child")?;
+        assert!(relay_command.redacted_argv.windows(2).any(|window| {
+            window[0] == "--admission-bearer-token-path" && window[1] == DAEMON_REDACTED_ARG
+        }));
         assert_eq!(
             agent_command.redacted_argv_sha256,
             daemon_argv_sha256(&agent_command.redacted_argv)
@@ -10985,6 +11142,36 @@ fi
     }
 
     #[test]
+    fn daemon_relay_admission_token_writer_uses_and_scrubs_private_runtime_file(
+    ) -> anyhow::Result<()> {
+        let runtime_dir = synthetic_runtime_dir("relay-admission-token");
+        std::fs::create_dir_all(&runtime_dir)?;
+        secure_daemon_runtime_dir(&runtime_dir)?;
+        let token = "daemon-relay-admission-secret-with-at-least-32-bytes";
+
+        let token_path = write_daemon_relay_admission_token(&runtime_dir, token)?;
+        assert_eq!(
+            token_path.file_name().and_then(|name| name.to_str()),
+            Some("daemon.relay-admission.token")
+        );
+        assert_eq!(std::fs::read_to_string(&token_path)?, format!("{token}\n"));
+        validate_daemon_relay_admission_token_file(&runtime_dir, &token_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&token_path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let mut token_paths = vec![token_path.clone()];
+        remove_daemon_relay_admission_token_files(&runtime_dir, &mut token_paths)?;
+        assert!(token_paths.is_empty());
+        assert!(!token_path.exists());
+        std::fs::remove_dir_all(&runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn daemon_join_token_file_validation_rejects_unsafe_paths() -> anyhow::Result<()> {
         let runtime_dir = synthetic_runtime_dir("token-validation");
         std::fs::create_dir_all(&runtime_dir)?;
@@ -11031,7 +11218,7 @@ fi
             &iparsd_bin,
             DaemonLoadOptions {
                 control_plane_processes: 2,
-                agent_processes: 2,
+                agent_processes: 3,
                 keep_runtime_dir: true,
                 http_readiness_timeout: Duration::from_secs(5),
                 agent_readiness_timeout: Duration::from_secs(15),
@@ -11046,17 +11233,17 @@ fi
         assert_eq!(report.transport, TransportMode::Daemon);
         assert_eq!(report.daemon_control_plane_processes, 2);
         assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
-        assert_eq!(report.daemon_agent_processes, 2);
-        assert_eq!(report.daemon_agent_status_endpoints, 2);
+        assert_eq!(report.daemon_agent_processes, 3);
+        assert_eq!(report.daemon_agent_status_endpoints, 3);
         assert!(report.daemon_agent_candidate_count_min > 0);
         assert!(report.daemon_agent_candidate_count_max >= report.daemon_agent_candidate_count_min);
         assert_eq!(report.relay_count, 1);
         assert_eq!(report.route_provider_count, 1);
         assert_eq!(report.advertised_routes, 1);
-        assert_eq!(report.registrations, 2);
-        assert_eq!(report.peer_map_requests, 6);
-        assert_eq!(report.peer_map_edges_seen, 2);
-        assert_eq!(report.daemon_processes, 7);
+        assert_eq!(report.registrations, 3);
+        assert_eq!(report.peer_map_requests, 9);
+        assert_eq!(report.peer_map_edges_seen, 6);
+        assert_eq!(report.daemon_processes, 8);
         let runtime_dir = report
             .daemon_runtime_dir
             .clone()
@@ -11152,41 +11339,41 @@ fi
             .iter()
             .all(|child| child.state == DaemonRuntimeManifestChildState::Exited));
         assert_eq!(report.daemon_control_plane_peer_map_endpoints, 2);
-        assert_eq!(report.daemon_control_plane_peer_map_edges_min, 2);
-        assert_eq!(report.daemon_control_plane_peer_map_edges_max, 2);
+        assert_eq!(report.daemon_control_plane_peer_map_edges_min, 6);
+        assert_eq!(report.daemon_control_plane_peer_map_edges_max, 6);
         assert!(report.daemon_control_plane_peer_maps_consistent);
         assert!(report.daemon_control_plane_failover_checked);
         assert_eq!(report.daemon_control_plane_failover_survivor_endpoints, 1);
-        assert_eq!(report.daemon_agent_failover_status_endpoints, 2);
+        assert_eq!(report.daemon_agent_failover_status_endpoints, 3);
         assert!(report.daemon_agent_failover_candidate_count_min > 0);
         assert!(
             report.daemon_agent_failover_candidate_count_max
                 >= report.daemon_agent_failover_candidate_count_min
         );
-        assert_eq!(report.daemon_agent_failover_path_status_endpoints, 2);
-        assert!(report.daemon_agent_failover_paths_total >= 2);
-        assert!(report.daemon_agent_failover_reachable_paths_total >= 2);
+        assert_eq!(report.daemon_agent_failover_path_status_endpoints, 3);
+        assert!(report.daemon_agent_failover_paths_total >= 6);
+        assert!(report.daemon_agent_failover_reachable_paths_total >= 6);
         assert!(
             report.daemon_agent_failover_path_count_max
                 >= report.daemon_agent_failover_path_count_min
         );
-        assert_eq!(report.daemon_control_plane_failover_peer_map_edges_min, 2);
-        assert_eq!(report.daemon_control_plane_failover_peer_map_edges_max, 2);
+        assert_eq!(report.daemon_control_plane_failover_peer_map_edges_min, 6);
+        assert_eq!(report.daemon_control_plane_failover_peer_map_edges_max, 6);
         assert!(report.daemon_control_plane_failover_peer_maps_consistent);
         assert_eq!(report.daemon_control_plane_failover_metrics_endpoints, 1);
         assert!(report.daemon_control_plane_failover_metrics_consistent);
         assert_eq!(report.daemon_control_plane_failover_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_failover_relay_candidates_max, 1);
-        assert!(report.daemon_control_plane_failover_path_count_min >= 2);
-        assert!(report.daemon_control_plane_failover_reachable_path_count_min >= 2);
-        assert_eq!(report.daemon_control_plane_failover_path_status_requests, 2);
-        assert!(report.daemon_control_plane_failover_path_status_count_min >= 2);
-        assert!(report.daemon_control_plane_failover_path_status_reachable_count_min >= 2);
+        assert!(report.daemon_control_plane_failover_path_count_min >= 6);
+        assert!(report.daemon_control_plane_failover_reachable_path_count_min >= 6);
+        assert_eq!(report.daemon_control_plane_failover_path_status_requests, 3);
+        assert!(report.daemon_control_plane_failover_path_status_count_min >= 6);
+        assert!(report.daemon_control_plane_failover_path_status_reachable_count_min >= 6);
         assert_eq!(
             report.daemon_control_plane_failover_path_status_stale_count_max,
             0
         );
-        assert!(report.daemon_control_plane_failover_healthy_nodes_min >= 2);
+        assert!(report.daemon_control_plane_failover_healthy_nodes_min >= 3);
         assert_eq!(
             report.daemon_control_plane_failover_healthy_nodes_min,
             report.daemon_control_plane_failover_healthy_nodes_max
@@ -11195,7 +11382,7 @@ fi
         assert_eq!(report.daemon_control_plane_failover_unhealthy_nodes_max, 0);
         assert_eq!(report.daemon_control_plane_relay_candidates_min, 1);
         assert_eq!(report.daemon_control_plane_relay_candidates_max, 1);
-        assert!(report.daemon_control_plane_healthy_nodes >= 2);
+        assert!(report.daemon_control_plane_healthy_nodes >= 3);
         assert_eq!(
             report.daemon_control_plane_healthy_nodes_min,
             report.daemon_control_plane_healthy_nodes
@@ -11211,8 +11398,8 @@ fi
         assert_eq!(report.daemon_control_plane_unhealthy_nodes_min, 0);
         assert_eq!(report.daemon_control_plane_unhealthy_nodes_max, 0);
         assert!(report.daemon_control_plane_metrics_consistent);
-        assert!(report.daemon_signal_health_reports >= 2);
-        assert!(report.daemon_signal_healthy_nodes >= 2);
+        assert!(report.daemon_signal_health_reports >= 3);
+        assert!(report.daemon_signal_healthy_nodes >= 3);
         assert_eq!(report.daemon_signal_degraded_nodes, 0);
         assert_eq!(report.daemon_signal_unhealthy_nodes, 0);
         assert_eq!(report.stun_http_requests, 2);
@@ -11607,8 +11794,15 @@ fi
             argv.extend([
                 "--join-token-path".to_string(),
                 DAEMON_REDACTED_ARG.to_string(),
+                "--relay-admission-bearer-token-path".to_string(),
+                DAEMON_REDACTED_ARG.to_string(),
                 "--state-path".to_string(),
                 "/tmp/ipars-load-agent.state.json".to_string(),
+            ]);
+        } else if role == "relay" {
+            argv.extend([
+                "--admission-bearer-token-path".to_string(),
+                DAEMON_REDACTED_ARG.to_string(),
             ]);
         }
         argv
@@ -11628,6 +11822,7 @@ fi
             signal_operator_api_bearer_token: LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN.to_string(),
             relay_http_url: "http://127.0.0.1:1".to_string(),
             relay_operator_api_bearer_token: LOAD_RELAY_OPERATOR_API_BEARER_TOKEN.to_string(),
+            relay_admission_bearer_token: LOAD_RELAY_ADMISSION_BEARER_TOKEN.to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             stun_http_url: "http://127.0.0.1:1".to_string(),
             stun_operator_api_bearer_token: "synthetic-stun-operator-secret-with-32-bytes"

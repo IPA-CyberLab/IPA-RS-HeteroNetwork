@@ -16,8 +16,8 @@ The 1000-node scenario samples active pairs rather than negotiating every possib
 
 - `in-memory`: exercises control-plane and signal services without HTTP.
 - `http`: drives loopback HTTP control-plane and signal endpoints.
-- `relay-udp`: adds relay HTTP admission and UDP forwarding throughput checks.
-- `daemon`: spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored. Multiple control-plane processes share one SQLite store.
+- `relay-udp`: adds Bearer-authenticated relay HTTP admission and UDP forwarding throughput checks.
+- `daemon`: spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored. Multiple control-plane processes share one SQLite store. Relay and Agents read a generated run-scoped admission credential from one owner-only file, and the harness removes that file after readiness.
 
 ## Required Success Gates
 
@@ -32,6 +32,7 @@ Each report is validated before command success. The harness rejects:
 - unauthenticated or unavailable Signal operator metrics during HTTP/daemon runs;
 - unauthenticated or unavailable STUN operator metrics during daemon runs;
 - unauthenticated or unavailable Relay operator metrics during relay/daemon runs;
+- unavailable Bearer-authenticated Relay admission during relay/daemon runs;
 - peer-map edge loss or cross-control-plane inconsistency;
 - relay-candidate loss;
 - relay packet loss, payload corruption, or relay counter skew;
