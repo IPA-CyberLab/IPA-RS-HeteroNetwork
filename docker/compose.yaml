@@ -132,7 +132,7 @@ services:
       - IPARS_RELAY_SESSION_TTL_SECONDS=${IPARS_RELAY_SESSION_TTL_SECONDS:-300}
       - IPARS_RELAY_ADMISSION_RATE_LIMIT=${IPARS_RELAY_ADMISSION_RATE_LIMIT:-4096}
       - IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS=${IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}
-      - IPARS_RELAY_ADMISSION_BEARER_TOKEN
+      - IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token
       - IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-operator-api-bearer-token
     ports:
       - "51820:51820/udp"
@@ -148,6 +148,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     secrets:
+      - ipars-relay-admission-bearer-token
       - ipars-relay-operator-api-bearer-token
 
   agent:
@@ -193,7 +194,7 @@ services:
       - IPARS_AGENT_RELAY_STATUS_URL=${IPARS_AGENT_RELAY_STATUS_URL:-http://127.0.0.1:9580}
       - IPARS_AGENT_RELAY_MAX_SESSIONS=${IPARS_AGENT_RELAY_MAX_SESSIONS:-10000}
       - IPARS_AGENT_RELAY_MAX_MBPS=${IPARS_AGENT_RELAY_MAX_MBPS:-1000}
-      - IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN
+      - IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token
       - IPARS_AGENT_RELAY_FORWARDER_ENDPOINT
       - IPARS_AGENT_RELAY_FORWARDER_BIND
       - IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT
@@ -227,6 +228,7 @@ services:
     secrets:
       - ipars-agent-join-token
       - ipars-agent-api-bearer-token
+      - ipars-relay-admission-bearer-token
     volumes:
       - agent-data:/var/lib/ipars
 
@@ -239,6 +241,8 @@ secrets:
     file: ${IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE:-./stun-operator-api.token}
   ipars-relay-operator-api-bearer-token:
     file: ${IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE:-./relay-operator-api.token}
+  ipars-relay-admission-bearer-token:
+    file: ${IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE:-./relay-admission.token}
   ipars-agent-join-token:
     file: ./join.token
   ipars-agent-api-bearer-token:

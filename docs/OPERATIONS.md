@@ -85,7 +85,7 @@ an ephemeral STUN bind only because its two host-network agents run with the
 non-mutating `dry-run` backend.
 
 Before starting the bundled stack, place the signed join token at
-`docker/join.token` and create distinct Control Plane, Signal, STUN, Relay, and Agent management tokens:
+`docker/join.token` and create distinct Control Plane, Signal, STUN, Relay, and Agent management tokens plus a separate Relay admission token:
 
 ```bash
 umask 077
@@ -94,14 +94,16 @@ head -c 32 /dev/urandom | base64 > docker/signal-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/stun-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/relay-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/agent-api.token
+head -c 32 /dev/urandom | base64 > docker/relay-admission.token
 ```
 
 Set `IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE`,
 `IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE`,
 `IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE`, or
+`IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE`,
+`IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE`, or
 `IPARS_AGENT_API_BEARER_TOKEN_FILE` when a token lives at a different host path.
-Keep all five credentials distinct, and keep the Relay operator token separate from `IPARS_RELAY_ADMISSION_BEARER_TOKEN`.
+Keep all six credentials distinct. Compose mounts the one Relay admission file into both Relay and Agent without copying its value into service environment variables.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait

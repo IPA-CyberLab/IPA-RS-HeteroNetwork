@@ -480,8 +480,14 @@ struct RelayArgs {
         default_value_t = 60
     )]
     admission_rate_limit_window_seconds: u64,
-    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
+    #[arg(
+        long,
+        env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN",
+        conflicts_with = "admission_bearer_token_path"
+    )]
     admission_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    admission_bearer_token_path: Option<PathBuf>,
     #[arg(
         long,
         env = "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN",
@@ -550,8 +556,14 @@ struct AgentArgs {
     relay_admission_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_RELAY_STATUS_URL")]
     relay_status_url: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")]
+    #[arg(
+        long,
+        env = "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN",
+        conflicts_with = "relay_admission_bearer_token_path"
+    )]
     relay_admission_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    relay_admission_bearer_token_path: Option<PathBuf>,
     #[arg(long, env = "IPARS_AGENT_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
     relay_max_sessions: u32,
     #[arg(long, env = "IPARS_AGENT_RELAY_MAX_MBPS", default_value_t = 1000)]
@@ -6253,6 +6265,7 @@ async fn run_relay(
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
     validate_relay_config(&args)?;
+    let admission_bearer_token = relay_admission_bearer_token(&args)?;
     let operator_api_bearer_token = relay_operator_api_bearer_token(&args)?;
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
@@ -6301,7 +6314,7 @@ async fn run_relay(
     });
     tracing::info!(%udp_addr, http_listen = %args.http_listen, "relay listening");
     let mut http_state = RelayHttpState::new(service);
-    if let Some(token) = args.admission_bearer_token {
+    if let Some(token) = admission_bearer_token {
         http_state = http_state.require_admission_bearer_token(token);
     }
     if let Some(token) = operator_api_bearer_token {
@@ -6367,6 +6380,17 @@ fn relay_operator_api_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<St
     read_api_bearer_token_file(path, "relay operator API").map(Some)
 }
 
+fn relay_admission_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.admission_bearer_token.as_deref() {
+        validate_relay_admission_bearer_token(token, "IPARS_RELAY_ADMISSION_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.admission_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    read_relay_admission_bearer_token_file(path, "relay admission").map(Some)
+}
+
 fn chrono_duration_seconds(value: u64, name: &str) -> anyhow::Result<chrono::Duration> {
     let seconds = i64::try_from(value).with_context(|| format!("{name} is too large"))?;
     Ok(chrono::Duration::seconds(seconds))
@@ -6379,6 +6403,7 @@ async fn run_agent(
 ) -> anyhow::Result<()> {
     validate_agent_runtime_config(&args)?;
     let api_bearer_token = agent_api_bearer_token(&args)?;
+    let relay_admission_bearer_token = agent_relay_admission_bearer_token(&args)?;
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
@@ -6640,7 +6665,7 @@ async fn run_agent(
                 hole_puncher,
                 SignalPathNegotiationOptions {
                     relay_forwarder_supervisor: relay_forwarder_supervisor.clone(),
-                    relay_admission_bearer_token: args.relay_admission_bearer_token.clone(),
+                    relay_admission_bearer_token: relay_admission_bearer_token.clone(),
                     relay_session_renew_before: Duration::from_secs(
                         args.relay_session_renew_before_seconds,
                     ),
@@ -10597,28 +10622,57 @@ fn agent_api_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
     read_api_bearer_token_file(path, "agent API").map(Some)
 }
 
+fn agent_relay_admission_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.relay_admission_bearer_token.as_deref() {
+        validate_relay_admission_bearer_token(token, "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.relay_admission_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    read_relay_admission_bearer_token_file(path, "agent relay admission").map(Some)
+}
+
+fn read_relay_admission_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<String> {
+    let token = read_bounded_bearer_token_file(path, label)?;
+    validate_relay_admission_bearer_token(
+        &token,
+        &format!("{label} bearer token file {}", path.display()),
+    )?;
+    Ok(token)
+}
+
 fn read_api_bearer_token_file(path: &Path, api_label: &str) -> anyhow::Result<String> {
+    let token = read_bounded_bearer_token_file(path, api_label)?;
+    validate_api_bearer_token(
+        &token,
+        &format!("{api_label} bearer token file {}", path.display()),
+    )?;
+    Ok(token)
+}
+
+fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path).with_context(|| {
         format!(
-            "failed to open {api_label} bearer token file {}",
+            "failed to open {label} bearer token file {}",
             path.display()
         )
     })?;
     let metadata = file.metadata().with_context(|| {
         format!(
-            "failed to inspect {api_label} bearer token file {}",
+            "failed to inspect {label} bearer token file {}",
             path.display()
         )
     })?;
     if !metadata.is_file() {
         anyhow::bail!(
-            "{api_label} bearer token path {} must resolve to a regular file",
+            "{label} bearer token path {} must resolve to a regular file",
             path.display()
         );
     }
     if metadata.len() > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
-            "{api_label} bearer token file {} exceeds maximum size of {} bytes",
+            "{label} bearer token file {} exceeds maximum size of {} bytes",
             path.display(),
             MAX_API_BEARER_TOKEN_FILE_BYTES
         );
@@ -10628,23 +10682,18 @@ fn read_api_bearer_token_file(path: &Path, api_label: &str) -> anyhow::Result<St
     let mut reader = file.by_ref().take(MAX_API_BEARER_TOKEN_FILE_BYTES + 1);
     reader.read_to_string(&mut token).with_context(|| {
         format!(
-            "failed to read {api_label} bearer token from {}",
+            "failed to read {label} bearer token from {}",
             path.display()
         )
     })?;
     if token.len() as u64 > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
-            "{api_label} bearer token file {} exceeds maximum size of {} bytes",
+            "{label} bearer token file {} exceeds maximum size of {} bytes",
             path.display(),
             MAX_API_BEARER_TOKEN_FILE_BYTES
         );
     }
-    let token = token.trim();
-    validate_api_bearer_token(
-        token,
-        &format!("{api_label} bearer token file {}", path.display()),
-    )?;
-    Ok(token.to_string())
+    Ok(token.trim().to_string())
 }
 
 fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
@@ -15881,6 +15930,51 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_relay_admission_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "agent-relay-admission-secret";
+        let inline =
+            Cli::try_parse_from(["iparsd", "agent", "--relay-admission-bearer-token", token])?;
+        let Command::Agent(args) = inline.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_agent_runtime_config(&args)?;
+        assert_eq!(
+            agent_relay_admission_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+
+        let dir = unique_test_dir("agent-relay-admission-token")?;
+        let path = dir.join("admission.token");
+        std::fs::write(&path, format!("{token}\n"))?;
+        let path_arg = path.display().to_string();
+        let file = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-admission-bearer-token-path",
+            path_arg.as_str(),
+        ])?;
+        let Command::Agent(args) = file.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_agent_runtime_config(&args)?;
+        assert_eq!(
+            agent_relay_admission_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+        assert!(Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-admission-bearer-token",
+            token,
+            "--relay-admission-bearer-token-path",
+            path_arg.as_str(),
+        ])
+        .is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
@@ -24398,6 +24492,51 @@ exec sleep 60
             Some(token)
         );
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn relay_admission_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "relay-admission-secret";
+        let base = [
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ];
+        let inline =
+            Cli::try_parse_from(base.into_iter().chain(["--admission-bearer-token", token]))?;
+        let Command::Relay(args) = inline.command else {
+            anyhow::bail!("expected relay command");
+        };
+        validate_relay_config(&args)?;
+        assert_eq!(relay_admission_bearer_token(&args)?.as_deref(), Some(token));
+
+        let dir = unique_test_dir("relay-admission-token")?;
+        let path = dir.join("admission.token");
+        std::fs::write(&path, format!("{token}\n"))?;
+        let path_arg = path.display().to_string();
+        let file = Cli::try_parse_from(
+            base.into_iter()
+                .chain(["--admission-bearer-token-path", path_arg.as_str()]),
+        )?;
+        let Command::Relay(args) = file.command else {
+            anyhow::bail!("expected relay command");
+        };
+        validate_relay_config(&args)?;
+        assert_eq!(relay_admission_bearer_token(&args)?.as_deref(), Some(token));
+        assert!(Cli::try_parse_from(base.into_iter().chain([
+            "--admission-bearer-token",
+            token,
+            "--admission-bearer-token-path",
+            path_arg.as_str(),
+        ]),)
+        .is_err());
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

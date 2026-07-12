@@ -5276,6 +5276,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "A separate 32-512 byte signal operator API Bearer token in docker/signal-operator-api.token, or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte STUN operator API Bearer token in docker/stun-operator-api.token, or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte relay operator API Bearer token in docker/relay-operator-api.token, or IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate high-entropy relay admission Bearer token in docker/relay-admission.token, or IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file shared only with authorized agents".to_string(),
         "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or IPARS_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
     ];
     if args.rootless {
@@ -5318,11 +5319,12 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file reads a distinct signal operator API Bearer token from docker/signal-operator-api.token (or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics".to_string(),
         "The bundled Compose file reads a distinct STUN operator API Bearer token from docker/stun-operator-api.token (or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics without affecting UDP Binding requests".to_string(),
         "The bundled Compose file reads a distinct relay operator API Bearer token from docker/relay-operator-api.token (or IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE) and protects Prometheus metrics without changing the public capability status contract or admission authentication".to_string(),
+        "The bundled Compose file mounts docker/relay-admission.token (or IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE) into the Relay and Agent as one shared file-backed admission credential without placing it in either service environment".to_string(),
         "The bundled Compose file reads a separate agent API Bearer token from docker/agent-api.token (or IPARS_AGENT_API_BEARER_TOKEN_FILE) through a file-backed Compose secret and protects every endpoint except /healthz".to_string(),
         "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file passes relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT/IPARS_RELAY_ADMISSION_URL and agent relay capability advertisement through IPARS_AGENT_RELAY_PUBLIC_ENDPOINT/IPARS_AGENT_RELAY_ADMISSION_URL; ipars docker install --relay-public-endpoint and --relay-admission-url emit both sides together so advertised relay metadata stays consistent".to_string(),
-        "The bundled Compose file can pass relay admission Bearer tokens through IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        "The bundled Compose file passes the relay admission secret through IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
     ]);
     if !args.rootless {
@@ -5364,7 +5366,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
             "STUN metrics require IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from other operator credentials while leaving the public UDP Binding service credentialless".to_string(),
             "Relay metrics require IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse the separately scoped relay admission credential".to_string(),
             "Agent API requests require the separate IPARS_AGENT_API_BEARER_TOKEN_FILE secret; do not reuse the signed join token".to_string(),
-            "When relay admission Bearer auth is enabled in Compose, set IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN to the same secret value".to_string(),
+            "Relay admission uses the shared IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE secret; rotate it independently from operator, issuer, join-token, node identity, and Agent API credentials".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
         notes,
@@ -11664,6 +11666,10 @@ fi
             requirement.contains("docker/relay-operator-api.token")
                 && requirement.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE")
         }));
+        assert!(plan.prerequisites.iter().any(|requirement| {
+            requirement.contains("docker/relay-admission.token")
+                && requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE")
+        }));
         assert!(plan.environment.iter().any(|environment| {
             environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
         }));
@@ -11701,8 +11707,8 @@ fi
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
         assert!(plan.security.iter().any(|requirement| {
-            requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN")
-                && requirement.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")
+            requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE")
+                && requirement.contains("rotate it independently")
         }));
         assert!(plan
             .notes
@@ -11727,6 +11733,10 @@ fi
                 && note.contains("capability status")
                 && note.contains("admission authentication")
         }));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("docker/relay-admission.token")
+                && note.contains("shared file-backed admission credential")
+        }));
         assert!(plan.security.iter().any(|requirement| {
             requirement.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
                 && requirement.contains("control-plane operator credential")
@@ -11746,7 +11756,9 @@ fi
                 && note.contains("IPARS_AGENT_RELAY_ADMISSION_URL")
         }));
         assert!(plan.notes.iter().any(|note| {
-            note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
+            note.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+                && note.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+                && note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
                 && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
         }));
         assert!(plan
@@ -12375,8 +12387,13 @@ fi
         assert!(compose.contains(
             "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS=${IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:-60}"
         ));
-        assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains(
+            "IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
+        ));
+        assert!(compose.contains(
+            "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
+        ));
+        assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE"));
         assert!(compose.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"));
         assert!(compose.contains("ipars-control-plane-operator-api-bearer-token"));
         assert!(compose.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE"));
@@ -12431,6 +12448,9 @@ fi
         assert!(rootless_compose.contains("devices: !reset []"));
         assert!(rootless_compose.contains("environment: !override"));
         assert!(rootless_compose.contains("IPARS_AGENT_RUNTIME_BACKEND=dry-run"));
+        assert!(rootless_compose.contains(
+            "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
+        ));
         assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND=command"));
         assert!(rootless_compose.contains("IPARS_AGENT_ROUTE_BACKEND=command"));
         assert!(rootless_compose.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=false"));

@@ -130,6 +130,12 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             && rendered.contains("/run/secrets/ipars-relay-operator-api-bearer-token"),
         "rendered base Compose config did not mount the relay operator API Bearer secret"
     );
+    anyhow::ensure!(
+        rendered.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+            && rendered.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+            && rendered.contains("/run/secrets/ipars-relay-admission-bearer-token"),
+        "rendered base Compose config did not share the file-backed relay admission Bearer secret"
+    );
 
     let rootful_discovery_compose = ComposeProject {
         repo_root: repo_root.clone(),
