@@ -15,7 +15,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use axum::Router;
 use aya::maps::{MapData, RingBuf};
-use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint};
+use aya::programs::{CgroupAttachMode as AyaCgroupAttachMode, CgroupSockAddr, TracePoint};
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
@@ -193,8 +193,14 @@ const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/bin:/usr/sbin:/bin:/sbin";
 const SANITIZED_RUNTIME_COMMAND_LOCALE: &str = "C";
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+const PROC_SYS_KERNEL_OSRELEASE: &str = "/proc/sys/kernel/osrelease";
 const MAX_PROC_SYSCTL_FLAG_BYTES: u64 = 64;
 const MAX_PROC_SELF_STATUS_BYTES: u64 = 64 * 1024;
+const MAX_KERNEL_OSRELEASE_BYTES: u64 = 256;
+const MIN_EBPF_CGROUP_KERNEL_MAJOR: u32 = 5;
+const MIN_EBPF_CGROUP_KERNEL_MINOR: u32 = 3;
+const MIN_EBPF_CGROUP_LINK_KERNEL_MAJOR: u32 = 5;
+const MIN_EBPF_CGROUP_LINK_KERNEL_MINOR: u32 = 7;
 const MAX_EBPF_TRACEPOINT_ID_BYTES: usize = 64;
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
     "/sys/kernel/tracing/events",
@@ -3202,6 +3208,7 @@ fn ensure_ebpf_cgroup_path_ready(path: &Path) -> anyhow::Result<()> {
         "eBPF packet-flow cgroup path {} must be on a cgroup v2 filesystem",
         path.display()
     );
+    ensure_ebpf_cgroup_kernel_ready()?;
     File::open(path).with_context(|| {
         format!(
             "failed to open eBPF packet-flow cgroup path {}",
@@ -3479,6 +3486,83 @@ fn proc_sysctl_flag(path: &Path) -> anyhow::Result<Option<bool>> {
             value
         ),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LinuxKernelVersion {
+    major: u32,
+    minor: u32,
+}
+
+fn ensure_ebpf_cgroup_kernel_ready() -> anyhow::Result<()> {
+    ensure_ebpf_cgroup_kernel_ready_in(Path::new(PROC_SYS_KERNEL_OSRELEASE))
+}
+
+fn ensure_ebpf_cgroup_kernel_ready_in(path: &Path) -> anyhow::Result<()> {
+    let _ = ebpf_cgroup_kernel_version_in(path)?;
+    Ok(())
+}
+
+fn ebpf_cgroup_kernel_version_in(path: &Path) -> anyhow::Result<LinuxKernelVersion> {
+    let release =
+        read_optional_bounded_utf8_file(path, "Linux kernel release", MAX_KERNEL_OSRELEASE_BYTES)?
+            .with_context(|| {
+                format!(
+                    "Linux kernel release `{}` is required for safe eBPF cgroup attachment",
+                    path.display()
+                )
+            })?;
+    let release = release.trim();
+    let version = parse_linux_kernel_version(release)?;
+    let minimum = LinuxKernelVersion {
+        major: MIN_EBPF_CGROUP_KERNEL_MAJOR,
+        minor: MIN_EBPF_CGROUP_KERNEL_MINOR,
+    };
+    anyhow::ensure!(
+        version >= minimum,
+        "eBPF packet-flow cgroup hooks require Linux {MIN_EBPF_CGROUP_KERNEL_MAJOR}.{MIN_EBPF_CGROUP_KERNEL_MINOR} or newer for bpf_sock_addr.sk source metadata; detected kernel release {release:?}"
+    );
+    Ok(version)
+}
+
+fn ebpf_cgroup_aya_attach_mode() -> anyhow::Result<AyaCgroupAttachMode> {
+    let version = ebpf_cgroup_kernel_version_in(Path::new(PROC_SYS_KERNEL_OSRELEASE))?;
+    Ok(ebpf_cgroup_aya_attach_mode_for_version(version))
+}
+
+fn ebpf_cgroup_aya_attach_mode_for_version(version: LinuxKernelVersion) -> AyaCgroupAttachMode {
+    let link_minimum = LinuxKernelVersion {
+        major: MIN_EBPF_CGROUP_LINK_KERNEL_MAJOR,
+        minor: MIN_EBPF_CGROUP_LINK_KERNEL_MINOR,
+    };
+    // Cgroup BPF links reject user flags and are multi-program internally. Aya uses
+    // legacy BPF_PROG_ATTACH below 5.7, where ALLOW_MULTI must be explicit.
+    if version >= link_minimum {
+        AyaCgroupAttachMode::Single
+    } else {
+        AyaCgroupAttachMode::AllowMultiple
+    }
+}
+
+fn parse_linux_kernel_version(release: &str) -> anyhow::Result<LinuxKernelVersion> {
+    let mut components = release.split('.');
+    let major = components.next().unwrap_or_default();
+    let minor = components.next().unwrap_or_default();
+    anyhow::ensure!(
+        !major.is_empty()
+            && !minor.is_empty()
+            && major.bytes().all(|byte| byte.is_ascii_digit())
+            && minor.bytes().all(|byte| byte.is_ascii_digit()),
+        "Linux kernel release {release:?} must start with numeric MAJOR.MINOR components"
+    );
+    Ok(LinuxKernelVersion {
+        major: major.parse().with_context(|| {
+            format!("Linux kernel release {release:?} has invalid major version")
+        })?,
+        minor: minor.parse().with_context(|| {
+            format!("Linux kernel release {release:?} has invalid minor version")
+        })?,
+    })
 }
 
 fn process_has_capability(bit: u8) -> anyhow::Result<Option<bool>> {
@@ -13011,6 +13095,7 @@ fn load_ebpf_ringbuf_packet_flow_reader(
             })?;
     }
     if let Some(cgroup_path) = &config.cgroup_path {
+        let cgroup_attach_mode = ebpf_cgroup_aya_attach_mode()?;
         let cgroup = File::open(cgroup_path).with_context(|| {
             format!(
                 "failed to open eBPF packet-flow cgroup {}",
@@ -13036,7 +13121,7 @@ fn load_ebpf_ringbuf_packet_flow_reader(
                 .load()
                 .with_context(|| format!("failed to load eBPF cgroup program `{program_name}`"))?;
             program
-                .attach(&cgroup, CgroupAttachMode::Single)
+                .attach(&cgroup, cgroup_attach_mode)
                 .with_context(|| {
                     format!(
                         "failed to attach eBPF program `{program_name}` to cgroup {}",
@@ -19697,47 +19782,73 @@ mod tests {
         let cgroup_path = std::env::var_os("IPARS_EBPF_CGROUP_PATH")
             .map(PathBuf::from)
             .map_or_else(current_process_cgroup_v2_path, Ok)?;
-        let config = EbpfRingbufConfig {
-            object_path,
-            ringbuf_map: DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP.to_string(),
-            attachments: Vec::new(),
-            cgroup_path: Some(cgroup_path.clone()),
-            cgroup_attachments: vec![
-                "ipars_cgroup_connect4".to_string(),
-                "ipars_cgroup_connect6".to_string(),
-                "ipars_cgroup_sendmsg4".to_string(),
-                "ipars_cgroup_sendmsg6".to_string(),
-            ],
+        let argv = vec![
+            std::ffi::OsString::from("iparsd"),
+            std::ffi::OsString::from("agent"),
+            std::ffi::OsString::from("--runtime-backend"),
+            std::ffi::OsString::from("dry-run"),
+            std::ffi::OsString::from("--packet-flow-detector"),
+            std::ffi::OsString::from("ebpf-ringbuf"),
+            std::ffi::OsString::from("--packet-flow-ebpf-object-path"),
+            object_path.into_os_string(),
+            std::ffi::OsString::from("--packet-flow-ebpf-cgroup-path"),
+            cgroup_path.into_os_string(),
+            std::ffi::OsString::from("--packet-flow-ebpf-cgroup-attach"),
+            std::ffi::OsString::from("ipars_cgroup_connect4"),
+            std::ffi::OsString::from("--packet-flow-ebpf-cgroup-attach"),
+            std::ffi::OsString::from("ipars_cgroup_connect6"),
+            std::ffi::OsString::from("--packet-flow-ebpf-cgroup-attach"),
+            std::ffi::OsString::from("ipars_cgroup_sendmsg4"),
+            std::ffi::OsString::from("--packet-flow-ebpf-cgroup-attach"),
+            std::ffi::OsString::from("ipars_cgroup_sendmsg6"),
+        ];
+        let cli = Cli::try_parse_from(argv)?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command for eBPF cgroup integration test");
         };
-        ensure_ebpf_object_file_ready(&config.object_path)?;
-        ensure_ebpf_cgroup_path_ready(&cgroup_path)?;
+        preflight_agent_runtime(&args)?;
+        let config = EbpfRingbufConfig::from_args(&args)?;
+        assert_ebpf_cgroup_packet_flow_events(&config).await
+    }
 
-        let mut reader = load_ebpf_ringbuf_packet_flow_reader(&config)?;
-        let tcp_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let tcp_destination = tcp_listener.local_addr()?;
-        let udp_receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let udp_sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let udp_destination = udp_receiver.local_addr()?;
-        let udp_source = udp_sender.local_addr()?;
+    async fn assert_ebpf_cgroup_packet_flow_events(
+        config: &EbpfRingbufConfig,
+    ) -> anyhow::Result<()> {
+        let mut reader = load_ebpf_ringbuf_packet_flow_reader(config)?;
+        let tcp4_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let tcp4_destination = tcp4_listener.local_addr()?;
+        let udp4_receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let udp4_sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let udp4_destination = udp4_receiver.local_addr()?;
+        let udp4_source = udp4_sender.local_addr()?;
+        let tcp6_listener = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0))?;
+        let tcp6_destination = tcp6_listener.local_addr()?;
+        let udp6_receiver = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))?;
+        let udp6_sender = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))?;
+        let udp6_destination = udp6_receiver.local_addr()?;
+        let udp6_source = udp6_sender.local_addr()?;
         let limits = EbpfRingbufReadLimits {
             max_events_per_wake: 512,
         };
-        let deadline = Instant::now() + Duration::from_secs(8);
-        let mut connect_seen = false;
-        let mut sendmsg_seen = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut connect4_seen = false;
+        let mut sendmsg4_seen = false;
+        let mut connect6_seen = false;
+        let mut sendmsg6_seen = false;
         let mut observed = Vec::new();
 
         while Instant::now() < deadline {
-            let client = std::net::TcpStream::connect(tcp_destination)?;
-            let (server, _) = tcp_listener.accept()?;
-            udp_sender.send_to(b"ipars-ebpf-cgroup-sendmsg-smoke", udp_destination)?;
+            let tcp4_client = std::net::TcpStream::connect(tcp4_destination)?;
+            let (tcp4_server, _) = tcp4_listener.accept()?;
+            let tcp6_client = std::net::TcpStream::connect(tcp6_destination)?;
+            let (tcp6_server, _) = tcp6_listener.accept()?;
+            udp4_sender.send_to(b"ipars-ebpf-cgroup-sendmsg4-smoke", udp4_destination)?;
+            udp6_sender.send_to(b"ipars-ebpf-cgroup-sendmsg6-smoke", udp6_destination)?;
 
             let Ok(guard_result) =
                 tokio::time::timeout(Duration::from_millis(300), reader.ringbuf.readable_mut())
                     .await
             else {
-                drop(server);
-                drop(client);
                 continue;
             };
             let mut guard = guard_result.with_context(|| {
@@ -19749,7 +19860,7 @@ mod tests {
             let flows = drain_ebpf_ringbuf_packet_flows(guard.get_inner_mut(), limits)?;
             guard.clear_ready();
             for flow in flows {
-                if observed.len() < 64 {
+                if observed.len() < 128 {
                     observed.push(format!(
                         "{}:{:?} {:?} {:?}:{:?}",
                         flow.destination,
@@ -19759,24 +19870,34 @@ mod tests {
                         flow.observation.source_port
                     ));
                 }
-                connect_seen |= flow.destination == tcp_destination.ip()
-                    && flow.observation.destination_port == Some(tcp_destination.port())
+                connect4_seen |= flow.destination == tcp4_destination.ip()
+                    && flow.observation.destination_port == Some(tcp4_destination.port())
                     && flow.observation.protocol == Some(TransportProtocol::Tcp);
-                sendmsg_seen |= flow.destination == udp_destination.ip()
-                    && flow.observation.destination_port == Some(udp_destination.port())
+                sendmsg4_seen |= flow.destination == udp4_destination.ip()
+                    && flow.observation.destination_port == Some(udp4_destination.port())
                     && flow.observation.protocol == Some(TransportProtocol::Udp)
-                    && flow.observation.source == Some(udp_source.ip())
-                    && flow.observation.source_port == Some(udp_source.port());
+                    && flow.observation.source == Some(udp4_source.ip())
+                    && flow.observation.source_port == Some(udp4_source.port());
+                connect6_seen |= flow.destination == tcp6_destination.ip()
+                    && flow.observation.destination_port == Some(tcp6_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Tcp);
+                sendmsg6_seen |= flow.destination == udp6_destination.ip()
+                    && flow.observation.destination_port == Some(udp6_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Udp)
+                    && flow.observation.source == Some(udp6_source.ip())
+                    && flow.observation.source_port == Some(udp6_source.port());
             }
-            drop(server);
-            drop(client);
-            if connect_seen && sendmsg_seen {
+            drop(tcp4_server);
+            drop(tcp4_client);
+            drop(tcp6_server);
+            drop(tcp6_client);
+            if connect4_seen && sendmsg4_seen && connect6_seen && sendmsg6_seen {
                 return Ok(());
             }
         }
 
         anyhow::bail!(
-            "timed out waiting for cgroup packet-flow hooks: connect_seen={connect_seen}, sendmsg_seen={sendmsg_seen}, expected tcp={tcp_destination}, udp={udp_source}->{udp_destination}, observed=[{}]",
+            "timed out waiting for cgroup packet-flow hooks: connect4_seen={connect4_seen}, sendmsg4_seen={sendmsg4_seen}, connect6_seen={connect6_seen}, sendmsg6_seen={sendmsg6_seen}, expected tcp4={tcp4_destination}, udp4={udp4_source}->{udp4_destination}, tcp6={tcp6_destination}, udp6={udp6_source}->{udp6_destination}, observed=[{}]",
             observed.join(", ")
         )
     }
@@ -23356,6 +23477,86 @@ exec sleep 60
             Err(error) => error,
         };
         assert!(error.to_string().contains("exceeds maximum size"));
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_cgroup_kernel_preflight_requires_bpf_sock_addr_source_support() -> anyhow::Result<()> {
+        assert_eq!(
+            parse_linux_kernel_version("5.3.0")?,
+            LinuxKernelVersion { major: 5, minor: 3 }
+        );
+        assert_eq!(
+            parse_linux_kernel_version("6.8.0-117-generic")?,
+            LinuxKernelVersion { major: 6, minor: 8 }
+        );
+        assert!(matches!(
+            ebpf_cgroup_aya_attach_mode_for_version(LinuxKernelVersion { major: 5, minor: 3 }),
+            AyaCgroupAttachMode::AllowMultiple
+        ));
+        assert!(matches!(
+            ebpf_cgroup_aya_attach_mode_for_version(LinuxKernelVersion { major: 5, minor: 6 }),
+            AyaCgroupAttachMode::AllowMultiple
+        ));
+        assert!(matches!(
+            ebpf_cgroup_aya_attach_mode_for_version(LinuxKernelVersion { major: 5, minor: 7 }),
+            AyaCgroupAttachMode::Single
+        ));
+        assert!(matches!(
+            ebpf_cgroup_aya_attach_mode_for_version(LinuxKernelVersion { major: 6, minor: 8 }),
+            AyaCgroupAttachMode::Single
+        ));
+
+        let base = unique_test_dir("ebpf-cgroup-kernel")?;
+        let supported = base.join("supported");
+        let unsupported = base.join("unsupported");
+        let malformed = base.join("malformed");
+        let oversized = base.join("oversized");
+        std::fs::write(&supported, "5.3.0-backport\n")?;
+        std::fs::write(&unsupported, "5.2.21\n")?;
+        std::fs::write(&malformed, "release-6.8\n")?;
+        std::fs::write(
+            &oversized,
+            vec![b'6'; MAX_KERNEL_OSRELEASE_BYTES as usize + 1],
+        )?;
+
+        ensure_ebpf_cgroup_kernel_ready_in(&supported)?;
+
+        let missing_error = match ensure_ebpf_cgroup_kernel_ready_in(&base.join("missing")) {
+            Ok(()) => anyhow::bail!("unexpected successful missing kernel preflight"),
+            Err(error) => error,
+        };
+        assert!(missing_error
+            .to_string()
+            .contains("is required for safe eBPF cgroup attachment"));
+
+        let old_error = match ensure_ebpf_cgroup_kernel_ready_in(&unsupported) {
+            Ok(()) => anyhow::bail!("unexpected successful old-kernel eBPF preflight"),
+            Err(error) => error,
+        };
+        assert!(old_error.to_string().contains("require Linux 5.3 or newer"));
+
+        let malformed_error = match ensure_ebpf_cgroup_kernel_ready_in(&malformed) {
+            Ok(()) => anyhow::bail!("unexpected successful malformed kernel preflight"),
+            Err(error) => error,
+        };
+        assert!(malformed_error
+            .to_string()
+            .contains("must start with numeric MAJOR.MINOR"));
+
+        let oversized_error = match ensure_ebpf_cgroup_kernel_ready_in(&oversized) {
+            Ok(()) => anyhow::bail!("unexpected successful oversized kernel preflight"),
+            Err(error) => error,
+        };
+        assert!(oversized_error.to_string().contains("exceeds maximum size"));
+
+        let overflow_error = match parse_linux_kernel_version("4294967296.3") {
+            Ok(version) => anyhow::bail!("unexpected parsed kernel version {version:?}"),
+            Err(error) => error,
+        };
+        assert!(overflow_error.to_string().contains("invalid major version"));
+
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
