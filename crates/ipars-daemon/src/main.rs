@@ -148,6 +148,7 @@ const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
 const MAX_PACKET_FLOW_EBPF_RINGBUF_EVENTS_PER_WAKE: usize = 65_536;
 const MAX_PACKET_FLOW_DEDUP_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_PACKET_FLOW_DEDUP_FINGERPRINTS: usize = 1_048_576;
+const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
@@ -1923,8 +1924,10 @@ fn validate_bounded_usize(value: usize, name: &str, max: usize) -> anyhow::Resul
 }
 
 fn validate_relay_admission_bearer_token(value: &str, name: &str) -> anyhow::Result<()> {
-    if value.is_empty() {
-        anyhow::bail!("{name} cannot be empty");
+    if value.len() < MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        anyhow::bail!(
+            "{name} must contain at least {MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes"
+        );
     }
     if value.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
         anyhow::bail!("{name} exceeds {MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes");
@@ -15808,7 +15811,7 @@ mod tests {
             "--relay-status-url",
             "http://relay-a:9580",
             "--relay-admission-bearer-token",
-            "cluster-relay-secret",
+            "cluster-relay-secret-with-at-least-32-bytes",
             "--relay-max-sessions",
             "500",
             "--relay-max-mbps",
@@ -15869,7 +15872,7 @@ mod tests {
             assert_eq!(reporter.status_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.relay_admission_bearer_token.as_deref(),
-                Some("cluster-relay-secret")
+                Some("cluster-relay-secret-with-at-least-32-bytes")
             );
             assert!(!relay_capability.enabled_by_policy);
             assert_eq!(relay_capability.max_sessions, 500);
@@ -15934,7 +15937,7 @@ mod tests {
 
     #[test]
     fn agent_relay_admission_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
-        let token = "agent-relay-admission-secret";
+        let token = "agent-relay-admission-secret-with-at-least-32-bytes";
         let inline =
             Cli::try_parse_from(["iparsd", "agent", "--relay-admission-bearer-token", token])?;
         let Command::Agent(args) = inline.command else {
@@ -15964,6 +15967,12 @@ mod tests {
             agent_relay_admission_bearer_token(&args)?.as_deref(),
             Some(token)
         );
+        std::fs::write(&path, "too-short\n")?;
+        let error = match agent_relay_admission_bearer_token(&args) {
+            Ok(_) => anyhow::bail!("short file-backed relay admission token should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must contain at least 32 bytes"));
         assert!(Cli::try_parse_from([
             "iparsd",
             "agent",
@@ -16211,6 +16220,25 @@ mod tests {
             anyhow::bail!("expected agent command");
         }
 
+        let short_bearer = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--skip-runtime-preflight",
+            "--relay-admission-bearer-token",
+            "too-short",
+        ])?;
+        if let Command::Agent(args) = short_bearer.command {
+            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
+                Ok(()) => anyhow::bail!("unexpected successful preflight"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must contain at least 32 bytes"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         let invalid_bearer = Cli::try_parse_from([
             "iparsd",
             "agent",
@@ -16218,7 +16246,7 @@ mod tests {
             "dry-run",
             "--skip-runtime-preflight",
             "--relay-admission-bearer-token",
-            "not allowed",
+            "relay admission token with whitespace and sufficient length",
         ])?;
         if let Command::Agent(args) = invalid_bearer.command {
             let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
@@ -24427,7 +24455,7 @@ exec sleep 60
             "--admission-rate-limit-window-seconds",
             "30",
             "--admission-bearer-token",
-            "cluster-relay-secret",
+            "cluster-relay-secret-with-at-least-32-bytes",
         ])?;
 
         if let Command::Relay(args) = cli.command {
@@ -24439,7 +24467,7 @@ exec sleep 60
             assert_eq!(args.admission_url.as_deref(), Some("http://relay-a:9580"));
             assert_eq!(
                 args.admission_bearer_token.as_deref(),
-                Some("cluster-relay-secret")
+                Some("cluster-relay-secret-with-at-least-32-bytes")
             );
             return Ok(());
         }
@@ -24497,7 +24525,7 @@ exec sleep 60
 
     #[test]
     fn relay_admission_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
-        let token = "relay-admission-secret";
+        let token = "relay-admission-secret-with-at-least-32-bytes";
         let base = [
             "iparsd",
             "relay",
@@ -24529,6 +24557,12 @@ exec sleep 60
         };
         validate_relay_config(&args)?;
         assert_eq!(relay_admission_bearer_token(&args)?.as_deref(), Some(token));
+        std::fs::write(&path, "too-short\n")?;
+        let error = match relay_admission_bearer_token(&args) {
+            Ok(_) => anyhow::bail!("short file-backed relay admission token should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must contain at least 32 bytes"));
         assert!(Cli::try_parse_from(base.into_iter().chain([
             "--admission-bearer-token",
             token,
@@ -24838,6 +24872,28 @@ exec sleep 60
             anyhow::bail!("expected relay command");
         }
 
+        let short_bearer = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+            "--admission-bearer-token",
+            "too-short",
+        ])?;
+        if let Command::Relay(args) = short_bearer.command {
+            let error = match validate_relay_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid relay config"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("must contain at least 32 bytes"));
+        } else {
+            anyhow::bail!("expected relay command");
+        }
+
         let invalid_bearer = Cli::try_parse_from([
             "iparsd",
             "relay",
@@ -24848,7 +24904,7 @@ exec sleep 60
             "--admission-url",
             "http://relay-a:9580",
             "--admission-bearer-token",
-            "not allowed",
+            "relay admission token with whitespace and sufficient length",
         ])?;
         if let Command::Relay(args) = invalid_bearer.command {
             let error = match validate_relay_config(&args) {
@@ -25621,7 +25677,7 @@ exec sleep 60
             if headers
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
-                != Some("Bearer cluster-relay-secret")
+                != Some("Bearer cluster-relay-secret-with-at-least-32-bytes")
             {
                 return Err(axum::http::StatusCode::UNAUTHORIZED);
             }
@@ -25695,7 +25751,7 @@ exec sleep 60
             &status,
             &peer,
             &relay,
-            Some("cluster-relay-secret"),
+            Some("cluster-relay-secret-with-at-least-32-bytes"),
         )
         .await?;
 

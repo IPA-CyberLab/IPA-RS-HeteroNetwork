@@ -50,6 +50,7 @@ const DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY: &str = "agent-api-token";
 const DEFAULT_RELAY_PROBE_TIMEOUT_MS: u64 = 2_000;
 const MAX_RELAY_PROBE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RELAY_PROBE_PAYLOAD_BYTES: usize = 16 * 1024;
+const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
@@ -2630,8 +2631,10 @@ fn validate_relay_probe_args(args: &RelayProbeArgs) -> anyhow::Result<()> {
 }
 
 fn validate_relay_admission_bearer_token(value: &str, label: &str) -> anyhow::Result<()> {
-    if value.is_empty() {
-        anyhow::bail!("{label} cannot be empty");
+    if value.len() < MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        anyhow::bail!(
+            "{label} must contain at least {MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes"
+        );
     }
     if value.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
         anyhow::bail!("{label} exceeds {MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes");
@@ -5276,7 +5279,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "A separate 32-512 byte signal operator API Bearer token in docker/signal-operator-api.token, or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte STUN operator API Bearer token in docker/stun-operator-api.token, or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte relay operator API Bearer token in docker/relay-operator-api.token, or IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
-        "A separate high-entropy relay admission Bearer token in docker/relay-admission.token, or IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file shared only with authorized agents".to_string(),
+        "A separate 32-512 byte relay admission Bearer token in docker/relay-admission.token, or IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file shared only with authorized agents".to_string(),
         "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or IPARS_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
     ];
     if args.rootless {
@@ -11311,7 +11314,7 @@ fi
             "--relay-url",
             "http://127.0.0.1:9580",
             "--relay-admission-bearer-token",
-            "cluster-relay-secret",
+            "cluster-relay-secret-with-at-least-32-bytes",
             "--relay-udp",
             "127.0.0.1:51820",
             "--left-node-id",
@@ -11338,7 +11341,7 @@ fi
         assert_eq!(args.relay_url.as_deref(), Some("http://127.0.0.1:9580"));
         assert_eq!(
             args.relay_admission_bearer_token.as_deref(),
-            Some("cluster-relay-secret")
+            Some("cluster-relay-secret-with-at-least-32-bytes")
         );
         assert_eq!(args.relay_udp, "127.0.0.1:51820".parse()?);
         assert_eq!(args.left_node_id, "left-a");
@@ -11393,7 +11396,15 @@ fi
         assert!(error.to_string().contains("--timeout-ms must be between"));
 
         args.timeout_ms = DEFAULT_RELAY_PROBE_TIMEOUT_MS;
-        args.relay_admission_bearer_token = Some("bad token".to_string());
+        args.relay_admission_bearer_token = Some("too-short".to_string());
+        let error = match validate_relay_probe_args(&args) {
+            Ok(_) => anyhow::bail!("short relay admission bearer token should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must contain at least 32 bytes"));
+
+        args.relay_admission_bearer_token =
+            Some("relay admission token with whitespace and sufficient length".to_string());
         let error = match validate_relay_probe_args(&args) {
             Ok(_) => anyhow::bail!("whitespace-bearing bearer token should be rejected"),
             Err(error) => error,

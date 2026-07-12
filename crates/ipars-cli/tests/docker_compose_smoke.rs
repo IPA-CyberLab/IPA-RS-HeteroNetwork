@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str = "compose-relay-admission-secret";
+const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str =
+    "compose-relay-admission-secret-with-at-least-32-bytes";
 const COMPOSE_AGENT_API_BEARER_TOKEN: &str = "compose-agent-api-secret-with-at-least-32-bytes";
 const COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "compose-control-plane-operator-secret";

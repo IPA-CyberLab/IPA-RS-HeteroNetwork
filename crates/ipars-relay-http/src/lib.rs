@@ -412,6 +412,7 @@ fn prometheus_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+const MIN_RELAY_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_RELAY_API_BEARER_TOKEN_BYTES: usize = 512;
 
 fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -427,8 +428,8 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn relay_api_token_matches(expected: &str, provided: &str) -> bool {
-    if expected.is_empty()
-        || provided.is_empty()
+    if expected.len() < MIN_RELAY_API_BEARER_TOKEN_BYTES
+        || provided.len() < MIN_RELAY_API_BEARER_TOKEN_BYTES
         || expected.len() > MAX_RELAY_API_BEARER_TOKEN_BYTES
         || provided.len() > MAX_RELAY_API_BEARER_TOKEN_BYTES
     {
@@ -539,6 +540,15 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn relay_bearer_comparison_rejects_short_credentials() {
+        assert!(!relay_api_token_matches("too-short", "too-short"));
+        assert!(relay_api_token_matches(
+            OPERATOR_API_BEARER_TOKEN,
+            OPERATOR_API_BEARER_TOKEN
+        ));
+    }
+
     #[tokio::test]
     async fn relay_operator_routes_are_disabled_without_a_credential(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -574,6 +584,7 @@ mod tests {
         );
         for authorization in [
             None,
+            Some("Bearer too-short"),
             Some("Bearer wrong-relay-token-with-at-least-32-bytes"),
         ] {
             let mut request = Request::builder().method("GET").uri("/metrics");
@@ -853,7 +864,9 @@ mod tests {
         ));
         let app = router(
             RelayHttpState::new(relay.clone())
-                .require_admission_bearer_token("cluster-relay-secret".to_string())
+                .require_admission_bearer_token(
+                    "cluster-relay-secret-with-at-least-32-bytes".to_string(),
+                )
                 .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
         );
 
@@ -899,7 +912,10 @@ mod tests {
                     .method("POST")
                     .uri("/v1/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer cluster-relay-secret")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer cluster-relay-secret-with-at-least-32-bytes",
+                    )
                     .body(Body::from(request_body))?,
             )
             .await?;
@@ -958,8 +974,9 @@ mod tests {
             }),
         ));
         let app = router(
-            RelayHttpState::new(relay.clone())
-                .require_admission_bearer_token("cluster-relay-secret".to_string()),
+            RelayHttpState::new(relay.clone()).require_admission_bearer_token(
+                "cluster-relay-secret-with-at-least-32-bytes".to_string(),
+            ),
         );
 
         let request_body = serde_json::to_vec(&RelayAdmissionRequest {
