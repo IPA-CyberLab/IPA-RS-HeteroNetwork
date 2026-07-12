@@ -45,7 +45,10 @@ services:
   agent:
     network_mode: !reset null
     networks:
-      - default
+      default:
+        interface_name: eth0
+      workload-a:
+        interface_name: eth1
     command:
       - agent
       - --listen
@@ -73,8 +76,13 @@ services:
       IPARS_AGENT_WIREGUARD_BACKEND: command
       IPARS_AGENT_ROUTE_BACKEND: command
       IPARS_AGENT_DISABLE_PEER_PROBE: "true"
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
       IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_DOCKER_CONTAINER_NAMESPACE: docker-workload-a
+      IPARS_DOCKER_HOST_INTERFACE: eth1
+      IPARS_DOCKER_CONTAINER_CIDRS: ${IPARS_DATAPLANE_WORKLOAD_A_CIDR:?set IPARS_DATAPLANE_WORKLOAD_A_CIDR}
+      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     depends_on: !override
       control-plane:
         condition: service_healthy
@@ -88,6 +96,8 @@ services:
       - NET_RAW
     devices: !reset []
     secrets: !reset []
+    sysctls:
+      net.ipv4.ip_forward: "1"
     volumes: !override
       - agent-dataplane-a:/var/lib/ipars
 
@@ -98,7 +108,10 @@ services:
     entrypoint:
       - /usr/local/bin/iparsd
     networks:
-      - default
+      default:
+        interface_name: eth0
+      workload-b:
+        interface_name: eth1
     command:
       - agent
       - --listen
@@ -126,8 +139,13 @@ services:
       IPARS_AGENT_WIREGUARD_BACKEND: command
       IPARS_AGENT_ROUTE_BACKEND: command
       IPARS_AGENT_DISABLE_PEER_PROBE: "true"
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
       IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_DOCKER_CONTAINER_NAMESPACE: docker-workload-b
+      IPARS_DOCKER_HOST_INTERFACE: eth1
+      IPARS_DOCKER_CONTAINER_CIDRS: ${IPARS_DATAPLANE_WORKLOAD_B_CIDR:?set IPARS_DATAPLANE_WORKLOAD_B_CIDR}
+      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     depends_on:
       control-plane:
         condition: service_healthy
@@ -144,8 +162,62 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
     volumes:
       - agent-dataplane-b:/var/lib/ipars
+
+  workload-a:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
+    command:
+      - stun
+      - --listen
+      - 0.0.0.0:3478
+      - --http-listen
+      - 0.0.0.0:8080
+    networks:
+      workload-a:
+        interface_name: eth0
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  workload-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
+    command:
+      - stun
+      - --listen
+      - 0.0.0.0:3478
+      - --http-listen
+      - 0.0.0.0:8080
+    networks:
+      workload-b:
+        interface_name: eth0
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+networks:
+  workload-a:
+  workload-b:
 
 volumes:
   agent-dataplane-a:

@@ -219,7 +219,7 @@ Run the repeatable Compose smoke with:
 scripts/docker-smoke.sh
 ```
 
-The suite first validates the full management stack with non-mutating Agents, then starts a second stack with two production `linux-command` Agents in distinct Docker network namespaces. The production phase requires kernel WireGuard support and verifies each `ipars0` address, remote `AllowedIPs`, overlay route, nonzero handshake, and an HTTP request to the peer's VPN IP in both directions. It does not mount `/dev/net/tun`; that device is only needed when an operator deliberately selects a userspace WireGuard implementation that consumes TUN.
+The suite first validates the full management stack with non-mutating Agents, then starts a second stack with two production `linux-command` Agents in distinct Docker network namespaces and an isolated workload bridge behind each Agent. The production phase discovers the actual bridge CIDRs before signing a route-authorized token, requires kernel WireGuard support, and verifies each `ipars0` address, VPN and remote-workload `AllowedIPs`/routes, nonzero handshakes and transfer counters, plus bidirectional node-to-container, container-to-node, and container-to-container HTTP. It does not mount `/dev/net/tun`; that device is only needed when an operator deliberately selects a userspace WireGuard implementation that consumes TUN.
 
 ## Kubernetes
 

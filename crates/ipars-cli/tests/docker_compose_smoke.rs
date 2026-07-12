@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::net::{IpAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use ipnet::Ipv4Net;
 use serde_json::Value;
 
 const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str =
@@ -677,6 +678,14 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
                 "IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN".to_string(),
                 agent_api_bearer_token,
             ),
+            (
+                "IPARS_DATAPLANE_WORKLOAD_A_CIDR".to_string(),
+                "172.30.1.0/24".to_string(),
+            ),
+            (
+                "IPARS_DATAPLANE_WORKLOAD_B_CIDR".to_string(),
+                "172.30.2.0/24".to_string(),
+            ),
         ],
     };
     let _compose_guard = ComposeCleanup {
@@ -703,11 +712,30 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         ],
     )?;
     let bootstrap_ip = compose_service_ipv4(&compose, "control-plane")?;
+    run_compose_with_diagnostics(
+        &compose,
+        [
+            "create",
+            "--build",
+            "agent",
+            "agent-b",
+            "workload-a",
+            "workload-b",
+        ],
+    )?;
+    let workload_a_cidr = compose_network_ipv4_subnet(&compose, "workload-a")?;
+    let workload_b_cidr = compose_network_ipv4_subnet(&compose, "workload-b")?;
+    anyhow::ensure!(
+        !workload_a_cidr.contains(&workload_b_cidr.network())
+            && !workload_b_cidr.contains(&workload_a_cidr.network()),
+        "Docker assigned overlapping workload networks {workload_a_cidr} and {workload_b_cidr}"
+    );
     let join_token = generated_dataplane_join_token(
         &cluster_id,
         &issuer_key_id,
         &issuer_private_key,
         bootstrap_ip,
+        &[workload_a_cidr, workload_b_cidr],
     )?;
     replace_compose_env(
         &mut compose,
@@ -718,6 +746,16 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         &mut compose,
         "IPARS_DATAPLANE_JOIN_TOKEN",
         join_token.to_string(),
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_WORKLOAD_A_CIDR",
+        workload_a_cidr.to_string(),
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_WORKLOAD_B_CIDR",
+        workload_b_cidr.to_string(),
     )?;
 
     let rendered = run_compose(&compose, ["config"])?;
@@ -740,11 +778,15 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         [
             "up",
             "-d",
+            "--no-deps",
+            "--force-recreate",
             "--wait",
             "--wait-timeout",
             "180",
             "agent",
             "agent-b",
+            "workload-a",
+            "workload-b",
         ],
     )?;
     assert_compose_services_running(
@@ -756,6 +798,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
             "stun",
             "agent",
             "agent-b",
+            "workload-a",
+            "workload-b",
         ],
     )?;
 
@@ -790,6 +834,38 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
 
     wait_for_compose_wireguard_path(&compose, "agent", agent_vpn_ip, agent_b_vpn_ip)?;
     wait_for_compose_wireguard_path(&compose, "agent-b", agent_b_vpn_ip, agent_vpn_ip)?;
+    let agent_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent", workload_a_cidr)?;
+    let agent_b_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent-b", workload_b_cidr)?;
+    let workload_a_ip = compose_service_ipv4_in_subnet(&compose, "workload-a", workload_a_cidr)?;
+    let workload_b_ip = compose_service_ipv4_in_subnet(&compose, "workload-b", workload_b_cidr)?;
+    configure_compose_workload_routes(
+        &compose,
+        "workload-a",
+        agent_workload_ip,
+        &[workload_b_cidr, "100.64.0.0/10".parse()?],
+    )?;
+    configure_compose_workload_routes(
+        &compose,
+        "workload-b",
+        agent_b_workload_ip,
+        &[workload_a_cidr, "100.64.0.0/10".parse()?],
+    )?;
+    wait_for_compose_advertised_route(&compose, "agent", workload_b_cidr, workload_b_ip)?;
+    wait_for_compose_advertised_route(&compose, "agent-b", workload_a_cidr, workload_a_ip)?;
+    assert_compose_routed_workload_traffic(
+        &compose,
+        "agent",
+        "workload-a",
+        agent_b_vpn_ip,
+        workload_b_ip,
+    )?;
+    assert_compose_routed_workload_traffic(
+        &compose,
+        "agent-b",
+        "workload-b",
+        agent_vpn_ip,
+        workload_a_ip,
+    )?;
     Ok(())
 }
 
@@ -798,11 +874,13 @@ fn generated_dataplane_join_token(
     issuer_key_id: &str,
     issuer_private_key: &str,
     bootstrap_ip: IpAddr,
+    allowed_routes: &[Ipv4Net],
 ) -> Result<Value> {
     let control_plane = format!("http://{bootstrap_ip}:8443");
     let signal = format!("http://{bootstrap_ip}:9443");
     let stun = format!("udp://{bootstrap_ip}:3478");
-    let output = Command::new(env!("CARGO_BIN_EXE_ipars"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ipars"));
+    command
         .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
         .args([
             "token",
@@ -822,7 +900,11 @@ fn generated_dataplane_join_token(
             &signal,
             "--stun-bootstrap",
             &stun,
-        ])
+        ]);
+    for route in allowed_routes {
+        command.arg("--allowed-route").arg(route.to_string());
+    }
+    let output = command
         .output()
         .context("failed to create Docker dataplane join token")?;
     ensure_success("Docker dataplane token create", &output)?;
@@ -1117,6 +1199,102 @@ fn compose_service_ipv4(compose: &ComposeProject, service: &str) -> Result<IpAdd
     Ok(IpAddr::V4(ipv4))
 }
 
+fn compose_network_ipv4_subnet(compose: &ComposeProject, network_key: &str) -> Result<Ipv4Net> {
+    let rendered = run_compose(compose, ["config", "--format", "json"])?;
+    let rendered: Value = serde_json::from_slice(&rendered.stdout)
+        .context("failed to parse rendered Compose JSON")?;
+    let network_name = rendered
+        .get("networks")
+        .and_then(|networks| networks.get(network_key))
+        .and_then(|network| network.get("name"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("rendered Compose config omitted network {network_key}"))?;
+    let output = Command::new("docker")
+        .args(["network", "inspect", network_name])
+        .output()
+        .with_context(|| format!("failed to inspect Docker network {network_name}"))?;
+    ensure_success(&format!("inspect Docker network {network_name}"), &output)?;
+    let inspected: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("failed to parse Docker network {network_name} inspection"))?;
+    let configs = inspected
+        .get(0)
+        .and_then(|network| network.get("IPAM"))
+        .and_then(|ipam| ipam.get("Config"))
+        .and_then(Value::as_array)
+        .with_context(|| format!("Docker network {network_name} omitted IPAM configuration"))?;
+    let subnets = configs
+        .iter()
+        .filter_map(|config| config.get("Subnet").and_then(Value::as_str))
+        .filter_map(|subnet| subnet.parse::<Ipv4Net>().ok())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        subnets.len() == 1,
+        "Docker network {network_name} must have exactly one IPv4 subnet, got {subnets:?}"
+    );
+    Ok(subnets[0])
+}
+
+fn compose_service_ipv4_in_subnet(
+    compose: &ComposeProject,
+    service: &str,
+    subnet: Ipv4Net,
+) -> Result<Ipv4Addr> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec", "-T", service, "ip", "-4", "-o", "address", "show", "scope", "global",
+    ]);
+    let output = command.output().with_context(|| {
+        format!("failed to inspect {service} IPv4 addresses for subnet {subnet}")
+    })?;
+    ensure_success(
+        &format!("inspect {service} IPv4 addresses for subnet {subnet}"),
+        &output,
+    )?;
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{service} IPv4 address output was not UTF-8"))?;
+    let addresses = stdout
+        .split_whitespace()
+        .filter_map(|field| field.split_once('/').map(|(addr, _)| addr))
+        .filter_map(|addr| addr.parse::<Ipv4Addr>().ok())
+        .filter(|addr| subnet.contains(addr))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        addresses.len() == 1,
+        "service {service} must have exactly one address in {subnet}, got {addresses:?}: {stdout:?}"
+    );
+    Ok(addresses[0])
+}
+
+fn configure_compose_workload_routes(
+    compose: &ComposeProject,
+    workload: &str,
+    gateway: Ipv4Addr,
+    routes: &[Ipv4Net],
+) -> Result<()> {
+    for route in routes {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            workload,
+            "ip",
+            "route",
+            "replace",
+            &route.to_string(),
+            "via",
+            &gateway.to_string(),
+        ]);
+        let output = command.output().with_context(|| {
+            format!("failed to configure {workload} route {route} via {gateway}")
+        })?;
+        ensure_success(
+            &format!("configure {workload} route {route} via {gateway}"),
+            &output,
+        )?;
+    }
+    Ok(())
+}
+
 fn compose_service_netns_identity(compose: &ComposeProject, service: &str) -> Result<String> {
     let mut command = compose_command(compose);
     command.args(["exec", "-T", service, "readlink", "/proc/self/ns/net"]);
@@ -1220,6 +1398,146 @@ wg show "$interface" latest-handshakes | awk '$2 > 0 { found = 1 } END { exit !f
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "Docker Agent {service} did not establish a WireGuard path from {local_vpn_ip} to {remote_vpn_ip}\nlast probe:\n{last_output}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn wait_for_compose_advertised_route(
+    compose: &ComposeProject,
+    service: &str,
+    remote_cidr: Ipv4Net,
+    remote_workload_ip: Ipv4Addr,
+) -> Result<()> {
+    let script = r#"
+set -eu
+interface="$1"
+remote_cidr="$2"
+remote_ip="$3"
+wg show "$interface" allowed-ips | grep -F -- "$remote_cidr" >/dev/null
+ip route get "$remote_ip" | grep -F -- "dev $interface" >/dev/null
+"#;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-ec",
+            script,
+            "sh",
+            "ipars0",
+            &remote_cidr.to_string(),
+            &remote_workload_ip.to_string(),
+        ]);
+        let last_output = match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("failed to execute route probe: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Docker Agent {service} did not route advertised CIDR {remote_cidr} through ipars0\nlast probe:\n{last_output}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn assert_compose_routed_workload_traffic(
+    compose: &ComposeProject,
+    local_agent: &str,
+    local_workload: &str,
+    remote_agent_vpn_ip: IpAddr,
+    remote_workload_ip: Ipv4Addr,
+) -> Result<()> {
+    wait_for_compose_http(
+        compose,
+        local_agent,
+        &format!("http://{remote_workload_ip}:8080/healthz"),
+        "node-to-container",
+    )?;
+    let remote_agent_host = match remote_agent_vpn_ip {
+        IpAddr::V4(_) => remote_agent_vpn_ip.to_string(),
+        IpAddr::V6(_) => format!("[{remote_agent_vpn_ip}]"),
+    };
+    wait_for_compose_http(
+        compose,
+        local_workload,
+        &format!("http://{remote_agent_host}:9780/healthz"),
+        "container-to-node",
+    )?;
+    wait_for_compose_http(
+        compose,
+        local_workload,
+        &format!("http://{remote_workload_ip}:8080/healthz"),
+        "container-to-container",
+    )?;
+
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        local_agent,
+        "sh",
+        "-ec",
+        "wg show ipars0 transfer | awk '$2 > 0 && $3 > 0 { found = 1 } END { exit !found }'",
+    ]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to inspect {local_agent} WireGuard transfer counters"))?;
+    ensure_success(
+        &format!("inspect {local_agent} WireGuard transfer counters"),
+        &output,
+    )
+}
+
+fn wait_for_compose_http(
+    compose: &ComposeProject,
+    service: &str,
+    url: &str,
+    traffic_kind: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            service,
+            "curl",
+            "--noproxy",
+            "*",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "5",
+            url,
+        ]);
+        let last_output = match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("failed to execute HTTP probe: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Docker {traffic_kind} probe from {service} to {url} failed\nlast probe:\n{last_output}\n{}",
                 compose_diagnostics(compose)
             );
         }
