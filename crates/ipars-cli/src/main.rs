@@ -79,6 +79,24 @@ const DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_AGENT_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT: u16 = 51_821;
+const DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT: u16 = 51_822;
+const DEFAULT_K8S_AGENT_WIREGUARD_LISTEN_PORT: u16 = 51_820;
+const DEFAULT_K8S_AGENT_PEER_PROBE_PORT: u16 = 51_821;
+const DEFAULT_AGENT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_AGENT_PEER_PROBE_SAMPLE_COUNT: u16 = 5;
+const DEFAULT_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS: u64 = 500;
+const DEFAULT_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS: u64 = 20;
+const DEFAULT_AGENT_PEER_PROBE_MAX_CONCURRENCY: usize = 32;
+const DEFAULT_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND: u32 = 100;
+const DEFAULT_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS: u64 = 120;
+const MAX_AGENT_PEER_PROBE_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_AGENT_PEER_PROBE_SAMPLE_COUNT: u16 = 64;
+const MAX_AGENT_PEER_PROBE_TIMEOUT_MILLIS: u64 = 10_000;
+const MAX_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS: u64 = 10_000;
+const MAX_AGENT_PEER_PROBE_MAX_CONCURRENCY: usize = 1024;
+const MAX_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND: u32 = 100_000;
+const MAX_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
@@ -599,6 +617,66 @@ enum K8sCommand {
     Install(Box<K8sInstallArgs>),
 }
 
+#[derive(Debug, Args, Clone, Copy, PartialEq, Eq)]
+struct AgentPeerProbeInstallArgs {
+    #[arg(long = "disable-agent-peer-probe", default_value_t = false)]
+    disabled: bool,
+    #[arg(long = "agent-peer-probe-port")]
+    port: Option<u16>,
+    #[arg(
+        long = "agent-peer-probe-interval-seconds",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_INTERVAL_SECONDS
+    )]
+    interval_seconds: u64,
+    #[arg(
+        long = "agent-peer-probe-sample-count",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_SAMPLE_COUNT
+    )]
+    sample_count: u16,
+    #[arg(
+        long = "agent-peer-probe-response-timeout-millis",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS
+    )]
+    response_timeout_millis: u64,
+    #[arg(
+        long = "agent-peer-probe-sample-interval-millis",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS
+    )]
+    sample_interval_millis: u64,
+    #[arg(
+        long = "agent-peer-probe-max-concurrency",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_MAX_CONCURRENCY
+    )]
+    max_concurrency: usize,
+    #[arg(
+        long = "agent-peer-probe-responder-max-requests-per-second",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND
+    )]
+    responder_max_requests_per_second: u32,
+    #[arg(
+        long = "agent-peer-probe-observation-max-age-seconds",
+        default_value_t = DEFAULT_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS
+    )]
+    observation_max_age_seconds: u64,
+}
+
+impl Default for AgentPeerProbeInstallArgs {
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            port: None,
+            interval_seconds: DEFAULT_AGENT_PEER_PROBE_INTERVAL_SECONDS,
+            sample_count: DEFAULT_AGENT_PEER_PROBE_SAMPLE_COUNT,
+            response_timeout_millis: DEFAULT_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS,
+            sample_interval_millis: DEFAULT_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS,
+            max_concurrency: DEFAULT_AGENT_PEER_PROBE_MAX_CONCURRENCY,
+            responder_max_requests_per_second:
+                DEFAULT_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND,
+            observation_max_age_seconds: DEFAULT_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct DockerInstallArgs {
     #[arg(long, default_value = "docker/compose.yaml")]
@@ -643,6 +721,8 @@ struct DockerInstallArgs {
         default_value_t = DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
     )]
     agent_direct_handshake_max_age_seconds: u64,
+    #[command(flatten)]
+    agent_peer_probe: AgentPeerProbeInstallArgs,
     #[arg(
         long = "agent-runtime-backend",
         default_value = "linux-command",
@@ -877,6 +957,8 @@ struct K8sInstallArgs {
         default_value_t = DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
     )]
     agent_direct_handshake_max_age_seconds: u64,
+    #[command(flatten)]
+    agent_peer_probe: AgentPeerProbeInstallArgs,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
@@ -5492,6 +5574,12 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         (!args.rootless && args.agent_runtime_backend == "linux-command")
             .then_some(DEFAULT_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS),
     )?;
+    validate_agent_peer_probe_settings(
+        &args.agent_peer_probe,
+        !args.rootless && args.agent_runtime_backend == "linux-command",
+        DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT,
+        DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT,
+    )?;
     validate_docker_userspace_wireguard_args(args)?;
     validate_docker_relay_advertisement(args)?;
     validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
@@ -5903,6 +5991,65 @@ fn validate_agent_direct_path_verification_settings(
     Ok(())
 }
 
+fn validate_agent_peer_probe_settings(
+    settings: &AgentPeerProbeInstallArgs,
+    linux_peer_map_active: bool,
+    wireguard_listen_port: u16,
+    default_probe_port: u16,
+) -> anyhow::Result<u16> {
+    let probe_port = settings.port.unwrap_or(default_probe_port);
+    anyhow::ensure!(
+        probe_port > 0,
+        "--agent-peer-probe-port must be greater than zero"
+    );
+    validate_bounded_docker_seconds(
+        settings.interval_seconds,
+        "--agent-peer-probe-interval-seconds",
+        MAX_AGENT_PEER_PROBE_INTERVAL_SECONDS,
+    )?;
+    anyhow::ensure!(
+        (1..=MAX_AGENT_PEER_PROBE_SAMPLE_COUNT).contains(&settings.sample_count),
+        "--agent-peer-probe-sample-count must be between 1 and {MAX_AGENT_PEER_PROBE_SAMPLE_COUNT}"
+    );
+    validate_bounded_docker_seconds(
+        settings.response_timeout_millis,
+        "--agent-peer-probe-response-timeout-millis",
+        MAX_AGENT_PEER_PROBE_TIMEOUT_MILLIS,
+    )?;
+    anyhow::ensure!(
+        settings.sample_interval_millis <= MAX_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS,
+        "--agent-peer-probe-sample-interval-millis must not exceed {MAX_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS}"
+    );
+    anyhow::ensure!(
+        (1..=MAX_AGENT_PEER_PROBE_MAX_CONCURRENCY).contains(&settings.max_concurrency),
+        "--agent-peer-probe-max-concurrency must be between 1 and {MAX_AGENT_PEER_PROBE_MAX_CONCURRENCY}"
+    );
+    anyhow::ensure!(
+        (1..=MAX_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND)
+            .contains(&settings.responder_max_requests_per_second),
+        "--agent-peer-probe-responder-max-requests-per-second must be between 1 and {MAX_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND}"
+    );
+    validate_bounded_docker_seconds(
+        settings.observation_max_age_seconds,
+        "--agent-peer-probe-observation-max-age-seconds",
+        MAX_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS,
+    )?;
+    if linux_peer_map_active && !settings.disabled {
+        anyhow::ensure!(
+            probe_port != wireguard_listen_port,
+            "--agent-peer-probe-port must differ from the effective WireGuard listen port {wireguard_listen_port}"
+        );
+        let minimum_observation_age = settings
+            .interval_seconds
+            .max(DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS);
+        anyhow::ensure!(
+            settings.observation_max_age_seconds >= minimum_observation_age,
+            "--agent-peer-probe-observation-max-age-seconds must be at least both --agent-peer-probe-interval-seconds and the {DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS}-second signal path interval"
+        );
+    }
+    Ok(probe_port)
+}
+
 fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{label} must be greater than zero");
@@ -6036,6 +6183,62 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
             value: args.agent_direct_handshake_max_age_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
+            value: (args.agent_peer_probe.disabled
+                || args.rootless
+                || args.agent_runtime_backend != "linux-command")
+                .to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_PORT".to_string(),
+            value: args
+                .agent_peer_probe
+                .port
+                .unwrap_or(DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT)
+                .to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_INTERVAL_SECONDS".to_string(),
+            value: args.agent_peer_probe.interval_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
+            value: args.agent_peer_probe.sample_count.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS".to_string(),
+            value: args.agent_peer_probe.response_timeout_millis.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS".to_string(),
+            value: args.agent_peer_probe.sample_interval_millis.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_MAX_CONCURRENCY".to_string(),
+            value: args.agent_peer_probe.max_concurrency.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND".to_string(),
+            value: args
+                .agent_peer_probe
+                .responder_max_requests_per_second
+                .to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
+            value: args
+                .agent_peer_probe
+                .observation_max_age_seconds
+                .to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS".to_string(),
+            value: args
+                .agent_peer_probe
+                .observation_max_age_seconds
+                .to_string(),
         },
         InstallEnvironment {
             name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
@@ -6277,6 +6480,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_network_policy(&args)?;
     validate_k8s_route_discovery(&args)?;
     validate_k8s_agent_wireguard_endpoint_config(&args)?;
+    validate_k8s_agent_peer_probe_config(&args)?;
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
         "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={} --set agent.apiBearerTokenSecretKey={}",
@@ -6930,6 +7134,46 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
         " --set agent.directPathVerification.handshakeMaxAgeSeconds={}",
         args.agent_direct_handshake_max_age_seconds
     ));
+    let peer_probe_enabled = !args.agent_peer_probe.disabled
+        && !args.disable_agent_peer_map
+        && args.agent_runtime_backend == "linux-command";
+    command.push_str(&format!(
+        " --set agent.peerProbe.enabled={peer_probe_enabled}"
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.port={}",
+        args.agent_peer_probe
+            .port
+            .unwrap_or(DEFAULT_K8S_AGENT_PEER_PROBE_PORT)
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.intervalSeconds={}",
+        args.agent_peer_probe.interval_seconds
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.sampleCount={}",
+        args.agent_peer_probe.sample_count
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.responseTimeoutMillis={}",
+        args.agent_peer_probe.response_timeout_millis
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.sampleIntervalMillis={}",
+        args.agent_peer_probe.sample_interval_millis
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.maxConcurrency={}",
+        args.agent_peer_probe.max_concurrency
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.responderMaxRequestsPerSecond={}",
+        args.agent_peer_probe.responder_max_requests_per_second
+    ));
+    command.push_str(&format!(
+        " --set agent.peerProbe.observationMaxAgeSeconds={}",
+        args.agent_peer_probe.observation_max_age_seconds
+    ));
     if args.disable_agent_host_network {
         command.push_str(" --set agent.hostNetwork=false");
     }
@@ -7371,6 +7615,25 @@ fn validate_k8s_agent_wireguard_endpoint_config(args: &K8sInstallArgs) -> anyhow
             "--agent-stun-bind port must equal --agent-wireguard-listen-port"
         );
     }
+    Ok(())
+}
+
+fn validate_k8s_agent_peer_probe_config(args: &K8sInstallArgs) -> anyhow::Result<()> {
+    let wireguard_listen_port = args
+        .agent_wireguard_listen_port
+        .or_else(|| {
+            args.agent_stun_bind
+                .as_deref()
+                .and_then(|bind| bind.parse::<SocketAddr>().ok())
+                .map(|bind| bind.port())
+        })
+        .unwrap_or(DEFAULT_K8S_AGENT_WIREGUARD_LISTEN_PORT);
+    validate_agent_peer_probe_settings(
+        &args.agent_peer_probe,
+        !args.disable_agent_peer_map && args.agent_runtime_backend == "linux-command",
+        wireguard_listen_port,
+        DEFAULT_K8S_AGENT_PEER_PROBE_PORT,
+    )?;
     Ok(())
 }
 
@@ -11733,6 +11996,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11781,6 +12045,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11965,6 +12230,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12122,6 +12388,116 @@ fi
                 ..docker_install_test_args()
             })
             .expect_err("invalid direct path verification settings should be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error:#}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_and_validates_peer_probe() -> anyhow::Result<()> {
+        let settings = AgentPeerProbeInstallArgs {
+            disabled: false,
+            port: Some(51_900),
+            interval_seconds: 45,
+            sample_count: 7,
+            response_timeout_millis: 750,
+            sample_interval_millis: 25,
+            max_concurrency: 8,
+            responder_max_requests_per_second: 200,
+            observation_max_age_seconds: 90,
+        };
+        let plan = docker_install_plan(DockerInstallArgs {
+            agent_peer_probe: settings,
+            ..docker_install_test_args()
+        })?;
+        for (name, expected) in [
+            ("IPARS_AGENT_DISABLE_PEER_PROBE", "false"),
+            ("IPARS_AGENT_PEER_PROBE_PORT", "51900"),
+            ("IPARS_AGENT_PEER_PROBE_INTERVAL_SECONDS", "45"),
+            ("IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
+            ("IPARS_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS", "750"),
+            ("IPARS_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS", "25"),
+            ("IPARS_AGENT_PEER_PROBE_MAX_CONCURRENCY", "8"),
+            (
+                "IPARS_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND",
+                "200",
+            ),
+            ("IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS", "90"),
+            ("IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS", "90"),
+        ] {
+            assert_eq!(environment_value(&plan, name), Some(expected));
+        }
+
+        let rootless = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            agent_peer_probe: settings,
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&rootless, "IPARS_AGENT_DISABLE_PEER_PROBE"),
+            Some("true")
+        );
+
+        for (settings, expected) in [
+            (
+                AgentPeerProbeInstallArgs {
+                    port: Some(DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT),
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-port must differ from the effective WireGuard listen port",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    sample_count: 0,
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-sample-count must be between 1 and 64",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    response_timeout_millis: 0,
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-response-timeout-millis must be greater than zero",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    sample_interval_millis: 10_001,
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-sample-interval-millis must not exceed 10000",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    max_concurrency: 0,
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-max-concurrency must be between 1 and 1024",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    responder_max_requests_per_second: 0,
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-responder-max-requests-per-second must be between 1 and 100000",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    interval_seconds: 60,
+                    observation_max_age_seconds: 59,
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-observation-max-age-seconds must be at least both",
+            ),
+        ] {
+            let error = docker_install_plan(DockerInstallArgs {
+                agent_peer_probe: settings,
+                ..docker_install_test_args()
+            })
+            .expect_err("invalid peer probe settings should be rejected");
             assert!(
                 error.to_string().contains(expected),
                 "expected `{expected}` in `{error:#}`"
@@ -12476,6 +12852,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12778,6 +13155,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12873,6 +13251,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12924,6 +13303,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12975,6 +13355,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -13038,6 +13419,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -13107,6 +13489,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -13213,6 +13596,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13264,6 +13648,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13315,6 +13700,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13368,6 +13754,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13704,6 +14091,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -16028,6 +16416,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: false,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -16257,6 +16646,117 @@ fi
         assert!(error
             .to_string()
             .contains("--agent-direct-handshake-max-age-seconds must be at least the 30-second signal path interval"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_and_validates_peer_probe() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_peer_probe = AgentPeerProbeInstallArgs {
+            disabled: false,
+            port: Some(51_900),
+            interval_seconds: 45,
+            sample_count: 7,
+            response_timeout_millis: 750,
+            sample_interval_millis: 25,
+            max_concurrency: 8,
+            responder_max_requests_per_second: 200,
+            observation_max_age_seconds: 90,
+        };
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+        for expected in [
+            "--set agent.peerProbe.enabled=true",
+            "--set agent.peerProbe.port=51900",
+            "--set agent.peerProbe.intervalSeconds=45",
+            "--set agent.peerProbe.sampleCount=7",
+            "--set agent.peerProbe.responseTimeoutMillis=750",
+            "--set agent.peerProbe.sampleIntervalMillis=25",
+            "--set agent.peerProbe.maxConcurrency=8",
+            "--set agent.peerProbe.responderMaxRequestsPerSecond=200",
+            "--set agent.peerProbe.observationMaxAgeSeconds=90",
+        ] {
+            assert!(helm.contains(expected), "missing `{expected}` in `{helm}`");
+        }
+
+        let mut dry_run = base_k8s_install_args();
+        dry_run.agent_runtime_backend = "dry-run".to_string();
+        let plan = k8s_install_plan(dry_run)?;
+        assert!(plan.commands[2].contains("--set agent.peerProbe.enabled=false"));
+
+        let mut peer_map_disabled = base_k8s_install_args();
+        peer_map_disabled.disable_agent_peer_map = true;
+        let plan = k8s_install_plan(peer_map_disabled)?;
+        assert!(plan.commands[2].contains("--set agent.peerProbe.enabled=false"));
+
+        let mut port_conflict = base_k8s_install_args();
+        port_conflict.agent_wireguard_listen_port = Some(DEFAULT_K8S_AGENT_PEER_PROBE_PORT);
+        let error = k8s_install_plan(port_conflict)
+            .expect_err("peer probe and WireGuard ports must differ");
+        assert!(error.to_string().contains(
+            "--agent-peer-probe-port must differ from the effective WireGuard listen port 51821"
+        ));
+
+        let mut stale = base_k8s_install_args();
+        stale.agent_peer_probe.interval_seconds = 60;
+        stale.agent_peer_probe.observation_max_age_seconds = 59;
+        let error = k8s_install_plan(stale)
+            .expect_err("observation freshness shorter than probe interval must fail");
+        assert!(error
+            .to_string()
+            .contains("--agent-peer-probe-observation-max-age-seconds must be at least both"));
+        Ok(())
+    }
+
+    #[test]
+    fn install_commands_parse_peer_probe_options() -> anyhow::Result<()> {
+        for command in ["docker", "k8s"] {
+            let cli = Cli::try_parse_from([
+                "ipars",
+                command,
+                "install",
+                "--disable-agent-peer-probe",
+                "--agent-peer-probe-port",
+                "51900",
+                "--agent-peer-probe-interval-seconds",
+                "45",
+                "--agent-peer-probe-sample-count",
+                "7",
+                "--agent-peer-probe-response-timeout-millis",
+                "750",
+                "--agent-peer-probe-sample-interval-millis",
+                "25",
+                "--agent-peer-probe-max-concurrency",
+                "8",
+                "--agent-peer-probe-responder-max-requests-per-second",
+                "200",
+                "--agent-peer-probe-observation-max-age-seconds",
+                "90",
+            ])?;
+            let settings = match cli.command {
+                Command::Docker {
+                    command: DockerCommand::Install(args),
+                } => args.agent_peer_probe,
+                Command::K8s {
+                    command: K8sCommand::Install(args),
+                } => args.agent_peer_probe,
+                _ => anyhow::bail!("expected {command} install command"),
+            };
+            assert_eq!(
+                settings,
+                AgentPeerProbeInstallArgs {
+                    disabled: true,
+                    port: Some(51_900),
+                    interval_seconds: 45,
+                    sample_count: 7,
+                    response_timeout_millis: 750,
+                    sample_interval_millis: 25,
+                    max_concurrency: 8,
+                    responder_max_requests_per_second: 200,
+                    observation_max_age_seconds: 90,
+                }
+            );
+        }
         Ok(())
     }
 
@@ -18217,6 +18717,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -18395,6 +18896,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -19923,6 +20425,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -20088,6 +20591,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -20387,6 +20891,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -20557,6 +21062,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -20722,6 +21228,7 @@ fi
             agent_direct_path_probe_timeout_seconds:
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
+            agent_peer_probe: AgentPeerProbeInstallArgs::default(),
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,

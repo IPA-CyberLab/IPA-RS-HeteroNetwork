@@ -100,7 +100,10 @@ loop. Defaults are five samples every 30 seconds, a 500 ms response timeout, a
 20 ms inter-sample delay, concurrency 32, and 100 responder requests per second
 per peer. Configure these through `IPARS_AGENT_PEER_PROBE_*` or the matching
 `--peer-probe-*` flags; `--disable-peer-probe` disables both measurement and the
-responder.
+responder. `ipars docker install` and `ipars k8s install` expose the same values
+as `--agent-peer-probe-*` and `--disable-agent-peer-probe`. Install plans disable
+the probe automatically for rootless/dry-run agents or disabled peer-map sync,
+where no real WireGuard data plane exists.
 
 Each completed round calculates mean RTT, loss in parts per million, mean
 absolute RTT jitter, and a bounded stability value smoothed only across the
@@ -110,6 +113,10 @@ Signal validates sample/loss consistency and applies it only when state,
 candidate address or relay node, and freshness all match the selected path.
 `--peer-probe-observation-max-age-seconds` and
 `IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS` default to 120 seconds.
+Docker install plans set the Agent observation age and bundled Signal TTL from
+the same `--agent-peer-probe-observation-max-age-seconds` value. Kubernetes
+installs must keep the external Signal service TTL at least as fresh as the
+rendered Agent observation age.
 Compose uses probe port `51822` because its bundled WireGuard listener uses
 `51821`; Helm uses WireGuard `51820` and probe `51821`. Monitor
 `ipars_agent_peer_probe_*`, `ipars_agent_path_quality_observations`, and

@@ -223,8 +223,10 @@ connect rather than probing every known node. The observation is signed as part
 of Signal negotiation and affects scoring only while its path fingerprint and
 TTL match. Peer-map source allowlisting, same-size responses, nonce/sequence
 validation, and per-peer rate limiting bound responder abuse. Configure the
-loop with `--peer-probe-*` / `IPARS_AGENT_PEER_PROBE_*` and Signal freshness
-with `--path-quality-observation-ttl-seconds` /
+loop with daemon `--peer-probe-*` / `IPARS_AGENT_PEER_PROBE_*`, or matching
+`--agent-peer-probe-*` options on `ipars docker install` and
+`ipars k8s install`. Configure Signal freshness with
+`--path-quality-observation-ttl-seconds` /
 `IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS`.
 
 For issuer key rotation, start `iparsd control-plane` with repeated `--trusted-issuer-key issuer_node_id,key_id,public_key` values, or semicolon-separated `IPARS_TRUSTED_ISSUER_KEYS`, so old and next signing keys overlap while new tokens move to the next `--issuer-key-id`. Registered nodes can rotate WireGuard data-plane keys through the local agent `POST /v1/wireguard-key/rotate` endpoint, which generates a new WireGuard keypair, signs the previous-to-next public-key transition, submits it to `PUT /v1/nodes/{node_id}/wireguard-key`, persists the new private key in the owner-only agent state file, and updates the running agent state after control-plane acceptance. A node can also request its own removal through the local agent `POST /v1/node/remove` endpoint; the agent signs a node-identity removal request and submits it to `DELETE /v1/nodes/{node_id}` using the configured control-plane endpoint failover list or the request's explicit `control_plane_url`. The control plane rejects stale, unsigned, malformed, mismatched, or non-current transitions before updating the durable node record or removing a node, and exposes accepted/rejected key-rotation and node-removal counters through JSON, Prometheus, and OTLP metrics.
