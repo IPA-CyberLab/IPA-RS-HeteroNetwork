@@ -42,7 +42,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 #[cfg(target_os = "linux")]
-use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_REQUEST};
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
 #[cfg(target_os = "linux")]
 use netlink_packet_generic::GenlMessage;
 #[cfg(target_os = "linux")]
@@ -2292,6 +2292,261 @@ pub trait WireGuardBackend: Send + Sync {
     async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireGuardPeerTelemetry {
+    pub public_key_b64: String,
+    pub endpoint: Option<String>,
+    pub latest_handshake_at: Option<DateTime<Utc>>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+impl WireGuardPeerTelemetry {
+    fn new(public_key_b64: String) -> Self {
+        Self {
+            public_key_b64,
+            endpoint: None,
+            latest_handshake_at: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }
+    }
+
+    fn merge(&mut self, update: Self) {
+        if update.endpoint.is_some() {
+            self.endpoint = update.endpoint;
+        }
+        if update.latest_handshake_at.is_some() {
+            self.latest_handshake_at = update.latest_handshake_at;
+        }
+        self.rx_bytes = self.rx_bytes.max(update.rx_bytes);
+        self.tx_bytes = self.tx_bytes.max(update.tx_bytes);
+    }
+}
+
+#[async_trait]
+pub trait WireGuardPeerTelemetrySource: Send + Sync {
+    async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandWireGuardPeerTelemetrySource {
+    interface: String,
+    namespace: Option<LinuxNetworkNamespace>,
+    timeout: Duration,
+    output_max_bytes: usize,
+}
+
+impl CommandWireGuardPeerTelemetrySource {
+    pub fn new(interface: impl Into<String>, timeout: Duration, output_max_bytes: usize) -> Self {
+        Self {
+            interface: interface.into(),
+            namespace: None,
+            timeout,
+            output_max_bytes,
+        }
+    }
+
+    pub fn new_in_namespace(
+        interface: impl Into<String>,
+        namespace: LinuxNetworkNamespace,
+        timeout: Duration,
+        output_max_bytes: usize,
+    ) -> Self {
+        Self {
+            interface: interface.into(),
+            namespace: Some(namespace),
+            timeout,
+            output_max_bytes,
+        }
+    }
+
+    async fn query(&self, field: &'static str) -> Result<Vec<u8>, AgentError> {
+        let mut command = LinuxCommand::new("wg", ["show", self.interface.as_str(), field]);
+        if let Some(namespace) = self.namespace.as_ref() {
+            warn_if_linux_netns_is_current(namespace, "WireGuard peer telemetry");
+            command = command.in_namespace(namespace);
+        }
+        run_system_command_capture_stdout(command, self.timeout, self.output_max_bytes).await
+    }
+}
+
+#[async_trait]
+impl WireGuardPeerTelemetrySource for CommandWireGuardPeerTelemetrySource {
+    async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+        let (handshakes, transfers, endpoints) = tokio::try_join!(
+            self.query("latest-handshakes"),
+            self.query("transfer"),
+            self.query("endpoints"),
+        )?;
+        parse_wireguard_command_telemetry(&handshakes, &transfers, &endpoints)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelWireGuardPeerTelemetrySource {
+    interface: String,
+    namespace: Option<LinuxNetworkNamespace>,
+}
+
+impl KernelWireGuardPeerTelemetrySource {
+    pub fn new(interface: impl Into<String>) -> Self {
+        Self {
+            interface: interface.into(),
+            namespace: None,
+        }
+    }
+
+    pub fn new_in_namespace(
+        interface: impl Into<String>,
+        namespace: LinuxNetworkNamespace,
+    ) -> Self {
+        Self {
+            interface: interface.into(),
+            namespace: Some(namespace),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl WireGuardPeerTelemetrySource for KernelWireGuardPeerTelemetrySource {
+    async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+        query_wireguard_peer_telemetry_netlink(&self.interface, self.namespace.as_ref()).await
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[async_trait]
+impl WireGuardPeerTelemetrySource for KernelWireGuardPeerTelemetrySource {
+    async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard telemetry is only supported on Linux".to_string(),
+        ))
+    }
+}
+
+fn parse_wireguard_command_telemetry(
+    handshakes: &[u8],
+    transfers: &[u8],
+    endpoints: &[u8],
+) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+    let mut peers = BTreeMap::new();
+
+    for fields in wireguard_command_output_rows(handshakes, "latest-handshakes", 2)? {
+        let seconds = fields[1].parse::<i64>().map_err(|error| {
+            AgentError::WireGuard(format!(
+                "invalid WireGuard latest-handshakes timestamp `{}`: {error}",
+                fields[1]
+            ))
+        })?;
+        let peer = wireguard_telemetry_entry(&mut peers, fields[0])?;
+        peer.latest_handshake_at = wireguard_handshake_timestamp(seconds, 0)?;
+    }
+
+    for fields in wireguard_command_output_rows(transfers, "transfer", 3)? {
+        let rx_bytes = fields[1].parse::<u64>().map_err(|error| {
+            AgentError::WireGuard(format!(
+                "invalid WireGuard transfer receive byte count `{}`: {error}",
+                fields[1]
+            ))
+        })?;
+        let tx_bytes = fields[2].parse::<u64>().map_err(|error| {
+            AgentError::WireGuard(format!(
+                "invalid WireGuard transfer transmit byte count `{}`: {error}",
+                fields[2]
+            ))
+        })?;
+        let peer = wireguard_telemetry_entry(&mut peers, fields[0])?;
+        peer.rx_bytes = rx_bytes;
+        peer.tx_bytes = tx_bytes;
+    }
+
+    for fields in wireguard_command_output_rows(endpoints, "endpoints", 2)? {
+        let peer = wireguard_telemetry_entry(&mut peers, fields[0])?;
+        peer.endpoint = (fields[1] != "(none)").then(|| fields[1].to_string());
+    }
+
+    Ok(peers)
+}
+
+fn wireguard_command_output_rows<'a>(
+    bytes: &'a [u8],
+    field: &'static str,
+    expected_fields: usize,
+) -> Result<Vec<Vec<&'a str>>, AgentError> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        AgentError::WireGuard(format!(
+            "WireGuard {field} output was not valid UTF-8: {error}"
+        ))
+    })?;
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != expected_fields || fields.iter().any(|field| field.is_empty()) {
+            return Err(AgentError::WireGuard(format!(
+                "invalid WireGuard {field} output row {}: expected {expected_fields} non-empty tab-separated fields, got {}",
+                index + 1,
+                fields.len()
+            )));
+        }
+        rows.push(fields);
+    }
+    Ok(rows)
+}
+
+fn wireguard_telemetry_entry<'a>(
+    peers: &'a mut BTreeMap<String, WireGuardPeerTelemetry>,
+    public_key_b64: &str,
+) -> Result<&'a mut WireGuardPeerTelemetry, AgentError> {
+    validate_wireguard_public_key(public_key_b64)?;
+    Ok(peers
+        .entry(public_key_b64.to_string())
+        .or_insert_with(|| WireGuardPeerTelemetry::new(public_key_b64.to_string())))
+}
+
+fn wireguard_handshake_timestamp(
+    seconds: i64,
+    nano_seconds: i64,
+) -> Result<Option<DateTime<Utc>>, AgentError> {
+    if seconds == 0 && nano_seconds == 0 {
+        return Ok(None);
+    }
+    if seconds < 0 || !(0..1_000_000_000).contains(&nano_seconds) {
+        return Err(AgentError::WireGuard(format!(
+            "invalid WireGuard handshake timestamp {seconds}.{nano_seconds:09}"
+        )));
+    }
+    let nano_seconds = u32::try_from(nano_seconds).map_err(|error| {
+        AgentError::WireGuard(format!(
+            "invalid WireGuard handshake nanoseconds {nano_seconds}: {error}"
+        ))
+    })?;
+    DateTime::<Utc>::from_timestamp(seconds, nano_seconds)
+        .map(Some)
+        .ok_or_else(|| {
+            AgentError::WireGuard(format!(
+                "WireGuard handshake timestamp {seconds}.{nano_seconds:09} is out of range"
+            ))
+        })
+}
+
+fn validate_wireguard_public_key(value: &str) -> Result<(), AgentError> {
+    let decoded = BASE64_STANDARD.decode(value).map_err(|error| {
+        AgentError::WireGuard(format!("invalid WireGuard public key base64: {error}"))
+    })?;
+    if decoded.len() != 32 {
+        return Err(AgentError::WireGuard(format!(
+            "WireGuard public key decoded to {} bytes, expected 32",
+            decoded.len()
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinuxCommand {
     pub program: String,
@@ -2507,6 +2762,30 @@ async fn run_system_command(
         "{command_label} failed: {}",
         command_stderr_message(&output.stderr)
     )))
+}
+
+async fn run_system_command_capture_stdout(
+    command: LinuxCommand,
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<Vec<u8>, AgentError> {
+    validate_system_command_runtime_bounds(timeout, output_max_bytes)?;
+    validate_linux_command(&command)?;
+    let command_label = command_label(&command.program, &command.args);
+    let output = run_command_output(command, timeout, output_max_bytes, &command_label).await?;
+    if !output.status.success() {
+        return Err(AgentError::WireGuard(format!(
+            "{command_label} failed: {}",
+            command_stderr_message(&output.stderr)
+        )));
+    }
+    if output.stdout.truncated {
+        return Err(AgentError::WireGuard(format!(
+            "{command_label} stdout exceeded {} bytes",
+            output.stdout.limit
+        )));
+    }
+    Ok(output.stdout.bytes)
 }
 
 fn validate_system_command_runtime_bounds(
@@ -2985,7 +3264,7 @@ async fn collect_bounded_command_output(
         }
     };
 
-    let _stdout = collect_command_output_task(stdout_task).await?;
+    let stdout = collect_command_output_task(stdout_task).await?;
     let stderr = collect_command_output_task(stderr_task).await?;
     if let Some(task) = stdin_task {
         match task.await {
@@ -2999,7 +3278,11 @@ async fn collect_bounded_command_output(
         }
     }
 
-    Ok(BoundedCommandOutput { status, stderr })
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn configure_command_process_group(_command: &mut Command) {
@@ -3058,6 +3341,7 @@ async fn collect_command_output_task(
 #[derive(Debug)]
 struct BoundedCommandOutput {
     status: ExitStatus,
+    stdout: LimitedCommandOutput,
     stderr: LimitedCommandOutput,
 }
 
@@ -3864,6 +4148,106 @@ async fn apply_wireguard_netlink(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+async fn query_wireguard_peer_telemetry_netlink(
+    interface: &str,
+    namespace: Option<&LinuxNetworkNamespace>,
+) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+    let (connection, mut handle, _) = with_netlink_namespace(namespace, || {
+        genetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+    })
+    .map_err(|error| {
+        AgentError::WireGuard(format!(
+            "failed to open generic netlink connection for WireGuard telemetry on interface {interface}{}: {error}",
+            wireguard_namespace_suffix(namespace)
+        ))
+    })?;
+    tokio::spawn(connection);
+
+    let genlmsg = GenlMessage::from_payload(WireguardMessage {
+        cmd: WireguardCmd::GetDevice,
+        attributes: vec![WireguardAttribute::IfName(interface.to_string())],
+    });
+    let mut nlmsg = NetlinkMessage::from(genlmsg);
+    nlmsg.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+
+    let mut responses = handle.request(nlmsg).await.map_err(|error| {
+        AgentError::WireGuard(format!(
+            "failed to query WireGuard telemetry for interface {interface}: {error}"
+        ))
+    })?;
+    let mut peers = BTreeMap::new();
+    while let Some(response) = responses.next().await {
+        let response = response.map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to decode WireGuard telemetry response for interface {interface}: {error}"
+            ))
+        })?;
+        match response.payload {
+            NetlinkPayload::InnerMessage(message) => {
+                for attribute in message.payload.attributes {
+                    let WireguardAttribute::Peers(netlink_peers) = attribute else {
+                        continue;
+                    };
+                    for peer in netlink_peers {
+                        let telemetry = wireguard_netlink_peer_telemetry(&peer)?;
+                        peers
+                            .entry(telemetry.public_key_b64.clone())
+                            .and_modify(|current: &mut WireGuardPeerTelemetry| {
+                                current.merge(telemetry.clone());
+                            })
+                            .or_insert(telemetry);
+                    }
+                }
+            }
+            NetlinkPayload::Error(error) if error.code.is_some() => {
+                return Err(AgentError::WireGuard(format!(
+                    "WireGuard telemetry query for interface {interface} failed: {}",
+                    error.to_io()
+                )));
+            }
+            NetlinkPayload::Error(_) | NetlinkPayload::Done(_) => break,
+            _ => {}
+        }
+    }
+    Ok(peers)
+}
+
+#[cfg(target_os = "linux")]
+fn wireguard_netlink_peer_telemetry(
+    peer: &WireguardPeer,
+) -> Result<WireGuardPeerTelemetry, AgentError> {
+    let public_key = peer.iter().find_map(|attribute| {
+        if let WireguardPeerAttribute::PublicKey(public_key) = attribute {
+            Some(*public_key)
+        } else {
+            None
+        }
+    });
+    let public_key = public_key.ok_or_else(|| {
+        AgentError::WireGuard(
+            "WireGuard netlink telemetry peer did not include a public key".to_string(),
+        )
+    })?;
+    let public_key_b64 = BASE64_STANDARD.encode(public_key);
+    let mut telemetry = WireGuardPeerTelemetry::new(public_key_b64);
+    for attribute in peer.iter() {
+        match attribute {
+            WireguardPeerAttribute::Endpoint(endpoint) => {
+                telemetry.endpoint = Some(endpoint.to_string());
+            }
+            WireguardPeerAttribute::LastHandshake(handshake) => {
+                telemetry.latest_handshake_at =
+                    wireguard_handshake_timestamp(handshake.seconds, handshake.nano_seconds)?;
+            }
+            WireguardPeerAttribute::RxBytes(rx_bytes) => telemetry.rx_bytes = *rx_bytes,
+            WireguardPeerAttribute::TxBytes(tx_bytes) => telemetry.tx_bytes = *tx_bytes,
+            _ => {}
+        }
+    }
+    Ok(telemetry)
+}
+
 #[derive(Debug, Default)]
 pub struct MemoryWireGuardBackend {
     peers: tokio::sync::RwLock<BTreeMap<NodeId, WireGuardPeerConfig>>,
@@ -4099,7 +4483,7 @@ where
                 .insert(peer.node_id.clone());
             peers_applied += 1;
 
-            let desired_routes = peer_routes_for_record(&peer)?;
+            let desired_routes = peer_routes_for_record(peer)?;
             let routes_to_remove = self
                 .applied_routes
                 .read()
@@ -6820,6 +7204,93 @@ mod tests {
                 LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
                     .with_stdin(format!("{second_private_key}\n").into_bytes()),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_wireguard_telemetry_parser_aggregates_bounded_field_outputs(
+    ) -> Result<(), AgentError> {
+        let first_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let second_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let handshakes = format!("{first_key}\t1710000000\n{second_key}\t0\n");
+        let transfers = format!("{first_key}\t120\t340\n{second_key}\t0\t0\n");
+        let endpoints = format!("{first_key}\t203.0.113.10:51820\n{second_key}\t(none)\n");
+
+        let telemetry = parse_wireguard_command_telemetry(
+            handshakes.as_bytes(),
+            transfers.as_bytes(),
+            endpoints.as_bytes(),
+        )?;
+
+        assert_eq!(telemetry.len(), 2);
+        assert_eq!(
+            telemetry.get(first_key),
+            Some(&WireGuardPeerTelemetry {
+                public_key_b64: first_key.to_string(),
+                endpoint: Some("203.0.113.10:51820".to_string()),
+                latest_handshake_at: DateTime::<Utc>::from_timestamp(1_710_000_000, 0),
+                rx_bytes: 120,
+                tx_bytes: 340,
+            })
+        );
+        assert_eq!(
+            telemetry.get(second_key),
+            Some(&WireGuardPeerTelemetry {
+                public_key_b64: second_key.to_string(),
+                endpoint: None,
+                latest_handshake_at: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_wireguard_telemetry_parser_rejects_malformed_or_untrusted_rows() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let malformed =
+            parse_wireguard_command_telemetry(format!("{key} 1710000000\n").as_bytes(), b"", b"");
+        assert!(matches!(
+            malformed,
+            Err(AgentError::WireGuard(message))
+                if message.contains("expected 2 non-empty tab-separated fields")
+        ));
+
+        let invalid_key = parse_wireguard_command_telemetry(b"not-a-key\t0\n", b"", b"");
+        assert!(matches!(
+            invalid_key,
+            Err(AgentError::WireGuard(message))
+                if message.contains("invalid WireGuard public key base64")
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_wireguard_telemetry_parser_reads_handshake_and_transfer() -> Result<(), AgentError> {
+        let peer = WireguardPeer(vec![
+            WireguardPeerAttribute::PublicKey([0; 32]),
+            WireguardPeerAttribute::Endpoint(SocketAddr::from(([203, 0, 113, 10], 51_820))),
+            WireguardPeerAttribute::LastHandshake(netlink_packet_wireguard::WireguardTimeSpec {
+                seconds: 1_710_000_000,
+                nano_seconds: 123_000_000,
+            }),
+            WireguardPeerAttribute::RxBytes(120),
+            WireguardPeerAttribute::TxBytes(340),
+        ]);
+
+        let telemetry = wireguard_netlink_peer_telemetry(&peer)?;
+
+        assert_eq!(
+            telemetry,
+            WireGuardPeerTelemetry {
+                public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                endpoint: Some("203.0.113.10:51820".to_string()),
+                latest_handshake_at: DateTime::<Utc>::from_timestamp(1_710_000_000, 123_000_000,),
+                rx_bytes: 120,
+                tx_bytes: 340,
+            }
         );
         Ok(())
     }
