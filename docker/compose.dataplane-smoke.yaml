@@ -45,10 +45,8 @@ services:
   agent:
     network_mode: !reset null
     networks:
-      default:
-        interface_name: eth0
-      workload-a:
-        interface_name: eth1
+      - default
+      - workload-a
     command:
       - agent
       - --listen
@@ -108,10 +106,8 @@ services:
     entrypoint:
       - /usr/local/bin/iparsd
     networks:
-      default:
-        interface_name: eth0
-      workload-b:
-        interface_name: eth1
+      - default
+      - workload-b
     command:
       - agent
       - --listen
@@ -180,8 +176,7 @@ services:
       - --http-listen
       - 0.0.0.0:8080
     networks:
-      workload-a:
-        interface_name: eth0
+      - workload-a
     cap_add:
       - NET_ADMIN
     healthcheck:
@@ -204,8 +199,7 @@ services:
       - --http-listen
       - 0.0.0.0:8080
     networks:
-      workload-b:
-        interface_name: eth0
+      - workload-b
     cap_add:
       - NET_ADMIN
     healthcheck:
