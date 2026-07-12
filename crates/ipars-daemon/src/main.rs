@@ -13445,12 +13445,15 @@ fn validate_ebpf_packet_flow_transport_metadata(event: &PacketFlowEvent) -> anyh
         event.tcp_state,
         event.protocol
     );
-    let protocol_has_ports = matches!(
+    let protocol_may_have_ports = matches!(
         event.protocol,
-        PACKET_FLOW_PROTOCOL_TCP | PACKET_FLOW_PROTOCOL_UDP | PACKET_FLOW_PROTOCOL_SCTP
+        PACKET_FLOW_PROTOCOL_UNKNOWN
+            | PACKET_FLOW_PROTOCOL_TCP
+            | PACKET_FLOW_PROTOCOL_UDP
+            | PACKET_FLOW_PROTOCOL_SCTP
     );
     anyhow::ensure!(
-        protocol_has_ports || (event.source_port() == 0 && event.destination_port() == 0),
+        protocol_may_have_ports || (event.source_port() == 0 && event.destination_port() == 0),
         "unsupported eBPF packet-flow port metadata for protocol code {}",
         event.protocol
     );
@@ -19237,10 +19240,9 @@ mod tests {
 
         let mut unknown_protocol = event;
         unknown_protocol[2] = PACKET_FLOW_PROTOCOL_UNKNOWN;
-        unknown_protocol[8..10].copy_from_slice(&0_u16.to_be_bytes());
         let flow = parse_ebpf_ringbuf_packet_flow_event(&unknown_protocol)?;
         assert_eq!(flow.observation.protocol, None);
-        assert_eq!(flow.observation.destination_port, None);
+        assert_eq!(flow.observation.destination_port, Some(51820));
 
         let mut unsupported_protocol = event;
         unsupported_protocol[2] = 253;
@@ -19532,7 +19534,7 @@ mod tests {
         };
         assert!(error.chain().any(|cause| cause
             .to_string()
-            .contains("port metadata requires TCP, UDP, or SCTP protocol")));
+            .contains("port metadata is incompatible with the reported protocol")));
 
         let inconsistent_application_line =
             br#"{"destination":"100.64.0.13","protocol":"icmp","application":"postgres"}

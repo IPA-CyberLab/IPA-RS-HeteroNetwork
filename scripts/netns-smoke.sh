@@ -2,7 +2,14 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cargo_bin="${CARGO:-/home/coder/.cargo/bin/cargo}"
+cargo_bin="${CARGO:-}"
+if [[ -z "${cargo_bin}" ]]; then
+  cargo_bin="$(command -v cargo 2>/dev/null || true)"
+fi
+if [[ -z "${cargo_bin}" || ! -x "${cargo_bin}" ]]; then
+  echo "CARGO must point to an executable cargo binary" >&2
+  exit 1
+fi
 suffix="$$-$(date +%s%N)"
 probe_netns="ipars-smoke-probe-${suffix}"
 probe_netns_path="/var/run/netns/${probe_netns}"
@@ -11,6 +18,7 @@ agent_preflight_log="/tmp/ipars-netns-smoke-agent-preflight-${suffix}.log"
 agent_preflight_state="/tmp/ipars-netns-smoke-agent-${suffix}.json"
 agent_preflight_token="/tmp/ipars-netns-smoke-agent-${suffix}.join-token.json"
 iparsd_bin="${IPARS_NETNS_SMOKE_IPARSD_BIN:-}"
+ebpf_object_path="${IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH:-}"
 
 cleanup() {
   ip netns del "${probe_netns}" >/dev/null 2>&1 || true
@@ -152,11 +160,26 @@ run_agent_runtime_preflights() {
   trap - EXIT
 }
 
+run_ebpf_attach_smoke() {
+  if [[ -z "${ebpf_object_path}" ]]; then
+    echo "skipping eBPF attach smoke because IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH is unset"
+    return
+  fi
+  echo "running eBPF attach and ring-buffer event smoke"
+  env \
+    IPARS_RUN_EBPF_ATTACH_TESTS=1 \
+    IPARS_EBPF_OBJECT_PATH="${ebpf_object_path}" \
+    "$cargo_bin" test --locked -p ipars-daemon \
+      tests::ebpf_ringbuf_privileged_attach_reads_sendto_event -- \
+      --exact --nocapture
+}
+
 preflight_netns
 
 cd "$repo_root"
 prepare_iparsd
 run_agent_runtime_preflights
+run_ebpf_attach_smoke
 
 run_cargo_test route-netns IPARS_RUN_NETNS_TESTS \
   -p ipars-route-manager --test netns_route_backend

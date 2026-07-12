@@ -2367,15 +2367,18 @@ pub mod api {
                 return Err("packet-flow TCP state requires TCP protocol".to_string());
             }
 
-            let protocol_has_ports = matches!(
+            let protocol_may_have_ports = matches!(
                 self.protocol,
-                Some(TransportProtocol::Tcp | TransportProtocol::Udp | TransportProtocol::Sctp)
+                None | Some(
+                    TransportProtocol::Tcp | TransportProtocol::Udp | TransportProtocol::Sctp
+                )
             );
-            if !protocol_has_ports
+            if !protocol_may_have_ports
                 && (self.source_port.is_some() || self.destination_port.is_some())
             {
                 return Err(
-                    "packet-flow port metadata requires TCP, UDP, or SCTP protocol".to_string(),
+                    "packet-flow port metadata is incompatible with the reported protocol"
+                        .to_string(),
                 );
             }
 
@@ -27447,6 +27450,10 @@ mod tests {
         )?;
         sctp_with_port.validate_transport_metadata()?;
 
+        let unknown_protocol_with_port: api::AgentPacketFlowObservation =
+            serde_json::from_str(r#"{"destination_port":51820}"#)?;
+        unknown_protocol_with_port.validate_transport_metadata()?;
+
         let usable_source: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"source":"192.0.2.10"}"#)?;
         usable_source.validate_transport_metadata()?;
@@ -27501,7 +27508,7 @@ mod tests {
             Ok(()) => return Err("ICMP observation with port metadata should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
+        assert!(error.contains("port metadata is incompatible with the reported protocol"));
 
         let gre_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"gre","destination_port":47}"#)?;
@@ -27509,7 +27516,7 @@ mod tests {
             Ok(()) => return Err("GRE observation with port metadata should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
+        assert!(error.contains("port metadata is incompatible with the reported protocol"));
 
         let ah_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"ah","destination_port":51}"#)?;
@@ -27517,7 +27524,7 @@ mod tests {
             Ok(()) => return Err("AH observation with port metadata should be rejected".into()),
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
+        assert!(error.contains("port metadata is incompatible with the reported protocol"));
 
         let ip_tunnel_with_port: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"protocol":"ip_in_ip","destination_port":4}"#)?;
@@ -27527,7 +27534,7 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert!(error.contains("port metadata requires TCP, UDP, or SCTP protocol"));
+        assert!(error.contains("port metadata is incompatible with the reported protocol"));
 
         let application_without_protocol: api::AgentPacketFlowObservation =
             serde_json::from_str(r#"{"application":"postgres"}"#)?;
