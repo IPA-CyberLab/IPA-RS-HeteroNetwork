@@ -317,4 +317,4 @@ Privileged Linux hosts can also run:
 scripts/netns-smoke.sh
 ```
 
-That suite requires network namespace creation privileges and may require `wireguard-tools`, kernel WireGuard support, `iptables`, and forwarding sysctls.
+That suite requires network namespace creation privileges and runs the routed peer-quality UDP probe alongside route, WireGuard, hole-punch, and relay-fallback checks. It may require `wireguard-tools`, kernel WireGuard support, `iptables`, and forwarding sysctls.

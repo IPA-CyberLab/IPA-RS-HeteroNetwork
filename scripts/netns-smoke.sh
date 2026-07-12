@@ -75,6 +75,9 @@ cd "$repo_root"
 run_cargo_test route-netns IPARS_RUN_NETNS_TESTS \
   -p ipars-route-manager --test netns_route_backend
 
+run_cargo_test peer-probe-netns IPARS_RUN_PEER_PROBE_NETNS_TESTS \
+  -p ipars-agent --test netns_peer_probe
+
 if [[ "${IPARS_NETNS_SMOKE_SKIP_WIREGUARD:-0}" == "1" ]]; then
   echo "skipping WireGuard netns smoke because IPARS_NETNS_SMOKE_SKIP_WIREGUARD=1"
 elif command -v wg >/dev/null 2>&1; then

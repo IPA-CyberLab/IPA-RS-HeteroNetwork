@@ -57,6 +57,7 @@ Linux network namespace integration tests are gated because they create host net
 
 ```bash
 IPARS_RUN_NETNS_TESTS=1 cargo test -p ipars-route-manager --test netns_route_backend
+IPARS_RUN_PEER_PROBE_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_peer_probe
 IPARS_RUN_WG_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_wireguard_backend
 IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_hole_punch
 IPARS_RUN_RELAY_NETNS_TESTS=1 cargo test -p ipars-agent --test netns_relay_fallback
@@ -68,7 +69,7 @@ For a repeatable privileged namespace suite with preflight checks, run:
 scripts/netns-smoke.sh
 ```
 
-It verifies temporary namespace creation before running the route, Docker/Kubernetes route-intent, WireGuard when `wg` is installed, hole-punch, and relay-fallback namespace tests. The relay fallback case also sends an invalid relay credential before the valid opaque payload and fails if that frame reaches the peer forwarder. Set `IPARS_NETNS_SMOKE_SKIP_WIREGUARD=1` to skip the WireGuard case on hosts without kernel WireGuard support.
+It verifies temporary namespace creation before running the route, Docker/Kubernetes route-intent, peer-quality UDP probe, WireGuard when `wg` is installed, hole-punch, and relay-fallback namespace tests. The relay fallback case also sends an invalid relay credential before the valid opaque payload and fails if that frame reaches the peer forwarder. Set `IPARS_NETNS_SMOKE_SKIP_WIREGUARD=1` to skip the WireGuard case on hosts without kernel WireGuard support.
 
 The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace tests include a signal-registry generated `DIRECT_NAT_TRAVERSAL` plan executed by the UDP puncher across direct-routed namespaces, fixed-port and port-preserving one-sided public-peer SNAT, IP-only, fixed-port, and mixed port-preserving/fixed-port endpoint-independent two-sided SNAT topologies, plus an address/port-dependent SNAT non-traversal case where advertised STUN reflexive ports differ from peer-destination mappings. Always-on NAT classification and signal tests also cover address-dependent mapping from same-port, different-address STUN probes and keep that strategy on coordinated hole punching when filtering evidence permits it. They require `iptables` plus `sysctl` when the gated tests are enabled.
 
