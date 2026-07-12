@@ -3,7 +3,8 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ipars_types::api::{
-    HeartbeatRequest, NodeRequestSignature, RemoveNodeRequest, RotateWireGuardKeyRequest,
+    HeartbeatRequest, NodeRequestSignature, RemoveNodeRequest, RevokeTokenRequest,
+    RotateWireGuardKeyRequest,
 };
 use ipars_types::{ClusterId, JoinTokenClaims, NodeId, SignedJoinToken};
 use rand_core::OsRng;
@@ -108,6 +109,19 @@ impl IdentityKeyPair {
     pub fn sign_remove_node_request(
         &self,
         request: &RemoveNodeRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeRequestSignature, CryptoError> {
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at))?;
+        let signature = self.signing_key.sign(&payload);
+        Ok(NodeRequestSignature {
+            signed_at,
+            signature: encode_bytes(&signature.to_bytes()),
+        })
+    }
+
+    pub fn sign_token_revocation_request(
+        &self,
+        request: &RevokeTokenRequest,
         signed_at: DateTime<Utc>,
     ) -> Result<NodeRequestSignature, CryptoError> {
         let payload = serde_json::to_vec(&request.signature_payload(signed_at))?;
@@ -224,6 +238,26 @@ pub fn verify_remove_node_signature(
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
+pub fn verify_token_revocation_signature(
+    request: &RevokeTokenRequest,
+    issuer_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let issuer_signature = request
+        .issuer_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let key_bytes = decode_32(issuer_public_key_b64)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
+    let signature_bytes = STANDARD.decode(&issuer_signature.signature)?;
+    let signature = Signature::try_from(signature_bytes.as_slice())
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(&request.signature_payload(issuer_signature.signed_at))?;
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 pub fn validate_identity_public_key_b64(value: &str) -> Result<(), CryptoError> {
     let key_bytes = decode_32(value)?;
     VerifyingKey::from_bytes(&key_bytes)
@@ -267,7 +301,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use chrono::Duration;
-    use ipars_types::api::{HeartbeatRequest, RemoveNodeRequest, RotateWireGuardKeyRequest};
+    use ipars_types::api::{
+        HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
+    };
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, Role, Tag,
         TokenPolicy,
@@ -407,6 +443,28 @@ mod tests {
         request.node_id = NodeId::from_string("node-tampered");
         assert!(matches!(
             verify_remove_node_signature(&request, &key.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_token_revocation_request_round_trips() -> Result<(), CryptoError> {
+        let issuer = IdentityKeyPair::generate();
+        let now = Utc::now();
+        let mut request = RevokeTokenRequest {
+            cluster_id: ClusterId::new(),
+            nonce: "token-nonce".to_string(),
+            issuer: issuer.node_id(),
+            key_id: KeyId::from_string("root"),
+            issuer_signature: None,
+        };
+        request.issuer_signature = Some(issuer.sign_token_revocation_request(&request, now)?);
+
+        verify_token_revocation_signature(&request, &issuer.public_key_b64())?;
+        request.nonce = "tampered-nonce".to_string();
+        assert!(matches!(
+            verify_token_revocation_signature(&request, &issuer.public_key_b64()),
             Err(CryptoError::InvalidSignature)
         ));
         Ok(())

@@ -1145,6 +1145,15 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct RevokeTokenSignaturePayload {
+        pub cluster_id: ClusterId,
+        pub nonce: String,
+        pub issuer: NodeId,
+        pub key_id: KeyId,
+        pub signed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HeartbeatRequest {
         pub node_id: NodeId,
         pub health: NodeHealth,
@@ -1234,10 +1243,26 @@ pub mod api {
         pub peer_delta_available: bool,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct RevokeTokenRequest {
         pub cluster_id: ClusterId,
         pub nonce: String,
+        pub issuer: NodeId,
+        pub key_id: KeyId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub issuer_signature: Option<NodeRequestSignature>,
+    }
+
+    impl RevokeTokenRequest {
+        pub fn signature_payload(&self, signed_at: DateTime<Utc>) -> RevokeTokenSignaturePayload {
+            RevokeTokenSignaturePayload {
+                cluster_id: self.cluster_id.clone(),
+                nonce: self.nonce.clone(),
+                issuer: self.issuer.clone(),
+                key_id: self.key_id.clone(),
+                signed_at,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

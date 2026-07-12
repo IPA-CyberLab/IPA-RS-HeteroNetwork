@@ -401,6 +401,12 @@ struct TokenRevokeArgs {
     cluster_id: String,
     #[arg(long)]
     nonce: String,
+    #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
+    issuer_key_id: String,
+    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
+    issuer_private_key_b64: Option<String>,
+    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY_PATH")]
+    issuer_private_key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1943,6 +1949,7 @@ fn validate_literal_bootstrap_socket(parsed: &reqwest::Url, flag: &str) -> anyho
 enum MissingIssuerPath {
     GenerateEphemeral,
     GenerateAndWrite,
+    RequireExisting,
 }
 
 fn issuer_key_from_source(
@@ -1960,7 +1967,14 @@ fn issuer_key_from_source(
     if let Some(path) = private_key_path {
         return issuer_key_from_path(path, missing_path);
     }
-    Ok(IdentityKeyPair::generate())
+    match missing_path {
+        MissingIssuerPath::RequireExisting => anyhow::bail!(
+            "token revocation requires --issuer-private-key-b64 or --issuer-private-key-path"
+        ),
+        MissingIssuerPath::GenerateEphemeral | MissingIssuerPath::GenerateAndWrite => {
+            Ok(IdentityKeyPair::generate())
+        }
+    }
 }
 
 fn issuer_key_from_path(
@@ -1971,9 +1985,10 @@ fn issuer_key_from_path(
         Ok(value) => IdentityKeyPair::from_signing_key_b64(value.trim())
             .with_context(|| format!("failed to load issuer private key from {}", path.display())),
         Err(error) if is_not_found_error(&error) => match missing_path {
-            MissingIssuerPath::GenerateEphemeral => Err(error).with_context(|| {
-                format!("issuer private key path {} does not exist", path.display())
-            }),
+            MissingIssuerPath::GenerateEphemeral | MissingIssuerPath::RequireExisting => Err(error)
+                .with_context(|| {
+                    format!("issuer private key path {} does not exist", path.display())
+                }),
             MissingIssuerPath::GenerateAndWrite => {
                 let key = IdentityKeyPair::generate();
                 write_issuer_private_key(path, &key)?;
@@ -2090,12 +2105,7 @@ fn write_issuer_private_key(path: &Path, key: &IdentityKeyPair) -> anyhow::Resul
 }
 
 async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenResponse> {
-    validate_token_identifier(&args.cluster_id, "--cluster-id")?;
-    validate_token_identifier(&args.nonce, "--nonce")?;
-    let request = RevokeTokenRequest {
-        cluster_id: ClusterId::from_string(args.cluster_id),
-        nonce: args.nonce,
-    };
+    let request = token_revocation_request(&args, Utc::now())?;
     let url = control_plane_token_revoke_url(&args.control_plane_url)?;
     let response = reqwest::Client::new()
         .post(&url)
@@ -2106,6 +2116,33 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
         .error_for_status()
         .context("control plane rejected token revoke request")?;
     read_bounded_json_response(response, "token revoke").await
+}
+
+fn token_revocation_request(
+    args: &TokenRevokeArgs,
+    signed_at: chrono::DateTime<Utc>,
+) -> anyhow::Result<RevokeTokenRequest> {
+    validate_token_identifier(&args.cluster_id, "--cluster-id")?;
+    validate_token_identifier(&args.nonce, "--nonce")?;
+    validate_token_identifier(&args.issuer_key_id, "--issuer-key-id")?;
+    let issuer = issuer_key_from_source(
+        args.issuer_private_key_b64.as_deref(),
+        args.issuer_private_key_path.as_deref(),
+        MissingIssuerPath::RequireExisting,
+    )?;
+    let mut request = RevokeTokenRequest {
+        cluster_id: ClusterId::from_string(args.cluster_id.clone()),
+        nonce: args.nonce.clone(),
+        issuer: issuer.node_id(),
+        key_id: KeyId::from_string(args.issuer_key_id.clone()),
+        issuer_signature: None,
+    };
+    request.issuer_signature = Some(
+        issuer
+            .sign_token_revocation_request(&request, signed_at)
+            .context("failed to sign token revocation request")?,
+    );
+    Ok(request)
 }
 
 async fn agent_status_with_bearer(
@@ -9362,6 +9399,47 @@ mod tests {
         };
         assert!(error.to_string().contains("control-plane URL"));
         assert!(error.to_string().contains("usable non-unspecified"));
+        Ok(())
+    }
+
+    #[test]
+    fn token_revocation_request_requires_and_uses_existing_issuer_key() -> anyhow::Result<()> {
+        let issuer = IdentityKeyPair::generate();
+        let signed_at = Utc::now();
+        let args = TokenRevokeArgs {
+            control_plane_url: "http://127.0.0.1:8443".to_string(),
+            cluster_id: "cluster-a".to_string(),
+            nonce: "token-nonce".to_string(),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: Some(issuer.signing_key_b64()),
+            issuer_private_key_path: None,
+        };
+
+        let request = token_revocation_request(&args, signed_at)?;
+        assert_eq!(request.cluster_id, ClusterId::from_string("cluster-a"));
+        assert_eq!(request.nonce, "token-nonce");
+        assert_eq!(request.issuer, issuer.node_id());
+        assert_eq!(request.key_id, KeyId::from_string("root"));
+        assert_eq!(
+            request
+                .issuer_signature
+                .as_ref()
+                .map(|signature| signature.signed_at),
+            Some(signed_at)
+        );
+        ipars_crypto::verify_token_revocation_signature(&request, &issuer.public_key_b64())?;
+
+        let missing_key = TokenRevokeArgs {
+            issuer_private_key_b64: None,
+            ..args
+        };
+        let error = match token_revocation_request(&missing_key, signed_at) {
+            Ok(_) => anyhow::bail!("unsigned token revocation request should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("requires --issuer-private-key-b64 or --issuer-private-key-path"));
         Ok(())
     }
 

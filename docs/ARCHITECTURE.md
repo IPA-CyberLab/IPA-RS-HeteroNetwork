@@ -238,6 +238,8 @@ Initial control-plane HTTP routes:
 - `GET /v1/paths/{node_id}`
 - `POST /v1/tokens/revoke`
 
+Token revocation is an authenticated issuer operation. The request carries the cluster ID, token nonce, issuer node/key IDs, and a bounded-fresh timestamp under an Ed25519 signature; the control plane verifies it against the configured trusted issuer key ring before touching the durable token ledger.
+
 Initial signal HTTP routes:
 
 - `GET /healthz`
@@ -289,6 +291,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 ## Security Model
 
 - Join tokens are signed, scoped, expiring, and revocable through the token ledger by cluster ID/nonce.
+- Token revocation requires a fresh signature from a configured trusted issuer key and rejects unsigned or tampered ledger mutations.
 - Token policy constrains relay permission, route advertisements contained within allowed CIDRs, allowed tags, and max-use admission.
 - Identity keys authenticate nodes to the control plane.
 - WireGuard keys provide data-plane confidentiality.

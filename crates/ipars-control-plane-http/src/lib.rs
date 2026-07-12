@@ -175,7 +175,7 @@ where
 {
     let record = state
         .join_service
-        .revoke_token(&request.cluster_id, &request.nonce, Utc::now())
+        .revoke_token(&request, Utc::now())
         .await?;
     let status = record.status(Utc::now());
     Ok(Json(RevokeTokenResponse { record, status }))
@@ -827,6 +827,28 @@ mod tests {
         request
     }
 
+    fn signed_token_revocation(
+        issuer: &IdentityKeyPair,
+        cluster_id: ClusterId,
+        nonce: String,
+        key_id: KeyId,
+    ) -> RevokeTokenRequest {
+        let mut request = RevokeTokenRequest {
+            cluster_id,
+            nonce,
+            issuer: issuer.node_id(),
+            key_id,
+            issuer_signature: None,
+        };
+        request.issuer_signature = Some(
+            match issuer.sign_token_revocation_request(&request, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test issuer should sign token revocation: {error}"),
+            },
+        );
+        request
+    }
+
     #[tokio::test]
     async fn http_heartbeat_rejects_direct_path_candidate_kind_mismatch(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -963,7 +985,11 @@ mod tests {
         assert_eq!(policy.cluster_policy.acl_rules[0].id, "allow-edge");
 
         let request_body = JoinNodeRequest {
-            token: issuer.sign_join_token(claims(cluster_id.clone(), issuer.node_id(), key_id))?,
+            token: issuer.sign_join_token(claims(
+                cluster_id.clone(),
+                issuer.node_id(),
+                key_id.clone(),
+            ))?,
             registration: registration("node-http"),
         };
 
@@ -1008,6 +1034,13 @@ mod tests {
             next_wireguard_public_key
         );
 
+        let unsigned_revocation = RevokeTokenRequest {
+            cluster_id: request_body.token.claims.cluster_id.clone(),
+            nonce: request_body.token.claims.nonce.clone(),
+            issuer: issuer.node_id(),
+            key_id: key_id.clone(),
+            issuer_signature: None,
+        };
         let response = app
             .clone()
             .oneshot(
@@ -1015,10 +1048,25 @@ mod tests {
                     .method("POST")
                     .uri("/v1/tokens/revoke")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&RevokeTokenRequest {
-                        cluster_id: request_body.token.claims.cluster_id.clone(),
-                        nonce: request_body.token.claims.nonce.clone(),
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(&unsigned_revocation)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let revocation = signed_token_revocation(
+            &issuer,
+            request_body.token.claims.cluster_id.clone(),
+            request_body.token.claims.nonce.clone(),
+            key_id,
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens/revoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&revocation)?))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);

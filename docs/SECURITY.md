@@ -27,10 +27,10 @@ Implemented controls:
 Revoke a token with:
 
 ```bash
-ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce>
+ipars token revoke --control-plane-url https://203.0.113.10:8443 --cluster-id <cluster-id> --nonce <token-nonce> --issuer-private-key-path ./issuer.key --issuer-key-id root
 ```
 
-Revocation blocks new joins. Existing data-plane sessions continue until policy, peer-map, route, or key changes are applied.
+The CLI signs the cluster ID, nonce, issuer node/key IDs, and current timestamp with the existing issuer private key. The control plane rejects missing, malformed, tampered, untrusted-key, wrong-cluster, or stale signatures before changing the token ledger. Any trusted issuer key can perform cluster-level revocation, which keeps issuer rotation overlap usable. Revocation blocks new joins; existing data-plane sessions continue until policy, peer-map, route, or key changes are applied.
 
 ## Key Rotation
 

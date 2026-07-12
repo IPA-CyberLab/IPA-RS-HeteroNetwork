@@ -20,6 +20,19 @@ ipars init \
 
 With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and `C` locale rather than the operator's full environment. The bootstrap state directory and `logs/` directory are made owner-only, and service log files must be regular, non-symlink, non-hardlinked owner-only files. Without `--spawn-daemons`, run the emitted `iparsd control-plane`, `iparsd signal`, `iparsd stun`, and `iparsd relay` commands manually or under systemd.
 
+Revoke a join token with the same trusted issuer key family used to mint it:
+
+```bash
+ipars token revoke \
+  --control-plane-url https://203.0.113.10:8443 \
+  --cluster-id <cluster-id> \
+  --nonce <token-nonce> \
+  --issuer-private-key-path ./issuer.key \
+  --issuer-key-id root
+```
+
+The control plane accepts only fresh Ed25519-signed revocations from its configured issuer key ring. Keep overlapping old/new issuer public keys configured until tokens from the old key no longer need revocation.
+
 ## Join Nodes
 
 Use file-backed tokens for agents:

@@ -4,6 +4,7 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Implemented In This Baseline
 
+- Control-plane token revocation now requires a bounded-fresh Ed25519 signature over cluster ID, nonce, issuer node/key IDs, and timestamp from a configured trusted issuer key. The CLI refuses to build an unsigned request, loads the existing owner-restricted issuer key source, and HTTP/service tests reject missing, stale, untrusted, wrong-cluster, and tampered revocations before ledger mutation.
 - Agent management HTTP now defaults to `127.0.0.1:9780`, rejects non-loopback startup without a validated 32-512 byte Bearer token, protects `/metrics` and every `/v1/*` read or mutation with constant-time credential comparison, and leaves only `/healthz` public for orchestration probes. The CLI has global inline/file-backed Agent credentials, while Docker Compose and Helm use management secrets distinct from signed join-token material.
 - The bundled Compose agent mounts `docker/agent-api.token` separately from `docker/join.token`, and its smoke coverage verifies unauthenticated Agent API rejection before exercising authenticated status, metrics, activity, and path flows.
 - The Helm DaemonSet injects the Agent API credential through a configurable `agent.apiBearerTokenSecretKey`, validates the key shape, rejects reuse of the join-token key, and keeps unauthenticated health probes compatible with the protected API.

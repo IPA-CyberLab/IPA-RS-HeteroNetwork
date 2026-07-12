@@ -9,12 +9,13 @@ use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
     verify_heartbeat_request_signature, verify_join_token, verify_remove_node_signature,
-    verify_wireguard_key_rotation_signature, CryptoError,
+    verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
     PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
-    RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
@@ -551,12 +552,41 @@ where
 
     pub async fn revoke_token(
         &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
+        request: &RevokeTokenRequest,
         revoked_at: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        if request.cluster_id != self.plane.config.cluster_id {
+            return Err(ControlPlaneError::TokenVerification(format!(
+                "token revocation cluster mismatch: expected {}, got {}",
+                self.plane.config.cluster_id, request.cluster_id
+            )));
+        }
+        let issuer_public_key = self
+            .issuer_keys
+            .get(&request.issuer, &request.key_id)
+            .ok_or_else(|| ControlPlaneError::IssuerKeyNotFound {
+                issuer: request.issuer.clone(),
+                key_id: request.key_id.clone(),
+            })?;
+        let signature = request.issuer_signature.as_ref().ok_or_else(|| {
+            ControlPlaneError::TokenVerification(
+                "token revocation issuer signature is required".to_string(),
+            )
+        })?;
+        verify_token_revocation_signature(request, issuer_public_key)?;
+        if !timestamp_within_skew(
+            signature.signed_at,
+            revoked_at,
+            self.plane.config.heartbeat_signature_max_age,
+        ) {
+            return Err(ControlPlaneError::TokenVerification(format!(
+                "token revocation signed_at {} is outside the allowed {}s window",
+                signature.signed_at,
+                self.plane.config.heartbeat_signature_max_age.as_secs()
+            )));
+        }
         self.admission
-            .revoke_token(cluster_id, nonce, revoked_at)
+            .revoke_token(&request.cluster_id, &request.nonce, revoked_at)
             .await
     }
 
@@ -2317,7 +2347,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
-        HeartbeatRequest, RegisterNodeRequest, RemoveNodeRequest, RotateWireGuardKeyRequest,
+        HeartbeatRequest, RegisterNodeRequest, RemoveNodeRequest, RevokeTokenRequest,
+        RotateWireGuardKeyRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
@@ -2682,6 +2713,24 @@ mod tests {
         let mut key_ring = IssuerKeyRing::default();
         key_ring.insert(issuer.node_id(), key_id, issuer.public_key_b64());
         Ok(ControlPlaneJoinService::new(plane, ledger, key_ring))
+    }
+
+    fn signed_token_revocation(
+        issuer: &IdentityKeyPair,
+        cluster_id: ClusterId,
+        nonce: &str,
+        key_id: KeyId,
+        signed_at: chrono::DateTime<Utc>,
+    ) -> Result<RevokeTokenRequest, Box<dyn std::error::Error>> {
+        let mut request = RevokeTokenRequest {
+            cluster_id,
+            nonce: nonce.to_string(),
+            issuer: issuer.node_id(),
+            key_id,
+            issuer_signature: None,
+        };
+        request.issuer_signature = Some(issuer.sign_token_revocation_request(&request, signed_at)?);
+        Ok(request)
     }
 
     #[tokio::test]
@@ -5926,6 +5975,89 @@ mod tests {
 
         assert_eq!(old_response.node.node_id, node_id("node-old"));
         assert_eq!(next_response.node.node_id, node_id("node-next"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_service_requires_fresh_trusted_issuer_signature_for_token_revocation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let nonce = "signed-revocation";
+        let now = Utc::now();
+        let token = issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            issuer.node_id(),
+            key_id.clone(),
+            nonce,
+        ))?;
+        let service = join_service(cluster_id.clone(), &issuer, key_id.clone())?;
+        service
+            .join(token, registration_request("node-revocation"), now)
+            .await?;
+
+        let unsigned = RevokeTokenRequest {
+            cluster_id: cluster_id.clone(),
+            nonce: nonce.to_string(),
+            issuer: issuer.node_id(),
+            key_id: key_id.clone(),
+            issuer_signature: None,
+        };
+        assert!(matches!(
+            service.revoke_token(&unsigned, now).await,
+            Err(ControlPlaneError::TokenVerification(_))
+        ));
+
+        let wrong_cluster =
+            signed_token_revocation(&issuer, ClusterId::new(), nonce, key_id.clone(), now)?;
+        let error = match service.revoke_token(&wrong_cluster, now).await {
+            Ok(_) => return Err("wrong-cluster token revocation was accepted".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ControlPlaneError::TokenVerification(_)));
+        assert!(error.to_string().contains("cluster mismatch"));
+
+        let untrusted_issuer = IdentityKeyPair::generate();
+        let untrusted = signed_token_revocation(
+            &untrusted_issuer,
+            cluster_id.clone(),
+            nonce,
+            key_id.clone(),
+            now,
+        )?;
+        assert!(matches!(
+            service.revoke_token(&untrusted, now).await,
+            Err(ControlPlaneError::IssuerKeyNotFound { .. })
+        ));
+
+        let stale = signed_token_revocation(
+            &issuer,
+            cluster_id.clone(),
+            nonce,
+            key_id.clone(),
+            now - Duration::seconds(301),
+        )?;
+        let error = match service.revoke_token(&stale, now).await {
+            Ok(_) => return Err("stale token revocation signature was accepted".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ControlPlaneError::TokenVerification(_)));
+        assert!(error
+            .to_string()
+            .contains("outside the allowed 300s window"));
+
+        let mut tampered =
+            signed_token_revocation(&issuer, cluster_id.clone(), nonce, key_id.clone(), now)?;
+        tampered.nonce = "tampered-revocation".to_string();
+        assert!(matches!(
+            service.revoke_token(&tampered, now).await,
+            Err(ControlPlaneError::TokenVerification(_))
+        ));
+
+        let request = signed_token_revocation(&issuer, cluster_id, nonce, key_id, now)?;
+        let revoked = service.revoke_token(&request, now).await?;
+        assert_eq!(revoked.status(now), TokenStatus::Revoked);
         Ok(())
     }
 
