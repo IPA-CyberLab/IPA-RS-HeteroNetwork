@@ -71,6 +71,9 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
 const DEFAULT_DOCKER_HOST_INTERFACE: &str = "docker0";
 const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
@@ -616,6 +619,16 @@ struct DockerInstallArgs {
     #[arg(long = "docker-route-interval-seconds", default_value_t = 60)]
     docker_route_interval_seconds: u64,
     #[arg(
+        long = "agent-http-connect-timeout-seconds",
+        default_value_t = DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS
+    )]
+    agent_http_connect_timeout_seconds: u64,
+    #[arg(
+        long = "agent-http-request-timeout-seconds",
+        default_value_t = DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS
+    )]
+    agent_http_request_timeout_seconds: u64,
+    #[arg(
         long = "agent-runtime-backend",
         default_value = "linux-command",
         value_parser = parse_agent_runtime_backend
@@ -829,6 +842,16 @@ struct K8sInstallArgs {
     disable_agent_peer_map: bool,
     #[arg(long = "agent-peer-map-poll-interval-seconds", default_value_t = 30)]
     agent_peer_map_poll_interval_seconds: u64,
+    #[arg(
+        long = "agent-http-connect-timeout-seconds",
+        default_value_t = DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS
+    )]
+    agent_http_connect_timeout_seconds: u64,
+    #[arg(
+        long = "agent-http-request-timeout-seconds",
+        default_value_t = DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS
+    )]
+    agent_http_request_timeout_seconds: u64,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
@@ -5434,6 +5457,10 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         args.docker_route_interval_seconds,
         "--docker-route-interval-seconds",
     )?;
+    validate_agent_http_timeout_settings(
+        args.agent_http_connect_timeout_seconds,
+        args.agent_http_request_timeout_seconds,
+    )?;
     validate_docker_userspace_wireguard_args(args)?;
     validate_docker_relay_advertisement(args)?;
     validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
@@ -5794,6 +5821,27 @@ fn validate_bounded_docker_seconds(value: u64, label: &str, max: u64) -> anyhow:
     Ok(())
 }
 
+fn validate_agent_http_timeout_settings(
+    connect_timeout_seconds: u64,
+    request_timeout_seconds: u64,
+) -> anyhow::Result<()> {
+    validate_bounded_docker_seconds(
+        connect_timeout_seconds,
+        "--agent-http-connect-timeout-seconds",
+        MAX_AGENT_HTTP_TIMEOUT_SECONDS,
+    )?;
+    validate_bounded_docker_seconds(
+        request_timeout_seconds,
+        "--agent-http-request-timeout-seconds",
+        MAX_AGENT_HTTP_TIMEOUT_SECONDS,
+    )?;
+    anyhow::ensure!(
+        connect_timeout_seconds <= request_timeout_seconds,
+        "--agent-http-connect-timeout-seconds must not exceed --agent-http-request-timeout-seconds"
+    );
+    Ok(())
+}
+
 fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{label} must be greater than zero");
@@ -5911,6 +5959,14 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "IPARS_AGENT_RUNTIME_BACKEND".to_string(),
             value: agent_runtime_backend.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
+            value: args.agent_http_connect_timeout_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
+            value: args.agent_http_request_timeout_seconds.to_string(),
         },
         InstallEnvironment {
             name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
@@ -6788,6 +6844,14 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     command.push_str(&format!(
         " --set agent.peerMap.pollIntervalSeconds={}",
         args.agent_peer_map_poll_interval_seconds
+    ));
+    command.push_str(&format!(
+        " --set agent.http.connectTimeoutSeconds={}",
+        args.agent_http_connect_timeout_seconds
+    ));
+    command.push_str(&format!(
+        " --set agent.http.requestTimeoutSeconds={}",
+        args.agent_http_request_timeout_seconds
     ));
     if args.disable_agent_host_network {
         command.push_str(" --set agent.hostNetwork=false");
@@ -8246,6 +8310,10 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     if args.agent_peer_map_poll_interval_seconds == 0 {
         anyhow::bail!("--agent-peer-map-poll-interval-seconds must be greater than zero");
     }
+    validate_agent_http_timeout_settings(
+        args.agent_http_connect_timeout_seconds,
+        args.agent_http_request_timeout_seconds,
+    )?;
     for label in &args.agent_pod_labels {
         validate_kubernetes_label_key(&label.key).map_err(anyhow::Error::msg)?;
         validate_kubernetes_label_value(&label.value).map_err(anyhow::Error::msg)?;
@@ -11577,6 +11645,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11620,6 +11690,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11799,6 +11871,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11861,6 +11935,44 @@ fi
         assert!(error
             .to_string()
             .contains("--docker-route-interval-seconds must be greater than zero"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_and_validates_agent_http_timeouts() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            agent_http_connect_timeout_seconds: 7,
+            agent_http_request_timeout_seconds: 45,
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS"),
+            Some("7")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS"),
+            Some("45")
+        );
+
+        for (connect, request, expected) in [
+            (0, 30, "--agent-http-connect-timeout-seconds must be greater than zero"),
+            (5, 0, "--agent-http-request-timeout-seconds must be greater than zero"),
+            (3_601, 3_601, "--agent-http-connect-timeout-seconds must not exceed 3600"),
+            (31, 30, "--agent-http-connect-timeout-seconds must not exceed --agent-http-request-timeout-seconds"),
+        ] {
+            let error = match docker_install_plan(DockerInstallArgs {
+                agent_http_connect_timeout_seconds: connect,
+                agent_http_request_timeout_seconds: request,
+                ..docker_install_test_args()
+            }) {
+                Ok(_) => anyhow::bail!("invalid Agent HTTP timeout settings should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error:#}`"
+            );
+        }
         Ok(())
     }
 
@@ -12205,6 +12317,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12496,6 +12610,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12586,6 +12702,8 @@ fi
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12632,6 +12750,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12678,6 +12798,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12736,6 +12858,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12800,6 +12924,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12901,6 +13027,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -12947,6 +13075,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -12993,6 +13123,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13041,6 +13173,8 @@ fi
             docker_container_cidrs: Vec::new(),
             disable_docker_expose_host_routes: false,
             docker_route_interval_seconds: 60,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13372,6 +13506,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -15212,6 +15348,16 @@ fi
                 "9223372036854775807",
             ),
             (
+                "agent.http.connectTimeoutSeconds",
+                "$agentHttpConnectTimeoutSeconds",
+                "3600",
+            ),
+            (
+                "agent.http.requestTimeoutSeconds",
+                "$agentHttpRequestTimeoutSeconds",
+                "3600",
+            ),
+            (
                 "agent.relayForwarder.maxSessions",
                 "$agentRelayForwarderMaxSessions",
                 "9223372036854775807",
@@ -15257,6 +15403,9 @@ fi
                 "{path} should validate as a bounded integer before int conversion"
             );
         }
+        assert!(daemonset.contains(
+            "agent.http.connectTimeoutSeconds must not exceed agent.http.requestTimeoutSeconds"
+        ));
         for probe_field in [
             "initialDelaySeconds",
             "periodSeconds",
@@ -15678,6 +15827,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: false,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -15846,6 +15997,39 @@ fi
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_and_validates_agent_http_timeouts() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_http_connect_timeout_seconds = 7;
+        args.agent_http_request_timeout_seconds = 45;
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.http.connectTimeoutSeconds=7"));
+        assert!(helm.contains("--set agent.http.requestTimeoutSeconds=45"));
+
+        let mut mismatch = base_k8s_install_args();
+        mismatch.agent_http_connect_timeout_seconds = 31;
+        mismatch.agent_http_request_timeout_seconds = 30;
+        let error = match k8s_install_plan(mismatch) {
+            Ok(_) => anyhow::bail!("Agent HTTP timeout ordering should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--agent-http-connect-timeout-seconds must not exceed --agent-http-request-timeout-seconds"
+        ));
+
+        let mut oversized = base_k8s_install_args();
+        oversized.agent_http_request_timeout_seconds = 3_601;
+        let error = match k8s_install_plan(oversized) {
+            Ok(_) => anyhow::bail!("oversized Agent HTTP request timeout should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--agent-http-request-timeout-seconds must not exceed 3600"));
         Ok(())
     }
 
@@ -17097,6 +17281,10 @@ fi
             "--disable-docker-expose-host-routes",
             "--docker-route-interval-seconds",
             "15",
+            "--agent-http-connect-timeout-seconds",
+            "7",
+            "--agent-http-request-timeout-seconds",
+            "45",
             "--route-backend",
             "kernel-netlink",
             "--userspace-wireguard-command",
@@ -17129,6 +17317,8 @@ fi
             assert!(args.docker_container_cidrs.is_empty());
             assert!(args.disable_docker_expose_host_routes);
             assert_eq!(args.docker_route_interval_seconds, 15);
+            assert_eq!(args.agent_http_connect_timeout_seconds, 7);
+            assert_eq!(args.agent_http_request_timeout_seconds, 45);
             assert_eq!(args.route_backend, "kernel-netlink");
             assert_eq!(
                 args.userspace_wireguard_command.as_deref(),
@@ -17217,6 +17407,10 @@ fi
             "kernel-netlink",
             "--disable-agent-peer-map",
             "--agent-peer-map-poll-interval-seconds",
+            "45",
+            "--agent-http-connect-timeout-seconds",
+            "7",
+            "--agent-http-request-timeout-seconds",
             "45",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
@@ -17452,6 +17646,8 @@ fi
             assert_eq!(args.route_backend, "kernel-netlink");
             assert!(args.disable_agent_peer_map);
             assert_eq!(args.agent_peer_map_poll_interval_seconds, 45);
+            assert_eq!(args.agent_http_connect_timeout_seconds, 7);
+            assert_eq!(args.agent_http_request_timeout_seconds, 45);
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
@@ -17777,6 +17973,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -17950,6 +18148,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -19473,6 +19673,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -19633,6 +19835,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -19927,6 +20131,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -20092,6 +20298,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -20252,6 +20460,8 @@ fi
             route_backend: "command".to_string(),
             disable_agent_peer_map: false,
             agent_peer_map_poll_interval_seconds: 30,
+            agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
+            agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,

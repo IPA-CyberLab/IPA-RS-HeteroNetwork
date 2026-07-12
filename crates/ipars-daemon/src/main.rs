@@ -152,6 +152,9 @@ const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
@@ -535,6 +538,18 @@ struct AgentArgs {
     control_plane_url: Option<String>,
     #[arg(long, env = "IPARS_AGENT_SIGNAL_URL")]
     signal_url: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS",
+        default_value_t = DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS
+    )]
+    http_connect_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS",
+        default_value_t = DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS
+    )]
+    http_request_timeout_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_JOIN_TOKEN",
@@ -1386,6 +1401,20 @@ fn preflight_agent_runtime_with_path_and_checks(
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_agent_api_auth_config(args)?;
+    validate_bounded_u64(
+        args.http_connect_timeout_seconds,
+        "--http-connect-timeout-seconds",
+        MAX_AGENT_HTTP_TIMEOUT_SECONDS,
+    )?;
+    validate_bounded_u64(
+        args.http_request_timeout_seconds,
+        "--http-request-timeout-seconds",
+        MAX_AGENT_HTTP_TIMEOUT_SECONDS,
+    )?;
+    anyhow::ensure!(
+        args.http_connect_timeout_seconds <= args.http_request_timeout_seconds,
+        "--http-connect-timeout-seconds must not exceed --http-request-timeout-seconds"
+    );
     validate_linux_interface_name(&args.wireguard_interface)?;
     if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
         anyhow::ensure!(
@@ -6399,6 +6428,32 @@ fn chrono_duration_seconds(value: u64, name: &str) -> anyhow::Result<chrono::Dur
     Ok(chrono::Duration::seconds(seconds))
 }
 
+fn agent_http_connect_timeout(args: &AgentArgs) -> Duration {
+    Duration::from_secs(args.http_connect_timeout_seconds)
+}
+
+fn agent_http_request_timeout(args: &AgentArgs) -> Duration {
+    Duration::from_secs(args.http_request_timeout_seconds)
+}
+
+fn build_agent_http_client(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .context("failed to build bounded agent HTTP client")
+}
+
+fn agent_http_client(args: &AgentArgs) -> anyhow::Result<reqwest::Client> {
+    build_agent_http_client(
+        agent_http_connect_timeout(args),
+        agent_http_request_timeout(args),
+    )
+}
+
 async fn run_agent(
     args: AgentArgs,
     otel_metrics_enabled: bool,
@@ -6407,6 +6462,7 @@ async fn run_agent(
     validate_agent_runtime_config(&args)?;
     let api_bearer_token = agent_api_bearer_token(&args)?;
     let relay_admission_bearer_token = agent_relay_admission_bearer_token(&args)?;
+    let http_client = agent_http_client(&args)?;
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
@@ -6442,6 +6498,7 @@ async fn run_agent(
             .await
             .context("failed to build agent requested routes")?;
         let registration = register_agent(
+            &http_client,
             runtime.as_ref(),
             token,
             args.control_plane_url.as_deref(),
@@ -6498,6 +6555,7 @@ async fn run_agent(
             heartbeat_route_reporter(&args, runtime.state().node_id.clone());
         background_tasks.push(start_heartbeat_reporting(
             runtime.clone(),
+            http_client.clone(),
             runtime
                 .state()
                 .identity_key_pair()
@@ -6645,6 +6703,7 @@ async fn run_agent(
         if let Some(node) = registered_node.clone().filter(|_| !signal_bases.is_empty()) {
             background_tasks.push(start_signal_registration(
                 runtime.clone(),
+                http_client.clone(),
                 runtime
                     .state()
                     .identity_key_pair()
@@ -6663,6 +6722,7 @@ async fn run_agent(
         if !control_plane_bases.is_empty() {
             background_tasks.push(start_signal_path_negotiation(
                 runtime.clone(),
+                http_client.clone(),
                 control_plane_bases.clone(),
                 signal_bases,
                 hole_puncher,
@@ -6679,7 +6739,8 @@ async fn run_agent(
     }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
     let mut http_state =
-        AgentHttpState::with_wireguard_key_rotation(runtime.clone(), store, control_plane_bases);
+        AgentHttpState::with_wireguard_key_rotation(runtime.clone(), store, control_plane_bases)
+            .with_control_plane_http_client(http_client, agent_http_request_timeout(&args));
     if let Some(token) = api_bearer_token {
         http_state = http_state.require_api_bearer_token(token);
     }
@@ -7549,12 +7610,7 @@ async fn start_peer_map_sync(
                 DryRunLinuxRouteManager,
             );
             let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
-            Ok(start_peer_map_sync_with_sink(
-                args,
-                runtime,
-                control_plane_urls,
-                applier,
-            ))
+            start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
         }
     }
 }
@@ -7635,6 +7691,8 @@ impl DockerApiNetworkDiscovery {
         let socket = docker_api_socket_path(args)?;
         let client = reqwest::Client::builder()
             .unix_socket(socket)
+            .connect_timeout(agent_http_connect_timeout(args))
+            .timeout(agent_http_request_timeout(args))
             .build()
             .context("failed to build Docker API client")?;
         Ok(Self {
@@ -8480,7 +8538,10 @@ impl KubernetesApiRouteDiscovery {
             .kubernetes_ca_cert_path
             .clone()
             .or_else(default_kubernetes_service_account_ca_cert);
-        let mut client = reqwest::Client::builder().default_headers(headers);
+        let mut client = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(agent_http_connect_timeout(args))
+            .timeout(agent_http_request_timeout(args));
         if let Some(ca_cert_path) = ca_cert_path.as_deref() {
             let ca = read_kubernetes_ca_certificate(ca_cert_path)?;
             client = client.add_root_certificate(
@@ -9092,12 +9153,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with Linux command runtime backend"
     );
-    Ok(start_peer_map_sync_with_sink(
-        args,
-        runtime,
-        control_plane_urls,
-        applier,
-    ))
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
 }
 
 async fn start_peer_map_sync_with_kernel_wireguard<R>(
@@ -9131,12 +9187,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with kernel WireGuard netlink backend"
     );
-    Ok(start_peer_map_sync_with_sink(
-        args,
-        runtime,
-        control_plane_urls,
-        applier,
-    ))
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
 }
 
 async fn start_peer_map_sync_with_command_wireguard_netlink_routes<W>(
@@ -9170,12 +9221,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with command WireGuard and kernel route netlink backends"
     );
-    Ok(start_peer_map_sync_with_sink(
-        args,
-        runtime,
-        control_plane_urls,
-        applier,
-    ))
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
 }
 
 async fn start_peer_map_sync_with_userspace_wireguard<W, R>(
@@ -9210,12 +9256,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with userspace WireGuard command backend"
     );
-    Ok(start_peer_map_sync_with_sink(
-        args,
-        runtime,
-        control_plane_urls,
-        applier,
-    ))
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
 }
 
 async fn start_peer_map_sync_with_kernel_backends(
@@ -9245,12 +9286,7 @@ async fn start_peer_map_sync_with_kernel_backends(
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with kernel WireGuard and route netlink backends"
     );
-    Ok(start_peer_map_sync_with_sink(
-        args,
-        runtime,
-        control_plane_urls,
-        applier,
-    ))
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
 }
 
 fn kernel_wireguard_backend(
@@ -9315,20 +9351,24 @@ fn start_peer_map_sync_with_sink<A>(
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
     sink: A,
-) -> tokio::task::JoinHandle<()>
+) -> anyhow::Result<tokio::task::JoinHandle<()>>
 where
     A: PeerMapSink + 'static,
 {
     let sync = PeerMapSync::new(
         runtime.state().node_id.clone(),
-        HttpPeerMapSource::new(control_plane_urls, runtime.state().clone()),
+        HttpPeerMapSource::new(
+            control_plane_urls,
+            runtime.state().clone(),
+            agent_http_client(args)?,
+        ),
         sink,
     );
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds);
     let interface = args.wireguard_interface.clone();
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         run_peer_map_sync_loop(sync, interval, interface).await;
-    })
+    }))
 }
 
 fn relay_forwarder_supervisor(
@@ -9792,6 +9832,7 @@ impl RelayForwarderTask {
 }
 
 async fn register_agent(
+    client: &reqwest::Client,
     runtime: &AgentRuntime,
     token: &SignedJoinToken,
     control_plane_url: Option<&str>,
@@ -9812,7 +9853,6 @@ async fn register_agent(
         },
     };
 
-    let client = reqwest::Client::new();
     let mut failures = Vec::new();
     for control_plane_url in control_plane_urls {
         let join_url = control_plane_join_url_from_base(&control_plane_url);
@@ -9855,6 +9895,7 @@ async fn register_agent(
 
 fn start_heartbeat_reporting(
     runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
     identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
@@ -9864,6 +9905,7 @@ fn start_heartbeat_reporting(
     tokio::spawn(async move {
         run_heartbeat_loop(
             runtime,
+            client,
             identity,
             control_plane_urls,
             interval,
@@ -9876,13 +9918,13 @@ fn start_heartbeat_reporting(
 
 async fn run_heartbeat_loop(
     runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
     identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
     route_reporter: Option<HeartbeatRouteReporter>,
 ) {
-    let client = reqwest::Client::new();
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
@@ -9989,6 +10031,7 @@ async fn heartbeat_request(
 
 fn start_signal_registration(
     runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
     identity: IdentityKeyPair,
     node: NodeRecord,
     signal_urls: Vec<String>,
@@ -9998,6 +10041,7 @@ fn start_signal_registration(
     tokio::spawn(async move {
         run_signal_registration_loop(
             runtime,
+            client,
             identity,
             node,
             signal_urls,
@@ -10010,13 +10054,13 @@ fn start_signal_registration(
 
 async fn run_signal_registration_loop(
     runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
     identity: IdentityKeyPair,
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) {
-    let client = reqwest::Client::new();
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
@@ -10204,6 +10248,7 @@ struct SignalPathNegotiationOptions {
 
 fn start_signal_path_negotiation(
     runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
     control_plane_urls: Vec<String>,
     signal_urls: Vec<String>,
     hole_puncher: UdpHolePuncher,
@@ -10212,6 +10257,7 @@ fn start_signal_path_negotiation(
     tokio::spawn(async move {
         run_signal_path_negotiation_loop(
             runtime,
+            client,
             control_plane_urls,
             signal_urls,
             hole_puncher,
@@ -10223,12 +10269,12 @@ fn start_signal_path_negotiation(
 
 async fn run_signal_path_negotiation_loop(
     runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
     control_plane_urls: Vec<String>,
     signal_urls: Vec<String>,
     hole_puncher: UdpHolePuncher,
     options: SignalPathNegotiationOptions,
 ) {
-    let client = reqwest::Client::new();
     loop {
         if let Err(error) = negotiate_signal_paths(
             &client,
@@ -13315,10 +13361,14 @@ struct HttpPeerMapSource {
 }
 
 impl HttpPeerMapSource {
-    fn new(control_plane_urls: Vec<String>, node_state: AgentNodeState) -> Self {
+    fn new(
+        control_plane_urls: Vec<String>,
+        node_state: AgentNodeState,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             control_plane_urls,
-            client: reqwest::Client::new(),
+            client,
             node_state,
         }
     }
@@ -14055,6 +14105,19 @@ mod tests {
         Ok(format!("http://{addr}"))
     }
 
+    async fn spawn_stalled_http_service() -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
     async fn spawn_raw_http_response(
         response: String,
     ) -> anyhow::Result<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> {
@@ -14174,6 +14237,46 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .context("timed out waiting for oversized peer-map test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_fetch_times_out_stalled_endpoint_and_fails_over() -> anyhow::Result<()> {
+        let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
+        let expected = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-timeout-failover"),
+            peers: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        let response = expected.clone();
+        let (available_url, available_task) = spawn_test_http_service(Router::new().route(
+            "/v1/peers/query",
+            axum::routing::post(move || {
+                let response = response.clone();
+                async move { axum::Json(response) }
+            }),
+        ))
+        .await?;
+        let identity = IdentityKeyPair::generate();
+        let client =
+            build_agent_http_client(Duration::from_millis(50), Duration::from_millis(100))?;
+        let started = Instant::now();
+
+        let peer_map = fetch_peer_map_from_control_planes(
+            &client,
+            &[stalled_url, available_url],
+            &identity.node_id(),
+            &identity,
+        )
+        .await?;
+
+        assert_eq!(peer_map, expected);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stalled endpoint failover exceeded the bounded request timeout"
+        );
+        stalled_task.abort();
+        available_task.abort();
         Ok(())
     }
 
@@ -16722,6 +16825,14 @@ mod tests {
             assert_eq!(args.wireguard_backend.as_str(), "command");
             assert_eq!(args.route_backend, RouteApplyBackend::Command);
             assert_eq!(args.route_backend.as_str(), "command");
+            assert_eq!(
+                args.http_connect_timeout_seconds,
+                DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS
+            );
+            assert_eq!(
+                args.http_request_timeout_seconds,
+                DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS
+            );
             assert_eq!(args.runtime_command_timeout_seconds, 30);
             assert_eq!(args.runtime_command_output_max_bytes, 65_536);
             return Ok(());
@@ -23530,6 +23641,33 @@ exec sleep 60
     #[test]
     fn agent_runtime_intervals_must_be_positive_when_enabled() -> anyhow::Result<()> {
         let cases = vec![
+            (
+                vec!["iparsd", "agent", "--http-connect-timeout-seconds", "0"],
+                "--http-connect-timeout-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--http-request-timeout-seconds", "0"],
+                "--http-request-timeout-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--http-connect-timeout-seconds", "3601"],
+                "--http-connect-timeout-seconds must not exceed 3600",
+            ),
+            (
+                vec!["iparsd", "agent", "--http-request-timeout-seconds", "3601"],
+                "--http-request-timeout-seconds must not exceed 3600",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--http-connect-timeout-seconds",
+                    "31",
+                    "--http-request-timeout-seconds",
+                    "30",
+                ],
+                "--http-connect-timeout-seconds must not exceed --http-request-timeout-seconds",
+            ),
             (
                 vec!["iparsd", "agent", "--heartbeat-interval-seconds", "0"],
                 "--heartbeat-interval-seconds must be greater than zero",

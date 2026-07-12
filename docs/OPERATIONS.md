@@ -58,6 +58,8 @@ iparsd agent \
 
 The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/ipars/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
 
+Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
+
 For a real `--apply-peer-map` runtime, keep `--stun-bind` and
 `--wireguard-listen-port` on the same nonzero UDP port. The agent performs its
 initial STUN probe before configuring the WireGuard interface, then configures
@@ -238,7 +240,7 @@ Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and 
 
 - Existing WireGuard data-plane state and relay sessions continue when the control plane is unavailable.
 - New joins, peer-map refreshes, policy changes, route changes, key rotations, and node removals require a reachable control plane.
-- Agents keep ordered control-plane and signal endpoint lists and retry failover endpoints without stopping the local data-plane loop.
+- Agents keep ordered control-plane and signal endpoint lists and retry failover endpoints without stopping the local data-plane loop. Connect and whole-request deadlines bound each endpoint attempt, including peers that accept TCP but never return HTTP.
 - Signal failure prevents new path negotiation and hole-punch planning; existing selected paths remain in local runtime state until they expire or are replaced.
 - Relay failure causes affected relay paths to renew or renegotiate. If direct candidates are available, path scoring can promote back to direct.
 - Redundant control-plane instances can share durable SQL state. The load harness verifies peer-map, path-state, relay-candidate, and existing relay dataplane survival after one control-plane process is stopped.

@@ -30,6 +30,9 @@ agent:
   peerMap:
     enabled: true
     pollIntervalSeconds: 30
+  http:
+    connectTimeoutSeconds: 5
+    requestTimeoutSeconds: 30
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   apiBearerTokenSecretKey: agent-api-token

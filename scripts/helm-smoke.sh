@@ -114,6 +114,28 @@ template_fails agent-runtime-invalid \
   "agent.runtimeBackend must be linux-command or dry-run" \
   --set-string agent.runtimeBackend=invalid
 
+template_ok agent-http-timeouts \
+  --set agent.http.connectTimeoutSeconds=7 \
+  --set agent.http.requestTimeoutSeconds=45
+
+assert_rendered_contains agent-http-timeouts "- --http-connect-timeout-seconds"
+assert_rendered_contains agent-http-timeouts '- "7"'
+assert_rendered_contains agent-http-timeouts "- --http-request-timeout-seconds"
+assert_rendered_contains agent-http-timeouts '- "45"'
+
+template_fails agent-http-connect-timeout-zero \
+  "agent.http.connectTimeoutSeconds must be greater than zero" \
+  --set agent.http.connectTimeoutSeconds=0
+
+template_fails agent-http-request-timeout-oversized \
+  "agent.http.requestTimeoutSeconds must be a non-negative integer no greater than 3600" \
+  --set agent.http.requestTimeoutSeconds=3601
+
+template_fails agent-http-timeout-order \
+  "agent.http.connectTimeoutSeconds must not exceed agent.http.requestTimeoutSeconds" \
+  --set agent.http.connectTimeoutSeconds=31 \
+  --set agent.http.requestTimeoutSeconds=30
+
 template_ok cluster-endpoints \
   --set-string cluster.controlPlaneUrl=https://control.example.com:8443 \
   --set-string cluster.signalUrl=https://signal.example.com:9443 \

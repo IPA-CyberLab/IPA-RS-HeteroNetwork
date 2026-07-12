@@ -48,6 +48,8 @@
 {{- $agentRouteBackend := printf "%v" .Values.agent.routeBackend -}}
 {{- $agentPeerMapEnabled := printf "%v" .Values.agent.peerMap.enabled -}}
 {{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
+{{- $agentHttpConnectTimeoutSeconds := printf "%v" .Values.agent.http.connectTimeoutSeconds -}}
+{{- $agentHttpRequestTimeoutSeconds := printf "%v" .Values.agent.http.requestTimeoutSeconds -}}
 {{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
@@ -127,6 +129,17 @@
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds "max" 9223372036854775807) -}}
 {{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentPeerMapPollIntervalSeconds) 1) -}}
 {{- fail "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.http.connectTimeoutSeconds" "value" $agentHttpConnectTimeoutSeconds "max" 3600) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.http.requestTimeoutSeconds" "value" $agentHttpRequestTimeoutSeconds "max" 3600) -}}
+{{- if lt (int $agentHttpConnectTimeoutSeconds) 1 -}}
+{{- fail "agent.http.connectTimeoutSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentHttpRequestTimeoutSeconds) 1 -}}
+{{- fail "agent.http.requestTimeoutSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if gt (int $agentHttpConnectTimeoutSeconds) (int $agentHttpRequestTimeoutSeconds) -}}
+{{- fail "agent.http.connectTimeoutSeconds must not exceed agent.http.requestTimeoutSeconds" -}}
 {{- end -}}
 {{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
 {{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
@@ -1065,6 +1078,10 @@ spec:
             - {{ .Values.cluster.controlPlaneUrl | quote }}
             - --signal-url
             - {{ .Values.cluster.signalUrl | quote }}
+            - --http-connect-timeout-seconds
+            - {{ $agentHttpConnectTimeoutSeconds | quote }}
+            - --http-request-timeout-seconds
+            - {{ $agentHttpRequestTimeoutSeconds | quote }}
             {{- if .Values.cluster.stunEndpoint }}
             - --stun-server
             - {{ .Values.cluster.stunEndpoint | quote }}

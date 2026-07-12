@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -24,6 +25,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
+const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -36,6 +38,8 @@ pub struct AgentHttpState {
     runtime: Arc<AgentRuntime>,
     state_store: Option<FileAgentStateStore>,
     control_plane_urls: Vec<String>,
+    control_plane_client: reqwest::Client,
+    control_plane_request_timeout: Duration,
     api_bearer_token: Option<Arc<str>>,
 }
 
@@ -45,6 +49,8 @@ impl AgentHttpState {
             runtime,
             state_store: None,
             control_plane_urls: Vec::new(),
+            control_plane_client: reqwest::Client::new(),
+            control_plane_request_timeout: DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             api_bearer_token: None,
         }
     }
@@ -57,6 +63,8 @@ impl AgentHttpState {
             runtime,
             state_store: None,
             control_plane_urls,
+            control_plane_client: reqwest::Client::new(),
+            control_plane_request_timeout: DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             api_bearer_token: None,
         }
     }
@@ -70,8 +78,20 @@ impl AgentHttpState {
             runtime,
             state_store: Some(state_store),
             control_plane_urls,
+            control_plane_client: reqwest::Client::new(),
+            control_plane_request_timeout: DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             api_bearer_token: None,
         }
+    }
+
+    pub fn with_control_plane_http_client(
+        mut self,
+        client: reqwest::Client,
+        request_timeout: Duration,
+    ) -> Self {
+        self.control_plane_client = client;
+        self.control_plane_request_timeout = request_timeout;
+        self
     }
 
     pub fn require_api_bearer_token(mut self, token: String) -> Self {
@@ -185,7 +205,8 @@ async fn rotate_wireguard_key(
     let rotated_at = chrono::Utc::now();
     let plan = state.runtime.plan_wireguard_key_rotation(rotated_at)?;
     let control_plane_response = send_wireguard_key_rotation_to_control_planes(
-        &reqwest::Client::new(),
+        &state.control_plane_client,
+        state.control_plane_request_timeout,
         &control_plane_urls,
         plan.request.clone(),
     )
@@ -222,7 +243,8 @@ async fn remove_node(
 
     let remove_request = state.runtime.remove_node_request(chrono::Utc::now())?;
     let control_plane_response = send_node_removal_to_control_planes(
-        &reqwest::Client::new(),
+        &state.control_plane_client,
+        state.control_plane_request_timeout,
         &control_plane_urls,
         remove_request,
     )
@@ -239,13 +261,20 @@ async fn remove_node(
 
 async fn send_wireguard_key_rotation_to_control_planes(
     client: &reqwest::Client,
+    request_timeout: Duration,
     control_plane_urls: &[String],
     request: RotateWireGuardKeyRequest,
 ) -> Result<RotateWireGuardKeyResponse, AgentError> {
     let mut failures = Vec::new();
     for control_plane_url in control_plane_urls {
         let url = wireguard_key_rotation_url(control_plane_url, &request.node_id);
-        match client.put(&url).json(&request).send().await {
+        match client
+            .put(&url)
+            .timeout(request_timeout)
+            .json(&request)
+            .send()
+            .await
+        {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match read_bounded_json_response(
                     response,
@@ -270,13 +299,20 @@ async fn send_wireguard_key_rotation_to_control_planes(
 
 async fn send_node_removal_to_control_planes(
     client: &reqwest::Client,
+    request_timeout: Duration,
     control_plane_urls: &[String],
     request: RemoveNodeRequest,
 ) -> Result<RemoveNodeResponse, AgentError> {
     let mut failures = Vec::new();
     for control_plane_url in control_plane_urls {
         let url = node_removal_url(control_plane_url, &request.node_id);
-        match client.delete(&url).json(&request).send().await {
+        match client
+            .delete(&url)
+            .timeout(request_timeout)
+            .json(&request)
+            .send()
+            .await
+        {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match read_bounded_json_response(
                     response,
@@ -1697,6 +1733,62 @@ mod tests {
         Ok((format!("http://{addr}"), task))
     }
 
+    async fn spawn_stalled_http_service(
+    ) -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+        Ok((format!("http://{addr}"), task))
+    }
+
+    #[tokio::test]
+    async fn wireguard_key_rotation_times_out_stalled_endpoint_and_fails_over(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
+        let capture = RotationCapture {
+            request: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let (available_url, available_task) = spawn_rotation_control_plane(capture.clone()).await?;
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let request = runtime.plan_wireguard_key_rotation(Utc::now())?.request;
+        let started = std::time::Instant::now();
+
+        let response = send_wireguard_key_rotation_to_control_planes(
+            &reqwest::Client::new(),
+            Duration::from_millis(100),
+            &[stalled_url, available_url],
+            request.clone(),
+        )
+        .await?;
+
+        assert_eq!(response.node.node_id, request.node_id);
+        assert_eq!(
+            capture
+                .request
+                .lock()
+                .await
+                .as_ref()
+                .map(|request| &request.next_wireguard_public_key),
+            Some(&request.next_wireguard_public_key)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stalled lifecycle endpoint failover exceeded the bounded request timeout"
+        );
+        stalled_task.abort();
+        available_task.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn wireguard_key_rotation_client_rejects_oversized_control_plane_response(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1714,6 +1806,7 @@ mod tests {
 
         let error = send_wireguard_key_rotation_to_control_planes(
             &reqwest::Client::new(),
+            DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             &[control_plane_url],
             request,
         )
