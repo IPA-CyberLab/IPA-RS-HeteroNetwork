@@ -3,9 +3,10 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ipars_types::api::{
-    AuthenticatedSignalPathRequest, HeartbeatRequest, NodeApiRequestSignature,
-    NodeRequestSignature, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
-    SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
+    AuthenticatedSignalPathRequest, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+    HeartbeatRequest, NodeApiRequestSignature, NodeRequestSignature, RemoveNodeRequest,
+    RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
+    SignalNodeUpsertRequest, SignalPathRequest,
 };
 use ipars_types::{ClusterId, JoinTokenClaims, NodeId, SignedJoinToken};
 use rand_core::{OsRng, RngCore};
@@ -144,6 +145,18 @@ impl IdentityKeyPair {
     ) -> Result<NodeApiRequestSignature, CryptoError> {
         let nonce = random_node_api_request_nonce();
         let payload = serde_json::to_vec(&request.signature_payload(signed_at, nonce.clone()))?;
+        Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    pub fn sign_control_plane_node_query_request(
+        &self,
+        request: &ControlPlaneNodeQueryRequest,
+        kind: ControlPlaneNodeQueryKind,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let payload =
+            serde_json::to_vec(&request.signature_payload(kind, signed_at, nonce.clone()))?;
         Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
     }
 
@@ -331,6 +344,23 @@ pub fn verify_signal_node_upsert_signature(
     verify_node_api_payload(&payload, request_signature, node_public_key_b64)
 }
 
+pub fn verify_control_plane_node_query_signature(
+    request: &ControlPlaneNodeQueryRequest,
+    kind: ControlPlaneNodeQueryKind,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let request_signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(&request.signature_payload(
+        kind,
+        request_signature.signed_at,
+        request_signature.nonce.clone(),
+    ))?;
+    verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+}
+
 pub fn verify_signal_path_signature(
     request: &AuthenticatedSignalPathRequest,
     node_public_key_b64: &str,
@@ -431,9 +461,9 @@ mod tests {
 
     use chrono::Duration;
     use ipars_types::api::{
-        AuthenticatedSignalPathRequest, HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest,
-        RotateWireGuardKeyRequest, SignalHolePunchPlanRequest, SignalNodeUpsertRequest,
-        SignalPathRequest,
+        AuthenticatedSignalPathRequest, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+        HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
+        SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
     };
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord, Role,
@@ -636,6 +666,44 @@ mod tests {
         });
         assert!(matches!(
             verify_signal_node_upsert_signature(&request, &identity.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_control_plane_node_query_is_operation_scoped() -> Result<(), CryptoError> {
+        let identity = IdentityKeyPair::generate();
+        let mut request = ControlPlaneNodeQueryRequest {
+            node_id: identity.node_id(),
+            request_signature: None,
+        };
+        request.request_signature = Some(identity.sign_control_plane_node_query_request(
+            &request,
+            ControlPlaneNodeQueryKind::PeerMap,
+            Utc::now(),
+        )?);
+
+        verify_control_plane_node_query_signature(
+            &request,
+            ControlPlaneNodeQueryKind::PeerMap,
+            &identity.public_key_b64(),
+        )?;
+        assert!(matches!(
+            verify_control_plane_node_query_signature(
+                &request,
+                ControlPlaneNodeQueryKind::Paths,
+                &identity.public_key_b64(),
+            ),
+            Err(CryptoError::InvalidSignature)
+        ));
+        request.node_id = NodeId::from_string("node-b");
+        assert!(matches!(
+            verify_control_plane_node_query_signature(
+                &request,
+                ControlPlaneNodeQueryKind::PeerMap,
+                &identity.public_key_b64(),
+            ),
             Err(CryptoError::InvalidSignature)
         ));
         Ok(())

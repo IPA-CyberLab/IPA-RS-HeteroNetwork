@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+ipars-agent = { path = "../ipars-agent" }
 ipars-crypto = { path = "../ipars-crypto" }
 ipars-relay = { path = "../ipars-relay" }
 ipars-stun = { path = "../ipars-stun" }

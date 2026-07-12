@@ -7,6 +7,7 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use anyhow::Context;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
+use ipars_agent::FileAgentStateStore;
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_stun::UdpStunProbe;
@@ -14,10 +15,10 @@ use ipars_types::api::{
     AgentNodeRemovalRequest, AgentNodeRemovalResponse, AgentPathEventsResponse,
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentWireGuardKeyRotationRequest,
-    AgentWireGuardKeyRotationResponse, ControlPlaneMetricsResponse, ControlPlanePathsResponse,
-    ControlPlanePolicyResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionRequest, RelayAdmissionResponse, RelayStatusResponse,
-    RevokeTokenRequest, RevokeTokenResponse,
+    AgentWireGuardKeyRotationResponse, ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind,
+    ControlPlaneNodeQueryRequest, ControlPlanePathsResponse, ControlPlanePolicyResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
@@ -90,6 +91,8 @@ struct Cli {
     agent_api_bearer_token: Option<String>,
     #[arg(long, global = true, env = "IPARS_AGENT_API_BEARER_TOKEN_PATH")]
     agent_api_bearer_token_path: Option<PathBuf>,
+    #[arg(long, global = true, env = "IPARS_AGENT_STATE_PATH")]
+    agent_state_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -1154,6 +1157,7 @@ async fn main() -> anyhow::Result<()> {
     let Cli {
         agent_api_bearer_token,
         agent_api_bearer_token_path,
+        agent_state_path,
         command,
     } = Cli::parse();
     let agent_api_auth =
@@ -1184,9 +1188,9 @@ async fn main() -> anyhow::Result<()> {
                 (Some(agent_url), None) if args.node_id.is_none() => print_json(
                     &agent_peer_map_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
                 )?,
-                (None, Some(control_plane_url)) => {
-                    print_json(&peer_map(control_plane_url, &args).await?)?
-                }
+                (None, Some(control_plane_url)) => print_json(
+                    &peer_map(control_plane_url, &args, agent_state_path.as_deref()).await?,
+                )?,
                 (None, None) if args.node_id.is_none() => print_json(
                     &agent_peer_map_with_bearer(
                         defaulted_agent_url(None),
@@ -1208,9 +1212,9 @@ async fn main() -> anyhow::Result<()> {
                 (Some(agent_url), None) if args.node_id.is_none() => print_json(
                     &agent_routes_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
                 )?,
-                (None, Some(control_plane_url)) => {
-                    print_json(&routes(control_plane_url, &args).await?)?
-                }
+                (None, Some(control_plane_url)) => print_json(
+                    &routes(control_plane_url, &args, agent_state_path.as_deref()).await?,
+                )?,
                 (None, None) if args.node_id.is_none() => print_json(
                     &agent_routes_with_bearer(
                         defaulted_agent_url(None),
@@ -1268,9 +1272,9 @@ async fn main() -> anyhow::Result<()> {
                 Some(agent_url) => print_json(
                     &path_status_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
                 )?,
-                None if args.control_plane_url.is_some() => {
-                    print_json(&control_plane_path_status(&args).await?)?
-                }
+                None if args.control_plane_url.is_some() => print_json(
+                    &control_plane_path_status(&args, agent_state_path.as_deref()).await?,
+                )?,
                 None if args.node_id.is_some() => {
                     anyhow::bail!("ipars path status requires --control-plane-url with --node-id")
                 }
@@ -2225,12 +2229,24 @@ async fn control_plane_status(control_plane_url: &str) -> anyhow::Result<Control
     })
 }
 
-async fn peer_map(control_plane_url: &str, args: &PeersArgs) -> anyhow::Result<PeerMap> {
+async fn peer_map(
+    control_plane_url: &str,
+    args: &PeersArgs,
+    agent_state_path: Option<&Path>,
+) -> anyhow::Result<PeerMap> {
     let node_id = required_node_id(args.node_id.as_deref(), "peers")?;
-    get_json(
+    let request = signed_control_plane_node_query(
+        node_id,
+        agent_state_path,
+        ControlPlaneNodeQueryKind::PeerMap,
+        "peers",
+    )?;
+    post_json_with_bearer(
         control_plane_url,
-        &format!("/v1/peers/{node_id}"),
+        "/v1/peers/query",
         "control-plane peer map",
+        &request,
+        None,
     )
     .await
 }
@@ -2242,15 +2258,64 @@ async fn agent_peer_map_with_bearer(
     get_json_with_bearer(agent_url, "/v1/peers", "agent peer map", bearer_token).await
 }
 
-async fn routes(control_plane_url: &str, args: &RoutesArgs) -> anyhow::Result<RoutesOutput> {
+async fn routes(
+    control_plane_url: &str,
+    args: &RoutesArgs,
+    agent_state_path: Option<&Path>,
+) -> anyhow::Result<RoutesOutput> {
     let node_id = required_node_id(args.node_id.as_deref(), "routes")?;
-    let peer_map: PeerMap = get_json(
+    let request = signed_control_plane_node_query(
+        node_id.clone(),
+        agent_state_path,
+        ControlPlaneNodeQueryKind::PeerMap,
+        "routes",
+    )?;
+    let peer_map: PeerMap = post_json_with_bearer(
         control_plane_url,
-        &format!("/v1/peers/{node_id}"),
+        "/v1/peers/query",
         "control-plane peer map",
+        &request,
+        None,
     )
     .await?;
     Ok(routes_output(node_id, peer_map))
+}
+
+fn signed_control_plane_node_query(
+    node_id: NodeId,
+    agent_state_path: Option<&Path>,
+    kind: ControlPlaneNodeQueryKind,
+    command: &str,
+) -> anyhow::Result<ControlPlaneNodeQueryRequest> {
+    let state_path = agent_state_path.with_context(|| {
+        format!("ipars {command} requires --agent-state-path for a direct control-plane node query")
+    })?;
+    let state = FileAgentStateStore::new(state_path)
+        .load()
+        .with_context(|| {
+            format!(
+                "failed to load agent identity from {}",
+                state_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        state.node_id == node_id,
+        "--node-id {node_id} does not match agent state node {}",
+        state.node_id
+    );
+    let identity = state
+        .identity_key_pair()
+        .context("failed to load node identity key from agent state")?;
+    let mut request = ControlPlaneNodeQueryRequest {
+        node_id,
+        request_signature: None,
+    };
+    request.request_signature = Some(
+        identity
+            .sign_control_plane_node_query_request(&request, kind, Utc::now())
+            .context("failed to sign control-plane node query")?,
+    );
+    Ok(request)
 }
 
 async fn agent_routes_with_bearer(
@@ -2614,16 +2679,25 @@ async fn path_events(agent_url: &str) -> anyhow::Result<AgentPathEventsResponse>
 
 async fn control_plane_path_status(
     args: &PathStatusArgs,
+    agent_state_path: Option<&Path>,
 ) -> anyhow::Result<ControlPlanePathsResponse> {
     let control_plane_url = args
         .control_plane_url
         .as_deref()
         .context("ipars path status requires --control-plane-url")?;
     let node_id = required_node_id(args.node_id.as_deref(), "path status")?;
-    get_json(
+    let request = signed_control_plane_node_query(
+        node_id,
+        agent_state_path,
+        ControlPlaneNodeQueryKind::Paths,
+        "path status",
+    )?;
+    post_json_with_bearer(
         control_plane_url,
-        &format!("/v1/paths/{node_id}"),
+        "/v1/paths/query",
         "control-plane path status",
+        &request,
+        None,
     )
     .await
 }
@@ -8908,7 +8982,8 @@ fn add_unique_kubernetes_node_port(
 
 #[cfg(test)]
 mod tests {
-    use ipars_crypto::verify_join_token;
+    use ipars_agent::AgentNodeState;
+    use ipars_crypto::{verify_control_plane_node_query_signature, verify_join_token};
 
     use super::*;
 
@@ -11257,6 +11332,43 @@ fi
         assert_eq!(output.routes.len(), 1);
         assert_eq!(output.routes[0].peer, peer);
         assert_eq!(output.routes[0].route, route);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_control_plane_node_query_uses_owner_only_agent_identity() -> anyhow::Result<()> {
+        let state = AgentNodeState::generate(Utc::now());
+        let state_dir = temp_path("node-query-state");
+        let state_path = state_dir.join("agent.json");
+        FileAgentStateStore::new(&state_path).save(&state)?;
+
+        let request = signed_control_plane_node_query(
+            state.node_id.clone(),
+            Some(&state_path),
+            ControlPlaneNodeQueryKind::PeerMap,
+            "peers",
+        )?;
+        verify_control_plane_node_query_signature(
+            &request,
+            ControlPlaneNodeQueryKind::PeerMap,
+            &state.identity_public_key_b64,
+        )?;
+        assert!(signed_control_plane_node_query(
+            NodeId::from_string("wrong-node"),
+            Some(&state_path),
+            ControlPlaneNodeQueryKind::PeerMap,
+            "peers",
+        )
+        .is_err());
+        assert!(signed_control_plane_node_query(
+            state.node_id,
+            None,
+            ControlPlaneNodeQueryKind::Paths,
+            "path status",
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(state_dir)?;
         Ok(())
     }
 

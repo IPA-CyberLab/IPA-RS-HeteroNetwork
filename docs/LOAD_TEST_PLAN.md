@@ -27,7 +27,7 @@ Each report is validated before command success. The harness rejects:
 - missing agent status endpoint coverage;
 - missing endpoint candidates;
 - missing reachable agent runtime path state;
-- missing control-plane path-state or `/v1/paths/{node_id}` propagation;
+- missing control-plane path-state or signed `/v1/paths/query` propagation;
 - peer-map edge loss or cross-control-plane inconsistency;
 - relay-candidate loss;
 - relay packet loss, payload corruption, or relay counter skew;

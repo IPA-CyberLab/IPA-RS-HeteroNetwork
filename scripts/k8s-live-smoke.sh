@@ -396,9 +396,12 @@ done
 
 wait_for_control_plane_metrics "$desired_agents"
 
-for node_id in "${node_ids[@]}"; do
-  peer_map_json="$("$kubectl_bin" -n "$namespace" exec "deployment/${bootstrap_name}" -c control-plane -- \
-    curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:8443/v1/peers/${node_id}")"
+for index in "${!node_ids[@]}"; do
+  node_id="${node_ids[$index]}"
+  pod="${agent_pods[$index]}"
+  peer_map_json="$("$kubectl_bin" -n "$namespace" exec "pod/${pod}" -c agent -- \
+    /usr/local/bin/ipars --agent-state-path /var/lib/ipars/agent.json peers \
+      --control-plane-url "$control_plane_url" --node-id "$node_id")"
   jq -e --arg cluster_id "$cluster_id" '.cluster_id == $cluster_id and (.peers | type == "array")' \
     >/dev/null <<<"$peer_map_json"
 done

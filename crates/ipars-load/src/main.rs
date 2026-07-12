@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
+use ipars_agent::FileAgentStateStore;
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, InMemoryStore, InMemoryTokenLedger,
     IssuerKeyRing,
@@ -22,12 +23,12 @@ use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
     AgentPathsResponse, AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
-    AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, ControlPlanePathsResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneDropReason, RelayStatusResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
-    StunMetricsResponse,
+    AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind,
+    ControlPlaneNodeQueryRequest, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneDropReason, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
+    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse, StunMetricsResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -2206,10 +2207,16 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
 
     let peer_map_started = Instant::now();
     let mut peer_map_edges_seen = 0;
-    for node in &nodes {
-        let peer_map: PeerMap = get_json(
+    for (index, node) in nodes.iter().enumerate() {
+        let request = control_plane_node_query_request(
+            &identity_for_index(index),
+            &node.node_id,
+            ControlPlaneNodeQueryKind::PeerMap,
+        )?;
+        let peer_map: PeerMap = post_json(
             &client,
-            format!("{}/v1/peers/{}", services.control_plane_url, node.node_id),
+            format!("{}/v1/peers/query", services.control_plane_url),
+            &request,
             "control-plane peer map",
         )
         .await?;
@@ -2750,13 +2757,20 @@ async fn run_daemon_scenario(
             .push(get_json(&client, format!("{url}/v1/status"), "daemon agent status").await?);
     }
     let agent_status_summary = daemon_agent_status_summary(&agent_statuses)?;
+    let agent_identities =
+        load_daemon_agent_identities(&services.agent_state_paths, &agent_statuses)?;
     services.ensure_running(DaemonRuntimePhase::RegistrationProbe)?;
     let registration_millis = registration_started.elapsed().as_millis();
 
     services.write_manifest(DaemonRuntimePhase::PeerMapProbe)?;
     let peer_map_started = Instant::now();
-    let peer_map_probe =
-        daemon_peer_map_probe(&client, &services.control_plane_urls, &agent_statuses).await?;
+    let peer_map_probe = daemon_peer_map_probe(
+        &client,
+        &services.control_plane_urls,
+        &agent_statuses,
+        &agent_identities,
+    )
+    .await?;
     let peer_map_requests = agent_statuses.len() * services.control_plane_urls.len();
     let peer_map_edges_seen = peer_map_probe.canonical_edge_count;
     let peer_records = peer_map_probe.canonical_peer_records;
@@ -2808,6 +2822,7 @@ async fn run_daemon_scenario(
         &client,
         &services.control_plane_urls,
         &agent_statuses,
+        &agent_identities,
         expected_agent_path_count,
         agent_readiness_timeout,
     )
@@ -3064,11 +3079,14 @@ async fn run_daemon_scenario(
             failover_relay_udp_payload_bytes_received =
                 failover_relay_udp_payload_bytes_received.saturating_add(len as u64);
         }
-        let failover_probe = daemon_peer_map_probe(&client, &survivor_urls, &agent_statuses)
-            .await
-            .with_context(|| {
-                format!("daemon control-plane failover probe failed after stopping {stopped_role}")
-            })?;
+        let failover_probe =
+            daemon_peer_map_probe(&client, &survivor_urls, &agent_statuses, &agent_identities)
+                .await
+                .with_context(|| {
+                    format!(
+                        "daemon control-plane failover probe failed after stopping {stopped_role}"
+                    )
+                })?;
         let failover_peer_map_requests = agent_statuses.len() * survivor_urls.len();
         total_peer_map_requests += failover_peer_map_requests;
         control_plane_http_requests += failover_peer_map_requests;
@@ -3118,6 +3136,7 @@ async fn run_daemon_scenario(
             &client,
             &survivor_urls,
             &agent_statuses,
+            &agent_identities,
         )
         .await
         .with_context(|| {
@@ -4926,6 +4945,7 @@ impl DaemonProcessGroup {
             &control_plane_urls,
             &signal_url,
             &agent_urls,
+            &startup.agent_state_paths,
             &mut startup.children,
             &manifest_seed,
             options.agent_readiness_timeout,
@@ -6380,6 +6400,7 @@ async fn wait_for_daemon_agents_ready(
     control_plane_urls: &[String],
     signal_url: &str,
     agent_urls: &[String],
+    agent_state_paths: &[PathBuf],
     children: &mut [DaemonChild],
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -6388,15 +6409,19 @@ async fn wait_for_daemon_agents_ready(
     while Instant::now() < deadline {
         ensure_daemon_children_running(children)?;
         match daemon_agent_statuses(client, agent_urls).await {
-            Ok(statuses) => match check_daemon_agent_control_and_signal_readiness(
-                client,
-                control_plane_urls,
-                signal_url,
-                &statuses,
-            )
-            .await
-            {
-                Ok(()) => return Ok(()),
+            Ok(statuses) => match load_daemon_agent_identities(agent_state_paths, &statuses) {
+                Ok(identities) => match check_daemon_agent_control_and_signal_readiness(
+                    client,
+                    control_plane_urls,
+                    signal_url,
+                    &statuses,
+                    &identities,
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = Some(error),
+                },
                 Err(error) => last_error = Some(error),
             },
             Err(error) => last_error = Some(error),
@@ -6419,6 +6444,7 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
     control_plane_urls: &[String],
     signal_url: &str,
     agent_urls: &[String],
+    agent_state_paths: &[PathBuf],
     children: &mut [DaemonChild],
     manifest_seed: &DaemonRuntimeManifestSeed,
     timeout: Duration,
@@ -6428,6 +6454,7 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
         control_plane_urls,
         signal_url,
         agent_urls,
+        agent_state_paths,
         children,
         timeout,
     )
@@ -6475,6 +6502,52 @@ async fn daemon_agent_statuses(
         );
     }
     Ok(statuses)
+}
+
+type DaemonAgentIdentities = BTreeMap<NodeId, IdentityKeyPair>;
+
+fn load_daemon_agent_identities(
+    state_paths: &[PathBuf],
+    statuses: &[AgentStatusResponse],
+) -> anyhow::Result<DaemonAgentIdentities> {
+    anyhow::ensure!(
+        state_paths.len() == statuses.len(),
+        "daemon agent state path count {} does not match status count {}",
+        state_paths.len(),
+        statuses.len()
+    );
+    let statuses_by_node = statuses
+        .iter()
+        .map(|status| (status.node_id.clone(), status))
+        .collect::<BTreeMap<_, _>>();
+    let mut identities = BTreeMap::new();
+    for path in state_paths {
+        let state = FileAgentStateStore::new(path)
+            .load()
+            .with_context(|| format!("failed to load daemon agent state {}", path.display()))?;
+        let status = statuses_by_node.get(&state.node_id).with_context(|| {
+            format!(
+                "daemon agent state {} contains unexpected node {}",
+                path.display(),
+                state.node_id
+            )
+        })?;
+        let identity = state
+            .identity_key_pair()
+            .with_context(|| format!("failed to load identity from {}", path.display()))?;
+        anyhow::ensure!(
+            identity.node_id() == state.node_id
+                && identity.public_key_b64() == status.identity_public_key,
+            "daemon agent state {} identity does not match status for {}",
+            path.display(),
+            status.node_id
+        );
+        anyhow::ensure!(
+            identities.insert(state.node_id, identity).is_none(),
+            "daemon agent state paths contain duplicate node identities"
+        );
+    }
+    Ok(identities)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6679,13 +6752,19 @@ async fn wait_for_daemon_control_plane_path_status_summary(
     client: &reqwest::Client,
     control_plane_urls: &[String],
     statuses: &[AgentStatusResponse],
+    identities: &DaemonAgentIdentities,
     expected_path_count: usize,
     timeout: Duration,
 ) -> anyhow::Result<DaemonControlPlanePathStatusSummary> {
     let started = Instant::now();
     loop {
-        let summary =
-            daemon_control_plane_path_status_summary(client, control_plane_urls, statuses).await?;
+        let summary = daemon_control_plane_path_status_summary(
+            client,
+            control_plane_urls,
+            statuses,
+            identities,
+        )
+        .await?;
         if summary.path_count_min >= expected_path_count
             && summary.reachable_path_count_min >= expected_path_count
             && summary.stale_path_count_max == 0
@@ -6712,6 +6791,7 @@ async fn daemon_control_plane_path_status_summary(
     client: &reqwest::Client,
     control_plane_urls: &[String],
     statuses: &[AgentStatusResponse],
+    identities: &DaemonAgentIdentities,
 ) -> anyhow::Result<DaemonControlPlanePathStatusSummary> {
     if control_plane_urls.is_empty() {
         bail!("at least one daemon control-plane URL is required");
@@ -6722,6 +6802,7 @@ async fn daemon_control_plane_path_status_summary(
             .first()
             .context("at least one daemon control-plane URL is required")?,
         statuses,
+        identities,
     )
     .await?;
     let mut summary = DaemonControlPlanePathStatusSummary {
@@ -6733,8 +6814,13 @@ async fn daemon_control_plane_path_status_summary(
         stale_path_count_max: first.stale_path_count,
     };
     for control_plane_url in &control_plane_urls[1..] {
-        let endpoint =
-            control_plane_path_status_endpoint_summary(client, control_plane_url, statuses).await?;
+        let endpoint = control_plane_path_status_endpoint_summary(
+            client,
+            control_plane_url,
+            statuses,
+            identities,
+        )
+        .await?;
         summary.request_count = summary.request_count.saturating_add(endpoint.request_count);
         summary.path_count_min = summary.path_count_min.min(endpoint.path_count);
         summary.path_count_max = summary.path_count_max.max(endpoint.path_count);
@@ -6761,6 +6847,7 @@ async fn control_plane_path_status_endpoint_summary(
     client: &reqwest::Client,
     control_plane_url: &str,
     statuses: &[AgentStatusResponse],
+    identities: &DaemonAgentIdentities,
 ) -> anyhow::Result<DaemonControlPlanePathStatusEndpointSummary> {
     let mut summary = DaemonControlPlanePathStatusEndpointSummary {
         request_count: 0,
@@ -6769,9 +6856,18 @@ async fn control_plane_path_status_endpoint_summary(
         stale_path_count: 0,
     };
     for (index, status) in statuses.iter().enumerate() {
-        let response: ControlPlanePathsResponse = get_json(
+        let identity = identities
+            .get(&status.node_id)
+            .with_context(|| format!("missing daemon agent identity for {}", status.node_id))?;
+        let request = control_plane_node_query_request(
+            identity,
+            &status.node_id,
+            ControlPlaneNodeQueryKind::Paths,
+        )?;
+        let response: ControlPlanePathsResponse = post_json(
             client,
-            format!("{control_plane_url}/v1/paths/{}", status.node_id),
+            format!("{control_plane_url}/v1/paths/query"),
+            &request,
             "daemon control-plane path status",
         )
         .await?;
@@ -6869,6 +6965,7 @@ async fn daemon_peer_map_probe(
     client: &reqwest::Client,
     control_plane_urls: &[String],
     agent_statuses: &[AgentStatusResponse],
+    identities: &DaemonAgentIdentities,
 ) -> anyhow::Result<DaemonPeerMapProbe> {
     if control_plane_urls.is_empty() {
         bail!("at least one daemon control-plane URL is required");
@@ -6882,9 +6979,18 @@ async fn daemon_peer_map_probe(
         for status in agent_statuses {
             let request_context =
                 format!("daemon control-plane peer map endpoint {endpoint_index}");
-            let peer_map: PeerMap = get_json(
+            let identity = identities
+                .get(&status.node_id)
+                .with_context(|| format!("missing daemon agent identity for {}", status.node_id))?;
+            let request = control_plane_node_query_request(
+                identity,
+                &status.node_id,
+                ControlPlaneNodeQueryKind::PeerMap,
+            )?;
+            let peer_map: PeerMap = post_json(
                 client,
-                format!("{control_plane_url}/v1/peers/{}", status.node_id),
+                format!("{control_plane_url}/v1/peers/query"),
+                &request,
                 &request_context,
             )
             .await?;
@@ -6911,6 +7017,7 @@ async fn check_daemon_agent_control_and_signal_readiness(
     control_plane_urls: &[String],
     signal_url: &str,
     statuses: &[AgentStatusResponse],
+    identities: &DaemonAgentIdentities,
 ) -> anyhow::Result<()> {
     let expected_agent_count = statuses.len();
     if expected_agent_count > 0 {
@@ -6936,9 +7043,18 @@ async fn check_daemon_agent_control_and_signal_readiness(
 
     for control_plane_url in control_plane_urls {
         for status in statuses {
-            let peer_map: PeerMap = get_json(
+            let identity = identities
+                .get(&status.node_id)
+                .with_context(|| format!("missing daemon agent identity for {}", status.node_id))?;
+            let request = control_plane_node_query_request(
+                identity,
+                &status.node_id,
+                ControlPlaneNodeQueryKind::PeerMap,
+            )?;
+            let peer_map: PeerMap = post_json(
                 client,
-                format!("{control_plane_url}/v1/peers/{}", status.node_id),
+                format!("{control_plane_url}/v1/peers/query"),
+                &request,
                 "daemon control-plane readiness peer map",
             )
             .await?;
@@ -7275,6 +7391,28 @@ fn signal_node_upsert_request(
         identity
             .sign_signal_node_upsert_request(&request, Utc::now())
             .context("failed to sign synthetic signal node upsert")?,
+    );
+    Ok(request)
+}
+
+fn control_plane_node_query_request(
+    identity: &IdentityKeyPair,
+    node_id: &NodeId,
+    kind: ControlPlaneNodeQueryKind,
+) -> anyhow::Result<ControlPlaneNodeQueryRequest> {
+    anyhow::ensure!(
+        identity.node_id() == *node_id,
+        "control-plane query node {node_id} does not match signing identity {}",
+        identity.node_id()
+    );
+    let mut request = ControlPlaneNodeQueryRequest {
+        node_id: node_id.clone(),
+        request_signature: None,
+    };
+    request.request_signature = Some(
+        identity
+            .sign_control_plane_node_query_request(&request, kind, Utc::now())
+            .context("failed to sign control-plane node query")?,
     );
     Ok(request)
 }
@@ -10411,11 +10549,18 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             });
         }
 
+        let identities = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| (status.node_id.clone(), identity_for_index(index)))
+            .collect::<DaemonAgentIdentities>();
+
         check_daemon_agent_control_and_signal_readiness(
             &client,
             std::slice::from_ref(&services.control_plane_url),
             &services.signal_url,
             &statuses,
+            &identities,
         )
         .await
     }

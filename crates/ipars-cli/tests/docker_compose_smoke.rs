@@ -910,18 +910,30 @@ fn assert_compose_control_plane_peer_maps(
     compose: &ComposeProject,
     nodes: &ComposeAgentNodes,
 ) -> Result<()> {
-    wait_for_json(
+    wait_for_ipars_control_plane_query(
         compose,
         "control-plane peer map for agent",
-        "control-plane",
-        &format!("http://127.0.0.1:8443/v1/peers/{}", nodes.agent),
+        "agent",
+        &[
+            "peers",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            &nodes.agent,
+        ],
         |value| ensure_peer_map_contains(value, &nodes.agent_b),
     )?;
-    wait_for_json(
+    wait_for_ipars_control_plane_query(
         compose,
         "control-plane peer map for agent-b",
-        "control-plane",
-        &format!("http://127.0.0.1:8443/v1/peers/{}", nodes.agent_b),
+        "agent-b",
+        &[
+            "peers",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            &nodes.agent_b,
+        ],
         |value| ensure_peer_map_contains(value, &nodes.agent),
     )?;
     wait_for_json(
@@ -1294,8 +1306,8 @@ fn assert_compose_control_plane_path_state(
     compose: &ComposeProject,
     nodes: &ComposeAgentNodes,
 ) -> Result<()> {
-    assert_compose_control_plane_node_path(compose, &nodes.agent, &nodes.agent_b)?;
-    assert_compose_control_plane_node_path(compose, &nodes.agent_b, &nodes.agent)?;
+    assert_compose_control_plane_node_path(compose, "agent", &nodes.agent, &nodes.agent_b)?;
+    assert_compose_control_plane_node_path(compose, "agent-b", &nodes.agent_b, &nodes.agent)?;
     wait_for_json(
         compose,
         "control-plane metrics after agent path-state heartbeats",
@@ -1311,14 +1323,22 @@ fn assert_compose_control_plane_path_state(
 
 fn assert_compose_control_plane_node_path(
     compose: &ComposeProject,
+    service: &str,
     local: &str,
     remote: &str,
 ) -> Result<()> {
-    wait_for_json(
+    wait_for_ipars_control_plane_query(
         compose,
         &format!("control-plane path state for {local}"),
-        "control-plane",
-        &format!("http://127.0.0.1:8443/v1/paths/{local}"),
+        service,
+        &[
+            "path",
+            "status",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--node-id",
+            local,
+        ],
         |value| ensure_agent_paths_contain(value, local, remote),
     )?;
     Ok(())
@@ -1589,6 +1609,65 @@ fn assert_compose_relay_prometheus_metrics(compose: &ComposeProject) -> Result<(
         1.0,
     )?;
     Ok(())
+}
+
+fn wait_for_ipars_control_plane_query<F>(
+    compose: &ComposeProject,
+    label: &str,
+    service: &str,
+    args: &[&str],
+    mut validate: F,
+) -> Result<Value>
+where
+    F: FnMut(&Value) -> Result<()>,
+{
+    let agent_state_path = match service {
+        "agent" => "/var/lib/ipars/agent.json",
+        "agent-b" => "/var/lib/ipars/agent-b.json",
+        _ => anyhow::bail!("service {service} does not have an agent identity state path"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let result: Result<Value> = (|| {
+            let mut command = compose_command(compose);
+            command.args([
+                "exec",
+                "-T",
+                service,
+                "/usr/local/bin/ipars",
+                "--agent-state-path",
+                agent_state_path,
+            ]);
+            command.args(args);
+            let output = command.output().with_context(|| {
+                format!("failed to run signed control-plane query {args:?} in {service}")
+            })?;
+            ensure_success(
+                &format!("signed control-plane query {args:?} in {service}"),
+                &output,
+            )?;
+            let value: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+                format!(
+                    "failed to parse signed control-plane query JSON: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            })?;
+            validate(&value)?;
+            Ok(value)
+        })();
+        match result {
+            Ok(value) => return Ok(value),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "{label} signed query in service {service} did not satisfy expectations: {error}\n{}",
+                    compose_diagnostics(compose)
+                )
+            }
+        }
+    }
 }
 
 fn wait_for_json<F>(

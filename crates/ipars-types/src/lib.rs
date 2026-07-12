@@ -1112,6 +1112,36 @@ pub mod api {
         pub generated_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControlPlaneNodeQueryKind {
+        PeerMap,
+        Paths,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ControlPlaneNodeQueryRequest {
+        pub node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_signature: Option<NodeApiRequestSignature>,
+    }
+
+    impl ControlPlaneNodeQueryRequest {
+        pub fn signature_payload(
+            &self,
+            kind: ControlPlaneNodeQueryKind,
+            signed_at: DateTime<Utc>,
+            nonce: String,
+        ) -> ControlPlaneNodeQuerySignaturePayload {
+            ControlPlaneNodeQuerySignaturePayload {
+                kind,
+                node_id: self.node_id.clone(),
+                signed_at,
+                nonce,
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct NodeRequestSignature {
         pub signed_at: DateTime<Utc>,
@@ -1123,6 +1153,14 @@ pub mod api {
         pub signed_at: DateTime<Utc>,
         pub nonce: String,
         pub signature: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ControlPlaneNodeQuerySignaturePayload {
+        pub kind: ControlPlaneNodeQueryKind,
+        pub node_id: NodeId,
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3772,12 +3810,10 @@ pub mod api {
             || path_starts_with_api_prefix(path, b"/v1/policy")
             || path_starts_with_api_prefix(path, b"/v1/tokens/revoke")
             || path_starts_with_api_prefix(path, b"/v1/nodes/authenticate-signal-upsert")
+            || path_starts_with_api_prefix(path, b"/v1/peers/query")
+            || path_starts_with_api_prefix(path, b"/v1/paths/query")
             || (method == b"DELETE" && path_is_ipars_node_record_api(path))
             || (path.starts_with(b"/v1/nodes/") && path_contains_any(path, &[b"/wireguard-key"]))
-            || (path.starts_with(b"/v1/peers/") && path.len() > b"/v1/peers/".len())
-            || (path.starts_with(b"/v1/paths/")
-                && path.len() > b"/v1/paths/".len()
-                && !path_starts_with_api_prefix(path, b"/v1/paths/negotiate"))
     }
 
     fn path_is_ipars_node_record_api(path: &[u8]) -> bool {

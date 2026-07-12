@@ -8,15 +8,16 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
-    verify_heartbeat_request_signature, verify_join_token, verify_remove_node_signature,
-    verify_signal_node_upsert_signature, verify_token_revocation_signature,
-    verify_wireguard_key_rotation_signature, CryptoError,
+    verify_control_plane_node_query_signature, verify_heartbeat_request_signature,
+    verify_join_token, verify_remove_node_signature, verify_signal_node_upsert_signature,
+    verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
-    PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
-    RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
+    ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+    ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RemoveNodeRequest, RemoveNodeResponse,
+    RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    SignalNodeUpsertRequest,
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
@@ -27,7 +28,7 @@ use ipars_types::{
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
     PathState::DirectPublic,
@@ -39,6 +40,7 @@ const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
 const MAX_PATH_SCORE_REASONS: usize = 16;
 const MAX_PATH_SCORE_REASON_BYTES: usize = 256;
 const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
+const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -52,6 +54,10 @@ pub enum ControlPlaneError {
     NodeSignatureRequired(NodeId),
     #[error("node {node_id} request signature rejected: {reason}")]
     NodeSignatureRejected { node_id: NodeId, reason: String },
+    #[error("node {0} request nonce was already accepted")]
+    NodeRequestReplay(NodeId),
+    #[error("control-plane node request replay cache is full")]
+    NodeRequestAuthenticationCapacity,
     #[error("node {node_id} heartbeat update rejected: {reason}")]
     NodeUpdateRejected { node_id: NodeId, reason: String },
     #[error("node {node_id} registration rejected: {reason}")]
@@ -605,6 +611,7 @@ pub struct ControlPlane<S> {
     config: ControlPlaneConfig,
     store: Arc<S>,
     allocator: RwLock<VpnAllocator>,
+    accepted_node_query_nonces: Mutex<BTreeMap<(NodeId, String), chrono::DateTime<Utc>>>,
     operation_metrics: ControlPlaneOperationMetrics,
 }
 
@@ -664,6 +671,7 @@ where
     pub fn new(config: ControlPlaneConfig, store: Arc<S>) -> Self {
         Self {
             allocator: RwLock::new(VpnAllocator::new(config.vpn_pool)),
+            accepted_node_query_nonces: Mutex::new(BTreeMap::new()),
             operation_metrics: ControlPlaneOperationMetrics::default(),
             config,
             store,
@@ -798,6 +806,60 @@ where
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    pub async fn authenticate_node_query(
+        &self,
+        request: &ControlPlaneNodeQueryRequest,
+        kind: ControlPlaneNodeQueryKind,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let signature = request
+            .request_signature
+            .as_ref()
+            .ok_or_else(|| ControlPlaneError::NodeSignatureRequired(request.node_id.clone()))?;
+        let node = self
+            .store
+            .get_node(&request.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        verify_control_plane_node_query_signature(request, kind, &node.identity_public_key)
+            .map_err(|error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: error.to_string(),
+            })?;
+        if !timestamp_within_skew(
+            signature.signed_at,
+            now,
+            self.config.heartbeat_signature_max_age,
+        ) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "signed_at {} is outside the allowed {}s window",
+                    signature.signed_at,
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+
+        let key = (request.node_id.clone(), signature.nonce.clone());
+        let mut accepted = self.accepted_node_query_nonces.lock().await;
+        accepted.retain(|_, accepted_at| {
+            now.signed_duration_since(*accepted_at)
+                .to_std()
+                .map_or(true, |age| age <= self.config.heartbeat_signature_max_age)
+        });
+        if accepted.contains_key(&key) {
+            return Err(ControlPlaneError::NodeRequestReplay(
+                request.node_id.clone(),
+            ));
+        }
+        if accepted.len() >= MAX_ACCEPTED_NODE_QUERY_NONCES {
+            return Err(ControlPlaneError::NodeRequestAuthenticationCapacity);
+        }
+        accepted.insert(key, now);
+        Ok(node)
     }
 
     pub async fn peer_map_for(&self, node_id: &NodeId) -> Result<PeerMap, ControlPlaneError> {

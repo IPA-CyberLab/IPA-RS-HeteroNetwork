@@ -11,11 +11,11 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
-    RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
-    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse,
-    SignalNodeUpsertRequest,
+    ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+    ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinNodeRequest, PeerMap, RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse,
+    RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
@@ -65,8 +65,8 @@ where
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
         .route("/v1/metrics", get(metrics::<S, L>))
         .route("/v1/policy", get(policy::<S, L>))
-        .route("/v1/peers/{node_id}", get(peers::<S, L>))
-        .route("/v1/paths/{node_id}", get(paths::<S, L>))
+        .route("/v1/peers/query", post(peers::<S, L>))
+        .route("/v1/paths/query", post(paths::<S, L>))
         .route(
             "/v1/nodes/authenticate-signal-upsert",
             post(authenticate_signal_node_upsert::<S, L>),
@@ -207,27 +207,33 @@ where
 
 async fn peers<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
-    Path(node_id): Path<String>,
+    Json(request): Json<ControlPlaneNodeQueryRequest>,
 ) -> Result<Json<PeerMap>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let node_id = NodeId::from_string(node_id);
-    let response = state.plane.peer_map_for(&node_id).await?;
+    state
+        .plane
+        .authenticate_node_query(&request, ControlPlaneNodeQueryKind::PeerMap, Utc::now())
+        .await?;
+    let response = state.plane.peer_map_for(&request.node_id).await?;
     Ok(Json(response))
 }
 
 async fn paths<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
-    Path(node_id): Path<String>,
+    Json(request): Json<ControlPlaneNodeQueryRequest>,
 ) -> Result<Json<ControlPlanePathsResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let node_id = NodeId::from_string(node_id);
-    let response = state.plane.paths_for(&node_id).await?;
+    state
+        .plane
+        .authenticate_node_query(&request, ControlPlaneNodeQueryKind::Paths, Utc::now())
+        .await?;
+    let response = state.plane.paths_for(&request.node_id).await?;
     Ok(Json(response))
 }
 
@@ -659,6 +665,8 @@ impl IntoResponse for ApiError {
             }
             ControlPlaneError::NodeSignatureRequired(_)
             | ControlPlaneError::NodeSignatureRejected { .. } => StatusCode::UNAUTHORIZED,
+            ControlPlaneError::NodeRequestReplay(_) => StatusCode::CONFLICT,
+            ControlPlaneError::NodeRequestAuthenticationCapacity => StatusCode::SERVICE_UNAVAILABLE,
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_)
             | ControlPlaneError::VpnIpAlreadyAllocated(_) => StatusCode::CONFLICT,
@@ -694,11 +702,11 @@ mod tests {
     };
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
-        ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
-        HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
-        RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
-        RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
-        SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
+        ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+        ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
+        JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse, RemoveNodeRequest,
+        RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
+        RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
@@ -837,6 +845,24 @@ mod tests {
         request
     }
 
+    fn signed_node_query(
+        label: &str,
+        kind: ControlPlaneNodeQueryKind,
+    ) -> ControlPlaneNodeQueryRequest {
+        let identity = identity_for_node(label);
+        let mut request = ControlPlaneNodeQueryRequest {
+            node_id: identity.node_id(),
+            request_signature: None,
+        };
+        request.request_signature = Some(
+            match identity.sign_control_plane_node_query_request(&request, kind, Utc::now()) {
+                Ok(signature) => signature,
+                Err(error) => panic!("test identity should sign node query: {error}"),
+            },
+        );
+        request
+    }
+
     fn signed_remove_node(label: &str) -> RemoveNodeRequest {
         let identity = identity_for_node(label);
         let mut request = RemoveNodeRequest {
@@ -946,9 +972,13 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("GET")
-                    .uri(format!("/v1/paths/{}", node_id("node-http")))
-                    .body(Body::empty())?,
+                    .method("POST")
+                    .uri("/v1/paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signed_node_query(
+                        "node-http",
+                        ControlPlaneNodeQueryKind::Paths,
+                    ))?))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1252,6 +1282,76 @@ mod tests {
         plane
             .register_with_claims(peer_claims, registration("node-peer"))
             .await?;
+
+        let unsigned_query = ControlPlaneNodeQueryRequest {
+            node_id: node_id("node-http"),
+            request_signature: None,
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/peers/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&unsigned_query)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/peers/{}", node_id("node-http")))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let peer_query = signed_node_query("node-http", ControlPlaneNodeQueryKind::PeerMap);
+        let peer_query_body = serde_json::to_vec(&peer_query)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(peer_query_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/peers/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(peer_query_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let peer_map: PeerMap = serde_json::from_slice(&body)?;
+        assert_eq!(peer_map.peers.len(), 1);
+        assert_eq!(peer_map.peers[0].node_id, node_id("node-peer"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/peers/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(peer_query_body))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
         let path_reported_at = Utc::now() + chrono::Duration::seconds(1);
         let heartbeat = signed_heartbeat_at(
             "node-http",
@@ -1288,9 +1388,13 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("GET")
-                    .uri(format!("/v1/paths/{}", node_id("node-http")))
-                    .body(Body::empty())?,
+                    .method("POST")
+                    .uri("/v1/paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signed_node_query(
+                        "node-http",
+                        ControlPlaneNodeQueryKind::Paths,
+                    ))?))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1390,9 +1494,13 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("GET")
-                    .uri(format!("/v1/paths/{}", node_id("node-http")))
-                    .body(Body::empty())?,
+                    .method("POST")
+                    .uri("/v1/paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signed_node_query(
+                        "node-http",
+                        ControlPlaneNodeQueryKind::Paths,
+                    ))?))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

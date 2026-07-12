@@ -16,6 +16,7 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ipnet.workspace = true
+ipars-agent = { path = "../ipars-agent" }
 ipars-control-plane = { path = "../ipars-control-plane" }
 ipars-control-plane-http = { path = "../ipars-control-plane-http" }
 ipars-crypto = { path = "../ipars-crypto" }

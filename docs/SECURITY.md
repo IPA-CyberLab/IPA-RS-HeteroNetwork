@@ -57,6 +57,12 @@ Signal node upserts, path negotiations, and hole-punch plan requests require an 
 
 For each node upsert, Signal asks an ordered control-plane endpoint set to verify the signature against the registered identity public key. Signal stores the authoritative control-plane `NodeRecord` rather than trusting client-supplied role, policy, route, or relay attributes. `--node-auth-ttl-seconds` or `IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS` bounds membership freshness; stale members are removed and cannot negotiate paths or request hole-punch plans until a signed upsert succeeds again. Configure control-plane failover with repeated `--control-plane-url` values or `IPARS_SIGNAL_CONTROL_PLANE_URLS`.
 
+## Control-Plane Node Queries
+
+Peer maps and node-scoped path status are available only through `POST /v1/peers/query` and `POST /v1/paths/query`. Requests require the queried node's Ed25519 identity signature over the node ID, operation kind, bounded-fresh timestamp, and random 192-bit nonce. The operation kind prevents a peer-map proof from being reused for path status. Each control-plane process keeps a bounded five-minute nonce cache and rejects same-instance replays; redundant instances independently verify every request. TLS remains required between nodes and control-plane endpoints to protect response confidentiality and cross-instance transport.
+
+The agent signs peer-map polling requests with its persisted owner-only state. Direct `ipars peers`, `ipars routes`, or `ipars path status` queries against a control-plane URL require `--agent-state-path`; the CLI rejects state/node mismatches and never places the private key in the URL, request body, command arguments, or logs.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.
