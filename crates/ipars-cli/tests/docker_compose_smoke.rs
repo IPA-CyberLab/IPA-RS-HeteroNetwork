@@ -313,9 +313,15 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         rendered.contains("read_only: true"),
         "rendered Docker discovery Compose config did not keep the Docker API socket bind read-only"
     );
+    let discovery_source = fs::read_to_string(
+        rootful_discovery_compose
+            .repo_root
+            .join("docker/compose.docker-discovery.yaml"),
+    )
+    .context("failed to read Docker discovery Compose source")?;
     anyhow::ensure!(
-        rendered.contains("create_host_path: false"),
-        "rendered Docker discovery Compose config could create a missing host Docker API socket path"
+        discovery_source.contains("create_host_path: false"),
+        "Docker discovery Compose source could create a missing host Docker API socket path"
     );
 
     let rootless_compose = ComposeProject {

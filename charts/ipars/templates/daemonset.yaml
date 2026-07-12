@@ -1085,7 +1085,7 @@ spec:
             - --runtime-backend
             - {{ $agentRuntimeBackend | quote }}
             - --join-token-path
-            - {{ printf "%s/token/%s" $agentStateMountPath .Values.agent.joinTokenSecretKey | quote }}
+            - {{ printf "%s/join-token" $agentStateMountPath | quote }}
             {{- if eq $agentPeerMapEnabled "true" }}
             - --apply-peer-map
             - --peer-map-poll-interval-seconds
@@ -1328,7 +1328,8 @@ spec:
               mountPath: /dev/net/tun
             {{- end }}
             - name: join-token
-              mountPath: {{ printf "%s/token" $agentStateMountPath | quote }}
+              mountPath: {{ printf "%s/join-token" $agentStateMountPath | quote }}
+              subPath: {{ .Values.agent.joinTokenSecretKey | quote }}
               readOnly: true
             {{- if .Values.agent.relayForwarder.netns }}
             - name: host-netns
@@ -1349,6 +1350,7 @@ spec:
         - name: join-token
           secret:
             secretName: {{ .Values.agent.joinTokenSecretName }}
+            defaultMode: 0400
             items:
               - key: {{ .Values.agent.joinTokenSecretKey | quote }}
                 path: {{ .Values.agent.joinTokenSecretKey | quote }}

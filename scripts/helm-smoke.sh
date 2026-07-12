@@ -77,6 +77,10 @@ assert_rendered_contains default "- --peer-probe-port"
 assert_rendered_contains default '- "51821"'
 assert_rendered_contains default "name: IPARS_AGENT_API_BEARER_TOKEN"
 assert_rendered_contains default 'key: "agent-api-token"'
+assert_rendered_contains default '- "/var/lib/ipars/join-token"'
+assert_rendered_contains default 'mountPath: "/var/lib/ipars/join-token"'
+assert_rendered_contains default 'subPath: "token"'
+assert_rendered_contains default "defaultMode: 0400"
 
 template_fails agent-api-token-key-empty \
   "agent.apiBearerTokenSecretKey must contain only ASCII letters" \

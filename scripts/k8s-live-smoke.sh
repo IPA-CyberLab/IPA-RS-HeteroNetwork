@@ -333,7 +333,8 @@ spec:
             - name: control-plane-state
               mountPath: /var/lib/ipars
             - name: control-plane-operator-api-token
-              mountPath: /run/secrets/control-plane
+              mountPath: /run/secrets/control-plane/operator-api-token
+              subPath: operator-api-token
               readOnly: true
         - name: signal
           image: ${image_ref_json}
@@ -351,6 +352,7 @@ spec:
         - name: control-plane-operator-api-token
           secret:
             secretName: ${token_secret}
+            defaultMode: 0400
             items:
               - key: control-plane-operator-api-token
                 path: operator-api-token

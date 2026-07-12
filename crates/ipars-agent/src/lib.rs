@@ -4340,13 +4340,24 @@ async fn find_link_index(
     handle: &rtnetlink::Handle,
     name: &str,
 ) -> Result<Option<u32>, AgentError> {
-    let mut links = handle.link().get().match_name(name.to_string()).execute();
-    let link = links.try_next().await.map_err(|error| {
+    let mut links = handle.link().get().execute();
+    while let Some(link) = links.try_next().await.map_err(|error| {
         AgentError::WireGuard(format!(
-            "failed to query WireGuard interface {name} through rtnetlink: {error}"
+            "failed to list interfaces while looking up WireGuard interface {name} through rtnetlink: {error}"
         ))
-    })?;
-    Ok(link.map(|link| link.header.index))
+    })? {
+        let matches_name = link.attributes.iter().any(|attribute| {
+            matches!(
+                attribute,
+                rtnetlink::packet_route::link::LinkAttribute::IfName(link_name)
+                    if link_name == name
+            )
+        });
+        if matches_name {
+            return Ok(Some(link.header.index));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
