@@ -148,7 +148,7 @@ wait_for_agent_runtime() {
     fi
     sleep 2
   done
-  echo "agent pod ${pod} did not report a synchronized peer map" >&2
+  echo "agent pod ${pod} did not report a synchronized peer map, VPN IP, and required endpoint candidate" >&2
   return 1
 }
 

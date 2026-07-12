@@ -1593,6 +1593,7 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
     }
     validate_listen_port_for_bootstrap(args.control_plane_listen, "--control-plane-listen")?;
     validate_listen_port_for_bootstrap(args.signal_listen, "--signal-listen")?;
+    validate_listen_port_for_bootstrap(args.stun_listen, "--stun-listen")?;
     if args.relay_http_listen.port() == 0 && args.relay_admission_url.is_none() {
         anyhow::bail!(
             "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
@@ -5245,25 +5246,20 @@ fn claims(
 
 fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
     let host = args.public_endpoint.ip();
+    let control_plane = SocketAddr::new(host, args.control_plane_listen.port());
+    let signal = SocketAddr::new(host, args.signal_listen.port());
+    let stun = SocketAddr::new(host, args.stun_listen.port());
     vec![
         BootstrapEndpoint {
-            url: format!(
-                "{}://{host}:{}",
-                args.bootstrap_scheme,
-                args.control_plane_listen.port()
-            ),
+            url: format!("{}://{control_plane}", args.bootstrap_scheme),
             kind: BootstrapEndpointKind::ControlPlane,
         },
         BootstrapEndpoint {
-            url: format!(
-                "{}://{host}:{}",
-                args.bootstrap_scheme,
-                args.signal_listen.port()
-            ),
+            url: format!("{}://{signal}", args.bootstrap_scheme),
             kind: BootstrapEndpointKind::Signal,
         },
         BootstrapEndpoint {
-            url: format!("udp://{}", args.public_endpoint),
+            url: format!("udp://{stun}"),
             kind: BootstrapEndpointKind::Stun,
         },
         BootstrapEndpoint {
@@ -10550,6 +10546,16 @@ mod tests {
             .to_string()
             .contains("nonzero port for bootstrap token generation"));
 
+        let mut zero_stun = valid_init_args();
+        zero_stun.stun_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        let Err(error) = init(zero_stun) else {
+            panic!("port-zero STUN listen should fail");
+        };
+        assert!(error.to_string().contains("--stun-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port for bootstrap token generation"));
+
         let mut zero_relay_http = valid_init_args();
         zero_relay_http.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
         let Err(error) = init(zero_relay_http) else {
@@ -10564,6 +10570,27 @@ mod tests {
         explicit_admission.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
         explicit_admission.relay_admission_url = Some("http://relay.example.test:9580".to_string());
         assert!(init(explicit_admission).is_ok());
+    }
+
+    #[test]
+    fn init_bootstrap_urls_use_service_ports_and_bracket_ipv6() -> anyhow::Result<()> {
+        let mut args = valid_init_args();
+        args.public_endpoint = "[2001:db8::10]:51820".parse()?;
+        let endpoints = bootstrap_from_public_endpoint(&args);
+
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "http://[2001:db8::10]:8443",
+                "http://[2001:db8::10]:9443",
+                "udp://[2001:db8::10]:3478",
+                "udp://[2001:db8::10]:51820",
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -10730,6 +10757,26 @@ mod tests {
                 .find(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
                 .map(|endpoint| endpoint.url.as_str()),
             Some("http://203.0.113.10:19443")
+        );
+        assert_eq!(
+            output
+                .join_token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
+                .map(|endpoint| endpoint.url.as_str()),
+            Some("udp://203.0.113.10:13478")
+        );
+        assert_eq!(
+            output
+                .join_token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == BootstrapEndpointKind::Relay)
+                .map(|endpoint| endpoint.url.as_str()),
+            Some("udp://203.0.113.10:51820")
         );
 
         let control_plane = output
