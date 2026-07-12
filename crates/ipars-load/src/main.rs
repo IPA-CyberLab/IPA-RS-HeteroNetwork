@@ -443,6 +443,7 @@ impl LoadReport {
                     false,
                     expected_peer_map_requests,
                 )?;
+                self.validate_path_quality_observations("daemon load scenario")?;
                 self.validate_relay_measurement("daemon load scenario")?;
                 let expected_processes =
                     self.daemon_agent_processes + self.daemon_control_plane_processes + 3;
@@ -1308,6 +1309,15 @@ impl LoadReport {
                 expected_signal_health_metrics,
                 measurement.stun_final_metrics,
                 expected_stun_final_metrics
+            );
+        }
+        let expected_signal_path_quality_metrics =
+            SignalPathQualityMetricsMeasurement::from_report(self);
+        if measurement.signal_path_quality_metrics != expected_signal_path_quality_metrics {
+            bail!(
+                "daemon load scenario retained manifest Signal path quality measurement does not match report: {:?}/{:?}",
+                measurement.signal_path_quality_metrics,
+                expected_signal_path_quality_metrics
             );
         }
         let expected_agent_status_metrics = AgentStatusMetricsMeasurement::from_report(self);
@@ -2948,6 +2958,22 @@ async fn run_daemon_scenario(
     )
     .await?;
     services.ensure_running(DaemonRuntimePhase::AgentPathValidation)?;
+    let signal_metrics_before_path_quality: SignalMetricsResponse = get_json_with_bearer(
+        &client,
+        format!("{}/v1/metrics", services.signal_url),
+        "daemon Signal metrics before path quality probe",
+        &services.signal_operator_api_bearer_token,
+    )
+    .await?;
+    let path_quality_observations_submitted = drive_daemon_signal_path_quality_observations(
+        &client,
+        &services.signal_url,
+        &agent_statuses,
+        &agent_identities,
+        active_pair_count,
+    )
+    .await?;
+    services.ensure_running(DaemonRuntimePhase::AgentPathValidation)?;
 
     services.write_manifest(DaemonRuntimePhase::RelayMeasurement)?;
     let relay_started = Instant::now();
@@ -3057,6 +3083,11 @@ async fn run_daemon_scenario(
         &services.signal_operator_api_bearer_token,
     )
     .await?;
+    let signal_path_quality_metrics = SignalPathQualityMetricsMeasurement::from_metrics_delta(
+        path_quality_observations_submitted,
+        &signal_metrics_before_path_quality,
+        &signal_metrics,
+    )?;
     let stun_metrics: StunMetricsResponse = get_json_with_bearer(
         &client,
         format!("{}/v1/metrics", services.stun_http_url),
@@ -3311,6 +3342,7 @@ async fn run_daemon_scenario(
         relay_active_sessions_reported: status.capability.active_sessions as usize,
         relay_final_metrics: RelayFinalMetricsMeasurement::from_status(&status),
         signal_health_metrics: SignalHealthMetricsMeasurement::from_metrics(&signal_metrics),
+        signal_path_quality_metrics,
         stun_final_metrics: StunFinalMetricsMeasurement::from_daemon_stun_report(&daemon_stun),
         agent_status_metrics: AgentStatusMetricsMeasurement::from_summary(agent_status_summary),
         agent_path_metrics: AgentPathMetricsMeasurement::from_summary(agent_path_summary),
@@ -3412,14 +3444,11 @@ async fn run_daemon_scenario(
         peer_map_requests: total_peer_map_requests,
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
-        path_quality_observations_submitted: signal_path_quality_observation_total(
-            &signal_metrics,
-        )?,
-        path_quality_observations_accepted: signal_metrics.path_quality_observation_accepted_count,
-        path_quality_observations_stale: signal_metrics.path_quality_observation_stale_count,
-        path_quality_observations_path_mismatch: signal_metrics
-            .path_quality_observation_path_mismatch_count,
-        path_quality_observations_rejected: signal_metrics.path_quality_observation_rejected_count,
+        path_quality_observations_submitted: signal_path_quality_metrics.submitted,
+        path_quality_observations_accepted: signal_path_quality_metrics.accepted,
+        path_quality_observations_stale: signal_path_quality_metrics.stale,
+        path_quality_observations_path_mismatch: signal_path_quality_metrics.path_mismatch,
+        path_quality_observations_rejected: signal_path_quality_metrics.rejected,
         relay_candidates: control_summary.relay_candidate_count_min,
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
@@ -3427,7 +3456,11 @@ async fn run_daemon_scenario(
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
         control_plane_http_requests,
-        signal_http_requests: peer_records.len() + active_pair_count + path_counts.direct_nat + 1,
+        signal_http_requests: peer_records.len()
+            + active_pair_count
+            + path_counts.direct_nat
+            + path_quality_observations_submitted.saturating_mul(2)
+            + 2,
         relay_http_requests: active_pair_count + 2,
         stun_http_requests: 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
@@ -3718,6 +3751,79 @@ async fn drive_daemon_agent_peer_activity(
             "daemon agent peer activity",
         )
         .await?;
+    }
+    Ok(pairs.len())
+}
+
+async fn drive_daemon_signal_path_quality_observations(
+    client: &reqwest::Client,
+    signal_url: &str,
+    statuses: &[AgentStatusResponse],
+    identities: &DaemonAgentIdentities,
+    active_pair_count: usize,
+) -> anyhow::Result<usize> {
+    let pairs = daemon_agent_activity_pairs(statuses, active_pair_count);
+    let expected_pairs = expected_daemon_agent_path_count(active_pair_count, statuses.len());
+    anyhow::ensure!(
+        pairs.len() == expected_pairs,
+        "daemon Signal path quality probe selected {} unique pairs, expected {expected_pairs}",
+        pairs.len()
+    );
+
+    for (pair_index, (source_index, target)) in pairs.iter().enumerate() {
+        let source = statuses.get(*source_index).with_context(|| {
+            format!("daemon Signal path quality probe source index {source_index} is missing")
+        })?;
+        let identity = identities.get(&source.node_id).with_context(|| {
+            format!(
+                "daemon Signal path quality probe identity for {} is missing",
+                source.node_id
+            )
+        })?;
+        let request = SignalPathRequest {
+            source: source.node_id.clone(),
+            target: target.clone(),
+            source_candidates: source.candidates.clone(),
+            source_nat_classification: source.nat_classification.clone(),
+            desired_routes: Vec::new(),
+        };
+        let baseline: SignalPathResponse = post_json(
+            client,
+            format!("{signal_url}/v1/paths/negotiate"),
+            &authenticated_signal_path_request_for_identity(identity, request.clone(), None)?,
+            "daemon Signal path quality baseline negotiation",
+        )
+        .await?;
+        anyhow::ensure!(
+            baseline.key.local == source.node_id && baseline.key.remote == *target,
+            "daemon Signal path quality baseline returned path {} -> {} for requested {} -> {}",
+            baseline.key.local,
+            baseline.key.remote,
+            source.node_id,
+            target
+        );
+        let observation =
+            synthetic_path_quality_observation(&baseline, pair_index)?.with_context(|| {
+                format!(
+                    "daemon Signal path quality baseline for {} -> {} was unreachable",
+                    source.node_id, target
+                )
+            })?;
+        let observed: SignalPathResponse = post_json(
+            client,
+            format!("{signal_url}/v1/paths/negotiate"),
+            &authenticated_signal_path_request_for_identity(identity, request, Some(observation))?,
+            "daemon Signal observed path negotiation",
+        )
+        .await?;
+        anyhow::ensure!(
+            observed.key == baseline.key && observed.preferred_state == baseline.preferred_state,
+            "daemon Signal path quality observation changed path {} -> {} from {:?} to {:?}",
+            baseline.key.local,
+            baseline.key.remote,
+            baseline.preferred_state,
+            observed.preferred_state
+        );
     }
     Ok(pairs.len())
 }
@@ -4190,6 +4296,65 @@ impl SignalHealthMetricsMeasurement {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct SignalPathQualityMetricsMeasurement {
+    submitted: usize,
+    accepted: u64,
+    stale: u64,
+    path_mismatch: u64,
+    rejected: u64,
+}
+
+impl SignalPathQualityMetricsMeasurement {
+    fn from_report(report: &LoadReport) -> Self {
+        Self {
+            submitted: report.path_quality_observations_submitted,
+            accepted: report.path_quality_observations_accepted,
+            stale: report.path_quality_observations_stale,
+            path_mismatch: report.path_quality_observations_path_mismatch,
+            rejected: report.path_quality_observations_rejected,
+        }
+    }
+
+    fn from_metrics_delta(
+        submitted: usize,
+        previous: &SignalMetricsResponse,
+        current: &SignalMetricsResponse,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            submitted,
+            accepted: checked_signal_metric_delta(
+                "accepted path quality observations",
+                previous.path_quality_observation_accepted_count,
+                current.path_quality_observation_accepted_count,
+            )?,
+            stale: checked_signal_metric_delta(
+                "stale path quality observations",
+                previous.path_quality_observation_stale_count,
+                current.path_quality_observation_stale_count,
+            )?,
+            path_mismatch: checked_signal_metric_delta(
+                "path-mismatched path quality observations",
+                previous.path_quality_observation_path_mismatch_count,
+                current.path_quality_observation_path_mismatch_count,
+            )?,
+            rejected: checked_signal_metric_delta(
+                "rejected path quality observations",
+                previous.path_quality_observation_rejected_count,
+                current.path_quality_observation_rejected_count,
+            )?,
+        })
+    }
+}
+
+fn checked_signal_metric_delta(label: &str, previous: u64, current: u64) -> anyhow::Result<u64> {
+    current.checked_sub(previous).with_context(|| {
+        format!(
+            "daemon Signal {label} counter regressed from {previous} to {current} during path quality probe"
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct StunFinalMetricsMeasurement {
     metrics_endpoints: usize,
@@ -4659,6 +4824,8 @@ struct DaemonRuntimeManifestMeasurement {
     relay_active_sessions_reported: usize,
     relay_final_metrics: RelayFinalMetricsMeasurement,
     signal_health_metrics: SignalHealthMetricsMeasurement,
+    #[serde(default)]
+    signal_path_quality_metrics: SignalPathQualityMetricsMeasurement,
     stun_final_metrics: StunFinalMetricsMeasurement,
     agent_status_metrics: AgentStatusMetricsMeasurement,
     agent_path_metrics: AgentPathMetricsMeasurement,
@@ -7882,28 +8049,24 @@ fn synthetic_path_quality_observation(
     }))
 }
 
-fn signal_path_quality_observation_total(metrics: &SignalMetricsResponse) -> anyhow::Result<usize> {
-    let total = [
-        metrics.path_quality_observation_accepted_count,
-        metrics.path_quality_observation_stale_count,
-        metrics.path_quality_observation_path_mismatch_count,
-        metrics.path_quality_observation_rejected_count,
-    ]
-    .into_iter()
-    .try_fold(0_u64, u64::checked_add)
-    .context("Signal path quality observation counters overflowed")?;
-    usize::try_from(total).context("Signal path quality observation count exceeds usize")
-}
-
 fn authenticated_signal_path_request(
     index: usize,
     request: SignalPathRequest,
     path_observation: Option<PathQualityObservation>,
 ) -> anyhow::Result<AuthenticatedSignalPathRequest> {
     let identity = identity_for_index(index);
+    authenticated_signal_path_request_for_identity(&identity, request, path_observation)
+}
+
+fn authenticated_signal_path_request_for_identity(
+    identity: &IdentityKeyPair,
+    request: SignalPathRequest,
+    path_observation: Option<PathQualityObservation>,
+) -> anyhow::Result<AuthenticatedSignalPathRequest> {
     anyhow::ensure!(
         request.source == identity.node_id(),
-        "synthetic signal path source identity does not match index {index}"
+        "signal path source identity does not match request source {}",
+        request.source
     );
     let mut authenticated = AuthenticatedSignalPathRequest {
         request,
@@ -8447,6 +8610,14 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         let daemon_report = valid_daemon_report_for_validation().await?;
         daemon_report.validate_success()?;
 
+        let mut missing_daemon_path_observation = daemon_report.clone();
+        missing_daemon_path_observation.path_quality_observations_accepted -= 1;
+        let error = match missing_daemon_path_observation.validate_success() {
+            Ok(_) => bail!("daemon report with missing path observation should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Signal accepted"));
+
         let mut missing_daemon_agent_status = daemon_report.clone();
         missing_daemon_agent_status.daemon_agent_status_endpoints -= 1;
         let error = match missing_daemon_agent_status.validate_success() {
@@ -8851,6 +9022,35 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             Err(error) => error.to_string(),
         };
         assert!(error.contains("final snapshot measurement"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
+        let mut mismatched_path_quality_measurement = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_path_quality_measurement,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_path_quality_measurement.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_path_quality_measurement.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            if let Some(measurement) = manifest.measurement.as_mut() {
+                measurement.signal_path_quality_metrics.accepted -= 1;
+            }
+        })?;
+        let error = match mismatched_path_quality_measurement.validate_success() {
+            Ok(_) => bail!(
+                "retained manifest with mismatched Signal path quality should fail validation"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Signal path quality measurement"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
         let mut mismatched_endpoint_summary_measurement = daemon_report.clone();
@@ -11457,6 +11657,7 @@ fi
         assert_eq!(report.registrations, 3);
         assert_eq!(report.peer_map_requests, 9);
         assert_eq!(report.peer_map_edges_seen, 6);
+        assert_reachable_path_quality_observations_accepted(&report);
         assert_eq!(report.daemon_processes, 8);
         let runtime_dir = report
             .daemon_runtime_dir
@@ -11494,6 +11695,10 @@ fi
         assert_eq!(
             manifest_measurement.signal_health_metrics,
             SignalHealthMetricsMeasurement::from_report(&report)
+        );
+        assert_eq!(
+            manifest_measurement.signal_path_quality_metrics,
+            SignalPathQualityMetricsMeasurement::from_report(&report)
         );
         assert_eq!(
             manifest_measurement.stun_final_metrics,
@@ -11676,6 +11881,19 @@ fi
     }
 
     #[test]
+    fn signal_path_quality_metric_delta_rejects_counter_regression() -> anyhow::Result<()> {
+        assert_eq!(
+            checked_signal_metric_delta("accepted observations", 7, 11)?,
+            4
+        );
+        let error = checked_signal_metric_delta("accepted observations", 11, 7)
+            .expect_err("regressed Signal counter should fail")
+            .to_string();
+        assert!(error.contains("regressed from 11 to 7"));
+        Ok(())
+    }
+
+    #[test]
     fn daemon_agent_path_expectation_caps_wrapped_active_pairs() {
         assert_eq!(expected_daemon_agent_path_count(30, 4), 12);
         assert_eq!(expected_daemon_agent_path_count(6, 3), 6);
@@ -11722,6 +11940,11 @@ fi
         report.direct_nat_paths = report.active_pair_count;
         report.relay_paths = 0;
         report.unreachable_paths = 0;
+        report.path_quality_observations_submitted = report.active_pair_count;
+        report.path_quality_observations_accepted = report.active_pair_count as u64;
+        report.path_quality_observations_stale = 0;
+        report.path_quality_observations_path_mismatch = 0;
+        report.path_quality_observations_rejected = 0;
         report.relay_packets_per_session = 1;
         report.relay_udp_packets_sent = report.active_pair_count;
         report.relay_udp_packets_received = report.active_pair_count;
@@ -12162,6 +12385,13 @@ fi
                 degraded_nodes: 0,
                 unhealthy_nodes: 0,
             },
+            signal_path_quality_metrics: SignalPathQualityMetricsMeasurement {
+                submitted: 6,
+                accepted: 6,
+                stale: 0,
+                path_mismatch: 0,
+                rejected: 0,
+            },
             stun_final_metrics: StunFinalMetricsMeasurement {
                 metrics_endpoints: 1,
                 listen_matches_expected: true,
@@ -12311,6 +12541,9 @@ fi
                     relay_active_sessions_reported: report.relay_active_sessions_reported,
                     relay_final_metrics: RelayFinalMetricsMeasurement::from_report(report),
                     signal_health_metrics: SignalHealthMetricsMeasurement::from_report(report),
+                    signal_path_quality_metrics: SignalPathQualityMetricsMeasurement::from_report(
+                        report,
+                    ),
                     stun_final_metrics: StunFinalMetricsMeasurement::from_report(report),
                     agent_status_metrics: AgentStatusMetricsMeasurement::from_report(report),
                     agent_path_metrics: AgentPathMetricsMeasurement::from_report(report),

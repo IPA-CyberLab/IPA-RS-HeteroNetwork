@@ -164,6 +164,7 @@ This file tracks the gap between the requested final system and the current repo
 - Daemon load failover reports now include survivor relay-candidate min/max and healthy/degraded/unhealthy node min/max in addition to survivor peer-map, path-state metric, and `/v1/paths/query` status checks.
 - Daemon load failover also revalidates each agent status and agent `/v1/paths` endpoint after one control-plane process is stopped, preserving the original node identity, endpoint candidates, and reachable runtime path state.
 - Daemon load failover sends a fresh payload through every already admitted relay UDP session after stopping one control-plane process and rejects runs where the existing relay data plane drops or corrupts that payload.
+- Multi-process daemon load path validation uses the persisted identity of each spawned Agent to sign a fresh baseline negotiation and matching path-quality observation for every reachable active pair, requires all Signal disposition deltas to be accepted with no stale/path-mismatch/rejected results, rejects counter regression, and records the deltas in the retained completed-run manifest.
 
 ## Remaining For Full Production Completion
 

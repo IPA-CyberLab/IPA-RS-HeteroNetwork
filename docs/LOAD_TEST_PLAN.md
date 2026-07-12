@@ -17,7 +17,7 @@ The 1000-node scenario samples active pairs rather than negotiating every possib
 - `in-memory`: exercises control-plane and signal services without HTTP.
 - `http`: drives loopback HTTP control-plane and signal endpoints.
 - `relay-udp`: adds Bearer-authenticated relay HTTP admission and UDP forwarding throughput checks.
-- `daemon`: spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored. Multiple control-plane processes share one SQLite store. Relay and Agents read a generated run-scoped admission credential from one owner-only file, and the harness removes that file after readiness.
+- `daemon`: spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored. Multiple control-plane processes share one SQLite store. Relay and Agents read a generated run-scoped admission credential from one owner-only file, and the harness removes that file after readiness. After agent path convergence, the harness uses each persisted agent identity to sign a baseline negotiation and path-quality observation for every active pair, then validates the Signal disposition counter deltas.
 
 ## Required Success Gates
 
