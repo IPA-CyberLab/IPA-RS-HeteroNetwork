@@ -18,12 +18,14 @@ use aya::programs::TracePoint;
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipars_agent::{
-    AgentError, AgentNodeState, AgentRuntime, FileAgentStateStore, KernelWireGuardBackend,
-    LinuxCommand, LinuxCommandRunner, LinuxWireGuardBackend, MemoryWireGuardBackend,
+    AgentError, AgentNodeState, AgentRuntime, CommandWireGuardPeerTelemetrySource,
+    FileAgentStateStore, KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand,
+    LinuxCommandRunner, LinuxWireGuardBackend, MemoryWireGuardBackend,
     NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier, PeerMapSink, PeerMapSource,
-    PeerMapSync, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
-    TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder, UserspaceWireGuardBackend,
-    WireGuardBackend,
+    PeerMapSync, PendingDirectPathProbe, RelayForwarderStats, RelaySessionState,
+    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
+    UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerTelemetry,
+    WireGuardPeerTelemetrySource,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -155,6 +157,10 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
+const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
+const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
+const DIRECT_PATH_HANDSHAKE_CLOCK_SKEW_SECONDS: i64 = 5;
 const MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
@@ -643,6 +649,18 @@ struct AgentArgs {
         default_value_t = 30
     )]
     signal_path_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS",
+        default_value_t = DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS
+    )]
+    direct_path_probe_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS",
+        default_value_t = DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
+    )]
+    direct_handshake_max_age_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_PACKET_FLOW_DETECTOR",
@@ -1449,6 +1467,29 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.signal_path_interval_seconds,
             "--signal-path-interval-seconds",
         )?;
+        validate_bounded_u64(
+            args.direct_path_probe_timeout_seconds,
+            "--direct-path-probe-timeout-seconds",
+            MAX_DIRECT_PATH_VERIFICATION_SECONDS,
+        )?;
+        validate_bounded_u64(
+            args.direct_handshake_max_age_seconds,
+            "--direct-handshake-max-age-seconds",
+            MAX_DIRECT_PATH_VERIFICATION_SECONDS,
+        )?;
+        anyhow::ensure!(
+            args.direct_handshake_max_age_seconds >= args.signal_path_interval_seconds,
+            "--direct-handshake-max-age-seconds must be at least --signal-path-interval-seconds"
+        );
+        if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
+            let minimum_probe_timeout = args
+                .peer_map_poll_interval_seconds
+                .saturating_add(args.signal_path_interval_seconds.saturating_mul(2));
+            anyhow::ensure!(
+                args.direct_path_probe_timeout_seconds >= minimum_probe_timeout,
+                "--direct-path-probe-timeout-seconds must be at least --peer-map-poll-interval-seconds plus two --signal-path-interval-seconds ({minimum_probe_timeout}s)"
+            );
+        }
         validate_positive_seconds(
             args.relay_session_renew_before_seconds,
             "--relay-session-renew-before-seconds",
@@ -5197,6 +5238,9 @@ struct AgentOtelSnapshot {
     relay_admission_failure_count: u64,
     relay_admission_failure_reason_counts: BTreeMap<AgentRelayAdmissionFailureReason, u64>,
     path_probe_record_count: u64,
+    direct_path_probe_started_count: u64,
+    direct_path_probe_confirmed_count: u64,
+    direct_path_probe_timeout_count: u64,
     peer_activity_record_count: u64,
     packet_flow_observation_count: u64,
     packet_flow_match_count: u64,
@@ -5234,6 +5278,9 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
                 .map(|entry| (entry.reason, entry.count))
                 .collect(),
             path_probe_record_count: metrics.path_probe_record_count,
+            direct_path_probe_started_count: metrics.direct_path_probe_started_count,
+            direct_path_probe_confirmed_count: metrics.direct_path_probe_confirmed_count,
+            direct_path_probe_timeout_count: metrics.direct_path_probe_timeout_count,
             peer_activity_record_count: metrics.peer_activity_record_count,
             packet_flow_observation_count: metrics.packet_flow_observation_count,
             packet_flow_match_count: metrics.packet_flow_match_count,
@@ -5293,6 +5340,9 @@ struct AgentOtelMetrics {
     relay_admission_failures: Counter<u64>,
     relay_admission_failures_by_reason: Counter<u64>,
     path_probe_records: Counter<u64>,
+    direct_path_probes_started: Counter<u64>,
+    direct_path_probes_confirmed: Counter<u64>,
+    direct_path_probes_timeout: Counter<u64>,
     peer_activity_records: Counter<u64>,
     packet_flow_observations: Counter<u64>,
     packet_flow_matches: Counter<u64>,
@@ -5442,6 +5492,22 @@ impl AgentOtelMetrics {
             path_probe_records: meter
                 .u64_counter("ipars.agent.path_probe.records")
                 .with_description("Path probe records accepted by the agent.")
+                .build(),
+            direct_path_probes_started: meter
+                .u64_counter("ipars.agent.direct_path.probes.started")
+                .with_description("Direct WireGuard path verification probes started.")
+                .build(),
+            direct_path_probes_confirmed: meter
+                .u64_counter("ipars.agent.direct_path.probes.confirmed")
+                .with_description(
+                    "Direct WireGuard path verification probes confirmed by handshake or transfer evidence.",
+                )
+                .build(),
+            direct_path_probes_timeout: meter
+                .u64_counter("ipars.agent.direct_path.probes.timeout")
+                .with_description(
+                    "Direct WireGuard path verification probes that expired without evidence.",
+                )
                 .build(),
             peer_activity_records: meter
                 .u64_counter("ipars.agent.peer_activity.records")
@@ -5803,6 +5869,30 @@ impl AgentOtelMetrics {
         );
         if path_probe_delta > 0 {
             self.path_probe_records.add(path_probe_delta, &node_attrs);
+        }
+        let direct_path_probe_started_delta = counter_delta(
+            metrics.direct_path_probe_started_count,
+            previous.map(|previous| previous.direct_path_probe_started_count),
+        );
+        if direct_path_probe_started_delta > 0 {
+            self.direct_path_probes_started
+                .add(direct_path_probe_started_delta, &node_attrs);
+        }
+        let direct_path_probe_confirmed_delta = counter_delta(
+            metrics.direct_path_probe_confirmed_count,
+            previous.map(|previous| previous.direct_path_probe_confirmed_count),
+        );
+        if direct_path_probe_confirmed_delta > 0 {
+            self.direct_path_probes_confirmed
+                .add(direct_path_probe_confirmed_delta, &node_attrs);
+        }
+        let direct_path_probe_timeout_delta = counter_delta(
+            metrics.direct_path_probe_timeout_count,
+            previous.map(|previous| previous.direct_path_probe_timeout_count),
+        );
+        if direct_path_probe_timeout_delta > 0 {
+            self.direct_path_probes_timeout
+                .add(direct_path_probe_timeout_delta, &node_attrs);
         }
         let peer_activity_delta = counter_delta(
             metrics.peer_activity_record_count,
@@ -6579,6 +6669,7 @@ async fn run_agent(
     } else {
         None
     };
+    let wireguard_peer_telemetry_source = agent_wireguard_peer_telemetry_source(&args)?;
     if let Some(task) = peer_map_task {
         background_tasks.push(task);
     }
@@ -6731,6 +6822,13 @@ async fn run_agent(
                     relay_admission_bearer_token: relay_admission_bearer_token.clone(),
                     relay_session_renew_before: Duration::from_secs(
                         args.relay_session_renew_before_seconds,
+                    ),
+                    wireguard_peer_telemetry_source: wireguard_peer_telemetry_source.clone(),
+                    direct_path_probe_timeout: Duration::from_secs(
+                        args.direct_path_probe_timeout_seconds,
+                    ),
+                    direct_handshake_max_age: Duration::from_secs(
+                        args.direct_handshake_max_age_seconds,
                     ),
                     interval: Duration::from_secs(args.signal_path_interval_seconds),
                 },
@@ -7621,6 +7719,49 @@ fn runtime_command_timeout(args: &AgentArgs) -> Duration {
 
 fn runtime_command_output_max_bytes(args: &AgentArgs) -> usize {
     args.runtime_command_output_max_bytes
+}
+
+fn agent_wireguard_peer_telemetry_source(
+    args: &AgentArgs,
+) -> anyhow::Result<Option<Arc<dyn WireGuardPeerTelemetrySource>>> {
+    if !args.apply_peer_map || args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
+        return Ok(None);
+    }
+    let namespace = args
+        .linux_netns
+        .as_deref()
+        .map(LinuxNetworkNamespace::from_name)
+        .transpose()?;
+    let source: Arc<dyn WireGuardPeerTelemetrySource> = match args.wireguard_backend {
+        WireGuardApplyBackend::Command | WireGuardApplyBackend::UserspaceCommand => match namespace
+        {
+            Some(namespace) => Arc::new(CommandWireGuardPeerTelemetrySource::new_in_namespace(
+                args.wireguard_interface.clone(),
+                namespace,
+                runtime_command_timeout(args),
+                runtime_command_output_max_bytes(args),
+            )),
+            None => Arc::new(CommandWireGuardPeerTelemetrySource::new(
+                args.wireguard_interface.clone(),
+                runtime_command_timeout(args),
+                runtime_command_output_max_bytes(args),
+            )),
+        },
+        WireGuardApplyBackend::KernelNetlink => match namespace {
+            Some(namespace) => Arc::new(
+                KernelWireGuardPeerTelemetrySource::new_in_namespace(
+                    args.wireguard_interface.clone(),
+                    namespace,
+                )
+                .with_timeout(runtime_command_timeout(args)),
+            ),
+            None => Arc::new(
+                KernelWireGuardPeerTelemetrySource::new(args.wireguard_interface.clone())
+                    .with_timeout(runtime_command_timeout(args)),
+            ),
+        },
+    };
+    Ok(Some(source))
 }
 
 #[derive(Debug, Clone)]
@@ -10243,7 +10384,194 @@ struct SignalPathNegotiationOptions {
     relay_forwarder_supervisor: Option<Arc<RelayForwarderSupervisor>>,
     relay_admission_bearer_token: Option<String>,
     relay_session_renew_before: Duration,
+    wireguard_peer_telemetry_source: Option<Arc<dyn WireGuardPeerTelemetrySource>>,
+    direct_path_probe_timeout: Duration,
+    direct_handshake_max_age: Duration,
     interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectPathVerificationDecision {
+    Disabled,
+    Confirmed(&'static str),
+    Start(PendingDirectPathProbe),
+    Pending,
+    Expired,
+    MissingCandidate,
+}
+
+async fn direct_path_verification_decision(
+    runtime: &AgentRuntime,
+    direct: &PathRecord,
+    telemetry_snapshot: Option<&BTreeMap<String, WireGuardPeerTelemetry>>,
+    verification_required: bool,
+    peer_public_key: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    probe_timeout: Duration,
+    handshake_max_age: Duration,
+) -> Result<DirectPathVerificationDecision, AgentError> {
+    if !verification_required {
+        return Ok(DirectPathVerificationDecision::Disabled);
+    }
+    let Some(candidate) = direct.selected_candidate.as_ref() else {
+        runtime
+            .remove_pending_direct_path_probe(&direct.key.remote)
+            .await;
+        return Ok(DirectPathVerificationDecision::MissingCandidate);
+    };
+    let telemetry = telemetry_snapshot.and_then(|snapshot| snapshot.get(peer_public_key));
+    if let Some(mut pending) = runtime.pending_direct_path_probe(&direct.key.remote).await {
+        if pending.targets(direct.selected_state, candidate) {
+            let active = pending.is_active_at(now);
+            if !active && direct_path_probe_confirmed(&pending, candidate, telemetry, now, false) {
+                runtime
+                    .remove_pending_direct_path_probe(&direct.key.remote)
+                    .await;
+                runtime.record_direct_path_probe_confirmed();
+                return Ok(DirectPathVerificationDecision::Confirmed(
+                    "wireguard_handshake",
+                ));
+            }
+            if !active {
+                runtime
+                    .remove_pending_direct_path_probe(&direct.key.remote)
+                    .await;
+                runtime.record_direct_path_probe_timeout();
+                return Ok(DirectPathVerificationDecision::Expired);
+            }
+            if let Some(telemetry) = telemetry {
+                if !direct_path_endpoint_matches(candidate, telemetry) {
+                    if pending.endpoint_observed_at.take().is_some() {
+                        pending.baseline_rx_bytes = None;
+                        pending.baseline_tx_bytes = None;
+                        runtime.upsert_pending_direct_path_probe(pending).await?;
+                    }
+                    return Ok(DirectPathVerificationDecision::Pending);
+                }
+                if pending.endpoint_observed_at.is_none() {
+                    pending.endpoint_observed_at = Some(now);
+                    pending.baseline_rx_bytes = Some(telemetry.rx_bytes);
+                    pending.baseline_tx_bytes = Some(telemetry.tx_bytes);
+                    runtime.upsert_pending_direct_path_probe(pending).await?;
+                    return Ok(DirectPathVerificationDecision::Pending);
+                }
+                if direct_path_probe_confirmed(&pending, candidate, Some(telemetry), now, true) {
+                    runtime
+                        .remove_pending_direct_path_probe(&direct.key.remote)
+                        .await;
+                    runtime.record_direct_path_probe_confirmed();
+                    let evidence = if pending.transfer_increased(telemetry) {
+                        "wireguard_transfer"
+                    } else {
+                        "wireguard_handshake"
+                    };
+                    return Ok(DirectPathVerificationDecision::Confirmed(evidence));
+                }
+            }
+            return Ok(DirectPathVerificationDecision::Pending);
+        }
+        runtime
+            .remove_pending_direct_path_probe(&direct.key.remote)
+            .await;
+    }
+
+    let current_direct_matches = runtime
+        .path_record_for_peer(&direct.key.remote)
+        .await
+        .is_some_and(|current| {
+            direct_path_record_targets(&current, direct.selected_state, candidate)
+        });
+    if current_direct_matches
+        && direct_path_telemetry_is_recent(candidate, telemetry, now, handshake_max_age)
+    {
+        return Ok(DirectPathVerificationDecision::Confirmed(
+            "recent_wireguard_handshake",
+        ));
+    }
+
+    let timeout = chrono::Duration::from_std(probe_timeout).map_err(|error| {
+        AgentError::PathProbeRejected(format!(
+            "direct path probe timeout is out of range: {error}"
+        ))
+    })?;
+    Ok(DirectPathVerificationDecision::Start(
+        PendingDirectPathProbe {
+            selected_state: direct.selected_state,
+            selected_candidate: candidate.clone(),
+            started_at: now,
+            expires_at: now + timeout,
+            endpoint_observed_at: None,
+            baseline_rx_bytes: None,
+            baseline_tx_bytes: None,
+        },
+    ))
+}
+
+fn direct_path_probe_confirmed(
+    pending: &PendingDirectPathProbe,
+    candidate: &EndpointCandidate,
+    telemetry: Option<&WireGuardPeerTelemetry>,
+    now: chrono::DateTime<chrono::Utc>,
+    active: bool,
+) -> bool {
+    let Some(telemetry) = telemetry else {
+        return false;
+    };
+    if !direct_path_endpoint_matches(candidate, telemetry) {
+        return false;
+    }
+    let Some(endpoint_observed_at) = pending.endpoint_observed_at else {
+        return false;
+    };
+    let skew = chrono::Duration::seconds(DIRECT_PATH_HANDSHAKE_CLOCK_SKEW_SECONDS);
+    let fresh_handshake = telemetry.latest_handshake_at.is_some_and(|handshake| {
+        handshake >= endpoint_observed_at
+            && handshake <= now + skew
+            && handshake <= pending.expires_at + skew
+    });
+    fresh_handshake || (active && pending.transfer_increased(telemetry))
+}
+
+fn direct_path_endpoint_matches(
+    candidate: &EndpointCandidate,
+    telemetry: &WireGuardPeerTelemetry,
+) -> bool {
+    let expected_endpoint = candidate.addr.to_string();
+    telemetry.endpoint.as_deref() == Some(expected_endpoint.as_str())
+}
+
+fn direct_path_record_targets(
+    record: &PathRecord,
+    state: PathState,
+    candidate: &EndpointCandidate,
+) -> bool {
+    record.selected_state == state
+        && record.selected_candidate.as_ref().is_some_and(|selected| {
+            selected.node_id == candidate.node_id
+                && selected.kind == candidate.kind
+                && selected.addr == candidate.addr
+        })
+}
+
+fn direct_path_telemetry_is_recent(
+    candidate: &EndpointCandidate,
+    telemetry: Option<&WireGuardPeerTelemetry>,
+    now: chrono::DateTime<chrono::Utc>,
+    handshake_max_age: Duration,
+) -> bool {
+    let Some(telemetry) = telemetry else {
+        return false;
+    };
+    if !direct_path_endpoint_matches(candidate, telemetry) {
+        return false;
+    }
+    let Ok(max_age) = chrono::Duration::from_std(handshake_max_age) else {
+        return false;
+    };
+    let skew = chrono::Duration::seconds(DIRECT_PATH_HANDSHAKE_CLOCK_SKEW_SECONDS);
+    telemetry
+        .latest_handshake_at
+        .is_some_and(|handshake| handshake >= now - max_age && handshake <= now + skew)
 }
 
 fn start_signal_path_negotiation(
@@ -10311,7 +10639,24 @@ async fn negotiate_signal_paths(
             .context("failed to fetch peer map for signal negotiation")?;
 
     let peer_set = signal_negotiation_peer_set(runtime, peer_map).await;
+    let verification_required = options.wireguard_peer_telemetry_source.is_some();
+    let telemetry_snapshot = if let Some(source) = options.wireguard_peer_telemetry_source.as_ref()
+    {
+        match source.snapshot().await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to read WireGuard peer telemetry; pending direct probes remain unconfirmed"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     for peer in peer_set.skipped {
+        runtime.remove_pending_direct_path_probe(&peer).await;
         remove_relay_session_for_peer(
             runtime,
             options.relay_forwarder_supervisor.as_ref(),
@@ -10332,52 +10677,130 @@ async fn negotiate_signal_paths(
         let candidate_record = signal_path_record(response, chrono::Utc::now());
         let (mut record, mut path_selection) =
             stable_signal_path_record(runtime, candidate_record).await;
-        if record.selected_state == PathState::DirectNatTraversal {
-            let hole_punch_result =
-                match fetch_hole_punch_plan(client, &signal_url, &record.key, &identity).await {
-                    Ok(plan) => {
-                        hole_puncher
-                            .execute(&status.node_id, &plan)
-                            .await
-                            .map(|attempts| {
-                                tracing::info!(
-                                    attempts,
-                                    peer = %record.key.remote,
-                                    "executed UDP hole punch plan"
-                                );
-                            })
-                    }
-                    Err(error) => Err(AgentError::HolePunch(format!(
-                        "failed to fetch UDP hole punch plan: {error:#}"
-                    ))),
-                };
-            if let Err(error) = hole_punch_result {
-                tracing::warn!(
-                    %error,
-                    peer = %record.key.remote,
-                    "failed to prepare direct NAT traversal path"
-                );
-                if let Some(fallback) = relay_fallback_path_record(&record, &relay_candidates) {
-                    tracing::warn!(
-                        peer = %record.key.remote,
-                        relay = ?fallback.relay_node,
-                        "falling back to relay after direct NAT traversal setup failed"
-                    );
-                    record = fallback;
-                    path_selection = StableSignalPathSelection::Candidate;
-                } else {
-                    record = unreachable_path_record(
+        if record.selected_state.is_direct()
+            && path_selection == StableSignalPathSelection::Candidate
+        {
+            let now = chrono::Utc::now();
+            let decision = direct_path_verification_decision(
+                runtime,
+                &record,
+                telemetry_snapshot.as_ref(),
+                verification_required,
+                &peer.wireguard_public_key,
+                now,
+                options.direct_path_probe_timeout,
+                options.direct_handshake_max_age,
+            )
+            .await?;
+            match decision {
+                DirectPathVerificationDecision::Disabled => {
+                    if let Err(error) = prepare_direct_nat_traversal(
+                        client,
+                        &signal_url,
+                        &status.node_id,
+                        &identity,
                         &record,
-                        "direct_nat_traversal_failed",
-                        chrono::Utc::now(),
+                        hole_puncher,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            peer = %record.key.remote,
+                            "failed to prepare direct NAT traversal path"
+                        );
+                        (record, path_selection) = direct_path_failure_record(
+                            &record,
+                            &relay_candidates,
+                            "direct_nat_traversal_failed",
+                            now,
+                        );
+                    }
+                }
+                DirectPathVerificationDecision::Confirmed(evidence) => {
+                    tracing::info!(
+                        peer = %record.key.remote,
+                        state = ?record.selected_state,
+                        evidence,
+                        "verified direct WireGuard path"
                     );
-                    path_selection = StableSignalPathSelection::Candidate;
+                }
+                DirectPathVerificationDecision::Start(probe) => {
+                    if let Err(error) = prepare_direct_nat_traversal(
+                        client,
+                        &signal_url,
+                        &status.node_id,
+                        &identity,
+                        &record,
+                        hole_puncher,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            peer = %record.key.remote,
+                            "failed to prepare direct NAT traversal path"
+                        );
+                        (record, path_selection) = direct_path_failure_record(
+                            &record,
+                            &relay_candidates,
+                            "direct_nat_traversal_failed",
+                            now,
+                        );
+                    } else {
+                        runtime.upsert_pending_direct_path_probe(probe).await?;
+                        runtime.record_direct_path_probe_started();
+                        tracing::info!(
+                            peer = %record.key.remote,
+                            state = ?record.selected_state,
+                            timeout_seconds = options.direct_path_probe_timeout.as_secs(),
+                            "started direct WireGuard path verification"
+                        );
+                        (record, path_selection) = retain_path_during_direct_probe(
+                            runtime,
+                            &record,
+                            &relay_candidates,
+                            now,
+                        )
+                        .await;
+                    }
+                }
+                DirectPathVerificationDecision::Pending => {
+                    (record, path_selection) =
+                        retain_path_during_direct_probe(runtime, &record, &relay_candidates, now)
+                            .await;
+                }
+                DirectPathVerificationDecision::Expired => {
                     tracing::warn!(
                         peer = %record.key.remote,
-                        "direct NAT traversal setup failed and no relay fallback candidate was available; marking path unreachable"
+                        state = ?record.selected_state,
+                        "direct WireGuard path verification expired"
+                    );
+                    (record, path_selection) = direct_path_failure_record(
+                        &record,
+                        &relay_candidates,
+                        "direct_path_probe_timeout",
+                        now,
+                    );
+                }
+                DirectPathVerificationDecision::MissingCandidate => {
+                    tracing::warn!(
+                        peer = %record.key.remote,
+                        state = ?record.selected_state,
+                        "signal selected a direct path without a usable candidate"
+                    );
+                    (record, path_selection) = direct_path_failure_record(
+                        &record,
+                        &relay_candidates,
+                        "direct_candidate_missing",
+                        now,
                     );
                 }
             }
+        } else {
+            runtime
+                .remove_pending_direct_path_probe(&peer.node_id)
+                .await;
         }
         if record.selected_state == PathState::Relay
             && path_selection == StableSignalPathSelection::Candidate
@@ -10551,6 +10974,72 @@ async fn negotiate_signal_paths(
         runtime.upsert_path_state(record).await?;
     }
     Ok(())
+}
+
+async fn prepare_direct_nat_traversal(
+    client: &reqwest::Client,
+    signal_url: &str,
+    local_node: &NodeId,
+    identity: &IdentityKeyPair,
+    direct: &PathRecord,
+    hole_puncher: &UdpHolePuncher,
+) -> Result<(), AgentError> {
+    if direct.selected_state != PathState::DirectNatTraversal {
+        return Ok(());
+    }
+    let plan = fetch_hole_punch_plan(client, signal_url, &direct.key, identity)
+        .await
+        .map_err(|error| {
+            AgentError::HolePunch(format!("failed to fetch UDP hole punch plan: {error:#}"))
+        })?;
+    let attempts = hole_puncher.execute(local_node, &plan).await?;
+    tracing::info!(
+        attempts,
+        peer = %direct.key.remote,
+        "executed UDP hole punch plan"
+    );
+    Ok(())
+}
+
+async fn retain_path_during_direct_probe(
+    runtime: &AgentRuntime,
+    direct: &PathRecord,
+    relay_candidates: &[NodeRecord],
+    now: chrono::DateTime<chrono::Utc>,
+) -> (PathRecord, StableSignalPathSelection) {
+    if let Some(mut current) = runtime.path_record_for_peer(&direct.key.remote).await {
+        if current.selected_state == PathState::Relay
+            && active_relay_session(runtime, &direct.key.remote)
+                .await
+                .is_some()
+        {
+            current.updated_at = now;
+            if !current
+                .score
+                .reasons
+                .iter()
+                .any(|reason| reason == "direct_path_probe_pending")
+            {
+                current
+                    .score
+                    .reasons
+                    .push("direct_path_probe_pending".to_string());
+            }
+            return (current, StableSignalPathSelection::CurrentRelay);
+        }
+    }
+    direct_path_failure_record(direct, relay_candidates, "direct_path_probe_pending", now)
+}
+
+fn direct_path_failure_record(
+    direct: &PathRecord,
+    relay_candidates: &[NodeRecord],
+    reason: &'static str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (PathRecord, StableSignalPathSelection) {
+    let record = relay_fallback_path_record_with_reason(direct, relay_candidates, reason, now)
+        .unwrap_or_else(|| unreachable_path_record(direct, reason, now));
+    (record, StableSignalPathSelection::Candidate)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11366,9 +11855,24 @@ fn unreachable_path_record(
     }
 }
 
+#[cfg(test)]
 fn relay_fallback_path_record(
     direct_record: &PathRecord,
     relay_candidates: &[NodeRecord],
+) -> Option<PathRecord> {
+    relay_fallback_path_record_with_reason(
+        direct_record,
+        relay_candidates,
+        "direct_nat_traversal_failed",
+        chrono::Utc::now(),
+    )
+}
+
+fn relay_fallback_path_record_with_reason(
+    direct_record: &PathRecord,
+    relay_candidates: &[NodeRecord],
+    reason: &'static str,
+    updated_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<PathRecord> {
     let relay = relay_candidates.first()?;
     let relay_load = relay.relay_capability.as_ref().map(|capability| {
@@ -11387,16 +11891,14 @@ fn relay_fallback_path_record(
         true,
         0,
     );
-    score
-        .reasons
-        .push("direct_nat_traversal_failed".to_string());
+    score.reasons.push(reason.to_string());
     Some(PathRecord {
         key: direct_record.key.clone(),
         selected_state: PathState::Relay,
         selected_candidate: None,
         relay_node: Some(relay.node_id.clone()),
         score,
-        updated_at: chrono::Utc::now(),
+        updated_at,
         pinned: direct_record.pinned,
     })
 }
@@ -13828,6 +14330,16 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct EmptyWireGuardPeerTelemetrySource;
+
+    #[async_trait]
+    impl WireGuardPeerTelemetrySource for EmptyWireGuardPeerTelemetrySource {
+        async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
+            Ok(BTreeMap::new())
+        }
+    }
+
     #[tokio::test]
     async fn peer_map_sync_uses_negotiated_path_without_relay_forwarder_config(
     ) -> anyhow::Result<()> {
@@ -15544,6 +16056,9 @@ mod tests {
                 observed_route_count: 2,
             },
             path_probe_record_count: 4,
+            direct_path_probe_started_count: 5,
+            direct_path_probe_confirmed_count: 3,
+            direct_path_probe_timeout_count: 2,
             peer_activity_record_count: 2,
             packet_flow_observation_count: 3,
             packet_flow_match_count: 2,
@@ -15723,6 +16238,9 @@ mod tests {
                 .get(&AgentPacketFlowDuplicateSource::EbpfRingbuf),
             Some(&5)
         );
+        assert_eq!(previous.direct_path_probe_started_count, 5);
+        assert_eq!(previous.direct_path_probe_confirmed_count, 3);
+        assert_eq!(previous.direct_path_probe_timeout_count, 2);
         assert!(agent_forwarder_deltas(&metrics, Some(&previous)).is_empty());
     }
 
@@ -16835,6 +17353,14 @@ mod tests {
             );
             assert_eq!(args.runtime_command_timeout_seconds, 30);
             assert_eq!(args.runtime_command_output_max_bytes, 65_536);
+            assert_eq!(
+                args.direct_path_probe_timeout_seconds,
+                DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS
+            );
+            assert_eq!(
+                args.direct_handshake_max_age_seconds,
+                DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
+            );
             return Ok(());
         }
 
@@ -23740,6 +24266,48 @@ exec sleep 60
                 "--signal-path-interval-seconds must be greater than zero",
             ),
             (
+                vec!["iparsd", "agent", "--direct-path-probe-timeout-seconds", "0"],
+                "--direct-path-probe-timeout-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--direct-handshake-max-age-seconds", "0"],
+                "--direct-handshake-max-age-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--direct-path-probe-timeout-seconds",
+                    "86401",
+                ],
+                "--direct-path-probe-timeout-seconds must not exceed 86400",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--signal-path-interval-seconds",
+                    "31",
+                    "--direct-handshake-max-age-seconds",
+                    "30",
+                ],
+                "--direct-handshake-max-age-seconds must be at least --signal-path-interval-seconds",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-peer-map",
+                    "--peer-map-poll-interval-seconds",
+                    "30",
+                    "--signal-path-interval-seconds",
+                    "30",
+                    "--direct-path-probe-timeout-seconds",
+                    "59",
+                ],
+                "--direct-path-probe-timeout-seconds must be at least --peer-map-poll-interval-seconds plus two --signal-path-interval-seconds",
+            ),
+            (
                 vec![
                     "iparsd",
                     "agent",
@@ -26137,6 +26705,9 @@ exec sleep 60
                 relay_forwarder_supervisor: None,
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
+                wireguard_peer_telemetry_source: None,
+                direct_path_probe_timeout: Duration::from_secs(120),
+                direct_handshake_max_age: Duration::from_secs(180),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26247,6 +26818,9 @@ exec sleep 60
                 relay_forwarder_supervisor: None,
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
+                wireguard_peer_telemetry_source: None,
+                direct_path_probe_timeout: Duration::from_secs(120),
+                direct_handshake_max_age: Duration::from_secs(180),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26369,6 +26943,9 @@ exec sleep 60
                 relay_forwarder_supervisor: None,
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(120),
+                wireguard_peer_telemetry_source: None,
+                direct_path_probe_timeout: Duration::from_secs(120),
+                direct_handshake_max_age: Duration::from_secs(180),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26398,6 +26975,161 @@ exec sleep 60
 
         signal_task.abort();
         control_plane_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_keeps_relay_until_direct_wireguard_probe_is_verified(
+    ) -> anyhow::Result<()> {
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-a"),
+                session_id: RelaySessionId::new(&request.left, &request.right)
+                    .as_str()
+                    .to_string(),
+                session_token: "token-a".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40_000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![candidate("peer-a", EndpointCandidateKind::PublicUdp, 10)];
+        runtime
+            .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+            .await;
+
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay = node_record("relay-a");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51_820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/query",
+                axum::routing::post(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let signal_response = SignalPathResponse {
+            key: PeerPathKey::new(local, peer.node_id.clone()),
+            target_candidates: peer.endpoint_candidates.clone(),
+            relay_candidates: vec![relay],
+            preferred_state: PathState::DirectPublic,
+            score: PathScore {
+                value: 115.0,
+                reasons: Vec::new(),
+            },
+        };
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(move || async move { axum::Json(signal_response.clone()) }),
+        ))
+        .await?;
+        let options = SignalPathNegotiationOptions {
+            relay_forwarder_supervisor: None,
+            relay_admission_bearer_token: None,
+            relay_session_renew_before: Duration::from_secs(30),
+            wireguard_peer_telemetry_source: Some(Arc::new(EmptyWireGuardPeerTelemetrySource)),
+            direct_path_probe_timeout: Duration::from_millis(1),
+            direct_handshake_max_age: Duration::from_secs(180),
+            interval: Duration::from_secs(1),
+        };
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            std::slice::from_ref(&control_plane_base),
+            std::slice::from_ref(&signal_base),
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &options,
+        )
+        .await?;
+
+        let pending_record = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay path should remain active during direct verification")?;
+        assert_eq!(pending_record.selected_state, PathState::Relay);
+        assert!(pending_record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_path_probe_pending"));
+        assert!(runtime
+            .pending_direct_path_probe(&peer.node_id)
+            .await
+            .is_some());
+        assert!(runtime.relay_session(&peer.node_id).await.is_some());
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &options,
+        )
+        .await?;
+
+        let fallback = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay fallback path should remain active")?;
+        assert_eq!(fallback.selected_state, PathState::Relay);
+        assert!(fallback
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_path_probe_timeout"));
+        assert!(runtime
+            .pending_direct_path_probe(&peer.node_id)
+            .await
+            .is_none());
+        assert!(runtime.relay_session(&peer.node_id).await.is_some());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.direct_path_probe_started_count, 1);
+        assert_eq!(metrics.direct_path_probe_confirmed_count, 0);
+        assert_eq!(metrics.direct_path_probe_timeout_count, 1);
+
+        signal_task.abort();
+        control_plane_task.abort();
+        relay_task.abort();
         Ok(())
     }
 
@@ -26500,6 +27232,9 @@ exec sleep 60
                 relay_forwarder_supervisor: None,
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
+                wireguard_peer_telemetry_source: None,
+                direct_path_probe_timeout: Duration::from_secs(120),
+                direct_handshake_max_age: Duration::from_secs(180),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26595,6 +27330,9 @@ exec sleep 60
                 relay_forwarder_supervisor: None,
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
+                wireguard_peer_telemetry_source: None,
+                direct_path_probe_timeout: Duration::from_secs(120),
+                direct_handshake_max_age: Duration::from_secs(180),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26908,6 +27646,204 @@ exec sleep 60
 
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_path_verification_requires_post_switch_wireguard_evidence() -> anyhow::Result<()>
+    {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let runtime = AgentRuntime::new(AgentNodeState::generate(now), ClusterPolicy::default());
+        let public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let selected_candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let direct = PathRecord {
+            key: PeerPathKey::new(runtime.state().node_id, NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(selected_candidate.clone()),
+            relay_node: None,
+            score: PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0),
+            updated_at: now,
+            pinned: false,
+        };
+
+        let preexisting_telemetry = BTreeMap::from([(
+            public_key.to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: public_key.to_string(),
+                endpoint: Some(selected_candidate.addr.to_string()),
+                latest_handshake_at: Some(now - ChronoDuration::seconds(1)),
+                rx_bytes: 10,
+                tx_bytes: 20,
+            },
+        )]);
+        let decision = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&preexisting_telemetry),
+            true,
+            public_key,
+            now,
+            Duration::from_secs(120),
+            Duration::from_secs(180),
+        )
+        .await?;
+        let DirectPathVerificationDecision::Start(probe) = decision else {
+            anyhow::bail!("expected a pending direct path probe")
+        };
+        assert_eq!(probe.baseline_rx_bytes, None);
+        runtime
+            .upsert_pending_direct_path_probe(probe.clone())
+            .await?;
+
+        let mut telemetry = BTreeMap::from([(
+            public_key.to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: public_key.to_string(),
+                endpoint: Some(selected_candidate.addr.to_string()),
+                latest_handshake_at: Some(now + ChronoDuration::seconds(2)),
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+        )]);
+        let activated = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&telemetry),
+            true,
+            public_key,
+            now + ChronoDuration::seconds(3),
+            Duration::from_secs(120),
+            Duration::from_secs(180),
+        )
+        .await?;
+        assert_eq!(activated, DirectPathVerificationDecision::Pending);
+        let pending = runtime
+            .pending_direct_path_probe(&direct.key.remote)
+            .await
+            .context("candidate endpoint should be observed before confirmation")?;
+        assert_eq!(
+            pending.endpoint_observed_at,
+            Some(now + ChronoDuration::seconds(3))
+        );
+        telemetry
+            .get_mut(public_key)
+            .context("peer telemetry")?
+            .latest_handshake_at = Some(now + ChronoDuration::seconds(4));
+
+        let confirmed = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&telemetry),
+            true,
+            public_key,
+            now + ChronoDuration::seconds(5),
+            Duration::from_secs(120),
+            Duration::from_secs(180),
+        )
+        .await?;
+
+        assert_eq!(
+            confirmed,
+            DirectPathVerificationDecision::Confirmed("wireguard_handshake")
+        );
+        assert!(runtime
+            .pending_direct_path_probe(&direct.key.remote)
+            .await
+            .is_none());
+        assert_eq!(runtime.metrics().await.direct_path_probe_confirmed_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_path_verification_accepts_transfer_growth_and_expires_without_evidence(
+    ) -> anyhow::Result<()> {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let runtime = AgentRuntime::new(AgentNodeState::generate(now), ClusterPolicy::default());
+        let public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let selected_candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let direct = PathRecord {
+            key: PeerPathKey::new(runtime.state().node_id, NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(selected_candidate.clone()),
+            relay_node: None,
+            score: PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0),
+            updated_at: now,
+            pinned: false,
+        };
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: selected_candidate.clone(),
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(120),
+                endpoint_observed_at: Some(now),
+                baseline_rx_bytes: Some(100),
+                baseline_tx_bytes: Some(200),
+            })
+            .await?;
+        let telemetry = BTreeMap::from([(
+            public_key.to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: public_key.to_string(),
+                endpoint: Some(selected_candidate.addr.to_string()),
+                latest_handshake_at: None,
+                rx_bytes: 101,
+                tx_bytes: 200,
+            },
+        )]);
+
+        let confirmed = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&telemetry),
+            true,
+            public_key,
+            now + ChronoDuration::seconds(30),
+            Duration::from_secs(120),
+            Duration::from_secs(180),
+        )
+        .await?;
+        assert_eq!(
+            confirmed,
+            DirectPathVerificationDecision::Confirmed("wireguard_transfer")
+        );
+
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate,
+                started_at: now - ChronoDuration::seconds(121),
+                expires_at: now - ChronoDuration::seconds(1),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: Some(101),
+                baseline_tx_bytes: Some(200),
+            })
+            .await?;
+        let expired = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            None,
+            true,
+            public_key,
+            now,
+            Duration::from_secs(120),
+            Duration::from_secs(180),
+        )
+        .await?;
+        assert_eq!(expired, DirectPathVerificationDecision::Expired);
+        assert!(runtime
+            .pending_direct_path_probe(&direct.key.remote)
+            .await
+            .is_none());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.direct_path_probe_confirmed_count, 1);
+        assert_eq!(metrics.direct_path_probe_timeout_count, 1);
+        Ok(())
     }
 
     #[tokio::test]

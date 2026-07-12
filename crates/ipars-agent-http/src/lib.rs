@@ -1158,6 +1158,45 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_direct_path_probes_started_total Direct WireGuard path verification probes started by the agent."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_direct_path_probes_started_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_direct_path_probes_started_total{{node_id=\"{node_id}\"}} {}",
+        metrics.direct_path_probe_started_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_direct_path_probes_confirmed_total Direct WireGuard path verification probes confirmed by handshake or transfer evidence."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_direct_path_probes_confirmed_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_direct_path_probes_confirmed_total{{node_id=\"{node_id}\"}} {}",
+        metrics.direct_path_probe_confirmed_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_agent_direct_path_probes_timeout_total Direct WireGuard path verification probes that expired without evidence."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_direct_path_probes_timeout_total counter"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_direct_path_probes_timeout_total{{node_id=\"{node_id}\"}} {}",
+        metrics.direct_path_probe_timeout_count
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_packet_flow_observations_total Packet-flow observations submitted to lazy-connect resolution."
     );
     prometheus_line!(
@@ -1533,6 +1572,9 @@ mod tests {
                 observed_route_count: 0,
             },
             path_probe_record_count: 0,
+            direct_path_probe_started_count: 0,
+            direct_path_probe_confirmed_count: 0,
+            direct_path_probe_timeout_count: 0,
             peer_activity_record_count: 0,
             packet_flow_observation_count: 0,
             packet_flow_match_count: 0,
@@ -1553,6 +1595,15 @@ mod tests {
         )));
         assert!(body.contains(&format!(
             "ipars_agent_path_change_events_dropped_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_direct_path_probes_started_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_direct_path_probes_confirmed_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_direct_path_probes_timeout_total{{node_id=\"{prometheus_node_id}\"}} 0"
         )));
 
         for source in AgentPacketFlowDuplicateSource::ALL {

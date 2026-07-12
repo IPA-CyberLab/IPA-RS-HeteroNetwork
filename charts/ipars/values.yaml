@@ -33,6 +33,9 @@ agent:
   http:
     connectTimeoutSeconds: 5
     requestTimeoutSeconds: 30
+  directPathVerification:
+    probeTimeoutSeconds: 120
+    handshakeMaxAgeSeconds: 180
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   apiBearerTokenSecretKey: agent-api-token

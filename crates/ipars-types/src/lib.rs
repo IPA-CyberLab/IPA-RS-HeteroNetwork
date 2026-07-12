@@ -17320,6 +17320,12 @@ pub mod api {
         pub path_state_counts: Vec<PathStateCount>,
         pub lazy_connect: LazyConnectMetrics,
         pub path_probe_record_count: u64,
+        #[serde(default)]
+        pub direct_path_probe_started_count: u64,
+        #[serde(default)]
+        pub direct_path_probe_confirmed_count: u64,
+        #[serde(default)]
+        pub direct_path_probe_timeout_count: u64,
         pub peer_activity_record_count: u64,
         pub packet_flow_observation_count: u64,
         pub packet_flow_match_count: u64,

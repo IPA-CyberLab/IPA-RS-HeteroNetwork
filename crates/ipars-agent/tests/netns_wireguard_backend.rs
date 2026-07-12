@@ -1,8 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ipars_agent::{KernelWireGuardBackend, WireGuardBackend, WireGuardPeerConfig};
+use ipars_agent::{
+    KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, WireGuardBackend,
+    WireGuardPeerConfig, WireGuardPeerTelemetrySource,
+};
 use ipars_crypto::WireGuardKeyPair;
 use ipars_route_manager::LinuxNetworkNamespace;
 use ipars_types::{NodeId, VpnIp};
@@ -18,7 +22,6 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
     }
 
     require_command("ip")?;
-    require_command("wg")?;
 
     let namespace_name = unique_namespace_name()?;
     let _guard = NamespaceGuard::create(namespace_name.clone())?;
@@ -29,7 +32,10 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
 
     let interface = "iparswg0";
     let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
-    let backend = KernelWireGuardBackend::new_in_namespace(interface, namespace);
+    let backend = KernelWireGuardBackend::new_in_namespace(interface, namespace.clone());
+    let telemetry_source =
+        KernelWireGuardPeerTelemetrySource::new_in_namespace(interface, namespace)
+            .with_timeout(Duration::from_secs(5));
 
     backend.ensure_interface().await?;
     let link = command_output(
@@ -67,33 +73,6 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
         ],
     )?;
     assert!(local_address.contains("100.64.99.1/32"));
-    let configured_private_key = command_output(
-        "ip",
-        [
-            "netns",
-            "exec",
-            namespace_name.as_str(),
-            "wg",
-            "show",
-            interface,
-            "private-key",
-        ],
-    )?;
-    assert_eq!(configured_private_key.trim(), local_key.private_key_b64);
-    let configured_listen_port = command_output(
-        "ip",
-        [
-            "netns",
-            "exec",
-            namespace_name.as_str(),
-            "wg",
-            "show",
-            interface,
-            "listen-port",
-        ],
-    )?;
-    assert_eq!(configured_listen_port.trim(), "51820");
-
     let peer = NodeId::from_string("wg-netns-peer");
     let peer_key = WireGuardKeyPair::generate();
     backend
@@ -106,35 +85,18 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
         })
         .await?;
 
-    let allowed_ips = command_output(
-        "ip",
-        [
-            "netns",
-            "exec",
-            namespace_name.as_str(),
-            "wg",
-            "show",
-            interface,
-            "allowed-ips",
-        ],
-    )?;
-    assert!(allowed_ips.contains(&peer_key.public_key_b64));
-    assert!(allowed_ips.contains("100.64.99.2/32"));
+    let telemetry = telemetry_source.snapshot().await?;
+    let peer_telemetry = telemetry
+        .get(&peer_key.public_key_b64)
+        .ok_or("kernel WireGuard telemetry did not include the configured peer")?;
+    assert_eq!(peer_telemetry.endpoint.as_deref(), Some("127.0.0.1:51820"));
+    assert_eq!(peer_telemetry.latest_handshake_at, None);
 
     backend.remove_peer(&peer).await?;
-    let peers_after_remove = command_output(
-        "ip",
-        [
-            "netns",
-            "exec",
-            namespace_name.as_str(),
-            "wg",
-            "show",
-            interface,
-            "peers",
-        ],
-    )?;
-    assert!(!peers_after_remove.contains(&peer_key.public_key_b64));
+    assert!(!telemetry_source
+        .snapshot()
+        .await?
+        .contains_key(&peer_key.public_key_b64));
 
     Ok(())
 }

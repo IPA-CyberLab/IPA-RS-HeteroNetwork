@@ -445,6 +445,7 @@ pub struct AgentRuntime {
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
+    pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     path_change_event_total_count: AtomicU64,
     path_change_event_dropped_count: AtomicU64,
@@ -458,6 +459,9 @@ pub struct AgentRuntime {
     relay_admission_failure_count: AtomicU64,
     relay_admission_failure_reason_counters: AgentRelayAdmissionFailureReasonCounters,
     path_probe_record_count: AtomicU64,
+    direct_path_probe_started_count: AtomicU64,
+    direct_path_probe_confirmed_count: AtomicU64,
+    direct_path_probe_timeout_count: AtomicU64,
     peer_activity_record_count: AtomicU64,
     packet_flow_observation_count: AtomicU64,
     packet_flow_match_count: AtomicU64,
@@ -1104,6 +1108,7 @@ impl AgentRuntime {
             nat_classification: tokio::sync::RwLock::new(None),
             latest_peer_map: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
+            pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             path_change_event_total_count: AtomicU64::new(0),
             path_change_event_dropped_count: AtomicU64::new(0),
@@ -1118,6 +1123,9 @@ impl AgentRuntime {
             relay_admission_failure_reason_counters:
                 AgentRelayAdmissionFailureReasonCounters::default(),
             path_probe_record_count: AtomicU64::new(0),
+            direct_path_probe_started_count: AtomicU64::new(0),
+            direct_path_probe_confirmed_count: AtomicU64::new(0),
+            direct_path_probe_timeout_count: AtomicU64::new(0),
             peer_activity_record_count: AtomicU64::new(0),
             packet_flow_observation_count: AtomicU64::new(0),
             packet_flow_match_count: AtomicU64::new(0),
@@ -1531,6 +1539,15 @@ impl AgentRuntime {
                 .collect(),
             lazy_connect: lazy_connect.metrics(),
             path_probe_record_count: self.path_probe_record_count.load(Ordering::Relaxed),
+            direct_path_probe_started_count: self
+                .direct_path_probe_started_count
+                .load(Ordering::Relaxed),
+            direct_path_probe_confirmed_count: self
+                .direct_path_probe_confirmed_count
+                .load(Ordering::Relaxed),
+            direct_path_probe_timeout_count: self
+                .direct_path_probe_timeout_count
+                .load(Ordering::Relaxed),
             peer_activity_record_count: self.peer_activity_record_count.load(Ordering::Relaxed),
             packet_flow_observation_count: self
                 .packet_flow_observation_count
@@ -1557,6 +1574,76 @@ impl AgentRuntime {
             .await
             .get(&(self.state().node_id, peer.clone()))
             .cloned()
+    }
+
+    pub async fn pending_direct_path_probe(&self, peer: &NodeId) -> Option<PendingDirectPathProbe> {
+        self.pending_direct_path_probes
+            .read()
+            .await
+            .get(peer)
+            .cloned()
+    }
+
+    pub async fn upsert_pending_direct_path_probe(
+        &self,
+        probe: PendingDirectPathProbe,
+    ) -> Result<(), AgentError> {
+        let local_node = self.state().node_id;
+        let peer = probe.selected_candidate.node_id.clone();
+        if !probe.selected_state.is_direct() {
+            return Err(AgentError::PathProbeRejected(
+                "pending direct path probe requires a direct path state".to_string(),
+            ));
+        }
+        if probe.expires_at <= probe.started_at {
+            return Err(AgentError::PathProbeRejected(
+                "pending direct path probe expiry must be after its start time".to_string(),
+            ));
+        }
+        if probe.endpoint_observed_at.is_some_and(|observed_at| {
+            observed_at < probe.started_at || observed_at >= probe.expires_at
+        }) {
+            return Err(AgentError::PathProbeRejected(
+                "pending direct path probe endpoint observation must be within its active window"
+                    .to_string(),
+            ));
+        }
+        validate_path_state_shape(
+            &local_node,
+            &peer,
+            probe.selected_state,
+            Some(&probe.selected_candidate),
+            None,
+            "pending direct path probe",
+        )
+        .map_err(AgentError::PathProbeRejected)?;
+        self.pending_direct_path_probes
+            .write()
+            .await
+            .insert(peer, probe);
+        Ok(())
+    }
+
+    pub async fn remove_pending_direct_path_probe(
+        &self,
+        peer: &NodeId,
+    ) -> Option<PendingDirectPathProbe> {
+        self.pending_direct_path_probes.write().await.remove(peer)
+    }
+
+    pub fn record_direct_path_probe_started(&self) {
+        self.direct_path_probe_started_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_path_probe_confirmed(&self) {
+        self.direct_path_probe_confirmed_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_path_probe_timeout(&self) {
+        self.direct_path_probe_timeout_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn record_path_probe(
@@ -2301,6 +2388,38 @@ pub struct WireGuardPeerTelemetry {
     pub tx_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDirectPathProbe {
+    pub selected_state: PathState,
+    pub selected_candidate: EndpointCandidate,
+    pub started_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub endpoint_observed_at: Option<DateTime<Utc>>,
+    pub baseline_rx_bytes: Option<u64>,
+    pub baseline_tx_bytes: Option<u64>,
+}
+
+impl PendingDirectPathProbe {
+    pub fn targets(&self, state: PathState, candidate: &EndpointCandidate) -> bool {
+        self.selected_state == state
+            && self.selected_candidate.node_id == candidate.node_id
+            && self.selected_candidate.kind == candidate.kind
+            && self.selected_candidate.addr == candidate.addr
+    }
+
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        now < self.expires_at
+    }
+
+    pub fn transfer_increased(&self, telemetry: &WireGuardPeerTelemetry) -> bool {
+        self.baseline_rx_bytes
+            .is_some_and(|baseline| telemetry.rx_bytes > baseline)
+            || self
+                .baseline_tx_bytes
+                .is_some_and(|baseline| telemetry.tx_bytes > baseline)
+    }
+}
+
 impl WireGuardPeerTelemetry {
     fn new(public_key_b64: String) -> Self {
         Self {
@@ -2387,6 +2506,7 @@ impl WireGuardPeerTelemetrySource for CommandWireGuardPeerTelemetrySource {
 pub struct KernelWireGuardPeerTelemetrySource {
     interface: String,
     namespace: Option<LinuxNetworkNamespace>,
+    timeout: Duration,
 }
 
 impl KernelWireGuardPeerTelemetrySource {
@@ -2394,6 +2514,7 @@ impl KernelWireGuardPeerTelemetrySource {
         Self {
             interface: interface.into(),
             namespace: None,
+            timeout: DEFAULT_SYSTEM_COMMAND_TIMEOUT,
         }
     }
 
@@ -2404,7 +2525,13 @@ impl KernelWireGuardPeerTelemetrySource {
         Self {
             interface: interface.into(),
             namespace: Some(namespace),
+            timeout: DEFAULT_SYSTEM_COMMAND_TIMEOUT,
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -2412,7 +2539,19 @@ impl KernelWireGuardPeerTelemetrySource {
 #[async_trait]
 impl WireGuardPeerTelemetrySource for KernelWireGuardPeerTelemetrySource {
     async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError> {
-        query_wireguard_peer_telemetry_netlink(&self.interface, self.namespace.as_ref()).await
+        validate_system_command_runtime_bounds(self.timeout, 1)?;
+        tokio::time::timeout(
+            self.timeout,
+            query_wireguard_peer_telemetry_netlink(&self.interface, self.namespace.as_ref()),
+        )
+        .await
+        .map_err(|_| {
+            AgentError::WireGuard(format!(
+                "WireGuard netlink telemetry query for interface {} timed out after {}",
+                self.interface,
+                command_timeout_label(self.timeout)
+            ))
+        })?
     }
 }
 
@@ -4317,6 +4456,17 @@ impl RuntimePeerEndpointResolver {
 #[async_trait]
 impl PeerEndpointResolver for RuntimePeerEndpointResolver {
     async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
+        if let Some(probe) = self
+            .runtime
+            .pending_direct_path_probe(&peer.node_id)
+            .await
+            .filter(|probe| probe.is_active_at(Utc::now()))
+        {
+            return Ok(wireguard_endpoint_for_candidate(
+                &probe.selected_candidate,
+                &peer.node_id,
+            ));
+        }
         let path = self.runtime.path_record_for_peer(&peer.node_id).await;
         let Some(path) = path else {
             return Ok(preferred_endpoint(peer));
@@ -7306,6 +7456,19 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kernel_wireguard_telemetry_rejects_unbounded_timeout() {
+        let source = KernelWireGuardPeerTelemetrySource::new("ipars0").with_timeout(Duration::ZERO);
+
+        let error = source.snapshot().await;
+
+        assert!(matches!(
+            error,
+            Err(AgentError::WireGuard(message)) if message.contains("timeout must be greater than zero")
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn kernel_wireguard_backend_builds_netlink_peer_config() -> Result<(), AgentError> {
         let public_key =
@@ -7716,6 +7879,128 @@ mod tests {
             .ok_or_else(|| AgentError::MissingPeer(peer_id.clone()))?;
         assert_eq!(config.endpoint.as_deref(), Some("127.0.0.1:52000"));
         assert_eq!(config.persistent_keepalive_seconds, Some(25));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_direct_probe_temporarily_overrides_relay_endpoint_and_expires(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local_id = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-probe");
+        let direct_endpoint = SocketAddr::from(([203, 0, 113, 10], 51_820));
+        let forwarder_endpoint = SocketAddr::from(([127, 0, 0, 1], 52_000));
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer_id.clone()),
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                score: PathScore::calculate(PathState::Relay, &PathMetrics::default(), true, 0),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+        runtime
+            .upsert_relay_forwarder_endpoint(peer_id.clone(), forwarder_endpoint)
+            .await;
+        runtime
+            .upsert_relay_session(RelaySessionState {
+                peer: peer_id.clone(),
+                relay_node: NodeId::from_string("relay-a"),
+                relay_endpoint: SocketAddr::from(([203, 0, 113, 30], 51_820)),
+                admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40_000)),
+                admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40_000)),
+                session_id: "session-probe".to_string(),
+                session_token: "secret".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+            })
+            .await;
+        let candidate = EndpointCandidate {
+            node_id: peer_id.clone(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: direct_endpoint,
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::ControlPlane,
+        };
+        let now = Utc::now();
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: candidate.clone(),
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(60),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: Some(10),
+                baseline_tx_bytes: Some(20),
+            })
+            .await?;
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        )
+        .with_endpoint_resolver(RuntimePeerEndpointResolver::new(runtime.clone()));
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)),
+            "wg-peer-public",
+            vec![candidate],
+            Vec::new(),
+        );
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer],
+            generated_at: Utc::now(),
+        };
+
+        applier.apply_peer_map(peer_map.clone()).await?;
+        assert_eq!(
+            applier
+                .wireguard
+                .peers
+                .read()
+                .await
+                .get(&peer_id)
+                .and_then(|config| config.endpoint.as_deref()),
+            Some("203.0.113.10:51820")
+        );
+
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: direct_endpoint,
+                    observed_at: Utc::now(),
+                    priority: 100,
+                    cost: 10,
+                    source: CandidateSource::ControlPlane,
+                },
+                started_at: now - ChronoDuration::seconds(2),
+                expires_at: now - ChronoDuration::seconds(1),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: Some(10),
+                baseline_tx_bytes: Some(20),
+            })
+            .await?;
+        applier.apply_peer_map(peer_map).await?;
+        assert_eq!(
+            applier
+                .wireguard
+                .peers
+                .read()
+                .await
+                .get(&peer_id)
+                .and_then(|config| config.endpoint.as_deref()),
+            Some("127.0.0.1:52000")
+        );
         Ok(())
     }
 

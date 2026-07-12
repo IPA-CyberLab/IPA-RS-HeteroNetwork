@@ -74,6 +74,11 @@ const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
+const DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
+const MAX_AGENT_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
@@ -629,6 +634,16 @@ struct DockerInstallArgs {
     )]
     agent_http_request_timeout_seconds: u64,
     #[arg(
+        long = "agent-direct-path-probe-timeout-seconds",
+        default_value_t = DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS
+    )]
+    agent_direct_path_probe_timeout_seconds: u64,
+    #[arg(
+        long = "agent-direct-handshake-max-age-seconds",
+        default_value_t = DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
+    )]
+    agent_direct_handshake_max_age_seconds: u64,
+    #[arg(
         long = "agent-runtime-backend",
         default_value = "linux-command",
         value_parser = parse_agent_runtime_backend
@@ -852,6 +867,16 @@ struct K8sInstallArgs {
         default_value_t = DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS
     )]
     agent_http_request_timeout_seconds: u64,
+    #[arg(
+        long = "agent-direct-path-probe-timeout-seconds",
+        default_value_t = DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS
+    )]
+    agent_direct_path_probe_timeout_seconds: u64,
+    #[arg(
+        long = "agent-direct-handshake-max-age-seconds",
+        default_value_t = DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
+    )]
+    agent_direct_handshake_max_age_seconds: u64,
     #[arg(long, default_value_t = false)]
     expose_agent_api: bool,
     #[arg(long, default_value_t = false)]
@@ -5461,6 +5486,12 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         args.agent_http_connect_timeout_seconds,
         args.agent_http_request_timeout_seconds,
     )?;
+    validate_agent_direct_path_verification_settings(
+        args.agent_direct_path_probe_timeout_seconds,
+        args.agent_direct_handshake_max_age_seconds,
+        (!args.rootless && args.agent_runtime_backend == "linux-command")
+            .then_some(DEFAULT_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS),
+    )?;
     validate_docker_userspace_wireguard_args(args)?;
     validate_docker_relay_advertisement(args)?;
     validate_relay_forwarder_install_settings(RelayForwarderInstallSettings::from_docker(args))?;
@@ -5842,6 +5873,36 @@ fn validate_agent_http_timeout_settings(
     Ok(())
 }
 
+fn validate_agent_direct_path_verification_settings(
+    probe_timeout_seconds: u64,
+    handshake_max_age_seconds: u64,
+    peer_map_poll_interval_seconds: Option<u64>,
+) -> anyhow::Result<()> {
+    validate_bounded_docker_seconds(
+        probe_timeout_seconds,
+        "--agent-direct-path-probe-timeout-seconds",
+        MAX_AGENT_DIRECT_PATH_VERIFICATION_SECONDS,
+    )?;
+    validate_bounded_docker_seconds(
+        handshake_max_age_seconds,
+        "--agent-direct-handshake-max-age-seconds",
+        MAX_AGENT_DIRECT_PATH_VERIFICATION_SECONDS,
+    )?;
+    anyhow::ensure!(
+        handshake_max_age_seconds >= DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS,
+        "--agent-direct-handshake-max-age-seconds must be at least the {DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS}-second signal path interval"
+    );
+    if let Some(peer_map_poll_interval_seconds) = peer_map_poll_interval_seconds {
+        let minimum = peer_map_poll_interval_seconds
+            .saturating_add(DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS.saturating_mul(2));
+        anyhow::ensure!(
+            probe_timeout_seconds >= minimum,
+            "--agent-direct-path-probe-timeout-seconds must be at least the peer-map poll interval plus two {DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS}-second signal path intervals ({minimum}s)"
+        );
+    }
+    Ok(())
+}
+
 fn validate_positive_docker_seconds(value: u64, label: &str) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!("{label} must be greater than zero");
@@ -5967,6 +6028,14 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
             value: args.agent_http_request_timeout_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS".to_string(),
+            value: args.agent_direct_path_probe_timeout_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
+            value: args.agent_direct_handshake_max_age_seconds.to_string(),
         },
         InstallEnvironment {
             name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
@@ -6852,6 +6921,14 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
     command.push_str(&format!(
         " --set agent.http.requestTimeoutSeconds={}",
         args.agent_http_request_timeout_seconds
+    ));
+    command.push_str(&format!(
+        " --set agent.directPathVerification.probeTimeoutSeconds={}",
+        args.agent_direct_path_probe_timeout_seconds
+    ));
+    command.push_str(&format!(
+        " --set agent.directPathVerification.handshakeMaxAgeSeconds={}",
+        args.agent_direct_handshake_max_age_seconds
     ));
     if args.disable_agent_host_network {
         command.push_str(" --set agent.hostNetwork=false");
@@ -8313,6 +8390,12 @@ fn validate_k8s_agent_pod_options(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_agent_http_timeout_settings(
         args.agent_http_connect_timeout_seconds,
         args.agent_http_request_timeout_seconds,
+    )?;
+    validate_agent_direct_path_verification_settings(
+        args.agent_direct_path_probe_timeout_seconds,
+        args.agent_direct_handshake_max_age_seconds,
+        (!args.disable_agent_peer_map && args.agent_runtime_backend == "linux-command")
+            .then_some(args.agent_peer_map_poll_interval_seconds),
     )?;
     for label in &args.agent_pod_labels {
         validate_kubernetes_label_key(&label.key).map_err(anyhow::Error::msg)?;
@@ -11647,6 +11730,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11692,6 +11778,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11873,6 +11962,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -11943,6 +12035,9 @@ fi
         let plan = docker_install_plan(DockerInstallArgs {
             agent_http_connect_timeout_seconds: 7,
             agent_http_request_timeout_seconds: 45,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             ..docker_install_test_args()
         })?;
         assert_eq!(
@@ -11963,11 +12058,70 @@ fi
             let error = match docker_install_plan(DockerInstallArgs {
                 agent_http_connect_timeout_seconds: connect,
                 agent_http_request_timeout_seconds: request,
+                agent_direct_path_probe_timeout_seconds: DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+                agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
                 ..docker_install_test_args()
             }) {
                 Ok(_) => anyhow::bail!("invalid Agent HTTP timeout settings should be rejected"),
                 Err(error) => error,
             };
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in `{error:#}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_wires_and_validates_direct_path_verification() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            agent_direct_path_probe_timeout_seconds: 90,
+            agent_direct_handshake_max_age_seconds: 240,
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS"),
+            Some("90")
+        );
+        assert_eq!(
+            environment_value(&plan, "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS"),
+            Some("240")
+        );
+
+        for (probe_timeout, handshake_max_age, expected) in [
+            (
+                0,
+                180,
+                "--agent-direct-path-probe-timeout-seconds must be greater than zero",
+            ),
+            (
+                120,
+                0,
+                "--agent-direct-handshake-max-age-seconds must be greater than zero",
+            ),
+            (
+                86_401,
+                180,
+                "--agent-direct-path-probe-timeout-seconds must not exceed 86400",
+            ),
+            (
+                120,
+                29,
+                "--agent-direct-handshake-max-age-seconds must be at least the 30-second signal path interval",
+            ),
+            (
+                59,
+                180,
+                "--agent-direct-path-probe-timeout-seconds must be at least the peer-map poll interval",
+            ),
+        ] {
+            let error = docker_install_plan(DockerInstallArgs {
+                agent_direct_path_probe_timeout_seconds: probe_timeout,
+                agent_direct_handshake_max_age_seconds: handshake_max_age,
+                ..docker_install_test_args()
+            })
+            .expect_err("invalid direct path verification settings should be rejected");
             assert!(
                 error.to_string().contains(expected),
                 "expected `{expected}` in `{error:#}`"
@@ -12319,6 +12473,9 @@ fi
             docker_route_interval_seconds: DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12501,6 +12658,12 @@ fi
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
         assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"));
+        assert!(compose.contains(
+            "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS=${IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS:-120}"
+        ));
+        assert!(compose.contains(
+            "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS=${IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS:-180}"
+        ));
         assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
         assert!(!compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
@@ -12612,6 +12775,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12704,6 +12870,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12752,6 +12921,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12800,6 +12972,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12860,6 +13035,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -12926,6 +13104,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
@@ -13029,6 +13210,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13077,6 +13261,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13125,6 +13312,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13175,6 +13365,9 @@ fi
             docker_route_interval_seconds: 60,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_runtime_backend: "linux-command".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: Some("wireguard-go".to_string()),
@@ -13508,6 +13701,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -15829,6 +16025,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: false,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -16030,6 +16229,34 @@ fi
         assert!(error
             .to_string()
             .contains("--agent-http-request-timeout-seconds must not exceed 3600"));
+        Ok(())
+    }
+
+    #[test]
+    fn k8s_install_plan_wires_and_validates_direct_path_verification() -> anyhow::Result<()> {
+        let mut args = base_k8s_install_args();
+        args.agent_direct_path_probe_timeout_seconds = 90;
+        args.agent_direct_handshake_max_age_seconds = 240;
+        let plan = k8s_install_plan(args)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set agent.directPathVerification.probeTimeoutSeconds=90"));
+        assert!(helm.contains("--set agent.directPathVerification.handshakeMaxAgeSeconds=240"));
+
+        let mut short = base_k8s_install_args();
+        short.agent_direct_path_probe_timeout_seconds = 59;
+        let error = k8s_install_plan(short)
+            .expect_err("probe timeout shorter than poll plus signal interval should fail");
+        assert!(error.to_string().contains(
+            "--agent-direct-path-probe-timeout-seconds must be at least the peer-map poll interval"
+        ));
+
+        let mut stale = base_k8s_install_args();
+        stale.agent_direct_handshake_max_age_seconds = 29;
+        let error = k8s_install_plan(stale)
+            .expect_err("handshake age shorter than signal interval should fail");
+        assert!(error
+            .to_string()
+            .contains("--agent-direct-handshake-max-age-seconds must be at least the 30-second signal path interval"));
         Ok(())
     }
 
@@ -17285,6 +17512,10 @@ fi
             "7",
             "--agent-http-request-timeout-seconds",
             "45",
+            "--agent-direct-path-probe-timeout-seconds",
+            "90",
+            "--agent-direct-handshake-max-age-seconds",
+            "240",
             "--route-backend",
             "kernel-netlink",
             "--userspace-wireguard-command",
@@ -17319,6 +17550,8 @@ fi
             assert_eq!(args.docker_route_interval_seconds, 15);
             assert_eq!(args.agent_http_connect_timeout_seconds, 7);
             assert_eq!(args.agent_http_request_timeout_seconds, 45);
+            assert_eq!(args.agent_direct_path_probe_timeout_seconds, 90);
+            assert_eq!(args.agent_direct_handshake_max_age_seconds, 240);
             assert_eq!(args.route_backend, "kernel-netlink");
             assert_eq!(
                 args.userspace_wireguard_command.as_deref(),
@@ -17412,6 +17645,10 @@ fi
             "7",
             "--agent-http-request-timeout-seconds",
             "45",
+            "--agent-direct-path-probe-timeout-seconds",
+            "90",
+            "--agent-direct-handshake-max-age-seconds",
+            "240",
             "--allow-public-service-exposure",
             "--allow-unrestricted-load-balancer",
             "--allow-cluster-external-traffic-policy",
@@ -17648,6 +17885,8 @@ fi
             assert_eq!(args.agent_peer_map_poll_interval_seconds, 45);
             assert_eq!(args.agent_http_connect_timeout_seconds, 7);
             assert_eq!(args.agent_http_request_timeout_seconds, 45);
+            assert_eq!(args.agent_direct_path_probe_timeout_seconds, 90);
+            assert_eq!(args.agent_direct_handshake_max_age_seconds, 240);
             assert!(args.allow_public_service_exposure);
             assert!(args.allow_unrestricted_load_balancer);
             assert!(args.allow_cluster_external_traffic_policy);
@@ -17975,6 +18214,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: false,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,
@@ -18150,6 +18392,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -19675,6 +19920,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -19837,6 +20085,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -20133,6 +20384,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: false,
             allow_unrestricted_load_balancer: false,
@@ -20300,6 +20554,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: false,
@@ -20462,6 +20719,9 @@ fi
             agent_peer_map_poll_interval_seconds: 30,
             agent_http_connect_timeout_seconds: DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS,
             agent_http_request_timeout_seconds: DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            agent_direct_path_probe_timeout_seconds:
+                DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
+            agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             expose_agent_api: true,
             allow_public_service_exposure: true,
             allow_unrestricted_load_balancer: true,

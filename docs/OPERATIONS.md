@@ -68,6 +68,27 @@ the interface to listen on that same port. For example, use
 local-port relationship needed by port-preserving NATs; relay fallback remains
 required where direct traversal is not possible.
 
+With a real `--apply-peer-map` backend, Signal candidates and successful UDP
+hole-punch sends are provisional. The agent reads each WireGuard peer's current
+endpoint, latest handshake, and RX/TX counters through generic netlink for the
+kernel backend or bounded `wg show` field queries for command/userspace
+backends. It promotes a path to `DIRECT_*` only after the candidate endpoint is
+active and a post-switch handshake or transfer increase is observed. During a
+relay-to-direct probe, the existing relay session and forwarder remain available;
+an unverified path returns to `RELAY`, or `UNREACHABLE` when no relay is
+admissible. `--direct-path-probe-timeout-seconds` defaults to 120 seconds and
+must cover at least one peer-map poll plus two Signal intervals;
+`--direct-handshake-max-age-seconds` defaults to 180 seconds and must be at least
+the Signal interval. The corresponding environment variables are
+`IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS` and
+`IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS`. Docker and Kubernetes install
+plans expose the same settings as `--agent-direct-path-probe-timeout-seconds`
+and `--agent-direct-handshake-max-age-seconds`. Monitor
+`ipars_agent_direct_path_probes_started_total`,
+`ipars_agent_direct_path_probes_confirmed_total`, and
+`ipars_agent_direct_path_probes_timeout_total`; a rising timeout ratio indicates
+candidate reachability, NAT classification, firewall, or keepalive problems.
+
 For validation without host route mutation:
 
 ```bash

@@ -50,6 +50,8 @@
 {{- $agentPeerMapPollIntervalSeconds := printf "%v" .Values.agent.peerMap.pollIntervalSeconds -}}
 {{- $agentHttpConnectTimeoutSeconds := printf "%v" .Values.agent.http.connectTimeoutSeconds -}}
 {{- $agentHttpRequestTimeoutSeconds := printf "%v" .Values.agent.http.requestTimeoutSeconds -}}
+{{- $agentDirectPathProbeTimeoutSeconds := printf "%v" .Values.agent.directPathVerification.probeTimeoutSeconds -}}
+{{- $agentDirectHandshakeMaxAgeSeconds := printf "%v" .Values.agent.directPathVerification.handshakeMaxAgeSeconds -}}
 {{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
@@ -140,6 +142,17 @@
 {{- end -}}
 {{- if gt (int $agentHttpConnectTimeoutSeconds) (int $agentHttpRequestTimeoutSeconds) -}}
 {{- fail "agent.http.connectTimeoutSeconds must not exceed agent.http.requestTimeoutSeconds" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.directPathVerification.probeTimeoutSeconds" "value" $agentDirectPathProbeTimeoutSeconds "max" 86400) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.directPathVerification.handshakeMaxAgeSeconds" "value" $agentDirectHandshakeMaxAgeSeconds "max" 86400) -}}
+{{- if lt (int $agentDirectPathProbeTimeoutSeconds) 1 -}}
+{{- fail "agent.directPathVerification.probeTimeoutSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentDirectHandshakeMaxAgeSeconds) 30 -}}
+{{- fail "agent.directPathVerification.handshakeMaxAgeSeconds must be at least the 30-second signal path interval" -}}
+{{- end -}}
+{{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentDirectPathProbeTimeoutSeconds) (add (int $agentPeerMapPollIntervalSeconds) 60)) -}}
+{{- fail "agent.directPathVerification.probeTimeoutSeconds must be at least agent.peerMap.pollIntervalSeconds plus two 30-second signal path intervals" -}}
 {{- end -}}
 {{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
 {{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
@@ -1034,6 +1047,10 @@ spec:
             - --peer-map-poll-interval-seconds
             - {{ $agentPeerMapPollIntervalSeconds | quote }}
             {{- end }}
+            - --direct-path-probe-timeout-seconds
+            - {{ $agentDirectPathProbeTimeoutSeconds | quote }}
+            - --direct-handshake-max-age-seconds
+            - {{ $agentDirectHandshakeMaxAgeSeconds | quote }}
             {{- if eq $agentRelayForwarderEnabled "true" }}
             {{- if .Values.agent.relayForwarder.endpoint }}
             - --relay-forwarder-endpoint

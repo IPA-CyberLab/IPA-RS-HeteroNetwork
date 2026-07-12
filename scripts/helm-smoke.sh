@@ -136,6 +136,28 @@ template_fails agent-http-timeout-order \
   --set agent.http.connectTimeoutSeconds=31 \
   --set agent.http.requestTimeoutSeconds=30
 
+template_ok agent-direct-path-verification \
+  --set agent.directPathVerification.probeTimeoutSeconds=90 \
+  --set agent.directPathVerification.handshakeMaxAgeSeconds=240
+
+assert_rendered_contains agent-direct-path-verification "- --direct-path-probe-timeout-seconds"
+assert_rendered_contains agent-direct-path-verification '- "90"'
+assert_rendered_contains agent-direct-path-verification "- --direct-handshake-max-age-seconds"
+assert_rendered_contains agent-direct-path-verification '- "240"'
+
+template_fails agent-direct-path-probe-timeout-zero \
+  "agent.directPathVerification.probeTimeoutSeconds must be greater than zero" \
+  --set agent.directPathVerification.probeTimeoutSeconds=0
+
+template_fails agent-direct-path-probe-timeout-short \
+  "agent.directPathVerification.probeTimeoutSeconds must be at least agent.peerMap.pollIntervalSeconds plus two 30-second signal path intervals" \
+  --set agent.peerMap.pollIntervalSeconds=30 \
+  --set agent.directPathVerification.probeTimeoutSeconds=89
+
+template_fails agent-direct-handshake-max-age-short \
+  "agent.directPathVerification.handshakeMaxAgeSeconds must be at least the 30-second signal path interval" \
+  --set agent.directPathVerification.handshakeMaxAgeSeconds=29
+
 template_ok cluster-endpoints \
   --set-string cluster.controlPlaneUrl=https://control.example.com:8443 \
   --set-string cluster.signalUrl=https://signal.example.com:9443 \
