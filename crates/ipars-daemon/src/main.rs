@@ -187,7 +187,7 @@ const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGV_BYTES: usize = 512 * 1024;
 const USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRIES: usize = 3;
 const USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRY_DELAY_MILLIS: u64 = 25;
-const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const SANITIZED_RUNTIME_COMMAND_PATH: &str = "/usr/bin:/usr/sbin:/bin:/sbin";
 const SANITIZED_RUNTIME_COMMAND_LOCALE: &str = "C";
 const PROC_SYS_IPV4_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const PROC_SYS_IPV6_FORWARDING: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
@@ -620,6 +620,13 @@ struct AgentArgs {
         default_value_t = AgentRuntimeBackend::LinuxCommand
     )]
     runtime_backend: AgentRuntimeBackend,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PREFLIGHT_ONLY",
+        default_value_t = false,
+        conflicts_with = "skip_runtime_preflight"
+    )]
+    preflight_only: bool,
     #[arg(
         long,
         env = "IPARS_AGENT_SKIP_RUNTIME_PREFLIGHT",
@@ -1237,8 +1244,7 @@ impl RuntimePreflightChecks {
 }
 
 fn preflight_agent_runtime(args: &AgentArgs) -> anyhow::Result<()> {
-    let path = std::env::var_os("PATH");
-    preflight_agent_runtime_with_path(args, path.as_deref())
+    preflight_agent_runtime_with_path(args, Some(OsStr::new(SANITIZED_RUNTIME_COMMAND_PATH)))
 }
 
 fn init_observability(
@@ -2740,7 +2746,6 @@ fn ensure_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result
 }
 
 fn resolve_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Result<PathBuf> {
-    ensure_runtime_command_path_is_absolute(path)?;
     let Some(path) = path else {
         anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
     };
@@ -2748,6 +2753,7 @@ fn resolve_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Resul
         anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
     }
     for directory in std::env::split_paths(path) {
+        ensure_runtime_command_path_entry_ready(&directory)?;
         let candidate = directory.join(program);
         match candidate.symlink_metadata() {
             Ok(_) => {
@@ -2771,26 +2777,18 @@ fn resolve_program_in_path(program: &str, path: Option<&OsStr>) -> anyhow::Resul
     anyhow::bail!("missing required Linux runtime command `{program}` in PATH");
 }
 
-fn ensure_runtime_command_path_is_absolute(path: Option<&OsStr>) -> anyhow::Result<()> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    if path.is_empty() {
-        return Ok(());
-    }
-    for directory in std::env::split_paths(path) {
-        anyhow::ensure!(
-            !directory.as_os_str().is_empty() && directory.is_absolute(),
-            "Linux runtime command PATH entry `{}` must be an absolute directory",
-            directory.display()
-        );
-        anyhow::ensure!(
-            !path_has_special_component(&directory),
-            "Linux runtime command PATH entry `{}` must not contain '.' or '..' components",
-            directory.display()
-        );
-        ensure_runtime_command_path_directory_ready(&directory)?;
-    }
+fn ensure_runtime_command_path_entry_ready(directory: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !directory.as_os_str().is_empty() && directory.is_absolute(),
+        "Linux runtime command PATH entry `{}` must be an absolute directory",
+        directory.display()
+    );
+    anyhow::ensure!(
+        !path_has_special_component(directory),
+        "Linux runtime command PATH entry `{}` must not contain '.' or '..' components",
+        directory.display()
+    );
+    ensure_runtime_command_path_directory_ready(directory)?;
     Ok(())
 }
 
@@ -6889,6 +6887,16 @@ async fn run_agent(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    if args.preflight_only {
+        preflight_agent_runtime(&args)?;
+        tracing::info!(
+            backend = args.runtime_backend.as_str(),
+            wireguard_backend = args.wireguard_backend.as_str(),
+            route_backend = args.route_backend.as_str(),
+            "agent runtime preflight-only check completed"
+        );
+        return Ok(());
+    }
     validate_agent_runtime_config(&args)?;
     let api_bearer_token = agent_api_bearer_token(&args)?;
     let relay_admission_bearer_token = agent_relay_admission_bearer_token(&args)?;
@@ -20332,6 +20340,53 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         Err(anyhow::anyhow!("expected agent command"))
     }
 
+    #[tokio::test]
+    async fn agent_preflight_only_does_not_create_state_or_read_join_token() -> anyhow::Result<()> {
+        let unique = format!(
+            "ipars-agent-preflight-only-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let state_path = std::env::temp_dir().join(format!("{unique}.state.json"));
+        let missing_token_path = std::env::temp_dir().join(format!("{unique}.join-token.json"));
+        let cli = Cli::try_parse_from(vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--preflight-only".to_string(),
+            "--runtime-backend".to_string(),
+            "dry-run".to_string(),
+            "--state-path".to_string(),
+            state_path.display().to_string(),
+            "--join-token-path".to_string(),
+            missing_token_path.display().to_string(),
+        ])?;
+
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        run_agent(*args, false, Duration::from_secs(1)).await?;
+
+        assert!(!state_path.exists());
+        assert!(!missing_token_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_preflight_only_rejects_skipping_preflight() {
+        let error = match Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--preflight-only",
+            "--skip-runtime-preflight",
+        ]) {
+            Ok(_) => panic!("preflight-only must conflict with skipped preflight"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cannot be used with"));
+        assert!(error.contains("--preflight-only"));
+        assert!(error.contains("--skip-runtime-preflight"));
+    }
+
     #[test]
     fn linux_peer_map_runtime_requires_stun_and_wireguard_ports_to_match() -> anyhow::Result<()> {
         let valid = Cli::try_parse_from([
@@ -20549,6 +20604,16 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(symlink_preceding_error
             .to_string()
             .contains("must not be a symlink"));
+
+        let unsafe_trailing_path =
+            std::env::join_paths([executable_bin.as_os_str(), unsafe_preceding_bin.as_os_str()])?;
+        ensure_program_in_path("ip", Some(unsafe_trailing_path.as_os_str()))?;
+
+        let symlink_trailing_path = std::env::join_paths([
+            executable_bin.as_os_str(),
+            symlink_preceding_bin.as_os_str(),
+        ])?;
+        ensure_program_in_path("ip", Some(symlink_trailing_path.as_os_str()))?;
 
         let non_executable_bin = base.join("non-executable-bin");
         std::fs::create_dir(&non_executable_bin)?;
@@ -21556,7 +21621,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let status_arg = status_path.display().to_string();
         let pid_arg = pid_path.display().to_string();
         let shell_script = r#"#!/bin/sh
-if test "${PATH:-}" = "/usr/sbin:/usr/bin:/sbin:/bin" &&
+if test "${PATH:-}" = "/usr/bin:/usr/sbin:/bin:/sbin" &&
    test "${LANG:-}" = "C" &&
    test "${LC_ALL:-}" = "C" &&
    test -z "${HOME+x}" &&

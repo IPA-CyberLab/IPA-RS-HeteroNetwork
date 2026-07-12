@@ -30,7 +30,7 @@ const DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYSTEM_ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const MAX_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
-const SANITIZED_SYSTEM_ROUTE_COMMAND_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+const SANITIZED_SYSTEM_ROUTE_COMMAND_PATH: &str = "/usr/bin:/usr/sbin:/bin:/sbin";
 const SANITIZED_SYSTEM_ROUTE_COMMAND_LOCALE: &str = "C";
 const MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_LINUX_ROUTE_COMMAND_ARGS: usize = 1024;
@@ -2217,7 +2217,7 @@ mod tests {
     async fn timed_system_route_command_runner_uses_sanitized_environment() {
         let runner = TimedSystemRouteCommandRunner::new(Duration::from_secs(1));
         let shell = trusted_route_test_shell();
-        let script = r#"test "${PATH:-}" = "/usr/sbin:/usr/bin:/sbin:/bin" && test "${LANG:-}" = "C" && test "${LC_ALL:-}" = "C" && test -z "${HOME+x}" && test -z "${LD_PRELOAD+x}""#;
+        let script = r#"test "${PATH:-}" = "/usr/bin:/usr/sbin:/bin:/sbin" && test "${LANG:-}" = "C" && test "${LC_ALL:-}" = "C" && test -z "${HOME+x}" && test -z "${LD_PRELOAD+x}""#;
 
         match runner
             .run(LinuxRouteCommand::new(shell, ["-c", script]))

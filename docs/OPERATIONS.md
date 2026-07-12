@@ -46,6 +46,20 @@ The control plane accepts only fresh Ed25519-signed revocations from its configu
 
 ## Join Nodes
 
+Before placing credentials or starting the service, validate the intended host runtime with the same data-plane flags:
+
+```bash
+iparsd agent \
+  --preflight-only \
+  --runtime-backend linux-command \
+  --apply-peer-map \
+  --wireguard-backend kernel-netlink \
+  --route-backend kernel-netlink \
+  --linux-netns edge-a
+```
+
+Preflight-only validates static settings plus required commands, capabilities, forwarding sysctls, netlink protocols, sockets, files, and namespace entries. It exits before reading join/API credentials, creating the Agent state file, contacting STUN/control/Signal, mutating the data plane, or binding a listener. Credential validity and service reachability are therefore still checked by normal startup.
+
 Use file-backed tokens for agents:
 
 ```bash
@@ -324,4 +338,4 @@ Privileged Linux hosts can also run:
 scripts/netns-smoke.sh
 ```
 
-That suite requires network namespace creation privileges and runs the routed peer-quality UDP probe alongside route, WireGuard, hole-punch, and relay-fallback checks. It may require `wireguard-tools`, kernel WireGuard support, `iptables`, and forwarding sysctls.
+That suite requires network namespace creation privileges, runs the actual `iparsd agent --preflight-only` path for kernel-netlink and (when `wg` is installed) command backends, and runs the routed peer-quality UDP probe alongside route, WireGuard, hole-punch, and relay-fallback checks. It may require `wireguard-tools`, kernel WireGuard support, `iptables`, and forwarding sysctls.
