@@ -196,6 +196,22 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
                 "20".to_string(),
             ),
             (
+                "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "IPARS_AGENT_PEER_PROBE_PORT".to_string(),
+                "51900".to_string(),
+            ),
+            (
+                "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
+                "7".to_string(),
+            ),
+            (
+                "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
+                "90".to_string(),
+            ),
+            (
                 "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
                 "127.0.0.1:45182".to_string(),
             ),
@@ -264,6 +280,10 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
                 "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
                 "20",
             ),
+            ("IPARS_AGENT_DISABLE_PEER_PROBE", "false"),
+            ("IPARS_AGENT_PEER_PROBE_PORT", "51900"),
+            ("IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
+            ("IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS", "90"),
             ("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT", "127.0.0.1:45182"),
             ("IPARS_AGENT_RELAY_FORWARDER_BIND", "0.0.0.0:45182"),
             (
@@ -307,6 +327,22 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         ],
         docker_socket: temp_dir.join("rootless-docker.sock"),
         extra_env: vec![
+            (
+                "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
+                "7".to_string(),
+            ),
+            (
+                "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
+                "45".to_string(),
+            ),
+            (
+                "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS".to_string(),
+                "90".to_string(),
+            ),
+            (
+                "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
+                "240".to_string(),
+            ),
             (
                 "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
                 "true".to_string(),
@@ -364,6 +400,22 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
                 "20".to_string(),
             ),
             (
+                "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "IPARS_AGENT_PEER_PROBE_PORT".to_string(),
+                "51900".to_string(),
+            ),
+            (
+                "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
+                "7".to_string(),
+            ),
+            (
+                "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
+                "90".to_string(),
+            ),
+            (
                 "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
                 "relay-fw".to_string(),
             ),
@@ -375,10 +427,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_rendered_compose_env(
         &rendered,
         &[
+            ("IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS", "7"),
+            ("IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS", "45"),
+            ("IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS", "90"),
+            ("IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS", "240"),
             ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
             ("IPARS_AGENT_STUN_BIND", "0.0.0.0:51821"),
             ("IPARS_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
             ("IPARS_AGENT_RUNTIME_BACKEND", "dry-run"),
+            ("IPARS_AGENT_DISABLE_PEER_PROBE", "true"),
+            ("IPARS_AGENT_PEER_PROBE_PORT", "51900"),
+            ("IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
+            ("IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS", "90"),
             ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
             ("IPARS_AGENT_WIREGUARD_BACKEND", "command"),
             ("IPARS_AGENT_ROUTE_BACKEND", "command"),

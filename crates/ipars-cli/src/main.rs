@@ -13114,6 +13114,18 @@ fi
         assert!(rootless_compose.contains("environment: !override"));
         assert!(rootless_compose.contains("IPARS_AGENT_RUNTIME_BACKEND=dry-run"));
         assert!(rootless_compose.contains(
+            "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS=${IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS:-5}"
+        ));
+        assert!(rootless_compose.contains(
+            "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS=${IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS:-120}"
+        ));
+        assert!(rootless_compose.contains("IPARS_AGENT_DISABLE_PEER_PROBE=true"));
+        assert!(rootless_compose
+            .contains("IPARS_AGENT_PEER_PROBE_PORT=${IPARS_AGENT_PEER_PROBE_PORT:-51822}"));
+        assert!(rootless_compose.contains(
+            "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS=${IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS:-120}"
+        ));
+        assert!(rootless_compose.contains(
             "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
         ));
         assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND=command"));
