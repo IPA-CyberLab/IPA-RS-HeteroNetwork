@@ -1995,6 +1995,13 @@ mod tests {
         route_acl(id, cidr, AclAction::Deny)
     }
 
+    fn test_cidr(value: &str) -> IpNet {
+        match value.parse() {
+            Ok(cidr) => cidr,
+            Err(error) => panic!("invalid test CIDR `{value}`: {error}"),
+        }
+    }
+
     fn route_acl(id: &str, cidr: &str, action: AclAction) -> AclRule {
         AclRule {
             id: id.to_string(),
@@ -2002,7 +2009,7 @@ mod tests {
             from_tags: BTreeSet::new(),
             to_roles: BTreeSet::new(),
             to_tags: BTreeSet::new(),
-            routes: vec![cidr.parse().unwrap()],
+            routes: vec![test_cidr(cidr)],
             protocol: TransportProtocol::Any,
             action,
         }
@@ -2011,7 +2018,7 @@ mod tests {
     fn advertised_route(id: &str, cidr: &str, advertised_by: &NodeId) -> Route {
         Route {
             id: id.to_string(),
-            cidr: cidr.parse().unwrap(),
+            cidr: test_cidr(cidr),
             advertised_by: advertised_by.clone(),
             via: None,
             metric: 100,
@@ -2196,12 +2203,10 @@ mod tests {
             .negotiate_with_observation(request(), Some(stale))
             .await?;
         let mut mismatched = observation.clone();
-        mismatched
-            .selected_candidate
-            .as_mut()
-            .expect("direct candidate")
-            .addr
-            .set_port(51_821);
+        let Some(candidate) = mismatched.selected_candidate.as_mut() else {
+            panic!("direct test observation must contain a selected candidate");
+        };
+        candidate.addr.set_port(51_821);
         registry
             .negotiate_with_observation(request(), Some(mismatched))
             .await?;
@@ -2776,7 +2781,7 @@ mod tests {
                 target: route_target.node_id.clone(),
                 source_candidates: source.endpoint_candidates.clone(),
                 source_nat_classification: None,
-                desired_routes: vec!["10.10.5.0/24".parse().unwrap()],
+                desired_routes: vec![test_cidr("10.10.5.0/24")],
             })
             .await?;
 
@@ -2817,7 +2822,7 @@ mod tests {
                 target: route_target.node_id.clone(),
                 source_candidates: source.endpoint_candidates.clone(),
                 source_nat_classification: None,
-                desired_routes: vec!["10.10.5.0/24".parse().unwrap()],
+                desired_routes: vec![test_cidr("10.10.5.0/24")],
             })
             .await?;
 
@@ -2837,7 +2842,7 @@ mod tests {
         let route_target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
         registry.upsert_node(source.clone()).await?;
         registry.upsert_node(route_target.clone()).await?;
-        let requested_route = "10.99.0.0/16".parse().unwrap();
+        let requested_route = test_cidr("10.99.0.0/16");
 
         assert!(matches!(
             registry

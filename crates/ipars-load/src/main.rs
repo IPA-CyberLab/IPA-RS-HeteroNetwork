@@ -3420,17 +3420,20 @@ async fn run_daemon_scenario(
         control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_summary(
             &control_summary,
         ),
-        control_plane_failover_lifecycle_metrics:
-            ControlPlaneLifecycleMetricsMeasurement::from_counts(
+        control_plane_failover_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement {
+            wireguard_key_rotation_success_count_min:
                 failover_wireguard_key_rotation_success_count_min,
+            wireguard_key_rotation_success_count_max:
                 failover_wireguard_key_rotation_success_count_max,
+            wireguard_key_rotation_failure_count_min:
                 failover_wireguard_key_rotation_failure_count_min,
+            wireguard_key_rotation_failure_count_max:
                 failover_wireguard_key_rotation_failure_count_max,
-                failover_node_removal_success_count_min,
-                failover_node_removal_success_count_max,
-                failover_node_removal_failure_count_min,
-                failover_node_removal_failure_count_max,
-            ),
+            node_removal_success_count_min: failover_node_removal_success_count_min,
+            node_removal_success_count_max: failover_node_removal_success_count_max,
+            node_removal_failure_count_min: failover_node_removal_failure_count_min,
+            node_removal_failure_count_max: failover_node_removal_failure_count_max,
+        },
     };
     let completed_manifest_path =
         services.stop_all_for_completed_manifest(completed_measurement)?;
@@ -4708,7 +4711,7 @@ impl ControlPlanePathStatusMetricsMeasurement {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlPlaneLifecycleMetricsMeasurement {
     wireguard_key_rotation_success_count_min: u64,
     wireguard_key_rotation_success_count_max: u64,
@@ -4789,28 +4792,6 @@ impl ControlPlaneLifecycleMetricsMeasurement {
             && self.node_removal_success_count_max == 0
             && self.node_removal_failure_count_min == 0
             && self.node_removal_failure_count_max == 0
-    }
-
-    fn from_counts(
-        wireguard_key_rotation_success_count_min: u64,
-        wireguard_key_rotation_success_count_max: u64,
-        wireguard_key_rotation_failure_count_min: u64,
-        wireguard_key_rotation_failure_count_max: u64,
-        node_removal_success_count_min: u64,
-        node_removal_success_count_max: u64,
-        node_removal_failure_count_min: u64,
-        node_removal_failure_count_max: u64,
-    ) -> Self {
-        Self {
-            wireguard_key_rotation_success_count_min,
-            wireguard_key_rotation_success_count_max,
-            wireguard_key_rotation_failure_count_min,
-            wireguard_key_rotation_failure_count_max,
-            node_removal_success_count_min,
-            node_removal_success_count_max,
-            node_removal_failure_count_min,
-            node_removal_failure_count_max,
-        }
     }
 }
 
@@ -5329,17 +5310,20 @@ impl DaemonProcessGroup {
             &agent_urls,
             &startup.children,
         )?;
+        let readiness_context = DaemonAgentReadinessContext {
+            control_plane_urls: &control_plane_urls,
+            signal_url: &signal_url,
+            agent_urls: &agent_urls,
+            agent_state_paths: &startup.agent_state_paths,
+            control_plane_operator_api_bearer_token: &control_plane_operator_api_bearer_token,
+            signal_operator_api_bearer_token: &signal_operator_api_bearer_token,
+            timeout: options.agent_readiness_timeout,
+        };
         wait_for_daemon_agents_ready_or_manifest_failure(
             &client,
-            &control_plane_urls,
-            &signal_url,
-            &agent_urls,
-            &startup.agent_state_paths,
-            &control_plane_operator_api_bearer_token,
-            &signal_operator_api_bearer_token,
+            &readiness_context,
             &mut startup.children,
             &manifest_seed,
-            options.agent_readiness_timeout,
         )
         .await?;
         startup.remove_join_token_files()?;
@@ -6900,39 +6884,45 @@ async fn wait_for_http_ok_or_manifest_failure(
     }
 }
 
+struct DaemonAgentReadinessContext<'a> {
+    control_plane_urls: &'a [String],
+    signal_url: &'a str,
+    agent_urls: &'a [String],
+    agent_state_paths: &'a [PathBuf],
+    control_plane_operator_api_bearer_token: &'a str,
+    signal_operator_api_bearer_token: &'a str,
+    timeout: Duration,
+}
+
 async fn wait_for_daemon_agents_ready(
     client: &reqwest::Client,
-    control_plane_urls: &[String],
-    signal_url: &str,
-    agent_urls: &[String],
-    agent_state_paths: &[PathBuf],
-    control_plane_operator_api_bearer_token: &str,
-    signal_operator_api_bearer_token: &str,
+    context: &DaemonAgentReadinessContext<'_>,
     children: &mut [DaemonChild],
-    timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut last_error = None;
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + context.timeout;
     while Instant::now() < deadline {
         ensure_daemon_children_running(children)?;
-        match daemon_agent_statuses(client, agent_urls).await {
-            Ok(statuses) => match load_daemon_agent_identities(agent_state_paths, &statuses) {
-                Ok(identities) => match check_daemon_agent_control_and_signal_readiness(
-                    client,
-                    control_plane_urls,
-                    signal_url,
-                    &statuses,
-                    &identities,
-                    control_plane_operator_api_bearer_token,
-                    signal_operator_api_bearer_token,
-                )
-                .await
-                {
-                    Ok(()) => return Ok(()),
+        match daemon_agent_statuses(client, context.agent_urls).await {
+            Ok(statuses) => {
+                match load_daemon_agent_identities(context.agent_state_paths, &statuses) {
+                    Ok(identities) => match check_daemon_agent_control_and_signal_readiness(
+                        client,
+                        context.control_plane_urls,
+                        context.signal_url,
+                        &statuses,
+                        &identities,
+                        context.control_plane_operator_api_bearer_token,
+                        context.signal_operator_api_bearer_token,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(error) => last_error = Some(error),
+                    },
                     Err(error) => last_error = Some(error),
-                },
-                Err(error) => last_error = Some(error),
-            },
+                }
+            }
             Err(error) => last_error = Some(error),
         }
         let now = Instant::now();
@@ -6950,35 +6940,17 @@ async fn wait_for_daemon_agents_ready(
 
 async fn wait_for_daemon_agents_ready_or_manifest_failure(
     client: &reqwest::Client,
-    control_plane_urls: &[String],
-    signal_url: &str,
-    agent_urls: &[String],
-    agent_state_paths: &[PathBuf],
-    control_plane_operator_api_bearer_token: &str,
-    signal_operator_api_bearer_token: &str,
+    context: &DaemonAgentReadinessContext<'_>,
     children: &mut [DaemonChild],
     manifest_seed: &DaemonRuntimeManifestSeed,
-    timeout: Duration,
 ) -> anyhow::Result<()> {
-    match wait_for_daemon_agents_ready(
-        client,
-        control_plane_urls,
-        signal_url,
-        agent_urls,
-        agent_state_paths,
-        control_plane_operator_api_bearer_token,
-        signal_operator_api_bearer_token,
-        children,
-        timeout,
-    )
-    .await
-    {
+    match wait_for_daemon_agents_ready(client, context, children).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Err(manifest_error) = write_daemon_manifest_after_startup_failure(
                 manifest_seed,
                 DaemonRuntimePhase::StartupReadiness,
-                agent_urls,
+                context.agent_urls,
                 children,
             ) {
                 bail!(
@@ -8290,6 +8262,13 @@ fn identity_for_index(index: usize) -> IdentityKeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_error<T, E>(result: Result<T, E>, context: &str) -> E {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
 
     fn assert_zero_filled_relay_admission_failure_reasons(report: &LoadReport) {
         assert_eq!(
@@ -10249,10 +10228,11 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             MAX_LOAD_HTTP_JSON_RESPONSE_BYTES + 1
         );
         let (url, server) = spawn_raw_http_response(response).await?;
-        let error =
+        let error = test_error(
             get_json::<serde_json::Value>(&reqwest::Client::new(), url, "load oversized JSON test")
-                .await
-                .expect_err("oversized load JSON response should be rejected");
+                .await,
+            "oversized load JSON response should be rejected",
+        );
         assert!(
             format!("{error:#}").contains("load oversized JSON test response exceeds maximum size")
         );
@@ -10264,10 +10244,11 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             .to_string();
         let (url, server) = spawn_raw_http_response(response).await?;
         let response = reqwest::Client::new().get(url).send().await?;
-        let error =
+        let error = test_error(
             read_bounded_json_response::<serde_json::Value>(response, "load chunked JSON test", 10)
-                .await
-                .expect_err("oversized chunked load JSON response should be rejected");
+                .await,
+            "oversized chunked load JSON response should be rejected",
+        );
         assert!(error
             .to_string()
             .contains("load chunked JSON test response exceeds maximum size of 10 bytes"));
@@ -10297,9 +10278,10 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             MAX_LOAD_HTTP_TEXT_RESPONSE_BYTES + 1
         );
         let (url, server) = spawn_raw_http_response(response).await?;
-        let error = get_text(&reqwest::Client::new(), url, "load oversized text test")
-            .await
-            .expect_err("oversized load text response should be rejected");
+        let error = test_error(
+            get_text(&reqwest::Client::new(), url, "load oversized text test").await,
+            "oversized load text response should be rejected",
+        );
         assert!(
             format!("{error:#}").contains("load oversized text test response exceeds maximum size")
         );
@@ -11926,9 +11908,11 @@ fi
             checked_signal_metric_delta("accepted observations", 7, 11)?,
             4
         );
-        let error = checked_signal_metric_delta("accepted observations", 11, 7)
-            .expect_err("regressed Signal counter should fail")
-            .to_string();
+        let error = test_error(
+            checked_signal_metric_delta("accepted observations", 11, 7),
+            "regressed Signal counter should fail",
+        )
+        .to_string();
         assert!(error.contains("regressed from 11 to 7"));
         Ok(())
     }
@@ -12559,11 +12543,9 @@ fi
             control_plane_failover_checked: true,
             control_plane_failover_survivor_endpoints: 1,
             control_plane_failover_stopped_role: Some("control-plane-0".to_string()),
-            control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::from_counts(
-                0, 0, 0, 0, 0, 0, 0, 0,
-            ),
+            control_plane_lifecycle_metrics: ControlPlaneLifecycleMetricsMeasurement::default(),
             control_plane_failover_lifecycle_metrics:
-                ControlPlaneLifecycleMetricsMeasurement::from_counts(0, 0, 0, 0, 0, 0, 0, 0),
+                ControlPlaneLifecycleMetricsMeasurement::default(),
         }
     }
 

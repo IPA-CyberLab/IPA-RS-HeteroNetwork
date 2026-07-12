@@ -6962,7 +6962,7 @@ async fn run_agent(
     if let Some(node) = registered_node.as_ref() {
         let mut persisted_state = runtime.state();
         if persisted_state.vpn_ip.as_ref() != Some(&node.vpn_ip) {
-            persisted_state.vpn_ip = Some(node.vpn_ip.clone());
+            persisted_state.vpn_ip = Some(node.vpn_ip);
             persisted_state.updated_at = chrono::Utc::now();
             store
                 .save(&persisted_state)
@@ -10782,17 +10782,22 @@ enum DirectPathVerificationDecision {
     MissingCandidate,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DirectPathVerificationConfig {
+    required: bool,
+    probe_timeout: Duration,
+    handshake_max_age: Duration,
+}
+
 async fn direct_path_verification_decision(
     runtime: &AgentRuntime,
     direct: &PathRecord,
     telemetry_snapshot: Option<&BTreeMap<String, WireGuardPeerTelemetry>>,
-    verification_required: bool,
     peer_public_key: &str,
     now: chrono::DateTime<chrono::Utc>,
-    probe_timeout: Duration,
-    handshake_max_age: Duration,
+    config: DirectPathVerificationConfig,
 ) -> Result<DirectPathVerificationDecision, AgentError> {
-    if !verification_required {
+    if !config.required {
         return Ok(DirectPathVerificationDecision::Disabled);
     }
     let Some(candidate) = direct.selected_candidate.as_ref() else {
@@ -10864,14 +10869,14 @@ async fn direct_path_verification_decision(
             direct_path_record_targets(&current, direct.selected_state, candidate)
         });
     if current_direct_matches
-        && direct_path_telemetry_is_recent(candidate, telemetry, now, handshake_max_age)
+        && direct_path_telemetry_is_recent(candidate, telemetry, now, config.handshake_max_age)
     {
         return Ok(DirectPathVerificationDecision::Confirmed(
             "recent_wireguard_handshake",
         ));
     }
 
-    let timeout = chrono::Duration::from_std(probe_timeout).map_err(|error| {
+    let timeout = chrono::Duration::from_std(config.probe_timeout).map_err(|error| {
         AgentError::PathProbeRejected(format!(
             "direct path probe timeout is out of range: {error}"
         ))
@@ -11021,7 +11026,11 @@ async fn negotiate_signal_paths(
             .context("failed to fetch peer map for signal negotiation")?;
 
     let peer_set = signal_negotiation_peer_set(runtime, peer_map).await;
-    let verification_required = options.wireguard_peer_telemetry_source.is_some();
+    let direct_path_verification = DirectPathVerificationConfig {
+        required: options.wireguard_peer_telemetry_source.is_some(),
+        probe_timeout: options.direct_path_probe_timeout,
+        handshake_max_age: options.direct_handshake_max_age,
+    };
     let telemetry_snapshot = if let Some(source) = options.wireguard_peer_telemetry_source.as_ref()
     {
         match source.snapshot().await {
@@ -11077,11 +11086,9 @@ async fn negotiate_signal_paths(
                 runtime,
                 &record,
                 telemetry_snapshot.as_ref(),
-                verification_required,
                 &peer.wireguard_public_key,
                 now,
-                options.direct_path_probe_timeout,
-                options.direct_handshake_max_age,
+                direct_path_verification,
             )
             .await?;
             match decision {
@@ -14749,6 +14756,13 @@ mod tests {
 
     use super::*;
 
+    fn test_error<T, E>(result: Result<T, E>, context: &str) -> E {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
         SignedJoinToken {
             claims: JoinTokenClaims {
@@ -15222,13 +15236,15 @@ mod tests {
         );
         let (url, server) = spawn_raw_http_response(response).await?;
         let response = reqwest::Client::new().get(&url).send().await?;
-        let error = read_bounded_agent_json_response::<HeartbeatResponse>(
-            response,
-            MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
-            "test heartbeat",
-        )
-        .await
-        .expect_err("oversized agent HTTP JSON response should be rejected");
+        let error = test_error(
+            read_bounded_agent_json_response::<HeartbeatResponse>(
+                response,
+                MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
+                "test heartbeat",
+            )
+            .await,
+            "oversized agent HTTP JSON response should be rejected",
+        );
         assert!(error
             .to_string()
             .contains("test heartbeat response exceeds maximum size"));
@@ -15246,14 +15262,16 @@ mod tests {
         );
         let (url, server) = spawn_raw_http_response(response).await?;
         let identity = IdentityKeyPair::generate();
-        let error = fetch_peer_map_from_control_planes(
-            &reqwest::Client::new(),
-            &[url],
-            &identity.node_id(),
-            &identity,
-        )
-        .await
-        .expect_err("oversized control-plane peer map response should be rejected");
+        let error = test_error(
+            fetch_peer_map_from_control_planes(
+                &reqwest::Client::new(),
+                &[url],
+                &identity.node_id(),
+                &identity,
+            )
+            .await,
+            "oversized control-plane peer map response should be rejected",
+        );
         assert!(
             error
                 .to_string()
@@ -16992,11 +17010,12 @@ mod tests {
 
     #[test]
     fn otel_generated_timestamp_seconds_uses_unix_seconds_and_clamps_pre_epoch() {
-        let generated_at = Utc
-            .timestamp_opt(1_725_000_123, 987_000_000)
-            .single()
-            .unwrap();
-        let pre_epoch = Utc.timestamp_opt(-1, 0).single().unwrap();
+        let Some(generated_at) = Utc.timestamp_opt(1_725_000_123, 987_000_000).single() else {
+            panic!("generated timestamp fixture must be valid");
+        };
+        let Some(pre_epoch) = Utc.timestamp_opt(-1, 0).single() else {
+            panic!("pre-epoch timestamp fixture must be valid");
+        };
 
         assert_eq!(
             otel_generated_timestamp_seconds(&generated_at),
@@ -20414,7 +20433,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "51831",
         ])?;
         if let Command::Agent(args) = mismatch.command {
-            let error = validate_agent_runtime_config(&args).unwrap_err();
+            let error = test_error(
+                validate_agent_runtime_config(&args),
+                "mismatched STUN and WireGuard ports should fail",
+            );
             assert!(error
                 .to_string()
                 .contains("--stun-bind port must equal --wireguard-listen-port"));
@@ -20432,7 +20454,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             "0",
         ])?;
         if let Command::Agent(args) = zero_port.command {
-            let error = validate_agent_runtime_config(&args).unwrap_err();
+            let error = test_error(
+                validate_agent_runtime_config(&args),
+                "zero WireGuard port should fail",
+            );
             assert!(error
                 .to_string()
                 .contains("--wireguard-listen-port must be greater than zero"));
@@ -23037,25 +23062,40 @@ exec sleep 60
         assert_eq!(read_bounded_bearer_token_file(&path, "test")?, token);
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
-        let error = read_bounded_bearer_token_file(&path, "test").unwrap_err();
+        let error = test_error(
+            read_bounded_bearer_token_file(&path, "test"),
+            "group-readable token should fail",
+        );
         assert!(error.to_string().contains("expected owner-only access"));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))?;
-        let error = read_bounded_bearer_token_file(&path, "test").unwrap_err();
+        let error = test_error(
+            read_bounded_bearer_token_file(&path, "test"),
+            "owner-unreadable token should fail",
+        );
         assert!(error.to_string().contains("must be owner-readable"));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
 
         let symlink_path = dir.join("symlink.token");
         symlink(&path, &symlink_path)?;
-        let error = read_bounded_bearer_token_file(&symlink_path, "test").unwrap_err();
+        let error = test_error(
+            read_bounded_bearer_token_file(&symlink_path, "test"),
+            "symlinked token should fail",
+        );
         assert!(error.to_string().contains("must not be a symlink"));
 
         let hardlink_path = dir.join("hardlink.token");
         std::fs::hard_link(&path, &hardlink_path)?;
-        let error = read_bounded_bearer_token_file(&path, "test").unwrap_err();
+        let error = test_error(
+            read_bounded_bearer_token_file(&path, "test"),
+            "hard-linked token should fail",
+        );
         assert!(error.to_string().contains("must not have hard links"));
 
-        let error = read_bounded_bearer_token_file(&dir, "test").unwrap_err();
+        let error = test_error(
+            read_bounded_bearer_token_file(&dir, "test"),
+            "token directory should fail",
+        );
         assert!(error.to_string().contains("must resolve to a regular file"));
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -28360,6 +28400,11 @@ exec sleep 60
             .context("time")?;
         let runtime = AgentRuntime::new(AgentNodeState::generate(now), ClusterPolicy::default());
         let public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = DirectPathVerificationConfig {
+            required: true,
+            probe_timeout: Duration::from_secs(120),
+            handshake_max_age: Duration::from_secs(180),
+        };
         let selected_candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
         let direct = PathRecord {
             key: PeerPathKey::new(runtime.state().node_id, NodeId::from_string("peer-a")),
@@ -28385,11 +28430,9 @@ exec sleep 60
             &runtime,
             &direct,
             Some(&preexisting_telemetry),
-            true,
             public_key,
             now,
-            Duration::from_secs(120),
-            Duration::from_secs(180),
+            config,
         )
         .await?;
         let DirectPathVerificationDecision::Start(probe) = decision else {
@@ -28414,11 +28457,9 @@ exec sleep 60
             &runtime,
             &direct,
             Some(&telemetry),
-            true,
             public_key,
             now + ChronoDuration::seconds(3),
-            Duration::from_secs(120),
-            Duration::from_secs(180),
+            config,
         )
         .await?;
         assert_eq!(activated, DirectPathVerificationDecision::Pending);
@@ -28439,11 +28480,9 @@ exec sleep 60
             &runtime,
             &direct,
             Some(&telemetry),
-            true,
             public_key,
             now + ChronoDuration::seconds(5),
-            Duration::from_secs(120),
-            Duration::from_secs(180),
+            config,
         )
         .await?;
 
@@ -28468,6 +28507,11 @@ exec sleep 60
             .context("time")?;
         let runtime = AgentRuntime::new(AgentNodeState::generate(now), ClusterPolicy::default());
         let public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = DirectPathVerificationConfig {
+            required: true,
+            probe_timeout: Duration::from_secs(120),
+            handshake_max_age: Duration::from_secs(180),
+        };
         let selected_candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
         let direct = PathRecord {
             key: PeerPathKey::new(runtime.state().node_id, NodeId::from_string("peer-a")),
@@ -28504,11 +28548,9 @@ exec sleep 60
             &runtime,
             &direct,
             Some(&telemetry),
-            true,
             public_key,
             now + ChronoDuration::seconds(30),
-            Duration::from_secs(120),
-            Duration::from_secs(180),
+            config,
         )
         .await?;
         assert_eq!(
@@ -28527,17 +28569,9 @@ exec sleep 60
                 baseline_tx_bytes: Some(200),
             })
             .await?;
-        let expired = direct_path_verification_decision(
-            &runtime,
-            &direct,
-            None,
-            true,
-            public_key,
-            now,
-            Duration::from_secs(120),
-            Duration::from_secs(180),
-        )
-        .await?;
+        let expired =
+            direct_path_verification_decision(&runtime, &direct, None, public_key, now, config)
+                .await?;
         assert_eq!(expired, DirectPathVerificationDecision::Expired);
         assert!(runtime
             .pending_direct_path_probe(&direct.key.remote)
@@ -28550,7 +28584,8 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn stable_signal_path_record_keeps_relay_when_direct_gain_is_small() {
+    async fn stable_signal_path_record_keeps_relay_when_direct_gain_is_small(
+    ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -28569,10 +28604,7 @@ exec sleep 60
             updated_at: Utc::now() - ChronoDuration::seconds(10),
             pinned: false,
         };
-        runtime
-            .upsert_path_state(current)
-            .await
-            .expect("valid relay path state should be stored");
+        runtime.upsert_path_state(current).await?;
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
@@ -28609,10 +28641,12 @@ exec sleep 60
         assert_eq!(selected.selected_state, PathState::Relay);
         assert_eq!(selected.relay_node, Some(NodeId::from_string("relay-a")));
         assert_eq!(selected.updated_at, candidate_updated_at);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stable_signal_path_record_accepts_direct_without_active_relay_session() {
+    async fn stable_signal_path_record_accepts_direct_without_active_relay_session(
+    ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -28632,8 +28666,7 @@ exec sleep 60
                 updated_at: Utc::now() - ChronoDuration::seconds(10),
                 pinned: false,
             })
-            .await
-            .expect("valid relay path state should be stored");
+            .await?;
         let candidate_record = PathRecord {
             key: PeerPathKey::new(local, peer),
             selected_state: PathState::DirectNatTraversal,
@@ -28656,10 +28689,12 @@ exec sleep 60
 
         assert_eq!(selection, StableSignalPathSelection::Candidate);
         assert_eq!(selected, candidate_record);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stable_signal_path_record_accepts_direct_when_relay_session_expired() {
+    async fn stable_signal_path_record_accepts_direct_when_relay_session_expired(
+    ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -28679,8 +28714,7 @@ exec sleep 60
                 updated_at: Utc::now() - ChronoDuration::seconds(10),
                 pinned: false,
             })
-            .await
-            .expect("valid relay path state should be stored");
+            .await?;
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
@@ -28715,10 +28749,12 @@ exec sleep 60
 
         assert_eq!(selection, StableSignalPathSelection::Candidate);
         assert_eq!(selected, candidate_record);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stable_signal_path_record_accepts_direct_when_gain_clears_margin() {
+    async fn stable_signal_path_record_accepts_direct_when_gain_clears_margin(
+    ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -28738,8 +28774,7 @@ exec sleep 60
                 updated_at: Utc::now() - ChronoDuration::seconds(10),
                 pinned: false,
             })
-            .await
-            .expect("valid relay path state should be stored");
+            .await?;
         let candidate_record = PathRecord {
             key: PeerPathKey::new(local, peer),
             selected_state: PathState::DirectNatTraversal,
@@ -28762,6 +28797,7 @@ exec sleep 60
 
         assert_eq!(selection, StableSignalPathSelection::Candidate);
         assert_eq!(selected, candidate_record);
+        Ok(())
     }
 
     #[test]

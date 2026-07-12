@@ -6051,7 +6051,7 @@ mod tests {
         );
         let local_id = runtime.state().node_id.clone();
         let peer_id = NodeId::from_string("peer-a");
-        let error = runtime
+        let error = match runtime
             .upsert_path_state(PathRecord {
                 key: PeerPathKey::new(local_id, peer_id.clone()),
                 selected_state: PathState::DirectPublic,
@@ -6073,7 +6073,10 @@ mod tests {
                 pinned: false,
             })
             .await
-            .expect_err("unusable selected candidate should be rejected");
+        {
+            Ok(()) => panic!("unusable selected candidate should be rejected"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, AgentError::PathStateRejected(_)));
         assert!(error.to_string().contains("selected candidate"));
@@ -6104,10 +6107,10 @@ mod tests {
             pinned: false,
         };
 
-        let error = runtime
-            .upsert_path_state(record)
-            .await
-            .expect_err("path state owned by another node should be rejected");
+        let error = match runtime.upsert_path_state(record).await {
+            Ok(()) => panic!("path state owned by another node should be rejected"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, AgentError::PathStateRejected(_)));
         assert!(error.to_string().contains("does not match runtime node"));
@@ -6115,7 +6118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_stores_latest_path_state() {
+    async fn runtime_stores_latest_path_state() -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -6126,20 +6129,16 @@ mod tests {
         let mut latest = path("peer-a", PathState::DirectPublic, 115.0);
         latest.key.local = local;
 
-        runtime
-            .upsert_path_state(first)
-            .await
-            .expect("valid first path state should be stored");
-        runtime
-            .upsert_path_state(latest.clone())
-            .await
-            .expect("valid latest path state should be stored");
+        runtime.upsert_path_state(first).await?;
+        runtime.upsert_path_state(latest.clone()).await?;
 
         assert_eq!(runtime.path_state().await, vec![latest]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn runtime_direct_path_state_clears_relay_session_and_forwarder_state() {
+    async fn runtime_direct_path_state_clears_relay_session_and_forwarder_state(
+    ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -6178,15 +6177,15 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await
-            .expect("valid direct path state should be stored");
+            .await?;
 
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn runtime_records_path_change_events_and_metrics() {
+    async fn runtime_records_path_change_events_and_metrics() -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -6196,18 +6195,9 @@ mod tests {
         first.key.local = local.clone();
         let mut latest = path("peer-a", PathState::DirectPublic, 115.0);
         latest.key.local = local;
-        runtime
-            .upsert_path_state(first.clone())
-            .await
-            .expect("valid first path state should be stored");
-        runtime
-            .upsert_path_state(first.clone())
-            .await
-            .expect("duplicate unchanged path state should be accepted");
-        runtime
-            .upsert_path_state(latest.clone())
-            .await
-            .expect("valid latest path state should be stored");
+        runtime.upsert_path_state(first.clone()).await?;
+        runtime.upsert_path_state(first.clone()).await?;
+        runtime.upsert_path_state(latest.clone()).await?;
 
         let events = runtime.path_change_events().await;
         assert_eq!(events.len(), 2);
@@ -6253,10 +6243,11 @@ mod tests {
                 },
             ]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn runtime_counts_dropped_path_change_events() {
+    async fn runtime_counts_dropped_path_change_events() -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -6265,10 +6256,7 @@ mod tests {
         for index in 0..(MAX_PATH_CHANGE_EVENTS + 3) {
             let mut record = path(&format!("peer-{index}"), PathState::Relay, 70.0);
             record.key.local = local.clone();
-            runtime
-                .upsert_path_state(record)
-                .await
-                .expect("valid path state should be stored");
+            runtime.upsert_path_state(record).await?;
         }
 
         let metrics = runtime.metrics().await;
@@ -6283,10 +6271,11 @@ mod tests {
         assert_eq!(total_count, (MAX_PATH_CHANGE_EVENTS + 3) as u64);
         assert_eq!(dropped_count, 3);
         assert_eq!(events[0].key.remote, NodeId::from_string("peer-3"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn runtime_records_path_probe_metrics_and_pins_peer() {
+    async fn runtime_records_path_probe_metrics_and_pins_peer() -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -6324,10 +6313,7 @@ mod tests {
             cost: 10,
             pin: true,
         };
-        let path = runtime
-            .record_path_probe(request, Utc::now())
-            .await
-            .expect("valid path probe should be recorded");
+        let path = runtime.record_path_probe(request, Utc::now()).await?;
 
         assert_eq!(path.selected_state, PathState::DirectPublic);
         assert!(path
@@ -6356,6 +6342,7 @@ mod tests {
             runtime.path_record_for_peer(&peer.node_id).await,
             Some(path)
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -6384,10 +6371,10 @@ mod tests {
             pin: false,
         };
 
-        let error = runtime
-            .record_path_probe(request, Utc::now())
-            .await
-            .expect_err("candidate kind mismatched to direct state should be rejected");
+        let error = match runtime.record_path_probe(request, Utc::now()).await {
+            Ok(_) => panic!("candidate kind mismatched to direct state should be rejected"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, AgentError::PathProbeRejected(_)));
         assert!(error.to_string().contains("selected state DirectPublic"));
@@ -6673,7 +6660,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_relay_forwarder_endpoint_uses_supplied_time_for_expiry() {
+    async fn runtime_relay_forwarder_endpoint_uses_supplied_time_for_expiry(
+    ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -6696,8 +6684,7 @@ mod tests {
                 updated_at: now,
                 pinned: false,
             })
-            .await
-            .expect("valid relay path state should be stored");
+            .await?;
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
@@ -6728,6 +6715,7 @@ mod tests {
         );
         assert!(runtime.relay_session(&peer).await.is_none());
         assert!(runtime.relay_forwarder_endpoint(&peer).await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -8020,8 +8008,7 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await
-            .expect("valid relay path state should be stored");
+            .await?;
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer_id.clone(),

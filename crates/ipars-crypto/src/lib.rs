@@ -792,12 +792,10 @@ mod tests {
             Some(identity.sign_authenticated_signal_path_request(&authenticated, now)?);
         verify_signal_path_signature(&authenticated, &identity.public_key_b64())?;
 
-        authenticated
-            .path_observation
-            .as_mut()
-            .expect("test observation")
-            .metrics
-            .latency_ms = Some(1.0);
+        let Some(observation) = authenticated.path_observation.as_mut() else {
+            panic!("signed test request must contain a path observation");
+        };
+        observation.metrics.latency_ms = Some(1.0);
         assert!(matches!(
             verify_signal_path_signature(&authenticated, &identity.public_key_b64()),
             Err(CryptoError::InvalidSignature)

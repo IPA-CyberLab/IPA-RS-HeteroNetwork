@@ -673,10 +673,12 @@ mod tests {
         );
         let observed_at = Utc::now();
 
-        let observation = runtime
+        let Some(observation) = runtime
             .record_peer_probe_measurement(&target, &measurement, observed_at)
             .await?
-            .expect("unchanged path should accept measurement");
+        else {
+            panic!("unchanged path should accept peer probe measurement");
+        };
         assert_eq!(observation.metrics.loss_ppm, 333_333);
         assert_eq!(
             runtime
@@ -690,12 +692,10 @@ mod tests {
         );
 
         let mut changed_path = selected_path;
-        changed_path
-            .selected_candidate
-            .as_mut()
-            .expect("direct path candidate")
-            .addr
-            .set_port(51_821);
+        let Some(candidate) = changed_path.selected_candidate.as_mut() else {
+            panic!("direct test path must contain a selected candidate");
+        };
+        candidate.addr.set_port(51_821);
         runtime.upsert_path_state(changed_path).await?;
         assert!(
             runtime

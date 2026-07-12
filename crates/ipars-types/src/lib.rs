@@ -4591,9 +4591,7 @@ pub mod api {
                     .then_some(DnsSectionParse::Truncated);
             };
             offset = name_end;
-            let Some(question_end) = offset.checked_add(4) else {
-                return None;
-            };
+            let question_end = offset.checked_add(4)?;
             let Some(question) = payload.get(offset..question_end) else {
                 return (question_index > 0 && allow_truncated)
                     .then_some(DnsSectionParse::Truncated);
@@ -4635,23 +4633,15 @@ pub mod api {
         mut offset: usize,
         allow_truncated: bool,
     ) -> Option<DnsSectionParse> {
-        let Some(name) = dns_resource_record_name_payload(payload, offset) else {
-            return None;
-        };
+        let name = dns_resource_record_name_payload(payload, offset)?;
         offset = name.end;
-        let Some(rr_header_end) = offset.checked_add(10) else {
-            return None;
-        };
-        let Some(rr_header) = payload.get(offset..rr_header_end) else {
-            return None;
-        };
+        let rr_header_end = offset.checked_add(10)?;
+        let rr_header = payload.get(offset..rr_header_end)?;
         let rr_type = u16::from_be_bytes([rr_header[0], rr_header[1]]);
         let rr_class = u16::from_be_bytes([rr_header[2], rr_header[3]]);
         let rr_ttl = u32::from_be_bytes([rr_header[4], rr_header[5], rr_header[6], rr_header[7]]);
         let rdlength = u16::from_be_bytes([rr_header[8], rr_header[9]]) as usize;
-        let Some(rr_end) = rr_header_end.checked_add(rdlength) else {
-            return None;
-        };
+        let rr_end = rr_header_end.checked_add(rdlength)?;
         if rr_type == 0
             || !dns_resource_record_header_payload(rr_type, rr_class, rr_ttl, name.labels)
             || !dns_resource_record_rdata_length_payload(rr_type, rdlength)
@@ -5184,9 +5174,7 @@ pub mod api {
         let mut labels = 0_usize;
         let mut name_len = 0_usize;
         loop {
-            let Some(&len) = payload.get(offset) else {
-                return None;
-            };
+            let &len = payload.get(offset)?;
             if len & 0xc0 == 0xc0 {
                 let pointer = read_u16_be(payload, offset)?;
                 let pointer_offset = (pointer & 0x3fff) as usize;
@@ -5213,12 +5201,8 @@ pub mod api {
                 return None;
             }
             let len = len as usize;
-            let Some(label_end) = offset.checked_add(len) else {
-                return None;
-            };
-            let Some(label) = payload.get(offset..label_end) else {
-                return None;
-            };
+            let label_end = offset.checked_add(len)?;
+            let label = payload.get(offset..label_end)?;
             if !label
                 .iter()
                 .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -6453,7 +6437,7 @@ pub mod api {
         }
         let code_ok = match (code_class, code_detail) {
             (0, 1..=5) => matches!(message_type, 0 | 1),
-            (2, 1..=31) | (4, 0..=31) | (5, 0..=31) => matches!(message_type, 0 | 1 | 2),
+            (2, 1..=31) | (4, 0..=31) | (5, 0..=31) => matches!(message_type, 0..=2),
             _ => false,
         };
         code_ok && coap_options_payload(payload, header_len)
@@ -6843,7 +6827,7 @@ pub mod api {
         }
         let version = (payload[0] >> 3) & 0x07;
         let mode = payload[0] & 0x07;
-        if !(3..=4).contains(&version) || !matches!(mode, 3 | 4 | 5) {
+        if !(3..=4).contains(&version) || !matches!(mode, 3..=5) {
             return false;
         }
         let stratum = payload[1];
@@ -6909,7 +6893,7 @@ pub mod api {
         if version & 0xf0 != 0xc0 || version & 0x0f > 1 {
             return false;
         }
-        if !matches!(payload[1], 1 | 2 | 3) {
+        if !matches!(payload[1], 1..=3) {
             return false;
         }
         if payload[2] == 0 {
@@ -6939,9 +6923,7 @@ pub mod api {
             return false;
         }
         let message_len = u16::from_be_bytes([payload[16], payload[17]]) as usize;
-        if !(BGP_HEADER_LEN..=4096).contains(&message_len)
-            || !matches!(payload[18], 1 | 2 | 3 | 4 | 5)
-        {
+        if !(BGP_HEADER_LEN..=4096).contains(&message_len) || !matches!(payload[18], 1..=5) {
             return false;
         }
         message_len <= payload.len()
@@ -7359,7 +7341,7 @@ pub mod api {
         value.len() == expected_len
             && value[2..2 + value_count]
                 .iter()
-                .all(|value_type| matches!(*value_type, 0 | 1 | 2 | 3))
+                .all(|value_type| matches!(*value_type, 0..=3))
     }
 
     fn statsd_payload(payload: &[u8]) -> bool {
@@ -7716,7 +7698,7 @@ pub mod api {
             return false;
         }
         let day = match (payload[4], payload[5]) {
-            (b' ', second) if second.is_ascii_digit() => (second - b'0') as u8,
+            (b' ', second) if second.is_ascii_digit() => second - b'0',
             (first, second) if first.is_ascii_digit() && second.is_ascii_digit() => {
                 (first - b'0') * 10 + (second - b'0')
             }
@@ -8741,7 +8723,7 @@ pub mod api {
                     || ascii_contains_ignore_case(text, b"storage")
                     || ascii_contains_ignore_case(text, b"access")
             }
-            500 | 501 | 502 | 503 | 504 => {
+            500..=504 => {
                 ascii_contains_ignore_case(text, b"syntax")
                     || ascii_contains_ignore_case(text, b"command")
                     || ascii_contains_ignore_case(text, b"parameter")
@@ -8999,7 +8981,7 @@ pub mod api {
         let Some(line_len) = git_pkt_line_len(payload) else {
             return false;
         };
-        if line_len < 4 || line_len > 65_520 {
+        if !(4..=65_520).contains(&line_len) {
             return false;
         }
         let available_end = line_len.min(payload.len());
@@ -10815,7 +10797,7 @@ pub mod api {
         let Some(login_len) = read_u32_le(body, 0).map(|value| value as usize) else {
             return false;
         };
-        login_len == declared_body_len && login_len >= 36 && login_len <= 65_527
+        login_len == declared_body_len && (36..=65_527).contains(&login_len)
     }
 
     fn mssql_sql_batch_body(body: &[u8], incomplete: bool) -> bool {
@@ -11244,14 +11226,14 @@ pub mod api {
         }
 
         let mut counters = [0_u64; 5];
-        for index in 0..5 {
+        for counter in &mut counters {
             let Some((value, next)) = clickhouse_uvarint(payload, offset) else {
                 return false;
             };
             if value > 1_000_000_000_000_000 {
                 return false;
             }
-            counters[index] = value;
+            *counter = value;
             offset = next;
         }
 
@@ -13829,7 +13811,7 @@ pub mod api {
         let Some((remaining_len, offset)) = mqtt_variable_integer(payload, 1) else {
             return false;
         };
-        if remaining_len < 2 || remaining_len > PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES {
+        if !(2..=PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES).contains(&remaining_len) {
             return false;
         }
         let Some(remaining_end) = offset.checked_add(remaining_len) else {
@@ -14537,10 +14519,8 @@ pub mod api {
         }
         let mut tokens = filter.split(|byte| *byte == b'/').peekable();
         while let Some(token) = tokens.next() {
-            if token.contains(&b'#') {
-                if token != b"#" || tokens.peek().is_some() {
-                    return false;
-                }
+            if token.contains(&b'#') && (token != b"#" || tokens.peek().is_some()) {
+                return false;
             }
             if token.contains(&b'+') && token != b"+" {
                 return false;
@@ -15027,8 +15007,8 @@ pub mod api {
         let Some((change, offset)) = cassandra_string_field(body_prefix, offset) else {
             return false;
         };
-        if !matches!(change, b"NEW_NODE" | b"REMOVED_NODE")
-            && !(version == 3 && change == b"MOVED_NODE")
+        if !(matches!(change, b"NEW_NODE" | b"REMOVED_NODE")
+            || version == 3 && change == b"MOVED_NODE")
         {
             return false;
         }
@@ -15485,9 +15465,7 @@ pub mod api {
         match option_id {
             0x0000 => cassandra_string_field(body_prefix, offset)
                 .map(|(_custom_type, next_offset)| next_offset),
-            0x0001 | 0x0002 | 0x0003 | 0x0004 | 0x0005 | 0x0006 | 0x0007 | 0x0008 | 0x0009
-            | 0x000a | 0x000b | 0x000c | 0x000d | 0x000e | 0x000f | 0x0010 | 0x0011 | 0x0012
-            | 0x0013 | 0x0014 | 0x0015 => Some(offset),
+            0x0001..=0x0015 => Some(offset),
             0x0020 | 0x0022 => {
                 cassandra_type_option_with_depth(body_prefix, offset, body_len, depth + 1)
             }
@@ -15711,7 +15689,7 @@ pub mod api {
         let Some(batch_type) = body_prefix.first() else {
             return false;
         };
-        if !matches!(*batch_type, 0 | 1 | 2) {
+        if !matches!(*batch_type, 0..=2) {
             return false;
         }
         let Some(statement_count) = read_u16_be(body_prefix, 1).map(|count| count as usize) else {
@@ -16505,10 +16483,7 @@ pub mod api {
                     let Some(identifier) = section.identifier else {
                         return false;
                     };
-                    if sequence_identifiers
-                        .iter()
-                        .any(|existing| *existing == identifier)
-                    {
+                    if sequence_identifiers.contains(&identifier) {
                         return false;
                     }
                     sequence_identifiers.push(identifier);
@@ -16638,7 +16613,7 @@ pub mod api {
             if is_array && !mongodb_bson_array_index_name(field_name, field_names.len()) {
                 return false;
             }
-            if field_names.iter().any(|existing| *existing == field_name) {
+            if field_names.contains(&field_name) {
                 return false;
             }
             field_names.push(field_name);
@@ -16778,7 +16753,7 @@ pub mod api {
         depth: usize,
     ) -> Option<usize> {
         let total_len = read_u32_le(payload, offset)? as usize;
-        if total_len < 14 || total_len > 16_777_216 {
+        if !(14..=16_777_216).contains(&total_len) {
             return None;
         }
         let value_end = offset.checked_add(total_len)?;
@@ -17039,7 +17014,7 @@ pub mod api {
     }
 
     fn starts_utf16le_ascii_keyword(payload: &[u8], keyword: &[u8]) -> bool {
-        let keyword_bytes = keyword.len().checked_mul(2).unwrap_or(usize::MAX);
+        let keyword_bytes = keyword.len().saturating_mul(2);
         if keyword.is_empty() || payload.len() < keyword_bytes {
             return false;
         }
@@ -19243,10 +19218,10 @@ mod tests {
             body.extend_from_slice(&[0; 23]);
             body.extend_from_slice(username);
             body.push(0);
-            if client_flags & MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
-                body.push(auth_response.len() as u8);
-                body.extend_from_slice(auth_response);
-            } else if client_flags & MYSQL_CLIENT_SECURE_CONNECTION != 0 {
+            if client_flags
+                & (MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | MYSQL_CLIENT_SECURE_CONNECTION)
+                != 0
+            {
                 body.push(auth_response.len() as u8);
                 body.extend_from_slice(auth_response);
             } else {
@@ -19951,11 +19926,13 @@ mod tests {
             encoded
         }
 
+        type CassandraColumn<'a> = (&'a [u8], &'a [u8], &'a [u8], u16);
+
         fn cassandra_prepared_metadata_body(
             flags: u32,
             pk_indices: &[u16],
             global_table: Option<(&[u8], &[u8])>,
-            columns: &[(&[u8], &[u8], &[u8], u16)],
+            columns: &[CassandraColumn<'_>],
         ) -> Vec<u8> {
             let mut encoded = Vec::new();
             encoded.extend_from_slice(&flags.to_be_bytes());
@@ -19983,7 +19960,7 @@ mod tests {
             flags: u32,
             metadata_id: Option<&[u8]>,
             global_table: Option<(&[u8], &[u8])>,
-            columns: &[(&[u8], &[u8], &[u8], u16)],
+            columns: &[CassandraColumn<'_>],
         ) -> Vec<u8> {
             let mut encoded = Vec::new();
             encoded.extend_from_slice(&flags.to_be_bytes());
@@ -21172,8 +21149,11 @@ mod tests {
         dns_response_self_pointer_answer[2] = 0x81;
         dns_response_self_pointer_answer[3] = 0x80;
         dns_response_self_pointer_answer[7] = 0x01;
-        let self_pointer =
-            0xc000_u16 | u16::try_from(dns_response_self_pointer_answer.len()).unwrap();
+        let self_pointer_offset = match u16::try_from(dns_response_self_pointer_answer.len()) {
+            Ok(offset) => offset,
+            Err(error) => panic!("DNS test payload length must fit u16: {error}"),
+        };
+        let self_pointer = 0xc000_u16 | self_pointer_offset;
         dns_response_self_pointer_answer.extend_from_slice(&self_pointer.to_be_bytes());
         dns_response_self_pointer_answer.extend_from_slice(&[
             0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 22,
@@ -21462,7 +21442,8 @@ mod tests {
             api::AgentPacketFlowApplication::Tftp
         );
         assert_eq!(
-            observation_for_udp_payload(b"\0\x02startup.cfg\0netascii\0timeout\05\0").application(),
+            observation_for_udp_payload(b"\0\x02startup.cfg\0netascii\0timeout\x005\0")
+                .application(),
             api::AgentPacketFlowApplication::Tftp
         );
         assert_eq!(

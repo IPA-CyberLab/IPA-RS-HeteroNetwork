@@ -767,7 +767,7 @@ where
         self.store
             .get_node(&request.node_id)
             .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id))
+            .ok_or(ControlPlaneError::NodeNotFound(request.node_id))
     }
 
     async fn insert_node_with_fresh_vpn_ip(

@@ -174,11 +174,13 @@ async fn read_bounded_response_body(
 pub struct SignalHttpState {
     registry: Arc<SignalRegistry>,
     authenticator: Arc<dyn SignalNodeAuthenticator>,
-    accepted_nonces: Arc<Mutex<BTreeMap<(NodeId, String), DateTime<Utc>>>>,
+    accepted_nonces: AcceptedNonceLedger,
     authenticated_nodes: Arc<Mutex<BTreeMap<NodeId, DateTime<Utc>>>>,
     node_auth_ttl: ChronoDuration,
     operator_api_bearer_token: Option<Arc<str>>,
 }
+
+type AcceptedNonceLedger = Arc<Mutex<BTreeMap<(NodeId, String), DateTime<Utc>>>>;
 
 impl SignalHttpState {
     pub fn new(
@@ -1119,9 +1121,13 @@ mod tests {
     }
 
     fn advertised_route(id: &str, cidr: &str, advertised_by: &NodeId) -> Route {
+        let cidr = match cidr.parse() {
+            Ok(cidr) => cidr,
+            Err(error) => panic!("invalid test CIDR `{cidr}`: {error}"),
+        };
         Route {
             id: id.to_string(),
-            cidr: cidr.parse().unwrap(),
+            cidr,
             advertised_by: advertised_by.clone(),
             via: None,
             metric: 100,

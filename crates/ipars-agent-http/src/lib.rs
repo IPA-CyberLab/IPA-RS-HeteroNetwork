@@ -1587,6 +1587,13 @@ mod tests {
 
     use super::*;
 
+    fn test_error<T, E>(result: Result<T, E>, context: &str) -> E {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+
     fn peer_record(node_id: NodeId, vpn_ip: IpAddr, routes: Vec<Route>) -> NodeRecord {
         NodeRecord {
             node_id,
@@ -1942,14 +1949,16 @@ mod tests {
             node_signature: None,
         };
 
-        let error = send_wireguard_key_rotation_to_control_planes(
-            &reqwest::Client::new(),
-            DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
-            &[control_plane_url],
-            request,
-        )
-        .await
-        .expect_err("oversized WireGuard key rotation response should be rejected");
+        let error = test_error(
+            send_wireguard_key_rotation_to_control_planes(
+                &reqwest::Client::new(),
+                DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
+                &[control_plane_url],
+                request,
+            )
+            .await,
+            "oversized WireGuard key rotation response should be rejected",
+        );
 
         assert!(error
             .to_string()
@@ -1965,13 +1974,15 @@ mod tests {
             .to_string();
         let (url, server) = spawn_raw_http_response(response).await?;
         let response = reqwest::Client::new().get(&url).send().await?;
-        let error = read_bounded_json_response::<serde_json::Value>(
-            response,
-            10,
-            "test control-plane JSON",
-        )
-        .await
-        .expect_err("oversized chunked control-plane body should be rejected");
+        let error = test_error(
+            read_bounded_json_response::<serde_json::Value>(
+                response,
+                10,
+                "test control-plane JSON",
+            )
+            .await,
+            "oversized chunked control-plane body should be rejected",
+        );
 
         assert!(error
             .to_string()
@@ -2302,8 +2313,7 @@ mod tests {
                 updated_at: Utc::now(),
                 pinned: false,
             })
-            .await
-            .expect("valid relay path state should be stored");
+            .await?;
         let forwarder_metrics = Arc::new(RelayForwarderStats::new(
             NodeId::from_string("peer-a"),
             NodeId::from_string("relay-a"),

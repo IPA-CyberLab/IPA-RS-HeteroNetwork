@@ -489,7 +489,7 @@ struct TokenRevokeArgs {
 #[derive(Debug, Subcommand)]
 enum RelayCommand {
     Status(RelayStatusArgs),
-    Probe(RelayProbeArgs),
+    Probe(Box<RelayProbeArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -1455,7 +1455,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(relay_url) => print_json(&relay_status(relay_url).await?)?,
                 None => print_json(&relay_status(defaulted_relay_url(None)).await?)?,
             },
-            RelayCommand::Probe(args) => print_json(&relay_probe(args).await?)?,
+            RelayCommand::Probe(args) => print_json(&relay_probe(*args).await?)?,
         },
         Command::Stun { command } => match command {
             StunCommand::Probe(args) => print_json(&stun_probe(args).await?)?,
@@ -2663,38 +2663,34 @@ async fn relay_probe(args: RelayProbeArgs) -> anyhow::Result<RelayProbeOutput> {
     );
 
     let payload = args.payload.as_bytes();
+    let left_to_right_route = RelayProbeRoute {
+        relay_udp: args.relay_udp,
+        session_id: &admission.session_id,
+        session_token: &admission.session_token,
+        source: &left,
+        destination: &right,
+    };
     let invalid_credential_drop = if args.send_invalid_credential {
         Some(relay_probe_invalid_credential(
             &left_socket,
-            args.relay_udp,
-            &admission.session_id,
-            &admission.session_token,
-            &left,
-            &right,
+            &left_to_right_route,
             payload,
         )?)
     } else {
         None
     };
-    let left_to_right = relay_probe_direction(
-        &left_socket,
-        &right_socket,
-        args.relay_udp,
-        &admission.session_id,
-        &admission.session_token,
-        &left,
-        &right,
-        payload,
-    )?;
+    let left_to_right =
+        relay_probe_direction(&left_socket, &right_socket, &left_to_right_route, payload)?;
     let right_to_left_payload = reversed_probe_payload(payload);
+    let right_to_left_route = RelayProbeRoute {
+        source: &right,
+        destination: &left,
+        ..left_to_right_route
+    };
     let right_to_left = relay_probe_direction(
         &right_socket,
         &left_socket,
-        args.relay_udp,
-        &admission.session_id,
-        &admission.session_token,
-        &right,
-        &left,
+        &right_to_left_route,
         &right_to_left_payload,
     )?;
 
@@ -2778,27 +2774,37 @@ fn validate_relay_admission_bearer_token(value: &str, label: &str) -> anyhow::Re
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RelayProbeRoute<'a> {
+    relay_udp: SocketAddr,
+    session_id: &'a str,
+    session_token: &'a str,
+    source: &'a NodeId,
+    destination: &'a NodeId,
+}
+
 fn relay_probe_invalid_credential(
     send_socket: &UdpSocket,
-    relay_udp: SocketAddr,
-    session_id: &str,
-    session_token: &str,
-    source: &NodeId,
-    destination: &NodeId,
+    route: &RelayProbeRoute<'_>,
     payload: &[u8],
 ) -> anyhow::Result<RelayProbeInvalidCredentialOutput> {
-    let invalid_session_token = format!("{session_token}-invalid");
+    let invalid_session_token = format!("{}-invalid", route.session_token);
     let datagram = encode_relay_datagram_with_route(
-        session_id,
+        route.session_id,
         &invalid_session_token,
-        source,
-        destination,
+        route.source,
+        route.destination,
         payload,
     )
     .context("failed to encode invalid-credential relay probe datagram")?;
-    let bytes_sent = send_socket.send_to(&datagram, relay_udp).with_context(|| {
-        format!("failed to send invalid-credential relay probe datagram to {relay_udp}")
-    })?;
+    let bytes_sent = send_socket
+        .send_to(&datagram, route.relay_udp)
+        .with_context(|| {
+            format!(
+                "failed to send invalid-credential relay probe datagram to {}",
+                route.relay_udp
+            )
+        })?;
     anyhow::ensure!(
         bytes_sent == datagram.len(),
         "invalid-credential relay probe sent {bytes_sent} of {} encoded bytes",
@@ -2806,8 +2812,8 @@ fn relay_probe_invalid_credential(
     );
 
     Ok(RelayProbeInvalidCredentialOutput {
-        source: source.clone(),
-        destination: destination.clone(),
+        source: route.source.clone(),
+        destination: route.destination.clone(),
         bytes_sent,
     })
 }
@@ -2828,19 +2834,20 @@ fn bind_probe_socket(
 fn relay_probe_direction(
     send_socket: &UdpSocket,
     recv_socket: &UdpSocket,
-    relay_udp: SocketAddr,
-    session_id: &str,
-    session_token: &str,
-    source: &NodeId,
-    destination: &NodeId,
+    route: &RelayProbeRoute<'_>,
     payload: &[u8],
 ) -> anyhow::Result<RelayProbeDirectionOutput> {
-    let datagram =
-        encode_relay_datagram_with_route(session_id, session_token, source, destination, payload)
-            .context("failed to encode relay probe datagram")?;
+    let datagram = encode_relay_datagram_with_route(
+        route.session_id,
+        route.session_token,
+        route.source,
+        route.destination,
+        payload,
+    )
+    .context("failed to encode relay probe datagram")?;
     let bytes_sent = send_socket
-        .send_to(&datagram, relay_udp)
-        .with_context(|| format!("failed to send relay probe datagram to {relay_udp}"))?;
+        .send_to(&datagram, route.relay_udp)
+        .with_context(|| format!("failed to send relay probe datagram to {}", route.relay_udp))?;
     anyhow::ensure!(
         bytes_sent == datagram.len(),
         "relay probe sent {bytes_sent} of {} encoded bytes",
@@ -2848,9 +2855,13 @@ fn relay_probe_direction(
     );
 
     let mut received = vec![0_u8; payload.len().saturating_add(1024).max(2048)];
-    let (bytes_received, remote_addr) = recv_socket
-        .recv_from(&mut received)
-        .with_context(|| format!("timed out waiting for relay probe payload from {source}"))?;
+    let (bytes_received, remote_addr) =
+        recv_socket.recv_from(&mut received).with_context(|| {
+            format!(
+                "timed out waiting for relay probe payload from {}",
+                route.source
+            )
+        })?;
     anyhow::ensure!(
         bytes_received == payload.len(),
         "relay probe received {bytes_received} bytes from {remote_addr}, expected {}",
@@ -2862,8 +2873,8 @@ fn relay_probe_direction(
     );
 
     Ok(RelayProbeDirectionOutput {
-        source: source.clone(),
-        destination: destination.clone(),
+        source: route.source.clone(),
+        destination: route.destination.clone(),
         bytes_sent,
         bytes_received,
     })
@@ -9507,6 +9518,13 @@ mod tests {
 
     use super::*;
 
+    fn test_error<T, E>(result: Result<T, E>, context: &str) -> E {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> anyhow::Result<SignedJoinToken> {
         Ok(SignedJoinToken {
             claims: claims(
@@ -9718,13 +9736,15 @@ mod tests {
         );
         let (url, server) = spawn_raw_http_response(response).await?;
         let response = reqwest::Client::new().get(&url).send().await?;
-        let error = read_bounded_json_response_with_limit::<serde_json::Value>(
-            response,
-            "test CLI JSON",
-            64,
-        )
-        .await
-        .expect_err("oversized Content-Length should be rejected");
+        let error = test_error(
+            read_bounded_json_response_with_limit::<serde_json::Value>(
+                response,
+                "test CLI JSON",
+                64,
+            )
+            .await,
+            "oversized Content-Length should be rejected",
+        );
         assert!(error
             .to_string()
             .contains("test CLI JSON response exceeds maximum size of 64 bytes"));
@@ -9736,13 +9756,15 @@ mod tests {
             .to_string();
         let (url, server) = spawn_raw_http_response(response).await?;
         let response = reqwest::Client::new().get(&url).send().await?;
-        let error = read_bounded_json_response_with_limit::<serde_json::Value>(
-            response,
-            "test CLI JSON chunked",
-            10,
-        )
-        .await
-        .expect_err("oversized chunked body should be rejected");
+        let error = test_error(
+            read_bounded_json_response_with_limit::<serde_json::Value>(
+                response,
+                "test CLI JSON chunked",
+                10,
+            )
+            .await,
+            "oversized chunked body should be rejected",
+        );
         assert!(error
             .to_string()
             .contains("test CLI JSON chunked response exceeds maximum size of 10 bytes"));
@@ -9759,9 +9781,10 @@ mod tests {
             MAX_CLI_HTTP_JSON_RESPONSE_BYTES + 1
         );
         let (url, server) = spawn_raw_http_response(response).await?;
-        let error = get_json::<serde_json::Value>(&url, "/v1/status", "test endpoint")
-            .await
-            .expect_err("oversized CLI HTTP response should be rejected");
+        let error = test_error(
+            get_json::<serde_json::Value>(&url, "/v1/status", "test endpoint").await,
+            "oversized CLI HTTP response should be rejected",
+        );
         assert!(format!("{error:#}").contains("test endpoint response exceeds maximum size"));
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
@@ -12382,12 +12405,14 @@ fi
                 "--agent-direct-path-probe-timeout-seconds must be at least the peer-map poll interval",
             ),
         ] {
-            let error = docker_install_plan(DockerInstallArgs {
-                agent_direct_path_probe_timeout_seconds: probe_timeout,
-                agent_direct_handshake_max_age_seconds: handshake_max_age,
-                ..docker_install_test_args()
-            })
-            .expect_err("invalid direct path verification settings should be rejected");
+            let error = test_error(
+                docker_install_plan(DockerInstallArgs {
+                    agent_direct_path_probe_timeout_seconds: probe_timeout,
+                    agent_direct_handshake_max_age_seconds: handshake_max_age,
+                    ..docker_install_test_args()
+                }),
+                "invalid direct path verification settings should be rejected",
+            );
             assert!(
                 error.to_string().contains(expected),
                 "expected `{expected}` in `{error:#}`"
@@ -12493,11 +12518,13 @@ fi
                 "--agent-peer-probe-observation-max-age-seconds must be at least both",
             ),
         ] {
-            let error = docker_install_plan(DockerInstallArgs {
-                agent_peer_probe: settings,
-                ..docker_install_test_args()
-            })
-            .expect_err("invalid peer probe settings should be rejected");
+            let error = test_error(
+                docker_install_plan(DockerInstallArgs {
+                    agent_peer_probe: settings,
+                    ..docker_install_test_args()
+                }),
+                "invalid peer probe settings should be rejected",
+            );
             assert!(
                 error.to_string().contains(expected),
                 "expected `{expected}` in `{error:#}`"
@@ -16645,16 +16672,20 @@ fi
 
         let mut short = base_k8s_install_args();
         short.agent_direct_path_probe_timeout_seconds = 59;
-        let error = k8s_install_plan(short)
-            .expect_err("probe timeout shorter than poll plus signal interval should fail");
+        let error = test_error(
+            k8s_install_plan(short),
+            "probe timeout shorter than poll plus signal interval should fail",
+        );
         assert!(error.to_string().contains(
             "--agent-direct-path-probe-timeout-seconds must be at least the peer-map poll interval"
         ));
 
         let mut stale = base_k8s_install_args();
         stale.agent_direct_handshake_max_age_seconds = 29;
-        let error = k8s_install_plan(stale)
-            .expect_err("handshake age shorter than signal interval should fail");
+        let error = test_error(
+            k8s_install_plan(stale),
+            "handshake age shorter than signal interval should fail",
+        );
         assert!(error
             .to_string()
             .contains("--agent-direct-handshake-max-age-seconds must be at least the 30-second signal path interval"));
@@ -16703,8 +16734,10 @@ fi
 
         let mut port_conflict = base_k8s_install_args();
         port_conflict.agent_wireguard_listen_port = Some(DEFAULT_K8S_AGENT_PEER_PROBE_PORT);
-        let error = k8s_install_plan(port_conflict)
-            .expect_err("peer probe and WireGuard ports must differ");
+        let error = test_error(
+            k8s_install_plan(port_conflict),
+            "peer probe and WireGuard ports must differ",
+        );
         assert!(error.to_string().contains(
             "--agent-peer-probe-port must differ from the effective WireGuard listen port 51821"
         ));
@@ -16712,8 +16745,10 @@ fi
         let mut stale = base_k8s_install_args();
         stale.agent_peer_probe.interval_seconds = 60;
         stale.agent_peer_probe.observation_max_age_seconds = 59;
-        let error = k8s_install_plan(stale)
-            .expect_err("observation freshness shorter than probe interval must fail");
+        let error = test_error(
+            k8s_install_plan(stale),
+            "observation freshness shorter than probe interval must fail",
+        );
         assert!(error
             .to_string()
             .contains("--agent-peer-probe-observation-max-age-seconds must be at least both"));
@@ -16799,7 +16834,10 @@ fi
         let mut mismatch = base_k8s_install_args();
         mismatch.agent_wireguard_listen_port = Some(51833);
         mismatch.agent_stun_bind = Some("0.0.0.0:51834".to_string());
-        let error = k8s_install_plan(mismatch).unwrap_err();
+        let error = test_error(
+            k8s_install_plan(mismatch),
+            "mismatched WireGuard and STUN ports should fail",
+        );
         assert!(error
             .to_string()
             .contains("--agent-stun-bind port must equal --agent-wireguard-listen-port"));
@@ -16854,7 +16892,10 @@ fi
 
         let mut invalid_runtime_backend = base_k8s_install_args();
         invalid_runtime_backend.agent_runtime_backend = "invalid".to_string();
-        let error = k8s_install_plan(invalid_runtime_backend).unwrap_err();
+        let error = test_error(
+            k8s_install_plan(invalid_runtime_backend),
+            "invalid runtime backend should fail",
+        );
         assert!(error
             .to_string()
             .contains("agent runtime backend must be linux-command or dry-run"));
