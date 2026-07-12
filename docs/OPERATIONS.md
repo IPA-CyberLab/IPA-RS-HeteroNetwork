@@ -89,6 +89,39 @@ and `--agent-direct-handshake-max-age-seconds`. Monitor
 `ipars_agent_direct_path_probes_timeout_total`; a rising timeout ratio indicates
 candidate reachability, NAT classification, firewall, or keepalive problems.
 
+After a path is active, the agent measures its actual WireGuard data-plane
+quality without operator input. A fixed 32-byte UDP challenge is sent to the
+peer VPN IP on `--peer-probe-port` (default `51821`); the responder binds only
+the local VPN IP, answers only source VPN IPs in the current peer map, returns
+exactly one same-size response, validates nonce and sequence, and applies a
+per-peer request rate limit. Only lazy-connect-active or pinned paths are
+measured, with bounded concurrency, so this does not create a full-mesh probe
+loop. Defaults are five samples every 30 seconds, a 500 ms response timeout, a
+20 ms inter-sample delay, concurrency 32, and 100 responder requests per second
+per peer. Configure these through `IPARS_AGENT_PEER_PROBE_*` or the matching
+`--peer-probe-*` flags; `--disable-peer-probe` disables both measurement and the
+responder.
+
+Each completed round calculates mean RTT, loss in parts per million, mean
+absolute RTT jitter, and a bounded stability value smoothed only across the
+same path fingerprint. A path change during measurement discards the round.
+The latest observation is included in the node-identity-signed Signal request;
+Signal validates sample/loss consistency and applies it only when state,
+candidate address or relay node, and freshness all match the selected path.
+`--peer-probe-observation-max-age-seconds` and
+`IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS` default to 120 seconds.
+Compose uses probe port `51822` because its bundled WireGuard listener uses
+`51821`; Helm uses WireGuard `51820` and probe `51821`. Monitor
+`ipars_agent_peer_probe_*`, `ipars_agent_path_quality_observations`, and
+`ipars_signal_path_quality_observations_total{status=...}` in Prometheus, or the
+equivalent OTLP instruments.
+
+For rolling upgrades, deploy the new Signal service before enabling upgraded
+agents: older Signal versions do not include the optional observation in their
+signature payload and therefore reject requests that carry it. New Signal
+versions continue to accept older agents because the absent field serializes
+identically to the previous signed payload.
+
 For validation without host route mutation:
 
 ```bash

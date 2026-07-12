@@ -17,15 +17,16 @@ use aya::maps::{MapData, RingBuf};
 use aya::programs::TracePoint;
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use futures_util::stream::{self, StreamExt};
 use ipars_agent::{
     AgentError, AgentNodeState, AgentRuntime, CommandWireGuardPeerTelemetrySource,
     FileAgentStateStore, KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand,
     LinuxCommandRunner, LinuxWireGuardBackend, MemoryWireGuardBackend,
     NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier, PeerMapSink, PeerMapSource,
-    PeerMapSync, PendingDirectPathProbe, RelayForwarderStats, RelaySessionState,
-    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpRelayFrameForwarder,
-    UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerTelemetry,
-    WireGuardPeerTelemetrySource,
+    PeerMapSync, PeerProbeConfig, PendingDirectPathProbe, RelayForwarderStats, RelaySessionState,
+    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe,
+    UdpPeerProbeResponder, UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
+    WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -160,6 +161,20 @@ const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_PEER_PROBE_SAMPLE_COUNT: u16 = 5;
+const DEFAULT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS: u64 = 500;
+const DEFAULT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS: u64 = 20;
+const DEFAULT_PEER_PROBE_MAX_CONCURRENCY: usize = 32;
+const DEFAULT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND: u32 = 100;
+const DEFAULT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS: u64 = 120;
+const MAX_PEER_PROBE_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS: u64 = 10_000;
+const MAX_PEER_PROBE_SAMPLE_INTERVAL_MILLIS: u64 = 10_000;
+const MAX_PEER_PROBE_MAX_CONCURRENCY: usize = 1024;
+const MAX_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND: u32 = 100_000;
+const MAX_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+const PEER_PROBE_RESPONDER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 const DIRECT_PATH_HANDSHAKE_CLOCK_SKEW_SECONDS: i64 = 5;
 const MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -414,6 +429,12 @@ struct SignalArgs {
     endpoint_candidate_ttl_seconds: u64,
     #[arg(
         long,
+        env = "IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS",
+        default_value_t = DEFAULT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS
+    )]
+    path_quality_observation_ttl_seconds: u64,
+    #[arg(
+        long,
         env = "IPARS_SIGNAL_NAT_CLASSIFICATION_TTL_SECONDS",
         default_value_t = 300
     )]
@@ -661,6 +682,56 @@ struct AgentArgs {
         default_value_t = DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
     )]
     direct_handshake_max_age_seconds: u64,
+    #[arg(long, env = "IPARS_AGENT_DISABLE_PEER_PROBE", default_value_t = false)]
+    disable_peer_probe: bool,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_PORT",
+        default_value_t = DEFAULT_PEER_PROBE_PORT
+    )]
+    peer_probe_port: u16,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_INTERVAL_SECONDS",
+        default_value_t = DEFAULT_PEER_PROBE_INTERVAL_SECONDS
+    )]
+    peer_probe_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT",
+        default_value_t = DEFAULT_PEER_PROBE_SAMPLE_COUNT
+    )]
+    peer_probe_sample_count: u16,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS",
+        default_value_t = DEFAULT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS
+    )]
+    peer_probe_response_timeout_millis: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS",
+        default_value_t = DEFAULT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS
+    )]
+    peer_probe_sample_interval_millis: u64,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_MAX_CONCURRENCY",
+        default_value_t = DEFAULT_PEER_PROBE_MAX_CONCURRENCY
+    )]
+    peer_probe_max_concurrency: usize,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND",
+        default_value_t = DEFAULT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND
+    )]
+    peer_probe_responder_max_requests_per_second: u32,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS",
+        default_value_t = DEFAULT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS
+    )]
+    peer_probe_observation_max_age_seconds: u64,
     #[arg(
         long,
         env = "IPARS_AGENT_PACKET_FLOW_DETECTOR",
@@ -1500,6 +1571,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--hole-punch-interval-millis",
         )?;
     }
+    validate_peer_probe_config(args)?;
     validate_bounded_u64(
         args.runtime_command_timeout_seconds,
         "--runtime-command-timeout-seconds",
@@ -1638,6 +1710,70 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
     }
     Ok(())
+}
+
+fn validate_peer_probe_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if args.disable_peer_probe
+        || !args.apply_peer_map
+        || args.runtime_backend != AgentRuntimeBackend::LinuxCommand
+    {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.peer_probe_port != args.wireguard_listen_port,
+        "--peer-probe-port must differ from --wireguard-listen-port"
+    );
+    validate_bounded_u64(
+        args.peer_probe_interval_seconds,
+        "--peer-probe-interval-seconds",
+        MAX_PEER_PROBE_INTERVAL_SECONDS,
+    )?;
+    anyhow::ensure!(
+        (1..=64).contains(&args.peer_probe_sample_count),
+        "--peer-probe-sample-count must be between 1 and 64"
+    );
+    validate_bounded_u64(
+        args.peer_probe_response_timeout_millis,
+        "--peer-probe-response-timeout-millis",
+        MAX_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS,
+    )?;
+    anyhow::ensure!(
+        args.peer_probe_sample_interval_millis <= MAX_PEER_PROBE_SAMPLE_INTERVAL_MILLIS,
+        "--peer-probe-sample-interval-millis must not exceed {MAX_PEER_PROBE_SAMPLE_INTERVAL_MILLIS}"
+    );
+    validate_bounded_usize(
+        args.peer_probe_max_concurrency,
+        "--peer-probe-max-concurrency",
+        MAX_PEER_PROBE_MAX_CONCURRENCY,
+    )?;
+    anyhow::ensure!(
+        (1..=MAX_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND)
+            .contains(&args.peer_probe_responder_max_requests_per_second),
+        "--peer-probe-responder-max-requests-per-second must be between 1 and {MAX_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND}"
+    );
+    validate_bounded_u64(
+        args.peer_probe_observation_max_age_seconds,
+        "--peer-probe-observation-max-age-seconds",
+        MAX_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS,
+    )?;
+    if !args.disable_signal_paths {
+        anyhow::ensure!(
+            args.peer_probe_observation_max_age_seconds
+                >= args
+                    .peer_probe_interval_seconds
+                    .max(args.signal_path_interval_seconds),
+            "--peer-probe-observation-max-age-seconds must be at least both --peer-probe-interval-seconds and --signal-path-interval-seconds"
+        );
+    }
+    PeerProbeConfig {
+        port: args.peer_probe_port,
+        sample_count: args.peer_probe_sample_count,
+        response_timeout: Duration::from_millis(args.peer_probe_response_timeout_millis),
+        sample_interval: Duration::from_millis(args.peer_probe_sample_interval_millis),
+        max_requests_per_second_per_peer: args.peer_probe_responder_max_requests_per_second,
+    }
+    .validate()
+    .map_err(anyhow::Error::from)
 }
 
 fn validate_agent_api_auth_config(args: &AgentArgs) -> anyhow::Result<()> {
@@ -3627,6 +3763,7 @@ async fn run_signal(
         idle_timeout_seconds: args.idle_timeout_seconds,
         relay_health_ttl_seconds: args.relay_health_ttl_seconds,
         endpoint_candidate_ttl_seconds: args.endpoint_candidate_ttl_seconds,
+        path_quality_observation_ttl_seconds: args.path_quality_observation_ttl_seconds,
         nat_classification_ttl_seconds: args.nat_classification_ttl_seconds,
         nat_classification_min_confidence_percent: args.nat_classification_min_confidence_percent,
         ..ClusterPolicy::default()
@@ -3676,6 +3813,11 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
     validate_positive_seconds(
         args.endpoint_candidate_ttl_seconds,
         "--endpoint-candidate-ttl-seconds",
+    )?;
+    validate_bounded_u64(
+        args.path_quality_observation_ttl_seconds,
+        "--path-quality-observation-ttl-seconds",
+        MAX_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS,
     )?;
     validate_positive_seconds(
         args.nat_classification_ttl_seconds,
@@ -4508,6 +4650,10 @@ struct SignalOtelSnapshot {
     path_negotiation_count: u64,
     path_acl_denied_count: u64,
     relay_candidate_acl_denied_count: u64,
+    path_quality_observation_accepted_count: u64,
+    path_quality_observation_stale_count: u64,
+    path_quality_observation_path_mismatch_count: u64,
+    path_quality_observation_rejected_count: u64,
     fresh_nat_classification_strategy_counts: Vec<NatTraversalStrategyCount>,
     path_negotiation_state_counts: Vec<PathStateCount>,
     hole_punch_plan_count: u64,
@@ -4523,6 +4669,13 @@ impl From<&SignalMetricsResponse> for SignalOtelSnapshot {
             path_negotiation_count: metrics.path_negotiation_count,
             path_acl_denied_count: metrics.path_acl_denied_count,
             relay_candidate_acl_denied_count: metrics.relay_candidate_acl_denied_count,
+            path_quality_observation_accepted_count: metrics
+                .path_quality_observation_accepted_count,
+            path_quality_observation_stale_count: metrics.path_quality_observation_stale_count,
+            path_quality_observation_path_mismatch_count: metrics
+                .path_quality_observation_path_mismatch_count,
+            path_quality_observation_rejected_count: metrics
+                .path_quality_observation_rejected_count,
             fresh_nat_classification_strategy_counts: metrics
                 .fresh_nat_classification_strategy_counts
                 .clone(),
@@ -4551,6 +4704,7 @@ struct SignalOtelMetrics {
     relay_health_ttl_seconds: Gauge<u64>,
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
+    path_quality_observation_ttl_seconds: Gauge<u64>,
     nat_classification_ttl_seconds: Gauge<u64>,
     nat_classification_min_confidence_percent: Gauge<u64>,
     metrics_generated_timestamp_seconds: Gauge<u64>,
@@ -4558,6 +4712,7 @@ struct SignalOtelMetrics {
     path_negotiations: Counter<u64>,
     path_acl_denials: Counter<u64>,
     relay_candidate_acl_denials: Counter<u64>,
+    path_quality_observations: Counter<u64>,
     path_negotiations_by_state: Counter<u64>,
     hole_punch_plans: Counter<u64>,
     hole_punch_acl_denials: Counter<u64>,
@@ -4621,6 +4776,12 @@ impl SignalOtelMetrics {
                 .u64_gauge("ipars.signal.endpoint_candidate_ttl_seconds")
                 .with_description("Endpoint candidate freshness window used by signal.")
                 .build(),
+            path_quality_observation_ttl_seconds: meter
+                .u64_gauge("ipars.signal.path_quality_observation_ttl_seconds")
+                .with_description(
+                    "Signed path quality observation freshness window used by Signal.",
+                )
+                .build(),
             nat_classification_ttl_seconds: meter
                 .u64_gauge("ipars.signal.nat_classification_ttl_seconds")
                 .with_description("NAT classification freshness window used by signal.")
@@ -4652,6 +4813,10 @@ impl SignalOtelMetrics {
                 .with_description(
                     "Eligible relay candidates removed from signal negotiation by cluster ACL policy.",
                 )
+                .build(),
+            path_quality_observations: meter
+                .u64_counter("ipars.signal.path_quality_observations")
+                .with_description("Signed path quality observations received by disposition.")
                 .build(),
             path_negotiations_by_state: meter
                 .u64_counter("ipars.signal.path_negotiations.by_state")
@@ -4711,6 +4876,8 @@ impl SignalOtelMetrics {
             .record(metrics.stale_endpoint_candidate_count as u64, &[]);
         self.endpoint_candidate_ttl_seconds
             .record(metrics.endpoint_candidate_ttl_seconds, &[]);
+        self.path_quality_observation_ttl_seconds
+            .record(metrics.path_quality_observation_ttl_seconds, &[]);
         self.nat_classification_ttl_seconds
             .record(metrics.nat_classification_ttl_seconds, &[]);
         self.nat_classification_min_confidence_percent.record(
@@ -4755,6 +4922,32 @@ impl SignalOtelMetrics {
             ),
             &[],
         );
+        for (status, current, previous_value) in [
+            (
+                "accepted",
+                metrics.path_quality_observation_accepted_count,
+                previous.map(|snapshot| snapshot.path_quality_observation_accepted_count),
+            ),
+            (
+                "stale",
+                metrics.path_quality_observation_stale_count,
+                previous.map(|snapshot| snapshot.path_quality_observation_stale_count),
+            ),
+            (
+                "path_mismatch",
+                metrics.path_quality_observation_path_mismatch_count,
+                previous.map(|snapshot| snapshot.path_quality_observation_path_mismatch_count),
+            ),
+            (
+                "rejected",
+                metrics.path_quality_observation_rejected_count,
+                previous.map(|snapshot| snapshot.path_quality_observation_rejected_count),
+            ),
+        ] {
+            let attrs = [KeyValue::new("status", status)];
+            self.path_quality_observations
+                .add(counter_delta(current, previous_value), &attrs);
+        }
         for state in [
             PathState::DirectPublic,
             PathState::DirectIpv6,
@@ -5241,6 +5434,16 @@ struct AgentOtelSnapshot {
     direct_path_probe_started_count: u64,
     direct_path_probe_confirmed_count: u64,
     direct_path_probe_timeout_count: u64,
+    peer_probe_measurement_count: u64,
+    peer_probe_failure_count: u64,
+    peer_probe_request_sent_count: u64,
+    peer_probe_response_received_count: u64,
+    peer_probe_timeout_count: u64,
+    peer_probe_responder_request_count: u64,
+    peer_probe_responder_invalid_count: u64,
+    peer_probe_responder_unknown_source_count: u64,
+    peer_probe_responder_rate_limited_count: u64,
+    peer_probe_responder_send_failure_count: u64,
     peer_activity_record_count: u64,
     packet_flow_observation_count: u64,
     packet_flow_match_count: u64,
@@ -5281,6 +5484,19 @@ impl From<&AgentMetricsResponse> for AgentOtelSnapshot {
             direct_path_probe_started_count: metrics.direct_path_probe_started_count,
             direct_path_probe_confirmed_count: metrics.direct_path_probe_confirmed_count,
             direct_path_probe_timeout_count: metrics.direct_path_probe_timeout_count,
+            peer_probe_measurement_count: metrics.peer_probe_measurement_count,
+            peer_probe_failure_count: metrics.peer_probe_failure_count,
+            peer_probe_request_sent_count: metrics.peer_probe_request_sent_count,
+            peer_probe_response_received_count: metrics.peer_probe_response_received_count,
+            peer_probe_timeout_count: metrics.peer_probe_timeout_count,
+            peer_probe_responder_request_count: metrics.peer_probe_responder_request_count,
+            peer_probe_responder_invalid_count: metrics.peer_probe_responder_invalid_count,
+            peer_probe_responder_unknown_source_count: metrics
+                .peer_probe_responder_unknown_source_count,
+            peer_probe_responder_rate_limited_count: metrics
+                .peer_probe_responder_rate_limited_count,
+            peer_probe_responder_send_failure_count: metrics
+                .peer_probe_responder_send_failure_count,
             peer_activity_record_count: metrics.peer_activity_record_count,
             packet_flow_observation_count: metrics.packet_flow_observation_count,
             packet_flow_match_count: metrics.packet_flow_match_count,
@@ -5343,6 +5559,17 @@ struct AgentOtelMetrics {
     direct_path_probes_started: Counter<u64>,
     direct_path_probes_confirmed: Counter<u64>,
     direct_path_probes_timeout: Counter<u64>,
+    path_quality_observations: Gauge<u64>,
+    peer_probe_measurements: Counter<u64>,
+    peer_probe_failures: Counter<u64>,
+    peer_probe_requests_sent: Counter<u64>,
+    peer_probe_responses_received: Counter<u64>,
+    peer_probe_timeouts: Counter<u64>,
+    peer_probe_responder_requests: Counter<u64>,
+    peer_probe_responder_invalid: Counter<u64>,
+    peer_probe_responder_unknown_source: Counter<u64>,
+    peer_probe_responder_rate_limited: Counter<u64>,
+    peer_probe_responder_send_failures: Counter<u64>,
     peer_activity_records: Counter<u64>,
     packet_flow_observations: Counter<u64>,
     packet_flow_matches: Counter<u64>,
@@ -5508,6 +5735,60 @@ impl AgentOtelMetrics {
                 .with_description(
                     "Direct WireGuard path verification probes that expired without evidence.",
                 )
+                .build(),
+            path_quality_observations: meter
+                .u64_gauge("ipars.agent.path_quality.observations")
+                .with_description("Path quality observations cached by the agent.")
+                .build(),
+            peer_probe_measurements: meter
+                .u64_counter("ipars.agent.peer_probe.measurements")
+                .with_description("Peer path quality measurement rounds committed by the agent.")
+                .build(),
+            peer_probe_failures: meter
+                .u64_counter("ipars.agent.peer_probe.failures")
+                .with_description(
+                    "Peer path quality measurements that failed before producing a valid round.",
+                )
+                .build(),
+            peer_probe_requests_sent: meter
+                .u64_counter("ipars.agent.peer_probe.requests.sent")
+                .with_description("UDP peer quality probe requests attempted by the agent.")
+                .build(),
+            peer_probe_responses_received: meter
+                .u64_counter("ipars.agent.peer_probe.responses.received")
+                .with_description(
+                    "Authenticated-path UDP peer quality probe responses received by the agent.",
+                )
+                .build(),
+            peer_probe_timeouts: meter
+                .u64_counter("ipars.agent.peer_probe.timeouts")
+                .with_description("UDP peer quality probe samples without a matching response.")
+                .build(),
+            peer_probe_responder_requests: meter
+                .u64_counter("ipars.agent.peer_probe.responder.requests")
+                .with_description("Allowlisted UDP peer quality requests answered by the agent.")
+                .build(),
+            peer_probe_responder_invalid: meter
+                .u64_counter("ipars.agent.peer_probe.responder.invalid")
+                .with_description(
+                    "Malformed or non-request UDP peer quality packets rejected by the agent.",
+                )
+                .build(),
+            peer_probe_responder_unknown_source: meter
+                .u64_counter("ipars.agent.peer_probe.responder.unknown_source")
+                .with_description(
+                    "UDP peer quality packets rejected because the source VPN IP was absent from the peer map.",
+                )
+                .build(),
+            peer_probe_responder_rate_limited: meter
+                .u64_counter("ipars.agent.peer_probe.responder.rate_limited")
+                .with_description(
+                    "Allowlisted UDP peer quality requests rejected by the per-peer rate limit.",
+                )
+                .build(),
+            peer_probe_responder_send_failures: meter
+                .u64_counter("ipars.agent.peer_probe.responder.send_failures")
+                .with_description("UDP peer quality responses that could not be sent in full.")
                 .build(),
             peer_activity_records: meter
                 .u64_counter("ipars.agent.peer_activity.records")
@@ -5893,6 +6174,65 @@ impl AgentOtelMetrics {
         if direct_path_probe_timeout_delta > 0 {
             self.direct_path_probes_timeout
                 .add(direct_path_probe_timeout_delta, &node_attrs);
+        }
+        self.path_quality_observations
+            .record(metrics.path_quality_observation_count as u64, &node_attrs);
+        for (instrument, current, previous_value) in [
+            (
+                &self.peer_probe_measurements,
+                metrics.peer_probe_measurement_count,
+                previous.map(|snapshot| snapshot.peer_probe_measurement_count),
+            ),
+            (
+                &self.peer_probe_failures,
+                metrics.peer_probe_failure_count,
+                previous.map(|snapshot| snapshot.peer_probe_failure_count),
+            ),
+            (
+                &self.peer_probe_requests_sent,
+                metrics.peer_probe_request_sent_count,
+                previous.map(|snapshot| snapshot.peer_probe_request_sent_count),
+            ),
+            (
+                &self.peer_probe_responses_received,
+                metrics.peer_probe_response_received_count,
+                previous.map(|snapshot| snapshot.peer_probe_response_received_count),
+            ),
+            (
+                &self.peer_probe_timeouts,
+                metrics.peer_probe_timeout_count,
+                previous.map(|snapshot| snapshot.peer_probe_timeout_count),
+            ),
+            (
+                &self.peer_probe_responder_requests,
+                metrics.peer_probe_responder_request_count,
+                previous.map(|snapshot| snapshot.peer_probe_responder_request_count),
+            ),
+            (
+                &self.peer_probe_responder_invalid,
+                metrics.peer_probe_responder_invalid_count,
+                previous.map(|snapshot| snapshot.peer_probe_responder_invalid_count),
+            ),
+            (
+                &self.peer_probe_responder_unknown_source,
+                metrics.peer_probe_responder_unknown_source_count,
+                previous.map(|snapshot| snapshot.peer_probe_responder_unknown_source_count),
+            ),
+            (
+                &self.peer_probe_responder_rate_limited,
+                metrics.peer_probe_responder_rate_limited_count,
+                previous.map(|snapshot| snapshot.peer_probe_responder_rate_limited_count),
+            ),
+            (
+                &self.peer_probe_responder_send_failures,
+                metrics.peer_probe_responder_send_failure_count,
+                previous.map(|snapshot| snapshot.peer_probe_responder_send_failure_count),
+            ),
+        ] {
+            let delta = counter_delta(current, previous_value);
+            if delta > 0 {
+                instrument.add(delta, &node_attrs);
+            }
         }
         let peer_activity_delta = counter_delta(
             metrics.peer_activity_record_count,
@@ -6673,6 +7013,36 @@ async fn run_agent(
     if let Some(task) = peer_map_task {
         background_tasks.push(task);
     }
+    if args.apply_peer_map
+        && args.runtime_backend == AgentRuntimeBackend::LinuxCommand
+        && !args.disable_peer_probe
+    {
+        let local_vpn_ip = runtime
+            .state()
+            .vpn_ip
+            .context("local VPN IP is required to start peer quality probing")?;
+        let namespace = args
+            .linux_netns
+            .as_deref()
+            .map(LinuxNetworkNamespace::from_name)
+            .transpose()?;
+        let config = agent_peer_probe_config(&args);
+        background_tasks.push(start_peer_probe_responder(
+            runtime.clone(),
+            local_vpn_ip,
+            namespace.clone(),
+            config,
+        ));
+        if !args.disable_signal_paths {
+            let probe = UdpPeerProbe::new(local_vpn_ip, namespace, config)?;
+            background_tasks.push(start_peer_quality_probing(
+                runtime.clone(),
+                probe,
+                Duration::from_secs(args.peer_probe_interval_seconds),
+                args.peer_probe_max_concurrency,
+            ));
+        }
+    }
     if args.apply_docker_routes {
         background_tasks.push(start_docker_routes(&args).await?);
     }
@@ -6829,6 +7199,9 @@ async fn run_agent(
                     ),
                     direct_handshake_max_age: Duration::from_secs(
                         args.direct_handshake_max_age_seconds,
+                    ),
+                    peer_probe_observation_max_age: Duration::from_secs(
+                        args.peer_probe_observation_max_age_seconds,
                     ),
                     interval: Duration::from_secs(args.signal_path_interval_seconds),
                 },
@@ -10387,6 +10760,7 @@ struct SignalPathNegotiationOptions {
     wireguard_peer_telemetry_source: Option<Arc<dyn WireGuardPeerTelemetrySource>>,
     direct_path_probe_timeout: Duration,
     direct_handshake_max_age: Duration,
+    peer_probe_observation_max_age: Duration,
     interval: Duration,
 }
 
@@ -10668,8 +11042,18 @@ async fn negotiate_signal_paths(
     }
 
     for peer in peer_set.active {
-        let request =
-            authenticated_signal_path_request(&identity, signal_path_request(&status, &peer))?;
+        let path_observation = runtime
+            .path_quality_observation_for_peer(
+                &peer.node_id,
+                chrono::Utc::now(),
+                options.peer_probe_observation_max_age,
+            )
+            .await;
+        let request = authenticated_signal_path_request(
+            &identity,
+            signal_path_request(&status, &peer),
+            path_observation,
+        )?;
         let (signal_url, response) =
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
         let mut relay_candidates = selected_relay_candidates(&response);
@@ -11994,10 +12378,11 @@ async fn send_signal_path_request_to_signal_services(
 fn authenticated_signal_path_request(
     identity: &IdentityKeyPair,
     request: SignalPathRequest,
+    path_observation: Option<ipars_types::PathQualityObservation>,
 ) -> anyhow::Result<AuthenticatedSignalPathRequest> {
     let mut authenticated = AuthenticatedSignalPathRequest {
         request,
-        path_observation: None,
+        path_observation,
         request_signature: None,
     };
     authenticated.request_signature = Some(
@@ -12088,6 +12473,126 @@ async fn run_peer_map_sync_loop<S, A>(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+fn agent_peer_probe_config(args: &AgentArgs) -> PeerProbeConfig {
+    PeerProbeConfig {
+        port: args.peer_probe_port,
+        sample_count: args.peer_probe_sample_count,
+        response_timeout: Duration::from_millis(args.peer_probe_response_timeout_millis),
+        sample_interval: Duration::from_millis(args.peer_probe_sample_interval_millis),
+        max_requests_per_second_per_peer: args.peer_probe_responder_max_requests_per_second,
+    }
+}
+
+fn start_peer_probe_responder(
+    runtime: Arc<AgentRuntime>,
+    local_vpn_ip: VpnIp,
+    namespace: Option<LinuxNetworkNamespace>,
+    config: PeerProbeConfig,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match UdpPeerProbeResponder::bind(local_vpn_ip, namespace.as_ref(), config) {
+                Ok(responder) => {
+                    tracing::info!(
+                        vpn_ip = %local_vpn_ip,
+                        port = config.port,
+                        linux_netns = namespace.as_ref().map(LinuxNetworkNamespace::name),
+                        max_requests_per_second_per_peer = config.max_requests_per_second_per_peer,
+                        "peer quality probe responder listening"
+                    );
+                    if let Err(error) = responder.run(runtime.clone()).await {
+                        tracing::warn!(
+                            %error,
+                            retry_seconds = PEER_PROBE_RESPONDER_RESTART_BACKOFF.as_secs(),
+                            "peer quality probe responder stopped; will retry"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        vpn_ip = %local_vpn_ip,
+                        port = config.port,
+                        linux_netns = namespace.as_ref().map(LinuxNetworkNamespace::name),
+                        retry_seconds = PEER_PROBE_RESPONDER_RESTART_BACKOFF.as_secs(),
+                        "failed to bind peer quality probe responder; will retry"
+                    );
+                }
+            }
+            tokio::time::sleep(PEER_PROBE_RESPONDER_RESTART_BACKOFF).await;
+        }
+    })
+}
+
+fn start_peer_quality_probing(
+    runtime: Arc<AgentRuntime>,
+    probe: UdpPeerProbe,
+    interval: Duration,
+    max_concurrency: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            run_peer_quality_probe_round(runtime.clone(), probe.clone(), max_concurrency).await;
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
+async fn run_peer_quality_probe_round(
+    runtime: Arc<AgentRuntime>,
+    probe: UdpPeerProbe,
+    max_concurrency: usize,
+) {
+    let targets = runtime.peer_quality_probe_targets().await;
+    stream::iter(targets)
+        .for_each_concurrent(max_concurrency, |target| {
+            let runtime = runtime.clone();
+            let probe = probe.clone();
+            async move {
+                match probe.measure(target.peer.vpn_ip).await {
+                    Ok(measurement) => match runtime
+                        .record_peer_probe_measurement(&target, &measurement, chrono::Utc::now())
+                        .await
+                    {
+                        Ok(Some(observation)) => tracing::debug!(
+                            peer = %target.peer.node_id,
+                            state = ?observation.selected_state,
+                            samples = observation.sample_count,
+                            successful_samples = observation.successful_sample_count,
+                            latency_ms = ?observation.metrics.latency_ms,
+                            loss_ppm = observation.metrics.loss_ppm,
+                            jitter_ms = ?observation.metrics.jitter_ms,
+                            stability = observation.metrics.stability,
+                            "recorded peer path quality observation"
+                        ),
+                        Ok(None) => tracing::debug!(
+                            peer = %target.peer.node_id,
+                            "discarded peer quality measurement because path changed during probe"
+                        ),
+                        Err(error) => {
+                            runtime.record_peer_probe_failure();
+                            tracing::warn!(
+                                %error,
+                                peer = %target.peer.node_id,
+                                "failed to record peer quality measurement"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        runtime.record_peer_probe_failure();
+                        tracing::warn!(
+                            %error,
+                            peer = %target.peer.node_id,
+                            vpn_ip = %target.peer.vpn_ip,
+                            "failed to measure peer path quality"
+                        );
+                    }
+                }
+            }
+        })
+        .await;
 }
 
 fn start_proc_net_conntrack_packet_flow_detector(
@@ -15577,6 +16082,8 @@ mod tests {
             "45",
             "--endpoint-candidate-ttl-seconds",
             "75",
+            "--path-quality-observation-ttl-seconds",
+            "90",
             "--nat-classification-ttl-seconds",
             "180",
             "--nat-classification-min-confidence-percent",
@@ -15589,6 +16096,7 @@ mod tests {
         };
         assert_eq!(args.relay_health_ttl_seconds, 45);
         assert_eq!(args.endpoint_candidate_ttl_seconds, 75);
+        assert_eq!(args.path_quality_observation_ttl_seconds, 90);
         assert_eq!(args.nat_classification_ttl_seconds, 180);
         assert_eq!(args.nat_classification_min_confidence_percent, 75);
         assert!(args.disable_relay_fallback);
@@ -15711,6 +16219,23 @@ mod tests {
     }
 
     #[test]
+    fn signal_path_quality_observation_ttl_must_be_bounded() -> anyhow::Result<()> {
+        for value in ["0", "86401"] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "signal",
+                "--path-quality-observation-ttl-seconds",
+                value,
+            ])?;
+            let Command::Signal(args) = cli.command else {
+                anyhow::bail!("expected signal command");
+            };
+            assert!(validate_signal_runtime_config(&args).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn signal_nat_classification_ttl_must_be_positive() -> anyhow::Result<()> {
         let cli =
             Cli::try_parse_from(["iparsd", "signal", "--nat-classification-ttl-seconds", "0"])?;
@@ -15777,6 +16302,10 @@ mod tests {
             path_negotiation_count: 0,
             path_acl_denied_count: 0,
             relay_candidate_acl_denied_count: 0,
+            path_quality_observation_accepted_count: 0,
+            path_quality_observation_stale_count: 0,
+            path_quality_observation_path_mismatch_count: 0,
+            path_quality_observation_rejected_count: 0,
             path_negotiation_state_counts: Vec::new(),
             hole_punch_plan_count: 1,
             hole_punch_acl_denied_count: 0,
@@ -15787,6 +16316,7 @@ mod tests {
             }],
             relay_health_ttl_seconds: 30,
             endpoint_candidate_ttl_seconds: 120,
+            path_quality_observation_ttl_seconds: 120,
             nat_classification_ttl_seconds: 300,
             nat_classification_min_confidence_percent: 50,
             generated_at: Utc::now(),
@@ -16060,6 +16590,17 @@ mod tests {
             direct_path_probe_started_count: 5,
             direct_path_probe_confirmed_count: 3,
             direct_path_probe_timeout_count: 2,
+            path_quality_observation_count: 1,
+            peer_probe_measurement_count: 7,
+            peer_probe_failure_count: 1,
+            peer_probe_request_sent_count: 35,
+            peer_probe_response_received_count: 31,
+            peer_probe_timeout_count: 4,
+            peer_probe_responder_request_count: 29,
+            peer_probe_responder_invalid_count: 2,
+            peer_probe_responder_unknown_source_count: 3,
+            peer_probe_responder_rate_limited_count: 4,
+            peer_probe_responder_send_failure_count: 1,
             peer_activity_record_count: 2,
             packet_flow_observation_count: 3,
             packet_flow_match_count: 2,
@@ -24367,6 +24908,96 @@ exec sleep 60
     }
 
     #[test]
+    fn agent_peer_probe_config_is_bounded_and_path_freshness_aligned() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--peer-probe-port",
+            "51900",
+            "--peer-probe-interval-seconds",
+            "20",
+            "--peer-probe-sample-count",
+            "7",
+            "--peer-probe-response-timeout-millis",
+            "750",
+            "--peer-probe-sample-interval-millis",
+            "25",
+            "--peer-probe-max-concurrency",
+            "8",
+            "--peer-probe-responder-max-requests-per-second",
+            "200",
+            "--peer-probe-observation-max-age-seconds",
+            "60",
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_agent_runtime_config(&args)?;
+        assert_eq!(
+            agent_peer_probe_config(&args),
+            PeerProbeConfig {
+                port: 51_900,
+                sample_count: 7,
+                response_timeout: Duration::from_millis(750),
+                sample_interval: Duration::from_millis(25),
+                max_requests_per_second_per_peer: 200,
+            }
+        );
+        assert_eq!(args.peer_probe_max_concurrency, 8);
+
+        for (arguments, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-peer-map",
+                    "--peer-probe-port",
+                    "51820",
+                ],
+                "--peer-probe-port must differ from --wireguard-listen-port",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-peer-map",
+                    "--peer-probe-sample-count",
+                    "0",
+                ],
+                "--peer-probe-sample-count must be between 1 and 64",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-peer-map",
+                    "--peer-probe-max-concurrency",
+                    "1025",
+                ],
+                "--peer-probe-max-concurrency must not exceed 1024",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--apply-peer-map",
+                    "--peer-probe-observation-max-age-seconds",
+                    "29",
+                ],
+                "--peer-probe-observation-max-age-seconds must be at least both",
+            ),
+        ] {
+            let error = agent_runtime_config_error(arguments)?;
+            assert!(
+                error.contains(expected),
+                "expected `{expected}` in `{error}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn docker_route_source_allows_api_discovery_without_explicit_routes() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -26709,6 +27340,7 @@ exec sleep 60
                 wireguard_peer_telemetry_source: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
+                peer_probe_observation_max_age: Duration::from_secs(120),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26822,6 +27454,7 @@ exec sleep 60
                 wireguard_peer_telemetry_source: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
+                peer_probe_observation_max_age: Duration::from_secs(120),
                 interval: Duration::from_secs(1),
             },
         )
@@ -26947,6 +27580,7 @@ exec sleep 60
                 wireguard_peer_telemetry_source: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
+                peer_probe_observation_max_age: Duration::from_secs(120),
                 interval: Duration::from_secs(1),
             },
         )
@@ -27068,6 +27702,7 @@ exec sleep 60
             wireguard_peer_telemetry_source: Some(Arc::new(EmptyWireGuardPeerTelemetrySource)),
             direct_path_probe_timeout: Duration::from_millis(1),
             direct_handshake_max_age: Duration::from_secs(180),
+            peer_probe_observation_max_age: Duration::from_secs(120),
             interval: Duration::from_secs(1),
         };
 
@@ -27236,6 +27871,7 @@ exec sleep 60
                 wireguard_peer_telemetry_source: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
+                peer_probe_observation_max_age: Duration::from_secs(120),
                 interval: Duration::from_secs(1),
             },
         )
@@ -27334,6 +27970,7 @@ exec sleep 60
                 wireguard_peer_telemetry_source: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
+                peer_probe_observation_max_age: Duration::from_secs(120),
                 interval: Duration::from_secs(1),
             },
         )
@@ -28588,6 +29225,7 @@ exec sleep 60
                 source_nat_classification: None,
                 desired_routes: Vec::new(),
             },
+            None,
         )?;
 
         let (selected_signal, response) = send_signal_path_request_to_signal_services(

@@ -52,6 +52,15 @@
 {{- $agentHttpRequestTimeoutSeconds := printf "%v" .Values.agent.http.requestTimeoutSeconds -}}
 {{- $agentDirectPathProbeTimeoutSeconds := printf "%v" .Values.agent.directPathVerification.probeTimeoutSeconds -}}
 {{- $agentDirectHandshakeMaxAgeSeconds := printf "%v" .Values.agent.directPathVerification.handshakeMaxAgeSeconds -}}
+{{- $agentPeerProbeEnabled := printf "%v" .Values.agent.peerProbe.enabled -}}
+{{- $agentPeerProbePort := printf "%v" .Values.agent.peerProbe.port -}}
+{{- $agentPeerProbeIntervalSeconds := printf "%v" .Values.agent.peerProbe.intervalSeconds -}}
+{{- $agentPeerProbeSampleCount := printf "%v" .Values.agent.peerProbe.sampleCount -}}
+{{- $agentPeerProbeResponseTimeoutMillis := printf "%v" .Values.agent.peerProbe.responseTimeoutMillis -}}
+{{- $agentPeerProbeSampleIntervalMillis := printf "%v" .Values.agent.peerProbe.sampleIntervalMillis -}}
+{{- $agentPeerProbeMaxConcurrency := printf "%v" .Values.agent.peerProbe.maxConcurrency -}}
+{{- $agentPeerProbeResponderMaxRequestsPerSecond := printf "%v" .Values.agent.peerProbe.responderMaxRequestsPerSecond -}}
+{{- $agentPeerProbeObservationMaxAgeSeconds := printf "%v" .Values.agent.peerProbe.observationMaxAgeSeconds -}}
 {{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
@@ -67,6 +76,7 @@
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
 {{- include "ipars.validateOptionalBoolean" (dict "path" "agent.podSecurityContext.runAsNonRoot" "value" .Values.agent.podSecurityContext.runAsNonRoot) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
+{{- include "ipars.validateBoolean" (dict "path" "agent.peerProbe.enabled" "value" .Values.agent.peerProbe.enabled) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- if hasKey .Values.serviceExposure "apiServer" -}}
 {{- fail "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs" -}}
@@ -153,6 +163,40 @@
 {{- end -}}
 {{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentDirectPathProbeTimeoutSeconds) (add (int $agentPeerMapPollIntervalSeconds) 60)) -}}
 {{- fail "agent.directPathVerification.probeTimeoutSeconds must be at least agent.peerMap.pollIntervalSeconds plus two 30-second signal path intervals" -}}
+{{- end -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.port" "value" $agentPeerProbePort "max" 65535) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.intervalSeconds" "value" $agentPeerProbeIntervalSeconds "max" 86400) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.sampleCount" "value" $agentPeerProbeSampleCount "max" 64) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.responseTimeoutMillis" "value" $agentPeerProbeResponseTimeoutMillis "max" 10000) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.sampleIntervalMillis" "value" $agentPeerProbeSampleIntervalMillis "max" 10000) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.maxConcurrency" "value" $agentPeerProbeMaxConcurrency "max" 1024) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.responderMaxRequestsPerSecond" "value" $agentPeerProbeResponderMaxRequestsPerSecond "max" 100000) -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.observationMaxAgeSeconds" "value" $agentPeerProbeObservationMaxAgeSeconds "max" 86400) -}}
+{{- if and (eq $agentPeerMapEnabled "true") (eq $agentPeerProbeEnabled "true") -}}
+{{- if lt (int $agentPeerProbePort) 1 -}}
+{{- fail "agent.peerProbe.port must be greater than zero" -}}
+{{- end -}}
+{{- if eq (int $agentPeerProbePort) (int $agentWireguardListenPortValue) -}}
+{{- fail "agent.peerProbe.port must differ from agent.wireguardListenPort" -}}
+{{- end -}}
+{{- if lt (int $agentPeerProbeIntervalSeconds) 1 -}}
+{{- fail "agent.peerProbe.intervalSeconds must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentPeerProbeSampleCount) 1 -}}
+{{- fail "agent.peerProbe.sampleCount must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentPeerProbeResponseTimeoutMillis) 1 -}}
+{{- fail "agent.peerProbe.responseTimeoutMillis must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentPeerProbeMaxConcurrency) 1 -}}
+{{- fail "agent.peerProbe.maxConcurrency must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentPeerProbeResponderMaxRequestsPerSecond) 1 -}}
+{{- fail "agent.peerProbe.responderMaxRequestsPerSecond must be greater than zero" -}}
+{{- end -}}
+{{- if lt (int $agentPeerProbeObservationMaxAgeSeconds) (max 30 (int $agentPeerProbeIntervalSeconds)) -}}
+{{- fail "agent.peerProbe.observationMaxAgeSeconds must be at least both agent.peerProbe.intervalSeconds and the 30-second signal path interval" -}}
+{{- end -}}
 {{- end -}}
 {{- if and (eq $agentRouteBackend "kernel-netlink") (not (or (eq $agentPeerMapEnabled "true") .Values.serviceExposure.enabled)) -}}
 {{- fail "agent.routeBackend=kernel-netlink requires agent.peerMap.enabled=true or serviceExposure.enabled=true" -}}
@@ -1051,6 +1095,26 @@ spec:
             - {{ $agentDirectPathProbeTimeoutSeconds | quote }}
             - --direct-handshake-max-age-seconds
             - {{ $agentDirectHandshakeMaxAgeSeconds | quote }}
+            {{- if ne $agentPeerProbeEnabled "true" }}
+            - --disable-peer-probe
+            {{- else }}
+            - --peer-probe-port
+            - {{ $agentPeerProbePort | quote }}
+            - --peer-probe-interval-seconds
+            - {{ $agentPeerProbeIntervalSeconds | quote }}
+            - --peer-probe-sample-count
+            - {{ $agentPeerProbeSampleCount | quote }}
+            - --peer-probe-response-timeout-millis
+            - {{ $agentPeerProbeResponseTimeoutMillis | quote }}
+            - --peer-probe-sample-interval-millis
+            - {{ $agentPeerProbeSampleIntervalMillis | quote }}
+            - --peer-probe-max-concurrency
+            - {{ $agentPeerProbeMaxConcurrency | quote }}
+            - --peer-probe-responder-max-requests-per-second
+            - {{ $agentPeerProbeResponderMaxRequestsPerSecond | quote }}
+            - --peer-probe-observation-max-age-seconds
+            - {{ $agentPeerProbeObservationMaxAgeSeconds | quote }}
+            {{- end }}
             {{- if eq $agentRelayForwarderEnabled "true" }}
             {{- if .Values.agent.relayForwarder.endpoint }}
             - --relay-forwarder-endpoint

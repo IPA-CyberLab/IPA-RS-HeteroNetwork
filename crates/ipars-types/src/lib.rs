@@ -1456,6 +1456,14 @@ pub mod api {
         #[serde(default)]
         pub relay_candidate_acl_denied_count: u64,
         #[serde(default)]
+        pub path_quality_observation_accepted_count: u64,
+        #[serde(default)]
+        pub path_quality_observation_stale_count: u64,
+        #[serde(default)]
+        pub path_quality_observation_path_mismatch_count: u64,
+        #[serde(default)]
+        pub path_quality_observation_rejected_count: u64,
+        #[serde(default)]
         pub path_negotiation_state_counts: Vec<PathStateCount>,
         pub hole_punch_plan_count: u64,
         #[serde(default)]
@@ -1467,6 +1475,8 @@ pub mod api {
         pub relay_health_ttl_seconds: u64,
         #[serde(default = "super::default_endpoint_candidate_ttl_seconds")]
         pub endpoint_candidate_ttl_seconds: u64,
+        #[serde(default = "super::default_path_quality_observation_ttl_seconds")]
+        pub path_quality_observation_ttl_seconds: u64,
         #[serde(default = "super::default_nat_classification_ttl_seconds")]
         pub nat_classification_ttl_seconds: u64,
         #[serde(default = "super::default_nat_classification_min_confidence_percent")]
@@ -17351,6 +17361,28 @@ pub mod api {
         pub direct_path_probe_confirmed_count: u64,
         #[serde(default)]
         pub direct_path_probe_timeout_count: u64,
+        #[serde(default)]
+        pub path_quality_observation_count: usize,
+        #[serde(default)]
+        pub peer_probe_measurement_count: u64,
+        #[serde(default)]
+        pub peer_probe_failure_count: u64,
+        #[serde(default)]
+        pub peer_probe_request_sent_count: u64,
+        #[serde(default)]
+        pub peer_probe_response_received_count: u64,
+        #[serde(default)]
+        pub peer_probe_timeout_count: u64,
+        #[serde(default)]
+        pub peer_probe_responder_request_count: u64,
+        #[serde(default)]
+        pub peer_probe_responder_invalid_count: u64,
+        #[serde(default)]
+        pub peer_probe_responder_unknown_source_count: u64,
+        #[serde(default)]
+        pub peer_probe_responder_rate_limited_count: u64,
+        #[serde(default)]
+        pub peer_probe_responder_send_failure_count: u64,
         pub peer_activity_record_count: u64,
         pub packet_flow_observation_count: u64,
         pub packet_flow_match_count: u64,

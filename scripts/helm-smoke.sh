@@ -73,6 +73,8 @@ assert_rendered_contains default "- --wireguard-listen-port"
 assert_rendered_contains default '- "51820"'
 assert_rendered_contains default "- --stun-bind"
 assert_rendered_contains default '- "0.0.0.0:51820"'
+assert_rendered_contains default "- --peer-probe-port"
+assert_rendered_contains default '- "51821"'
 assert_rendered_contains default "name: IPARS_AGENT_API_BEARER_TOKEN"
 assert_rendered_contains default 'key: "agent-api-token"'
 
@@ -157,6 +159,40 @@ template_fails agent-direct-path-probe-timeout-short \
 template_fails agent-direct-handshake-max-age-short \
   "agent.directPathVerification.handshakeMaxAgeSeconds must be at least the 30-second signal path interval" \
   --set agent.directPathVerification.handshakeMaxAgeSeconds=29
+
+template_ok agent-peer-probe \
+  --set agent.peerProbe.port=51900 \
+  --set agent.peerProbe.intervalSeconds=45 \
+  --set agent.peerProbe.sampleCount=7 \
+  --set agent.peerProbe.responseTimeoutMillis=750 \
+  --set agent.peerProbe.sampleIntervalMillis=25 \
+  --set agent.peerProbe.maxConcurrency=8 \
+  --set agent.peerProbe.responderMaxRequestsPerSecond=200 \
+  --set agent.peerProbe.observationMaxAgeSeconds=90
+
+assert_rendered_contains agent-peer-probe "- --peer-probe-port"
+assert_rendered_contains agent-peer-probe '- "51900"'
+assert_rendered_contains agent-peer-probe "- --peer-probe-sample-count"
+assert_rendered_contains agent-peer-probe '- "7"'
+
+template_ok agent-peer-probe-disabled \
+  --set agent.peerProbe.enabled=false
+
+assert_rendered_contains agent-peer-probe-disabled "- --disable-peer-probe"
+assert_rendered_absent agent-peer-probe-disabled "- --peer-probe-port"
+
+template_fails agent-peer-probe-port-conflict \
+  "agent.peerProbe.port must differ from agent.wireguardListenPort" \
+  --set agent.peerProbe.port=51820
+
+template_fails agent-peer-probe-samples-zero \
+  "agent.peerProbe.sampleCount must be greater than zero" \
+  --set agent.peerProbe.sampleCount=0
+
+template_fails agent-peer-probe-observation-too-short \
+  "agent.peerProbe.observationMaxAgeSeconds must be at least both agent.peerProbe.intervalSeconds and the 30-second signal path interval" \
+  --set agent.peerProbe.intervalSeconds=60 \
+  --set agent.peerProbe.observationMaxAgeSeconds=59
 
 template_ok cluster-endpoints \
   --set-string cluster.controlPlaneUrl=https://control.example.com:8443 \

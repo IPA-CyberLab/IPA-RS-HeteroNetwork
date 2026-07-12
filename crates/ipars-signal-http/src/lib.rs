@@ -659,6 +659,28 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_signal_path_quality_observations_total Signed path quality observations received by disposition."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_path_quality_observations_total counter"
+    );
+    for (status, value) in [
+        ("accepted", metrics.path_quality_observation_accepted_count),
+        ("stale", metrics.path_quality_observation_stale_count),
+        (
+            "path_mismatch",
+            metrics.path_quality_observation_path_mismatch_count,
+        ),
+        ("rejected", metrics.path_quality_observation_rejected_count),
+    ] {
+        prometheus_line!(
+            &mut body,
+            "ipars_signal_path_quality_observations_total{{status=\"{status}\"}} {value}"
+        );
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_signal_path_negotiation_state_total Successful signal path negotiations by selected state."
     );
     prometheus_line!(
@@ -753,6 +775,19 @@ fn render_prometheus_metrics(metrics: &SignalMetricsResponse) -> String {
         &mut body,
         "ipars_signal_endpoint_candidate_ttl_seconds {}",
         metrics.endpoint_candidate_ttl_seconds
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_signal_path_quality_observation_ttl_seconds Signed path quality observation freshness window used by Signal."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_signal_path_quality_observation_ttl_seconds gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_signal_path_quality_observation_ttl_seconds {}",
+        metrics.path_quality_observation_ttl_seconds
     );
     prometheus_line!(
         &mut body,
@@ -1274,12 +1309,17 @@ mod tests {
             ));
         assert_eq!(metrics.stale_endpoint_candidate_count, 0);
         assert_eq!(metrics.endpoint_candidate_ttl_seconds, 120);
+        assert_eq!(metrics.path_quality_observation_ttl_seconds, 120);
         assert_eq!(metrics.nat_classification_ttl_seconds, 300);
         assert_eq!(metrics.nat_classification_min_confidence_percent, 50);
         assert_eq!(metrics.node_upsert_count, 2);
         assert_eq!(metrics.path_negotiation_count, 1);
         assert_eq!(metrics.path_acl_denied_count, 0);
         assert_eq!(metrics.relay_candidate_acl_denied_count, 0);
+        assert_eq!(metrics.path_quality_observation_accepted_count, 0);
+        assert_eq!(metrics.path_quality_observation_stale_count, 0);
+        assert_eq!(metrics.path_quality_observation_path_mismatch_count, 0);
+        assert_eq!(metrics.path_quality_observation_rejected_count, 0);
         assert_eq!(metrics.hole_punch_acl_denied_count, 0);
         assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
         assert!(metrics
@@ -1319,6 +1359,7 @@ mod tests {
         assert!(body.contains("ipars_signal_fresh_low_confidence_nat_classifications 0"));
         assert!(body.contains("ipars_signal_stale_endpoint_candidates 0"));
         assert!(body.contains("ipars_signal_endpoint_candidate_ttl_seconds 120"));
+        assert!(body.contains("ipars_signal_path_quality_observation_ttl_seconds 120"));
         assert!(body.contains("ipars_signal_nat_classification_ttl_seconds 300"));
         assert!(body.contains("ipars_signal_nat_classification_min_confidence_percent 50"));
         assert!(body.contains(
@@ -1327,6 +1368,9 @@ mod tests {
         assert!(body.contains("ipars_signal_path_negotiations_total 1"));
         assert!(body.contains("ipars_signal_path_acl_denials_total 0"));
         assert!(body.contains("ipars_signal_relay_candidate_acl_denials_total 0"));
+        assert!(
+            body.contains("ipars_signal_path_quality_observations_total{status=\"accepted\"} 0")
+        );
         assert!(body.contains("ipars_signal_hole_punch_acl_denials_total 0"));
         assert!(body.contains("ipars_signal_hole_punch_nat_suppressions_total 0"));
         assert!(body.contains(

@@ -78,6 +78,20 @@ Direct paths are preferred when allowed and healthy. Relay paths remain encrypte
 
 Direct selection is data-plane verified. A Signal response or completed UDP hole-punch send starts a pending probe but does not by itself establish `DIRECT_PUBLIC`, `DIRECT_IPV6`, or `DIRECT_NAT_TRAVERSAL`. The peer-map resolver temporarily points WireGuard at the proposed candidate while retaining an active relay session as a hot fallback. The agent takes one bounded WireGuard telemetry snapshot per Signal negotiation cycle: command and userspace backends query only `latest-handshakes`, `transfer`, and `endpoints` fields through trusted bounded `wg` subprocesses, while the kernel backend reads the same fields with generic netlink `GetDevice`. A candidate is confirmed only when the observed WireGuard endpoint matches it and either a handshake occurred after the switch or RX/TX counters increased from the pre-switch baseline. Expired probes clear the temporary endpoint preference and select an admissible relay or `UNREACHABLE`; already-direct paths must continue to show a recent handshake before they are accepted without a new probe.
 
+Active paths are then measured autonomously over the WireGuard interface. Each
+agent runs a fixed-width UDP challenge/response service bound to its VPN IP and
+periodically probes only lazy-connect-active or pinned peers with bounded
+concurrency. RTT samples produce latency, exact sample-derived loss, jitter,
+and path-fingerprint-scoped stability. The agent caches pair-scoped
+observations, discards a round if the path changed while it was in flight, and
+adds the latest fresh observation to the signed Signal negotiation envelope.
+Signal rejects malformed or internally inconsistent observations and uses the
+metrics only when the observed direct candidate or relay node exactly matches
+the path it is scoring. Relay load remains Signal-authoritative and cannot be
+supplied by an agent. This keeps initial candidate discovery optimistic while
+subsequent negotiations and relay-to-direct hysteresis use measured data-plane
+quality rather than static latency/loss/jitter defaults.
+
 ## ACL And Peer Visibility
 
 Control-plane peer maps and relay maps are filtered through cluster ACL rules when rules are configured. An empty ACL list preserves the default allow-all peer visibility. When ACL rules exist, deny matches take precedence over allow matches, and unmatched peers/routes are hidden. Rules match source role/tag, target role/tag, protocol, and advertised route CIDR containment; route-specific rules can expose only the allowed subset of a node's advertised routes. Endpoint candidates older than `endpoint_candidate_ttl_seconds` or carrying unusable port-zero, unspecified, multicast, or IPv4 broadcast endpoints are removed from peer and relay maps before they are served, while the underlying node record remains available for the next heartbeat refresh. Path records older than `path_state_ttl_seconds` are excluded from control-plane path status and active path-state metrics, with stale totals reported separately so operators can distinguish old records from live path state.

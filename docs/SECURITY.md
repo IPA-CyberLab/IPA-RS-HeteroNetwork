@@ -99,6 +99,26 @@ The daemon bounds token-file reads and compares submitted credentials in constan
 
 Bearer authentication is an authorization control, not transport encryption. Use TLS before traffic leaves a trusted host or private deployment network.
 
+## Peer Probe Abuse Controls
+
+The autonomous quality responder binds to the node's assigned VPN IP, not a
+public or wildcard address. It accepts only exact fixed-width versioned request
+packets from VPN source IPs present in the current peer map, returns one
+same-size packet, and rate-limits each peer. Responses echo a random 128-bit
+challenge and sequence number, so off-path packets cannot satisfy a sample and
+the protocol has no amplification factor. Unknown sources, malformed packets,
+rate-limit drops, and send failures have separate metrics.
+
+WireGuard cryptokey routing authenticates the overlay source address before the
+UDP responder sees it. Quality observations are additionally covered by the
+source node's Signal-request signature and include the measured path state,
+candidate or relay fingerprint, sample counts, and timestamp. Signal rejects
+inconsistent loss/sample values, future-invalid data, agent-supplied relay
+load, and impossible path shapes; stale or nonmatching observations are
+counted but ignored for scoring. A compromised member can still under-report
+its own observed quality, so these measurements are path-selection hints, not
+an authorization or billing trust boundary.
+
 ## Relay Abuse Controls
 
 Relay eligibility requires policy permission, usable public endpoint/admission URL values, fresh healthy heartbeat state, capacity, and E2E-only relay mode. Public IP reachability alone is not enough to become a relay.

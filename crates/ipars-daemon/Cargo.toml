@@ -17,6 +17,7 @@ aya.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 ipnet.workspace = true
 ipars-agent = { path = "../ipars-agent" }
 ipars-agent-http = { path = "../ipars-agent-http" }

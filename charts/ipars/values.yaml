@@ -36,6 +36,16 @@ agent:
   directPathVerification:
     probeTimeoutSeconds: 120
     handshakeMaxAgeSeconds: 180
+  peerProbe:
+    enabled: true
+    port: 51821
+    intervalSeconds: 30
+    sampleCount: 5
+    responseTimeoutMillis: 500
+    sampleIntervalMillis: 20
+    maxConcurrency: 32
+    responderMaxRequestsPerSecond: 100
+    observationMaxAgeSeconds: 120
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   apiBearerTokenSecretKey: agent-api-token

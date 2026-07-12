@@ -1197,6 +1197,75 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_path_quality_observations Cached fresh-or-stale path quality observations; Signal applies its own freshness bound."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_agent_path_quality_observations gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_path_quality_observations{{node_id=\"{node_id}\"}} {}",
+        metrics.path_quality_observation_count
+    );
+    for (name, help, value) in [
+        (
+            "ipars_agent_peer_probe_measurements_total",
+            "Peer path quality measurement rounds committed by the agent.",
+            metrics.peer_probe_measurement_count,
+        ),
+        (
+            "ipars_agent_peer_probe_failures_total",
+            "Peer path quality measurements that failed before producing a valid round.",
+            metrics.peer_probe_failure_count,
+        ),
+        (
+            "ipars_agent_peer_probe_requests_sent_total",
+            "UDP peer quality probe requests attempted by the agent.",
+            metrics.peer_probe_request_sent_count,
+        ),
+        (
+            "ipars_agent_peer_probe_responses_received_total",
+            "Authenticated-path UDP peer quality probe responses received by the agent.",
+            metrics.peer_probe_response_received_count,
+        ),
+        (
+            "ipars_agent_peer_probe_timeouts_total",
+            "UDP peer quality probe samples without a matching response.",
+            metrics.peer_probe_timeout_count,
+        ),
+        (
+            "ipars_agent_peer_probe_responder_requests_total",
+            "Allowlisted UDP peer quality requests answered by the agent.",
+            metrics.peer_probe_responder_request_count,
+        ),
+        (
+            "ipars_agent_peer_probe_responder_invalid_total",
+            "Malformed or non-request UDP peer quality packets rejected by the agent.",
+            metrics.peer_probe_responder_invalid_count,
+        ),
+        (
+            "ipars_agent_peer_probe_responder_unknown_source_total",
+            "UDP peer quality packets rejected because the source VPN IP was absent from the peer map.",
+            metrics.peer_probe_responder_unknown_source_count,
+        ),
+        (
+            "ipars_agent_peer_probe_responder_rate_limited_total",
+            "Allowlisted UDP peer quality requests rejected by the per-peer rate limit.",
+            metrics.peer_probe_responder_rate_limited_count,
+        ),
+        (
+            "ipars_agent_peer_probe_responder_send_failures_total",
+            "UDP peer quality responses that could not be sent in full.",
+            metrics.peer_probe_responder_send_failure_count,
+        ),
+    ] {
+        prometheus_line!(&mut body, "# HELP {name} {help}");
+        prometheus_line!(&mut body, "# TYPE {name} counter");
+        prometheus_line!(&mut body, "{name}{{node_id=\"{node_id}\"}} {value}");
+    }
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_packet_flow_observations_total Packet-flow observations submitted to lazy-connect resolution."
     );
     prometheus_line!(
@@ -1468,7 +1537,8 @@ impl IntoResponse for ApiError {
             | AgentError::HolePunch(_)
             | AgentError::RelaySession(_)
             | AgentError::InsecureStatePath(_)
-            | AgentError::WireGuard(_) => StatusCode::SERVICE_UNAVAILABLE,
+            | AgentError::WireGuard(_)
+            | AgentError::PeerProbe(_) => StatusCode::SERVICE_UNAVAILABLE,
             AgentError::PathProbeRejected(_) | AgentError::PathStateRejected(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -1575,6 +1645,17 @@ mod tests {
             direct_path_probe_started_count: 0,
             direct_path_probe_confirmed_count: 0,
             direct_path_probe_timeout_count: 0,
+            path_quality_observation_count: 0,
+            peer_probe_measurement_count: 0,
+            peer_probe_failure_count: 0,
+            peer_probe_request_sent_count: 0,
+            peer_probe_response_received_count: 0,
+            peer_probe_timeout_count: 0,
+            peer_probe_responder_request_count: 0,
+            peer_probe_responder_invalid_count: 0,
+            peer_probe_responder_unknown_source_count: 0,
+            peer_probe_responder_rate_limited_count: 0,
+            peer_probe_responder_send_failure_count: 0,
             peer_activity_record_count: 0,
             packet_flow_observation_count: 0,
             packet_flow_match_count: 0,
@@ -1604,6 +1685,12 @@ mod tests {
         )));
         assert!(body.contains(&format!(
             "ipars_agent_direct_path_probes_timeout_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_path_quality_observations{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_peer_probe_measurements_total{{node_id=\"{prometheus_node_id}\"}} 0"
         )));
 
         for source in AgentPacketFlowDuplicateSource::ALL {

@@ -1511,6 +1511,7 @@ impl AgentRuntime {
         let userspace_wireguard_process = self.userspace_wireguard_process.read().await.clone();
         let path_change_events = self.path_change_events.read().await;
         let lazy_connect = self.lazy_connect.read().await;
+        let path_quality_observations = self.path_quality_observations.read().await;
         let latest_peer_map = self.latest_peer_map.read().await;
         let peer_map_peer_count = latest_peer_map
             .as_ref()
@@ -1579,6 +1580,31 @@ impl AgentRuntime {
                 .load(Ordering::Relaxed),
             direct_path_probe_timeout_count: self
                 .direct_path_probe_timeout_count
+                .load(Ordering::Relaxed),
+            path_quality_observation_count: path_quality_observations.len(),
+            peer_probe_measurement_count: self.peer_probe_measurement_count.load(Ordering::Relaxed),
+            peer_probe_failure_count: self.peer_probe_failure_count.load(Ordering::Relaxed),
+            peer_probe_request_sent_count: self
+                .peer_probe_request_sent_count
+                .load(Ordering::Relaxed),
+            peer_probe_response_received_count: self
+                .peer_probe_response_received_count
+                .load(Ordering::Relaxed),
+            peer_probe_timeout_count: self.peer_probe_timeout_count.load(Ordering::Relaxed),
+            peer_probe_responder_request_count: self
+                .peer_probe_responder_request_count
+                .load(Ordering::Relaxed),
+            peer_probe_responder_invalid_count: self
+                .peer_probe_responder_invalid_count
+                .load(Ordering::Relaxed),
+            peer_probe_responder_unknown_source_count: self
+                .peer_probe_responder_unknown_source_count
+                .load(Ordering::Relaxed),
+            peer_probe_responder_rate_limited_count: self
+                .peer_probe_responder_rate_limited_count
+                .load(Ordering::Relaxed),
+            peer_probe_responder_send_failure_count: self
+                .peer_probe_responder_send_failure_count
                 .load(Ordering::Relaxed),
             peer_activity_record_count: self.peer_activity_record_count.load(Ordering::Relaxed),
             packet_flow_observation_count: self

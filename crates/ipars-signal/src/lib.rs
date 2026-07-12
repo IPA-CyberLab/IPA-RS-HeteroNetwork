@@ -84,6 +84,10 @@ pub struct SignalRegistry {
     path_negotiations: AtomicU64,
     path_acl_denials: AtomicU64,
     relay_candidate_acl_denials: AtomicU64,
+    path_quality_observation_accepted: AtomicU64,
+    path_quality_observation_stale: AtomicU64,
+    path_quality_observation_path_mismatch: AtomicU64,
+    path_quality_observation_rejected: AtomicU64,
     direct_public_negotiations: AtomicU64,
     direct_ipv6_negotiations: AtomicU64,
     direct_nat_traversal_negotiations: AtomicU64,
@@ -109,6 +113,10 @@ impl SignalRegistry {
             path_negotiations: AtomicU64::new(0),
             path_acl_denials: AtomicU64::new(0),
             relay_candidate_acl_denials: AtomicU64::new(0),
+            path_quality_observation_accepted: AtomicU64::new(0),
+            path_quality_observation_stale: AtomicU64::new(0),
+            path_quality_observation_path_mismatch: AtomicU64::new(0),
+            path_quality_observation_rejected: AtomicU64::new(0),
             direct_public_negotiations: AtomicU64::new(0),
             direct_ipv6_negotiations: AtomicU64::new(0),
             direct_nat_traversal_negotiations: AtomicU64::new(0),
@@ -226,7 +234,16 @@ impl SignalRegistry {
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
         if let Some(observation) = path_observation.as_ref() {
-            validate_path_quality_observation(&request.source, &request.target, observation, now)?;
+            if let Err(error) = validate_path_quality_observation(
+                &request.source,
+                &request.target,
+                observation,
+                now,
+            ) {
+                self.path_quality_observation_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
         }
         validate_desired_routes(&target, &request.desired_routes)?;
         if !acl_allows_path(
@@ -237,6 +254,7 @@ impl SignalRegistry {
         ) {
             self.path_acl_denials.fetch_add(1, Ordering::Relaxed);
             let response = acl_denied_signal_path_response(request);
+            self.record_path_quality_observation_result(path_observation.as_ref(), &response, now);
             self.record_path_negotiation_state(response.preferred_state);
             return Ok(response);
         }
@@ -286,6 +304,7 @@ impl SignalRegistry {
             path_observation.as_ref(),
             now,
         );
+        self.record_path_quality_observation_result(path_observation.as_ref(), &response, now);
         self.record_path_negotiation_state(response.preferred_state);
         Ok(response)
     }
@@ -392,6 +411,8 @@ impl SignalRegistry {
         let now = Utc::now();
         let relay_health_ttl_seconds = self.coordinator.policy.relay_health_ttl_seconds;
         let endpoint_candidate_ttl_seconds = self.coordinator.policy.endpoint_candidate_ttl_seconds;
+        let path_quality_observation_ttl_seconds =
+            self.coordinator.policy.path_quality_observation_ttl_seconds;
         let nat_classification_ttl_seconds = self.coordinator.policy.nat_classification_ttl_seconds;
         let nat_classification_min_confidence_percent = self
             .coordinator
@@ -472,6 +493,18 @@ impl SignalRegistry {
             relay_candidate_acl_denied_count: self
                 .relay_candidate_acl_denials
                 .load(Ordering::Relaxed),
+            path_quality_observation_accepted_count: self
+                .path_quality_observation_accepted
+                .load(Ordering::Relaxed),
+            path_quality_observation_stale_count: self
+                .path_quality_observation_stale
+                .load(Ordering::Relaxed),
+            path_quality_observation_path_mismatch_count: self
+                .path_quality_observation_path_mismatch
+                .load(Ordering::Relaxed),
+            path_quality_observation_rejected_count: self
+                .path_quality_observation_rejected
+                .load(Ordering::Relaxed),
             path_negotiation_state_counts: self.path_negotiation_state_counts(),
             hole_punch_plan_count: self.hole_punch_plans.load(Ordering::Relaxed),
             hole_punch_acl_denied_count: self.hole_punch_acl_denials.load(Ordering::Relaxed),
@@ -482,6 +515,7 @@ impl SignalRegistry {
                 .hole_punch_nat_suppression_strategy_counts(),
             relay_health_ttl_seconds,
             endpoint_candidate_ttl_seconds,
+            path_quality_observation_ttl_seconds,
             nat_classification_ttl_seconds,
             nat_classification_min_confidence_percent,
             generated_at: now,
@@ -497,6 +531,42 @@ impl SignalRegistry {
             PathState::Unreachable => &self.unreachable_negotiations,
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_path_quality_observation_result(
+        &self,
+        observation: Option<&PathQualityObservation>,
+        response: &SignalPathResponse,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let Some(observation) = observation else {
+            return;
+        };
+        if !path_quality_observation_is_fresh(
+            observation,
+            now,
+            self.coordinator.policy.path_quality_observation_ttl_seconds,
+        ) {
+            self.path_quality_observation_stale
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if matching_path_observation_metrics(
+            response.preferred_state,
+            &response.target_candidates,
+            &response.relay_candidates,
+            Some(observation),
+            now,
+            self.coordinator.policy.path_quality_observation_ttl_seconds,
+        )
+        .is_some()
+        {
+            self.path_quality_observation_accepted
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.path_quality_observation_path_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn path_negotiation_state_counts(&self) -> Vec<PathStateCount> {
@@ -2093,6 +2163,64 @@ mod tests {
                 .iter()
                 .any(|reason| reason.starts_with("latency_ms=")));
         }
+    }
+
+    #[tokio::test]
+    async fn registry_counts_path_observation_dispositions() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source_node = source(Vec::new());
+        let target_node = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        registry.upsert_node(source_node.clone()).await?;
+        registry.upsert_node(target_node.clone()).await?;
+        let request = || SignalPathRequest {
+            source: source_node.node_id.clone(),
+            target: target_node.node_id.clone(),
+            source_candidates: Vec::new(),
+            source_nat_classification: None,
+            desired_routes: Vec::new(),
+        };
+        let now = Utc::now();
+        let observation = quality_observation(
+            PathState::DirectPublic,
+            target_node.endpoint_candidates.first().cloned(),
+            None,
+            now,
+        );
+
+        registry
+            .negotiate_with_observation(request(), Some(observation.clone()))
+            .await?;
+        let mut stale = observation.clone();
+        stale.observed_at = now - chrono::Duration::seconds(121);
+        registry
+            .negotiate_with_observation(request(), Some(stale))
+            .await?;
+        let mut mismatched = observation.clone();
+        mismatched
+            .selected_candidate
+            .as_mut()
+            .expect("direct candidate")
+            .addr
+            .set_port(51_821);
+        registry
+            .negotiate_with_observation(request(), Some(mismatched))
+            .await?;
+        let mut invalid = observation;
+        invalid.metrics.loss_ppm = 0;
+        assert!(matches!(
+            registry
+                .negotiate_with_observation(request(), Some(invalid))
+                .await,
+            Err(SignalError::PathQualityObservationInvalid { .. })
+        ));
+
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.path_quality_observation_accepted_count, 1);
+        assert_eq!(metrics.path_quality_observation_stale_count, 1);
+        assert_eq!(metrics.path_quality_observation_path_mismatch_count, 1);
+        assert_eq!(metrics.path_quality_observation_rejected_count, 1);
+        assert_eq!(metrics.path_quality_observation_ttl_seconds, 120);
+        Ok(())
     }
 
     #[test]
