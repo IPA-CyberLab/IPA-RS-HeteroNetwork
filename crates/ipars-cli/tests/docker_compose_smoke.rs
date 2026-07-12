@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -636,12 +638,12 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
-    assert_compose_linux_wireguard_dataplane(&compose.repo_root, &temp_dir)?;
+    assert_compose_linux_wireguard_dataplane(&compose.repo_root)?;
 
     Ok(())
 }
 
-fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -> Result<()> {
+fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     let init = generated_init_output(51_820)?;
     let cluster_id = json_string(&init, "cluster_id")?;
     let issuer_node_id = json_string(&init, "issuer_node_id")?;
@@ -653,15 +655,30 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         .context("init output missing join_token")?
         .to_string();
     let suffix = unique_suffix()?;
+    let project_name = format!("ipars-dataplane-{suffix}");
+    let docker_socket = docker_engine_socket_path()?;
+    let route_a_network = format!("{project_name}-route-a");
+    let route_b_network = format!("{project_name}-route-b");
+    let route_b_replacement_reservation = format!("{project_name}-route-b-next");
+    let _docker_network_guard = DockerNetworksCleanup {
+        names: vec![
+            route_a_network.clone(),
+            route_b_network.clone(),
+            route_b_replacement_reservation.clone(),
+        ],
+    };
+    let route_a_cidr = create_docker_bridge_network(&route_a_network)?;
+    let route_b_cidr = create_docker_bridge_network(&route_b_network)?;
+    let route_b_replacement_cidr = create_docker_bridge_network(&route_b_replacement_reservation)?;
     let agent_api_bearer_token = COMPOSE_AGENT_API_BEARER_TOKEN.to_string();
     let mut compose = ComposeProject {
         repo_root: repo_root.to_path_buf(),
-        project_name: format!("ipars-dataplane-{suffix}"),
+        project_name,
         compose_files: vec![
             PathBuf::from("docker/compose.yaml"),
             PathBuf::from("docker/compose.dataplane-smoke.yaml"),
         ],
-        docker_socket: temp_dir.join("dataplane-unused-docker.sock"),
+        docker_socket,
         extra_env: vec![
             ("IPARS_DATAPLANE_CLUSTER_ID".to_string(), cluster_id.clone()),
             ("IPARS_DATAPLANE_ISSUER_NODE_ID".to_string(), issuer_node_id),
@@ -679,12 +696,20 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
                 agent_api_bearer_token,
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_A_CIDR".to_string(),
-                "172.30.1.0/24".to_string(),
+                "IPARS_DATAPLANE_WORKLOAD_A_NETWORK".to_string(),
+                "placeholder-workload-a".to_string(),
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_B_CIDR".to_string(),
-                "172.30.2.0/24".to_string(),
+                "IPARS_DATAPLANE_WORKLOAD_B_NETWORK".to_string(),
+                "placeholder-workload-b".to_string(),
+            ),
+            (
+                "IPARS_DATAPLANE_ROUTE_A_NETWORK".to_string(),
+                route_a_network.clone(),
+            ),
+            (
+                "IPARS_DATAPLANE_ROUTE_B_NETWORK".to_string(),
+                route_b_network.clone(),
             ),
         ],
     };
@@ -695,6 +720,19 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         docker_socket: compose.docker_socket.clone(),
         extra_env: compose.extra_env.clone(),
     };
+
+    let workload_a_network = compose_network_name(&compose, "workload-a")?;
+    let workload_b_network = compose_network_name(&compose, "workload-b")?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_WORKLOAD_A_NETWORK",
+        workload_a_network,
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_WORKLOAD_B_NETWORK",
+        workload_b_network,
+    )?;
 
     run_compose_with_diagnostics(
         &compose,
@@ -737,7 +775,13 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         &issuer_key_id,
         &issuer_private_key,
         bootstrap_ip,
-        &[workload_a_cidr, workload_b_cidr],
+        &[
+            workload_a_cidr,
+            workload_b_cidr,
+            route_a_cidr,
+            route_b_cidr,
+            route_b_replacement_cidr,
+        ],
     )?;
     replace_compose_env(
         &mut compose,
@@ -749,17 +793,6 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
         "IPARS_DATAPLANE_JOIN_TOKEN",
         join_token.to_string(),
     )?;
-    replace_compose_env(
-        &mut compose,
-        "IPARS_DATAPLANE_WORKLOAD_A_CIDR",
-        workload_a_cidr.to_string(),
-    )?;
-    replace_compose_env(
-        &mut compose,
-        "IPARS_DATAPLANE_WORKLOAD_B_CIDR",
-        workload_b_cidr.to_string(),
-    )?;
-
     let rendered = run_compose(&compose, ["config"])?;
     let rendered =
         String::from_utf8(rendered.stdout).context("dataplane Compose config was not UTF-8")?;
@@ -773,6 +806,15 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
     anyhow::ensure!(
         !rendered.contains("/dev/net/tun"),
         "dataplane Compose config unexpectedly mounted /dev/net/tun\n{rendered}"
+    );
+    anyhow::ensure!(
+        rendered
+            .matches("IPARS_DOCKER_DISCOVER_NETWORKS: \"true\"")
+            .count()
+            == 2
+            && rendered.matches("target: /run/ipars/docker.sock").count() == 2
+            && rendered.matches("read_only: true").count() >= 2,
+        "dataplane Compose config did not render two read-only Docker API discovery mounts\n{rendered}"
     );
 
     run_compose_with_diagnostics(
@@ -854,6 +896,29 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
     )?;
     wait_for_compose_advertised_route(&compose, "agent", workload_b_cidr, workload_b_ip)?;
     wait_for_compose_advertised_route(&compose, "agent-b", workload_a_cidr, workload_a_ip)?;
+    wait_for_compose_advertised_route(
+        &compose,
+        "agent",
+        route_b_cidr,
+        ipv4_network_probe_address(route_b_cidr),
+    )?;
+    wait_for_compose_advertised_route(
+        &compose,
+        "agent-b",
+        route_a_cidr,
+        ipv4_network_probe_address(route_a_cidr),
+    )?;
+    replace_docker_bridge_network(
+        &route_b_network,
+        &route_b_replacement_reservation,
+        route_b_replacement_cidr,
+    )?;
+    wait_for_compose_advertised_route_replacement(
+        &compose,
+        "agent",
+        route_b_cidr,
+        route_b_replacement_cidr,
+    )?;
     assert_compose_routed_workload_traffic(
         &compose,
         "agent",
@@ -1169,6 +1234,172 @@ fn replace_compose_env(compose: &mut ComposeProject, name: &str, value: String) 
     Ok(())
 }
 
+fn docker_engine_socket_path() -> Result<PathBuf> {
+    let docker_host = match std::env::var_os("DOCKER_HOST") {
+        Some(value) if !value.is_empty() => value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("DOCKER_HOST was not valid UTF-8"))?,
+        _ => {
+            let output = Command::new("docker")
+                .args([
+                    "context",
+                    "inspect",
+                    "--format",
+                    "{{.Endpoints.docker.Host}}",
+                ])
+                .output()
+                .context("failed to inspect active Docker context")?;
+            ensure_success("inspect active Docker context", &output)?;
+            String::from_utf8(output.stdout)
+                .context("active Docker context endpoint was not UTF-8")?
+                .trim()
+                .to_string()
+        }
+    };
+    let client_socket = docker_host
+        .strip_prefix("unix://")
+        .with_context(|| {
+            format!(
+                "Docker dataplane discovery requires a local unix:// Docker endpoint, got {docker_host:?}"
+            )
+        })?;
+    let client_socket = PathBuf::from(client_socket);
+    anyhow::ensure!(
+        client_socket.is_absolute(),
+        "Docker Unix socket path must be absolute: {}",
+        client_socket.display()
+    );
+    let metadata = fs::symlink_metadata(&client_socket).with_context(|| {
+        format!(
+            "failed to inspect Docker Unix socket {}",
+            client_socket.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "Docker Unix socket must not be a symlink: {}",
+        client_socket.display()
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "Docker endpoint is not a Unix socket: {}",
+        client_socket.display()
+    );
+    #[cfg(not(unix))]
+    anyhow::bail!("Docker dataplane discovery smoke requires a Unix host");
+
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("IPARS_DOCKER_API_SOCKET_HOST") {
+        candidates.push(PathBuf::from(configured));
+    }
+    candidates.push(client_socket);
+    candidates.push(PathBuf::from("/var/run/docker.sock"));
+    candidates.push(PathBuf::from("/run/docker.sock"));
+    let mut seen = BTreeSet::new();
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_absolute() || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let mount = format!(
+            "type=bind,source={},target=/docker.sock,readonly",
+            candidate.display()
+        );
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--mount",
+                &mount,
+                "debian:bookworm-slim",
+                "sh",
+                "-c",
+                "test -S /docker.sock",
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to probe Docker daemon bind path {}",
+                    candidate.display()
+                )
+            })?;
+        if output.status.success() {
+            return Ok(candidate);
+        }
+        failures.push(format!(
+            "{}: {}",
+            candidate.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    anyhow::bail!(
+        "no Docker daemon-visible Unix socket bind path was found: {}",
+        failures.join("; ")
+    )
+}
+
+fn create_docker_bridge_network(name: &str) -> Result<Ipv4Net> {
+    let mut last_error = String::new();
+    for index in 0..=255u16 {
+        let second = 240 + index / 256;
+        let third = index % 256;
+        let cidr = format!("10.{second}.{third}.0/24").parse::<Ipv4Net>()?;
+        let output = Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--subnet",
+                &cidr.to_string(),
+                name,
+            ])
+            .output()
+            .with_context(|| format!("failed to create Docker network {name}"))?;
+        if output.status.success() {
+            return Ok(cidr);
+        }
+        last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    }
+    anyhow::bail!(
+        "failed to allocate a non-overlapping Docker bridge subnet for {name}: {last_error}"
+    )
+}
+
+fn replace_docker_bridge_network(
+    name: &str,
+    replacement_reservation: &str,
+    replacement_cidr: Ipv4Net,
+) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["network", "rm", name, replacement_reservation])
+        .output()
+        .with_context(|| format!("failed to remove Docker network {name} for subnet churn"))?;
+    ensure_success("remove Docker networks before subnet churn", &output)?;
+    let output = Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--subnet",
+            &replacement_cidr.to_string(),
+            name,
+        ])
+        .output()
+        .with_context(|| format!("failed to recreate Docker network {name}"))?;
+    ensure_success("recreate Docker network with replacement subnet", &output)?;
+    Ok(())
+}
+
 fn compose_service_ipv4(compose: &ComposeProject, service: &str) -> Result<IpAddr> {
     let mut command = compose_command(compose);
     command.args([
@@ -1201,18 +1432,23 @@ fn compose_service_ipv4(compose: &ComposeProject, service: &str) -> Result<IpAdd
     Ok(IpAddr::V4(ipv4))
 }
 
-fn compose_network_ipv4_subnet(compose: &ComposeProject, network_key: &str) -> Result<Ipv4Net> {
+fn compose_network_name(compose: &ComposeProject, network_key: &str) -> Result<String> {
     let rendered = run_compose(compose, ["config", "--format", "json"])?;
     let rendered: Value = serde_json::from_slice(&rendered.stdout)
         .context("failed to parse rendered Compose JSON")?;
-    let network_name = rendered
+    rendered
         .get("networks")
         .and_then(|networks| networks.get(network_key))
         .and_then(|network| network.get("name"))
         .and_then(Value::as_str)
-        .with_context(|| format!("rendered Compose config omitted network {network_key}"))?;
+        .map(ToString::to_string)
+        .with_context(|| format!("rendered Compose config omitted network {network_key}"))
+}
+
+fn compose_network_ipv4_subnet(compose: &ComposeProject, network_key: &str) -> Result<Ipv4Net> {
+    let network_name = compose_network_name(compose, network_key)?;
     let output = Command::new("docker")
-        .args(["network", "inspect", network_name])
+        .args(["network", "inspect", &network_name])
         .output()
         .with_context(|| format!("failed to inspect Docker network {network_name}"))?;
     ensure_success(&format!("inspect Docker network {network_name}"), &output)?;
@@ -1456,6 +1692,75 @@ ip route get "$remote_ip" | grep -F -- "dev $interface" >/dev/null
     }
 }
 
+fn ipv4_network_probe_address(cidr: Ipv4Net) -> Ipv4Addr {
+    let network = u32::from(cidr.network());
+    let broadcast = u32::from(cidr.broadcast());
+    network
+        .checked_add(1)
+        .filter(|candidate| *candidate < broadcast)
+        .map(Ipv4Addr::from)
+        .unwrap_or_else(|| cidr.network())
+}
+
+fn wait_for_compose_advertised_route_replacement(
+    compose: &ComposeProject,
+    service: &str,
+    stale_cidr: Ipv4Net,
+    replacement_cidr: Ipv4Net,
+) -> Result<()> {
+    let replacement_ip = ipv4_network_probe_address(replacement_cidr);
+    let script = r#"
+set -eu
+interface="$1"
+stale_cidr="$2"
+replacement_cidr="$3"
+replacement_ip="$4"
+allowed_ips="$(wg show "$interface" allowed-ips)"
+printf '%s\n' "$allowed_ips" | grep -F -- "$replacement_cidr" >/dev/null
+if printf '%s\n' "$allowed_ips" | grep -F -- "$stale_cidr" >/dev/null; then
+  exit 1
+fi
+ip route get "$replacement_ip" | grep -F -- "dev $interface" >/dev/null
+if ip route show table all | grep -F -- "$stale_cidr dev $interface" >/dev/null; then
+  exit 1
+fi
+"#;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-ec",
+            script,
+            "sh",
+            "ipars0",
+            &stale_cidr.to_string(),
+            &replacement_cidr.to_string(),
+            &replacement_ip.to_string(),
+        ]);
+        let last_output = match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("failed to execute route replacement probe: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Docker Agent {service} did not replace advertised CIDR {stale_cidr} with {replacement_cidr}\nlast probe:\n{last_output}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 fn assert_compose_routed_workload_traffic(
     compose: &ComposeProject,
     local_agent: &str,
@@ -1577,6 +1882,21 @@ struct ComposeCleanup {
     compose_files: Vec<PathBuf>,
     docker_socket: PathBuf,
     extra_env: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+struct DockerNetworksCleanup {
+    names: Vec<String>,
+}
+
+impl Drop for DockerNetworksCleanup {
+    fn drop(&mut self) {
+        for name in &self.names {
+            let _ = Command::new("docker")
+                .args(["network", "rm", name])
+                .output();
+        }
+    }
 }
 
 impl Drop for ComposeCleanup {

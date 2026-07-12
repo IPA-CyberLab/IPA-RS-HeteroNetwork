@@ -75,10 +75,11 @@ services:
       IPARS_AGENT_ROUTE_BACKEND: command
       IPARS_AGENT_DISABLE_PEER_PROBE: "true"
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "true"
+      IPARS_DOCKER_API_SOCKET: /run/ipars/docker.sock
+      IPARS_DOCKER_NETWORKS: ${IPARS_DATAPLANE_WORKLOAD_A_NETWORK:?set IPARS_DATAPLANE_WORKLOAD_A_NETWORK},${IPARS_DATAPLANE_ROUTE_A_NETWORK:?set IPARS_DATAPLANE_ROUTE_A_NETWORK}
       IPARS_DOCKER_CONTAINER_NAMESPACE: docker-workload-a
       IPARS_DOCKER_HOST_INTERFACE: eth1
-      IPARS_DOCKER_CONTAINER_CIDRS: ${IPARS_DATAPLANE_WORKLOAD_A_CIDR:?set IPARS_DATAPLANE_WORKLOAD_A_CIDR}
       IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
       IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     depends_on: !override
@@ -98,6 +99,12 @@ services:
       net.ipv4.ip_forward: "1"
     volumes: !override
       - agent-dataplane-a:/var/lib/ipars
+      - type: bind
+        source: ${IPARS_DOCKER_API_SOCKET_HOST:?set IPARS_DOCKER_API_SOCKET_HOST}
+        target: /run/ipars/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
 
   agent-b:
     build:
@@ -136,10 +143,11 @@ services:
       IPARS_AGENT_ROUTE_BACKEND: command
       IPARS_AGENT_DISABLE_PEER_PROBE: "true"
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "true"
+      IPARS_DOCKER_API_SOCKET: /run/ipars/docker.sock
+      IPARS_DOCKER_NETWORKS: ${IPARS_DATAPLANE_WORKLOAD_B_NETWORK:?set IPARS_DATAPLANE_WORKLOAD_B_NETWORK},${IPARS_DATAPLANE_ROUTE_B_NETWORK:?set IPARS_DATAPLANE_ROUTE_B_NETWORK}
       IPARS_DOCKER_CONTAINER_NAMESPACE: docker-workload-b
       IPARS_DOCKER_HOST_INTERFACE: eth1
-      IPARS_DOCKER_CONTAINER_CIDRS: ${IPARS_DATAPLANE_WORKLOAD_B_CIDR:?set IPARS_DATAPLANE_WORKLOAD_B_CIDR}
       IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
       IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     depends_on:
@@ -162,6 +170,12 @@ services:
       net.ipv4.ip_forward: "1"
     volumes:
       - agent-dataplane-b:/var/lib/ipars
+      - type: bind
+        source: ${IPARS_DOCKER_API_SOCKET_HOST:?set IPARS_DOCKER_API_SOCKET_HOST}
+        target: /run/ipars/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
 
   workload-a:
     build:

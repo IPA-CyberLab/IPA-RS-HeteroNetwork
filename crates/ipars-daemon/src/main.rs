@@ -108,7 +108,7 @@ use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing_subscriber::prelude::*;
@@ -8434,8 +8434,20 @@ struct DockerApiNetwork {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DockerApiIpam {
-    #[serde(rename = "Config", default)]
+    #[serde(
+        rename = "Config",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     config: Vec<DockerApiIpamConfig>,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26397,7 +26409,7 @@ exec sleep 60
             let body = r#"[
   {"Id":"default-id","Name":"compose_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.18.0.0/16"}]}},
   {"Id":"extra-id","Name":"compose_extra","Driver":"bridge","IPAM":{"Config":[{"Subnet":"fd00:18::/64"}]}},
-  {"Id":"host-id","Name":"host","Driver":"host","IPAM":{"Config":[{"Subnet":"192.0.2.0/24"}]}}
+  {"Id":"host-id","Name":"host","Driver":"host","IPAM":{"Config":null}}
 ]"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
