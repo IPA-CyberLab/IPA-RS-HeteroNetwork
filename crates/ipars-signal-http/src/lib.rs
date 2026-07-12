@@ -1,18 +1,32 @@
-use std::fmt::Write;
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use ipars_crypto::{verify_signal_hole_punch_plan_signature, verify_signal_path_signature};
 use ipars_signal::{SignalError, SignalRegistry};
 use ipars_types::api::{
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    AuthenticatedSignalPathRequest, NodeApiRequestSignature, SignalHolePunchPlanRequest,
+    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeAuthenticationResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathResponse,
 };
-use ipars_types::{NodeId, PathState};
+use ipars_types::{NodeId, NodeRecord, PathState};
 use serde::Serialize;
+use thiserror::Error;
+use tokio::sync::Mutex;
+
+const MAX_CONTROL_PLANE_AUTH_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CONTROL_PLANE_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
+const CONTROL_PLANE_AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SIGNAL_REQUEST_SIGNATURE_MAX_AGE_SECONDS: i64 = 300;
+const MAX_ACCEPTED_SIGNAL_REQUEST_NONCES: usize = 131_072;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -20,14 +34,178 @@ macro_rules! prometheus_line {
     }};
 }
 
+#[derive(Debug, Error)]
+pub enum SignalNodeAuthenticationError {
+    #[error("at least one control-plane URL is required for signal node authentication")]
+    MissingControlPlane,
+    #[error("signal node authentication TTL must be a positive representable duration")]
+    InvalidNodeAuthenticationTtl,
+    #[error("control-plane node authentication rejected the request: {0}")]
+    Rejected(String),
+    #[error("all control-plane node authentication endpoints failed: {0}")]
+    Unavailable(String),
+    #[error("control-plane node authentication returned an invalid response: {0}")]
+    InvalidResponse(String),
+    #[error("failed to build the control-plane authentication client: {0}")]
+    Client(String),
+}
+
+#[async_trait]
+pub trait SignalNodeAuthenticator: Debug + Send + Sync {
+    async fn authenticate(
+        &self,
+        request: &SignalNodeUpsertRequest,
+    ) -> Result<SignalNodeAuthenticationResponse, SignalNodeAuthenticationError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneSignalNodeAuthenticator {
+    client: reqwest::Client,
+    control_plane_urls: Arc<Vec<String>>,
+}
+
+impl ControlPlaneSignalNodeAuthenticator {
+    pub fn new(control_plane_urls: Vec<String>) -> Result<Self, SignalNodeAuthenticationError> {
+        if control_plane_urls.is_empty() {
+            return Err(SignalNodeAuthenticationError::MissingControlPlane);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(CONTROL_PLANE_AUTH_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| SignalNodeAuthenticationError::Client(error.to_string()))?;
+        Ok(Self {
+            client,
+            control_plane_urls: Arc::new(control_plane_urls),
+        })
+    }
+}
+
+#[async_trait]
+impl SignalNodeAuthenticator for ControlPlaneSignalNodeAuthenticator {
+    async fn authenticate(
+        &self,
+        request: &SignalNodeUpsertRequest,
+    ) -> Result<SignalNodeAuthenticationResponse, SignalNodeAuthenticationError> {
+        let mut failures = Vec::new();
+        for control_plane_url in self.control_plane_urls.iter() {
+            let url = format!(
+                "{}/v1/nodes/authenticate-signal-upsert",
+                control_plane_url.trim_end_matches('/')
+            );
+            let response = match self.client.post(&url).json(request).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{url}: {error}"));
+                    continue;
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let detail = read_bounded_response_body(
+                    response,
+                    MAX_CONTROL_PLANE_ERROR_RESPONSE_BYTES,
+                    "control-plane authentication error",
+                )
+                .await
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_else(|error| error);
+                if status.is_client_error() {
+                    return Err(SignalNodeAuthenticationError::Rejected(format!(
+                        "{status} from {url}: {detail}"
+                    )));
+                }
+                failures.push(format!("{url}: {status}: {detail}"));
+                continue;
+            }
+            let body = read_bounded_response_body(
+                response,
+                MAX_CONTROL_PLANE_AUTH_RESPONSE_BYTES,
+                "control-plane authentication response",
+            )
+            .await
+            .map_err(SignalNodeAuthenticationError::InvalidResponse)?;
+            let authenticated: SignalNodeAuthenticationResponse = serde_json::from_slice(&body)
+                .map_err(|error| {
+                    SignalNodeAuthenticationError::InvalidResponse(error.to_string())
+                })?;
+            if authenticated.node.node_id != request.node.node_id {
+                return Err(SignalNodeAuthenticationError::InvalidResponse(format!(
+                    "node ID mismatch: expected {}, got {}",
+                    request.node.node_id, authenticated.node.node_id
+                )));
+            }
+            return Ok(authenticated);
+        }
+        Err(SignalNodeAuthenticationError::Unavailable(
+            failures.join("; "),
+        ))
+    }
+}
+
+async fn read_bounded_response_body(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(format!("{context} exceeds {max_bytes} bytes"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to read {context}: {error}"))?
+    {
+        let next_len = body.len() as u64 + chunk.len() as u64;
+        if next_len > max_bytes {
+            return Err(format!("{context} exceeds {max_bytes} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[derive(Debug, Clone)]
 pub struct SignalHttpState {
     registry: Arc<SignalRegistry>,
+    authenticator: Arc<dyn SignalNodeAuthenticator>,
+    accepted_nonces: Arc<Mutex<BTreeMap<(NodeId, String), DateTime<Utc>>>>,
+    authenticated_nodes: Arc<Mutex<BTreeMap<NodeId, DateTime<Utc>>>>,
+    node_auth_ttl: ChronoDuration,
 }
 
 impl SignalHttpState {
-    pub fn new(registry: Arc<SignalRegistry>) -> Self {
-        Self { registry }
+    pub fn new(
+        registry: Arc<SignalRegistry>,
+        control_plane_urls: Vec<String>,
+        node_auth_ttl: Duration,
+    ) -> Result<Self, SignalNodeAuthenticationError> {
+        let authenticator = Arc::new(ControlPlaneSignalNodeAuthenticator::new(
+            control_plane_urls,
+        )?);
+        Self::with_authenticator(registry, authenticator, node_auth_ttl)
+    }
+
+    pub fn with_authenticator(
+        registry: Arc<SignalRegistry>,
+        authenticator: Arc<dyn SignalNodeAuthenticator>,
+        node_auth_ttl: Duration,
+    ) -> Result<Self, SignalNodeAuthenticationError> {
+        if node_auth_ttl.is_zero() {
+            return Err(SignalNodeAuthenticationError::InvalidNodeAuthenticationTtl);
+        }
+        let node_auth_ttl = ChronoDuration::from_std(node_auth_ttl)
+            .map_err(|_| SignalNodeAuthenticationError::InvalidNodeAuthenticationTtl)?;
+        Ok(Self {
+            registry,
+            authenticator,
+            accepted_nonces: Arc::new(Mutex::new(BTreeMap::new())),
+            authenticated_nodes: Arc::new(Mutex::new(BTreeMap::new())),
+            node_auth_ttl,
+        })
     }
 }
 
@@ -38,7 +216,7 @@ pub fn router(state: SignalHttpState) -> Router {
         .route("/v1/metrics", get(metrics))
         .route("/v1/nodes/{node_id}", put(upsert_node))
         .route("/v1/paths/negotiate", post(negotiate))
-        .route("/v1/hole-punch/{source}/{target}", get(hole_punch_plan))
+        .route("/v1/hole-punch", post(hole_punch_plan))
         .with_state(state)
 }
 
@@ -47,10 +225,12 @@ async fn healthz() -> Json<HealthResponse> {
 }
 
 async fn metrics(State(state): State<SignalHttpState>) -> Json<SignalMetricsResponse> {
+    purge_stale_authenticated_nodes(&state, Utc::now()).await;
     Json(state.registry.metrics().await)
 }
 
 async fn prometheus_metrics(State(state): State<SignalHttpState>) -> impl IntoResponse {
+    purge_stale_authenticated_nodes(&state, Utc::now()).await;
     let metrics = state.registry.metrics().await;
     (
         [(
@@ -66,38 +246,159 @@ async fn upsert_node(
     Path(node_id): Path<String>,
     Json(request): Json<SignalNodeUpsertRequest>,
 ) -> Result<Json<SignalNodeUpsertResponse>, ApiError> {
+    let now = Utc::now();
+    purge_stale_authenticated_nodes(&state, now).await;
     let path_node_id = NodeId::from_string(node_id);
     if path_node_id != request.node.node_id {
         return Err(ApiError::bad_request("node_id path/body mismatch"));
     }
 
-    Ok(Json(
-        state
-            .registry
-            .upsert_node_with_nat_and_health(
-                request.node,
-                request.nat_classification,
-                request.health,
-            )
-            .await?,
-    ))
+    let authenticated = state
+        .authenticator
+        .authenticate(&request)
+        .await
+        .map_err(ApiError::Authentication)?;
+    let signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(ApiError::Unauthorized(
+            "signal node request signature is required",
+        ))?;
+    record_authenticated_request_nonce(&state, &request.node.node_id, signature, now).await?;
+
+    let response = state
+        .registry
+        .upsert_node_with_nat_and_health(
+            authenticated.node,
+            request.nat_classification,
+            request.health,
+        )
+        .await?;
+    state
+        .authenticated_nodes
+        .lock()
+        .await
+        .insert(response.node.node_id.clone(), now);
+    Ok(Json(response))
+}
+
+async fn purge_stale_authenticated_nodes(state: &SignalHttpState, now: DateTime<Utc>) {
+    let oldest = now - state.node_auth_ttl;
+    let stale = {
+        let mut authenticated = state.authenticated_nodes.lock().await;
+        let stale = authenticated
+            .iter()
+            .filter(|(_, authenticated_at)| **authenticated_at < oldest)
+            .map(|(node_id, _)| node_id.clone())
+            .collect::<Vec<_>>();
+        for node_id in &stale {
+            authenticated.remove(node_id);
+        }
+        stale
+    };
+    for node_id in stale {
+        state.registry.remove_node(&node_id).await;
+    }
+}
+
+async fn authenticated_node(
+    state: &SignalHttpState,
+    node_id: &NodeId,
+    now: DateTime<Utc>,
+) -> Result<NodeRecord, ApiError> {
+    purge_stale_authenticated_nodes(state, now).await;
+    if !state.authenticated_nodes.lock().await.contains_key(node_id) {
+        return Err(ApiError::Unauthorized(
+            "signal node membership authentication is stale or missing",
+        ));
+    }
+    state
+        .registry
+        .get_node(node_id)
+        .await
+        .ok_or(ApiError::Unauthorized(
+            "signal node membership authentication is stale or missing",
+        ))
+}
+
+async fn record_authenticated_request_nonce(
+    state: &SignalHttpState,
+    node_id: &NodeId,
+    signature: &NodeApiRequestSignature,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if signature.nonce.len() != 32
+        || !signature
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ApiError::Unauthorized(
+            "signal node request nonce is invalid",
+        ));
+    }
+    let skew = ChronoDuration::seconds(SIGNAL_REQUEST_SIGNATURE_MAX_AGE_SECONDS);
+    if signature.signed_at < now - skew || signature.signed_at > now + skew {
+        return Err(ApiError::Unauthorized(
+            "signal node request signature is outside the allowed time window",
+        ));
+    }
+
+    let key = (node_id.clone(), signature.nonce.clone());
+    let mut accepted = state.accepted_nonces.lock().await;
+    let oldest = now - skew;
+    accepted.retain(|_, signed_at| *signed_at >= oldest);
+    if accepted.contains_key(&key) {
+        return Err(ApiError::Replay(
+            "signal node request nonce was already accepted".to_string(),
+        ));
+    }
+    if accepted.len() >= MAX_ACCEPTED_SIGNAL_REQUEST_NONCES {
+        return Err(ApiError::AuthenticationCapacity);
+    }
+    accepted.insert(key, signature.signed_at);
+    Ok(())
 }
 
 async fn negotiate(
     State(state): State<SignalHttpState>,
-    Json(request): Json<SignalPathRequest>,
+    Json(request): Json<AuthenticatedSignalPathRequest>,
 ) -> Result<Json<SignalPathResponse>, ApiError> {
-    Ok(Json(state.registry.negotiate(request).await?))
+    let now = Utc::now();
+    let source = authenticated_node(&state, &request.request.source, now).await?;
+    authenticated_node(&state, &request.request.target, now).await?;
+    verify_signal_path_signature(&request, &source.identity_public_key)
+        .map_err(|_| ApiError::Unauthorized("signal path request signature was rejected"))?;
+    let signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(ApiError::Unauthorized(
+            "signal path request signature is required",
+        ))?;
+    record_authenticated_request_nonce(&state, &source.node_id, signature, now).await?;
+    Ok(Json(state.registry.negotiate(request.request).await?))
 }
 
 async fn hole_punch_plan(
     State(state): State<SignalHttpState>,
-    Path((source, target)): Path<(String, String)>,
+    Json(request): Json<SignalHolePunchPlanRequest>,
 ) -> Result<Json<SignalHolePunchPlanResponse>, ApiError> {
+    let now = Utc::now();
+    let source = authenticated_node(&state, &request.source, now).await?;
+    authenticated_node(&state, &request.target, now).await?;
+    verify_signal_hole_punch_plan_signature(&request, &source.identity_public_key)
+        .map_err(|_| ApiError::Unauthorized("signal hole-punch signature was rejected"))?;
+    let signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(ApiError::Unauthorized(
+            "signal hole-punch signature is required",
+        ))?;
+    record_authenticated_request_nonce(&state, &source.node_id, signature, now).await?;
     Ok(Json(
         state
             .registry
-            .hole_punch_plan(NodeId::from_string(source), NodeId::from_string(target))
+            .hole_punch_plan(request.source, request.target)
             .await?,
     ))
 }
@@ -422,6 +723,10 @@ fn path_state_label(state: PathState) -> &'static str {
 pub enum ApiError {
     Signal(SignalError),
     BadRequest(String),
+    Authentication(SignalNodeAuthenticationError),
+    Unauthorized(&'static str),
+    Replay(String),
+    AuthenticationCapacity,
 }
 
 impl ApiError {
@@ -483,6 +788,26 @@ impl IntoResponse for ApiError {
                 format!("route {route_id} for node {node_id} is invalid: {reason}"),
             ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
+            Self::Authentication(SignalNodeAuthenticationError::Rejected(error)) => {
+                (StatusCode::UNAUTHORIZED, error)
+            }
+            Self::Authentication(error @ SignalNodeAuthenticationError::MissingControlPlane)
+            | Self::Authentication(
+                error @ SignalNodeAuthenticationError::InvalidNodeAuthenticationTtl,
+            )
+            | Self::Authentication(error @ SignalNodeAuthenticationError::Unavailable(_))
+            | Self::Authentication(error @ SignalNodeAuthenticationError::Client(_)) => {
+                (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            }
+            Self::Authentication(error @ SignalNodeAuthenticationError::InvalidResponse(_)) => {
+                (StatusCode::BAD_GATEWAY, error.to_string())
+            }
+            Self::Unauthorized(error) => (StatusCode::UNAUTHORIZED, error.to_string()),
+            Self::Replay(error) => (StatusCode::CONFLICT, error),
+            Self::AuthenticationCapacity => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "signal request authentication replay cache is full".to_string(),
+            ),
         };
         (status, Json(ErrorResponse { error })).into_response()
     }
@@ -501,8 +826,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use chrono::Utc;
+    use ipars_crypto::{verify_signal_node_upsert_signature, IdentityKeyPair};
     use ipars_types::api::{
-        SignalMetricsResponse, SignalNodeUpsertRequest, SignalPathRequest, SignalPathResponse,
+        AuthenticatedSignalPathRequest, SignalHolePunchPlanRequest, SignalMetricsResponse,
+        SignalNodeUpsertRequest, SignalPathRequest, SignalPathResponse,
     };
     use ipars_types::{
         CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
@@ -511,6 +838,91 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct TestSignalNodeAuthenticator;
+
+    #[async_trait]
+    impl SignalNodeAuthenticator for TestSignalNodeAuthenticator {
+        async fn authenticate(
+            &self,
+            request: &SignalNodeUpsertRequest,
+        ) -> Result<SignalNodeAuthenticationResponse, SignalNodeAuthenticationError> {
+            verify_signal_node_upsert_signature(request, &request.node.identity_public_key)
+                .map_err(|error| SignalNodeAuthenticationError::Rejected(error.to_string()))?;
+            Ok(SignalNodeAuthenticationResponse {
+                node: request.node.clone(),
+                authenticated_at: Utc::now(),
+            })
+        }
+    }
+
+    fn test_state(registry: Arc<SignalRegistry>) -> SignalHttpState {
+        SignalHttpState::with_authenticator(
+            registry,
+            Arc::new(TestSignalNodeAuthenticator),
+            Duration::from_secs(90),
+        )
+        .unwrap_or_else(|error| panic!("test signal state should be valid: {error}"))
+    }
+
+    fn identity_for_node(node_id: &str) -> IdentityKeyPair {
+        let mut seed = [0_u8; 32];
+        for (index, byte) in node_id.as_bytes().iter().enumerate() {
+            seed[index % seed.len()] = seed[index % seed.len()].wrapping_add(*byte);
+        }
+        if seed.iter().all(|byte| *byte == 0) {
+            seed[0] = 1;
+        }
+        IdentityKeyPair::from_signing_bytes(seed)
+    }
+
+    fn signed_upsert(node: NodeRecord) -> SignalNodeUpsertRequest {
+        let identity = identity_for_node(&node.node_id.to_string());
+        let mut request = SignalNodeUpsertRequest {
+            node,
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
+        request.request_signature = Some(
+            identity
+                .sign_signal_node_upsert_request(&request, Utc::now())
+                .unwrap_or_else(|error| panic!("test node should sign signal upsert: {error}")),
+        );
+        request
+    }
+
+    fn signed_path(request: SignalPathRequest) -> AuthenticatedSignalPathRequest {
+        let identity = identity_for_node(&request.source.to_string());
+        let mut authenticated = AuthenticatedSignalPathRequest {
+            request,
+            request_signature: None,
+        };
+        authenticated.request_signature = Some(
+            identity
+                .sign_signal_path_request(&authenticated.request, Utc::now())
+                .unwrap_or_else(|error| panic!("test node should sign signal path: {error}")),
+        );
+        authenticated
+    }
+
+    fn signed_hole_punch(source: &str, target: &str) -> SignalHolePunchPlanRequest {
+        let identity = identity_for_node(source);
+        let mut request = SignalHolePunchPlanRequest {
+            source: NodeId::from_string(source),
+            target: NodeId::from_string(target),
+            request_signature: None,
+        };
+        request.request_signature = Some(
+            identity
+                .sign_signal_hole_punch_plan_request(&request, Utc::now())
+                .unwrap_or_else(|error| {
+                    panic!("test node should sign signal hole-punch request: {error}")
+                }),
+        );
+        request
+    }
 
     fn candidate(node_id: &str, kind: EndpointCandidateKind) -> EndpointCandidate {
         EndpointCandidate {
@@ -525,11 +937,12 @@ mod tests {
     }
 
     fn node(node_id: &str, candidates: Vec<EndpointCandidate>) -> NodeRecord {
+        let identity = identity_for_node(node_id);
         NodeRecord {
             node_id: NodeId::from_string(node_id),
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
-            identity_public_key: format!("identity-{node_id}"),
+            identity_public_key: identity.public_key_b64(),
             wireguard_public_key: format!("wg-{node_id}"),
             role: Role::edge(),
             tags: BTreeSet::new(),
@@ -556,7 +969,7 @@ mod tests {
     async fn http_signal_registers_node_and_negotiates_path(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        let app = router(SignalHttpState::new(registry));
+        let app = router(test_state(registry));
         let source = node(
             "node-a",
             vec![candidate("node-a", EndpointCandidateKind::StunReflexive)],
@@ -566,6 +979,12 @@ mod tests {
             vec![candidate("node-b", EndpointCandidateKind::PublicUdp)],
         );
 
+        let unsigned = SignalNodeUpsertRequest {
+            node: source.clone(),
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
         let response = app
             .clone()
             .oneshot(
@@ -573,14 +992,36 @@ mod tests {
                     .method("PUT")
                     .uri("/v1/nodes/node-a")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
-                        node: source,
-                        nat_classification: None,
-                        health: None,
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(&unsigned)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let source_upsert = signed_upsert(source);
+        let source_body = serde_json::to_vec(&source_upsert)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(source_body.clone()))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(source_body))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
 
         let response = app
             .clone()
@@ -589,15 +1030,18 @@ mod tests {
                     .method("PUT")
                     .uri("/v1/nodes/node-b")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
-                        node: target,
-                        nat_classification: None,
-                        health: None,
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(&signed_upsert(target))?))?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
 
+        let path_request = SignalPathRequest {
+            source: NodeId::from_string("node-a"),
+            target: NodeId::from_string("node-b"),
+            source_candidates: vec![candidate("node-a", EndpointCandidateKind::StunReflexive)],
+            source_nat_classification: None,
+            desired_routes: Vec::new(),
+        };
         let response = app
             .clone()
             .oneshot(
@@ -605,16 +1049,25 @@ mod tests {
                     .method("POST")
                     .uri("/v1/paths/negotiate")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&SignalPathRequest {
-                        source: NodeId::from_string("node-a"),
-                        target: NodeId::from_string("node-b"),
-                        source_candidates: vec![candidate(
-                            "node-a",
-                            EndpointCandidateKind::StunReflexive,
-                        )],
-                        source_nat_classification: None,
-                        desired_routes: Vec::new(),
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(
+                        &AuthenticatedSignalPathRequest {
+                            request: path_request.clone(),
+                            request_signature: None,
+                        },
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let signed_path_body = serde_json::to_vec(&signed_path(path_request))?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/paths/negotiate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(signed_path_body.clone()))?,
             )
             .await?;
 
@@ -625,6 +1078,43 @@ mod tests {
             response.preferred_state,
             ipars_types::PathState::DirectPublic
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/paths/negotiate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(signed_path_body))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let signed_hole_punch_body = serde_json::to_vec(&signed_hole_punch("node-a", "node-b"))?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/hole-punch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(signed_hole_punch_body.clone()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/hole-punch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(signed_hole_punch_body))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
 
         let response = app
             .clone()
@@ -712,10 +1202,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_signal_evicts_nodes_after_membership_authentication_ttl(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
+        let state = SignalHttpState::with_authenticator(
+            registry.clone(),
+            Arc::new(TestSignalNodeAuthenticator),
+            Duration::from_millis(1),
+        )?;
+        let app = router(state);
+        let request = signed_upsert(node("node-a", Vec::new()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/nodes/node-a")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(registry
+            .get_node(&NodeId::from_string("node-a"))
+            .await
+            .is_some());
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let metrics: SignalMetricsResponse = serde_json::from_slice(&body)?;
+        assert_eq!(metrics.node_count, 0);
+        assert!(registry
+            .get_node(&NodeId::from_string("node-a"))
+            .await
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn http_signal_rejects_unowned_endpoint_candidate(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        let app = router(SignalHttpState::new(registry));
+        let app = router(test_state(registry));
         let node = node(
             "node-a",
             vec![candidate("node-b", EndpointCandidateKind::StunReflexive)],
@@ -727,11 +1264,7 @@ mod tests {
                     .method("PUT")
                     .uri("/v1/nodes/node-a")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
-                        node,
-                        nat_classification: None,
-                        health: None,
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(&signed_upsert(node))?))?,
             )
             .await?;
 
@@ -746,7 +1279,7 @@ mod tests {
     async fn http_signal_rejects_invalid_endpoint_candidate(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        let app = router(SignalHttpState::new(registry));
+        let app = router(test_state(registry));
         let node = node(
             "node-a",
             vec![candidate("node-a", EndpointCandidateKind::Ipv6)],
@@ -758,11 +1291,7 @@ mod tests {
                     .method("PUT")
                     .uri("/v1/nodes/node-a")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
-                        node,
-                        nat_classification: None,
-                        health: None,
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(&signed_upsert(node))?))?,
             )
             .await?;
 
@@ -777,7 +1306,7 @@ mod tests {
     async fn http_signal_rejects_invalid_route_advertisement(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        let app = router(SignalHttpState::new(registry.clone()));
+        let app = router(test_state(registry.clone()));
         let mut node = node("node-a", Vec::new());
         node.routes.push(advertised_route(
             "unsafe-route",
@@ -791,11 +1320,7 @@ mod tests {
                     .method("PUT")
                     .uri("/v1/nodes/node-a")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&SignalNodeUpsertRequest {
-                        node,
-                        nat_classification: None,
-                        health: None,
-                    })?))?,
+                    .body(Body::from(serde_json::to_vec(&signed_upsert(node))?))?,
             )
             .await?;
 

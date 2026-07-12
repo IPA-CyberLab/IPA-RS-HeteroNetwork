@@ -22,11 +22,12 @@ use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_types::api::{
     AgentPathsResponse, AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
-    ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneDropReason, RelayStatusResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse, StunMetricsResponse,
+    AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, ControlPlanePathsResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeRequest,
+    RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayDataplaneDropReason, RelayStatusResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    StunMetricsResponse,
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
@@ -2187,11 +2188,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         let _: SignalNodeUpsertResponse = put_json(
             &client,
             upsert_url,
-            &SignalNodeUpsertRequest {
-                node: response.node.clone(),
-                nat_classification: None,
-                health: Some(healthy_node_health()),
-            },
+            &signal_node_upsert_request(index, response.node.clone())?,
             "signal node upsert",
         )
         .await
@@ -2230,13 +2227,16 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         let response: SignalPathResponse = post_json(
             &client,
             format!("{}/v1/paths/negotiate", services.signal_url),
-            &SignalPathRequest {
-                source: source.node_id.clone(),
-                target: target.node_id.clone(),
-                source_candidates: source.endpoint_candidates.clone(),
-                source_nat_classification: None,
-                desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
-            },
+            &authenticated_signal_path_request(
+                source_index,
+                SignalPathRequest {
+                    source: source.node_id.clone(),
+                    target: target.node_id.clone(),
+                    source_candidates: source.endpoint_candidates.clone(),
+                    source_nat_classification: None,
+                    desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
+                },
+            )?,
             "signal path negotiation",
         )
         .await?;
@@ -2262,7 +2262,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         direct_nat_paths: path_counts.direct_nat,
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
-        control_plane_http_requests: nodes.len() * 2 + scenario.relay_count + 1,
+        control_plane_http_requests: nodes.len() * 3 + scenario.relay_count + 1,
         signal_http_requests: nodes.len() + scenario.active_pair_count,
         relay_http_requests: 0,
         stun_http_requests: 0,
@@ -2765,19 +2765,6 @@ async fn run_daemon_scenario(
     let peer_map_millis = peer_map_started.elapsed().as_millis();
 
     services.write_manifest(DaemonRuntimePhase::SignalUpsert)?;
-    for peer in &peer_records {
-        let _: SignalNodeUpsertResponse = put_json(
-            &client,
-            format!("{}/v1/nodes/{}", services.signal_url, peer.node_id),
-            &SignalNodeUpsertRequest {
-                node: peer.clone(),
-                nat_classification: None,
-                health: Some(healthy_node_health()),
-            },
-            "daemon signal node upsert",
-        )
-        .await?;
-    }
     services.ensure_running(DaemonRuntimePhase::SignalUpsert)?;
 
     services.write_manifest(DaemonRuntimePhase::SignalNegotiation)?;
@@ -2788,28 +2775,7 @@ async fn run_daemon_scenario(
     } else {
         0
     };
-    let mut path_counts = PathCounts::default();
-    for pair_index in 0..active_pair_count {
-        let (source_index, target_index) = active_pair_indices(pair_index, agent_statuses.len());
-        let source = &agent_statuses[source_index];
-        let target = &agent_statuses[target_index];
-        let response: SignalPathResponse = post_json(
-            &client,
-            format!("{}/v1/paths/negotiate", services.signal_url),
-            &SignalPathRequest {
-                source: source.node_id.clone(),
-                target: target.node_id.clone(),
-                source_candidates: source.candidates.clone(),
-                source_nat_classification: source.nat_classification.clone(),
-                desired_routes: Vec::new(),
-            },
-            "daemon signal path negotiation",
-        )
-        .await?;
-        path_counts.record(response.preferred_state);
-    }
     services.ensure_running(DaemonRuntimePhase::SignalNegotiation)?;
-    let signal_millis = signal_started.elapsed().as_millis();
 
     services.write_manifest(DaemonRuntimePhase::AgentPathValidation)?;
     let expected_agent_path_count =
@@ -2829,6 +2795,8 @@ async fn run_daemon_scenario(
         agent_readiness_timeout,
     )
     .await?;
+    let path_counts = agent_path_summary.path_counts;
+    let signal_millis = signal_started.elapsed().as_millis();
     let control_path_summary = wait_for_daemon_control_plane_path_summary(
         &client,
         &services.control_plane_urls,
@@ -2968,8 +2936,10 @@ async fn run_daemon_scenario(
     let daemon_relay_count = daemon_relay_agent_count(scenario, agent_processes);
     let daemon_route_provider_count = daemon_route_provider_agent_count(scenario, agent_processes);
     let mut total_peer_map_requests = peer_map_requests;
-    let mut control_plane_http_requests =
-        agent_statuses.len() + peer_map_requests + control_summary.endpoint_count;
+    let mut control_plane_http_requests = agent_statuses.len()
+        + peer_map_requests
+        + peer_records.len()
+        + control_summary.endpoint_count;
     let mut failover_checked = false;
     let mut failover_survivor_endpoints = 0;
     let mut failover_stopped_role = None;
@@ -3296,7 +3266,7 @@ async fn run_daemon_scenario(
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
         control_plane_http_requests,
-        signal_http_requests: peer_records.len() + active_pair_count + 1,
+        signal_http_requests: peer_records.len() + active_pair_count + path_counts.direct_nat + 1,
         relay_http_requests: active_pair_count + 2,
         stun_http_requests: 2,
         relay_udp_sessions: status.capability.active_sessions as usize,
@@ -3533,6 +3503,7 @@ struct DaemonAgentPathSummary {
     reachable_path_count_total: usize,
     path_count_min: usize,
     path_count_max: usize,
+    path_counts: PathCounts,
 }
 
 fn expected_daemon_agent_path_count(active_pair_count: usize, node_count: usize) -> usize {
@@ -3636,6 +3607,7 @@ async fn daemon_agent_path_summary(
         reachable_path_count_total: 0,
         path_count_min: 0,
         path_count_max: 0,
+        path_counts: PathCounts::default(),
     };
     for (index, (url, status)) in agent_urls.iter().zip(statuses).enumerate() {
         let response: AgentPathsResponse =
@@ -3648,6 +3620,7 @@ async fn daemon_agent_path_summary(
                     path.key.local
                 );
             }
+            summary.path_counts.record(path.selected_state);
         }
         let path_count = response.paths.len();
         let reachable_count = response
@@ -3720,7 +3693,7 @@ fn validate_daemon_timeout(timeout: Duration, flag: &str) -> anyhow::Result<Dura
     Ok(timeout)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PathCounts {
     direct_public: usize,
     direct_ipv6: usize,
@@ -3756,7 +3729,7 @@ impl NetworkedServices {
         let mut tasks = Vec::new();
         let control_plane_url =
             Self::spawn_control_plane(cluster_id, issuer, key_id, &mut tasks).await?;
-        let signal_url = Self::spawn_signal(&mut tasks).await?;
+        let signal_url = Self::spawn_signal(&control_plane_url, &mut tasks).await?;
         Ok(Self {
             control_plane_url,
             signal_url,
@@ -3791,10 +3764,15 @@ impl NetworkedServices {
     }
 
     async fn spawn_signal(
+        control_plane_url: &str,
         tasks: &mut Vec<JoinHandle<std::io::Result<()>>>,
     ) -> anyhow::Result<String> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        let app = signal_router(SignalHttpState::new(registry));
+        let app = signal_router(SignalHttpState::new(
+            registry,
+            vec![control_plane_url.to_string()],
+            Duration::from_secs(90),
+        )?);
         Self::spawn_router(app, tasks).await
     }
 
@@ -4741,13 +4719,18 @@ impl DaemonProcessGroup {
             )
             .await?;
         }
+        let mut signal_args = vec![
+            "signal".to_string(),
+            "--listen".to_string(),
+            signal_addr.to_string(),
+        ];
+        for control_plane_url in &control_plane_urls {
+            signal_args.push("--control-plane-url".to_string());
+            signal_args.push(control_plane_url.clone());
+        }
         startup.children.push(spawn_iparsd(
             &manifest_seed.iparsd_binary.path,
-            &[
-                "signal".to_string(),
-                "--listen".to_string(),
-                signal_addr.to_string(),
-            ],
+            &signal_args,
             "signal",
             &runtime_dir,
         )?);
@@ -7001,24 +6984,6 @@ async fn check_daemon_agent_control_and_signal_readiness(
         }
     }
 
-    if statuses.len() >= 2 {
-        let source = &statuses[0];
-        let target = &statuses[1];
-        let _: SignalPathResponse = post_json(
-            client,
-            format!("{signal_url}/v1/paths/negotiate"),
-            &SignalPathRequest {
-                source: source.node_id.clone(),
-                target: target.node_id.clone(),
-                source_candidates: source.candidates.clone(),
-                source_nat_classification: source.nat_classification.clone(),
-                desired_routes: Vec::new(),
-            },
-            "daemon signal readiness negotiation",
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -7291,6 +7256,50 @@ fn heartbeat_request(index: usize, node: &NodeRecord) -> anyhow::Result<Heartbea
     Ok(request)
 }
 
+fn signal_node_upsert_request(
+    index: usize,
+    node: NodeRecord,
+) -> anyhow::Result<SignalNodeUpsertRequest> {
+    let identity = identity_for_index(index);
+    anyhow::ensure!(
+        node.node_id == identity.node_id(),
+        "synthetic signal node identity does not match index {index}"
+    );
+    let mut request = SignalNodeUpsertRequest {
+        node,
+        nat_classification: None,
+        health: Some(healthy_node_health()),
+        request_signature: None,
+    };
+    request.request_signature = Some(
+        identity
+            .sign_signal_node_upsert_request(&request, Utc::now())
+            .context("failed to sign synthetic signal node upsert")?,
+    );
+    Ok(request)
+}
+
+fn authenticated_signal_path_request(
+    index: usize,
+    request: SignalPathRequest,
+) -> anyhow::Result<AuthenticatedSignalPathRequest> {
+    let identity = identity_for_index(index);
+    anyhow::ensure!(
+        request.source == identity.node_id(),
+        "synthetic signal path source identity does not match index {index}"
+    );
+    let mut authenticated = AuthenticatedSignalPathRequest {
+        request,
+        request_signature: None,
+    };
+    authenticated.request_signature = Some(
+        identity
+            .sign_signal_path_request(&authenticated.request, Utc::now())
+            .context("failed to sign synthetic signal path request")?,
+    );
+    Ok(authenticated)
+}
+
 fn healthy_node_health() -> NodeHealth {
     NodeHealth {
         state: HealthState::Healthy,
@@ -7534,7 +7543,7 @@ mod tests {
         assert_eq!(report.advertised_routes, 1);
         assert_eq!(report.peer_map_edges_seen, 6);
         assert_eq!(report.signal_negotiations, 6);
-        assert_eq!(report.control_plane_http_requests, 8);
+        assert_eq!(report.control_plane_http_requests, 11);
         assert_eq!(report.signal_http_requests, 9);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
@@ -10385,11 +10394,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             let _: SignalNodeUpsertResponse = put_json(
                 &client,
                 format!("{}/v1/nodes/{}", services.signal_url, response.node.node_id),
-                &SignalNodeUpsertRequest {
-                    node: response.node.clone(),
-                    nat_classification: None,
-                    health: Some(healthy_node_health()),
-                },
+                &signal_node_upsert_request(index, response.node.clone())?,
                 "readiness signal node upsert",
             )
             .await?;

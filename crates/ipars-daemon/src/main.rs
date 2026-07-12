@@ -31,6 +31,8 @@ use ipars_control_plane::{
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
+#[cfg(test)]
+use ipars_crypto::verify_signal_node_upsert_signature;
 use ipars_crypto::IdentityKeyPair;
 use ipars_relay::{
     encode_relay_datagram, RelayAdmissionRateLimit, RelayService, RelaySessionId, UdpRelay,
@@ -45,21 +47,26 @@ use ipars_route_manager::{
 };
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
+#[cfg(test)]
+use ipars_signal_http::{SignalNodeAuthenticationError, SignalNodeAuthenticator};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::{
     BindingStunServer, Rfc5780StunServer, StunServerMetricsSnapshot, StunServerStats,
 };
+#[cfg(test)]
+use ipars_types::api::SignalNodeAuthenticationResponse;
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
     AgentPacketFlowApplication, AgentPacketFlowClassification, AgentPacketFlowConntrackStatus,
     AgentPacketFlowDropReason, AgentPacketFlowDuplicateSource, AgentPacketFlowObservation,
     AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics,
-    ControlPlaneMetricsResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
-    RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanResponse, SignalMetricsResponse, SignalNodeUpsertRequest,
-    SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse, StunMetricsResponse,
+    AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, HeartbeatRequest,
+    HeartbeatResponse, JoinNodeRequest, NatTraversalStrategyCount, PathStateCount, PeerMap,
+    RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
+    RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanRequest, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    StunMetricsResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -355,6 +362,15 @@ struct TrustedIssuerKeyArg {
 struct SignalArgs {
     #[arg(long, env = "IPARS_SIGNAL_LISTEN", default_value = "0.0.0.0:9443")]
     listen: SocketAddr,
+    #[arg(
+        long = "control-plane-url",
+        env = "IPARS_SIGNAL_CONTROL_PLANE_URLS",
+        value_delimiter = ',',
+        default_value = "http://127.0.0.1:8443"
+    )]
+    control_plane_urls: Vec<String>,
+    #[arg(long, env = "IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS", default_value_t = 90)]
+    node_auth_ttl_seconds: u64,
     #[arg(long, env = "IPARS_SIGNAL_IDLE_TIMEOUT_SECONDS", default_value_t = 300)]
     idle_timeout_seconds: u64,
     #[arg(
@@ -3485,7 +3501,12 @@ async fn run_signal(
             otel_metrics_interval.max(Duration::from_secs(1)),
         )
     });
-    let result = serve_router(args.listen, signal_router(SignalHttpState::new(registry))).await;
+    let signal_state = SignalHttpState::new(
+        registry,
+        args.control_plane_urls,
+        Duration::from_secs(args.node_auth_ttl_seconds),
+    )?;
+    let result = serve_router(args.listen, signal_router(signal_state)).await;
     if let Some(task) = otel_metrics_task {
         task.abort();
     }
@@ -3493,6 +3514,23 @@ async fn run_signal(
 }
 
 fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
+    let mut control_plane_urls = std::collections::BTreeSet::new();
+    for url in &args.control_plane_urls {
+        validate_http_url(url, "--control-plane-url")?;
+        anyhow::ensure!(
+            control_plane_urls.insert(normalize_base_url(url)),
+            "--control-plane-url must not contain duplicates"
+        );
+    }
+    anyhow::ensure!(
+        !control_plane_urls.is_empty(),
+        "at least one --control-plane-url is required"
+    );
+    validate_positive_seconds(args.node_auth_ttl_seconds, "--node-auth-ttl-seconds")?;
+    anyhow::ensure!(
+        args.node_auth_ttl_seconds <= 3600,
+        "--node-auth-ttl-seconds must be at most 3600"
+    );
     validate_positive_seconds(args.idle_timeout_seconds, "--idle-timeout-seconds")?;
     validate_positive_seconds(args.relay_health_ttl_seconds, "--relay-health-ttl-seconds")?;
     validate_positive_seconds(
@@ -6406,6 +6444,10 @@ async fn run_agent(
         if let Some(node) = registered_node.clone().filter(|_| !signal_bases.is_empty()) {
             background_tasks.push(start_signal_registration(
                 runtime.clone(),
+                runtime
+                    .state()
+                    .identity_key_pair()
+                    .context("failed to load agent identity key for signal signing")?,
                 node,
                 signal_bases.clone(),
                 Duration::from_secs(args.signal_registration_interval_seconds),
@@ -9746,6 +9788,7 @@ async fn heartbeat_request(
 
 fn start_signal_registration(
     runtime: Arc<AgentRuntime>,
+    identity: IdentityKeyPair,
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
@@ -9754,6 +9797,7 @@ fn start_signal_registration(
     tokio::spawn(async move {
         run_signal_registration_loop(
             runtime,
+            identity,
             node,
             signal_urls,
             interval,
@@ -9765,6 +9809,7 @@ fn start_signal_registration(
 
 async fn run_signal_registration_loop(
     runtime: Arc<AgentRuntime>,
+    identity: IdentityKeyPair,
     node: NodeRecord,
     signal_urls: Vec<String>,
     interval: Duration,
@@ -9774,8 +9819,21 @@ async fn run_signal_registration_loop(
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
-        let request =
-            signal_node_upsert_request(runtime.as_ref(), node.clone(), relay_capability).await;
+        let request = match signal_node_upsert_request(
+            runtime.as_ref(),
+            &identity,
+            node.clone(),
+            relay_capability,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "failed to sign signal node upsert; will retry");
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
         match send_signal_node_upsert_to_signal_services(&client, &signal_urls, request).await {
             Ok(successes) => tracing::info!(
                 node_id = %node.node_id,
@@ -9852,19 +9910,27 @@ async fn send_signal_node_upsert(
 
 async fn signal_node_upsert_request(
     runtime: &AgentRuntime,
+    identity: &IdentityKeyPair,
     mut node: NodeRecord,
     relay_capability: Option<RelayCapability>,
-) -> SignalNodeUpsertRequest {
+) -> anyhow::Result<SignalNodeUpsertRequest> {
     let status = runtime.status().await;
     let health = agent_health_from_status(&status, "agent signal registration");
     node.endpoint_candidates = status.candidates;
     node.relay_capability =
         signal_relay_capability(node.relay_capability.as_ref(), relay_capability);
-    SignalNodeUpsertRequest {
+    let mut request = SignalNodeUpsertRequest {
         node,
         nat_classification: status.nat_classification,
         health: Some(health),
-    }
+        request_signature: None,
+    };
+    request.request_signature = Some(
+        identity
+            .sign_signal_node_upsert_request(&request, chrono::Utc::now())
+            .context("failed to sign signal node upsert request")?,
+    );
+    Ok(request)
 }
 
 fn signal_relay_capability(
@@ -9988,6 +10054,10 @@ async fn negotiate_signal_paths(
     options: &SignalPathNegotiationOptions,
 ) -> anyhow::Result<()> {
     let status = runtime.status().await;
+    let identity = runtime
+        .state()
+        .identity_key_pair()
+        .context("failed to load agent identity key for signal path signing")?;
     let peer_map = fetch_peer_map_from_control_planes(client, control_plane_urls, &status.node_id)
         .await
         .context("failed to fetch peer map for signal negotiation")?;
@@ -10005,7 +10075,8 @@ async fn negotiate_signal_paths(
     }
 
     for peer in peer_set.active {
-        let request = signal_path_request(&status, &peer);
+        let request =
+            authenticated_signal_path_request(&identity, signal_path_request(&status, &peer))?;
         let (signal_url, response) =
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
         let mut relay_candidates = selected_relay_candidates(&response);
@@ -10014,23 +10085,24 @@ async fn negotiate_signal_paths(
         let (mut record, mut path_selection) =
             stable_signal_path_record(runtime, candidate_record).await;
         if record.selected_state == PathState::DirectNatTraversal {
-            let hole_punch_result = match fetch_hole_punch_plan(client, &signal_url, &record.key)
-                .await
-            {
-                Ok(plan) => hole_puncher
-                    .execute(&status.node_id, &plan)
-                    .await
-                    .map(|attempts| {
-                        tracing::info!(
-                            attempts,
-                            peer = %record.key.remote,
-                            "executed UDP hole punch plan"
-                        );
-                    }),
-                Err(error) => Err(AgentError::HolePunch(format!(
-                    "failed to fetch UDP hole punch plan: {error:#}"
-                ))),
-            };
+            let hole_punch_result =
+                match fetch_hole_punch_plan(client, &signal_url, &record.key, &identity).await {
+                    Ok(plan) => {
+                        hole_puncher
+                            .execute(&status.node_id, &plan)
+                            .await
+                            .map(|attempts| {
+                                tracing::info!(
+                                    attempts,
+                                    peer = %record.key.remote,
+                                    "executed UDP hole punch plan"
+                                );
+                            })
+                    }
+                    Err(error) => Err(AgentError::HolePunch(format!(
+                        "failed to fetch UDP hole punch plan: {error:#}"
+                    ))),
+                };
             if let Err(error) = hole_punch_result {
                 tracing::warn!(
                     %error,
@@ -10996,9 +11068,21 @@ async fn fetch_hole_punch_plan(
     client: &reqwest::Client,
     signal_url: &str,
     key: &ipars_types::PeerPathKey,
+    identity: &IdentityKeyPair,
 ) -> anyhow::Result<SignalHolePunchPlanResponse> {
+    let mut request = SignalHolePunchPlanRequest {
+        source: key.local.clone(),
+        target: key.remote.clone(),
+        request_signature: None,
+    };
+    request.request_signature = Some(
+        identity
+            .sign_signal_hole_punch_plan_request(&request, chrono::Utc::now())
+            .context("failed to sign signal hole-punch plan request")?,
+    );
     let response = client
-        .get(signal_hole_punch_url(signal_url, &key.local, &key.remote))
+        .post(signal_hole_punch_url(signal_url))
+        .json(&request)
         .send()
         .await
         .context("failed to fetch hole punch plan")?
@@ -11015,7 +11099,7 @@ async fn fetch_hole_punch_plan(
 async fn send_signal_path_request(
     client: &reqwest::Client,
     signal_url: &str,
-    request: SignalPathRequest,
+    request: AuthenticatedSignalPathRequest,
 ) -> anyhow::Result<SignalPathResponse> {
     let response = client
         .post(signal_path_url(signal_url))
@@ -11036,7 +11120,7 @@ async fn send_signal_path_request(
 async fn send_signal_path_request_to_signal_services(
     client: &reqwest::Client,
     signal_urls: &[String],
-    request: SignalPathRequest,
+    request: AuthenticatedSignalPathRequest,
 ) -> anyhow::Result<(String, SignalPathResponse)> {
     let mut errors = Vec::new();
     for signal_url in signal_urls {
@@ -11049,6 +11133,22 @@ async fn send_signal_path_request_to_signal_services(
         "all signal services failed path negotiation: {}",
         errors.join("; ")
     )
+}
+
+fn authenticated_signal_path_request(
+    identity: &IdentityKeyPair,
+    request: SignalPathRequest,
+) -> anyhow::Result<AuthenticatedSignalPathRequest> {
+    let mut authenticated = AuthenticatedSignalPathRequest {
+        request,
+        request_signature: None,
+    };
+    authenticated.request_signature = Some(
+        identity
+            .sign_signal_path_request(&authenticated.request, chrono::Utc::now())
+            .context("failed to sign signal path request")?,
+    );
+    Ok(authenticated)
 }
 
 fn signal_path_request(
@@ -12995,13 +13095,8 @@ fn signal_path_url(signal_url: &str) -> String {
     format!("{}/v1/paths/negotiate", signal_url.trim_end_matches('/'))
 }
 
-fn signal_hole_punch_url(signal_url: &str, source: &NodeId, target: &NodeId) -> String {
-    format!(
-        "{}/v1/hole-punch/{}/{}",
-        signal_url.trim_end_matches('/'),
-        source,
-        target
-    )
+fn signal_hole_punch_url(signal_url: &str) -> String {
+    format!("{}/v1/hole-punch", signal_url.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -13559,10 +13654,33 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestSignalNodeAuthenticator;
+
+    #[async_trait]
+    impl SignalNodeAuthenticator for TestSignalNodeAuthenticator {
+        async fn authenticate(
+            &self,
+            request: &SignalNodeUpsertRequest,
+        ) -> Result<SignalNodeAuthenticationResponse, SignalNodeAuthenticationError> {
+            verify_signal_node_upsert_signature(request, &request.node.identity_public_key)
+                .map_err(|error| SignalNodeAuthenticationError::Rejected(error.to_string()))?;
+            Ok(SignalNodeAuthenticationResponse {
+                node: request.node.clone(),
+                authenticated_at: Utc::now(),
+            })
+        }
+    }
+
     async fn spawn_test_signal_service(
         registry: Arc<SignalRegistry>,
     ) -> anyhow::Result<(String, tokio::task::JoinHandle<anyhow::Result<()>>)> {
-        spawn_test_http_service(signal_router(SignalHttpState::new(registry))).await
+        spawn_test_http_service(signal_router(SignalHttpState::with_authenticator(
+            registry,
+            Arc::new(TestSignalNodeAuthenticator),
+            Duration::from_secs(90),
+        )?))
+        .await
     }
 
     async fn spawn_test_http_service(
@@ -24180,12 +24298,8 @@ exec sleep 60
     #[test]
     fn signal_hole_punch_url_trims_signal_base_url() {
         assert_eq!(
-            signal_hole_punch_url(
-                "http://127.0.0.1:9443/",
-                &NodeId::from_string("node-a"),
-                &NodeId::from_string("node-b"),
-            ),
-            "http://127.0.0.1:9443/v1/hole-punch/node-a/node-b"
+            signal_hole_punch_url("http://127.0.0.1:9443/"),
+            "http://127.0.0.1:9443/v1/hole-punch"
         );
     }
 
@@ -25663,29 +25777,33 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn signal_node_upsert_request_uses_runtime_candidates() {
+    async fn signal_node_upsert_request_uses_runtime_candidates() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
+        let identity = runtime.state().identity_key_pair()?;
         let node = node_record("node-a");
 
-        let request = signal_node_upsert_request(&runtime, node, None).await;
+        let request = signal_node_upsert_request(&runtime, &identity, node, None).await?;
 
         assert_eq!(request.node.node_id, NodeId::from_string("node-a"));
         assert!(request.node.endpoint_candidates.is_empty());
+        assert!(request.request_signature.is_some());
         assert_eq!(
             request.health.as_ref().map(|health| health.state),
             Some(HealthState::Healthy)
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn signal_node_upsert_refreshes_policy_enabled_relay_capability() {
+    async fn signal_node_upsert_refreshes_policy_enabled_relay_capability() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
+        let identity = runtime.state().identity_key_pair()?;
         let mut node = node_record("node-a");
         node.relay_capability = Some(test_relay_capability(100, 1));
         let refreshed = RelayCapability {
@@ -25698,7 +25816,9 @@ exec sleep 60
             e2e_only: true,
         };
 
-        let request = signal_node_upsert_request(&runtime, node, Some(refreshed)).await;
+        let request =
+            signal_node_upsert_request(&runtime, &identity, node, Some(refreshed)).await?;
+        assert!(request.request_signature.is_some());
         let relay_capability = match request.node.relay_capability {
             Some(relay_capability) => relay_capability,
             None => panic!("policy enabled relay should remain advertised"),
@@ -25708,28 +25828,33 @@ exec sleep 60
         assert_eq!(relay_capability.max_sessions, 250);
         assert_eq!(relay_capability.active_sessions, 12);
         assert_eq!(relay_capability.max_mbps, 750);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn signal_node_upsert_clears_relay_capability_without_status_refresh() {
+    async fn signal_node_upsert_clears_relay_capability_without_status_refresh(
+    ) -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
+        let identity = runtime.state().identity_key_pair()?;
         let mut node = node_record("node-a");
         node.relay_capability = Some(test_relay_capability(100, 1));
 
-        let request = signal_node_upsert_request(&runtime, node, None).await;
+        let request = signal_node_upsert_request(&runtime, &identity, node, None).await?;
 
         assert!(request.node.relay_capability.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn signal_node_upsert_reports_userspace_wireguard_exit_health() {
+    async fn signal_node_upsert_reports_userspace_wireguard_exit_health() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
+        let identity = runtime.state().identity_key_pair()?;
         runtime
             .record_userspace_wireguard_process_status(
                 AgentManagedProcessState::Exited,
@@ -25740,7 +25865,7 @@ exec sleep 60
             .await;
         let node = node_record("node-a");
 
-        let request = signal_node_upsert_request(&runtime, node, None).await;
+        let request = signal_node_upsert_request(&runtime, &identity, node, None).await?;
 
         let health = match request.health {
             Some(health) => health,
@@ -25752,6 +25877,7 @@ exec sleep 60
             .as_deref()
             .unwrap_or_default()
             .contains("state=exited"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -26534,13 +26660,18 @@ exec sleep 60
         let (base_b, task_b) = spawn_test_signal_service(registry_b.clone()).await?;
         let unavailable = unused_http_base_url().await?;
         let client = reqwest::Client::new();
-        let node = node_record("node-a");
+        let identity = IdentityKeyPair::generate();
+        let mut node = node_record("node-a");
+        node.identity_public_key = identity.public_key_b64();
         let node_id = node.node_id.clone();
-        let request = SignalNodeUpsertRequest {
+        let mut request = SignalNodeUpsertRequest {
             node,
             nat_classification: None,
             health: None,
+            request_signature: None,
         };
+        request.request_signature =
+            Some(identity.sign_signal_node_upsert_request(&request, Utc::now())?);
 
         let successes = send_signal_node_upsert_to_signal_services(
             &client,
@@ -26560,20 +26691,45 @@ exec sleep 60
     #[tokio::test]
     async fn signal_path_request_fails_over_to_available_signal_service() -> anyhow::Result<()> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        registry.upsert_node(node_record("node-a")).await?;
-        registry.upsert_node(node_record("node-b")).await?;
+        let identity = IdentityKeyPair::generate();
+        let mut source_node = node_record("node-a");
+        source_node.identity_public_key = identity.public_key_b64();
+        let target_identity = IdentityKeyPair::generate();
+        let mut target_node = node_record("node-b");
+        target_node.identity_public_key = target_identity.public_key_b64();
         let (base, task) = spawn_test_signal_service(registry.clone()).await?;
         let unavailable = unused_http_base_url().await?;
         let client = reqwest::Client::new();
+        let mut source_upsert = SignalNodeUpsertRequest {
+            node: source_node,
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
+        source_upsert.request_signature =
+            Some(identity.sign_signal_node_upsert_request(&source_upsert, Utc::now())?);
+        send_signal_node_upsert(&client, &base, source_upsert).await?;
+        let mut target_upsert = SignalNodeUpsertRequest {
+            node: target_node,
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
+        target_upsert.request_signature =
+            Some(target_identity.sign_signal_node_upsert_request(&target_upsert, Utc::now())?);
+        send_signal_node_upsert(&client, &base, target_upsert).await?;
         let source = NodeId::from_string("node-a");
         let target = NodeId::from_string("node-b");
-        let request = SignalPathRequest {
-            source: source.clone(),
-            target: target.clone(),
-            source_candidates: vec![candidate("node-a", EndpointCandidateKind::PublicUdp, 10)],
-            source_nat_classification: None,
-            desired_routes: Vec::new(),
-        };
+        let request = authenticated_signal_path_request(
+            &identity,
+            SignalPathRequest {
+                source: source.clone(),
+                target: target.clone(),
+                source_candidates: vec![candidate("node-a", EndpointCandidateKind::PublicUdp, 10)],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+        )?;
 
         let (selected_signal, response) = send_signal_path_request_to_signal_services(
             &client,

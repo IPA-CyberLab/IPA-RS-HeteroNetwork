@@ -1119,6 +1119,13 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct NodeApiRequestSignature {
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
+        pub signature: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HeartbeatSignaturePayload {
         pub node_id: NodeId,
         pub health: NodeHealth,
@@ -1151,6 +1158,32 @@ pub mod api {
         pub issuer: NodeId,
         pub key_id: KeyId,
         pub signed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct SignalNodeUpsertSignaturePayload {
+        pub node: NodeRecord,
+        #[serde(default)]
+        pub nat_classification: Option<NatClassification>,
+        #[serde(default)]
+        pub health: Option<NodeHealth>,
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct SignalPathNegotiationSignaturePayload {
+        pub request: SignalPathRequest,
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct SignalHolePunchPlanSignaturePayload {
+        pub source: NodeId,
+        pub target: NodeId,
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1405,18 +1438,86 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct AuthenticatedSignalPathRequest {
+        pub request: SignalPathRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_signature: Option<NodeApiRequestSignature>,
+    }
+
+    impl AuthenticatedSignalPathRequest {
+        pub fn signature_payload(
+            &self,
+            signed_at: DateTime<Utc>,
+            nonce: String,
+        ) -> SignalPathNegotiationSignaturePayload {
+            SignalPathNegotiationSignaturePayload {
+                request: self.request.clone(),
+                signed_at,
+                nonce,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct SignalHolePunchPlanRequest {
+        pub source: NodeId,
+        pub target: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_signature: Option<NodeApiRequestSignature>,
+    }
+
+    impl SignalHolePunchPlanRequest {
+        pub fn signature_payload(
+            &self,
+            signed_at: DateTime<Utc>,
+            nonce: String,
+        ) -> SignalHolePunchPlanSignaturePayload {
+            SignalHolePunchPlanSignaturePayload {
+                source: self.source.clone(),
+                target: self.target.clone(),
+                signed_at,
+                nonce,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalNodeUpsertRequest {
         pub node: NodeRecord,
         #[serde(default)]
         pub nat_classification: Option<NatClassification>,
         #[serde(default)]
         pub health: Option<NodeHealth>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_signature: Option<NodeApiRequestSignature>,
+    }
+
+    impl SignalNodeUpsertRequest {
+        pub fn signature_payload(
+            &self,
+            signed_at: DateTime<Utc>,
+            nonce: String,
+        ) -> SignalNodeUpsertSignaturePayload {
+            SignalNodeUpsertSignaturePayload {
+                node: self.node.clone(),
+                nat_classification: self.nat_classification.clone(),
+                health: self.health.clone(),
+                signed_at,
+                nonce,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SignalNodeUpsertResponse {
         pub node: NodeRecord,
         pub registered_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct SignalNodeAuthenticationResponse {
+        pub node: NodeRecord,
+        pub authenticated_at: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3670,6 +3771,7 @@ pub mod api {
             || path_starts_with_api_prefix(path, b"/v1/heartbeat")
             || path_starts_with_api_prefix(path, b"/v1/policy")
             || path_starts_with_api_prefix(path, b"/v1/tokens/revoke")
+            || path_starts_with_api_prefix(path, b"/v1/nodes/authenticate-signal-upsert")
             || (method == b"DELETE" && path_is_ipars_node_record_api(path))
             || (path.starts_with(b"/v1/nodes/") && path_contains_any(path, &[b"/wireguard-key"]))
             || (path.starts_with(b"/v1/peers/") && path.len() > b"/v1/peers/".len())
@@ -3687,7 +3789,7 @@ pub mod api {
 
     fn ipars_signal_http_api_path(method: &[u8], path: &[u8]) -> bool {
         path_starts_with_api_prefix(path, b"/v1/paths/negotiate")
-            || path.starts_with(b"/v1/hole-punch/")
+            || path_starts_with_api_prefix(path, b"/v1/hole-punch")
             || (method == b"PUT" && path_is_ipars_node_record_api(path))
     }
 

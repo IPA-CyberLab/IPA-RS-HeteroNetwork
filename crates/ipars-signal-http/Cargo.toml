@@ -7,15 +7,19 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
+chrono.workspace = true
+ipars-crypto = { path = "../ipars-crypto" }
 ipars-signal = { path = "../ipars-signal" }
 ipars-types = { path = "../ipars-types" }
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
-serde_json.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [lints]

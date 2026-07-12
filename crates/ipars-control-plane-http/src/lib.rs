@@ -14,7 +14,8 @@ use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
     HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap, RegisterNodeResponse,
     RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse,
-    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse,
+    SignalNodeUpsertRequest,
 };
 use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
@@ -66,6 +67,10 @@ where
         .route("/v1/policy", get(policy::<S, L>))
         .route("/v1/peers/{node_id}", get(peers::<S, L>))
         .route("/v1/paths/{node_id}", get(paths::<S, L>))
+        .route(
+            "/v1/nodes/authenticate-signal-upsert",
+            post(authenticate_signal_node_upsert::<S, L>),
+        )
         .route("/v1/nodes/{node_id}", delete(remove_node::<S, L>))
         .route(
             "/v1/nodes/{node_id}/wireguard-key",
@@ -179,6 +184,25 @@ where
         .await?;
     let status = record.status(Utc::now());
     Ok(Json(RevokeTokenResponse { record, status }))
+}
+
+async fn authenticate_signal_node_upsert<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<SignalNodeUpsertRequest>,
+) -> Result<Json<SignalNodeAuthenticationResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let authenticated_at = Utc::now();
+    let node = state
+        .plane
+        .authenticate_signal_node_upsert(&request, authenticated_at)
+        .await?;
+    Ok(Json(SignalNodeAuthenticationResponse {
+        node,
+        authenticated_at,
+    }))
 }
 
 async fn peers<S, L>(
@@ -674,6 +698,7 @@ mod tests {
         HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
         RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
         RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
@@ -1008,6 +1033,64 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RegisterNodeResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.node.node_id, node_id("node-http"));
+
+        let mut signal_upsert = SignalNodeUpsertRequest {
+            node: response.node.clone(),
+            nat_classification: None,
+            health: Some(NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: Utc::now(),
+                latency_ms: None,
+                relay_load: None,
+                message: None,
+            }),
+            request_signature: None,
+        };
+        let unsigned_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/nodes/authenticate-signal-upsert")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signal_upsert)?))?,
+            )
+            .await?;
+        assert_eq!(unsigned_response.status(), StatusCode::UNAUTHORIZED);
+
+        let node_identity = identity_for_node("node-http");
+        signal_upsert.request_signature =
+            Some(node_identity.sign_signal_node_upsert_request(&signal_upsert, Utc::now())?);
+        let authenticated_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/nodes/authenticate-signal-upsert")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signal_upsert)?))?,
+            )
+            .await?;
+        assert_eq!(authenticated_response.status(), StatusCode::OK);
+        let authenticated_body =
+            axum::body::to_bytes(authenticated_response.into_body(), usize::MAX).await?;
+        let authenticated: SignalNodeAuthenticationResponse =
+            serde_json::from_slice(&authenticated_body)?;
+        assert_eq!(authenticated.node, response.node);
+
+        signal_upsert.health = None;
+        let tampered_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/nodes/authenticate-signal-upsert")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signal_upsert)?))?,
+            )
+            .await?;
+        assert_eq!(tampered_response.status(), StatusCode::UNAUTHORIZED);
+
         let previous_wireguard_public_key = response.node.wireguard_public_key.clone();
         let next_wireguard_public_key = wireguard_public_key_for_node("node-http-rotated");
 

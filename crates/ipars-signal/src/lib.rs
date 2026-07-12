@@ -185,6 +185,12 @@ impl SignalRegistry {
         self.nodes.read().await.get(node_id).cloned()
     }
 
+    pub async fn remove_node(&self, node_id: &NodeId) -> bool {
+        self.nat_classifications.write().await.remove(node_id);
+        self.health.write().await.remove(node_id);
+        self.nodes.write().await.remove(node_id).is_some()
+    }
+
     pub async fn negotiate(
         &self,
         mut request: SignalPathRequest,

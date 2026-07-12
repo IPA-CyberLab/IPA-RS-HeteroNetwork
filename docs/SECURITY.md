@@ -51,6 +51,12 @@ WireGuard data-plane keys rotate through the local agent API. The agent signs th
 
 Node removal uses the same node identity boundary. `DELETE /v1/nodes/{node_id}` requires a signed request from the registered node identity before the control plane removes the durable node record, clears health/path state, and releases the VPN IP lease for reuse.
 
+## Signal Authentication
+
+Signal node upserts, path negotiations, and hole-punch plan requests require an Ed25519 signature from the requesting node's persisted identity key. Each signed payload includes the complete request body, a bounded-fresh timestamp, and a random 192-bit nonce. Signal keeps a bounded accepted-nonce cache and rejects duplicates, stale signatures, body tampering, source-ID mismatches, and requests from nodes without fresh authenticated membership.
+
+For each node upsert, Signal asks an ordered control-plane endpoint set to verify the signature against the registered identity public key. Signal stores the authoritative control-plane `NodeRecord` rather than trusting client-supplied role, policy, route, or relay attributes. `--node-auth-ttl-seconds` or `IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS` bounds membership freshness; stale members are removed and cannot negotiate paths or request hole-punch plans until a signed upsert succeeds again. Configure control-plane failover with repeated `--control-plane-url` values or `IPARS_SIGNAL_CONTROL_PLANE_URLS`.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.

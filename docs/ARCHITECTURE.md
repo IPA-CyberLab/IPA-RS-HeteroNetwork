@@ -237,6 +237,7 @@ Initial control-plane HTTP routes:
 - `GET /v1/peers/{node_id}`
 - `GET /v1/paths/{node_id}`
 - `POST /v1/tokens/revoke`
+- `POST /v1/nodes/authenticate-signal-upsert`
 
 Token revocation is an authenticated issuer operation. The request carries the cluster ID, token nonce, issuer node/key IDs, and a bounded-fresh timestamp under an Ed25519 signature; the control plane verifies it against the configured trusted issuer key ring before touching the durable token ledger.
 
@@ -247,7 +248,9 @@ Initial signal HTTP routes:
 - `GET /v1/metrics`
 - `PUT /v1/nodes/{node_id}`
 - `POST /v1/paths/negotiate`
-- `GET /v1/hole-punch/{source}/{target}`
+- `POST /v1/hole-punch`
+
+Signal node upserts, path negotiations, and hole-punch plan requests carry a bounded-fresh timestamp, random nonce, and Ed25519 node-identity signature. Signal checks node upserts against the authoritative control-plane registration, caches accepted nonces to reject replays, and removes memberships that exceed its configured authentication TTL. Path and hole-punch requests are admitted only while both participants have fresh authenticated memberships.
 
 Initial relay HTTP routes:
 

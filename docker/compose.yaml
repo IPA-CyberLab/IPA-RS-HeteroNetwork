@@ -60,6 +60,10 @@ services:
       - 0.0.0.0:9443
     environment:
       IPARS_ROLE: signal
+      IPARS_SIGNAL_CONTROL_PLANE_URLS: http://control-plane:8443
+    depends_on:
+      control-plane:
+        condition: service_healthy
     ports:
       - "9443:9443"
     healthcheck:

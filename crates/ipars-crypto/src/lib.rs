@@ -1,13 +1,14 @@
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ipars_types::api::{
-    HeartbeatRequest, NodeRequestSignature, RemoveNodeRequest, RevokeTokenRequest,
-    RotateWireGuardKeyRequest,
+    AuthenticatedSignalPathRequest, HeartbeatRequest, NodeApiRequestSignature,
+    NodeRequestSignature, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
+    SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
 };
 use ipars_types::{ClusterId, JoinTokenClaims, NodeId, SignedJoinToken};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -22,6 +23,8 @@ pub enum CryptoError {
     InvalidWireGuardKey,
     #[error("ed25519 signature is invalid")]
     InvalidSignature,
+    #[error("node API request nonce is invalid")]
+    InvalidRequestNonce,
     #[error("token serialization failed")]
     TokenSerialization(#[from] serde_json::Error),
     #[error("token is not valid at {0}")]
@@ -32,6 +35,8 @@ pub enum CryptoError {
         actual: ClusterId,
     },
 }
+
+const NODE_API_REQUEST_NONCE_BYTES: usize = 24;
 
 #[derive(Clone)]
 pub struct IdentityKeyPair {
@@ -131,6 +136,60 @@ impl IdentityKeyPair {
             signature: encode_bytes(&signature.to_bytes()),
         })
     }
+
+    pub fn sign_signal_node_upsert_request(
+        &self,
+        request: &SignalNodeUpsertRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at, nonce.clone()))?;
+        Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    pub fn sign_signal_path_request(
+        &self,
+        request: &SignalPathRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let envelope = AuthenticatedSignalPathRequest {
+            request: request.clone(),
+            request_signature: None,
+        };
+        let payload = serde_json::to_vec(&envelope.signature_payload(signed_at, nonce.clone()))?;
+        Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    pub fn sign_signal_hole_punch_plan_request(
+        &self,
+        request: &SignalHolePunchPlanRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at, nonce.clone()))?;
+        Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    fn sign_node_api_payload(
+        &self,
+        payload: &[u8],
+        signed_at: DateTime<Utc>,
+        nonce: String,
+    ) -> NodeApiRequestSignature {
+        let signature = self.signing_key.sign(payload);
+        NodeApiRequestSignature {
+            signed_at,
+            nonce,
+            signature: encode_bytes(&signature.to_bytes()),
+        }
+    }
+}
+
+fn random_node_api_request_nonce() -> String {
+    let mut nonce_bytes = [0_u8; NODE_API_REQUEST_NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    URL_SAFE_NO_PAD.encode(nonce_bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +317,75 @@ pub fn verify_token_revocation_signature(
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
+pub fn verify_signal_node_upsert_signature(
+    request: &SignalNodeUpsertRequest,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let request_signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(
+        &request.signature_payload(request_signature.signed_at, request_signature.nonce.clone()),
+    )?;
+    verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+}
+
+pub fn verify_signal_path_signature(
+    request: &AuthenticatedSignalPathRequest,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let request_signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(
+        &request.signature_payload(request_signature.signed_at, request_signature.nonce.clone()),
+    )?;
+    verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+}
+
+pub fn verify_signal_hole_punch_plan_signature(
+    request: &SignalHolePunchPlanRequest,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let request_signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(
+        &request.signature_payload(request_signature.signed_at, request_signature.nonce.clone()),
+    )?;
+    verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+}
+
+fn verify_node_api_payload(
+    payload: &[u8],
+    request_signature: &NodeApiRequestSignature,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    validate_node_api_request_nonce(&request_signature.nonce)?;
+    let key_bytes = decode_32(node_public_key_b64)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
+    let signature_bytes = STANDARD.decode(&request_signature.signature)?;
+    let signature = Signature::try_from(signature_bytes.as_slice())
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    verifying_key
+        .verify(payload, &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
+pub fn validate_node_api_request_nonce(value: &str) -> Result<(), CryptoError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| CryptoError::InvalidRequestNonce)?;
+    if bytes.len() != NODE_API_REQUEST_NONCE_BYTES || URL_SAFE_NO_PAD.encode(bytes) != value {
+        return Err(CryptoError::InvalidRequestNonce);
+    }
+    Ok(())
+}
+
 pub fn validate_identity_public_key_b64(value: &str) -> Result<(), CryptoError> {
     let key_bytes = decode_32(value)?;
     VerifyingKey::from_bytes(&key_bytes)
@@ -299,14 +427,17 @@ fn decode_32(value: &str) -> Result<[u8; 32], CryptoError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use chrono::Duration;
     use ipars_types::api::{
-        HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
+        AuthenticatedSignalPathRequest, HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest,
+        RotateWireGuardKeyRequest, SignalHolePunchPlanRequest, SignalNodeUpsertRequest,
+        SignalPathRequest,
     };
     use ipars_types::{
-        BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, Role, Tag,
-        TokenPolicy,
+        BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord, Role,
+        Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -465,6 +596,86 @@ mod tests {
         request.nonce = "tampered-nonce".to_string();
         assert!(matches!(
             verify_token_revocation_signature(&request, &issuer.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_signal_node_upsert_request_round_trips() -> Result<(), CryptoError> {
+        let identity = IdentityKeyPair::generate();
+        let now = Utc::now();
+        let mut request = SignalNodeUpsertRequest {
+            node: NodeRecord {
+                node_id: identity.node_id(),
+                cluster_id: ClusterId::from_string("cluster-a"),
+                vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+                identity_public_key: identity.public_key_b64(),
+                wireguard_public_key: WireGuardKeyPair::generate().public_key_b64,
+                role: Role::edge(),
+                tags: BTreeSet::new(),
+                endpoint_candidates: Vec::new(),
+                relay_capability: None,
+                token_policy: TokenPolicy::default(),
+                routes: Vec::new(),
+                registered_at: now,
+            },
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
+        request.request_signature = Some(identity.sign_signal_node_upsert_request(&request, now)?);
+
+        verify_signal_node_upsert_signature(&request, &identity.public_key_b64())?;
+        request.health = Some(NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: now,
+            latency_ms: None,
+            relay_load: None,
+            message: None,
+        });
+        assert!(matches!(
+            verify_signal_node_upsert_signature(&request, &identity.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_signal_path_requests_round_trip() -> Result<(), CryptoError> {
+        let identity = IdentityKeyPair::generate();
+        let now = Utc::now();
+        let path = SignalPathRequest {
+            source: identity.node_id(),
+            target: NodeId::from_string("node-b"),
+            source_candidates: Vec::new(),
+            source_nat_classification: None,
+            desired_routes: Vec::new(),
+        };
+        let mut authenticated = AuthenticatedSignalPathRequest {
+            request: path,
+            request_signature: None,
+        };
+        authenticated.request_signature =
+            Some(identity.sign_signal_path_request(&authenticated.request, now)?);
+        verify_signal_path_signature(&authenticated, &identity.public_key_b64())?;
+        authenticated.request.target = NodeId::from_string("node-c");
+        assert!(matches!(
+            verify_signal_path_signature(&authenticated, &identity.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+
+        let mut hole_punch = SignalHolePunchPlanRequest {
+            source: identity.node_id(),
+            target: NodeId::from_string("node-b"),
+            request_signature: None,
+        };
+        hole_punch.request_signature =
+            Some(identity.sign_signal_hole_punch_plan_request(&hole_punch, now)?);
+        verify_signal_hole_punch_plan_signature(&hole_punch, &identity.public_key_b64())?;
+        hole_punch.target = NodeId::from_string("node-c");
+        assert!(matches!(
+            verify_signal_hole_punch_plan_signature(&hole_punch, &identity.public_key_b64()),
             Err(CryptoError::InvalidSignature)
         ));
         Ok(())

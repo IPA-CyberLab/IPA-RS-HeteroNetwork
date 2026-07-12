@@ -9,13 +9,14 @@ use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
     verify_heartbeat_request_signature, verify_join_token, verify_remove_node_signature,
-    verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
+    verify_signal_node_upsert_signature, verify_token_revocation_signature,
+    verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
     PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayMap,
     RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse,
+    RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
@@ -935,6 +936,42 @@ where
             path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
             generated_at: now,
         })
+    }
+
+    pub async fn authenticate_signal_node_upsert(
+        &self,
+        request: &SignalNodeUpsertRequest,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let node = self
+            .store
+            .get_node(&request.node.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node.node_id.clone()))?;
+        let signature = request.request_signature.as_ref().ok_or_else(|| {
+            ControlPlaneError::NodeSignatureRequired(request.node.node_id.clone())
+        })?;
+        verify_signal_node_upsert_signature(request, &node.identity_public_key).map_err(
+            |error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node.node_id.clone(),
+                reason: error.to_string(),
+            },
+        )?;
+        if !timestamp_within_skew(
+            signature.signed_at,
+            now,
+            self.config.heartbeat_signature_max_age,
+        ) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node.node_id.clone(),
+                reason: format!(
+                    "signed_at {} is outside the allowed {}s window",
+                    signature.signed_at,
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+        Ok(node)
     }
 
     pub async fn heartbeat(
