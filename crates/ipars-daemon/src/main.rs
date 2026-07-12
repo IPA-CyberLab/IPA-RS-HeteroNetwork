@@ -15,7 +15,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use axum::Router;
 use aya::maps::{MapData, RingBuf};
-use aya::programs::{CgroupAttachMode as AyaCgroupAttachMode, CgroupSockAddr, TracePoint};
+use aya::programs::{CgroupAttachMode as AyaCgroupAttachMode, CgroupSockAddr, SockOps, TracePoint};
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
@@ -147,6 +147,7 @@ const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const MAX_PACKET_FLOW_EBPF_ATTACH_SPECS: usize = 32;
 const MAX_PACKET_FLOW_EBPF_CGROUP_ATTACH_SPECS: usize = 16;
+const MAX_PACKET_FLOW_EBPF_SOCKOPS_ATTACH_SPECS: usize = 16;
 const MAX_PACKET_FLOW_READ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
 const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
@@ -780,6 +781,12 @@ struct AgentArgs {
         value_name = "PROGRAM"
     )]
     packet_flow_ebpf_cgroup_attach: Vec<String>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_SOCKOPS_ATTACH",
+        value_name = "PROGRAM"
+    )]
+    packet_flow_ebpf_sockops_attach: Vec<String>,
     #[arg(
         long,
         env = "IPARS_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
@@ -1689,8 +1696,9 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         )?;
         anyhow::ensure!(
             !args.packet_flow_ebpf_attach.is_empty()
-                || !args.packet_flow_ebpf_cgroup_attach.is_empty(),
-            "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach must be set when --packet-flow-detector ebpf-ringbuf is set"
+                || !args.packet_flow_ebpf_cgroup_attach.is_empty()
+                || !args.packet_flow_ebpf_sockops_attach.is_empty(),
+            "at least one --packet-flow-ebpf-attach, --packet-flow-ebpf-cgroup-attach, or --packet-flow-ebpf-sockops-attach must be set when --packet-flow-detector ebpf-ringbuf is set"
         );
         validate_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
         validate_packet_flow_ebpf_cgroup_config(args)?;
@@ -1927,14 +1935,19 @@ fn validate_packet_flow_ebpf_cgroup_config(args: &AgentArgs) -> anyhow::Result<(
         "--packet-flow-ebpf-cgroup-attach may be repeated at most {MAX_PACKET_FLOW_EBPF_CGROUP_ATTACH_SPECS} times"
     );
     anyhow::ensure!(
-        args.packet_flow_ebpf_cgroup_path.is_some()
-            || args.packet_flow_ebpf_cgroup_attach.is_empty(),
-        "--packet-flow-ebpf-cgroup-path is required when --packet-flow-ebpf-cgroup-attach is set"
+        args.packet_flow_ebpf_sockops_attach.len()
+            <= MAX_PACKET_FLOW_EBPF_SOCKOPS_ATTACH_SPECS,
+        "--packet-flow-ebpf-sockops-attach may be repeated at most {MAX_PACKET_FLOW_EBPF_SOCKOPS_ATTACH_SPECS} times"
+    );
+    let has_cgroup_programs = !args.packet_flow_ebpf_cgroup_attach.is_empty()
+        || !args.packet_flow_ebpf_sockops_attach.is_empty();
+    anyhow::ensure!(
+        args.packet_flow_ebpf_cgroup_path.is_some() || !has_cgroup_programs,
+        "--packet-flow-ebpf-cgroup-path is required when --packet-flow-ebpf-cgroup-attach or --packet-flow-ebpf-sockops-attach is set"
     );
     anyhow::ensure!(
-        args.packet_flow_ebpf_cgroup_path.is_none()
-            || !args.packet_flow_ebpf_cgroup_attach.is_empty(),
-        "--packet-flow-ebpf-cgroup-path requires at least one --packet-flow-ebpf-cgroup-attach"
+        args.packet_flow_ebpf_cgroup_path.is_none() || has_cgroup_programs,
+        "--packet-flow-ebpf-cgroup-path requires at least one --packet-flow-ebpf-cgroup-attach or --packet-flow-ebpf-sockops-attach"
     );
 
     let mut seen = BTreeSet::new();
@@ -1943,6 +1956,18 @@ fn validate_packet_flow_ebpf_cgroup_config(args: &AgentArgs) -> anyhow::Result<(
         anyhow::ensure!(
             seen.insert(program),
             "--packet-flow-ebpf-cgroup-attach must not repeat `{program}`"
+        );
+    }
+    let mut sockops_seen = BTreeSet::new();
+    for program in &args.packet_flow_ebpf_sockops_attach {
+        validate_ebpf_identifier(program, "--packet-flow-ebpf-sockops-attach program")?;
+        anyhow::ensure!(
+            sockops_seen.insert(program),
+            "--packet-flow-ebpf-sockops-attach must not repeat `{program}`"
+        );
+        anyhow::ensure!(
+            !seen.contains(program),
+            "eBPF cgroup program `{program}` must not be shared by --packet-flow-ebpf-cgroup-attach and --packet-flow-ebpf-sockops-attach"
         );
     }
     Ok(())
@@ -1977,6 +2002,10 @@ fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Resu
         anyhow::ensure!(
             args.packet_flow_ebpf_cgroup_attach.is_empty(),
             "--packet-flow-ebpf-cgroup-attach requires --packet-flow-detector ebpf-ringbuf"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_sockops_attach.is_empty(),
+            "--packet-flow-ebpf-sockops-attach requires --packet-flow-detector ebpf-ringbuf"
         );
     }
     if args.packet_flow_detector == PacketFlowDetector::Disabled {
@@ -2316,7 +2345,9 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         && args.packet_flow_conntrack_path.is_some();
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
     let ebpf_tracepoints = ebpf_ringbuf && !args.packet_flow_ebpf_attach.is_empty();
-    let ebpf_cgroup = ebpf_ringbuf && !args.packet_flow_ebpf_cgroup_attach.is_empty();
+    let ebpf_cgroup = ebpf_ringbuf
+        && (!args.packet_flow_ebpf_cgroup_attach.is_empty()
+            || !args.packet_flow_ebpf_sockops_attach.is_empty());
     let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
     let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
     let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
@@ -13129,6 +13160,31 @@ fn load_ebpf_ringbuf_packet_flow_reader(
                     )
                 })?;
         }
+        for program_name in &config.sockops_attachments {
+            let program: &mut SockOps = bpf
+                .program_mut(program_name)
+                .with_context(|| {
+                    format!(
+                        "eBPF packet-flow object {} does not contain cgroup sockops program `{program_name}`",
+                        config.object_path.display()
+                    )
+                })?
+                .try_into()
+                .with_context(|| {
+                    format!("eBPF program `{program_name}` is not a cgroup sockops program")
+                })?;
+            program
+                .load()
+                .with_context(|| format!("failed to load eBPF sockops program `{program_name}`"))?;
+            program
+                .attach(&cgroup, cgroup_attach_mode)
+                .with_context(|| {
+                    format!(
+                        "failed to attach eBPF sockops program `{program_name}` to cgroup {}",
+                        cgroup_path.display()
+                    )
+                })?;
+        }
     }
 
     let map = bpf.take_map(&config.ringbuf_map).with_context(|| {
@@ -13491,6 +13547,7 @@ struct EbpfRingbufConfig {
     attachments: Vec<EbpfTracepointAttachSpec>,
     cgroup_path: Option<PathBuf>,
     cgroup_attachments: Vec<String>,
+    sockops_attachments: Vec<String>,
 }
 
 impl EbpfRingbufConfig {
@@ -13505,8 +13562,9 @@ impl EbpfRingbufConfig {
         )?;
         anyhow::ensure!(
             !args.packet_flow_ebpf_attach.is_empty()
-                || !args.packet_flow_ebpf_cgroup_attach.is_empty(),
-            "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach must be set when --packet-flow-detector ebpf-ringbuf is set"
+                || !args.packet_flow_ebpf_cgroup_attach.is_empty()
+                || !args.packet_flow_ebpf_sockops_attach.is_empty(),
+            "at least one --packet-flow-ebpf-attach, --packet-flow-ebpf-cgroup-attach, or --packet-flow-ebpf-sockops-attach must be set when --packet-flow-detector ebpf-ringbuf is set"
         );
         let attachments = parse_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
         validate_packet_flow_ebpf_cgroup_config(args)?;
@@ -13516,6 +13574,7 @@ impl EbpfRingbufConfig {
             attachments,
             cgroup_path: args.packet_flow_ebpf_cgroup_path.clone(),
             cgroup_attachments: args.packet_flow_ebpf_cgroup_attach.clone(),
+            sockops_attachments: args.packet_flow_ebpf_sockops_attach.clone(),
         })
     }
 }
@@ -18445,6 +18504,19 @@ mod tests {
                 "--packet-flow-ebpf-cgroup-attach requires --packet-flow-detector ebpf-ringbuf",
             ),
             (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-sockops-attach",
+                    "ipars_cgroup_sockops",
+                ],
+                "--packet-flow-ebpf-sockops-attach requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
                 vec!["iparsd", "agent", "--packet-flow-pin"],
                 "--packet-flow-pin requires --packet-flow-detector to be enabled",
             ),
@@ -18945,6 +19017,7 @@ mod tests {
             assert_eq!(config.attachments.len(), 2);
             assert!(config.cgroup_path.is_none());
             assert!(config.cgroup_attachments.is_empty());
+            assert!(config.sockops_attachments.is_empty());
             assert_eq!(config.attachments[0].program, "ipars_ingress");
             assert_eq!(config.attachments[0].category, "net");
             assert_eq!(config.attachments[0].name, "netif_receive_skb");
@@ -18972,6 +19045,8 @@ mod tests {
             "ipars_cgroup_connect4",
             "--packet-flow-ebpf-cgroup-attach",
             "ipars_cgroup_sendmsg4",
+            "--packet-flow-ebpf-sockops-attach",
+            "ipars_cgroup_sockops",
         ])?;
 
         if let Command::Agent(args) = cli.command {
@@ -18986,6 +19061,7 @@ mod tests {
                 config.cgroup_attachments,
                 ["ipars_cgroup_connect4", "ipars_cgroup_sendmsg4"]
             );
+            assert_eq!(config.sockops_attachments, ["ipars_cgroup_sockops"]);
             return Ok(());
         }
 
@@ -19019,7 +19095,7 @@ mod tests {
                     "--packet-flow-ebpf-object-path",
                     "/run/ipars/ipars-packet-flow.bpf.o",
                 ],
-                "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach",
+                "at least one --packet-flow-ebpf-attach",
             ),
             (
                 vec![
@@ -19071,7 +19147,7 @@ mod tests {
                     "--packet-flow-ebpf-object-path",
                     "/run/ipars/ipars-packet-flow.bpf.o",
                 ],
-                "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach",
+                "at least one --packet-flow-ebpf-attach",
             ),
             (
                 vec![
@@ -19209,6 +19285,19 @@ mod tests {
                     "ebpf-ringbuf",
                     "--packet-flow-ebpf-object-path",
                     "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-sockops-attach",
+                    "ipars_cgroup_sockops",
+                ],
+                "--packet-flow-ebpf-cgroup-path is required",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
                     "--packet-flow-ebpf-cgroup-path",
                     "/sys/fs/cgroup",
                     "--packet-flow-ebpf-attach",
@@ -19247,6 +19336,55 @@ mod tests {
                     "ipars_cgroup_connect4",
                 ],
                 "--packet-flow-ebpf-cgroup-attach must not repeat",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                    "--packet-flow-ebpf-sockops-attach",
+                    "bad/program",
+                ],
+                "--packet-flow-ebpf-sockops-attach program",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                    "--packet-flow-ebpf-sockops-attach",
+                    "ipars_cgroup_sockops",
+                    "--packet-flow-ebpf-sockops-attach",
+                    "ipars_cgroup_sockops",
+                ],
+                "--packet-flow-ebpf-sockops-attach must not repeat",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                    "--packet-flow-ebpf-cgroup-attach",
+                    "ipars_cgroup_shared",
+                    "--packet-flow-ebpf-sockops-attach",
+                    "ipars_cgroup_shared",
+                ],
+                "must not be shared",
             ),
         ] {
             let cli = Cli::try_parse_from(argv)?;
@@ -19287,6 +19425,33 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("--packet-flow-ebpf-cgroup-attach may be repeated at most 16 times"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
+        let mut too_many_sockops = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--packet-flow-detector".to_string(),
+            "ebpf-ringbuf".to_string(),
+            "--packet-flow-ebpf-object-path".to_string(),
+            "/run/ipars/ipars-packet-flow.bpf.o".to_string(),
+            "--packet-flow-ebpf-cgroup-path".to_string(),
+            "/sys/fs/cgroup".to_string(),
+        ];
+        for index in 0..=MAX_PACKET_FLOW_EBPF_SOCKOPS_ATTACH_SPECS {
+            too_many_sockops.push("--packet-flow-ebpf-sockops-attach".to_string());
+            too_many_sockops.push(format!("ipars_sockops_{index}"));
+        }
+        let cli = Cli::try_parse_from(too_many_sockops)?;
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid oversized eBPF sockops config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-sockops-attach may be repeated at most 16 times"));
         } else {
             anyhow::bail!("expected agent command");
         }
@@ -19702,6 +19867,7 @@ mod tests {
             ],
             cgroup_path: None,
             cgroup_attachments: Vec::new(),
+            sockops_attachments: Vec::new(),
         };
         ensure_ebpf_object_file_ready(&config.object_path)?;
         for attachment in &config.attachments {
@@ -19801,6 +19967,8 @@ mod tests {
             std::ffi::OsString::from("ipars_cgroup_sendmsg4"),
             std::ffi::OsString::from("--packet-flow-ebpf-cgroup-attach"),
             std::ffi::OsString::from("ipars_cgroup_sendmsg6"),
+            std::ffi::OsString::from("--packet-flow-ebpf-sockops-attach"),
+            std::ffi::OsString::from("ipars_cgroup_sockops"),
         ];
         let cli = Cli::try_parse_from(argv)?;
         let Command::Agent(args) = cli.command else {
@@ -19835,6 +20003,10 @@ mod tests {
         let mut sendmsg4_seen = false;
         let mut connect6_seen = false;
         let mut sendmsg6_seen = false;
+        let mut established4_seen = false;
+        let mut closing4_seen = false;
+        let mut established6_seen = false;
+        let mut closing6_seen = false;
         let mut observed = Vec::new();
 
         while Instant::now() < deadline {
@@ -19862,12 +20034,13 @@ mod tests {
             for flow in flows {
                 if observed.len() < 128 {
                     observed.push(format!(
-                        "{}:{:?} {:?} {:?}:{:?}",
+                        "{}:{:?} {:?} {:?}:{:?} state={:?}",
                         flow.destination,
                         flow.observation.destination_port,
                         flow.observation.protocol,
                         flow.observation.source,
-                        flow.observation.source_port
+                        flow.observation.source_port,
+                        flow.observation.tcp_state
                     ));
                 }
                 connect4_seen |= flow.destination == tcp4_destination.ip()
@@ -19886,18 +20059,64 @@ mod tests {
                     && flow.observation.protocol == Some(TransportProtocol::Udp)
                     && flow.observation.source == Some(udp6_source.ip())
                     && flow.observation.source_port == Some(udp6_source.port());
+                established4_seen |= flow.destination == tcp4_destination.ip()
+                    && flow.observation.destination_port == Some(tcp4_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Tcp)
+                    && flow.observation.source == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    && flow.observation.source_port.is_some()
+                    && flow.observation.tcp_state == Some(AgentPacketFlowTcpState::Established);
+                closing4_seen |= flow.destination == tcp4_destination.ip()
+                    && flow.observation.destination_port == Some(tcp4_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Tcp)
+                    && matches!(
+                        flow.observation.tcp_state,
+                        Some(
+                            AgentPacketFlowTcpState::FinWait
+                                | AgentPacketFlowTcpState::TimeWait
+                                | AgentPacketFlowTcpState::Close
+                                | AgentPacketFlowTcpState::CloseWait
+                                | AgentPacketFlowTcpState::LastAck
+                        )
+                    );
+                established6_seen |= flow.destination == tcp6_destination.ip()
+                    && flow.observation.destination_port == Some(tcp6_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Tcp)
+                    && flow.observation.source == Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                    && flow.observation.source_port.is_some()
+                    && flow.observation.tcp_state == Some(AgentPacketFlowTcpState::Established);
+                closing6_seen |= flow.destination == tcp6_destination.ip()
+                    && flow.observation.destination_port == Some(tcp6_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Tcp)
+                    && matches!(
+                        flow.observation.tcp_state,
+                        Some(
+                            AgentPacketFlowTcpState::FinWait
+                                | AgentPacketFlowTcpState::TimeWait
+                                | AgentPacketFlowTcpState::Close
+                                | AgentPacketFlowTcpState::CloseWait
+                                | AgentPacketFlowTcpState::LastAck
+                        )
+                    );
             }
             drop(tcp4_server);
             drop(tcp4_client);
             drop(tcp6_server);
             drop(tcp6_client);
-            if connect4_seen && sendmsg4_seen && connect6_seen && sendmsg6_seen {
+            if connect4_seen
+                && sendmsg4_seen
+                && connect6_seen
+                && sendmsg6_seen
+                && established4_seen
+                && closing4_seen
+                && established6_seen
+                && closing6_seen
+            {
                 return Ok(());
             }
         }
 
         anyhow::bail!(
-            "timed out waiting for cgroup packet-flow hooks: connect4_seen={connect4_seen}, sendmsg4_seen={sendmsg4_seen}, connect6_seen={connect6_seen}, sendmsg6_seen={sendmsg6_seen}, expected tcp4={tcp4_destination}, udp4={udp4_source}->{udp4_destination}, tcp6={tcp6_destination}, udp6={udp6_source}->{udp6_destination}, observed=[{}]",
+            "timed out waiting for cgroup packet-flow hooks: connect4_seen={connect4_seen}, sendmsg4_seen={sendmsg4_seen}, established4_seen={established4_seen}, closing4_seen={closing4_seen}, connect6_seen={connect6_seen}, sendmsg6_seen={sendmsg6_seen}, established6_seen={established6_seen}, closing6_seen={closing6_seen}, expected tcp4={tcp4_destination}, udp4={udp4_source}->{udp4_destination}, tcp6={tcp6_destination}, udp6={udp6_source}->{udp6_destination}, observed=[{}]",
             observed.join(", ")
         )
     }
@@ -23167,6 +23386,8 @@ exec sleep 60
             "/sys/fs/cgroup/ipars.slice",
             "--packet-flow-ebpf-cgroup-attach",
             "ipars_cgroup_connect4",
+            "--packet-flow-ebpf-sockops-attach",
+            "ipars_cgroup_sockops",
         ])?;
 
         if let Command::Agent(args) = cli.command {
