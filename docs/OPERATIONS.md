@@ -23,6 +23,8 @@ ipars init \
 
 With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and `C` locale rather than the operator's full environment. The Control Plane receives the operator credential by file path, not token value in argv. Its policy and metric routes are absent when no operator credential is configured. The bootstrap state directory and `logs/` directory are made owner-only, and service log files must be regular, non-symlink, non-hardlinked owner-only files. Without `--spawn-daemons`, run the emitted `iparsd control-plane`, `iparsd signal`, `iparsd stun`, and `iparsd relay` commands manually or under systemd.
 
+All file-backed daemon Bearer credentials must be direct regular files with one hard link, an owner-read bit, and no group or world permissions. Use mode `0400` or `0600`; the `umask 077` examples in this runbook create compliant files. The daemon rejects a final symlink component and verifies file identity across open/read, so mount the credential file itself rather than a symlink managed outside the deployment's trust boundary.
+
 Signal metrics also require a distinct operator token. For a manually supervised Signal service, generate one with `umask 077`, pass `--operator-api-bearer-token-path /etc/ipars/signal-operator-api.token`, and configure the same credential in the metrics scraper. If omitted, Signal metric routes remain absent while health and signed protocol routes continue operating.
 
 STUN HTTP metrics require another distinct token through `iparsd stun --operator-api-bearer-token-path /etc/ipars/stun-operator-api.token`. Omitting it removes only `/metrics` and `/v1/metrics`; UDP Binding, RFC5780 probes, and `/healthz` remain available.

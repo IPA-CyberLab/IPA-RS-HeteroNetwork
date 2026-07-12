@@ -63,6 +63,10 @@ Peer maps and node-scoped path status are available only through `POST /v1/peers
 
 The agent signs peer-map polling requests with its persisted owner-only state. Direct `ipars peers`, `ipars routes`, or `ipars path status` queries against a control-plane URL require `--agent-state-path`; the CLI rejects state/node mismatches and never places the private key in the URL, request body, command arguments, or logs.
 
+## Bearer Token Files
+
+Every file-backed `iparsd` operator API, Agent management API, and Relay admission credential uses the same bounded secret loader. On Unix, the final path component must be a single-link regular file that is owner-readable and has no group or world permission bits; direct symlinks, hardlinks, directories, oversized input, and owner-unreadable or broadly accessible files are rejected. The daemon opens with `O_NOFOLLOW | O_NONBLOCK`, verifies the opened device/inode against pre-open metadata, and rechecks the descriptor after reading so a final-component replacement race cannot redirect or block startup on a substituted FIFO. Parent-directory symlinks are not prohibited, so those directories remain part of the operator's trust boundary.
+
 ## Control-Plane Operator API
 
 Control-plane policy and metrics are available through `GET /v1/policy`, `GET /v1/metrics`, and `GET /metrics` only when `--operator-api-bearer-token` or `--operator-api-bearer-token-path` configures a 32-512 byte printable non-whitespace ASCII credential. When no credential is configured, these routes are not registered and return 404. When configured, missing or rejected credentials return 401 with a Bearer challenge, and comparison runs over a fixed maximum size.

@@ -10655,7 +10655,34 @@ fn read_api_bearer_token_file(path: &Path, api_label: &str) -> anyhow::Result<St
 }
 
 fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<String> {
-    let mut file = std::fs::File::open(path).with_context(|| {
+    let path_metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect {label} bearer token path {}",
+            path.display()
+        )
+    })?;
+    if path_metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "{label} bearer token path {} must not be a symlink",
+            path.display()
+        );
+    }
+    if !path_metadata.is_file() {
+        anyhow::bail!(
+            "{label} bearer token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    validate_open_bearer_token_file_metadata(path, label, &path_metadata, &path_metadata)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).with_context(|| {
         format!(
             "failed to open {label} bearer token file {}",
             path.display()
@@ -10673,6 +10700,7 @@ fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<St
             path.display()
         );
     }
+    validate_open_bearer_token_file_metadata(path, label, &path_metadata, &metadata)?;
     if metadata.len() > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
             "{label} bearer token file {} exceeds maximum size of {} bytes",
@@ -10696,7 +10724,59 @@ fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<St
             MAX_API_BEARER_TOKEN_FILE_BYTES
         );
     }
+    let final_metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to re-inspect {label} bearer token file {}",
+            path.display()
+        )
+    })?;
+    validate_open_bearer_token_file_metadata(path, label, &metadata, &final_metadata)?;
     Ok(token.trim().to_string())
+}
+
+fn validate_open_bearer_token_file_metadata(
+    path: &Path,
+    label: &str,
+    expected: &std::fs::Metadata,
+    opened: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    if !opened.is_file() {
+        anyhow::bail!(
+            "{label} bearer token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        anyhow::ensure!(
+            expected.dev() == opened.dev() && expected.ino() == opened.ino(),
+            "{label} bearer token file {} changed while it was being opened",
+            path.display()
+        );
+        anyhow::ensure!(
+            opened.nlink() == 1,
+            "{label} bearer token file {} must not have hard links",
+            path.display()
+        );
+        let mode = opened.permissions().mode() & 0o777;
+        anyhow::ensure!(
+            mode & 0o400 != 0,
+            "{label} bearer token file {} must be owner-readable",
+            path.display()
+        );
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "{label} bearer token file {} permissions are {mode:o}; expected owner-only access",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected;
+    }
+    Ok(())
 }
 
 fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
@@ -14412,7 +14492,7 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let cli = Cli::try_parse_from([
             "iparsd",
             "stun",
@@ -14709,7 +14789,7 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -14918,7 +14998,7 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let cli = Cli::try_parse_from([
             "iparsd",
             "signal",
@@ -15951,7 +16031,7 @@ mod tests {
 
         let dir = unique_test_dir("agent-relay-admission-token")?;
         let path = dir.join("admission.token");
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let path_arg = path.display().to_string();
         let file = Cli::try_parse_from([
             "iparsd",
@@ -21672,7 +21752,7 @@ exec sleep 60
         let dir = unique_test_dir("agent-api-token")?;
         let path = dir.join("api.token");
         let token = "agent-api-file-secret-with-at-least-32-bytes";
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let cli = Cli::try_parse_from([
             "iparsd",
             "agent",
@@ -21698,6 +21778,42 @@ exec sleep 60
         };
         assert!(error.to_string().contains("exceeds maximum size"));
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bearer_token_file_reader_rejects_unsafe_unix_files() -> anyhow::Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = unique_test_dir("bearer-token-file-security")?;
+        let path = dir.join("private.token");
+        let token = "private-bearer-token-with-at-least-32-bytes";
+        write_private_test_secret(&path, format!("{token}\n"))?;
+        assert_eq!(read_bounded_bearer_token_file(&path, "test")?, token);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        let error = read_bounded_bearer_token_file(&path, "test").unwrap_err();
+        assert!(error.to_string().contains("expected owner-only access"));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))?;
+        let error = read_bounded_bearer_token_file(&path, "test").unwrap_err();
+        assert!(error.to_string().contains("must be owner-readable"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+
+        let symlink_path = dir.join("symlink.token");
+        symlink(&path, &symlink_path)?;
+        let error = read_bounded_bearer_token_file(&symlink_path, "test").unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+
+        let hardlink_path = dir.join("hardlink.token");
+        std::fs::hard_link(&path, &hardlink_path)?;
+        let error = read_bounded_bearer_token_file(&path, "test").unwrap_err();
+        assert!(error.to_string().contains("must not have hard links"));
+
+        let error = read_bounded_bearer_token_file(&dir, "test").unwrap_err();
+        assert!(error.to_string().contains("must resolve to a regular file"));
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -22081,6 +22197,17 @@ exec sleep 60
         ));
         std::fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn write_private_test_secret(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        std::fs::write(path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -24506,7 +24633,7 @@ exec sleep 60
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let path_arg = path.display().to_string();
         let cli = Cli::try_parse_from(
             base.into_iter()
@@ -24546,7 +24673,7 @@ exec sleep 60
 
         let dir = unique_test_dir("relay-admission-token")?;
         let path = dir.join("admission.token");
-        std::fs::write(&path, format!("{token}\n"))?;
+        write_private_test_secret(&path, format!("{token}\n"))?;
         let path_arg = path.display().to_string();
         let file = Cli::try_parse_from(
             base.into_iter()
