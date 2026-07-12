@@ -12,6 +12,8 @@ The `ipars-load` harness is the executable load plan for 3-node, 10-node, and 10
 
 The 1000-node scenario samples active pairs rather than negotiating every possible pair, preserving the lazy-connect design assumption while still measuring peer-map fanout and path-state propagation.
 
+Daemon transport can launch fewer Agents than the scenario's design node count. Its executed active-pair count is `min(scenario samples, agents * (agents - 1))`; reports and retained manifests preserve both the scenario sample count and this executed workload count.
+
 ## Transports
 
 - `in-memory`: exercises control-plane and signal services without HTTP.

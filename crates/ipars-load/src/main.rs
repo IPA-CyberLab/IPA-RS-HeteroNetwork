@@ -91,7 +91,11 @@ struct Cli {
     #[arg(long, default_value = "iparsd")]
     iparsd_bin: PathBuf,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Spawned daemon Agents; executed active pairs are capped by the directed Agent topology"
+    )]
     daemon_agent_processes: usize,
 
     #[arg(long, default_value_t = 1)]
@@ -1208,13 +1212,16 @@ impl LoadReport {
                 expected_scenario.active_pair_count
             );
         }
-        if workload.daemon_agent_processes != self.daemon_agent_processes
+        if workload.daemon_active_pair_count != self.active_pair_count
+            || workload.daemon_agent_processes != self.daemon_agent_processes
             || workload.daemon_control_plane_processes != self.daemon_control_plane_processes
             || workload.relay_packets_per_session != self.relay_packets_per_session
             || workload.relay_payload_bytes != self.relay_payload_bytes_per_packet
         {
             bail!(
-                "daemon load scenario retained manifest daemon workload does not match report: agents={}/{}, control_planes={}/{}, relay_packets={}/{}, relay_payload={}/{}",
+                "daemon load scenario retained manifest daemon workload does not match report: active_pairs={}/{}, agents={}/{}, control_planes={}/{}, relay_packets={}/{}, relay_payload={}/{}",
+                workload.daemon_active_pair_count,
+                self.active_pair_count,
                 workload.daemon_agent_processes,
                 self.daemon_agent_processes,
                 workload.daemon_control_plane_processes,
@@ -2913,11 +2920,7 @@ async fn run_daemon_scenario(
     services.write_manifest(DaemonRuntimePhase::SignalNegotiation)?;
     let signal_started = Instant::now();
     let advertised_routes = daemon_advertised_route_count(&peer_records);
-    let active_pair_count = if agent_statuses.len() > 1 {
-        scenario.active_pair_count
-    } else {
-        0
-    };
+    let active_pair_count = daemon_active_pair_count(scenario, agent_statuses.len());
     services.ensure_running(DaemonRuntimePhase::SignalNegotiation)?;
 
     services.write_manifest(DaemonRuntimePhase::AgentPathValidation)?;
@@ -3707,6 +3710,10 @@ fn expected_daemon_agent_path_count(active_pair_count: usize, node_count: usize)
     active_pair_count.min(node_count.saturating_mul(node_count.saturating_sub(1)))
 }
 
+fn daemon_active_pair_count(scenario: Scenario, agent_processes: usize) -> usize {
+    expected_daemon_agent_path_count(scenario.active_pair_count, agent_processes)
+}
+
 fn daemon_agent_activity_pairs(
     statuses: &[AgentStatusResponse],
     active_pair_count: usize,
@@ -4220,6 +4227,8 @@ struct DaemonRuntimeManifestWorkload {
     scenario_relay_node_count: usize,
     scenario_route_provider_count: usize,
     scenario_active_pair_count: usize,
+    #[serde(default)]
+    daemon_active_pair_count: usize,
     daemon_control_plane_processes: usize,
     daemon_agent_processes: usize,
     daemon_http_readiness_timeout_seconds: u64,
@@ -5018,6 +5027,10 @@ impl DaemonProcessGroup {
                 scenario_relay_node_count: scenario.relay_count,
                 scenario_route_provider_count: scenario.route_provider_count,
                 scenario_active_pair_count: scenario.active_pair_count,
+                daemon_active_pair_count: daemon_active_pair_count(
+                    scenario,
+                    options.agent_processes,
+                ),
                 daemon_control_plane_processes: options.control_plane_processes,
                 daemon_agent_processes: options.agent_processes,
                 daemon_http_readiness_timeout_seconds: options.http_readiness_timeout.as_secs(),
@@ -9725,6 +9738,33 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
         assert!(error.contains("scenario workload"));
         std::fs::remove_dir_all(&runtime_dir)?;
 
+        let mut mismatched_daemon_pair_workload = daemon_report.clone();
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &mismatched_daemon_pair_workload,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        mismatched_daemon_pair_workload.daemon_runtime_dir = Some(runtime_dir.clone());
+        mismatched_daemon_pair_workload.daemon_runtime_manifest = Some(manifest_path.clone());
+        mutate_retained_daemon_manifest(&manifest_path, |manifest| {
+            manifest.workload.daemon_active_pair_count -= 1;
+        })?;
+        let error = match mismatched_daemon_pair_workload.validate_success() {
+            Ok(_) => bail!(
+                "retained manifest with mismatched daemon pair workload should fail validation"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("daemon workload"));
+        std::fs::remove_dir_all(&runtime_dir)?;
+
         let mut mismatched_readiness_timeout = daemon_report.clone();
         let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
             &mismatched_readiness_timeout,
@@ -11901,6 +11941,71 @@ fi
     }
 
     #[test]
+    fn daemon_active_pairs_match_launched_agent_topology() {
+        assert_eq!(
+            daemon_active_pair_count(Scenario::from_name(ScenarioName::Three), 3),
+            6
+        );
+        assert_eq!(
+            daemon_active_pair_count(Scenario::from_name(ScenarioName::Ten), 3),
+            6
+        );
+        assert_eq!(
+            daemon_active_pair_count(Scenario::from_name(ScenarioName::Ten), 4),
+            12
+        );
+        assert_eq!(
+            daemon_active_pair_count(Scenario::from_name(ScenarioName::Ten), 10),
+            30
+        );
+        assert_eq!(
+            daemon_active_pair_count(Scenario::from_name(ScenarioName::Thousand), 3),
+            6
+        );
+        assert_eq!(
+            daemon_active_pair_count(Scenario::from_name(ScenarioName::Thousand), 1),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_daemon_manifest_separates_scenario_and_executed_pairs() -> anyhow::Result<()> {
+        let mut report = valid_daemon_report_for_validation().await?;
+        report.scenario = ScenarioName::Ten;
+        report.relay_count = 2;
+        report.daemon_control_plane_relay_candidates_min = 2;
+        report.daemon_control_plane_relay_candidates_max = 2;
+        report.daemon_control_plane_failover_relay_candidates_min = 2;
+        report.daemon_control_plane_failover_relay_candidates_max = 2;
+
+        let (runtime_dir, manifest_path) = write_synthetic_retained_daemon_manifest(
+            &report,
+            DaemonRuntimePhase::Completed,
+            &[
+                "control-plane-0",
+                "control-plane-1",
+                "signal",
+                "relay",
+                "stun",
+                "agent",
+            ],
+        )?;
+        report.daemon_runtime_dir = Some(runtime_dir.clone());
+        report.daemon_runtime_manifest = Some(manifest_path.clone());
+
+        let manifest: DaemonRuntimeManifest = serde_json::from_slice(&read_bounded_regular_file(
+            &manifest_path,
+            "partial daemon manifest",
+            MAX_DAEMON_RUNTIME_MANIFEST_BYTES,
+        )?)?;
+        assert_eq!(manifest.workload.scenario_active_pair_count, 30);
+        assert_eq!(manifest.workload.daemon_active_pair_count, 6);
+        report.validate_success()?;
+        std::fs::remove_dir_all(runtime_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn daemon_agent_activity_pairs_deduplicate_wrapped_pairs() {
         let statuses = (0..4)
             .map(|index| agent_status_for_summary(index, 1))
@@ -12343,6 +12448,7 @@ fi
             scenario_relay_node_count: 1,
             scenario_route_provider_count: 1,
             scenario_active_pair_count: 6,
+            daemon_active_pair_count: 2,
             daemon_control_plane_processes: 2,
             daemon_agent_processes: 2,
             daemon_http_readiness_timeout_seconds: 5,
@@ -12499,15 +12605,17 @@ fi
         }
 
         let updated_at = Utc::now();
+        let scenario = Scenario::from_name(report.scenario);
         let manifest =
             DaemonRuntimeManifest {
                 scenario: report.scenario,
                 phase,
                 workload: DaemonRuntimeManifestWorkload {
-                    scenario_node_count: report.node_count,
-                    scenario_relay_node_count: report.relay_count,
-                    scenario_route_provider_count: report.route_provider_count,
-                    scenario_active_pair_count: report.active_pair_count,
+                    scenario_node_count: scenario.node_count,
+                    scenario_relay_node_count: scenario.relay_count,
+                    scenario_route_provider_count: scenario.route_provider_count,
+                    scenario_active_pair_count: scenario.active_pair_count,
+                    daemon_active_pair_count: report.active_pair_count,
                     daemon_control_plane_processes: report.daemon_control_plane_processes,
                     daemon_agent_processes: report.daemon_agent_processes,
                     daemon_http_readiness_timeout_seconds: 5,
