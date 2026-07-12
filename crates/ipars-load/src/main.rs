@@ -33,7 +33,8 @@ use ipars_types::api::{
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
     EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NodeHealth,
-    NodeId, NodeRecord, PathState, RelayCapability, Role, Route, Tag, TokenPolicy,
+    NodeId, NodeRecord, PathMetrics, PathQualityObservation, PathState, RelayCapability, Role,
+    Route, Tag, TokenPolicy,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -206,6 +207,11 @@ struct LoadReport {
     peer_map_requests: usize,
     peer_map_edges_seen: usize,
     signal_negotiations: usize,
+    path_quality_observations_submitted: usize,
+    path_quality_observations_accepted: u64,
+    path_quality_observations_stale: u64,
+    path_quality_observations_path_mismatch: u64,
+    path_quality_observations_rejected: u64,
     relay_candidates: usize,
     direct_public_paths: usize,
     direct_ipv6_paths: usize,
@@ -412,6 +418,7 @@ impl LoadReport {
         match self.transport {
             TransportMode::InMemory | TransportMode::Http => {
                 self.validate_registration_and_paths("load scenario", true, self.node_count)?;
+                self.validate_path_quality_observations("load scenario")?;
                 if self.relay_count > 0 && self.relay_candidates < self.relay_count {
                     bail!(
                         "load scenario reported {} relay candidates, expected at least {}",
@@ -911,6 +918,38 @@ impl LoadReport {
             bail!(
                 "{context} reported {} unreachable paths",
                 self.unreachable_paths
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_path_quality_observations(&self, context: &str) -> anyhow::Result<()> {
+        let expected = self
+            .signal_negotiations
+            .saturating_sub(self.unreachable_paths);
+        if self.path_quality_observations_submitted != expected {
+            bail!(
+                "{context} submitted {} path quality observations, expected one for each of {expected} reachable negotiations",
+                self.path_quality_observations_submitted
+            );
+        }
+        let expected_accepted = u64::try_from(expected)
+            .context("expected path quality observation count exceeds u64")?;
+        if self.path_quality_observations_accepted != expected_accepted {
+            bail!(
+                "{context} Signal accepted {} path quality observations, expected {expected_accepted}",
+                self.path_quality_observations_accepted
+            );
+        }
+        if self.path_quality_observations_stale != 0
+            || self.path_quality_observations_path_mismatch != 0
+            || self.path_quality_observations_rejected != 0
+        {
+            bail!(
+                "{context} Signal reported non-accepted path quality observations: stale={}, path_mismatch={}, rejected={}",
+                self.path_quality_observations_stale,
+                self.path_quality_observations_path_mismatch,
+                self.path_quality_observations_rejected
             );
         }
         Ok(())
@@ -1989,22 +2028,39 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
     let signal_started = Instant::now();
     let advertised_routes = nodes.iter().map(|node| node.routes.len()).sum();
     let mut path_counts = PathCounts::default();
+    let mut path_quality_observations_submitted = 0;
     for pair_index in 0..scenario.active_pair_count {
         let (source_index, target_index) = active_pair_indices(pair_index, nodes.len());
         let source = &nodes[source_index];
         let target = &nodes[target_index];
-        let response = registry
-            .negotiate(SignalPathRequest {
-                source: source.node_id.clone(),
-                target: target.node_id.clone(),
-                source_candidates: source.endpoint_candidates.clone(),
-                source_nat_classification: None,
-                desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
-            })
-            .await?;
+        let request = SignalPathRequest {
+            source: source.node_id.clone(),
+            target: target.node_id.clone(),
+            source_candidates: source.endpoint_candidates.clone(),
+            source_nat_classification: None,
+            desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
+        };
+        let baseline = registry.negotiate(request.clone()).await?;
+        let response =
+            if let Some(observation) = synthetic_path_quality_observation(&baseline, pair_index)? {
+                path_quality_observations_submitted += 1;
+                let observed = registry
+                    .negotiate_with_observation(request, Some(observation))
+                    .await?;
+                anyhow::ensure!(
+                    observed.preferred_state == baseline.preferred_state,
+                    "synthetic path observation changed selected state from {:?} to {:?}",
+                    baseline.preferred_state,
+                    observed.preferred_state
+                );
+                observed
+            } else {
+                baseline
+            };
         path_counts.record(response.preferred_state);
     }
     let signal_millis = signal_started.elapsed().as_millis();
+    let signal_metrics = registry.metrics().await;
 
     Ok(LoadReport {
         transport: TransportMode::InMemory,
@@ -2018,6 +2074,12 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         peer_map_requests: nodes.len(),
         peer_map_edges_seen,
         signal_negotiations: scenario.active_pair_count,
+        path_quality_observations_submitted,
+        path_quality_observations_accepted: signal_metrics.path_quality_observation_accepted_count,
+        path_quality_observations_stale: signal_metrics.path_quality_observation_stale_count,
+        path_quality_observations_path_mismatch: signal_metrics
+            .path_quality_observation_path_mismatch_count,
+        path_quality_observations_rejected: signal_metrics.path_quality_observation_rejected_count,
         relay_candidates: registry.relay_candidates().await.len(),
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
@@ -2242,29 +2304,55 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
     let signal_started = Instant::now();
     let advertised_routes = nodes.iter().map(|node| node.routes.len()).sum();
     let mut path_counts = PathCounts::default();
+    let mut path_quality_observations_submitted = 0;
     for pair_index in 0..scenario.active_pair_count {
         let (source_index, target_index) = active_pair_indices(pair_index, nodes.len());
         let source = &nodes[source_index];
         let target = &nodes[target_index];
-        let response: SignalPathResponse = post_json(
+        let request = SignalPathRequest {
+            source: source.node_id.clone(),
+            target: target.node_id.clone(),
+            source_candidates: source.endpoint_candidates.clone(),
+            source_nat_classification: None,
+            desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
+        };
+        let baseline: SignalPathResponse = post_json(
             &client,
             format!("{}/v1/paths/negotiate", services.signal_url),
-            &authenticated_signal_path_request(
-                source_index,
-                SignalPathRequest {
-                    source: source.node_id.clone(),
-                    target: target.node_id.clone(),
-                    source_candidates: source.endpoint_candidates.clone(),
-                    source_nat_classification: None,
-                    desired_routes: target.routes.iter().map(|route| route.cidr).collect(),
-                },
-            )?,
+            &authenticated_signal_path_request(source_index, request.clone(), None)?,
             "signal path negotiation",
         )
         .await?;
+        let response =
+            if let Some(observation) = synthetic_path_quality_observation(&baseline, pair_index)? {
+                path_quality_observations_submitted += 1;
+                let observed: SignalPathResponse = post_json(
+                    &client,
+                    format!("{}/v1/paths/negotiate", services.signal_url),
+                    &authenticated_signal_path_request(source_index, request, Some(observation))?,
+                    "observed signal path negotiation",
+                )
+                .await?;
+                anyhow::ensure!(
+                    observed.preferred_state == baseline.preferred_state,
+                    "synthetic HTTP path observation changed selected state from {:?} to {:?}",
+                    baseline.preferred_state,
+                    observed.preferred_state
+                );
+                observed
+            } else {
+                baseline
+            };
         path_counts.record(response.preferred_state);
     }
     let signal_millis = signal_started.elapsed().as_millis();
+    let signal_metrics: SignalMetricsResponse = get_json_with_bearer(
+        &client,
+        format!("{}/v1/metrics", services.signal_url),
+        "signal metrics",
+        LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN,
+    )
+    .await?;
 
     Ok(LoadReport {
         transport: TransportMode::Http,
@@ -2278,6 +2366,12 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         peer_map_requests: nodes.len(),
         peer_map_edges_seen,
         signal_negotiations: scenario.active_pair_count,
+        path_quality_observations_submitted,
+        path_quality_observations_accepted: signal_metrics.path_quality_observation_accepted_count,
+        path_quality_observations_stale: signal_metrics.path_quality_observation_stale_count,
+        path_quality_observations_path_mismatch: signal_metrics
+            .path_quality_observation_path_mismatch_count,
+        path_quality_observations_rejected: signal_metrics.path_quality_observation_rejected_count,
         relay_candidates,
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
@@ -2285,7 +2379,10 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_paths: path_counts.relay,
         unreachable_paths: path_counts.unreachable,
         control_plane_http_requests: nodes.len() * 3 + scenario.relay_count + 1,
-        signal_http_requests: nodes.len() + scenario.active_pair_count,
+        signal_http_requests: nodes.len()
+            + scenario.active_pair_count
+            + path_quality_observations_submitted
+            + 1,
         relay_http_requests: 0,
         stun_http_requests: 0,
         relay_udp_sessions: 0,
@@ -2529,6 +2626,11 @@ async fn run_relay_udp_scenario(
         peer_map_requests: 0,
         peer_map_edges_seen: 0,
         signal_negotiations: 0,
+        path_quality_observations_submitted: 0,
+        path_quality_observations_accepted: 0,
+        path_quality_observations_stale: 0,
+        path_quality_observations_path_mismatch: 0,
+        path_quality_observations_rejected: 0,
         relay_candidates: 1,
         direct_public_paths: 0,
         direct_ipv6_paths: 0,
@@ -3310,6 +3412,14 @@ async fn run_daemon_scenario(
         peer_map_requests: total_peer_map_requests,
         peer_map_edges_seen,
         signal_negotiations: active_pair_count,
+        path_quality_observations_submitted: signal_path_quality_observation_total(
+            &signal_metrics,
+        )?,
+        path_quality_observations_accepted: signal_metrics.path_quality_observation_accepted_count,
+        path_quality_observations_stale: signal_metrics.path_quality_observation_stale_count,
+        path_quality_observations_path_mismatch: signal_metrics
+            .path_quality_observation_path_mismatch_count,
+        path_quality_observations_rejected: signal_metrics.path_quality_observation_rejected_count,
         relay_candidates: control_summary.relay_candidate_count_min,
         direct_public_paths: path_counts.direct_public,
         direct_ipv6_paths: path_counts.direct_ipv6,
@@ -7717,9 +7827,78 @@ fn control_plane_node_query_request(
     Ok(request)
 }
 
+fn synthetic_path_quality_observation(
+    response: &SignalPathResponse,
+    pair_index: usize,
+) -> anyhow::Result<Option<PathQualityObservation>> {
+    let (selected_candidate, relay_node) = match response.preferred_state {
+        PathState::DirectPublic | PathState::DirectIpv6 | PathState::DirectNatTraversal => {
+            let candidate = response
+                .target_candidates
+                .iter()
+                .filter(|candidate| {
+                    response
+                        .preferred_state
+                        .allows_selected_candidate_kind(candidate.kind)
+                })
+                .min_by(|left, right| {
+                    left.cost
+                        .cmp(&right.cost)
+                        .then_with(|| right.priority.cmp(&left.priority))
+                })
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "synthetic load path {:?} has no matching target candidate",
+                        response.preferred_state
+                    )
+                })?;
+            (Some(candidate), None)
+        }
+        PathState::Relay => {
+            let relay_node = response
+                .relay_candidates
+                .first()
+                .map(|relay| relay.node_id.clone())
+                .context("synthetic load relay path has no relay candidate")?;
+            (None, Some(relay_node))
+        }
+        PathState::Unreachable => return Ok(None),
+    };
+    Ok(Some(PathQualityObservation {
+        selected_state: response.preferred_state,
+        selected_candidate,
+        relay_node,
+        metrics: PathMetrics {
+            latency_ms: Some(5.0 + (pair_index % 100) as f32),
+            loss_ppm: 0,
+            jitter_ms: Some(1.0 + (pair_index % 5) as f32 * 0.1),
+            relay_load: None,
+            stability: 0.95,
+        },
+        sample_count: 5,
+        successful_sample_count: 5,
+        observed_at: Utc::now(),
+    }))
+}
+
+fn signal_path_quality_observation_total(metrics: &SignalMetricsResponse) -> anyhow::Result<usize> {
+    let total = [
+        metrics.path_quality_observation_accepted_count,
+        metrics.path_quality_observation_stale_count,
+        metrics.path_quality_observation_path_mismatch_count,
+        metrics.path_quality_observation_rejected_count,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add)
+    .context("Signal path quality observation counters overflowed")?;
+    usize::try_from(total).context("Signal path quality observation count exceeds usize")
+}
+
 fn authenticated_signal_path_request(
     index: usize,
     request: SignalPathRequest,
+    path_observation: Option<PathQualityObservation>,
 ) -> anyhow::Result<AuthenticatedSignalPathRequest> {
     let identity = identity_for_index(index);
     anyhow::ensure!(
@@ -7728,7 +7907,7 @@ fn authenticated_signal_path_request(
     );
     let mut authenticated = AuthenticatedSignalPathRequest {
         request,
-        path_observation: None,
+        path_observation,
         request_signature: None,
     };
     authenticated.request_signature = Some(
@@ -7952,6 +8131,20 @@ mod tests {
         }
     }
 
+    fn assert_reachable_path_quality_observations_accepted(report: &LoadReport) {
+        let reachable_paths = report
+            .signal_negotiations
+            .saturating_sub(report.unreachable_paths);
+        assert_eq!(report.path_quality_observations_submitted, reachable_paths);
+        assert_eq!(
+            report.path_quality_observations_accepted,
+            reachable_paths as u64
+        );
+        assert_eq!(report.path_quality_observations_stale, 0);
+        assert_eq!(report.path_quality_observations_path_mismatch, 0);
+        assert_eq!(report.path_quality_observations_rejected, 0);
+    }
+
     #[tokio::test]
     async fn load_harness_runs_three_node_scenario() -> anyhow::Result<()> {
         let report = run_in_memory_scenario(Scenario::from_name(ScenarioName::Three)).await?;
@@ -7963,6 +8156,8 @@ mod tests {
         assert_eq!(report.advertised_routes, 1);
         assert_eq!(report.peer_map_edges_seen, 6);
         assert_eq!(report.signal_negotiations, 6);
+        assert_eq!(report.path_quality_observations_submitted, 4);
+        assert_reachable_path_quality_observations_accepted(&report);
         assert_eq!(report.control_plane_http_requests, 0);
         assert_eq!(report.signal_http_requests, 0);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
@@ -7982,8 +8177,10 @@ mod tests {
         assert_eq!(report.advertised_routes, 1);
         assert_eq!(report.peer_map_edges_seen, 6);
         assert_eq!(report.signal_negotiations, 6);
+        assert_eq!(report.path_quality_observations_submitted, 4);
+        assert_reachable_path_quality_observations_accepted(&report);
         assert_eq!(report.control_plane_http_requests, 11);
-        assert_eq!(report.signal_http_requests, 9);
+        assert_eq!(report.signal_http_requests, 14);
         assert_eq!(report.daemon_control_plane_healthy_nodes, 0);
         assert_eq!(report.daemon_signal_health_reports, 0);
         report.validate_success()?;
@@ -8170,6 +8367,22 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             Err(error) => error.to_string(),
         };
         assert!(error.contains("advertised"));
+
+        let mut missing_path_observation = report.clone();
+        missing_path_observation.path_quality_observations_submitted -= 1;
+        let error = match missing_path_observation.validate_success() {
+            Ok(_) => bail!("missing path quality observation should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("path quality observations"));
+
+        let mut mismatched_path_observation = report.clone();
+        mismatched_path_observation.path_quality_observations_path_mismatch = 1;
+        let error = match mismatched_path_observation.validate_success() {
+            Ok(_) => bail!("path-mismatched observation should fail validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("non-accepted path quality observations"));
 
         let relay_report = run_relay_udp_scenario(
             Scenario::from_name(ScenarioName::Three),
@@ -11494,6 +11707,7 @@ fi
         assert_eq!(report.advertised_routes, 25);
         assert_eq!(report.peer_map_edges_seen, 999_000);
         assert_eq!(report.signal_negotiations, 2_000);
+        assert_reachable_path_quality_observations_accepted(&report);
         assert!(report.signal_negotiations < report.peer_map_edges_seen);
         Ok(())
     }

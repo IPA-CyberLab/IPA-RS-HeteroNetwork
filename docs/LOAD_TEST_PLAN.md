@@ -30,6 +30,7 @@ Each report is validated before command success. The harness rejects:
 - missing control-plane path-state or signed `/v1/paths/query` propagation;
 - unauthenticated or unavailable control-plane operator metrics during HTTP/daemon runs;
 - unauthenticated or unavailable Signal operator metrics during HTTP/daemon runs;
+- missing signed path-quality observations for reachable active pairs, or any Signal `stale`, `path_mismatch`, or `rejected` observation disposition;
 - unauthenticated or unavailable STUN operator metrics during daemon runs;
 - unauthenticated or unavailable Relay operator metrics during relay/daemon runs;
 - unavailable Bearer-authenticated Relay admission during relay/daemon runs;
@@ -65,6 +66,7 @@ Track these fields across runs:
 - registration count and registration time;
 - peer-map edge count and per-control-plane endpoint min/max;
 - selected path-state totals;
+- submitted and Signal-accepted path-quality observation totals, including non-accepted disposition counters;
 - relay-candidate count and relay capacity counters;
 - relay UDP packet and byte throughput;
 - daemon child process count, readiness time, and failure phase;
