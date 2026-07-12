@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
+use std::fs::File;
 use std::io::{Read, SeekFrom};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -14,7 +15,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use axum::Router;
 use aya::maps::{MapData, RingBuf};
-use aya::programs::TracePoint;
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, TracePoint};
 use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
@@ -145,6 +146,7 @@ const DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS: usize = 131_072;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS: usize = 4096;
 const DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP: &str = PACKET_FLOW_RINGBUF_MAP;
 const MAX_PACKET_FLOW_EBPF_ATTACH_SPECS: usize = 32;
+const MAX_PACKET_FLOW_EBPF_CGROUP_ATTACH_SPECS: usize = 16;
 const MAX_PACKET_FLOW_READ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PACKET_FLOW_LINE_BYTES: usize = 64 * 1024;
 const MAX_PACKET_FLOW_RECORDS: usize = 1_048_576;
@@ -764,6 +766,14 @@ struct AgentArgs {
         value_name = "PROGRAM:CATEGORY:NAME"
     )]
     packet_flow_ebpf_attach: Vec<String>,
+    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_CGROUP_PATH")]
+    packet_flow_ebpf_cgroup_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_PACKET_FLOW_EBPF_CGROUP_ATTACH",
+        value_name = "PROGRAM"
+    )]
+    packet_flow_ebpf_cgroup_attach: Vec<String>,
     #[arg(
         long,
         env = "IPARS_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
@@ -1122,6 +1132,7 @@ struct RuntimePreflightNeeds {
     docker_api_socket: bool,
     conntrack_procfs_path: bool,
     ebpf_jsonl_event_path: bool,
+    ebpf_cgroup_path: bool,
     ipv4_forwarding: bool,
     ipv6_forwarding: bool,
     cap_net_admin: bool,
@@ -1145,6 +1156,7 @@ impl RuntimePreflightNeeds {
             docker_api_socket: false,
             conntrack_procfs_path: false,
             ebpf_jsonl_event_path: false,
+            ebpf_cgroup_path: false,
             ipv4_forwarding: false,
             ipv6_forwarding: false,
             cap_net_admin: false,
@@ -1167,6 +1179,7 @@ impl RuntimePreflightNeeds {
             && !self.docker_api_socket
             && !self.conntrack_procfs_path
             && !self.ebpf_jsonl_event_path
+            && !self.ebpf_cgroup_path
             && !self.ipv4_forwarding
             && !self.ipv6_forwarding
             && !self.cap_net_admin
@@ -1213,6 +1226,7 @@ struct RuntimePreflightChecks {
     cap_bpf: fn() -> anyhow::Result<()>,
     ebpf_object: fn(&Path) -> anyhow::Result<()>,
     ebpf_tracepoint: fn(&EbpfTracepointAttachSpec) -> anyhow::Result<()>,
+    ebpf_cgroup: fn(&Path) -> anyhow::Result<()>,
     linux_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     relay_forwarder_netns: fn(&LinuxNetworkNamespace) -> anyhow::Result<()>,
     netlink: fn(RuntimeNetlinkProtocol) -> anyhow::Result<()>,
@@ -1232,6 +1246,7 @@ impl RuntimePreflightChecks {
             cap_bpf: ensure_cap_bpf_if_known,
             ebpf_object: ensure_ebpf_object_file_ready,
             ebpf_tracepoint: ensure_ebpf_tracepoint_ready,
+            ebpf_cgroup: ensure_ebpf_cgroup_path_ready,
             linux_netns: ensure_linux_netns_ready,
             relay_forwarder_netns: ensure_relay_forwarder_netns_ready,
             netlink: ensure_netlink_protocol_ready,
@@ -1435,6 +1450,13 @@ fn preflight_agent_runtime_with_path_and_checks(
             .context("--packet-flow-ebpf-event-path is required")?;
         ensure_ebpf_jsonl_event_path_ready(event_path)?;
     }
+    if needs.ebpf_cgroup_path {
+        let cgroup_path = args
+            .packet_flow_ebpf_cgroup_path
+            .as_deref()
+            .context("--packet-flow-ebpf-cgroup-path is required")?;
+        (checks.ebpf_cgroup)(cgroup_path)?;
+    }
     if needs.ipv4_forwarding {
         (checks.ipv4_forwarding)()?;
     }
@@ -1479,6 +1501,7 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_docker_api_socket = needs.docker_api_socket,
         needs_conntrack_procfs_path = needs.conntrack_procfs_path,
         needs_ebpf_jsonl_event_path = needs.ebpf_jsonl_event_path,
+        needs_ebpf_cgroup_path = needs.ebpf_cgroup_path,
         needs_ipv4_forwarding = needs.ipv4_forwarding,
         needs_ipv6_forwarding = needs.ipv6_forwarding,
         needs_cap_net_admin = needs.cap_net_admin,
@@ -1659,10 +1682,12 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--packet-flow-ebpf-ringbuf-map",
         )?;
         anyhow::ensure!(
-            !args.packet_flow_ebpf_attach.is_empty(),
-            "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
+            !args.packet_flow_ebpf_attach.is_empty()
+                || !args.packet_flow_ebpf_cgroup_attach.is_empty(),
+            "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach must be set when --packet-flow-detector ebpf-ringbuf is set"
         );
         validate_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
+        validate_packet_flow_ebpf_cgroup_config(args)?;
         validate_bounded_usize(
             args.packet_flow_ebpf_ringbuf_max_events,
             "--packet-flow-ebpf-ringbuf-max-events",
@@ -1889,6 +1914,34 @@ fn parse_packet_flow_ebpf_attach_specs(
     Ok(specs)
 }
 
+fn validate_packet_flow_ebpf_cgroup_config(args: &AgentArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.packet_flow_ebpf_cgroup_attach.len()
+            <= MAX_PACKET_FLOW_EBPF_CGROUP_ATTACH_SPECS,
+        "--packet-flow-ebpf-cgroup-attach may be repeated at most {MAX_PACKET_FLOW_EBPF_CGROUP_ATTACH_SPECS} times"
+    );
+    anyhow::ensure!(
+        args.packet_flow_ebpf_cgroup_path.is_some()
+            || args.packet_flow_ebpf_cgroup_attach.is_empty(),
+        "--packet-flow-ebpf-cgroup-path is required when --packet-flow-ebpf-cgroup-attach is set"
+    );
+    anyhow::ensure!(
+        args.packet_flow_ebpf_cgroup_path.is_none()
+            || !args.packet_flow_ebpf_cgroup_attach.is_empty(),
+        "--packet-flow-ebpf-cgroup-path requires at least one --packet-flow-ebpf-cgroup-attach"
+    );
+
+    let mut seen = BTreeSet::new();
+    for program in &args.packet_flow_ebpf_cgroup_attach {
+        validate_ebpf_identifier(program, "--packet-flow-ebpf-cgroup-attach program")?;
+        anyhow::ensure!(
+            seen.insert(program),
+            "--packet-flow-ebpf-cgroup-attach must not repeat `{program}`"
+        );
+    }
+    Ok(())
+}
+
 fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Result<()> {
     if args.packet_flow_detector != PacketFlowDetector::ProcNetConntrack {
         anyhow::ensure!(
@@ -1910,6 +1963,14 @@ fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Resu
         anyhow::ensure!(
             args.packet_flow_ebpf_attach.is_empty(),
             "--packet-flow-ebpf-attach requires --packet-flow-detector ebpf-ringbuf"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_cgroup_path.is_none(),
+            "--packet-flow-ebpf-cgroup-path requires --packet-flow-detector ebpf-ringbuf"
+        );
+        anyhow::ensure!(
+            args.packet_flow_ebpf_cgroup_attach.is_empty(),
+            "--packet-flow-ebpf-cgroup-attach requires --packet-flow-detector ebpf-ringbuf"
         );
     }
     if args.packet_flow_detector == PacketFlowDetector::Disabled {
@@ -2248,6 +2309,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     let conntrack_procfs_path = args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack
         && args.packet_flow_conntrack_path.is_some();
     let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
+    let ebpf_tracepoints = ebpf_ringbuf && !args.packet_flow_ebpf_attach.is_empty();
+    let ebpf_cgroup = ebpf_ringbuf && !args.packet_flow_ebpf_cgroup_attach.is_empty();
     let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
     let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
     let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
@@ -2258,9 +2321,10 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
             docker_api_socket,
             conntrack_procfs_path,
             ebpf_jsonl_event_path: ebpf_jsonl,
-            cap_net_admin: netfilter_netlink,
+            ebpf_cgroup_path: ebpf_cgroup,
+            cap_net_admin: netfilter_netlink || ebpf_cgroup,
             cap_sys_admin: relay_forwarder_netns,
-            cap_perfmon: ebpf_ringbuf,
+            cap_perfmon: ebpf_tracepoints,
             cap_bpf: ebpf_ringbuf,
             relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
@@ -2271,6 +2335,10 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
             docker_api_socket,
             conntrack_procfs_path,
             ebpf_jsonl_event_path: ebpf_jsonl,
+            ebpf_cgroup_path: ebpf_cgroup,
+            cap_net_admin: ebpf_cgroup,
+            cap_perfmon: ebpf_tracepoints,
+            cap_bpf: ebpf_ringbuf,
             cap_sys_admin: relay_forwarder_netns,
             relay_forwarder_netns,
             ..RuntimePreflightNeeds::none()
@@ -2308,16 +2376,18 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         docker_api_socket,
         conntrack_procfs_path,
         ebpf_jsonl_event_path: ebpf_jsonl,
+        ebpf_cgroup_path: ebpf_cgroup,
         ipv4_forwarding,
         ipv6_forwarding,
         cap_net_admin: applies_routes
             || (applies_wireguard && !applies_wireguard_with_userspace_command)
-            || netfilter_netlink,
+            || netfilter_netlink
+            || ebpf_cgroup,
         cap_net_raw: applies_wireguard && !applies_wireguard_with_userspace_command,
         cap_sys_admin: (args.linux_netns.is_some()
             && (applies_routes || applies_wireguard || starts_userspace_wireguard))
             || relay_forwarder_netns,
-        cap_perfmon: ebpf_ringbuf,
+        cap_perfmon: ebpf_tracepoints,
         cap_bpf: ebpf_ringbuf,
         linux_netns: args.linux_netns.is_some()
             && (applies_routes || applies_wireguard || starts_userspace_wireguard),
@@ -3040,7 +3110,7 @@ fn ensure_runtime_executable_file(path: &Path, label: &str) -> anyhow::Result<()
 fn ensure_cap_net_admin_if_known() -> anyhow::Result<()> {
     if let Some(false) = process_has_capability(CAP_NET_ADMIN_BIT)? {
         anyhow::bail!(
-            "agent runtime preflight requires CAP_NET_ADMIN for kernel networking or conntrack netlink access"
+            "agent runtime preflight requires CAP_NET_ADMIN for kernel networking, conntrack netlink access, or cgroup eBPF attachment"
         );
     }
     Ok(())
@@ -3101,6 +3171,52 @@ fn ensure_ebpf_object_file_ready(path: &Path) -> anyhow::Result<()> {
         path.display()
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_ebpf_cgroup_path_ready(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "eBPF packet-flow cgroup path {} is not readable",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "eBPF packet-flow cgroup path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "eBPF packet-flow cgroup path {} must be a directory",
+        path.display()
+    );
+    let filesystem = nix::sys::statfs::statfs(path).with_context(|| {
+        format!(
+            "failed to inspect filesystem for eBPF packet-flow cgroup path {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        filesystem.filesystem_type() == nix::sys::statfs::CGROUP2_SUPER_MAGIC,
+        "eBPF packet-flow cgroup path {} must be on a cgroup v2 filesystem",
+        path.display()
+    );
+    File::open(path).with_context(|| {
+        format!(
+            "failed to open eBPF packet-flow cgroup path {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_ebpf_cgroup_path_ready(path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "eBPF packet-flow cgroup path {} requires Linux cgroup v2",
+        path.display()
+    )
 }
 
 fn ensure_ebpf_jsonl_event_path_ready(path: &Path) -> anyhow::Result<()> {
@@ -7151,7 +7267,9 @@ async fn run_agent(
                 detector = args.packet_flow_detector.as_str(),
                 object_path = %config.object_path.display(),
                 ringbuf_map = %config.ringbuf_map,
-                attachments = config.attachments.len(),
+                tracepoint_attachments = config.attachments.len(),
+                cgroup_path = ?config.cgroup_path,
+                cgroup_attachments = config.cgroup_attachments.len(),
                 retry_interval_seconds = args.packet_flow_poll_interval_seconds,
                 max_events_per_wake = limits.max_events_per_wake,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
@@ -12892,6 +13010,41 @@ fn load_ebpf_ringbuf_packet_flow_reader(
                 )
             })?;
     }
+    if let Some(cgroup_path) = &config.cgroup_path {
+        let cgroup = File::open(cgroup_path).with_context(|| {
+            format!(
+                "failed to open eBPF packet-flow cgroup {}",
+                cgroup_path.display()
+            )
+        })?;
+        for program_name in &config.cgroup_attachments {
+            let program: &mut CgroupSockAddr = bpf
+                .program_mut(program_name)
+                .with_context(|| {
+                    format!(
+                        "eBPF packet-flow object {} does not contain cgroup socket-address program `{program_name}`",
+                        config.object_path.display()
+                    )
+                })?
+                .try_into()
+                .with_context(|| {
+                    format!(
+                        "eBPF program `{program_name}` is not a cgroup socket-address program"
+                    )
+                })?;
+            program
+                .load()
+                .with_context(|| format!("failed to load eBPF cgroup program `{program_name}`"))?;
+            program
+                .attach(&cgroup, CgroupAttachMode::Single)
+                .with_context(|| {
+                    format!(
+                        "failed to attach eBPF program `{program_name}` to cgroup {}",
+                        cgroup_path.display()
+                    )
+                })?;
+        }
+    }
 
     let map = bpf.take_map(&config.ringbuf_map).with_context(|| {
         format!(
@@ -13251,6 +13404,8 @@ struct EbpfRingbufConfig {
     object_path: PathBuf,
     ringbuf_map: String,
     attachments: Vec<EbpfTracepointAttachSpec>,
+    cgroup_path: Option<PathBuf>,
+    cgroup_attachments: Vec<String>,
 }
 
 impl EbpfRingbufConfig {
@@ -13264,14 +13419,18 @@ impl EbpfRingbufConfig {
             "--packet-flow-ebpf-ringbuf-map",
         )?;
         anyhow::ensure!(
-            !args.packet_flow_ebpf_attach.is_empty(),
-            "--packet-flow-ebpf-attach must be set at least once when --packet-flow-detector ebpf-ringbuf is set"
+            !args.packet_flow_ebpf_attach.is_empty()
+                || !args.packet_flow_ebpf_cgroup_attach.is_empty(),
+            "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach must be set when --packet-flow-detector ebpf-ringbuf is set"
         );
         let attachments = parse_packet_flow_ebpf_attach_specs(&args.packet_flow_ebpf_attach)?;
+        validate_packet_flow_ebpf_cgroup_config(args)?;
         Ok(Self {
             object_path,
             ringbuf_map: args.packet_flow_ebpf_ringbuf_map.clone(),
             attachments,
+            cgroup_path: args.packet_flow_ebpf_cgroup_path.clone(),
+            cgroup_attachments: args.packet_flow_ebpf_cgroup_attach.clone(),
         })
     }
 }
@@ -18175,6 +18334,32 @@ mod tests {
                 "--packet-flow-ebpf-attach requires --packet-flow-detector ebpf-ringbuf",
             ),
             (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                ],
+                "--packet-flow-ebpf-cgroup-path requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-jsonl",
+                    "--packet-flow-ebpf-event-path",
+                    "/run/ipars/events.jsonl",
+                    "--packet-flow-ebpf-cgroup-attach",
+                    "ipars_cgroup_connect4",
+                ],
+                "--packet-flow-ebpf-cgroup-attach requires --packet-flow-detector ebpf-ringbuf",
+            ),
+            (
                 vec!["iparsd", "agent", "--packet-flow-pin"],
                 "--packet-flow-pin requires --packet-flow-detector to be enabled",
             ),
@@ -18673,10 +18858,49 @@ mod tests {
             );
             let config = EbpfRingbufConfig::from_args(&args)?;
             assert_eq!(config.attachments.len(), 2);
+            assert!(config.cgroup_path.is_none());
+            assert!(config.cgroup_attachments.is_empty());
             assert_eq!(config.attachments[0].program, "ipars_ingress");
             assert_eq!(config.attachments[0].category, "net");
             assert_eq!(config.attachments[0].name, "netif_receive_skb");
             assert!(args.packet_flow_pin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_args_accept_ebpf_cgroup_packet_flow_hooks() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-cgroup-path",
+            "/sys/fs/cgroup/ipars.slice",
+            "--packet-flow-ebpf-cgroup-attach",
+            "ipars_cgroup_connect4",
+            "--packet-flow-ebpf-cgroup-attach",
+            "ipars_cgroup_sendmsg4",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            validate_agent_runtime_config(&args)?;
+            let config = EbpfRingbufConfig::from_args(&args)?;
+            assert!(config.attachments.is_empty());
+            assert_eq!(
+                config.cgroup_path.as_deref(),
+                Some(Path::new("/sys/fs/cgroup/ipars.slice"))
+            );
+            assert_eq!(
+                config.cgroup_attachments,
+                ["ipars_cgroup_connect4", "ipars_cgroup_sendmsg4"]
+            );
             return Ok(());
         }
 
@@ -18710,7 +18934,7 @@ mod tests {
                     "--packet-flow-ebpf-object-path",
                     "/run/ipars/ipars-packet-flow.bpf.o",
                 ],
-                "--packet-flow-ebpf-attach must be set at least once",
+                "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach",
             ),
             (
                 vec![
@@ -18762,7 +18986,7 @@ mod tests {
                     "--packet-flow-ebpf-object-path",
                     "/run/ipars/ipars-packet-flow.bpf.o",
                 ],
-                "--packet-flow-ebpf-attach must be set at least once",
+                "at least one --packet-flow-ebpf-attach or --packet-flow-ebpf-cgroup-attach",
             ),
             (
                 vec![
@@ -18873,6 +19097,115 @@ mod tests {
         } else {
             anyhow::bail!("expected agent command");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_ebpf_cgroup_packet_flow_config_must_be_consistent() -> anyhow::Result<()> {
+        for (argv, expected) in [
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-attach",
+                    "ipars_cgroup_connect4",
+                ],
+                "--packet-flow-ebpf-cgroup-path is required",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                    "--packet-flow-ebpf-attach",
+                    "ipars_sys_enter_connect:syscalls:sys_enter_connect",
+                ],
+                "--packet-flow-ebpf-cgroup-path requires at least one",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                    "--packet-flow-ebpf-cgroup-attach",
+                    "bad/program",
+                ],
+                "--packet-flow-ebpf-cgroup-attach program",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--packet-flow-detector",
+                    "ebpf-ringbuf",
+                    "--packet-flow-ebpf-object-path",
+                    "/run/ipars/ipars-packet-flow.bpf.o",
+                    "--packet-flow-ebpf-cgroup-path",
+                    "/sys/fs/cgroup",
+                    "--packet-flow-ebpf-cgroup-attach",
+                    "ipars_cgroup_connect4",
+                    "--packet-flow-ebpf-cgroup-attach",
+                    "ipars_cgroup_connect4",
+                ],
+                "--packet-flow-ebpf-cgroup-attach must not repeat",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv)?;
+            if let Command::Agent(args) = cli.command {
+                let error = match validate_agent_runtime_config(&args) {
+                    Ok(()) => anyhow::bail!("unexpected valid eBPF cgroup config"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains(expected),
+                    "expected `{expected}`, got `{error}`"
+                );
+            } else {
+                anyhow::bail!("expected agent command");
+            }
+        }
+
+        let mut too_many = vec![
+            "iparsd".to_string(),
+            "agent".to_string(),
+            "--packet-flow-detector".to_string(),
+            "ebpf-ringbuf".to_string(),
+            "--packet-flow-ebpf-object-path".to_string(),
+            "/run/ipars/ipars-packet-flow.bpf.o".to_string(),
+            "--packet-flow-ebpf-cgroup-path".to_string(),
+            "/sys/fs/cgroup".to_string(),
+        ];
+        for index in 0..=MAX_PACKET_FLOW_EBPF_CGROUP_ATTACH_SPECS {
+            too_many.push("--packet-flow-ebpf-cgroup-attach".to_string());
+            too_many.push(format!("ipars_cgroup_{index}"));
+        }
+        let cli = Cli::try_parse_from(too_many)?;
+        if let Command::Agent(args) = cli.command {
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("unexpected valid oversized eBPF cgroup config"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--packet-flow-ebpf-cgroup-attach may be repeated at most 16 times"));
+        } else {
+            anyhow::bail!("expected agent command");
+        }
+
         Ok(())
     }
 
@@ -19282,6 +19615,8 @@ mod tests {
                     "ipars_sys_enter_sendmsg:syscalls:sys_enter_sendmsg",
                 )?,
             ],
+            cgroup_path: None,
+            cgroup_attachments: Vec::new(),
         };
         ensure_ebpf_object_file_ready(&config.object_path)?;
         for attachment in &config.attachments {
@@ -19344,6 +19679,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ebpf_ringbuf_privileged_cgroup_hooks_read_connect_and_sendmsg_events(
+    ) -> anyhow::Result<()> {
+        if !env_flag_enabled("IPARS_RUN_EBPF_ATTACH_TESTS") {
+            eprintln!(
+                "skipping eBPF cgroup attach integration test; set IPARS_RUN_EBPF_ATTACH_TESTS=1 to run it"
+            );
+            return Ok(());
+        }
+
+        let object_path = std::env::var_os("IPARS_EBPF_OBJECT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/ebpf/ipars-packet-flow.bpf.o"));
+        let cgroup_path = std::env::var_os("IPARS_EBPF_CGROUP_PATH")
+            .map(PathBuf::from)
+            .map_or_else(current_process_cgroup_v2_path, Ok)?;
+        let config = EbpfRingbufConfig {
+            object_path,
+            ringbuf_map: DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP.to_string(),
+            attachments: Vec::new(),
+            cgroup_path: Some(cgroup_path.clone()),
+            cgroup_attachments: vec![
+                "ipars_cgroup_connect4".to_string(),
+                "ipars_cgroup_connect6".to_string(),
+                "ipars_cgroup_sendmsg4".to_string(),
+                "ipars_cgroup_sendmsg6".to_string(),
+            ],
+        };
+        ensure_ebpf_object_file_ready(&config.object_path)?;
+        ensure_ebpf_cgroup_path_ready(&cgroup_path)?;
+
+        let mut reader = load_ebpf_ringbuf_packet_flow_reader(&config)?;
+        let tcp_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let tcp_destination = tcp_listener.local_addr()?;
+        let udp_receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let udp_sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let udp_destination = udp_receiver.local_addr()?;
+        let udp_source = udp_sender.local_addr()?;
+        let limits = EbpfRingbufReadLimits {
+            max_events_per_wake: 512,
+        };
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut connect_seen = false;
+        let mut sendmsg_seen = false;
+        let mut observed = Vec::new();
+
+        while Instant::now() < deadline {
+            let client = std::net::TcpStream::connect(tcp_destination)?;
+            let (server, _) = tcp_listener.accept()?;
+            udp_sender.send_to(b"ipars-ebpf-cgroup-sendmsg-smoke", udp_destination)?;
+
+            let Ok(guard_result) =
+                tokio::time::timeout(Duration::from_millis(300), reader.ringbuf.readable_mut())
+                    .await
+            else {
+                drop(server);
+                drop(client);
+                continue;
+            };
+            let mut guard = guard_result.with_context(|| {
+                format!(
+                    "failed to wait for eBPF packet-flow ring buffer `{}`",
+                    config.ringbuf_map
+                )
+            })?;
+            let flows = drain_ebpf_ringbuf_packet_flows(guard.get_inner_mut(), limits)?;
+            guard.clear_ready();
+            for flow in flows {
+                if observed.len() < 64 {
+                    observed.push(format!(
+                        "{}:{:?} {:?} {:?}:{:?}",
+                        flow.destination,
+                        flow.observation.destination_port,
+                        flow.observation.protocol,
+                        flow.observation.source,
+                        flow.observation.source_port
+                    ));
+                }
+                connect_seen |= flow.destination == tcp_destination.ip()
+                    && flow.observation.destination_port == Some(tcp_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Tcp);
+                sendmsg_seen |= flow.destination == udp_destination.ip()
+                    && flow.observation.destination_port == Some(udp_destination.port())
+                    && flow.observation.protocol == Some(TransportProtocol::Udp)
+                    && flow.observation.source == Some(udp_source.ip())
+                    && flow.observation.source_port == Some(udp_source.port());
+            }
+            drop(server);
+            drop(client);
+            if connect_seen && sendmsg_seen {
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!(
+            "timed out waiting for cgroup packet-flow hooks: connect_seen={connect_seen}, sendmsg_seen={sendmsg_seen}, expected tcp={tcp_destination}, udp={udp_source}->{udp_destination}, observed=[{}]",
+            observed.join(", ")
+        )
+    }
+
+    fn current_process_cgroup_v2_path() -> anyhow::Result<PathBuf> {
+        let membership = std::fs::read_to_string("/proc/self/cgroup")
+            .context("failed to read current cgroup membership")?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .context("current process is not in a cgroup v2 hierarchy")?;
+        let relative = Path::new(relative)
+            .strip_prefix("/")
+            .context("current cgroup v2 membership must be absolute")?;
+        anyhow::ensure!(
+            relative.components().all(|component| matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )),
+            "current cgroup v2 membership contains unsafe path components"
+        );
+        Ok(Path::new("/sys/fs/cgroup").join(relative))
     }
 
     #[test]
@@ -22191,6 +22646,10 @@ exec sleep 60
         )
     }
 
+    fn preflight_fail_ebpf_cgroup(path: &Path) -> anyhow::Result<()> {
+        anyhow::bail!("blocked test eBPF cgroup {}", path.display())
+    }
+
     fn preflight_fail_ipv4_forwarding() -> anyhow::Result<()> {
         anyhow::bail!("blocked test net.ipv4.ip_forward")
     }
@@ -22240,6 +22699,7 @@ exec sleep 60
             cap_bpf: preflight_noop,
             ebpf_object: preflight_noop_ebpf_object,
             ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
+            ebpf_cgroup: preflight_noop_path,
             linux_netns: preflight_noop_netns,
             relay_forwarder_netns: preflight_noop_netns,
             netlink,
@@ -22262,6 +22722,7 @@ exec sleep 60
             cap_bpf: preflight_noop,
             ebpf_object: preflight_noop_ebpf_object,
             ebpf_tracepoint: preflight_noop_ebpf_tracepoint,
+            ebpf_cgroup: preflight_noop_path,
             linux_netns: preflight_noop_netns,
             relay_forwarder_netns: preflight_noop_netns,
             netlink: preflight_noop_netlink,
@@ -22571,6 +23032,49 @@ exec sleep 60
     }
 
     #[test]
+    fn runtime_preflight_requires_cgroup_ebpf_caps_and_path() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--packet-flow-detector",
+            "ebpf-ringbuf",
+            "--packet-flow-ebpf-object-path",
+            "/run/ipars/ipars-packet-flow.bpf.o",
+            "--packet-flow-ebpf-cgroup-path",
+            "/sys/fs/cgroup/ipars.slice",
+            "--packet-flow-ebpf-cgroup-attach",
+            "ipars_cgroup_connect4",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ebpf_cgroup_path);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_perfmon);
+            assert!(needs.cap_bpf);
+
+            let mut checks = test_preflight_checks(preflight_noop_netlink);
+            checks.ebpf_cgroup = preflight_fail_ebpf_cgroup;
+            let error = match preflight_agent_runtime_with_path_and_checks(
+                &args,
+                Some(OsStr::new("")),
+                checks,
+            ) {
+                Ok(()) => anyhow::bail!("unexpected successful eBPF cgroup preflight"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("blocked test eBPF cgroup /sys/fs/cgroup/ipars.slice"));
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
     fn runtime_preflight_requires_forwarding_for_route_underlay() -> anyhow::Result<()> {
         let docker = Cli::try_parse_from([
             "iparsd",
@@ -22713,6 +23217,40 @@ exec sleep 60
         assert!(directory_error
             .to_string()
             .contains("must be a regular file"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ebpf_cgroup_preflight_rejects_non_directory_and_symlink() -> anyhow::Result<()> {
+        let base = unique_test_dir("ebpf-cgroup-preflight")?;
+        let regular = base.join("regular");
+        std::fs::write(&regular, b"not a cgroup")?;
+        let regular_error = match ensure_ebpf_cgroup_path_ready(&regular) {
+            Ok(()) => anyhow::bail!("unexpected successful regular-file cgroup preflight"),
+            Err(error) => error,
+        };
+        assert!(regular_error.to_string().contains("must be a directory"));
+
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::create_dir(&target)?;
+        std::os::unix::fs::symlink(&target, &link)?;
+        let link_error = match ensure_ebpf_cgroup_path_ready(&link) {
+            Ok(()) => anyhow::bail!("unexpected successful symlink cgroup preflight"),
+            Err(error) => error,
+        };
+        assert!(link_error.to_string().contains("must not be a symlink"));
+
+        let directory_error = match ensure_ebpf_cgroup_path_ready(&target) {
+            Ok(()) => anyhow::bail!("unexpected successful non-cgroup-v2 preflight"),
+            Err(error) => error,
+        };
+        assert!(directory_error
+            .to_string()
+            .contains("must be on a cgroup v2 filesystem"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

@@ -7,13 +7,16 @@ mod ipars_ebpf_abi;
 
 use aya_ebpf::{
     helpers::bpf_probe_read_user,
-    macros::{map, tracepoint},
+    macros::{cgroup_sock_addr, map, tracepoint},
     maps::RingBuf,
-    programs::TracePointContext,
+    programs::{SockAddrContext, TracePointContext},
 };
 use ipars_ebpf_abi::{
     PacketFlowEvent, PacketFlowEventFields, PACKET_FLOW_IP_FAMILY_IPV4, PACKET_FLOW_IP_FAMILY_IPV6,
-    PACKET_FLOW_PROTOCOL_UNKNOWN, PACKET_FLOW_TCP_STATE_UNKNOWN,
+    PACKET_FLOW_PROTOCOL_AH, PACKET_FLOW_PROTOCOL_ESP, PACKET_FLOW_PROTOCOL_GRE,
+    PACKET_FLOW_PROTOCOL_ICMP, PACKET_FLOW_PROTOCOL_ICMPV6, PACKET_FLOW_PROTOCOL_IPIP,
+    PACKET_FLOW_PROTOCOL_IPV6_ENCAP, PACKET_FLOW_PROTOCOL_SCTP, PACKET_FLOW_PROTOCOL_TCP,
+    PACKET_FLOW_PROTOCOL_UDP, PACKET_FLOW_PROTOCOL_UNKNOWN, PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 
 const AF_INET: u16 = 2;
@@ -75,6 +78,135 @@ pub fn ipars_sys_enter_sendto(ctx: TracePointContext) -> u32 {
 pub fn ipars_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
     emit_msghdr_name_arg(&ctx, SENDMSG_MSGHDR_ARG);
     0
+}
+
+#[cgroup_sock_addr(connect4)]
+pub fn ipars_cgroup_connect4(ctx: SockAddrContext) -> i32 {
+    emit_cgroup_ipv4(&ctx, false);
+    1
+}
+
+#[cgroup_sock_addr(connect6)]
+pub fn ipars_cgroup_connect6(ctx: SockAddrContext) -> i32 {
+    emit_cgroup_ipv6(&ctx, false);
+    1
+}
+
+#[cgroup_sock_addr(sendmsg4)]
+pub fn ipars_cgroup_sendmsg4(ctx: SockAddrContext) -> i32 {
+    emit_cgroup_ipv4(&ctx, true);
+    1
+}
+
+#[cgroup_sock_addr(sendmsg6)]
+pub fn ipars_cgroup_sendmsg6(ctx: SockAddrContext) -> i32 {
+    emit_cgroup_ipv6(&ctx, true);
+    1
+}
+
+#[inline(always)]
+fn emit_cgroup_ipv4(ctx: &SockAddrContext, use_message_source: bool) {
+    let sock_addr = unsafe { &*ctx.sock_addr };
+    let mut destination = [0_u8; 16];
+    destination[..4].copy_from_slice(&sock_addr.user_ip4.to_ne_bytes());
+    let (socket_source, source_port_be) = socket_source_ipv4(ctx);
+    let message_source = sock_addr.msg_src_ip4.to_ne_bytes();
+    let source_ipv4 = if use_message_source && message_source != [0; 4] {
+        message_source
+    } else {
+        socket_source
+    };
+    let mut source = [0_u8; 16];
+    source[..4].copy_from_slice(&source_ipv4);
+    emit_event(PacketFlowEvent::new(PacketFlowEventFields {
+        ip_family: PACKET_FLOW_IP_FAMILY_IPV4,
+        protocol: supported_protocol(sock_addr.protocol),
+        tcp_state: PACKET_FLOW_TCP_STATE_UNKNOWN,
+        conntrack_status: 0,
+        source_port_be,
+        destination_port_be: (sock_addr.user_port as u16).to_ne_bytes(),
+        source,
+        destination,
+    }));
+}
+
+#[inline(always)]
+fn emit_cgroup_ipv6(ctx: &SockAddrContext, use_message_source: bool) {
+    let sock_addr = unsafe { &*ctx.sock_addr };
+    let socket_source = socket_source_ipv6(ctx);
+    let message_source = network_ipv6_bytes(sock_addr.msg_src_ip6);
+    let source = if use_message_source && message_source != [0; 16] {
+        message_source
+    } else {
+        socket_source.0
+    };
+    emit_event(PacketFlowEvent::new(PacketFlowEventFields {
+        ip_family: PACKET_FLOW_IP_FAMILY_IPV6,
+        protocol: supported_protocol(sock_addr.protocol),
+        tcp_state: PACKET_FLOW_TCP_STATE_UNKNOWN,
+        conntrack_status: 0,
+        source_port_be: socket_source.1,
+        destination_port_be: (sock_addr.user_port as u16).to_ne_bytes(),
+        source,
+        destination: network_ipv6_bytes(sock_addr.user_ip6),
+    }));
+}
+
+#[inline(always)]
+fn socket_source_ipv4(ctx: &SockAddrContext) -> ([u8; 4], [u8; 2]) {
+    let socket = unsafe { (*ctx.sock_addr).__bindgen_anon_1.sk };
+    if socket.is_null() {
+        return ([0; 4], [0; 2]);
+    }
+    unsafe {
+        (
+            (*socket).src_ip4.to_ne_bytes(),
+            ((*socket).src_port as u16).to_be_bytes(),
+        )
+    }
+}
+
+#[inline(always)]
+fn socket_source_ipv6(ctx: &SockAddrContext) -> ([u8; 16], [u8; 2]) {
+    let socket = unsafe { (*ctx.sock_addr).__bindgen_anon_1.sk };
+    if socket.is_null() {
+        return ([0; 16], [0; 2]);
+    }
+    unsafe {
+        (
+            network_ipv6_bytes((*socket).src_ip6),
+            ((*socket).src_port as u16).to_be_bytes(),
+        )
+    }
+}
+
+#[inline(always)]
+fn network_ipv6_bytes(words: [u32; 4]) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[0..4].copy_from_slice(&words[0].to_ne_bytes());
+    bytes[4..8].copy_from_slice(&words[1].to_ne_bytes());
+    bytes[8..12].copy_from_slice(&words[2].to_ne_bytes());
+    bytes[12..16].copy_from_slice(&words[3].to_ne_bytes());
+    bytes
+}
+
+#[inline(always)]
+fn supported_protocol(protocol: u32) -> u8 {
+    match protocol {
+        value if value == PACKET_FLOW_PROTOCOL_ICMP as u32 => PACKET_FLOW_PROTOCOL_ICMP,
+        value if value == PACKET_FLOW_PROTOCOL_IPIP as u32 => PACKET_FLOW_PROTOCOL_IPIP,
+        value if value == PACKET_FLOW_PROTOCOL_TCP as u32 => PACKET_FLOW_PROTOCOL_TCP,
+        value if value == PACKET_FLOW_PROTOCOL_UDP as u32 => PACKET_FLOW_PROTOCOL_UDP,
+        value if value == PACKET_FLOW_PROTOCOL_IPV6_ENCAP as u32 => {
+            PACKET_FLOW_PROTOCOL_IPV6_ENCAP
+        }
+        value if value == PACKET_FLOW_PROTOCOL_GRE as u32 => PACKET_FLOW_PROTOCOL_GRE,
+        value if value == PACKET_FLOW_PROTOCOL_ESP as u32 => PACKET_FLOW_PROTOCOL_ESP,
+        value if value == PACKET_FLOW_PROTOCOL_AH as u32 => PACKET_FLOW_PROTOCOL_AH,
+        value if value == PACKET_FLOW_PROTOCOL_ICMPV6 as u32 => PACKET_FLOW_PROTOCOL_ICMPV6,
+        value if value == PACKET_FLOW_PROTOCOL_SCTP as u32 => PACKET_FLOW_PROTOCOL_SCTP,
+        _ => PACKET_FLOW_PROTOCOL_UNKNOWN,
+    }
 }
 
 fn emit_sockaddr_arg(ctx: &TracePointContext, sockaddr_arg_index: usize, len_arg_index: usize) {

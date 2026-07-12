@@ -172,6 +172,12 @@ run_ebpf_attach_smoke() {
     "$cargo_bin" test --locked -p ipars-daemon \
       tests::ebpf_ringbuf_privileged_attach_reads_sendto_event -- \
       --exact --nocapture
+  env \
+    IPARS_RUN_EBPF_ATTACH_TESTS=1 \
+    IPARS_EBPF_OBJECT_PATH="${ebpf_object_path}" \
+    "$cargo_bin" test --locked -p ipars-daemon \
+      tests::ebpf_ringbuf_privileged_cgroup_hooks_read_connect_and_sendmsg_events -- \
+      --exact --nocapture
 }
 
 preflight_netns
