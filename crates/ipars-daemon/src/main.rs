@@ -9018,18 +9018,16 @@ where
     W: WireGuardBackend,
     R: RouteManager,
 {
-    if args.relay_forwarder_endpoint.is_some() || args.relay_forwarder_bind.is_some() {
-        let mut resolver = RuntimePeerEndpointResolver::new(runtime.clone());
-        if let Some(endpoint) = args.relay_forwarder_endpoint {
-            resolver = resolver.with_relay_forwarder_endpoint(endpoint);
-        }
-        tracing::info!(
-            relay_forwarder_endpoint = ?args.relay_forwarder_endpoint,
-            relay_forwarder_bind = ?args.relay_forwarder_bind,
-            "using relay-aware endpoint resolver for WireGuard peers"
-        );
-        applier = applier.with_endpoint_resolver(resolver);
+    let mut resolver = RuntimePeerEndpointResolver::new(runtime.clone());
+    if let Some(endpoint) = args.relay_forwarder_endpoint {
+        resolver = resolver.with_relay_forwarder_endpoint(endpoint);
     }
+    tracing::info!(
+        relay_forwarder_endpoint = ?args.relay_forwarder_endpoint,
+        relay_forwarder_bind = ?args.relay_forwarder_bind,
+        "using negotiated path-aware endpoint resolver for WireGuard peers"
+    );
+    applier = applier.with_endpoint_resolver(resolver);
     applier.with_lazy_connect_runtime(runtime)
 }
 
@@ -13230,6 +13228,128 @@ mod tests {
             routes: Vec::new(),
             registered_at: Utc::now(),
         }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingWireGuardBackend {
+        peers: Arc<tokio::sync::RwLock<BTreeMap<NodeId, ipars_agent::WireGuardPeerConfig>>>,
+    }
+
+    #[async_trait]
+    impl WireGuardBackend for RecordingWireGuardBackend {
+        async fn upsert_peer(
+            &self,
+            config: ipars_agent::WireGuardPeerConfig,
+        ) -> Result<(), AgentError> {
+            self.peers.write().await.insert(config.peer.clone(), config);
+            Ok(())
+        }
+
+        async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError> {
+            self.peers.write().await.remove(peer);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_map_sync_uses_negotiated_path_without_relay_forwarder_config(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert!(args.relay_forwarder_endpoint.is_none());
+        assert!(args.relay_forwarder_bind.is_none());
+
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-path-aware");
+        let selected_candidate = EndpointCandidate {
+            node_id: peer_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 20], 51_820)),
+            observed_at: Utc::now(),
+            priority: 50,
+            cost: 50,
+            source: CandidateSource::StunProbe,
+        };
+        let mut peer = node_record("peer-path-aware");
+        peer.endpoint_candidates = vec![
+            EndpointCandidate {
+                node_id: peer_id.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 1,
+                source: CandidateSource::ControlPlane,
+            },
+            selected_candidate.clone(),
+        ];
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local.clone(), peer_id.clone()),
+                selected_state: PathState::DirectNatTraversal,
+                selected_candidate: Some(selected_candidate.clone()),
+                relay_node: None,
+                score: PathScore {
+                    value: 90.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: true,
+            })
+            .await?;
+
+        let wireguard = RecordingWireGuardBackend::default();
+        let recorded_peers = wireguard.peers.clone();
+        let applier = PeerMapApplier::new("ipars0", wireguard, DryRunLinuxRouteManager);
+        let applier = configure_peer_map_endpoint_resolver(&args, runtime.clone(), applier);
+        let peer_map = || PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer.clone()],
+            generated_at: Utc::now(),
+        };
+
+        applier.apply_peer_map(peer_map()).await?;
+        {
+            let peers = recorded_peers.read().await;
+            let config = peers
+                .get(&peer_id)
+                .context("negotiated peer should be applied")?;
+            assert_eq!(
+                config.endpoint.as_deref(),
+                Some(selected_candidate.addr.to_string().as_str())
+            );
+            assert_eq!(config.persistent_keepalive_seconds, Some(25));
+        }
+
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local, peer_id.clone()),
+                selected_state: PathState::Unreachable,
+                selected_candidate: None,
+                relay_node: None,
+                score: PathScore {
+                    value: 0.0,
+                    reasons: Vec::new(),
+                },
+                updated_at: Utc::now(),
+                pinned: true,
+            })
+            .await?;
+        applier.apply_peer_map(peer_map()).await?;
+
+        let peers = recorded_peers.read().await;
+        let config = peers
+            .get(&peer_id)
+            .context("unreachable peer should remain configured without an endpoint")?;
+        assert!(config.endpoint.is_none());
+        assert!(config.persistent_keepalive_seconds.is_none());
+        Ok(())
     }
 
     fn test_route_plan(
