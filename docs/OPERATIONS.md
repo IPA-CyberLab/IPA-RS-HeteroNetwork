@@ -25,6 +25,8 @@ With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and 
 
 Signal metrics also require a distinct operator token. For a manually supervised Signal service, generate one with `umask 077`, pass `--operator-api-bearer-token-path /etc/ipars/signal-operator-api.token`, and configure the same credential in the metrics scraper. If omitted, Signal metric routes remain absent while health and signed protocol routes continue operating.
 
+STUN HTTP metrics require another distinct token through `iparsd stun --operator-api-bearer-token-path /etc/ipars/stun-operator-api.token`. Omitting it removes only `/metrics` and `/v1/metrics`; UDP Binding, RFC5780 probes, and `/healthz` remain available.
+
 Signal must be able to reach at least one control-plane API to authenticate node registrations. Configure repeated `iparsd signal --control-plane-url http://control-plane-a:8443 --control-plane-url http://control-plane-b:8443` values, or the comma-delimited `IPARS_SIGNAL_CONTROL_PLANE_URLS` environment variable. The default authenticated-membership TTL is 90 seconds; agents refresh every 30 seconds. Tune it with `--node-auth-ttl-seconds` or `IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS` between 1 and 3600 seconds, keeping it above the refresh interval and consistent across redundant Signal instances.
 
 Revoke a join token with the same trusted issuer key family used to mint it:
@@ -83,19 +85,21 @@ an ephemeral STUN bind only because its two host-network agents run with the
 non-mutating `dry-run` backend.
 
 Before starting the bundled stack, place the signed join token at
-`docker/join.token` and create distinct Control Plane, Signal, and Agent management tokens:
+`docker/join.token` and create distinct Control Plane, Signal, STUN, and Agent management tokens:
 
 ```bash
 umask 077
 head -c 32 /dev/urandom | base64 > docker/control-plane-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/signal-operator-api.token
+head -c 32 /dev/urandom | base64 > docker/stun-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/agent-api.token
 ```
 
 Set `IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE`, or
+`IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE`,
+`IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE`, or
 `IPARS_AGENT_API_BEARER_TOKEN_FILE` when a token lives at a different host path.
-Keep all three credentials distinct.
+Keep all four credentials distinct.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait
@@ -222,7 +226,7 @@ ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 
 ipars stun probe --stun-server 127.0.0.1:3478
 ```
 
-Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. Agent metrics use the same Bearer authentication as its `/v1/*` routes when configured. Control Plane and Signal metrics require their distinct operator Bearer credentials and are absent when those credentials are not configured. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
+Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and agent HTTP services. Agent metrics use the same Bearer authentication as its `/v1/*` routes when configured. Control Plane, Signal, and STUN metrics require distinct operator Bearer credentials and are absent when those credentials are not configured. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
 
 ## Failure Behavior
 

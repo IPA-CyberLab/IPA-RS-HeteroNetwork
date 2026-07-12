@@ -94,10 +94,13 @@ services:
     environment:
       IPARS_ROLE: stun
       IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}
+      IPARS_STUN_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-stun-operator-api-bearer-token
     ports:
       - "3478:3478/udp"
       - "3480:3480/udp"
       - "3479:3479"
+    secrets:
+      - ipars-stun-operator-api-bearer-token
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3479/healthz >/dev/null"]
       interval: 10s
@@ -229,6 +232,8 @@ secrets:
     file: ${IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE:-./control-plane-operator-api.token}
   ipars-signal-operator-api-bearer-token:
     file: ${IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE:-./signal-operator-api.token}
+  ipars-stun-operator-api-bearer-token:
+    file: ${IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE:-./stun-operator-api.token}
   ipars-agent-join-token:
     file: ./join.token
   ipars-agent-api-bearer-token:

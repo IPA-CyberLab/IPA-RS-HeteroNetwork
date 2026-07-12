@@ -75,6 +75,12 @@ Signal JSON and Prometheus metrics are available through `GET /v1/metrics` and `
 
 Compose mounts the Signal credential from its own file-backed secret. Keep it distinct from Control Plane, Agent, issuer, join, node-identity, and relay credentials, and use TLS whenever metric traffic leaves trusted private transport.
 
+## STUN Operator API
+
+STUN JSON and Prometheus metrics use `GET /v1/metrics` and `GET /metrics` only when `iparsd stun --operator-api-bearer-token` or `--operator-api-bearer-token-path` configures a separate 32-512 byte printable non-whitespace ASCII credential. Without one, both metric routes return 404. With one, missing or rejected credentials return 401 with a Bearer challenge and fixed-bound constant-time comparison. `/healthz`, UDP Binding requests, and RFC5780 filtering probes remain public because clients need them before joining the overlay.
+
+Compose mounts a distinct STUN operator secret. This Bearer control protects HTTP observations but does not encrypt them; use TLS for metric traffic outside trusted private transport and keep the credential separate from all node, issuer, relay, and other operator material.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.
@@ -107,6 +113,7 @@ Implemented controls:
 - Keep Agent API Bearer tokens owner-only, separate from join tokens, and pass them through `--api-bearer-token-path`, Compose secrets, or a distinct Kubernetes Secret key.
 - Keep the Control Plane operator API credential owner-only and distinct from issuer, join, node, Agent, and relay credentials; prefer `--operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
 - Keep the Signal operator API credential owner-only and distinct from the Control Plane credential and all node/data-plane credentials; prefer `iparsd signal --operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
+- Keep the STUN operator API credential owner-only and distinct from every other credential; prefer `iparsd stun --operator-api-bearer-token-path` while leaving UDP Binding publicly reachable.
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable relay admission Bearer tokens for public relays.
 - Scope ACLs and route allowlists by role, tag, route, and protocol. Deny rules take precedence.

@@ -5274,6 +5274,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "A reusable issuer private key for init/token create workflows".to_string(),
         "A separate 32-512 byte control-plane operator API Bearer token in docker/control-plane-operator-api.token, or IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte signal operator API Bearer token in docker/signal-operator-api.token, or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate 32-512 byte STUN operator API Bearer token in docker/stun-operator-api.token, or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or IPARS_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
     ];
     if args.rootless {
@@ -5314,6 +5315,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
         "The bundled Compose file reads a distinct control-plane operator API Bearer token from docker/control-plane-operator-api.token (or IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE) and protects metrics and policy routes".to_string(),
         "The bundled Compose file reads a distinct signal operator API Bearer token from docker/signal-operator-api.token (or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics".to_string(),
+        "The bundled Compose file reads a distinct STUN operator API Bearer token from docker/stun-operator-api.token (or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics without affecting UDP Binding requests".to_string(),
         "The bundled Compose file reads a separate agent API Bearer token from docker/agent-api.token (or IPARS_AGENT_API_BEARER_TOKEN_FILE) through a file-backed Compose secret and protects every endpoint except /healthz".to_string(),
         "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
@@ -5357,6 +5359,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
             "Control-plane metrics and policy require IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse issuer, join-token, or node identity material".to_string(),
             "Signal metrics require IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from the control-plane operator credential and node identity material".to_string(),
+            "STUN metrics require IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from other operator credentials while leaving the public UDP Binding service credentialless".to_string(),
             "Agent API requests require the separate IPARS_AGENT_API_BEARER_TOKEN_FILE secret; do not reuse the signed join token".to_string(),
             "When relay admission Bearer auth is enabled in Compose, set IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN to the same secret value".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
@@ -11650,6 +11653,10 @@ fi
             requirement.contains("docker/signal-operator-api.token")
                 && requirement.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
         }));
+        assert!(plan.prerequisites.iter().any(|requirement| {
+            requirement.contains("docker/stun-operator-api.token")
+                && requirement.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE")
+        }));
         assert!(plan.environment.iter().any(|environment| {
             environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
         }));
@@ -11705,9 +11712,16 @@ fi
             note.contains("docker/signal-operator-api.token")
                 && note.contains("JSON and Prometheus metrics")
         }));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("docker/stun-operator-api.token") && note.contains("UDP Binding requests")
+        }));
         assert!(plan.security.iter().any(|requirement| {
             requirement.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
                 && requirement.contains("control-plane operator credential")
+        }));
+        assert!(plan.security.iter().any(|requirement| {
+            requirement.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE")
+                && requirement.contains("UDP Binding service")
         }));
         assert!(plan.notes.iter().any(|note| {
             note.contains("IPARS_RELAY_PUBLIC_ENDPOINT")

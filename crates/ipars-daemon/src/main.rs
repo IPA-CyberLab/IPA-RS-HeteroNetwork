@@ -442,6 +442,14 @@ struct StunArgs {
     alternate_listen: Option<SocketAddr>,
     #[arg(long, env = "IPARS_STUN_HTTP_LISTEN", default_value = "0.0.0.0:3479")]
     http_listen: SocketAddr,
+    #[arg(
+        long,
+        env = "IPARS_STUN_OPERATOR_API_BEARER_TOKEN",
+        conflicts_with = "operator_api_bearer_token_path"
+    )]
+    operator_api_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_STUN_OPERATOR_API_BEARER_TOKEN_PATH")]
+    operator_api_bearer_token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -3606,6 +3614,7 @@ async fn run_stun(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    let operator_api_bearer_token = stun_operator_api_bearer_token(&args)?;
     let stats = Arc::new(StunServerStats::default());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (listen, alternate_listen, udp_task) = if let Some(alternate_listen) = args.alternate_listen
@@ -3636,11 +3645,11 @@ async fn run_stun(
         )
     });
     tracing::info!(%listen, ?alternate_listen, http_listen = %args.http_listen, "stun listening");
-    let result = serve_router(
-        args.http_listen,
-        stun_router(StunHttpState::new(listen, alternate_listen, stats)),
-    )
-    .await;
+    let mut http_state = StunHttpState::new(listen, alternate_listen, stats);
+    if let Some(token) = operator_api_bearer_token {
+        http_state = http_state.require_operator_api_bearer_token(token);
+    }
+    let result = serve_router(args.http_listen, stun_router(http_state)).await;
     udp_task.abort();
     if let Some(task) = otel_metrics_task {
         task.abort();
@@ -3648,11 +3657,23 @@ async fn run_stun(
     result
 }
 
-#[derive(Debug, Clone)]
+fn stun_operator_api_bearer_token(args: &StunArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "IPARS_STUN_OPERATOR_API_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    read_api_bearer_token_file(path, "STUN operator API").map(Some)
+}
+
+#[derive(Clone)]
 struct StunHttpState {
     listen: SocketAddr,
     alternate_listen: Option<SocketAddr>,
     stats: Arc<StunServerStats>,
+    operator_api_bearer_token: Option<Arc<str>>,
 }
 
 impl StunHttpState {
@@ -3665,7 +3686,13 @@ impl StunHttpState {
             listen,
             alternate_listen,
             stats,
+            operator_api_bearer_token: None,
         }
+    }
+
+    fn require_operator_api_bearer_token(mut self, token: String) -> Self {
+        self.operator_api_bearer_token = Some(Arc::from(token));
+        self
     }
 
     fn metrics(&self) -> StunMetricsResponse {
@@ -3688,12 +3715,78 @@ struct StunHealthResponse {
     status: &'static str,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct StunOperatorApiErrorResponse {
+    error: &'static str,
+}
+
 fn stun_router(state: StunHttpState) -> Router {
-    Router::new()
-        .route("/healthz", axum::routing::get(stun_healthz))
-        .route("/v1/metrics", axum::routing::get(stun_metrics))
-        .route("/metrics", axum::routing::get(stun_prometheus_metrics))
-        .with_state(state)
+    let protocol = Router::new().route("/healthz", axum::routing::get(stun_healthz));
+    let app = if let Some(token) = state.operator_api_bearer_token.clone() {
+        let operator = Router::new()
+            .route("/v1/metrics", axum::routing::get(stun_metrics))
+            .route("/metrics", axum::routing::get(stun_prometheus_metrics))
+            .route_layer(axum::middleware::from_fn_with_state(
+                token,
+                require_stun_operator_api_bearer,
+            ));
+        protocol.merge(operator)
+    } else {
+        protocol
+    };
+    app.with_state(state)
+}
+
+async fn require_stun_operator_api_bearer(
+    axum::extract::State(expected): axum::extract::State<Arc<str>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let provided = stun_bearer_token_from_headers(request.headers());
+    if !provided.is_some_and(|provided| stun_operator_api_token_matches(&expected, provided)) {
+        return axum::response::IntoResponse::into_response((
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+            axum::Json(StunOperatorApiErrorResponse {
+                error: "STUN operator API bearer token was rejected",
+            }),
+        ));
+    }
+    next.run(request).await
+}
+
+fn stun_bearer_token_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn stun_operator_api_token_matches(expected: &str, provided: &str) -> bool {
+    if expected.is_empty()
+        || provided.is_empty()
+        || expected.len() > MAX_API_BEARER_TOKEN_BYTES
+        || provided.len() > MAX_API_BEARER_TOKEN_BYTES
+    {
+        return false;
+    }
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut diff = expected.len() ^ provided.len();
+    for index in 0..MAX_API_BEARER_TOKEN_BYTES {
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        let provided_byte = provided.get(index).copied().unwrap_or_default();
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+    diff == 0
 }
 
 async fn stun_healthz() -> axum::Json<StunHealthResponse> {
@@ -14221,6 +14314,101 @@ mod tests {
             Some(SocketAddr::from(([127, 0, 0, 1], 3480)))
         );
         assert_eq!(args.http_listen, SocketAddr::from(([127, 0, 0, 1], 3479)));
+        Ok(())
+    }
+
+    #[test]
+    fn stun_operator_api_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "stun-operator-secret-with-at-least-32-bytes";
+        let cli = Cli::try_parse_from(["iparsd", "stun", "--operator-api-bearer-token", token])?;
+        let Command::Stun(args) = cli.command else {
+            anyhow::bail!("expected stun command");
+        };
+        assert_eq!(
+            stun_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ipars-stun-operator-api-token-{}-{}.txt",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, format!("{token}\n"))?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "stun",
+            "--operator-api-bearer-token-path",
+            &path.display().to_string(),
+        ])?;
+        let Command::Stun(args) = cli.command else {
+            anyhow::bail!("expected stun command");
+        };
+        assert_eq!(
+            stun_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stun_operator_routes_are_disabled_without_a_credential() -> anyhow::Result<()> {
+        let state = StunHttpState::new(
+            SocketAddr::from(([127, 0, 0, 1], 3478)),
+            None,
+            Arc::new(StunServerStats::default()),
+        );
+        let (base_url, task) = spawn_test_http_service(stun_router(state)).await?;
+        let client = reqwest::Client::new();
+
+        let metrics = client.get(format!("{base_url}/v1/metrics")).send().await?;
+        assert_eq!(metrics.status(), reqwest::StatusCode::NOT_FOUND);
+        let health = client.get(format!("{base_url}/healthz")).send().await?;
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stun_operator_routes_require_the_configured_credential() -> anyhow::Result<()> {
+        let token = "stun-operator-secret-with-at-least-32-bytes";
+        let state = StunHttpState::new(
+            SocketAddr::from(([127, 0, 0, 1], 3478)),
+            None,
+            Arc::new(StunServerStats::default()),
+        )
+        .require_operator_api_bearer_token(token.to_string());
+        let (base_url, task) = spawn_test_http_service(stun_router(state)).await?;
+        let client = reqwest::Client::new();
+
+        for authorization in [
+            None,
+            Some("Bearer wrong-stun-operator-secret-with-32-bytes"),
+        ] {
+            let mut request = client.get(format!("{base_url}/v1/metrics"));
+            if let Some(authorization) = authorization {
+                request = request.header(reqwest::header::AUTHORIZATION, authorization);
+            }
+            let response = request.send().await?;
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer")
+            );
+        }
+        let response = client
+            .get(format!("{base_url}/v1/metrics"))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        task.abort();
         Ok(())
     }
 

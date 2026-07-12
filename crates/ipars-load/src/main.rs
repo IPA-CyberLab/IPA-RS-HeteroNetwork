@@ -2940,16 +2940,18 @@ async fn run_daemon_scenario(
         &services.signal_operator_api_bearer_token,
     )
     .await?;
-    let stun_metrics: StunMetricsResponse = get_json(
+    let stun_metrics: StunMetricsResponse = get_json_with_bearer(
         &client,
         format!("{}/v1/metrics", services.stun_http_url),
         "daemon STUN metrics",
+        &services.stun_operator_api_bearer_token,
     )
     .await?;
-    let stun_prometheus = get_text(
+    let stun_prometheus = get_text_with_bearer(
         &client,
         format!("{}/metrics", services.stun_http_url),
         "daemon STUN Prometheus metrics",
+        &services.stun_operator_api_bearer_token,
     )
     .await?;
     let daemon_stun = daemon_stun_report(
@@ -3915,6 +3917,7 @@ struct DaemonProcessGroup {
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
     stun_http_url: String,
+    stun_operator_api_bearer_token: String,
     stun_addr: SocketAddr,
     stun_alternate_addr: SocketAddr,
     agent_urls: Vec<String>,
@@ -4739,6 +4742,7 @@ impl DaemonProcessGroup {
             daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE));
         let control_plane_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let signal_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
+        let stun_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
             let role = format!("control-plane-{index}");
@@ -4837,11 +4841,15 @@ impl DaemonProcessGroup {
             &startup.children,
         )?;
         let stun_args = daemon_stun_args(stun_addr, stun_alternate_addr, stun_http_addr);
-        startup.children.push(spawn_iparsd(
+        startup.children.push(spawn_iparsd_with_env(
             &manifest_seed.iparsd_binary.path,
             &stun_args,
             "stun",
             &runtime_dir,
+            &[(
+                "IPARS_STUN_OPERATOR_API_BEARER_TOKEN",
+                stun_operator_api_bearer_token.as_str(),
+            )],
         )?);
         manifest_seed.write(
             DaemonRuntimePhase::ServiceStartup,
@@ -5020,6 +5028,7 @@ impl DaemonProcessGroup {
             relay_http_url,
             relay_udp_addr,
             stun_http_url,
+            stun_operator_api_bearer_token,
             stun_addr,
             stun_alternate_addr,
             agent_urls,
@@ -7236,6 +7245,23 @@ where
 async fn get_text(client: &reqwest::Client, url: String, context: &str) -> anyhow::Result<String> {
     let response = client
         .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to send {context} request"))?
+        .error_for_status()
+        .with_context(|| format!("{context} request was rejected"))?;
+    read_bounded_text_response(response, context, MAX_LOAD_HTTP_TEXT_RESPONSE_BYTES).await
+}
+
+async fn get_text_with_bearer(
+    client: &reqwest::Client,
+    url: String,
+    context: &str,
+    bearer_token: &str,
+) -> anyhow::Result<String> {
+    let response = client
+        .get(url)
+        .bearer_auth(bearer_token)
         .send()
         .await
         .with_context(|| format!("failed to send {context} request"))?
@@ -11586,6 +11612,8 @@ fi
             relay_http_url: "http://127.0.0.1:1".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             stun_http_url: "http://127.0.0.1:1".to_string(),
+            stun_operator_api_bearer_token: "synthetic-stun-operator-secret-with-32-bytes"
+                .to_string(),
             stun_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             stun_alternate_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2),
             agent_urls: Vec::new(),

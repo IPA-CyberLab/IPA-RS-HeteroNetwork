@@ -30,6 +30,7 @@ Each report is validated before command success. The harness rejects:
 - missing control-plane path-state or signed `/v1/paths/query` propagation;
 - unauthenticated or unavailable control-plane operator metrics during HTTP/daemon runs;
 - unauthenticated or unavailable Signal operator metrics during HTTP/daemon runs;
+- unauthenticated or unavailable STUN operator metrics during daemon runs;
 - peer-map edge loss or cross-control-plane inconsistency;
 - relay-candidate loss;
 - relay packet loss, payload corruption, or relay counter skew;
