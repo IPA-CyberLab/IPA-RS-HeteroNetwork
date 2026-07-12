@@ -252,7 +252,8 @@ async fn run_peer() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = [0_u8; 512];
     let (len, _) =
         tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await??;
-    assert_eq!(&buffer[..len], b"opaque-wireguard-outbound");
+    let outbound_payload = wireguard_transport_payload(0xb1);
+    assert_eq!(&buffer[..len], outbound_payload.as_slice());
 
     let rejected_datagram = encode_relay_datagram(
         SESSION_ID,
@@ -262,7 +263,8 @@ async fn run_peer() -> Result<(), Box<dyn std::error::Error>> {
     socket.send_to(&rejected_datagram, relay_endpoint).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let datagram = encode_relay_datagram(SESSION_ID, SESSION_TOKEN, b"opaque-wireguard-inbound")?;
+    let inbound_payload = wireguard_transport_payload(0xc1);
+    let datagram = encode_relay_datagram(SESSION_ID, SESSION_TOKEN, &inbound_payload)?;
     socket.send_to(&datagram, relay_endpoint).await?;
     Ok(())
 }
@@ -301,8 +303,9 @@ async fn run_forwarder() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let forwarder_task = tokio::spawn(forwarder.serve(forwarder_socket, shutdown_rx));
 
+    let outbound_payload = wireguard_transport_payload(0xb1);
     wireguard_socket
-        .send_to(b"opaque-wireguard-outbound", forwarder_addr)
+        .send_to(&outbound_payload, forwarder_addr)
         .await?;
     let mut buffer = [0_u8; 512];
     let (len, _) = tokio::time::timeout(
@@ -310,20 +313,18 @@ async fn run_forwarder() -> Result<(), Box<dyn std::error::Error>> {
         wireguard_socket.recv_from(&mut buffer),
     )
     .await??;
-    assert_eq!(&buffer[..len], b"opaque-wireguard-inbound");
+    let inbound_payload = wireguard_transport_payload(0xc1);
+    assert_eq!(&buffer[..len], inbound_payload.as_slice());
 
     let snapshot = stats.snapshot();
     assert_eq!(snapshot.outbound_packets, 1);
     assert_eq!(
         snapshot.outbound_payload_bytes,
-        b"opaque-wireguard-outbound".len() as u64
+        outbound_payload.len() as u64
     );
     assert!(snapshot.outbound_datagram_bytes > snapshot.outbound_payload_bytes);
     assert_eq!(snapshot.inbound_packets, 1);
-    assert_eq!(
-        snapshot.inbound_payload_bytes,
-        b"opaque-wireguard-inbound".len() as u64
-    );
+    assert_eq!(snapshot.inbound_payload_bytes, inbound_payload.len() as u64);
     assert!(snapshot.last_forwarded_at.is_some());
 
     shutdown_tx.send(true)?;
@@ -423,6 +424,12 @@ fn wait_for_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     std::env::var(name).map_err(|_| format!("required env `{name}` is missing").into())
+}
+
+fn wireguard_transport_payload(fill: u8) -> [u8; 32] {
+    let mut payload = [fill; 32];
+    payload[..4].copy_from_slice(&4_u32.to_le_bytes());
+    payload
 }
 
 fn unique_suffix() -> Result<String, Box<dyn std::error::Error>> {
