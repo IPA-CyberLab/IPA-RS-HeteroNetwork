@@ -3329,6 +3329,21 @@ where
             ))
             .await
     }
+
+    pub async fn configure_interface_address(&self, vpn_ip: VpnIp) -> Result<(), AgentError> {
+        self.runner
+            .run(LinuxCommand::new(
+                "ip",
+                [
+                    "address".to_string(),
+                    "replace".to_string(),
+                    overlay_interface_cidr(vpn_ip),
+                    "dev".to_string(),
+                    self.interface.clone(),
+                ],
+            ))
+            .await
+    }
 }
 
 #[async_trait]
@@ -6610,6 +6625,9 @@ mod tests {
 
         backend.ensure_interface().await?;
         backend
+            .configure_interface_address(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))))
+            .await?;
+        backend
             .upsert_peer(WireGuardPeerConfig {
                 peer: peer.clone(),
                 public_key: "peer-public".to_string(),
@@ -6624,6 +6642,10 @@ mod tests {
             runner.commands().await,
             vec![
                 LinuxCommand::new("wg", ["show", "ipars0"]),
+                LinuxCommand::new(
+                    "ip",
+                    ["address", "replace", "100.64.0.1/32", "dev", "ipars0"]
+                ),
                 LinuxCommand::new(
                     "wg",
                     [

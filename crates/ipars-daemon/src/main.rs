@@ -8919,6 +8919,9 @@ where
     wireguard
         .configure_interface_listen_port(args.wireguard_listen_port)
         .await?;
+    wireguard
+        .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
+        .await?;
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
     let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
     tracing::info!(
