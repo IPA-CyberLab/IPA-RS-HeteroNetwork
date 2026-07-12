@@ -65,6 +65,7 @@ const DEFAULT_DAEMON_HTTP_READINESS_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS: u64 = 15;
 const LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "ipars-load-control-plane-operator-token";
+const LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "ipars-load-signal-operator-api-token";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -2932,10 +2933,11 @@ async fn run_daemon_scenario(
         "daemon",
     )
     .await?;
-    let signal_metrics: SignalMetricsResponse = get_json(
+    let signal_metrics: SignalMetricsResponse = get_json_with_bearer(
         &client,
         format!("{}/v1/metrics", services.signal_url),
         "daemon signal metrics",
+        &services.signal_operator_api_bearer_token,
     )
     .await?;
     let stun_metrics: StunMetricsResponse = get_json(
@@ -3770,7 +3772,13 @@ impl NetworkedServices {
             &mut tasks,
         )
         .await?;
-        let signal_url = Self::spawn_signal(&control_plane_url, &mut tasks).await?;
+        let signal_operator_api_bearer_token = LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN.to_string();
+        let signal_url = Self::spawn_signal(
+            &control_plane_url,
+            &signal_operator_api_bearer_token,
+            &mut tasks,
+        )
+        .await?;
         Ok(Self {
             control_plane_url,
             control_plane_operator_api_bearer_token,
@@ -3811,14 +3819,18 @@ impl NetworkedServices {
 
     async fn spawn_signal(
         control_plane_url: &str,
+        operator_api_bearer_token: &str,
         tasks: &mut Vec<JoinHandle<std::io::Result<()>>>,
     ) -> anyhow::Result<String> {
         let registry = Arc::new(SignalRegistry::new(ClusterPolicy::default()));
-        let app = signal_router(SignalHttpState::new(
-            registry,
-            vec![control_plane_url.to_string()],
-            Duration::from_secs(90),
-        )?);
+        let app = signal_router(
+            SignalHttpState::new(
+                registry,
+                vec![control_plane_url.to_string()],
+                Duration::from_secs(90),
+            )?
+            .require_operator_api_bearer_token(operator_api_bearer_token.to_string()),
+        );
         Self::spawn_router(app, tasks).await
     }
 
@@ -3899,6 +3911,7 @@ struct DaemonProcessGroup {
     control_plane_urls: Vec<String>,
     control_plane_operator_api_bearer_token: String,
     signal_url: String,
+    signal_operator_api_bearer_token: String,
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
     stun_http_url: String,
@@ -4725,6 +4738,7 @@ impl DaemonProcessGroup {
         let control_plane_database_url =
             daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE));
         let control_plane_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
+        let signal_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
             let role = format!("control-plane-{index}");
@@ -4780,11 +4794,15 @@ impl DaemonProcessGroup {
             signal_args.push("--control-plane-url".to_string());
             signal_args.push(control_plane_url.clone());
         }
-        startup.children.push(spawn_iparsd(
+        startup.children.push(spawn_iparsd_with_env(
             &manifest_seed.iparsd_binary.path,
             &signal_args,
             "signal",
             &runtime_dir,
+            &[(
+                "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN",
+                signal_operator_api_bearer_token.as_str(),
+            )],
         )?);
         manifest_seed.write(
             DaemonRuntimePhase::ServiceStartup,
@@ -4980,6 +4998,7 @@ impl DaemonProcessGroup {
             &agent_urls,
             &startup.agent_state_paths,
             &control_plane_operator_api_bearer_token,
+            &signal_operator_api_bearer_token,
             &mut startup.children,
             &manifest_seed,
             options.agent_readiness_timeout,
@@ -4997,6 +5016,7 @@ impl DaemonProcessGroup {
             control_plane_urls,
             control_plane_operator_api_bearer_token,
             signal_url,
+            signal_operator_api_bearer_token,
             relay_http_url,
             relay_udp_addr,
             stun_http_url,
@@ -6450,6 +6470,7 @@ async fn wait_for_daemon_agents_ready(
     agent_urls: &[String],
     agent_state_paths: &[PathBuf],
     control_plane_operator_api_bearer_token: &str,
+    signal_operator_api_bearer_token: &str,
     children: &mut [DaemonChild],
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -6466,6 +6487,7 @@ async fn wait_for_daemon_agents_ready(
                     &statuses,
                     &identities,
                     control_plane_operator_api_bearer_token,
+                    signal_operator_api_bearer_token,
                 )
                 .await
                 {
@@ -6496,6 +6518,7 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
     agent_urls: &[String],
     agent_state_paths: &[PathBuf],
     control_plane_operator_api_bearer_token: &str,
+    signal_operator_api_bearer_token: &str,
     children: &mut [DaemonChild],
     manifest_seed: &DaemonRuntimeManifestSeed,
     timeout: Duration,
@@ -6507,6 +6530,7 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
         agent_urls,
         agent_state_paths,
         control_plane_operator_api_bearer_token,
+        signal_operator_api_bearer_token,
         children,
         timeout,
     )
@@ -7079,6 +7103,7 @@ async fn check_daemon_agent_control_and_signal_readiness(
     statuses: &[AgentStatusResponse],
     identities: &DaemonAgentIdentities,
     control_plane_operator_api_bearer_token: &str,
+    signal_operator_api_bearer_token: &str,
 ) -> anyhow::Result<()> {
     let expected_agent_count = statuses.len();
     if expected_agent_count > 0 {
@@ -7137,10 +7162,11 @@ async fn check_daemon_agent_control_and_signal_readiness(
     }
 
     if expected_agent_count > 0 {
-        let signal_metrics: SignalMetricsResponse = get_json(
+        let signal_metrics: SignalMetricsResponse = get_json_with_bearer(
             client,
             format!("{signal_url}/v1/metrics"),
             "daemon signal readiness metrics",
+            signal_operator_api_bearer_token,
         )
         .await?;
         if signal_metrics.health_report_count < expected_agent_count {
@@ -10648,6 +10674,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             &statuses,
             &identities,
             &services.control_plane_operator_api_bearer_token,
+            LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN,
         )
         .await
     }
@@ -11555,6 +11582,7 @@ fi
             control_plane_operator_api_bearer_token: LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN
                 .to_string(),
             signal_url: "http://127.0.0.1:1".to_string(),
+            signal_operator_api_bearer_token: LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN.to_string(),
             relay_http_url: "http://127.0.0.1:1".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             stun_http_url: "http://127.0.0.1:1".to_string(),

@@ -11,3 +11,4 @@
 docker/join.token
 docker/agent-api.token
 docker/control-plane-operator-api.token
+docker/signal-operator-api.token

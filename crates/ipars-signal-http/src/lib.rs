@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -27,6 +28,7 @@ const MAX_CONTROL_PLANE_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 const CONTROL_PLANE_AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNAL_REQUEST_SIGNATURE_MAX_AGE_SECONDS: i64 = 300;
 const MAX_ACCEPTED_SIGNAL_REQUEST_NONCES: usize = 131_072;
+const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -168,13 +170,14 @@ async fn read_bounded_response_body(
     Ok(body)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SignalHttpState {
     registry: Arc<SignalRegistry>,
     authenticator: Arc<dyn SignalNodeAuthenticator>,
     accepted_nonces: Arc<Mutex<BTreeMap<(NodeId, String), DateTime<Utc>>>>,
     authenticated_nodes: Arc<Mutex<BTreeMap<NodeId, DateTime<Utc>>>>,
     node_auth_ttl: ChronoDuration,
+    operator_api_bearer_token: Option<Arc<str>>,
 }
 
 impl SignalHttpState {
@@ -205,19 +208,85 @@ impl SignalHttpState {
             accepted_nonces: Arc::new(Mutex::new(BTreeMap::new())),
             authenticated_nodes: Arc::new(Mutex::new(BTreeMap::new())),
             node_auth_ttl,
+            operator_api_bearer_token: None,
         })
+    }
+
+    pub fn require_operator_api_bearer_token(mut self, token: String) -> Self {
+        self.operator_api_bearer_token = Some(Arc::from(token));
+        self
     }
 }
 
 pub fn router(state: SignalHttpState) -> Router {
-    Router::new()
+    let protocol = Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(prometheus_metrics))
-        .route("/v1/metrics", get(metrics))
         .route("/v1/nodes/{node_id}", put(upsert_node))
         .route("/v1/paths/negotiate", post(negotiate))
-        .route("/v1/hole-punch", post(hole_punch_plan))
-        .with_state(state)
+        .route("/v1/hole-punch", post(hole_punch_plan));
+    let app = if let Some(token) = state.operator_api_bearer_token.clone() {
+        let operator = Router::new()
+            .route("/metrics", get(prometheus_metrics))
+            .route("/v1/metrics", get(metrics))
+            .route_layer(middleware::from_fn_with_state(
+                token,
+                require_signal_operator_api_bearer,
+            ));
+        protocol.merge(operator)
+    } else {
+        protocol
+    };
+    app.with_state(state)
+}
+
+async fn require_signal_operator_api_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = bearer_token_from_headers(request.headers());
+    if !provided.is_some_and(|provided| operator_api_token_matches(&expected, provided)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "signal operator API bearer token was rejected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn operator_api_token_matches(expected: &str, provided: &str) -> bool {
+    if expected.is_empty()
+        || provided.is_empty()
+        || expected.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES
+        || provided.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES
+    {
+        return false;
+    }
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut diff = expected.len() ^ provided.len();
+    for index in 0..MAX_OPERATOR_API_BEARER_TOKEN_BYTES {
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        let provided_byte = provided.get(index).copied().unwrap_or_default();
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+    diff == 0
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -839,6 +908,8 @@ mod tests {
 
     use super::*;
 
+    const OPERATOR_API_BEARER_TOKEN: &str = "signal-test-operator-token-with-32-bytes";
+
     #[derive(Debug)]
     struct TestSignalNodeAuthenticator;
 
@@ -864,6 +935,48 @@ mod tests {
             Duration::from_secs(90),
         )
         .unwrap_or_else(|error| panic!("test signal state should be valid: {error}"))
+        .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string())
+    }
+
+    #[tokio::test]
+    async fn signal_operator_routes_are_disabled_without_a_credential(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = SignalHttpState::with_authenticator(
+            Arc::new(SignalRegistry::new(ClusterPolicy::default())),
+            Arc::new(TestSignalNodeAuthenticator),
+            Duration::from_secs(90),
+        )?;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_operator_routes_require_the_configured_credential(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let app = router(test_state(Arc::new(SignalRegistry::new(
+            ClusterPolicy::default(),
+        ))));
+        for authorization in [None, Some("Bearer wrong-token-with-at-least-32-bytes")] {
+            let mut request = Request::builder().method("GET").uri("/v1/metrics");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE),
+                Some(&header::HeaderValue::from_static("Bearer"))
+            );
+        }
+        Ok(())
     }
 
     fn identity_for_node(node_id: &str) -> IdentityKeyPair {
@@ -1122,6 +1235,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;
@@ -1169,6 +1286,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;
@@ -1209,7 +1330,8 @@ mod tests {
             registry.clone(),
             Arc::new(TestSignalNodeAuthenticator),
             Duration::from_millis(1),
-        )?;
+        )?
+        .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string());
         let app = router(state);
         let request = signed_upsert(node("node-a", Vec::new()));
         let response = app
@@ -1234,6 +1356,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;

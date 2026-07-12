@@ -372,6 +372,14 @@ struct SignalArgs {
     #[arg(long, env = "IPARS_SIGNAL_LISTEN", default_value = "0.0.0.0:9443")]
     listen: SocketAddr,
     #[arg(
+        long,
+        env = "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN",
+        conflicts_with = "operator_api_bearer_token_path"
+    )]
+    operator_api_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")]
+    operator_api_bearer_token_path: Option<PathBuf>,
+    #[arg(
         long = "control-plane-url",
         env = "IPARS_SIGNAL_CONTROL_PLANE_URLS",
         value_delimiter = ',',
@@ -3510,6 +3518,7 @@ async fn run_signal(
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
     validate_signal_runtime_config(&args)?;
+    let operator_api_bearer_token = signal_operator_api_bearer_token(&args)?;
     let policy = ClusterPolicy {
         allow_ipv6_direct: !args.disable_ipv6_direct,
         allow_nat_traversal: !args.disable_nat_traversal,
@@ -3528,11 +3537,14 @@ async fn run_signal(
             otel_metrics_interval.max(Duration::from_secs(1)),
         )
     });
-    let signal_state = SignalHttpState::new(
+    let mut signal_state = SignalHttpState::new(
         registry,
         args.control_plane_urls,
         Duration::from_secs(args.node_auth_ttl_seconds),
     )?;
+    if let Some(token) = operator_api_bearer_token {
+        signal_state = signal_state.require_operator_api_bearer_token(token);
+    }
     let result = serve_router(args.listen, signal_router(signal_state)).await;
     if let Some(task) = otel_metrics_task {
         task.abort();
@@ -3571,7 +3583,22 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
     validate_percent(
         args.nat_classification_min_confidence_percent,
         "--nat-classification-min-confidence-percent",
-    )
+    )?;
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "--operator-api-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn signal_operator_api_bearer_token(args: &SignalArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    read_api_bearer_token_file(path, "signal operator API").map(Some)
 }
 
 async fn run_stun(
@@ -14604,6 +14631,42 @@ mod tests {
         assert_eq!(args.nat_classification_min_confidence_percent, 75);
         assert!(args.disable_relay_fallback);
         validate_signal_runtime_config(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn signal_operator_api_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "signal-operator-secret-with-at-least-32-bytes";
+        let cli = Cli::try_parse_from(["iparsd", "signal", "--operator-api-bearer-token", token])?;
+        let Command::Signal(args) = cli.command else {
+            anyhow::bail!("expected signal command");
+        };
+        validate_signal_runtime_config(&args)?;
+        assert_eq!(
+            signal_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ipars-signal-operator-api-token-{}-{}.txt",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, format!("{token}\n"))?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "signal",
+            "--operator-api-bearer-token-path",
+            &path.display().to_string(),
+        ])?;
+        let Command::Signal(args) = cli.command else {
+            anyhow::bail!("expected signal command");
+        };
+        assert_eq!(
+            signal_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+        std::fs::remove_file(path)?;
         Ok(())
     }
 

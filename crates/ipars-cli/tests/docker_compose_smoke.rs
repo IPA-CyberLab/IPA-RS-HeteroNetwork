@@ -12,6 +12,7 @@ const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str = "compose-relay-admission-secr
 const COMPOSE_AGENT_API_BEARER_TOKEN: &str = "compose-agent-api-secret-with-at-least-32-bytes";
 const COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "compose-control-plane-operator-secret";
+const COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "compose-signal-operator-api-secret";
 
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
@@ -111,6 +112,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         rendered.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-control-plane-operator-api-bearer-token"),
         "rendered base Compose config did not mount the control-plane operator API Bearer secret"
+    );
+    anyhow::ensure!(
+        rendered.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")
+            && rendered.contains("/run/secrets/ipars-signal-operator-api-bearer-token"),
+        "rendered base Compose config did not mount the signal operator API Bearer secret"
     );
 
     let rootful_discovery_compose = ComposeProject {
@@ -436,6 +442,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             && rendered.contains(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require control-plane operator API Bearer auth"
     );
+    anyhow::ensure!(
+        rendered.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN")
+            && rendered.contains(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
+        "rendered smoke Compose config did not require signal operator API Bearer auth"
+    );
 
     drop(tcp_ports);
     drop(udp_ports);
@@ -482,6 +493,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     anyhow::ensure!(
         unauthorized_control_plane_metrics == 401,
         "control-plane metrics without Bearer auth returned {unauthorized_control_plane_metrics}, expected 401"
+    );
+    let unauthorized_signal_metrics = compose_exec_http_status(
+        &compose,
+        "signal",
+        "GET",
+        "http://127.0.0.1:9443/v1/metrics",
+        None,
+        "signal metrics without Bearer auth",
+    )?;
+    anyhow::ensure!(
+        unauthorized_signal_metrics == 401,
+        "signal metrics without Bearer auth returned {unauthorized_signal_metrics}, expected 401"
     );
     let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
@@ -581,6 +604,11 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - "{control_plane_port}:8443"
 
   signal:
+    environment: !override
+      IPARS_ROLE: signal
+      IPARS_SIGNAL_CONTROL_PLANE_URLS: http://control-plane:8443
+      IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN: {signal_operator_api_bearer_token}
+    secrets: !reset []
     ports:
       - "{signal_port}:9443"
 
@@ -702,6 +730,8 @@ volumes:
         issuer_public_key = config.issuer_public_key,
         control_plane_operator_api_bearer_token =
             yaml_single_quoted(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
+        signal_operator_api_bearer_token =
+            yaml_single_quoted(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         join_token = yaml_single_quoted(config.join_token),
         agent_api_bearer_token = yaml_single_quoted(COMPOSE_AGENT_API_BEARER_TOKEN),
         relay_admission_bearer_token = yaml_single_quoted(config.relay_admission_bearer_token),
@@ -1832,6 +1862,7 @@ fn add_api_bearer_header(command: &mut Command, service: &str) {
     let token = match service {
         "agent" | "agent-b" => Some(COMPOSE_AGENT_API_BEARER_TOKEN),
         "control-plane" => Some(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
+        "signal" => Some(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         _ => None,
     };
     if let Some(token) = token {

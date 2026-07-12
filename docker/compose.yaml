@@ -64,11 +64,14 @@ services:
     environment:
       IPARS_ROLE: signal
       IPARS_SIGNAL_CONTROL_PLANE_URLS: http://control-plane:8443
+      IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-signal-operator-api-bearer-token
     depends_on:
       control-plane:
         condition: service_healthy
     ports:
       - "9443:9443"
+    secrets:
+      - ipars-signal-operator-api-bearer-token
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9443/healthz >/dev/null"]
       interval: 10s
@@ -224,6 +227,8 @@ services:
 secrets:
   ipars-control-plane-operator-api-bearer-token:
     file: ${IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE:-./control-plane-operator-api.token}
+  ipars-signal-operator-api-bearer-token:
+    file: ${IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE:-./signal-operator-api.token}
   ipars-agent-join-token:
     file: ./join.token
   ipars-agent-api-bearer-token:

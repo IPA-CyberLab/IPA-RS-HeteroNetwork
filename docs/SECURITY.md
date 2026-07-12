@@ -69,6 +69,12 @@ Control-plane policy and metrics are available through `GET /v1/policy`, `GET /v
 
 The CLI applies its distinct global `--control-plane-operator-api-bearer-token` or preferred `--control-plane-operator-api-bearer-token-path` source to `ipars status --control-plane-url`. Compose mounts a dedicated file-backed secret, and the Kubernetes live gate mounts a separate Secret key. Do not reuse issuer private keys, join tokens, node identities, Agent management credentials, or relay admission credentials. Bearer authentication does not encrypt policy or metric responses, so TLS remains required outside trusted private transport.
 
+## Signal Operator API
+
+Signal JSON and Prometheus metrics are available through `GET /v1/metrics` and `GET /metrics` only when `iparsd signal --operator-api-bearer-token` or `--operator-api-bearer-token-path` configures a separate 32-512 byte printable non-whitespace ASCII credential. Without one, both routes are unregistered and return 404. With one, missing or rejected credentials return 401 with a Bearer challenge and fixed-bound constant-time comparison. `/healthz` remains public; node upsert, path negotiation, and hole-punch routes continue to require node-identity signatures and never accept this operator token as a substitute.
+
+Compose mounts the Signal credential from its own file-backed secret. Keep it distinct from Control Plane, Agent, issuer, join, node-identity, and relay credentials, and use TLS whenever metric traffic leaves trusted private transport.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.
@@ -100,6 +106,7 @@ Implemented controls:
 - Prefer file-backed join tokens through `--join-token-path` or Kubernetes Secrets over command-line token arguments.
 - Keep Agent API Bearer tokens owner-only, separate from join tokens, and pass them through `--api-bearer-token-path`, Compose secrets, or a distinct Kubernetes Secret key.
 - Keep the Control Plane operator API credential owner-only and distinct from issuer, join, node, Agent, and relay credentials; prefer `--operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
+- Keep the Signal operator API credential owner-only and distinct from the Control Plane credential and all node/data-plane credentials; prefer `iparsd signal --operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable relay admission Bearer tokens for public relays.
 - Scope ACLs and route allowlists by role, tag, route, and protocol. Deny rules take precedence.

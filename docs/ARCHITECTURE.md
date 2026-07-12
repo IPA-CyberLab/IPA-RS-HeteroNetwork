@@ -248,14 +248,16 @@ Control-plane policy and metric routes are a separate operator trust boundary. `
 
 Initial signal HTTP routes:
 
-- `GET /healthz`
-- `GET /metrics`
-- `GET /v1/metrics`
-- `PUT /v1/nodes/{node_id}`
-- `POST /v1/paths/negotiate`
-- `POST /v1/hole-punch`
+- `GET /healthz` (public orchestration probe)
+- `GET /metrics` (configured operator Bearer credential)
+- `GET /v1/metrics` (configured operator Bearer credential)
+- `PUT /v1/nodes/{node_id}` (node identity signature)
+- `POST /v1/paths/negotiate` (node identity signature)
+- `POST /v1/hole-punch` (node identity signature)
 
 Signal node upserts, path negotiations, and hole-punch plan requests carry a bounded-fresh timestamp, random nonce, and Ed25519 node-identity signature. Signal checks node upserts against the authoritative control-plane registration, caches accepted nonces to reject replays, and removes memberships that exceed its configured authentication TTL. Path and hole-punch requests are admitted only while both participants have fresh authenticated memberships.
+
+Signal metric routes form a separate operator trust boundary. They are registered only when `iparsd signal` receives a validated 32-512 byte printable token through `--operator-api-bearer-token` or the preferred file-backed `--operator-api-bearer-token-path`; missing or rejected credentials receive a Bearer challenge using fixed-bound constant-time comparison. Omitting the credential leaves both metric routes absent while `/healthz` and signed protocol routes remain available.
 
 Initial relay HTTP routes:
 
