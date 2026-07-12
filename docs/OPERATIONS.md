@@ -209,14 +209,17 @@ ipars docker install \
 Set `--agent-runtime-backend dry-run` for rootful Compose validation that must not
 create host networking resources. Rootless deployments are always forced to the
 same `dry-run` backend because their Compose override intentionally removes the
-TUN device and kernel capabilities required by a WireGuard data plane. Use a
-rootful agent for production WireGuard connectivity.
+kernel capabilities required by route and kernel-WireGuard mutation and does
+not provide an unprivileged userspace data plane. Use a rootful agent for
+production WireGuard connectivity.
 
 Run the repeatable Compose smoke with:
 
 ```bash
 scripts/docker-smoke.sh
 ```
+
+The suite first validates the full management stack with non-mutating Agents, then starts a second stack with two production `linux-command` Agents in distinct Docker network namespaces. The production phase requires kernel WireGuard support and verifies each `ipars0` address, remote `AllowedIPs`, overlay route, nonzero handshake, and an HTTP request to the peer's VPN IP in both directions. It does not mount `/dev/net/tun`; that device is only needed when an operator deliberately selects a userspace WireGuard implementation that consumes TUN.
 
 ## Kubernetes
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::net::{TcpListener, UdpSocket};
+use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -635,8 +635,198 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
+    assert_compose_linux_wireguard_dataplane(&compose.repo_root, &temp_dir)?;
 
     Ok(())
+}
+
+fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -> Result<()> {
+    let init = generated_init_output(51_820)?;
+    let cluster_id = json_string(&init, "cluster_id")?;
+    let issuer_node_id = json_string(&init, "issuer_node_id")?;
+    let issuer_key_id = json_string(&init, "issuer_key_id")?;
+    let issuer_public_key = json_string(&init, "issuer_public_key")?;
+    let issuer_private_key = json_string(&init, "issuer_private_key_b64")?;
+    let placeholder_token = init
+        .get("join_token")
+        .context("init output missing join_token")?
+        .to_string();
+    let suffix = unique_suffix()?;
+    let agent_api_bearer_token = COMPOSE_AGENT_API_BEARER_TOKEN.to_string();
+    let mut compose = ComposeProject {
+        repo_root: repo_root.to_path_buf(),
+        project_name: format!("ipars-dataplane-{suffix}"),
+        compose_files: vec![
+            PathBuf::from("docker/compose.yaml"),
+            PathBuf::from("docker/compose.dataplane-smoke.yaml"),
+        ],
+        docker_socket: temp_dir.join("dataplane-unused-docker.sock"),
+        extra_env: vec![
+            ("IPARS_DATAPLANE_CLUSTER_ID".to_string(), cluster_id.clone()),
+            ("IPARS_DATAPLANE_ISSUER_NODE_ID".to_string(), issuer_node_id),
+            (
+                "IPARS_DATAPLANE_ISSUER_PUBLIC_KEY".to_string(),
+                issuer_public_key,
+            ),
+            (
+                "IPARS_DATAPLANE_BOOTSTRAP_IP".to_string(),
+                "127.0.0.1".to_string(),
+            ),
+            ("IPARS_DATAPLANE_JOIN_TOKEN".to_string(), placeholder_token),
+            (
+                "IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN".to_string(),
+                agent_api_bearer_token,
+            ),
+        ],
+    };
+    let _compose_guard = ComposeCleanup {
+        repo_root: compose.repo_root.clone(),
+        project_name: compose.project_name.clone(),
+        compose_files: compose.compose_files.clone(),
+        docker_socket: compose.docker_socket.clone(),
+        extra_env: compose.extra_env.clone(),
+    };
+
+    run_compose_with_diagnostics(
+        &compose,
+        [
+            "up",
+            "-d",
+            "--build",
+            "--wait",
+            "--wait-timeout",
+            "180",
+            "postgres",
+            "control-plane",
+            "signal",
+            "stun",
+        ],
+    )?;
+    let bootstrap_ip = compose_service_ipv4(&compose, "control-plane")?;
+    let join_token = generated_dataplane_join_token(
+        &cluster_id,
+        &issuer_key_id,
+        &issuer_private_key,
+        bootstrap_ip,
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_BOOTSTRAP_IP",
+        bootstrap_ip.to_string(),
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_JOIN_TOKEN",
+        join_token.to_string(),
+    )?;
+
+    let rendered = run_compose(&compose, ["config"])?;
+    let rendered =
+        String::from_utf8(rendered.stdout).context("dataplane Compose config was not UTF-8")?;
+    anyhow::ensure!(
+        rendered
+            .matches("IPARS_AGENT_RUNTIME_BACKEND: linux-command")
+            .count()
+            == 2,
+        "dataplane Compose config did not render two production Agent backends\n{rendered}"
+    );
+    anyhow::ensure!(
+        !rendered.contains("/dev/net/tun"),
+        "dataplane Compose config unexpectedly mounted /dev/net/tun\n{rendered}"
+    );
+
+    run_compose_with_diagnostics(
+        &compose,
+        [
+            "up",
+            "-d",
+            "--wait",
+            "--wait-timeout",
+            "180",
+            "agent",
+            "agent-b",
+        ],
+    )?;
+    assert_compose_services_running(
+        &compose,
+        &[
+            "postgres",
+            "control-plane",
+            "signal",
+            "stun",
+            "agent",
+            "agent-b",
+        ],
+    )?;
+
+    let agent_netns = compose_service_netns_identity(&compose, "agent")?;
+    let agent_b_netns = compose_service_netns_identity(&compose, "agent-b")?;
+    anyhow::ensure!(
+        agent_netns != agent_b_netns,
+        "dataplane Agents unexpectedly shared network namespace {agent_netns}"
+    );
+
+    let (agent_id, agent_vpn_ip) = compose_dataplane_agent_status(&compose, "agent")?;
+    let (agent_b_id, agent_b_vpn_ip) = compose_dataplane_agent_status(&compose, "agent-b")?;
+    anyhow::ensure!(
+        agent_id != agent_b_id,
+        "dataplane Agents unexpectedly registered the same node ID {agent_id}"
+    );
+    anyhow::ensure!(
+        agent_vpn_ip != agent_b_vpn_ip,
+        "dataplane Agents unexpectedly received the same VPN IP {agent_vpn_ip}"
+    );
+    let nodes = ComposeAgentNodes {
+        agent: agent_id.clone(),
+        agent_b: agent_b_id.clone(),
+    };
+    let ports = ComposeApiPorts {
+        agent: 9780,
+        agent_b: 9780,
+    };
+    assert_compose_agent_peer_maps(&compose, &nodes, &ports)?;
+    assert_compose_agent_peer_activity(&compose, "agent", 9780, &agent_b_id)?;
+    assert_compose_agent_peer_activity(&compose, "agent-b", 9780, &agent_id)?;
+
+    wait_for_compose_wireguard_path(&compose, "agent", agent_vpn_ip, agent_b_vpn_ip)?;
+    wait_for_compose_wireguard_path(&compose, "agent-b", agent_b_vpn_ip, agent_vpn_ip)?;
+    Ok(())
+}
+
+fn generated_dataplane_join_token(
+    cluster_id: &str,
+    issuer_key_id: &str,
+    issuer_private_key: &str,
+    bootstrap_ip: IpAddr,
+) -> Result<Value> {
+    let control_plane = format!("http://{bootstrap_ip}:8443");
+    let signal = format!("http://{bootstrap_ip}:9443");
+    let stun = format!("udp://{bootstrap_ip}:3478");
+    let output = Command::new(env!("CARGO_BIN_EXE_ipars"))
+        .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
+        .args([
+            "token",
+            "create",
+            "--cluster-id",
+            cluster_id,
+            "--issuer-key-id",
+            issuer_key_id,
+            "--ttl-seconds",
+            "3600",
+            "--unlimited-uses",
+            "--allowed-route",
+            "100.64.0.0/10",
+            "--control-plane-bootstrap",
+            &control_plane,
+            "--signal-bootstrap",
+            &signal,
+            "--stun-bootstrap",
+            &stun,
+        ])
+        .output()
+        .context("failed to create Docker dataplane join token")?;
+    ensure_success("Docker dataplane token create", &output)?;
+    serde_json::from_slice(&output.stdout).context("failed to parse Docker dataplane join token")
 }
 
 fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
@@ -883,6 +1073,158 @@ volumes:
         agent_port = config.ports.agent,
         agent_b_port = config.ports.agent_b,
     )
+}
+
+fn replace_compose_env(compose: &mut ComposeProject, name: &str, value: String) -> Result<()> {
+    let entry = compose
+        .extra_env
+        .iter_mut()
+        .find(|(entry_name, _)| entry_name == name)
+        .with_context(|| format!("Compose environment did not contain {name}"))?;
+    entry.1 = value;
+    Ok(())
+}
+
+fn compose_service_ipv4(compose: &ComposeProject, service: &str) -> Result<IpAddr> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec", "-T", service, "ip", "-4", "-o", "address", "show", "dev", "eth0", "scope",
+        "global",
+    ]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to inspect {service} IPv4 address"))?;
+    ensure_success(&format!("inspect {service} IPv4 address"), &output)?;
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{service} IPv4 address output was not UTF-8"))?;
+    let ip = stdout
+        .split_whitespace()
+        .find_map(|field| field.split_once('/').map(|(addr, _)| addr))
+        .with_context(|| format!("{service} did not report a global IPv4 address: {stdout:?}"))?
+        .parse::<IpAddr>()
+        .with_context(|| format!("{service} reported an invalid IPv4 address: {stdout:?}"))?;
+    let IpAddr::V4(ipv4) = ip else {
+        anyhow::bail!("{service} unexpectedly reported non-IPv4 address {ip}");
+    };
+    anyhow::ensure!(
+        !ipv4.is_unspecified()
+            && !ipv4.is_loopback()
+            && !ipv4.is_link_local()
+            && !ipv4.is_multicast()
+            && !ipv4.is_broadcast(),
+        "{service} reported unusable Docker bootstrap address {ipv4}"
+    );
+    Ok(IpAddr::V4(ipv4))
+}
+
+fn compose_service_netns_identity(compose: &ComposeProject, service: &str) -> Result<String> {
+    let mut command = compose_command(compose);
+    command.args(["exec", "-T", service, "readlink", "/proc/self/ns/net"]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to inspect {service} network namespace"))?;
+    ensure_success(&format!("inspect {service} network namespace"), &output)?;
+    let identity = String::from_utf8(output.stdout)
+        .with_context(|| format!("{service} network namespace output was not UTF-8"))?
+        .trim()
+        .to_string();
+    anyhow::ensure!(
+        identity.starts_with("net:[") && identity.ends_with(']'),
+        "{service} returned invalid network namespace identity {identity:?}"
+    );
+    Ok(identity)
+}
+
+fn compose_dataplane_agent_status(
+    compose: &ComposeProject,
+    service: &str,
+) -> Result<(String, IpAddr)> {
+    let status = wait_for_json(
+        compose,
+        &format!("{service} production dataplane status"),
+        service,
+        "http://127.0.0.1:9780/v1/status",
+        |value| {
+            ensure_json_string_nonempty(value, "node_id")?;
+            ensure_json_string_nonempty(value, "vpn_ip")?;
+            ensure_json_u64_at_least(value, "candidate_count", 1)?;
+            Ok(())
+        },
+    )?;
+    let node_id = json_string_required(&status, "node_id")?;
+    let vpn_ip = json_string_required(&status, "vpn_ip")?
+        .parse::<IpAddr>()
+        .with_context(|| format!("{service} status returned invalid VPN IP: {status}"))?;
+    anyhow::ensure!(
+        !vpn_ip.is_unspecified() && !vpn_ip.is_loopback() && !vpn_ip.is_multicast(),
+        "{service} status returned unusable VPN IP {vpn_ip}"
+    );
+    Ok((node_id, vpn_ip))
+}
+
+fn wait_for_compose_wireguard_path(
+    compose: &ComposeProject,
+    service: &str,
+    local_vpn_ip: IpAddr,
+    remote_vpn_ip: IpAddr,
+) -> Result<()> {
+    let prefix = if local_vpn_ip.is_ipv4() { 32 } else { 128 };
+    let local_cidr = format!("{local_vpn_ip}/{prefix}");
+    let remote_cidr = format!("{remote_vpn_ip}/{prefix}");
+    let remote_url_host = match remote_vpn_ip {
+        IpAddr::V4(_) => remote_vpn_ip.to_string(),
+        IpAddr::V6(_) => format!("[{remote_vpn_ip}]"),
+    };
+    let remote_url = format!("http://{remote_url_host}:9780/healthz");
+    let script = r#"
+set -eu
+interface="$1"
+local_cidr="$2"
+remote_cidr="$3"
+remote_ip="$4"
+remote_url="$5"
+test "$(wg show "$interface" listen-port)" = "51820"
+ip -o address show dev "$interface" | grep -F -- "$local_cidr" >/dev/null
+wg show "$interface" allowed-ips | grep -F -- "$remote_cidr" >/dev/null
+ip route get "$remote_ip" | grep -F -- "dev $interface" >/dev/null
+curl --noproxy '*' --fail --silent --show-error --max-time 5 "$remote_url" >/dev/null
+wg show "$interface" latest-handshakes | awk '$2 > 0 { found = 1 } END { exit !found }'
+"#;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-ec",
+            script,
+            "sh",
+            "ipars0",
+            &local_cidr,
+            &remote_cidr,
+            &remote_vpn_ip.to_string(),
+            &remote_url,
+        ]);
+        let last_output = match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("failed to execute path probe: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Docker Agent {service} did not establish a WireGuard path from {local_vpn_ip} to {remote_vpn_ip}\nlast probe:\n{last_output}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn yaml_single_quoted(value: &str) -> String {

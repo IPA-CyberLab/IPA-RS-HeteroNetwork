@@ -131,6 +131,21 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
+      - name: Ensure kernel WireGuard support
+        run: |
+          set -euo pipefail
+          if sudo modprobe wireguard; then
+            exit 0
+          fi
+          sudo apt-get update
+          module_package="linux-modules-extra-$(uname -r)"
+          if ! apt-cache show "$module_package" >/dev/null 2>&1; then
+            echo "WireGuard kernel support is unavailable and ${module_package} does not exist" >&2
+            exit 1
+          fi
+          sudo apt-get install --yes --no-install-recommends "$module_package"
+          sudo modprobe wireguard
+
       - name: Run live Compose stack integration suite
         env:
           CARGO: cargo
