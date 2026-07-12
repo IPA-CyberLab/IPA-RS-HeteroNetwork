@@ -715,7 +715,9 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path, temp_dir: &Path) -
     run_compose_with_diagnostics(
         &compose,
         [
-            "create",
+            "up",
+            "--no-start",
+            "--no-deps",
             "--build",
             "agent",
             "agent-b",
