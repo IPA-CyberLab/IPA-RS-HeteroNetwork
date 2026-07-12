@@ -15,7 +15,7 @@ run_load() {
   local expected_scenario="$3"
   local report_path="${output_dir}/ipars-load-${name}.json"
   shift 3
-  "$cargo_bin" run -p ipars-load --quiet -- "$@" >"$report_path"
+  "$cargo_bin" run --locked -p ipars-load --quiet -- "$@" >"$report_path"
   if ! grep -Fq "\"transport\": \"${expected_transport}\"" "$report_path"; then
     echo "load smoke report ${report_path} did not record transport ${expected_transport}" >&2
     cat "$report_path" >&2
@@ -37,7 +37,7 @@ run_load relay-udp-three relay_udp three --transport relay-udp --scenario three 
   --relay-payload-bytes 128
 
 if [[ "${IPARS_LOAD_SMOKE_BUILD_DAEMON:-0}" == "1" ]]; then
-  "$cargo_bin" build -p ipars-daemon
+  "$cargo_bin" build --locked -p ipars-daemon
   daemon_bin="${repo_root}/target/debug/iparsd"
 fi
 

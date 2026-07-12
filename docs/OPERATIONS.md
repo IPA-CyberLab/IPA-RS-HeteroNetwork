@@ -325,8 +325,8 @@ Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and 
 Use these before publishing an operational change:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
 scripts/helm-smoke.sh
 scripts/docker-smoke.sh
 IPARS_LOAD_SMOKE_BUILD_DAEMON=1 scripts/load-smoke.sh
@@ -339,3 +339,5 @@ scripts/netns-smoke.sh
 ```
 
 That suite requires network namespace creation privileges, runs the actual `iparsd agent --preflight-only` path for kernel-netlink and (when `wg` is installed) command backends, and runs the routed peer-quality UDP probe alongside route, WireGuard, hole-punch, and relay-fallback checks. It may require `wireguard-tools`, kernel WireGuard support, `iptables`, and forwarding sysctls.
+
+`.github/workflows/ci.yml` runs the Rust/MSRV, 3/10/1000-node plus daemon-failover load, Helm, Docker Compose, privileged namespace, and two-node kind suites as independent CI jobs for every pull request and `master` push. The privileged namespace job installs the matching Ubuntu kernel module package only when WireGuard is not already available. The Kubernetes job downloads fixed kind, kubectl, and Helm versions and verifies each binary archive against its pinned SHA-256 before creating the disposable cluster.

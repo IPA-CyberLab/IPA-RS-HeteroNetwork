@@ -50,7 +50,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURI
 ## Build
 
 ```bash
-cargo test --workspace
+cargo test --locked --workspace
 ```
 
 Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`:
@@ -109,6 +109,14 @@ use the `dry-run` agent backend by default:
 ```bash
 scripts/kind-k8s-smoke.sh
 ```
+
+The pinned [GitHub Actions CI workflow](.github/workflows/ci.yml) runs Rust 1.96.1 formatting,
+strict workspace Clippy, all workspace tests, an all-target MSRV 1.88 check, 3/10/1000-node and
+multi-process daemon failover load smoke, the privileged network-namespace suite with kernel
+WireGuard support, the live Docker Compose suite, Helm lint/render coverage, and the disposable
+two-node kind integration suite on every `master` push and pull request. Workflow permissions are
+read-only, checkout is pinned by commit, and the kind, kubectl, and Helm binaries used by the live
+Kubernetes job are versioned and SHA-256 verified.
 
 Scale/load harness scenarios run against in-memory control-plane and signal components by default,
 against loopback HTTP control-plane/signal endpoints with `--transport http`, through relay

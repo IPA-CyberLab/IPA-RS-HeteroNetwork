@@ -73,12 +73,12 @@ run_cargo_test() {
   local env_name="$2"
   shift 2
   echo "running ${name}"
-  env "${env_name}=1" "$cargo_bin" test "$@" -- --nocapture
+  env "${env_name}=1" "$cargo_bin" test --locked "$@" -- --nocapture
 }
 
 prepare_iparsd() {
   if [[ -z "${iparsd_bin}" ]]; then
-    "$cargo_bin" build -p ipars-daemon
+    "$cargo_bin" build --locked -p ipars-daemon
     iparsd_bin="${repo_root}/target/debug/iparsd"
   fi
   if [[ ! -x "${iparsd_bin}" ]]; then

@@ -50,7 +50,7 @@ run_ipars() {
   if [[ -n "$ipars_bin" ]]; then
     "$ipars_bin" "$@"
   else
-    "$cargo_bin" run -q -p ipars-cli -- "$@"
+    "$cargo_bin" run --locked -q -p ipars-cli -- "$@"
   fi
 }
 

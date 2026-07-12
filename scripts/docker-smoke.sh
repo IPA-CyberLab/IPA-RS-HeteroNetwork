@@ -44,6 +44,6 @@ env \
   DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" \
   COMPOSE_DOCKER_CLI_BUILD="${COMPOSE_DOCKER_CLI_BUILD:-1}" \
   IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 \
-  "$cargo_bin" test -p ipars-cli --test docker_compose_smoke -- --nocapture
+  "$cargo_bin" test --locked -p ipars-cli --test docker_compose_smoke -- --nocapture
 
 echo "Docker Compose smoke checks completed"

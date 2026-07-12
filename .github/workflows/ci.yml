@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTUP_TOOLCHAIN: 1.96.1
+  RUST_MSRV_TOOLCHAIN: 1.88.0
+
+jobs:
+  rust-quality:
+    name: Rust quality and MSRV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust components
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace
+
+      - name: Install minimum supported Rust
+        run: rustup toolchain install "$RUST_MSRV_TOOLCHAIN" --profile minimal
+
+      - name: Check all targets on MSRV
+        run: cargo +"$RUST_MSRV_TOOLCHAIN" check --locked --workspace --all-targets
+
+  netns-smoke:
+    name: Privileged network namespace smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Install network tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            iproute2 \
+            iptables \
+            kmod \
+            procps \
+            wireguard-tools
+          if ! sudo modprobe wireguard; then
+            module_package="linux-modules-extra-$(uname -r)"
+            if ! apt-cache show "$module_package" >/dev/null 2>&1; then
+              echo "WireGuard kernel support is unavailable and ${module_package} does not exist" >&2
+              exit 1
+            fi
+            sudo apt-get install --yes --no-install-recommends "$module_package"
+            sudo modprobe wireguard
+          fi
+
+      - name: Build daemon
+        run: cargo build --locked -p ipars-daemon
+
+      - name: Run privileged namespace integration suite
+        run: |
+          set -euo pipefail
+          sudo env \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            CARGO="$(command -v cargo)" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            IPARS_NETNS_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
+            scripts/netns-smoke.sh
+
+  docker-compose-smoke:
+    name: Docker Compose smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Run live Compose stack integration suite
+        env:
+          CARGO: cargo
+        run: scripts/docker-smoke.sh
+
+  load-smoke:
+    name: Scale and daemon failover smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Run scale, transport, and daemon failover suite
+        env:
+          CARGO: cargo
+          IPARS_LOAD_SMOKE_BUILD_DAEMON: "1"
+        run: scripts/load-smoke.sh
+
+  helm-smoke:
+    name: Helm chart smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run Helm lint and render suite
+        env:
+          IPARS_HELM_IMAGE: alpine/helm@sha256:31ce11c4ee98c5e1e13628ead9212e665f32c3277cae63bd55ced32989089f3e
+        run: scripts/helm-smoke.sh
+
+  kind-smoke:
+    name: Kubernetes kind live smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Install pinned Kubernetes tools
+        env:
+          KIND_VERSION: v0.32.0
+          KIND_SHA256: 50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54
+          KUBECTL_VERSION: v1.36.2
+          KUBECTL_SHA256: 1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82
+          HELM_VERSION: v3.14.4
+          HELM_SHA256: a5844ef2c38ef6ddf3b5a8f7d91e7e0e8ebc39a38bb3fc8013d629c1ef29c259
+        run: |
+          set -euo pipefail
+          install_dir="$RUNNER_TEMP/ipars-tools"
+          mkdir -p "$install_dir"
+
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 300 \
+            --output "$install_dir/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          printf '%s  %s\n' "$KIND_SHA256" "$install_dir/kind" | sha256sum --check --strict
+          chmod 0755 "$install_dir/kind"
+
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 300 \
+            --output "$install_dir/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          printf '%s  %s\n' "$KUBECTL_SHA256" "$install_dir/kubectl" | sha256sum --check --strict
+          chmod 0755 "$install_dir/kubectl"
+
+          helm_archive="$RUNNER_TEMP/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 300 \
+            --output "$helm_archive" \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          printf '%s  %s\n' "$HELM_SHA256" "$helm_archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$helm_archive" --directory "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/linux-amd64/helm" "$install_dir/helm"
+
+          printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Run two-node Kubernetes integration suite
+        env:
+          CARGO: cargo
+          IPARS_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS: "300"
+        run: scripts/kind-k8s-smoke.sh
