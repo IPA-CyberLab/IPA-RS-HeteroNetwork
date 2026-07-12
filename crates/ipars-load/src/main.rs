@@ -7728,11 +7728,12 @@ fn authenticated_signal_path_request(
     );
     let mut authenticated = AuthenticatedSignalPathRequest {
         request,
+        path_observation: None,
         request_signature: None,
     };
     authenticated.request_signature = Some(
         identity
-            .sign_signal_path_request(&authenticated.request, Utc::now())
+            .sign_authenticated_signal_path_request(&authenticated, Utc::now())
             .context("failed to sign synthetic signal path request")?,
     );
     Ok(authenticated)

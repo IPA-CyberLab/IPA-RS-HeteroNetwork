@@ -11997,11 +11997,12 @@ fn authenticated_signal_path_request(
 ) -> anyhow::Result<AuthenticatedSignalPathRequest> {
     let mut authenticated = AuthenticatedSignalPathRequest {
         request,
+        path_observation: None,
         request_signature: None,
     };
     authenticated.request_signature = Some(
         identity
-            .sign_signal_path_request(&authenticated.request, chrono::Utc::now())
+            .sign_authenticated_signal_path_request(&authenticated, chrono::Utc::now())
             .context("failed to sign signal path request")?,
     );
     Ok(authenticated)

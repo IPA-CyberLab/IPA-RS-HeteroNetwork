@@ -165,12 +165,21 @@ impl IdentityKeyPair {
         request: &SignalPathRequest,
         signed_at: DateTime<Utc>,
     ) -> Result<NodeApiRequestSignature, CryptoError> {
-        let nonce = random_node_api_request_nonce();
         let envelope = AuthenticatedSignalPathRequest {
             request: request.clone(),
+            path_observation: None,
             request_signature: None,
         };
-        let payload = serde_json::to_vec(&envelope.signature_payload(signed_at, nonce.clone()))?;
+        self.sign_authenticated_signal_path_request(&envelope, signed_at)
+    }
+
+    pub fn sign_authenticated_signal_path_request(
+        &self,
+        request: &AuthenticatedSignalPathRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at, nonce.clone()))?;
         Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
     }
 
@@ -466,8 +475,8 @@ mod tests {
         SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
     };
     use ipars_types::{
-        BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord, Role,
-        Tag, TokenPolicy, VpnIp,
+        BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord,
+        PathMetrics, PathQualityObservation, PathState, Role, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -722,6 +731,7 @@ mod tests {
         };
         let mut authenticated = AuthenticatedSignalPathRequest {
             request: path,
+            path_observation: None,
             request_signature: None,
         };
         authenticated.request_signature =
@@ -744,6 +754,52 @@ mod tests {
         hole_punch.target = NodeId::from_string("node-c");
         assert!(matches!(
             verify_signal_hole_punch_plan_signature(&hole_punch, &identity.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_signal_path_observation_cannot_be_tampered() -> Result<(), CryptoError> {
+        let identity = IdentityKeyPair::generate();
+        let now = Utc::now();
+        let mut authenticated = AuthenticatedSignalPathRequest {
+            request: SignalPathRequest {
+                source: identity.node_id(),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            path_observation: Some(PathQualityObservation {
+                selected_state: PathState::Relay,
+                selected_candidate: None,
+                relay_node: Some(NodeId::from_string("relay-a")),
+                metrics: PathMetrics {
+                    latency_ms: Some(10.0),
+                    loss_ppm: 0,
+                    jitter_ms: None,
+                    relay_load: None,
+                    stability: 1.0,
+                },
+                sample_count: 1,
+                successful_sample_count: 1,
+                observed_at: now,
+            }),
+            request_signature: None,
+        };
+        authenticated.request_signature =
+            Some(identity.sign_authenticated_signal_path_request(&authenticated, now)?);
+        verify_signal_path_signature(&authenticated, &identity.public_key_b64())?;
+
+        authenticated
+            .path_observation
+            .as_mut()
+            .expect("test observation")
+            .metrics
+            .latency_ms = Some(1.0);
+        assert!(matches!(
+            verify_signal_path_signature(&authenticated, &identity.public_key_b64()),
             Err(CryptoError::InvalidSignature)
         ));
         Ok(())

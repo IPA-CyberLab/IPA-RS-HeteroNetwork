@@ -445,7 +445,12 @@ async fn negotiate(
             "signal path request signature is required",
         ))?;
     record_authenticated_request_nonce(&state, &source.node_id, signature, now).await?;
-    Ok(Json(state.registry.negotiate(request.request).await?))
+    Ok(Json(
+        state
+            .registry
+            .negotiate_with_observation(request.request, request.path_observation)
+            .await?,
+    ))
 }
 
 async fn hole_punch_plan(
@@ -856,6 +861,16 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 format!("route {route_id} for node {node_id} is invalid: {reason}"),
             ),
+            Self::Signal(SignalError::PathQualityObservationInvalid {
+                source_node,
+                target_node,
+                reason,
+            }) => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "path quality observation from {source_node} to {target_node} is invalid: {reason}"
+                ),
+            ),
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
             Self::Authentication(SignalNodeAuthenticationError::Rejected(error)) => {
                 (StatusCode::UNAUTHORIZED, error)
@@ -1010,6 +1025,7 @@ mod tests {
         let identity = identity_for_node(&request.source.to_string());
         let mut authenticated = AuthenticatedSignalPathRequest {
             request,
+            path_observation: None,
             request_signature: None,
         };
         authenticated.request_signature = Some(
@@ -1165,6 +1181,7 @@ mod tests {
                     .body(Body::from(serde_json::to_vec(
                         &AuthenticatedSignalPathRequest {
                             request: path_request.clone(),
+                            path_observation: None,
                             request_signature: None,
                         },
                     )?))?,

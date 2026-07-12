@@ -544,6 +544,19 @@ pub struct PathMetrics {
     pub stability: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathQualityObservation {
+    pub selected_state: PathState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_candidate: Option<EndpointCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node: Option<NodeId>,
+    pub metrics: PathMetrics,
+    pub sample_count: u16,
+    pub successful_sample_count: u16,
+    pub observed_at: DateTime<Utc>,
+}
+
 impl Default for PathMetrics {
     fn default() -> Self {
         Self {
@@ -798,6 +811,8 @@ pub struct ClusterPolicy {
     pub endpoint_candidate_ttl_seconds: u64,
     #[serde(default = "default_path_state_ttl_seconds")]
     pub path_state_ttl_seconds: u64,
+    #[serde(default = "default_path_quality_observation_ttl_seconds")]
+    pub path_quality_observation_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_ttl_seconds")]
     pub nat_classification_ttl_seconds: u64,
     #[serde(default = "default_nat_classification_min_confidence_percent")]
@@ -823,6 +838,7 @@ impl Default for ClusterPolicy {
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
             path_state_ttl_seconds: default_path_state_ttl_seconds(),
+            path_quality_observation_ttl_seconds: default_path_quality_observation_ttl_seconds(),
             nat_classification_ttl_seconds: default_nat_classification_ttl_seconds(),
             nat_classification_min_confidence_percent:
                 default_nat_classification_min_confidence_percent(),
@@ -843,6 +859,10 @@ fn default_endpoint_candidate_ttl_seconds() -> u64 {
 
 fn default_path_state_ttl_seconds() -> u64 {
     600
+}
+
+fn default_path_quality_observation_ttl_seconds() -> u64 {
+    120
 }
 
 fn default_nat_classification_ttl_seconds() -> u64 {
@@ -1212,6 +1232,8 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalPathNegotiationSignaturePayload {
         pub request: SignalPathRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub path_observation: Option<PathQualityObservation>,
         pub signed_at: DateTime<Utc>,
         pub nonce: String,
     }
@@ -1479,6 +1501,8 @@ pub mod api {
     pub struct AuthenticatedSignalPathRequest {
         pub request: SignalPathRequest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub path_observation: Option<PathQualityObservation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request_signature: Option<NodeApiRequestSignature>,
     }
 
@@ -1490,6 +1514,7 @@ pub mod api {
         ) -> SignalPathNegotiationSignaturePayload {
             SignalPathNegotiationSignaturePayload {
                 request: self.request.clone(),
+                path_observation: self.path_observation.clone(),
                 signed_at,
                 nonce,
             }

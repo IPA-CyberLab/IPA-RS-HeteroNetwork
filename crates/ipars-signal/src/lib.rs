@@ -11,7 +11,8 @@ use ipars_types::api::{
 use ipars_types::{
     endpoint_addr_is_usable, AclAction, AclRule, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, HealthState, NatClassification, NatTraversalStrategy, NodeHealth,
-    NodeId, NodeRecord, PathMetrics, PathScore, PathState, PeerPathKey, Route, TransportProtocol,
+    NodeId, NodeRecord, PathMetrics, PathQualityObservation, PathScore, PathState, PeerPathKey,
+    Route, TransportProtocol,
 };
 use ipnet::IpNet;
 use thiserror::Error;
@@ -25,6 +26,7 @@ const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
     PathState::Unreachable,
 ];
 const SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS: u64 = 300;
+const MAX_PATH_QUALITY_OBSERVATION_SAMPLES: u16 = 64;
 
 #[derive(Debug, Error)]
 pub enum SignalError {
@@ -63,6 +65,12 @@ pub enum SignalError {
         node_id: NodeId,
         route_id: String,
         reason: &'static str,
+    },
+    #[error("path quality observation from {source_node} to {target_node} is invalid: {reason}")]
+    PathQualityObservationInvalid {
+        source_node: NodeId,
+        target_node: NodeId,
+        reason: String,
     },
 }
 
@@ -193,7 +201,15 @@ impl SignalRegistry {
 
     pub async fn negotiate(
         &self,
+        request: SignalPathRequest,
+    ) -> Result<SignalPathResponse, SignalError> {
+        self.negotiate_with_observation(request, None).await
+    }
+
+    pub async fn negotiate_with_observation(
+        &self,
         mut request: SignalPathRequest,
+        path_observation: Option<PathQualityObservation>,
     ) -> Result<SignalPathResponse, SignalError> {
         self.path_negotiations.fetch_add(1, Ordering::Relaxed);
         let now = Utc::now();
@@ -209,6 +225,9 @@ impl SignalRegistry {
             .get_node(&request.target)
             .await
             .ok_or_else(|| SignalError::NodeNotFound(request.target.clone()))?;
+        if let Some(observation) = path_observation.as_ref() {
+            validate_path_quality_observation(&request.source, &request.target, observation, now)?;
+        }
         validate_desired_routes(&target, &request.desired_routes)?;
         if !acl_allows_path(
             &source_node,
@@ -259,11 +278,13 @@ impl SignalRegistry {
             self.relay_candidate_acl_denials
                 .fetch_add(relay_acl_denials, Ordering::Relaxed);
         }
-        let response = self.coordinator.negotiate(
+        let response = self.coordinator.negotiate_with_observation(
             request,
             &target,
             target_nat_classification.as_ref(),
             &relays,
+            path_observation.as_ref(),
+            now,
         );
         self.record_path_negotiation_state(response.preferred_state);
         Ok(response)
@@ -600,7 +621,25 @@ impl SignalCoordinator {
         target_nat_classification: Option<&NatClassification>,
         relays: &[NodeRecord],
     ) -> SignalPathResponse {
-        let now = Utc::now();
+        self.negotiate_with_observation(
+            request,
+            target,
+            target_nat_classification,
+            relays,
+            None,
+            Utc::now(),
+        )
+    }
+
+    pub fn negotiate_with_observation(
+        &self,
+        request: SignalPathRequest,
+        target: &NodeRecord,
+        target_nat_classification: Option<&NatClassification>,
+        relays: &[NodeRecord],
+        path_observation: Option<&PathQualityObservation>,
+        now: chrono::DateTime<Utc>,
+    ) -> SignalPathResponse {
         let source_candidates = fresh_endpoint_candidates(
             &request.source_candidates,
             now,
@@ -640,19 +679,34 @@ impl SignalCoordinator {
             preferred_state
         };
 
-        let metrics = PathMetrics {
-            relay_load: relay_candidates
-                .first()
-                .and_then(|relay| relay.relay_capability.as_ref())
-                .map(|capability| {
-                    if capability.max_sessions == 0 {
-                        1.0
-                    } else {
-                        capability.active_sessions as f32 / capability.max_sessions as f32
-                    }
-                }),
-            ..PathMetrics::default()
-        };
+        if usable_state == PathState::Relay {
+            prioritize_observed_relay(
+                &mut relay_candidates,
+                path_observation,
+                now,
+                self.policy.path_quality_observation_ttl_seconds,
+            );
+        }
+
+        let mut metrics = matching_path_observation_metrics(
+            usable_state,
+            &target_candidates,
+            &relay_candidates,
+            path_observation,
+            now,
+            self.policy.path_quality_observation_ttl_seconds,
+        )
+        .unwrap_or_default();
+        metrics.relay_load = relay_candidates
+            .first()
+            .and_then(|relay| relay.relay_capability.as_ref())
+            .map(|capability| {
+                if capability.max_sessions == 0 {
+                    1.0
+                } else {
+                    capability.active_sessions as f32 / capability.max_sessions as f32
+                }
+            });
         let cost = path_candidate_cost(usable_state, &source_candidates, &target_candidates);
 
         SignalPathResponse {
@@ -749,6 +803,220 @@ impl SignalCoordinator {
 
         PathState::Unreachable
     }
+}
+
+fn validate_path_quality_observation(
+    source: &NodeId,
+    target: &NodeId,
+    observation: &PathQualityObservation,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), SignalError> {
+    let invalid = |reason: String| SignalError::PathQualityObservationInvalid {
+        source_node: source.clone(),
+        target_node: target.clone(),
+        reason,
+    };
+    observation
+        .metrics
+        .validate()
+        .map_err(|error| invalid(error.to_string()))?;
+    if observation.metrics.relay_load.is_some() {
+        return Err(invalid(
+            "relay_load must be omitted because Signal supplies authoritative relay load"
+                .to_string(),
+        ));
+    }
+    if observation.sample_count == 0
+        || observation.sample_count > MAX_PATH_QUALITY_OBSERVATION_SAMPLES
+    {
+        return Err(invalid(format!(
+            "sample_count must be between 1 and {MAX_PATH_QUALITY_OBSERVATION_SAMPLES}"
+        )));
+    }
+    if observation.successful_sample_count > observation.sample_count {
+        return Err(invalid(
+            "successful_sample_count must not exceed sample_count".to_string(),
+        ));
+    }
+    let lost = u64::from(observation.sample_count - observation.successful_sample_count);
+    let expected_loss_ppm = (lost * 1_000_000 / u64::from(observation.sample_count)) as u32;
+    if observation.metrics.loss_ppm != expected_loss_ppm {
+        return Err(invalid(format!(
+            "loss_ppm must equal {expected_loss_ppm} for the supplied sample counts"
+        )));
+    }
+    match observation.successful_sample_count {
+        0 if observation.metrics.latency_ms.is_some()
+            || observation.metrics.jitter_ms.is_some() =>
+        {
+            return Err(invalid(
+                "latency_ms and jitter_ms must be omitted when no samples succeeded".to_string(),
+            ));
+        }
+        0 => {}
+        1 if observation.metrics.latency_ms.is_none()
+            || observation.metrics.jitter_ms.is_some() =>
+        {
+            return Err(invalid(
+                "one successful sample requires latency_ms and no jitter_ms".to_string(),
+            ));
+        }
+        1 => {}
+        _ if observation.metrics.latency_ms.is_none()
+            || observation.metrics.jitter_ms.is_none() =>
+        {
+            return Err(invalid(
+                "multiple successful samples require latency_ms and jitter_ms".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    match observation.selected_state {
+        state if state.is_direct() => {
+            if observation.relay_node.is_some() {
+                return Err(invalid(
+                    "direct observations must not include relay_node".to_string(),
+                ));
+            }
+            let candidate = observation.selected_candidate.as_ref().ok_or_else(|| {
+                invalid("direct observations require selected_candidate".to_string())
+            })?;
+            if candidate.node_id != *target {
+                return Err(invalid(
+                    "selected_candidate must belong to the target node".to_string(),
+                ));
+            }
+            if !state.allows_selected_candidate_kind(candidate.kind) {
+                return Err(invalid(
+                    "selected_candidate kind does not match selected_state".to_string(),
+                ));
+            }
+            candidate
+                .validate_kind_address()
+                .map_err(|reason| invalid(reason.to_string()))?;
+            if !endpoint_addr_is_usable(candidate.addr) {
+                return Err(invalid(
+                    "selected_candidate address is not usable".to_string(),
+                ));
+            }
+        }
+        PathState::Relay => {
+            if observation.selected_candidate.is_some() {
+                return Err(invalid(
+                    "relay observations must not include selected_candidate".to_string(),
+                ));
+            }
+            let relay = observation
+                .relay_node
+                .as_ref()
+                .ok_or_else(|| invalid("relay observations require relay_node".to_string()))?;
+            if relay == source || relay == target {
+                return Err(invalid(
+                    "relay_node must differ from source and target".to_string(),
+                ));
+            }
+        }
+        PathState::Unreachable => {
+            return Err(invalid(
+                "unreachable paths cannot produce quality observations".to_string(),
+            ));
+        }
+        _ => unreachable!("all direct states are handled by the guarded arm"),
+    }
+
+    let future_skew = chrono::Duration::seconds(SIGNAL_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS as i64);
+    if observation.observed_at > now + future_skew {
+        return Err(invalid("observed_at is too far in the future".to_string()));
+    }
+    Ok(())
+}
+
+fn path_quality_observation_is_fresh(
+    observation: &PathQualityObservation,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    now.signed_duration_since(observation.observed_at)
+        .to_std()
+        .map(|age| age <= Duration::from_secs(ttl_seconds))
+        .unwrap_or(true)
+}
+
+fn prioritize_observed_relay(
+    relay_candidates: &mut Vec<NodeRecord>,
+    observation: Option<&PathQualityObservation>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) {
+    let Some(observation) = observation.filter(|observation| {
+        observation.selected_state == PathState::Relay
+            && path_quality_observation_is_fresh(observation, now, ttl_seconds)
+    }) else {
+        return;
+    };
+    let Some(relay_node) = observation.relay_node.as_ref() else {
+        return;
+    };
+    if let Some(index) = relay_candidates
+        .iter()
+        .position(|relay| relay.node_id == *relay_node)
+    {
+        let relay = relay_candidates.remove(index);
+        relay_candidates.insert(0, relay);
+    }
+}
+
+fn matching_path_observation_metrics(
+    state: PathState,
+    target_candidates: &[EndpointCandidate],
+    relay_candidates: &[NodeRecord],
+    observation: Option<&PathQualityObservation>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> Option<PathMetrics> {
+    let observation = observation?;
+    if observation.selected_state != state
+        || !path_quality_observation_is_fresh(observation, now, ttl_seconds)
+    {
+        return None;
+    }
+    let matches_path = if state.is_direct() {
+        selected_target_candidate(state, target_candidates).is_some_and(|selected| {
+            observation
+                .selected_candidate
+                .as_ref()
+                .is_some_and(|observed| endpoint_candidate_identity_matches(selected, observed))
+        })
+    } else if state == PathState::Relay {
+        relay_candidates
+            .first()
+            .is_some_and(|relay| observation.relay_node.as_ref() == Some(&relay.node_id))
+    } else {
+        false
+    };
+    matches_path.then(|| observation.metrics.clone())
+}
+
+fn selected_target_candidate(
+    state: PathState,
+    target_candidates: &[EndpointCandidate],
+) -> Option<&EndpointCandidate> {
+    target_candidates
+        .iter()
+        .filter(|candidate| state.allows_selected_candidate_kind(candidate.kind))
+        .min_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| right.priority.cmp(&left.priority))
+        })
+}
+
+fn endpoint_candidate_identity_matches(
+    left: &EndpointCandidate,
+    right: &EndpointCandidate,
+) -> bool {
+    left.node_id == right.node_id && left.kind == right.kind && left.addr == right.addr
 }
 
 fn validate_endpoint_candidates(
@@ -1691,6 +1959,29 @@ mod tests {
         }
     }
 
+    fn quality_observation(
+        selected_state: PathState,
+        selected_candidate: Option<EndpointCandidate>,
+        relay_node: Option<NodeId>,
+        observed_at: chrono::DateTime<Utc>,
+    ) -> PathQualityObservation {
+        PathQualityObservation {
+            selected_state,
+            selected_candidate,
+            relay_node,
+            metrics: PathMetrics {
+                latency_ms: Some(42.0),
+                loss_ppm: 200_000,
+                jitter_ms: Some(5.0),
+                relay_load: None,
+                stability: 0.8,
+            },
+            sample_count: 5,
+            successful_sample_count: 4,
+            observed_at,
+        }
+    }
+
     #[test]
     fn direct_public_is_preferred_when_target_has_public_udp() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
@@ -1708,6 +1999,100 @@ mod tests {
         );
 
         assert_eq!(response.preferred_state, PathState::DirectPublic);
+    }
+
+    #[test]
+    fn matching_fresh_path_observation_drives_direct_score() {
+        let now = Utc::now();
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        let observation = quality_observation(
+            PathState::DirectPublic,
+            target.endpoint_candidates.first().cloned(),
+            None,
+            now,
+        );
+        let response = coordinator.negotiate_with_observation(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target,
+            None,
+            &[],
+            Some(&observation),
+            now,
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectPublic);
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "latency_ms=42.0"));
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "loss_ppm=200000"));
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "jitter_ms=5.0"));
+        assert!(response
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "stability=0.80"));
+    }
+
+    #[test]
+    fn stale_or_mismatched_path_observation_is_not_reused() {
+        let now = Utc::now();
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let target = target(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        let mut mismatched_candidate = target.endpoint_candidates[0].clone();
+        mismatched_candidate.addr.set_port(51821);
+        let observations = [
+            quality_observation(
+                PathState::DirectPublic,
+                Some(mismatched_candidate),
+                None,
+                now,
+            ),
+            quality_observation(
+                PathState::DirectPublic,
+                target.endpoint_candidates.first().cloned(),
+                None,
+                now - chrono::Duration::seconds(121),
+            ),
+        ];
+
+        for observation in observations {
+            let response = coordinator.negotiate_with_observation(
+                SignalPathRequest {
+                    source: NodeId::from_string("node-a"),
+                    target: NodeId::from_string("node-b"),
+                    source_candidates: Vec::new(),
+                    source_nat_classification: None,
+                    desired_routes: Vec::new(),
+                },
+                &target,
+                None,
+                &[],
+                Some(&observation),
+                now,
+            );
+            assert!(!response
+                .score
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("latency_ms=")));
+        }
     }
 
     #[test]
