@@ -440,6 +440,7 @@ fn write_private_agent_state_file(path: &Path, bytes: &[u8]) -> Result<(), Agent
 #[derive(Debug)]
 pub struct AgentRuntime {
     state: RwLock<AgentNodeState>,
+    stun_refresh: tokio::sync::Mutex<()>,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
@@ -1098,6 +1099,7 @@ impl AgentRuntime {
     pub fn new(state: AgentNodeState, policy: ClusterPolicy) -> Self {
         Self {
             state: RwLock::new(state),
+            stun_refresh: tokio::sync::Mutex::new(()),
             candidates: tokio::sync::RwLock::new(Vec::new()),
             nat_classification: tokio::sync::RwLock::new(None),
             latest_peer_map: tokio::sync::RwLock::new(None),
@@ -1341,10 +1343,12 @@ impl AgentRuntime {
         local_bind: std::net::SocketAddr,
         stun_server: std::net::SocketAddr,
     ) -> Result<EndpointCandidate, AgentError> {
+        let _refresh = self.stun_refresh.lock().await;
         let candidate = UdpStunProbe
             .probe(self.state().node_id, local_bind, stun_server)
             .await?;
-        self.candidates.write().await.push(candidate.clone());
+        self.replace_stun_candidates(vec![candidate.clone()]).await;
+        *self.nat_classification.write().await = None;
         Ok(candidate)
     }
 
@@ -1353,6 +1357,7 @@ impl AgentRuntime {
         local_bind: std::net::SocketAddr,
         stun_servers: Vec<std::net::SocketAddr>,
     ) -> Result<NatClassification, AgentError> {
+        let _refresh = self.stun_refresh.lock().await;
         if stun_servers.is_empty() {
             return Err(AgentError::Stun(StunError::InvalidResponse(
                 "at least one STUN server is required for NAT classification".to_string(),
@@ -1380,15 +1385,37 @@ impl AgentRuntime {
             Utc::now(),
         );
 
-        let mut candidates = self.candidates.write().await;
-        candidates.extend(
+        self.replace_stun_candidates(
             observations
                 .iter()
-                .map(|observation| self.stun_candidate_from_observation(observation)),
-        );
+                .map(|observation| self.stun_candidate_from_observation(observation))
+                .collect(),
+        )
+        .await;
         *self.nat_classification.write().await = Some(classification.clone());
 
         Ok(classification)
+    }
+
+    async fn replace_stun_candidates(&self, refreshed: Vec<EndpointCandidate>) {
+        let mut deduplicated = Vec::<EndpointCandidate>::with_capacity(refreshed.len());
+        for candidate in refreshed {
+            if let Some(existing) = deduplicated.iter_mut().find(|existing| {
+                existing.source == CandidateSource::StunProbe
+                    && existing.kind == candidate.kind
+                    && existing.addr == candidate.addr
+            }) {
+                if candidate.observed_at >= existing.observed_at {
+                    *existing = candidate;
+                }
+            } else {
+                deduplicated.push(candidate);
+            }
+        }
+
+        let mut candidates = self.candidates.write().await;
+        candidates.retain(|candidate| candidate.source != CandidateSource::StunProbe);
+        candidates.extend(deduplicated);
     }
 
     fn stun_candidate_from_observation(
@@ -9356,6 +9383,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_replaces_and_deduplicates_stun_candidates() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id;
+        let observed_at = Utc::now();
+        let interface_candidate = EndpointCandidate {
+            node_id: node_id.clone(),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([10, 0, 0, 10], 51_820)),
+            observed_at,
+            priority: 100,
+            cost: 1,
+            source: CandidateSource::InterfaceScan,
+        };
+        let stale_stun_candidate = EndpointCandidate {
+            node_id: node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 10], 40_000)),
+            observed_at,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        };
+        runtime
+            .replace_candidates(vec![interface_candidate.clone(), stale_stun_candidate])
+            .await;
+
+        let duplicate_addr = SocketAddr::from(([198, 51, 100, 20], 40_001));
+        let older_duplicate = EndpointCandidate {
+            node_id: node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: duplicate_addr,
+            observed_at: observed_at + ChronoDuration::seconds(1),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        };
+        let latest_duplicate = EndpointCandidate {
+            observed_at: observed_at + ChronoDuration::seconds(2),
+            priority: 90,
+            cost: 10,
+            ..older_duplicate.clone()
+        };
+        let second_stun_candidate = EndpointCandidate {
+            node_id,
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 30], 40_002)),
+            observed_at: observed_at + ChronoDuration::seconds(2),
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        };
+
+        runtime
+            .replace_stun_candidates(vec![
+                older_duplicate,
+                latest_duplicate.clone(),
+                second_stun_candidate.clone(),
+            ])
+            .await;
+
+        let status = runtime.status().await;
+        assert_eq!(status.candidate_count, 3);
+        assert_eq!(
+            status.candidates,
+            vec![interface_candidate, latest_duplicate, second_stun_candidate,]
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_classifies_nat_from_multiple_stun_observations(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let first_server = Rfc5780StunServer::bind(
@@ -9396,7 +9495,7 @@ mod tests {
             NatTraversalStrategy::DirectCandidate
         );
         let status = runtime.status().await;
-        assert_eq!(status.candidate_count, 2);
+        assert_eq!(status.candidate_count, 1);
         assert_eq!(status.nat_classification, Some(classification));
         Ok(())
     }
