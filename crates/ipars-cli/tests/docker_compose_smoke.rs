@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{hash_map::DefaultHasher, BTreeSet};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde_json::Value;
 
 const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str =
@@ -656,6 +657,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         .to_string();
     let suffix = unique_suffix()?;
     let project_name = format!("ipars-dataplane-{suffix}");
+    let (workload_a_v6_cidr, workload_b_v6_cidr) = dataplane_ipv6_cidrs(&project_name)?;
     let docker_socket = docker_engine_socket_path()?;
     let route_a_network = format!("{project_name}-route-a");
     let route_b_network = format!("{project_name}-route-b");
@@ -704,6 +706,22 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
                 "placeholder-workload-b".to_string(),
             ),
             (
+                "IPARS_DATAPLANE_WORKLOAD_A_V6_NETWORK".to_string(),
+                "placeholder-workload-a-v6".to_string(),
+            ),
+            (
+                "IPARS_DATAPLANE_WORKLOAD_B_V6_NETWORK".to_string(),
+                "placeholder-workload-b-v6".to_string(),
+            ),
+            (
+                "IPARS_DATAPLANE_WORKLOAD_A_V6_CIDR".to_string(),
+                workload_a_v6_cidr.to_string(),
+            ),
+            (
+                "IPARS_DATAPLANE_WORKLOAD_B_V6_CIDR".to_string(),
+                workload_b_v6_cidr.to_string(),
+            ),
+            (
                 "IPARS_DATAPLANE_ROUTE_A_NETWORK".to_string(),
                 route_a_network.clone(),
             ),
@@ -723,6 +741,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
 
     let workload_a_network = compose_network_name(&compose, "workload-a")?;
     let workload_b_network = compose_network_name(&compose, "workload-b")?;
+    let workload_a_v6_network = compose_network_name(&compose, "workload-a-v6")?;
+    let workload_b_v6_network = compose_network_name(&compose, "workload-b-v6")?;
     replace_compose_env(
         &mut compose,
         "IPARS_DATAPLANE_WORKLOAD_A_NETWORK",
@@ -732,6 +752,16 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         &mut compose,
         "IPARS_DATAPLANE_WORKLOAD_B_NETWORK",
         workload_b_network,
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_WORKLOAD_A_V6_NETWORK",
+        workload_a_v6_network,
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "IPARS_DATAPLANE_WORKLOAD_B_V6_NETWORK",
+        workload_b_v6_network,
     )?;
 
     run_compose_with_diagnostics(
@@ -761,10 +791,21 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "agent-b",
             "workload-a",
             "workload-b",
+            "workload-a-v6",
+            "workload-b-v6",
         ],
     )?;
     let workload_a_cidr = compose_network_ipv4_subnet(&compose, "workload-a")?;
     let workload_b_cidr = compose_network_ipv4_subnet(&compose, "workload-b")?;
+    let workload_a_v6_ipv4_cidr = compose_network_ipv4_subnet(&compose, "workload-a-v6")?;
+    let workload_b_v6_ipv4_cidr = compose_network_ipv4_subnet(&compose, "workload-b-v6")?;
+    let discovered_workload_a_v6_cidr = compose_network_ipv6_subnet(&compose, "workload-a-v6")?;
+    let discovered_workload_b_v6_cidr = compose_network_ipv6_subnet(&compose, "workload-b-v6")?;
+    anyhow::ensure!(
+        discovered_workload_a_v6_cidr == workload_a_v6_cidr
+            && discovered_workload_b_v6_cidr == workload_b_v6_cidr,
+        "Docker IPv6 workload networks did not preserve configured subnets: expected {workload_a_v6_cidr} and {workload_b_v6_cidr}, got {discovered_workload_a_v6_cidr} and {discovered_workload_b_v6_cidr}"
+    );
     anyhow::ensure!(
         !workload_a_cidr.contains(&workload_b_cidr.network())
             && !workload_b_cidr.contains(&workload_a_cidr.network()),
@@ -776,11 +817,15 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         &issuer_private_key,
         bootstrap_ip,
         &[
-            workload_a_cidr,
-            workload_b_cidr,
-            route_a_cidr,
-            route_b_cidr,
-            route_b_replacement_cidr,
+            workload_a_cidr.into(),
+            workload_b_cidr.into(),
+            workload_a_v6_ipv4_cidr.into(),
+            workload_b_v6_ipv4_cidr.into(),
+            workload_a_v6_cidr.into(),
+            workload_b_v6_cidr.into(),
+            route_a_cidr.into(),
+            route_b_cidr.into(),
+            route_b_replacement_cidr.into(),
         ],
     )?;
     replace_compose_env(
@@ -831,6 +876,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "agent-b",
             "workload-a",
             "workload-b",
+            "workload-a-v6",
+            "workload-b-v6",
         ],
     )?;
     assert_compose_services_running(
@@ -844,6 +891,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "agent-b",
             "workload-a",
             "workload-b",
+            "workload-a-v6",
+            "workload-b-v6",
         ],
     )?;
 
@@ -882,6 +931,18 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     let agent_b_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent-b", workload_b_cidr)?;
     let workload_a_ip = compose_service_ipv4_in_subnet(&compose, "workload-a", workload_a_cidr)?;
     let workload_b_ip = compose_service_ipv4_in_subnet(&compose, "workload-b", workload_b_cidr)?;
+    let workload_a_v6_ipv4_ip =
+        compose_service_ipv4_in_subnet(&compose, "workload-a-v6", workload_a_v6_ipv4_cidr)?;
+    let workload_b_v6_ipv4_ip =
+        compose_service_ipv4_in_subnet(&compose, "workload-b-v6", workload_b_v6_ipv4_cidr)?;
+    let agent_workload_v6_ip =
+        compose_service_ipv6_in_subnet(&compose, "agent", workload_a_v6_cidr)?;
+    let agent_b_workload_v6_ip =
+        compose_service_ipv6_in_subnet(&compose, "agent-b", workload_b_v6_cidr)?;
+    let workload_a_v6_ip =
+        compose_service_ipv6_in_subnet(&compose, "workload-a-v6", workload_a_v6_cidr)?;
+    let workload_b_v6_ip =
+        compose_service_ipv6_in_subnet(&compose, "workload-b-v6", workload_b_v6_cidr)?;
     configure_compose_workload_routes(
         &compose,
         "workload-a",
@@ -894,8 +955,34 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         agent_b_workload_ip,
         &[workload_a_cidr, "100.64.0.0/10".parse()?],
     )?;
+    configure_compose_workload_ipv6_routes(
+        &compose,
+        "workload-a-v6",
+        agent_workload_v6_ip,
+        &[workload_b_v6_cidr],
+    )?;
+    configure_compose_workload_ipv6_routes(
+        &compose,
+        "workload-b-v6",
+        agent_b_workload_v6_ip,
+        &[workload_a_v6_cidr],
+    )?;
     wait_for_compose_advertised_route(&compose, "agent", workload_b_cidr, workload_b_ip)?;
     wait_for_compose_advertised_route(&compose, "agent-b", workload_a_cidr, workload_a_ip)?;
+    wait_for_compose_advertised_route(
+        &compose,
+        "agent",
+        workload_b_v6_ipv4_cidr,
+        workload_b_v6_ipv4_ip,
+    )?;
+    wait_for_compose_advertised_route(
+        &compose,
+        "agent-b",
+        workload_a_v6_ipv4_cidr,
+        workload_a_v6_ipv4_ip,
+    )?;
+    wait_for_compose_advertised_route(&compose, "agent", workload_b_v6_cidr, workload_b_v6_ip)?;
+    wait_for_compose_advertised_route(&compose, "agent-b", workload_a_v6_cidr, workload_a_v6_ip)?;
     wait_for_compose_advertised_route(
         &compose,
         "agent",
@@ -933,6 +1020,18 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         agent_vpn_ip,
         workload_a_ip,
     )?;
+    assert_compose_routed_ipv6_workload_traffic(
+        &compose,
+        "agent",
+        "workload-a-v6",
+        workload_b_v6_ip,
+    )?;
+    assert_compose_routed_ipv6_workload_traffic(
+        &compose,
+        "agent-b",
+        "workload-b-v6",
+        workload_a_v6_ip,
+    )?;
     Ok(())
 }
 
@@ -941,7 +1040,7 @@ fn generated_dataplane_join_token(
     issuer_key_id: &str,
     issuer_private_key: &str,
     bootstrap_ip: IpAddr,
-    allowed_routes: &[Ipv4Net],
+    allowed_routes: &[IpNet],
 ) -> Result<Value> {
     let control_plane = format!("http://{bootstrap_ip}:8443");
     let signal = format!("http://{bootstrap_ip}:9443");
@@ -1374,6 +1473,31 @@ fn create_docker_bridge_network(name: &str) -> Result<Ipv4Net> {
     )
 }
 
+fn dataplane_ipv6_cidrs(project_name: &str) -> Result<(Ipv6Net, Ipv6Net)> {
+    let mut hasher = DefaultHasher::new();
+    project_name.hash(&mut hasher);
+    let hash = hasher.finish();
+    let global_id_high = 0xfd00 | (((hash >> 32) as u16) & 0x00ff);
+    let global_id_mid = (hash >> 16) as u16;
+    let global_id_low = hash as u16;
+    let network = |subnet| {
+        Ipv6Net::new(
+            Ipv6Addr::new(
+                global_id_high,
+                global_id_mid,
+                global_id_low,
+                subnet,
+                0,
+                0,
+                0,
+                0,
+            ),
+            64,
+        )
+    };
+    Ok((network(1)?, network(2)?))
+}
+
 fn replace_docker_bridge_network(
     name: &str,
     replacement_reservation: &str,
@@ -1447,6 +1571,38 @@ fn compose_network_name(compose: &ComposeProject, network_key: &str) -> Result<S
 
 fn compose_network_ipv4_subnet(compose: &ComposeProject, network_key: &str) -> Result<Ipv4Net> {
     let network_name = compose_network_name(compose, network_key)?;
+    let subnets = compose_network_subnets(compose, network_key)?
+        .into_iter()
+        .filter_map(|subnet| match subnet {
+            IpNet::V4(subnet) => Some(subnet),
+            IpNet::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        subnets.len() == 1,
+        "Docker network {network_name} must have exactly one IPv4 subnet, got {subnets:?}"
+    );
+    Ok(subnets[0])
+}
+
+fn compose_network_ipv6_subnet(compose: &ComposeProject, network_key: &str) -> Result<Ipv6Net> {
+    let network_name = compose_network_name(compose, network_key)?;
+    let subnets = compose_network_subnets(compose, network_key)?
+        .into_iter()
+        .filter_map(|subnet| match subnet {
+            IpNet::V4(_) => None,
+            IpNet::V6(subnet) => Some(subnet),
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        subnets.len() == 1,
+        "Docker network {network_name} must have exactly one IPv6 subnet, got {subnets:?}"
+    );
+    Ok(subnets[0])
+}
+
+fn compose_network_subnets(compose: &ComposeProject, network_key: &str) -> Result<Vec<IpNet>> {
+    let network_name = compose_network_name(compose, network_key)?;
     let output = Command::new("docker")
         .args(["network", "inspect", &network_name])
         .output()
@@ -1463,13 +1619,17 @@ fn compose_network_ipv4_subnet(compose: &ComposeProject, network_key: &str) -> R
     let subnets = configs
         .iter()
         .filter_map(|config| config.get("Subnet").and_then(Value::as_str))
-        .filter_map(|subnet| subnet.parse::<Ipv4Net>().ok())
-        .collect::<Vec<_>>();
+        .map(|subnet| {
+            subnet.parse::<IpNet>().with_context(|| {
+                format!("Docker network {network_name} returned invalid subnet {subnet:?}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(
-        subnets.len() == 1,
-        "Docker network {network_name} must have exactly one IPv4 subnet, got {subnets:?}"
+        !subnets.is_empty(),
+        "Docker network {network_name} did not report any IPAM subnets"
     );
-    Ok(subnets[0])
+    Ok(subnets)
 }
 
 fn compose_service_ipv4_in_subnet(
@@ -1503,6 +1663,37 @@ fn compose_service_ipv4_in_subnet(
     Ok(addresses[0])
 }
 
+fn compose_service_ipv6_in_subnet(
+    compose: &ComposeProject,
+    service: &str,
+    subnet: Ipv6Net,
+) -> Result<Ipv6Addr> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec", "-T", service, "ip", "-6", "-o", "address", "show", "scope", "global",
+    ]);
+    let output = command.output().with_context(|| {
+        format!("failed to inspect {service} IPv6 addresses for subnet {subnet}")
+    })?;
+    ensure_success(
+        &format!("inspect {service} IPv6 addresses for subnet {subnet}"),
+        &output,
+    )?;
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{service} IPv6 address output was not UTF-8"))?;
+    let addresses = stdout
+        .split_whitespace()
+        .filter_map(|field| field.split_once('/').map(|(addr, _)| addr))
+        .filter_map(|addr| addr.parse::<Ipv6Addr>().ok())
+        .filter(|addr| subnet.contains(addr))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        addresses.len() == 1,
+        "service {service} must have exactly one IPv6 address in {subnet}, got {addresses:?}: {stdout:?}"
+    );
+    Ok(addresses[0])
+}
+
 fn configure_compose_workload_routes(
     compose: &ComposeProject,
     workload: &str,
@@ -1527,6 +1718,37 @@ fn configure_compose_workload_routes(
         })?;
         ensure_success(
             &format!("configure {workload} route {route} via {gateway}"),
+            &output,
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_compose_workload_ipv6_routes(
+    compose: &ComposeProject,
+    workload: &str,
+    gateway: Ipv6Addr,
+    routes: &[Ipv6Net],
+) -> Result<()> {
+    for route in routes {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            workload,
+            "ip",
+            "-6",
+            "route",
+            "replace",
+            &route.to_string(),
+            "via",
+            &gateway.to_string(),
+        ]);
+        let output = command.output().with_context(|| {
+            format!("failed to configure {workload} IPv6 route {route} via {gateway}")
+        })?;
+        ensure_success(
+            &format!("configure {workload} IPv6 route {route} via {gateway}"),
             &output,
         )?;
     }
@@ -1643,12 +1865,18 @@ wg show "$interface" latest-handshakes | awk '$2 > 0 { found = 1 } END { exit !f
     }
 }
 
-fn wait_for_compose_advertised_route(
+fn wait_for_compose_advertised_route<C, A>(
     compose: &ComposeProject,
     service: &str,
-    remote_cidr: Ipv4Net,
-    remote_workload_ip: Ipv4Addr,
-) -> Result<()> {
+    remote_cidr: C,
+    remote_workload_ip: A,
+) -> Result<()>
+where
+    C: Into<IpNet>,
+    A: Into<IpAddr>,
+{
+    let remote_cidr = remote_cidr.into();
+    let remote_workload_ip = remote_workload_ip.into();
     let script = r#"
 set -eu
 interface="$1"
@@ -1791,20 +2019,42 @@ fn assert_compose_routed_workload_traffic(
         "container-to-container",
     )?;
 
+    assert_compose_wireguard_transfer(compose, local_agent)
+}
+
+fn assert_compose_routed_ipv6_workload_traffic(
+    compose: &ComposeProject,
+    local_agent: &str,
+    local_workload: &str,
+    remote_workload_ip: Ipv6Addr,
+) -> Result<()> {
+    let remote_url = format!("http://[{remote_workload_ip}]:8080/healthz");
+    wait_for_compose_http(compose, local_agent, &remote_url, "IPv6 node-to-container")?;
+    wait_for_compose_http(
+        compose,
+        local_workload,
+        &remote_url,
+        "IPv6 container-to-container",
+    )?;
+
+    assert_compose_wireguard_transfer(compose, local_agent)
+}
+
+fn assert_compose_wireguard_transfer(compose: &ComposeProject, service: &str) -> Result<()> {
     let mut command = compose_command(compose);
     command.args([
         "exec",
         "-T",
-        local_agent,
+        service,
         "sh",
         "-ec",
         "wg show ipars0 transfer | awk '$2 > 0 && $3 > 0 { found = 1 } END { exit !found }'",
     ]);
     let output = command
         .output()
-        .with_context(|| format!("failed to inspect {local_agent} WireGuard transfer counters"))?;
+        .with_context(|| format!("failed to inspect {service} WireGuard transfer counters"))?;
     ensure_success(
-        &format!("inspect {local_agent} WireGuard transfer counters"),
+        &format!("inspect {service} WireGuard transfer counters"),
         &output,
     )
 }
