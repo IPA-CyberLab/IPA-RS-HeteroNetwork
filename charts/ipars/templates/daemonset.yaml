@@ -5,6 +5,12 @@
 {{- if or (eq .Values.agent.joinTokenSecretKey "") (gt (len .Values.agent.joinTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.joinTokenSecretKey)) -}}
 {{- fail "agent.joinTokenSecretKey must contain only ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
+{{- if or (eq .Values.agent.apiBearerTokenSecretKey "") (gt (len .Values.agent.apiBearerTokenSecretKey) 253) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.apiBearerTokenSecretKey)) -}}
+{{- fail "agent.apiBearerTokenSecretKey must contain only ASCII letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- if eq .Values.agent.apiBearerTokenSecretKey .Values.agent.joinTokenSecretKey -}}
+{{- fail "agent.apiBearerTokenSecretKey must differ from agent.joinTokenSecretKey" -}}
+{{- end -}}
 {{- $relayAdmissionBearerTokenSecretName := .Values.agent.relayAdmissionBearerTokenSecret.name -}}
 {{- $relayAdmissionBearerTokenSecretKey := .Values.agent.relayAdmissionBearerTokenSecret.key -}}
 {{- if and (eq $relayAdmissionBearerTokenSecretName "") (ne $relayAdmissionBearerTokenSecretKey "") -}}
@@ -1096,6 +1102,11 @@ spec:
             {{- end }}
             {{- end }}
           env:
+            - name: IPARS_AGENT_API_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agent.joinTokenSecretName | quote }}
+                  key: {{ .Values.agent.apiBearerTokenSecretKey | quote }}
             - name: IPARS_KUBERNETES_NODE_NAME
               valueFrom:
                 fieldRef:

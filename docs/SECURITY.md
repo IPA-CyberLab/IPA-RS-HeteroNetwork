@@ -51,6 +51,14 @@ WireGuard data-plane keys rotate through the local agent API. The agent signs th
 
 Node removal uses the same node identity boundary. `DELETE /v1/nodes/{node_id}` requires a signed request from the registered node identity before the control plane removes the durable node record, clears health/path state, and releases the VPN IP lease for reuse.
 
+## Agent Management API
+
+The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.
+
+The daemon bounds token-file reads and compares submitted credentials in constant time over a fixed maximum size. The CLI applies its global `--agent-api-bearer-token` or `--agent-api-bearer-token-path` source to every Agent API read and mutation. Prefer file-backed tokens, keep them separate from signed join tokens, and rotate them through the deployment secret mechanism. The Kubernetes chart uses a distinct Secret key and rejects reuse of the join-token key.
+
+Bearer authentication is an authorization control, not transport encryption. Use TLS before traffic leaves a trusted host or private deployment network.
+
 ## Relay Abuse Controls
 
 Relay eligibility requires policy permission, usable public endpoint/admission URL values, fresh healthy heartbeat state, capacity, and E2E-only relay mode. Public IP reachability alone is not enough to become a relay.
@@ -72,6 +80,7 @@ Implemented controls:
 - Store issuer private keys outside the control-plane process where possible; pass only issuer public keys to redundant control-plane instances.
 - When using `ipars init --spawn-daemons`, spawned bootstrap services receive a cleared environment with only a fixed system `PATH` and `C` locale so issuer-key environment variables are not propagated.
 - Prefer file-backed join tokens through `--join-token-path` or Kubernetes Secrets over command-line token arguments.
+- Keep Agent API Bearer tokens owner-only, separate from join tokens, and pass them through `--api-bearer-token-path`, Compose secrets, or a distinct Kubernetes Secret key.
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable relay admission Bearer tokens for public relays.
 - Scope ACLs and route allowlists by role, tag, route, and protocol. Deny rules take precedence.

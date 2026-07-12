@@ -268,6 +268,8 @@ Initial agent HTTP routes:
 - `POST /v1/peer-activity`
 - `POST /v1/packet-flow`
 
+The Agent listener defaults to loopback. Non-loopback listeners require a 32-512 byte management Bearer token, and configured authentication covers `/metrics` plus all `/v1/*` reads and mutations. `/healthz` remains unauthenticated for orchestration probes. CLI Agent calls, Compose, and the Helm DaemonSet carry the same credential through file-backed or Secret-backed configuration; the management credential is intentionally separate from the signed join token.
+
 ## Observability
 
 All daemons emit:
@@ -290,6 +292,7 @@ Every `iparsd` subcommand shares root observability options. When `--otel-enable
 - Token policy constrains relay permission, route advertisements contained within allowed CIDRs, allowed tags, and max-use admission.
 - Identity keys authenticate nodes to the control plane.
 - WireGuard keys provide data-plane confidentiality.
+- Agent management APIs default to loopback and require Bearer authentication for non-loopback listeners; `/healthz` is the only intentionally unauthenticated Agent route when protection is configured.
 - Relays cannot decrypt payload.
 - Public nodes are not automatically relays; policy, health, and capacity are required.
 - Kubernetes NetworkPolicies can restrict agent API and relay ingress by CIDR when the cluster CNI enforces them; hostNetwork enforcement is explicitly acknowledged because it is implementation-dependent.

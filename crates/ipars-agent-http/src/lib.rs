@@ -1,8 +1,9 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,6 +23,7 @@ use ipars_types::{NodeId, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -34,6 +36,7 @@ pub struct AgentHttpState {
     runtime: Arc<AgentRuntime>,
     state_store: Option<FileAgentStateStore>,
     control_plane_urls: Vec<String>,
+    api_bearer_token: Option<Arc<str>>,
 }
 
 impl AgentHttpState {
@@ -42,6 +45,7 @@ impl AgentHttpState {
             runtime,
             state_store: None,
             control_plane_urls: Vec::new(),
+            api_bearer_token: None,
         }
     }
 
@@ -53,6 +57,7 @@ impl AgentHttpState {
             runtime,
             state_store: None,
             control_plane_urls,
+            api_bearer_token: None,
         }
     }
 
@@ -65,13 +70,18 @@ impl AgentHttpState {
             runtime,
             state_store: Some(state_store),
             control_plane_urls,
+            api_bearer_token: None,
         }
+    }
+
+    pub fn require_api_bearer_token(mut self, token: String) -> Self {
+        self.api_bearer_token = Some(Arc::from(token));
+        self
     }
 }
 
 pub fn router(state: AgentHttpState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+    let mut protected = Router::new()
         .route("/metrics", get(prometheus_metrics))
         .route("/v1/status", get(status))
         .route("/v1/metrics", get(metrics))
@@ -84,8 +94,64 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/v1/peer-activity", post(peer_activity))
         .route("/v1/packet-flow", post(packet_flow))
         .route("/v1/wireguard-key/rotate", post(rotate_wireguard_key))
-        .route("/v1/node/remove", post(remove_node))
+        .route("/v1/node/remove", post(remove_node));
+    if let Some(token) = state.api_bearer_token.clone() {
+        protected = protected.route_layer(middleware::from_fn_with_state(
+            token,
+            require_agent_api_bearer,
+        ));
+    }
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn require_agent_api_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let provided = bearer_token_from_headers(request.headers())
+        .ok_or_else(|| ApiError::unauthorized("agent API bearer token is required"))?;
+    if !agent_api_token_matches(&expected, provided) {
+        return Err(ApiError::unauthorized(
+            "agent API bearer token was rejected",
+        ));
+    }
+    Ok(next.run(request).await)
+}
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn agent_api_token_matches(expected: &str, provided: &str) -> bool {
+    if expected.is_empty()
+        || provided.is_empty()
+        || expected.len() > MAX_AGENT_API_BEARER_TOKEN_BYTES
+        || provided.len() > MAX_AGENT_API_BEARER_TOKEN_BYTES
+    {
+        return false;
+    }
+
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut diff = expected.len() ^ provided.len();
+    for index in 0..MAX_AGENT_API_BEARER_TOKEN_BYTES {
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        let provided_byte = provided.get(index).copied().unwrap_or_default();
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+    diff == 0
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -1283,6 +1349,13 @@ fn prometheus_label(value: &str) -> String {
 pub enum ApiError {
     Agent(AgentError),
     BadRequest(String),
+    Unauthorized(&'static str),
+}
+
+impl ApiError {
+    fn unauthorized(message: &'static str) -> Self {
+        Self::Unauthorized(message)
+    }
 }
 
 impl From<AgentError> for ApiError {
@@ -1296,6 +1369,16 @@ impl IntoResponse for ApiError {
         let error = match self {
             ApiError::BadRequest(error) => {
                 return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+            }
+            ApiError::Unauthorized(error) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer")],
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response();
             }
             ApiError::Agent(error) => error,
         };
@@ -1711,6 +1794,79 @@ mod tests {
                 .and_then(|process| process.pid),
             Some(4242)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_api_bearer_auth_protects_every_endpoint_except_health(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const TOKEN: &str = "agent-api-secret-with-at-least-32-bytes";
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(AgentHttpState::new(runtime).require_api_bearer_token(TOKEN.to_string()));
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing.headers().get(header::WWW_AUTHENTICATE),
+            Some(&header::HeaderValue::from_static("Bearer"))
+        );
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .header(header::AUTHORIZATION, "Bearer wrong-secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let protected_mutation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path-probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(protected_mutation.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(accepted.status(), StatusCode::OK);
         Ok(())
     }
 

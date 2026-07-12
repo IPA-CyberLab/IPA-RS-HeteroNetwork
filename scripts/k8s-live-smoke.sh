@@ -17,6 +17,7 @@ namespace="${IPARS_K8S_SMOKE_NAMESPACE:-ipars-live-${suffix}}"
 release="${IPARS_K8S_SMOKE_RELEASE:-ipars-live-${suffix}}"
 bootstrap_name="ipars-bootstrap"
 token_secret="ipars-live-join"
+agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 chart_fullname=""
 tmp_dir=""
 namespace_created=0
@@ -123,9 +124,13 @@ wait_for_agent_runtime() {
   local attempt
   for attempt in $(seq 1 60); do
     status_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
-      curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9780/v1/status 2>/dev/null || true)"
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer ${agent_api_token}" \
+        http://127.0.0.1:9780/v1/status 2>/dev/null || true)"
     metrics_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
-      curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer ${agent_api_token}" \
+        http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
     if jq -e '(.node_id | type == "string") and (.candidate_count | type == "number")' \
       >/dev/null 2>&1 <<<"$status_json" \
       && jq -e '.peer_map_synced == true and (.node_id | type == "string")' \
@@ -263,10 +268,13 @@ cluster_id="$(jq -er '.cluster_id | strings' "$init_output")"
 issuer_node_id="$(jq -er '.issuer_node_id | strings' "$init_output")"
 issuer_public_key="$(jq -er '.issuer_public_key | strings' "$init_output")"
 token_file="$tmp_dir/join-token.json"
+agent_api_token_file="$tmp_dir/agent-api.token"
 jq -ce '.join_token' "$init_output" >"$token_file"
+printf '%s\n' "$agent_api_token" >"$agent_api_token_file"
 
 "$kubectl_bin" -n "$namespace" create secret generic "$token_secret" \
   --from-file=token="$token_file" \
+  --from-file=agent-api-token="$agent_api_token_file" \
   --dry-run=client -o yaml | "$kubectl_bin" -n "$namespace" apply -f - >/dev/null
 
 image_ref="${image_repository}:${image_tag}"

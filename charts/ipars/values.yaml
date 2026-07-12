@@ -32,6 +32,7 @@ agent:
     pollIntervalSeconds: 30
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
+  apiBearerTokenSecretKey: agent-api-token
   routeProvider: false
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet

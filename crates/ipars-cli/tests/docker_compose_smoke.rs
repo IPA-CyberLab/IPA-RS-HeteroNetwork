@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str = "compose-relay-admission-secret";
+const COMPOSE_AGENT_API_BEARER_TOKEN: &str = "compose-agent-api-secret-with-at-least-32-bytes";
 
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
@@ -98,6 +99,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     anyhow::ensure!(
         rendered.contains("apply-peer-map"),
         "rendered base Compose config did not enable agent peer-map application"
+    );
+    anyhow::ensure!(
+        rendered.contains("IPARS_AGENT_API_BEARER_TOKEN_PATH")
+            && rendered.contains("/run/secrets/ipars-agent-api-bearer-token"),
+        "rendered base Compose config did not mount the agent API Bearer secret"
     );
 
     let rootful_discovery_compose = ComposeProject {
@@ -413,6 +419,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             && rendered.contains(COMPOSE_RELAY_ADMISSION_BEARER_TOKEN),
         "rendered smoke Compose config did not pass the relay admission Bearer token to the agent"
     );
+    anyhow::ensure!(
+        rendered.contains("IPARS_AGENT_API_BEARER_TOKEN")
+            && rendered.contains(COMPOSE_AGENT_API_BEARER_TOKEN),
+        "rendered smoke Compose config did not require agent API Bearer auth"
+    );
 
     drop(tcp_ports);
     drop(udp_ports);
@@ -436,6 +447,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         agent: agent_port,
         agent_b: agent_b_port,
     };
+    let unauthorized_agent_status = compose_exec_http_status(
+        &compose,
+        "agent",
+        "GET",
+        &format!("http://127.0.0.1:{agent_port}/v1/status"),
+        None,
+        "agent status without Bearer auth",
+    )?;
+    anyhow::ensure!(
+        unauthorized_agent_status == 401,
+        "agent status without Bearer auth returned {unauthorized_agent_status}, expected 401"
+    );
     let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
     assert_compose_agent_peer_maps(&compose, &agent_nodes, &api_ports)?;
@@ -558,6 +581,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
       IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_API_BEARER_TOKEN: {agent_api_bearer_token}
       IPARS_AGENT_STUN_BIND: 0.0.0.0:0
       IPARS_AGENT_RUNTIME_BACKEND: dry-run
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
@@ -604,6 +628,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
       IPARS_AGENT_JOIN_TOKEN: {join_token}
+      IPARS_AGENT_API_BEARER_TOKEN: {agent_api_bearer_token}
       IPARS_AGENT_STUN_BIND: 0.0.0.0:0
       IPARS_AGENT_RUNTIME_BACKEND: dry-run
       IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
@@ -647,6 +672,7 @@ volumes:
         issuer_node_id = config.issuer_node_id,
         issuer_public_key = config.issuer_public_key,
         join_token = yaml_single_quoted(config.join_token),
+        agent_api_bearer_token = yaml_single_quoted(COMPOSE_AGENT_API_BEARER_TOKEN),
         relay_admission_bearer_token = yaml_single_quoted(config.relay_admission_bearer_token),
         control_plane_port = config.ports.control_plane,
         signal_port = config.ports.signal,
@@ -1608,8 +1634,9 @@ fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Resu
         "5",
         "-H",
         "Accept: application/json",
-        url,
     ]);
+    add_agent_api_bearer_header(&mut command, service);
+    command.arg(url);
     let output = command
         .output()
         .with_context(|| format!("failed to run docker compose exec {service} curl {url}"))?;
@@ -1637,8 +1664,9 @@ fn compose_exec_text(compose: &ComposeProject, service: &str, url: &str) -> Resu
         "5",
         "-H",
         "Accept: text/plain",
-        url,
     ]);
+    add_agent_api_bearer_header(&mut command, service);
+    command.arg(url);
     let output = command
         .output()
         .with_context(|| format!("failed to run docker compose exec {service} curl {url}"))?;
@@ -1672,8 +1700,9 @@ fn compose_exec_post_json(
         "Content-Type: application/json",
         "--data-binary",
         body,
-        url,
     ]);
+    add_agent_api_bearer_header(&mut command, service);
+    command.arg(url);
     let output = command
         .output()
         .with_context(|| format!("failed to run docker compose exec {service} curl POST {url}"))?;
@@ -1687,6 +1716,15 @@ fn compose_exec_post_json(
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+fn add_agent_api_bearer_header(command: &mut Command, service: &str) {
+    if matches!(service, "agent" | "agent-b") {
+        command.args([
+            "-H",
+            &format!("Authorization: Bearer {COMPOSE_AGENT_API_BEARER_TOKEN}"),
+        ]);
+    }
 }
 
 fn compose_exec_http_status(

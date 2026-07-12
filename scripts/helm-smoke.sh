@@ -73,6 +73,16 @@ assert_rendered_contains default "- --wireguard-listen-port"
 assert_rendered_contains default '- "51820"'
 assert_rendered_contains default "- --stun-bind"
 assert_rendered_contains default '- "0.0.0.0:51820"'
+assert_rendered_contains default "name: IPARS_AGENT_API_BEARER_TOKEN"
+assert_rendered_contains default 'key: "agent-api-token"'
+
+template_fails agent-api-token-key-empty \
+  "agent.apiBearerTokenSecretKey must contain only ASCII letters" \
+  --set-string agent.apiBearerTokenSecretKey=
+
+template_fails agent-api-token-key-reuses-join-key \
+  "agent.apiBearerTokenSecretKey must differ from agent.joinTokenSecretKey" \
+  --set-string agent.apiBearerTokenSecretKey=token
 
 template_ok agent-listen-port \
   --set agent.wireguardListenPort=51830 \

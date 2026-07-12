@@ -32,6 +32,8 @@ iparsd agent \
   --apply-peer-map
 ```
 
+The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/ipars/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
+
 For a real `--apply-peer-map` runtime, keep `--stun-bind` and
 `--wireguard-listen-port` on the same nonzero UDP port. The agent performs its
 initial STUN probe before configuring the WireGuard interface, then configures
@@ -59,6 +61,17 @@ bundled relay UDP listener on `51820`. Override the two variables together with
 the same nonzero port for a real data-plane deployment. The Compose smoke uses
 an ephemeral STUN bind only because its two host-network agents run with the
 non-mutating `dry-run` backend.
+
+Before starting the bundled stack, place the signed join token at
+`docker/join.token` and create a separate management token:
+
+```bash
+umask 077
+head -c 32 /dev/urandom | base64 > docker/agent-api.token
+```
+
+Set `IPARS_AGENT_API_BEARER_TOKEN_FILE` when the management token lives at a
+different host path.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait
@@ -106,6 +119,15 @@ before rendering the DaemonSet.
 `--agent-wireguard-listen-port` or `--agent-stun-bind`; the omitted value is
 derived from the supplied port, while conflicting explicit values are rejected
 before Helm is invoked.
+
+Prepare separate join and Agent API token files. The install plan creates one
+Kubernetes Secret with distinct keys and rejects key reuse:
+
+```bash
+kubectl -n ipars-system create secret generic ipars-join-token \
+  --from-file=token=./join.token \
+  --from-file=agent-api-token=./agent-api.token
+```
 
 ```bash
 ipars k8s install \
@@ -163,6 +185,7 @@ the cluster and live-smoke namespace for diagnostics.
 Common probes:
 
 ```bash
+export IPARS_AGENT_API_BEARER_TOKEN_PATH=/etc/ipars/agent-api.token
 ipars status --agent-url http://127.0.0.1:9780
 ipars status --control-plane-url http://127.0.0.1:8443
 ipars peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
@@ -174,7 +197,7 @@ ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 
 ipars stun probe --stun-server 127.0.0.1:3478
 ```
 
-Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
+Prometheus-style metrics are exposed by control-plane, signal, relay, and agent HTTP services. Agent metrics use the same Bearer authentication as its `/v1/*` routes when configured. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
 
 ## Failure Behavior
 

@@ -45,10 +45,14 @@ const DEFAULT_LOCAL_AGENT_URL: &str = "http://127.0.0.1:9780";
 const DEFAULT_LOCAL_RELAY_URL: &str = "http://127.0.0.1:9580";
 const DEFAULT_LOCAL_RELAY_UDP: &str = "127.0.0.1:51820";
 const DEFAULT_LOCAL_STUN_UDP: &str = "127.0.0.1:3478";
+const DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY: &str = "agent-api-token";
 const DEFAULT_RELAY_PROBE_TIMEOUT_MS: u64 = 2_000;
 const MAX_RELAY_PROBE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RELAY_PROBE_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
+const MIN_AGENT_API_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -77,8 +81,116 @@ const DOCKER_NETWORK_SUBNETS_TEMPLATE: &str =
 #[command(name = "ipars")]
 #[command(about = "IPA-RS-HeteroNetwork P2P VPN control CLI")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        env = "IPARS_AGENT_API_BEARER_TOKEN",
+        conflicts_with = "agent_api_bearer_token_path"
+    )]
+    agent_api_bearer_token: Option<String>,
+    #[arg(long, global = true, env = "IPARS_AGENT_API_BEARER_TOKEN_PATH")]
+    agent_api_bearer_token_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentApiAuth {
+    bearer_token: Option<String>,
+}
+
+impl AgentApiAuth {
+    fn from_sources(inline: Option<String>, path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let bearer_token = match (inline, path) {
+            (Some(token), None) => {
+                validate_agent_api_bearer_token(&token, "--agent-api-bearer-token")?;
+                Some(token)
+            }
+            (None, Some(path)) => Some(read_agent_api_bearer_token_file(&path)?),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "--agent-api-bearer-token conflicts with --agent-api-bearer-token-path"
+                )
+            }
+        };
+        Ok(Self { bearer_token })
+    }
+
+    fn bearer_token(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
+    }
+}
+
+fn validate_agent_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
+    if token.len() < MIN_AGENT_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must contain at least {MIN_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+    }
+    if token.len() > MAX_AGENT_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must not exceed {MAX_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+    }
+    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        anyhow::bail!("{label} must contain only printable non-whitespace ASCII characters");
+    }
+    Ok(())
+}
+
+fn read_agent_api_bearer_token_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open agent API bearer token file {}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect agent API bearer token file {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "agent API bearer token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+        anyhow::bail!(
+            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+        );
+    }
+
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed to read agent API bearer token from {}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+        anyhow::bail!(
+            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+        );
+    }
+    let token = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "failed to decode agent API bearer token file {} as UTF-8",
+            path.display()
+        )
+    })?;
+    let token = token.trim();
+    validate_agent_api_bearer_token(
+        token,
+        &format!("agent API bearer token file {}", path.display()),
+    )?;
+    Ok(token.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -1033,31 +1145,49 @@ struct KubernetesTopologySpreadArg {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    let Cli {
+        agent_api_bearer_token,
+        agent_api_bearer_token_path,
+        command,
+    } = Cli::parse();
+    let agent_api_auth =
+        AgentApiAuth::from_sources(agent_api_bearer_token, agent_api_bearer_token_path)?;
+    match command {
         Command::Init(args) => print_json(&init(*args)?)?,
         Command::Join(args) => print_json(&join(args).await?)?,
         Command::Status(args) => {
             match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
-                (Some(agent_url), None) => print_json(&agent_status(agent_url).await?)?,
+                (Some(agent_url), None) => print_json(
+                    &agent_status_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
+                )?,
                 (None, Some(control_plane_url)) => {
                     print_json(&control_plane_status(control_plane_url).await?)?
                 }
-                (None, None) => print_json(&agent_status(defaulted_agent_url(None)).await?)?,
+                (None, None) => print_json(
+                    &agent_status_with_bearer(
+                        defaulted_agent_url(None),
+                        agent_api_auth.bearer_token(),
+                    )
+                    .await?,
+                )?,
                 (Some(_), Some(_)) => unreachable!("clap prevents conflicting status URLs"),
             }
         }
         Command::Peers(args) => {
             match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
-                (Some(agent_url), None) if args.node_id.is_none() => {
-                    print_json(&agent_peer_map(agent_url).await?)?
-                }
+                (Some(agent_url), None) if args.node_id.is_none() => print_json(
+                    &agent_peer_map_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
+                )?,
                 (None, Some(control_plane_url)) => {
                     print_json(&peer_map(control_plane_url, &args).await?)?
                 }
-                (None, None) if args.node_id.is_none() => {
-                    print_json(&agent_peer_map(defaulted_agent_url(None)).await?)?
-                }
+                (None, None) if args.node_id.is_none() => print_json(
+                    &agent_peer_map_with_bearer(
+                        defaulted_agent_url(None),
+                        agent_api_auth.bearer_token(),
+                    )
+                    .await?,
+                )?,
                 (Some(_), None) => {
                     anyhow::bail!("ipars peers cannot use --node-id with --agent-url")
                 }
@@ -1069,15 +1199,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Routes(args) => {
             match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
-                (Some(agent_url), None) if args.node_id.is_none() => {
-                    print_json(&agent_routes(agent_url).await?)?
-                }
+                (Some(agent_url), None) if args.node_id.is_none() => print_json(
+                    &agent_routes_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
+                )?,
                 (None, Some(control_plane_url)) => {
                     print_json(&routes(control_plane_url, &args).await?)?
                 }
-                (None, None) if args.node_id.is_none() => {
-                    print_json(&agent_routes(defaulted_agent_url(None)).await?)?
-                }
+                (None, None) if args.node_id.is_none() => print_json(
+                    &agent_routes_with_bearer(
+                        defaulted_agent_url(None),
+                        agent_api_auth.bearer_token(),
+                    )
+                    .await?,
+                )?,
                 (Some(_), None) => {
                     anyhow::bail!("ipars routes cannot use --node-id with --agent-url")
                 }
@@ -1094,13 +1228,23 @@ async fn main() -> anyhow::Result<()> {
         Command::Key { command } => match command {
             KeyCommand::Rotate(args) => {
                 let agent_url = defaulted_agent_url(args.agent_url.as_deref());
-                print_json(&rotate_wireguard_key(agent_url, &args).await?)?
+                print_json(
+                    &rotate_wireguard_key_with_bearer(
+                        agent_url,
+                        &args,
+                        agent_api_auth.bearer_token(),
+                    )
+                    .await?,
+                )?
             }
         },
         Command::Node { command } => match command {
             NodeCommand::Remove(args) => {
                 let agent_url = defaulted_agent_url(args.agent_url.as_deref());
-                print_json(&remove_node(agent_url, &args).await?)?
+                print_json(
+                    &remove_node_with_bearer(agent_url, &args, agent_api_auth.bearer_token())
+                        .await?,
+                )?
             }
         },
         Command::Relay { command } => match command {
@@ -1115,26 +1259,42 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Path { command } => match command {
             PathCommand::Status(args) => match args.agent_url.as_deref() {
-                Some(agent_url) => print_json(&path_status(agent_url).await?)?,
+                Some(agent_url) => print_json(
+                    &path_status_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
+                )?,
                 None if args.control_plane_url.is_some() => {
                     print_json(&control_plane_path_status(&args).await?)?
                 }
                 None if args.node_id.is_some() => {
                     anyhow::bail!("ipars path status requires --control-plane-url with --node-id")
                 }
-                None => print_json(&path_status(defaulted_agent_url(None)).await?)?,
+                None => print_json(
+                    &path_status_with_bearer(
+                        defaulted_agent_url(None),
+                        agent_api_auth.bearer_token(),
+                    )
+                    .await?,
+                )?,
             },
             PathCommand::Events(args) => {
                 let agent_url = defaulted_agent_url(args.agent_url.as_deref());
-                print_json(&path_events(agent_url).await?)?
+                print_json(
+                    &path_events_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
+                )?
             }
             PathCommand::Activity(args) => {
                 let agent_url = defaulted_agent_url(args.agent_url.as_deref());
-                print_json(&path_activity(agent_url, &args).await?)?
+                print_json(
+                    &path_activity_with_bearer(agent_url, &args, agent_api_auth.bearer_token())
+                        .await?,
+                )?
             }
             PathCommand::Probe(args) => {
                 let agent_url = defaulted_agent_url(args.agent_url.as_deref());
-                print_json(&path_probe(agent_url, &args).await?)?
+                print_json(
+                    &path_probe_with_bearer(agent_url, &args, agent_api_auth.bearer_token())
+                        .await?,
+                )?
             }
         },
         Command::Docker {
@@ -1948,34 +2108,63 @@ async fn revoke_token(args: TokenRevokeArgs) -> anyhow::Result<RevokeTokenRespon
     read_bounded_json_response(response, "token revoke").await
 }
 
-async fn agent_status(agent_url: &str) -> anyhow::Result<AgentStatusResponse> {
-    get_json(agent_url, "/v1/status", "agent status").await
+async fn agent_status_with_bearer(
+    agent_url: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<AgentStatusResponse> {
+    get_json_with_bearer(agent_url, "/v1/status", "agent status", bearer_token).await
 }
 
-async fn rotate_wireguard_key(
+async fn rotate_wireguard_key_with_bearer(
     agent_url: &str,
     args: &KeyRotateArgs,
+    bearer_token: Option<&str>,
 ) -> anyhow::Result<AgentWireGuardKeyRotationResponse> {
     let request = AgentWireGuardKeyRotationRequest {
         control_plane_url: args.control_plane_url.clone(),
     };
-    post_json(
+    post_json_with_bearer(
         agent_url,
         "/v1/wireguard-key/rotate",
         "agent WireGuard key rotation",
         &request,
+        bearer_token,
     )
     .await
 }
 
-async fn remove_node(
+#[cfg(test)]
+async fn rotate_wireguard_key(
+    agent_url: &str,
+    args: &KeyRotateArgs,
+) -> anyhow::Result<AgentWireGuardKeyRotationResponse> {
+    rotate_wireguard_key_with_bearer(agent_url, args, None).await
+}
+
+async fn remove_node_with_bearer(
     agent_url: &str,
     args: &NodeRemoveArgs,
+    bearer_token: Option<&str>,
 ) -> anyhow::Result<AgentNodeRemovalResponse> {
     let request = AgentNodeRemovalRequest {
         control_plane_url: args.control_plane_url.clone(),
     };
-    post_json(agent_url, "/v1/node/remove", "agent node removal", &request).await
+    post_json_with_bearer(
+        agent_url,
+        "/v1/node/remove",
+        "agent node removal",
+        &request,
+        bearer_token,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn remove_node(
+    agent_url: &str,
+    args: &NodeRemoveArgs,
+) -> anyhow::Result<AgentNodeRemovalResponse> {
+    remove_node_with_bearer(agent_url, args, None).await
 }
 
 fn defaulted_agent_url(agent_url: Option<&str>) -> &str {
@@ -2009,8 +2198,11 @@ async fn peer_map(control_plane_url: &str, args: &PeersArgs) -> anyhow::Result<P
     .await
 }
 
-async fn agent_peer_map(agent_url: &str) -> anyhow::Result<PeerMap> {
-    get_json(agent_url, "/v1/peers", "agent peer map").await
+async fn agent_peer_map_with_bearer(
+    agent_url: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<PeerMap> {
+    get_json_with_bearer(agent_url, "/v1/peers", "agent peer map", bearer_token).await
 }
 
 async fn routes(control_plane_url: &str, args: &RoutesArgs) -> anyhow::Result<RoutesOutput> {
@@ -2024,9 +2216,12 @@ async fn routes(control_plane_url: &str, args: &RoutesArgs) -> anyhow::Result<Ro
     Ok(routes_output(node_id, peer_map))
 }
 
-async fn agent_routes(agent_url: &str) -> anyhow::Result<RoutesOutput> {
-    let status = agent_status(agent_url).await?;
-    let peer_map = agent_peer_map(agent_url).await?;
+async fn agent_routes_with_bearer(
+    agent_url: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<RoutesOutput> {
+    let status = agent_status_with_bearer(agent_url, bearer_token).await?;
+    let peer_map = agent_peer_map_with_bearer(agent_url, bearer_token).await?;
     Ok(routes_output(status.node_id, peer_map))
 }
 
@@ -2355,12 +2550,29 @@ fn reversed_probe_payload(payload: &[u8]) -> Vec<u8> {
     payload.iter().rev().copied().collect()
 }
 
-async fn path_status(agent_url: &str) -> anyhow::Result<AgentPathsResponse> {
-    get_json(agent_url, "/v1/paths", "agent path status").await
+async fn path_status_with_bearer(
+    agent_url: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<AgentPathsResponse> {
+    get_json_with_bearer(agent_url, "/v1/paths", "agent path status", bearer_token).await
 }
 
+async fn path_events_with_bearer(
+    agent_url: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<AgentPathEventsResponse> {
+    get_json_with_bearer(
+        agent_url,
+        "/v1/path-events",
+        "agent path events",
+        bearer_token,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn path_events(agent_url: &str) -> anyhow::Result<AgentPathEventsResponse> {
-    get_json(agent_url, "/v1/path-events", "agent path events").await
+    path_events_with_bearer(agent_url, None).await
 }
 
 async fn control_plane_path_status(
@@ -2379,16 +2591,18 @@ async fn control_plane_path_status(
     .await
 }
 
-async fn path_activity(
+async fn path_activity_with_bearer(
     agent_url: &str,
     args: &PathActivityArgs,
+    bearer_token: Option<&str>,
 ) -> anyhow::Result<AgentPeerActivityResponse> {
     let request = path_activity_request(args)?;
-    post_json(
+    post_json_with_bearer(
         agent_url,
         "/v1/peer-activity",
         "agent peer activity",
         &request,
+        bearer_token,
     )
     .await
 }
@@ -2400,12 +2614,20 @@ fn path_activity_request(args: &PathActivityArgs) -> anyhow::Result<AgentPeerAct
     })
 }
 
-async fn path_probe(
+async fn path_probe_with_bearer(
     agent_url: &str,
     args: &PathProbeArgs,
+    bearer_token: Option<&str>,
 ) -> anyhow::Result<AgentPathProbeResponse> {
     let request = path_probe_request(args, Utc::now())?;
-    post_json(agent_url, "/v1/path-probe", "agent path probe", &request).await
+    post_json_with_bearer(
+        agent_url,
+        "/v1/path-probe",
+        "agent path probe",
+        &request,
+        bearer_token,
+    )
+    .await
 }
 
 fn path_probe_request(
@@ -2534,9 +2756,24 @@ async fn get_json<T>(base_url: &str, path: &str, label: &str) -> anyhow::Result<
 where
     T: DeserializeOwned,
 {
+    get_json_with_bearer(base_url, path, label, None).await
+}
+
+async fn get_json_with_bearer<T>(
+    base_url: &str,
+    path: &str,
+    label: &str,
+    bearer_token: Option<&str>,
+) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
     let url = api_url(base_url, path, label)?;
-    let response = reqwest::Client::new()
-        .get(&url)
+    let mut request = reqwest::Client::new().get(&url);
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("failed to send {label} request to {url}"))?
@@ -2545,19 +2782,6 @@ where
     read_bounded_json_response(response, label)
         .await
         .with_context(|| format!("failed to decode {label} response from {url}"))
-}
-
-async fn post_json<Request, Response>(
-    base_url: &str,
-    path: &str,
-    label: &str,
-    request: &Request,
-) -> anyhow::Result<Response>
-where
-    Request: Serialize + ?Sized,
-    Response: DeserializeOwned,
-{
-    post_json_with_bearer(base_url, path, label, request, None).await
 }
 
 async fn post_json_with_bearer<Request, Response>(
@@ -4848,6 +5072,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
+        "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or IPARS_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
     ];
     if args.rootless {
         prerequisites.push(
@@ -4885,6 +5110,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     notes.extend([
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
+        "The bundled Compose file reads a separate agent API Bearer token from docker/agent-api.token (or IPARS_AGENT_API_BEARER_TOKEN_FILE) through a file-backed Compose secret and protects every endpoint except /healthz".to_string(),
         "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
         "The bundled Compose file passes relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT/IPARS_RELAY_ADMISSION_URL and agent relay capability advertisement through IPARS_AGENT_RELAY_PUBLIC_ENDPOINT/IPARS_AGENT_RELAY_ADMISSION_URL; ipars docker install --relay-public-endpoint and --relay-admission-url emit both sides together so advertised relay metadata stays consistent".to_string(),
@@ -4925,6 +5151,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         security: vec![
             "The bundled Compose file uses plain HTTP on a private development network".to_string(),
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
+            "Agent API requests require the separate IPARS_AGENT_API_BEARER_TOKEN_FILE secret; do not reuse the signed join token".to_string(),
             "When relay admission Bearer auth is enabled in Compose, set IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN to the same secret value".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
@@ -5710,12 +5937,13 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
     validate_k8s_agent_wireguard_endpoint_config(&args)?;
     let chart = args.chart.display().to_string();
     let mut helm_command = format!(
-        "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={}",
+        "helm upgrade --install {} {} --namespace {} --set agent.joinTokenSecretName={} --set agent.joinTokenSecretKey={} --set agent.apiBearerTokenSecretKey={}",
         args.release,
         shell_word(&chart),
         args.namespace,
         args.join_token_secret,
-        args.join_token_key
+        args.join_token_key,
+        DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY
     );
     append_k8s_chart_metadata_values(&mut helm_command, &args);
     append_k8s_cluster_values(&mut helm_command, &args);
@@ -6088,8 +6316,11 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
                 args.namespace
             ),
             format!(
-                "kubectl -n {} create secret generic {} --from-file={}=./join.token --dry-run=client -o yaml | kubectl apply -f -",
-                args.namespace, args.join_token_secret, args.join_token_key
+                "kubectl -n {} create secret generic {} --from-file={}=./join.token --from-file={}=./agent-api.token --dry-run=client -o yaml | kubectl apply -f -",
+                args.namespace,
+                args.join_token_secret,
+                args.join_token_key,
+                DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY
             ),
             helm_command,
         ],
@@ -6103,7 +6334,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
             "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
         ],
         security: vec![
-            "Store the signed join token in the configured Secret; do not bake it into an image".to_string(),
+            "Store the signed join token and a separate 32-512 byte agent API Bearer token in the configured Secret; do not bake either secret into an image".to_string(),
             "Agent API and relay Services are disabled by default and must be explicitly enabled".to_string(),
             "NodePort or LoadBalancer exposure requires --allow-public-service-exposure and sets chart exposure acknowledgement".to_string(),
             "Service externalIPs require --allow-public-service-exposure because they can route traffic to the exposed Service outside the cluster".to_string(),
@@ -6799,6 +7030,10 @@ fn validate_k8s_install_metadata(args: &K8sInstallArgs) -> anyhow::Result<()> {
     validate_kubernetes_dns_subdomain(&args.join_token_secret, "join token Secret name")
         .map_err(anyhow::Error::msg)?;
     validate_kubernetes_secret_key(&args.join_token_key).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        args.join_token_key != DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY,
+        "join token Secret key must differ from agent API Bearer token Secret key {DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY}"
+    );
     Ok(())
 }
 
@@ -10006,6 +10241,44 @@ fi
     }
 
     #[test]
+    fn agent_api_auth_accepts_global_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "agent-api-secret-with-at-least-32-bytes";
+        let cli = Cli::try_parse_from(["ipars", "status", "--agent-api-bearer-token", token])?;
+        assert_eq!(cli.agent_api_bearer_token.as_deref(), Some(token));
+        assert!(cli.agent_api_bearer_token_path.is_none());
+        let auth = AgentApiAuth::from_sources(cli.agent_api_bearer_token, None)?;
+        assert_eq!(auth.bearer_token(), Some(token));
+
+        let path = temp_path("agent-api-token");
+        std::fs::write(&path, format!("{token}\n"))?;
+        let auth = AgentApiAuth::from_sources(None, Some(path.clone()))?;
+        assert_eq!(auth.bearer_token(), Some(token));
+
+        let error = match AgentApiAuth::from_sources(Some("too-short".to_string()), None) {
+            Ok(_) => anyhow::bail!("short agent API bearer token should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("at least 32 bytes"));
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_api_client_sends_bearer_authorization() -> anyhow::Result<()> {
+        let token = "agent-api-secret-with-at-least-32-bytes";
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_string();
+        let (url, server, request_rx) = spawn_raw_http_response_with_request(response).await?;
+
+        let body: serde_json::Value =
+            get_json_with_bearer(&url, "/v1/status", "agent status", Some(token)).await?;
+        assert_eq!(body, serde_json::json!({ "ok": true }));
+        let request = String::from_utf8(request_rx.await?)?;
+        assert!(request.contains(&format!("authorization: Bearer {token}\r\n")));
+        server.await??;
+        Ok(())
+    }
+
+    #[test]
     fn status_and_path_args_accept_agent_url() -> anyhow::Result<()> {
         let status =
             Cli::try_parse_from(["ipars", "status", "--agent-url", "http://127.0.0.1:9780"])?;
@@ -12790,9 +13063,10 @@ fi
             .any(|requirement| requirement.contains("net.ipv4.ip_forward")));
         assert_eq!(
             plan.commands[1],
-            "kubectl -n edge-system create secret generic edge-token --from-file=signed-token=./join.token --dry-run=client -o yaml | kubectl apply -f -"
+            "kubectl -n edge-system create secret generic edge-token --from-file=signed-token=./join.token --from-file=agent-api-token=./agent-api.token --dry-run=client -o yaml | kubectl apply -f -"
         );
         assert!(plan.commands[2].contains("helm upgrade --install edge"));
+        assert!(plan.commands[2].contains("--set agent.apiBearerTokenSecretKey=agent-api-token"));
         assert!(plan.commands[2].contains("--set serviceExposure.discoverApiServer=true"));
         assert!(plan.commands[2].contains("--set serviceExposure.routeIntervalSeconds=60"));
         assert!(plan.commands[2].contains("--set agent.routeBackend=command"));
@@ -16211,6 +16485,14 @@ fi
             Err(error) => error.to_string(),
         };
         assert!(error.contains("join token Secret key"));
+
+        let mut reused_agent_api_key = base_k8s_install_args();
+        reused_agent_api_key.join_token_key = DEFAULT_AGENT_API_BEARER_TOKEN_SECRET_KEY.to_string();
+        let error = match k8s_install_plan(reused_agent_api_key) {
+            Ok(_) => panic!("agent API token key reused for join token should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("must differ from agent API Bearer token Secret key"));
 
         let mut missing_bearer_key = base_k8s_install_args();
         missing_bearer_key.relay_admission_bearer_token_secret =

@@ -108,6 +108,9 @@ const CAP_SYS_ADMIN_BIT: u8 = 21;
 const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
+const MIN_AGENT_API_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
@@ -442,7 +445,7 @@ struct RelayArgs {
 
 #[derive(Debug, Args, Clone)]
 struct AgentArgs {
-    #[arg(long, env = "IPARS_AGENT_LISTEN", default_value = "0.0.0.0:9780")]
+    #[arg(long, env = "IPARS_AGENT_LISTEN", default_value = "127.0.0.1:9780")]
     listen: SocketAddr,
     #[arg(
         long,
@@ -450,6 +453,14 @@ struct AgentArgs {
         default_value = "/var/lib/ipars/agent.json"
     )]
     state_path: std::path::PathBuf,
+    #[arg(
+        long,
+        env = "IPARS_AGENT_API_BEARER_TOKEN",
+        conflicts_with = "api_bearer_token_path"
+    )]
+    api_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_AGENT_API_BEARER_TOKEN_PATH")]
+    api_bearer_token_path: Option<PathBuf>,
     #[arg(
         long = "stun-server",
         env = "IPARS_AGENT_STUN_SERVER",
@@ -1312,6 +1323,7 @@ fn preflight_agent_runtime_with_path_and_checks(
 }
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
+    validate_agent_api_auth_config(args)?;
     validate_linux_interface_name(&args.wireguard_interface)?;
     if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
         anyhow::ensure!(
@@ -1492,6 +1504,32 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_relay_forwarder_config(args)?;
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--relay-admission-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn validate_agent_api_auth_config(args: &AgentArgs) -> anyhow::Result<()> {
+    if let Some(token) = args.api_bearer_token.as_deref() {
+        validate_agent_api_bearer_token(token, "--api-bearer-token")?;
+    }
+    if !args.listen.ip().is_loopback() {
+        anyhow::ensure!(
+            args.api_bearer_token.is_some() || args.api_bearer_token_path.is_some(),
+            "non-loopback --listen requires --api-bearer-token or --api-bearer-token-path"
+        );
+    }
+    Ok(())
+}
+
+fn validate_agent_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
+    if token.len() < MIN_AGENT_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must contain at least {MIN_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+    }
+    if token.len() > MAX_AGENT_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must not exceed {MAX_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+    }
+    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        anyhow::bail!("{label} must contain only printable non-whitespace ASCII characters");
     }
     Ok(())
 }
@@ -6129,6 +6167,7 @@ async fn run_agent(
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
     validate_agent_runtime_config(&args)?;
+    let api_bearer_token = agent_api_bearer_token(&args)?;
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
@@ -6396,15 +6435,12 @@ async fn run_agent(
         }
     }
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
-    let result = serve_router(
-        args.listen,
-        agent_router(AgentHttpState::with_wireguard_key_rotation(
-            runtime.clone(),
-            store,
-            control_plane_bases,
-        )),
-    )
-    .await;
+    let mut http_state =
+        AgentHttpState::with_wireguard_key_rotation(runtime.clone(), store, control_plane_bases);
+    if let Some(token) = api_bearer_token {
+        http_state = http_state.require_api_bearer_token(token);
+    }
+    let result = serve_router(args.listen, agent_router(http_state)).await;
     for task in background_tasks {
         task.abort();
     }
@@ -10302,6 +10338,65 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
     serde_json::from_str(&token)
         .map(Some)
         .context("agent join token must be JSON signed token")
+}
+
+fn agent_api_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.api_bearer_token.as_deref() {
+        validate_agent_api_bearer_token(token, "IPARS_AGENT_API_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.api_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open agent API bearer token file {}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect agent API bearer token file {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "agent API bearer token path {} must resolve to a regular file",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+        anyhow::bail!(
+            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+        );
+    }
+
+    let mut token = String::new();
+    let mut reader = file
+        .by_ref()
+        .take(MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES + 1);
+    reader.read_to_string(&mut token).with_context(|| {
+        format!(
+            "failed to read agent API bearer token from {}",
+            path.display()
+        )
+    })?;
+    if token.len() as u64 > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+        anyhow::bail!(
+            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            path.display(),
+            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+        );
+    }
+    let token = token.trim();
+    validate_agent_api_bearer_token(
+        token,
+        &format!("agent API bearer token file {}", path.display()),
+    )?;
+    Ok(Some(token.to_string()))
 }
 
 fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
@@ -20870,6 +20965,86 @@ exec sleep 60
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_api_auth_requires_a_strong_secret_for_non_loopback_listeners() -> anyhow::Result<()> {
+        let default = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(default) = default.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert_eq!(default.listen, SocketAddr::from(([127, 0, 0, 1], 9780)));
+        validate_agent_runtime_config(&default)?;
+
+        let exposed = Cli::try_parse_from(["iparsd", "agent", "--listen", "0.0.0.0:9780"])?;
+        let Command::Agent(exposed) = exposed.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match validate_agent_runtime_config(&exposed) {
+            Ok(()) => anyhow::bail!("non-loopback agent API without auth should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("non-loopback --listen requires --api-bearer-token"));
+
+        let short = Cli::try_parse_from(["iparsd", "agent", "--api-bearer-token", "too-short"])?;
+        let Command::Agent(short) = short.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match validate_agent_runtime_config(&short) {
+            Ok(()) => anyhow::bail!("short agent API token should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("at least 32 bytes"));
+
+        let valid = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--listen",
+            "0.0.0.0:9780",
+            "--api-bearer-token",
+            "agent-api-secret-with-at-least-32-bytes",
+        ])?;
+        let Command::Agent(valid) = valid.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_agent_runtime_config(&valid)?;
+        Ok(())
+    }
+
+    #[test]
+    fn agent_api_auth_loads_a_bounded_file_secret() -> anyhow::Result<()> {
+        let dir = unique_test_dir("agent-api-token")?;
+        let path = dir.join("api.token");
+        let token = "agent-api-file-secret-with-at-least-32-bytes";
+        std::fs::write(&path, format!("{token}\n"))?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--listen",
+            "0.0.0.0:9780",
+            "--api-bearer-token-path",
+            path.to_str().context("test token path must be UTF-8")?,
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        validate_agent_runtime_config(&args)?;
+        assert_eq!(agent_api_bearer_token(&args)?.as_deref(), Some(token));
+
+        std::fs::write(
+            &path,
+            "x".repeat(MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES as usize + 1),
+        )?;
+        let error = match agent_api_bearer_token(&args) {
+            Ok(_) => anyhow::bail!("oversized agent API token file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds maximum size"));
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
     }
 
     #[test]
