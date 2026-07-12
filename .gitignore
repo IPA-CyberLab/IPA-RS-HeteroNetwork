@@ -5,3 +5,5 @@ ebpf/*/target/
 .env.*
 !.env.example
 docker/join.token
+docker/agent-api.token
+docker/control-plane-operator-api.token

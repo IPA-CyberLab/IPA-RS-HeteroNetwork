@@ -28,6 +28,7 @@ Each report is validated before command success. The harness rejects:
 - missing endpoint candidates;
 - missing reachable agent runtime path state;
 - missing control-plane path-state or signed `/v1/paths/query` propagation;
+- unauthenticated or unavailable control-plane operator metrics during HTTP/daemon runs;
 - peer-map edge loss or cross-control-plane inconsistency;
 - relay-candidate loss;
 - relay packet loss, payload corruption, or relay counter skew;

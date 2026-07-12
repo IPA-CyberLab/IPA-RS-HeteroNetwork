@@ -1,8 +1,9 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -20,16 +21,18 @@ use ipars_types::api::{
 use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
 use serde::Serialize;
 
+const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
+
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
         let _ = writeln!($body, $($arg)*);
     }};
 }
 
-#[derive(Debug)]
 pub struct ControlPlaneHttpState<S, L> {
     plane: Arc<ControlPlane<S>>,
     join_service: Arc<ControlPlaneJoinService<S, L>>,
+    operator_api_bearer_token: Option<Arc<str>>,
 }
 
 impl<S, L> Clone for ControlPlaneHttpState<S, L> {
@@ -37,6 +40,7 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
         Self {
             plane: self.plane.clone(),
             join_service: self.join_service.clone(),
+            operator_api_bearer_token: self.operator_api_bearer_token.clone(),
         }
     }
 }
@@ -49,7 +53,13 @@ impl<S, L> ControlPlaneHttpState<S, L> {
         Self {
             plane,
             join_service,
+            operator_api_bearer_token: None,
         }
+    }
+
+    pub fn require_operator_api_bearer_token(mut self, token: String) -> Self {
+        self.operator_api_bearer_token = Some(Arc::from(token));
+        self
     }
 }
 
@@ -58,13 +68,10 @@ where
     S: ControlPlaneStore + 'static,
     L: TokenLedger + 'static,
 {
-    Router::new()
+    let protocol = Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(prometheus_metrics::<S, L>))
         .route("/v1/join", post(join::<S, L>))
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
-        .route("/v1/metrics", get(metrics::<S, L>))
-        .route("/v1/policy", get(policy::<S, L>))
         .route("/v1/peers/query", post(peers::<S, L>))
         .route("/v1/paths/query", post(paths::<S, L>))
         .route(
@@ -76,8 +83,73 @@ where
             "/v1/nodes/{node_id}/wireguard-key",
             put(rotate_wireguard_key::<S, L>),
         )
-        .route("/v1/tokens/revoke", post(revoke_token::<S, L>))
-        .with_state(state)
+        .route("/v1/tokens/revoke", post(revoke_token::<S, L>));
+
+    let app = if let Some(token) = state.operator_api_bearer_token.clone() {
+        let operator = Router::new()
+            .route("/metrics", get(prometheus_metrics::<S, L>))
+            .route("/v1/metrics", get(metrics::<S, L>))
+            .route("/v1/policy", get(policy::<S, L>))
+            .route_layer(middleware::from_fn_with_state(
+                token,
+                require_operator_api_bearer,
+            ));
+        protocol.merge(operator)
+    } else {
+        protocol
+    };
+    app.with_state(state)
+}
+
+async fn require_operator_api_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = bearer_token_from_headers(request.headers());
+    if !provided.is_some_and(|provided| operator_api_token_matches(&expected, provided)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "control-plane operator API bearer token was rejected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || token.is_empty()
+        || token.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn operator_api_token_matches(expected: &str, provided: &str) -> bool {
+    if expected.is_empty()
+        || provided.is_empty()
+        || expected.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES
+        || provided.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES
+    {
+        return false;
+    }
+
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut diff = expected.len() ^ provided.len();
+    for index in 0..MAX_OPERATOR_API_BEARER_TOKEN_BYTES {
+        let expected_byte = expected.get(index).copied().unwrap_or_default();
+        let provided_byte = provided.get(index).copied().unwrap_or_default();
+        diff |= usize::from(expected_byte ^ provided_byte);
+    }
+    diff == 0
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -717,6 +789,8 @@ mod tests {
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
 
+    const OPERATOR_API_BEARER_TOKEN: &str = "control-plane-test-operator-token-32-bytes";
+
     use super::*;
 
     fn claims(cluster_id: ClusterId, issuer: NodeId, key_id: KeyId) -> JoinTokenClaims {
@@ -922,6 +996,17 @@ mod tests {
         ));
         let app = router(ControlPlaneHttpState::new(plane.clone(), join_service));
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
         let mut claims = claims(cluster_id, issuer.node_id(), key_id);
         claims.nonce = "http-path-node".to_string();
         plane
@@ -1019,7 +1104,10 @@ mod tests {
             ledger,
             key_ring,
         ));
-        let app = router(ControlPlaneHttpState::new(plane.clone(), join_service));
+        let app = router(
+            ControlPlaneHttpState::new(plane.clone(), join_service)
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
+        );
 
         let response = app
             .clone()
@@ -1027,6 +1115,37 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/policy")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&header::HeaderValue::from_static("Bearer"))
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/metrics")
+                    .header(header::AUTHORIZATION, "Bearer wrong-operator-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/policy")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;
@@ -1242,6 +1361,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/v1/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;
@@ -1412,6 +1535,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;

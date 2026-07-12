@@ -51,9 +51,9 @@ const DEFAULT_RELAY_PROBE_TIMEOUT_MS: u64 = 2_000;
 const MAX_RELAY_PROBE_TIMEOUT_MS: u64 = 60_000;
 const MAX_RELAY_PROBE_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
-const MIN_AGENT_API_BEARER_TOKEN_BYTES: usize = 32;
-const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
-const MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
+const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -91,6 +91,19 @@ struct Cli {
     agent_api_bearer_token: Option<String>,
     #[arg(long, global = true, env = "IPARS_AGENT_API_BEARER_TOKEN_PATH")]
     agent_api_bearer_token_path: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+        conflicts_with = "control_plane_operator_api_bearer_token_path"
+    )]
+    control_plane_operator_api_bearer_token: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"
+    )]
+    control_plane_operator_api_bearer_token_path: Option<PathBuf>,
     #[arg(long, global = true, env = "IPARS_AGENT_STATE_PATH")]
     agent_state_path: Option<PathBuf>,
     #[command(subcommand)]
@@ -106,10 +119,10 @@ impl AgentApiAuth {
     fn from_sources(inline: Option<String>, path: Option<PathBuf>) -> anyhow::Result<Self> {
         let bearer_token = match (inline, path) {
             (Some(token), None) => {
-                validate_agent_api_bearer_token(&token, "--agent-api-bearer-token")?;
+                validate_api_bearer_token(&token, "--agent-api-bearer-token")?;
                 Some(token)
             }
-            (None, Some(path)) => Some(read_agent_api_bearer_token_file(&path)?),
+            (None, Some(path)) => Some(read_api_bearer_token_file(&path, "agent API")?),
             (None, None) => None,
             (Some(_), Some(_)) => {
                 anyhow::bail!(
@@ -125,12 +138,12 @@ impl AgentApiAuth {
     }
 }
 
-fn validate_agent_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
-    if token.len() < MIN_AGENT_API_BEARER_TOKEN_BYTES {
-        anyhow::bail!("{label} must contain at least {MIN_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+fn validate_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
+    if token.len() < MIN_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must contain at least {MIN_API_BEARER_TOKEN_BYTES} bytes");
     }
-    if token.len() > MAX_AGENT_API_BEARER_TOKEN_BYTES {
-        anyhow::bail!("{label} must not exceed {MAX_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+    if token.len() > MAX_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must not exceed {MAX_API_BEARER_TOKEN_BYTES} bytes");
     }
     if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         anyhow::bail!("{label} must contain only printable non-whitespace ASCII characters");
@@ -138,62 +151,94 @@ fn validate_agent_api_bearer_token(token: &str, label: &str) -> anyhow::Result<(
     Ok(())
 }
 
-fn read_agent_api_bearer_token_file(path: &Path) -> anyhow::Result<String> {
+fn read_api_bearer_token_file(path: &Path, api_label: &str) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path).with_context(|| {
         format!(
-            "failed to open agent API bearer token file {}",
+            "failed to open {api_label} bearer token file {}",
             path.display()
         )
     })?;
     let metadata = file.metadata().with_context(|| {
         format!(
-            "failed to inspect agent API bearer token file {}",
+            "failed to inspect {api_label} bearer token file {}",
             path.display()
         )
     })?;
     if !metadata.is_file() {
         anyhow::bail!(
-            "agent API bearer token path {} must resolve to a regular file",
+            "{api_label} bearer token path {} must resolve to a regular file",
             path.display()
         );
     }
-    if metadata.len() > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+    if metadata.len() > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
-            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            "{api_label} bearer token file {} exceeds maximum size of {} bytes",
             path.display(),
-            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+            MAX_API_BEARER_TOKEN_FILE_BYTES
         );
     }
 
     let mut bytes = Vec::new();
     std::io::Read::by_ref(&mut file)
-        .take(MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES + 1)
+        .take(MAX_API_BEARER_TOKEN_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .with_context(|| {
             format!(
-                "failed to read agent API bearer token from {}",
+                "failed to read {api_label} bearer token from {}",
                 path.display()
             )
         })?;
-    if bytes.len() as u64 > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+    if bytes.len() as u64 > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
-            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            "{api_label} bearer token file {} exceeds maximum size of {} bytes",
             path.display(),
-            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+            MAX_API_BEARER_TOKEN_FILE_BYTES
         );
     }
     let token = String::from_utf8(bytes).with_context(|| {
         format!(
-            "failed to decode agent API bearer token file {} as UTF-8",
+            "failed to decode {api_label} bearer token file {} as UTF-8",
             path.display()
         )
     })?;
     let token = token.trim();
-    validate_agent_api_bearer_token(
+    validate_api_bearer_token(
         token,
-        &format!("agent API bearer token file {}", path.display()),
+        &format!("{api_label} bearer token file {}", path.display()),
     )?;
     Ok(token.to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ControlPlaneOperatorApiAuth {
+    bearer_token: Option<String>,
+}
+
+impl ControlPlaneOperatorApiAuth {
+    fn from_sources(inline: Option<String>, path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let bearer_token = match (inline, path) {
+            (Some(token), None) => {
+                validate_api_bearer_token(
+                    &token,
+                    "--control-plane-operator-api-bearer-token",
+                )?;
+                Some(token)
+            }
+            (None, Some(path)) => Some(read_api_bearer_token_file(
+                &path,
+                "control-plane operator API",
+            )?),
+            (None, None) => None,
+            (Some(_), Some(_)) => anyhow::bail!(
+                "--control-plane-operator-api-bearer-token conflicts with --control-plane-operator-api-bearer-token-path"
+            ),
+        };
+        Ok(Self { bearer_token })
+    }
+
+    fn bearer_token(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,6 +320,8 @@ struct InitArgs {
     control_plane_listen: SocketAddr,
     #[arg(long)]
     control_plane_database_url: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")]
+    control_plane_operator_api_bearer_token_path: Option<PathBuf>,
     #[arg(long, default_value = "0.0.0.0:9443")]
     signal_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:3478")]
@@ -1157,11 +1204,22 @@ async fn main() -> anyhow::Result<()> {
     let Cli {
         agent_api_bearer_token,
         agent_api_bearer_token_path,
+        control_plane_operator_api_bearer_token,
+        control_plane_operator_api_bearer_token_path,
         agent_state_path,
         command,
     } = Cli::parse();
+    if matches!(&command, Command::Init(_)) && control_plane_operator_api_bearer_token.is_some() {
+        anyhow::bail!(
+            "ipars init requires --control-plane-operator-api-bearer-token-path so the credential is not placed in daemon arguments"
+        );
+    }
     let agent_api_auth =
         AgentApiAuth::from_sources(agent_api_bearer_token, agent_api_bearer_token_path)?;
+    let control_plane_operator_api_auth = ControlPlaneOperatorApiAuth::from_sources(
+        control_plane_operator_api_bearer_token,
+        control_plane_operator_api_bearer_token_path,
+    )?;
     match command {
         Command::Init(args) => print_json(&init(*args)?)?,
         Command::Join(args) => print_json(&join(args).await?)?,
@@ -1170,9 +1228,13 @@ async fn main() -> anyhow::Result<()> {
                 (Some(agent_url), None) => print_json(
                     &agent_status_with_bearer(agent_url, agent_api_auth.bearer_token()).await?,
                 )?,
-                (None, Some(control_plane_url)) => {
-                    print_json(&control_plane_status(control_plane_url).await?)?
-                }
+                (None, Some(control_plane_url)) => print_json(
+                    &control_plane_status(
+                        control_plane_url,
+                        control_plane_operator_api_auth.bearer_token(),
+                    )
+                    .await?,
+                )?,
                 (None, None) => print_json(
                     &agent_status_with_bearer(
                         defaulted_agent_url(None),
@@ -1374,6 +1436,8 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
             .emit_issuer_private_key
             .then(|| identity.signing_key_b64()),
         issuer_private_key_path: args.issuer_private_key_path,
+        control_plane_operator_api_bearer_token_path: args
+            .control_plane_operator_api_bearer_token_path,
         identity_public_key: identity.public_key_b64(),
         wireguard_public_key: wireguard.public_key_b64,
         bootstrap_endpoints,
@@ -1402,6 +1466,9 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
         anyhow::bail!(
             "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
         );
+    }
+    if let Some(path) = args.control_plane_operator_api_bearer_token_path.as_deref() {
+        read_api_bearer_token_file(path, "control-plane operator API")?;
     }
     Ok(())
 }
@@ -1468,24 +1535,30 @@ fn init_daemon_specs(
         args.stun_http_listen.to_string(),
     ]);
 
+    let mut control_plane_args = vec![
+        "control-plane".to_string(),
+        "--listen".to_string(),
+        args.control_plane_listen.to_string(),
+        "--cluster-id".to_string(),
+        cluster_id.as_str().to_string(),
+        "--issuer-node-id".to_string(),
+        node_id.as_str().to_string(),
+        "--issuer-key-id".to_string(),
+        issuer_key_id.to_string(),
+        "--issuer-public-key".to_string(),
+        issuer_public_key.to_string(),
+        "--database-url".to_string(),
+        control_plane_database_url,
+    ];
+    if let Some(path) = args.control_plane_operator_api_bearer_token_path.as_ref() {
+        control_plane_args.push("--operator-api-bearer-token-path".to_string());
+        control_plane_args.push(path.display().to_string());
+    }
+
     vec![
         InitDaemonSpec {
             service: "control-plane",
-            args: vec![
-                "control-plane".to_string(),
-                "--listen".to_string(),
-                args.control_plane_listen.to_string(),
-                "--cluster-id".to_string(),
-                cluster_id.as_str().to_string(),
-                "--issuer-node-id".to_string(),
-                node_id.as_str().to_string(),
-                "--issuer-key-id".to_string(),
-                issuer_key_id.to_string(),
-                "--issuer-public-key".to_string(),
-                issuer_public_key.to_string(),
-                "--database-url".to_string(),
-                control_plane_database_url,
-            ],
+            args: control_plane_args,
             log_path: log_dir.join("control-plane.log"),
         },
         InitDaemonSpec {
@@ -2222,10 +2295,25 @@ struct ControlPlaneStatus {
     policy: ControlPlanePolicyResponse,
 }
 
-async fn control_plane_status(control_plane_url: &str) -> anyhow::Result<ControlPlaneStatus> {
+async fn control_plane_status(
+    control_plane_url: &str,
+    operator_api_bearer_token: Option<&str>,
+) -> anyhow::Result<ControlPlaneStatus> {
     Ok(ControlPlaneStatus {
-        metrics: get_json(control_plane_url, "/v1/metrics", "control-plane metrics").await?,
-        policy: get_json(control_plane_url, "/v1/policy", "control-plane policy").await?,
+        metrics: get_json_with_bearer(
+            control_plane_url,
+            "/v1/metrics",
+            "control-plane metrics",
+            operator_api_bearer_token,
+        )
+        .await?,
+        policy: get_json_with_bearer(
+            control_plane_url,
+            "/v1/policy",
+            "control-plane policy",
+            operator_api_bearer_token,
+        )
+        .await?,
     })
 }
 
@@ -5101,6 +5189,7 @@ struct InitOutput {
     issuer_public_key: String,
     issuer_private_key_b64: Option<String>,
     issuer_private_key_path: Option<PathBuf>,
+    control_plane_operator_api_bearer_token_path: Option<PathBuf>,
     identity_public_key: String,
     wireguard_public_key: String,
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
@@ -5183,6 +5272,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
+        "A separate 32-512 byte control-plane operator API Bearer token in docker/control-plane-operator-api.token, or IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
         "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or IPARS_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
     ];
     if args.rootless {
@@ -5221,6 +5311,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     notes.extend([
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
         "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
+        "The bundled Compose file reads a distinct control-plane operator API Bearer token from docker/control-plane-operator-api.token (or IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE) and protects metrics and policy routes".to_string(),
         "The bundled Compose file reads a separate agent API Bearer token from docker/agent-api.token (or IPARS_AGENT_API_BEARER_TOKEN_FILE) through a file-backed Compose secret and protects every endpoint except /healthz".to_string(),
         "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
         "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
@@ -5262,6 +5353,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         security: vec![
             "The bundled Compose file uses plain HTTP on a private development network".to_string(),
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
+            "Control-plane metrics and policy require IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse issuer, join-token, or node identity material".to_string(),
             "Agent API requests require the separate IPARS_AGENT_API_BEARER_TOKEN_FILE secret; do not reuse the signed join token".to_string(),
             "When relay admission Bearer auth is enabled in Compose, set IPARS_RELAY_ADMISSION_BEARER_TOKEN and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN to the same secret value".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
@@ -9029,6 +9121,7 @@ mod tests {
             daemon_state_dir: temp_path("state"),
             control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
             control_plane_database_url: None,
+            control_plane_operator_api_bearer_token_path: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
             stun_alternate_listen: None,
@@ -10041,6 +10134,7 @@ mod tests {
             daemon_state_dir: temp_path("state"),
             control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
             control_plane_database_url: None,
+            control_plane_operator_api_bearer_token_path: None,
             signal_listen: SocketAddr::from(([0, 0, 0, 0], 9443)),
             stun_listen: SocketAddr::from(([0, 0, 0, 0], 3478)),
             stun_alternate_listen: None,
@@ -10126,6 +10220,11 @@ mod tests {
     #[test]
     fn init_outputs_daemon_commands_for_bootstrap_services() -> anyhow::Result<()> {
         let key_path = temp_path("issuer-bootstrap.key");
+        let operator_token_path = temp_path("control-plane-operator-api.token");
+        std::fs::write(
+            &operator_token_path,
+            "control-plane-operator-secret-with-32-bytes\n",
+        )?;
         let state_dir = temp_path("bootstrap-state");
         let output = init(InitArgs {
             public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
@@ -10146,6 +10245,7 @@ mod tests {
             daemon_state_dir: state_dir.clone(),
             control_plane_listen: "127.0.0.1:18443".parse()?,
             control_plane_database_url: None,
+            control_plane_operator_api_bearer_token_path: Some(operator_token_path.clone()),
             signal_listen: "127.0.0.1:19443".parse()?,
             stun_listen: "0.0.0.0:13478".parse()?,
             stun_alternate_listen: Some("127.0.0.1:13480".parse()?),
@@ -10197,6 +10297,16 @@ mod tests {
         assert!(control_plane.command.iter().any(|value| {
             value.starts_with("sqlite://") && value.ends_with("control-plane.sqlite?mode=rwc")
         }));
+        assert!(control_plane
+            .command
+            .contains(&"--operator-api-bearer-token-path".to_string()));
+        assert!(control_plane
+            .command
+            .contains(&operator_token_path.display().to_string()));
+        assert_eq!(
+            output.control_plane_operator_api_bearer_token_path.as_ref(),
+            Some(&operator_token_path)
+        );
 
         let stun = output
             .daemon_commands
@@ -10220,6 +10330,7 @@ mod tests {
             .contains(&"http://203.0.113.10:19580".to_string()));
 
         let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(operator_token_path);
         Ok(())
     }
 
@@ -10412,6 +10523,65 @@ fi
             Err(error) => error,
         };
         assert!(error.to_string().contains("at least 32 bytes"));
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_operator_api_auth_accepts_global_inline_and_file_sources() -> anyhow::Result<()>
+    {
+        let token = "control-plane-operator-secret-with-32-bytes";
+        let cli = Cli::try_parse_from([
+            "ipars",
+            "status",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--control-plane-operator-api-bearer-token",
+            token,
+        ])?;
+        assert_eq!(
+            cli.control_plane_operator_api_bearer_token.as_deref(),
+            Some(token)
+        );
+        assert!(cli.control_plane_operator_api_bearer_token_path.is_none());
+        let auth = ControlPlaneOperatorApiAuth::from_sources(
+            cli.control_plane_operator_api_bearer_token,
+            None,
+        )?;
+        assert_eq!(auth.bearer_token(), Some(token));
+
+        let path = temp_path("control-plane-operator-api-token");
+        std::fs::write(&path, format!("{token}\n"))?;
+        let auth = ControlPlaneOperatorApiAuth::from_sources(None, Some(path.clone()))?;
+        assert_eq!(auth.bearer_token(), Some(token));
+
+        let error =
+            match ControlPlaneOperatorApiAuth::from_sources(Some("too-short".to_string()), None) {
+                Ok(_) => anyhow::bail!("short control-plane operator token should be rejected"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("at least 32 bytes"));
+
+        let cli = Cli::try_parse_from([
+            "ipars",
+            "init",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--control-plane-operator-api-bearer-token-path",
+            "/run/secrets/control-plane-operator-api.token",
+        ])?;
+        assert_eq!(
+            cli.control_plane_operator_api_bearer_token_path.as_deref(),
+            Some(Path::new("/run/secrets/control-plane-operator-api.token"))
+        );
+        let Command::Init(args) = cli.command else {
+            anyhow::bail!("expected init command");
+        };
+        assert_eq!(
+            args.control_plane_operator_api_bearer_token_path.as_deref(),
+            Some(Path::new("/run/secrets/control-plane-operator-api.token"))
+        );
+
         let _ = std::fs::remove_file(path);
         Ok(())
     }
@@ -12162,6 +12332,9 @@ fi
         ));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN"));
         assert!(compose.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN"));
+        assert!(compose.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"));
+        assert!(compose.contains("ipars-control-plane-operator-api-bearer-token"));
+        assert!(compose.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE"));
         assert!(compose.contains("IPARS_RELAY_PUBLIC_ENDPOINT"));
         assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
         assert!(compose.contains(

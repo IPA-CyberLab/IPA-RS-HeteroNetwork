@@ -18,6 +18,7 @@ release="${IPARS_K8S_SMOKE_RELEASE:-ipars-live-${suffix}}"
 bootstrap_name="ipars-bootstrap"
 token_secret="ipars-live-join"
 agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
+control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
 chart_fullname=""
 tmp_dir=""
 namespace_created=0
@@ -150,9 +151,11 @@ wait_for_control_plane_metrics() {
   local attempt
   for attempt in $(seq 1 60); do
     metrics_json="$("$kubectl_bin" -n "$namespace" exec "deployment/${bootstrap_name}" -c control-plane -- \
-      curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8443/v1/metrics 2>/dev/null || true)"
+      /usr/local/bin/ipars \
+        --control-plane-operator-api-bearer-token-path /run/secrets/control-plane/operator-api-token \
+        status --control-plane-url http://127.0.0.1:8443 2>/dev/null || true)"
     if jq -e --argjson minimum "$minimum_nodes" \
-      '.node_count >= $minimum and .healthy_node_count >= $minimum and .token_ledger_use_count >= $minimum' \
+      '.metrics.node_count >= $minimum and .metrics.healthy_node_count >= $minimum and .metrics.token_ledger_use_count >= $minimum' \
       >/dev/null 2>&1 <<<"$metrics_json"; then
       return 0
     fi
@@ -269,12 +272,15 @@ issuer_node_id="$(jq -er '.issuer_node_id | strings' "$init_output")"
 issuer_public_key="$(jq -er '.issuer_public_key | strings' "$init_output")"
 token_file="$tmp_dir/join-token.json"
 agent_api_token_file="$tmp_dir/agent-api.token"
+control_plane_operator_api_token_file="$tmp_dir/control-plane-operator-api.token"
 jq -ce '.join_token' "$init_output" >"$token_file"
 printf '%s\n' "$agent_api_token" >"$agent_api_token_file"
+printf '%s\n' "$control_plane_operator_api_token" >"$control_plane_operator_api_token_file"
 
 "$kubectl_bin" -n "$namespace" create secret generic "$token_secret" \
   --from-file=token="$token_file" \
   --from-file=agent-api-token="$agent_api_token_file" \
+  --from-file=control-plane-operator-api-token="$control_plane_operator_api_token_file" \
   --dry-run=client -o yaml | "$kubectl_bin" -n "$namespace" apply -f - >/dev/null
 
 image_ref="${image_repository}:${image_tag}"
@@ -318,12 +324,17 @@ spec:
             - ${issuer_public_key_json}
             - --database-url
             - sqlite:///var/lib/ipars/control-plane.sqlite?mode=rwc
+            - --operator-api-bearer-token-path
+            - /run/secrets/control-plane/operator-api-token
           ports:
             - name: control-plane
               containerPort: 8443
           volumeMounts:
             - name: control-plane-state
               mountPath: /var/lib/ipars
+            - name: control-plane-operator-api-token
+              mountPath: /run/secrets/control-plane
+              readOnly: true
         - name: signal
           image: ${image_ref_json}
           command: ["/usr/local/bin/iparsd"]
@@ -337,6 +348,12 @@ spec:
       volumes:
         - name: control-plane-state
           emptyDir: {}
+        - name: control-plane-operator-api-token
+          secret:
+            secretName: ${token_secret}
+            items:
+              - key: control-plane-operator-api-token
+                path: operator-api-token
 EOF
 
 "$kubectl_bin" -n "$namespace" rollout status "deployment/${bootstrap_name}" --timeout="${timeout_seconds}s"

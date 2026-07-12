@@ -63,6 +63,8 @@ const MAX_LOAD_HTTP_JSON_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LOAD_HTTP_TEXT_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_DAEMON_HTTP_READINESS_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS: u64 = 15;
+const LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
+    "ipars-load-control-plane-operator-token";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -2196,10 +2198,11 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         .with_context(|| format!("failed to upsert synthetic node {index} to signal over HTTP"))?;
         nodes.push(response.node);
     }
-    let metrics: ControlPlaneMetricsResponse = get_json(
+    let metrics: ControlPlaneMetricsResponse = get_json_with_bearer(
         &client,
         format!("{}/v1/metrics", services.control_plane_url),
         "control-plane metrics",
+        &services.control_plane_operator_api_bearer_token,
     )
     .await?;
     let relay_candidates = metrics.relay_candidate_count;
@@ -2814,6 +2817,7 @@ async fn run_daemon_scenario(
     let control_path_summary = wait_for_daemon_control_plane_path_summary(
         &client,
         &services.control_plane_urls,
+        &services.control_plane_operator_api_bearer_token,
         expected_agent_path_count,
         agent_readiness_timeout,
     )
@@ -2921,8 +2925,13 @@ async fn run_daemon_scenario(
     } else {
         relay_payload_bytes_received as f64 * 8.0 / relay_elapsed.as_secs_f64() / 1_000_000.0
     };
-    let control_summary =
-        control_plane_health_summary(&client, &services.control_plane_urls, "daemon").await?;
+    let control_summary = control_plane_health_summary(
+        &client,
+        &services.control_plane_urls,
+        &services.control_plane_operator_api_bearer_token,
+        "daemon",
+    )
+    .await?;
     let signal_metrics: SignalMetricsResponse = get_json(
         &client,
         format!("{}/v1/metrics", services.signal_url),
@@ -3097,10 +3106,14 @@ async fn run_daemon_scenario(
         let failover_metrics_context = format!(
             "daemon control-plane failover metrics probe failed after stopping {stopped_role}"
         );
-        let failover_control_summary =
-            control_plane_health_summary(&client, &survivor_urls, "daemon control-plane failover")
-                .await
-                .context(failover_metrics_context)?;
+        let failover_control_summary = control_plane_health_summary(
+            &client,
+            &survivor_urls,
+            &services.control_plane_operator_api_bearer_token,
+            "daemon control-plane failover",
+        )
+        .await
+        .context(failover_metrics_context)?;
         failover_metrics_endpoints = failover_control_summary.endpoint_count;
         failover_metrics_consistent = failover_control_summary.metrics_consistent();
         failover_relay_candidates_min = failover_control_summary.relay_candidate_count_min;
@@ -3735,6 +3748,7 @@ impl PathCounts {
 
 struct NetworkedServices {
     control_plane_url: String,
+    control_plane_operator_api_bearer_token: String,
     signal_url: String,
     tasks: Vec<JoinHandle<std::io::Result<()>>>,
 }
@@ -3746,11 +3760,20 @@ impl NetworkedServices {
         key_id: &KeyId,
     ) -> anyhow::Result<Self> {
         let mut tasks = Vec::new();
-        let control_plane_url =
-            Self::spawn_control_plane(cluster_id, issuer, key_id, &mut tasks).await?;
+        let control_plane_operator_api_bearer_token =
+            LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN.to_string();
+        let control_plane_url = Self::spawn_control_plane(
+            cluster_id,
+            issuer,
+            key_id,
+            &control_plane_operator_api_bearer_token,
+            &mut tasks,
+        )
+        .await?;
         let signal_url = Self::spawn_signal(&control_plane_url, &mut tasks).await?;
         Ok(Self {
             control_plane_url,
+            control_plane_operator_api_bearer_token,
             signal_url,
             tasks,
         })
@@ -3760,6 +3783,7 @@ impl NetworkedServices {
         cluster_id: ClusterId,
         issuer: &IdentityKeyPair,
         key_id: &KeyId,
+        operator_api_bearer_token: &str,
         tasks: &mut Vec<JoinHandle<std::io::Result<()>>>,
     ) -> anyhow::Result<String> {
         let store = Arc::new(InMemoryStore::default());
@@ -3778,7 +3802,10 @@ impl NetworkedServices {
             ledger,
             key_ring,
         ));
-        let app = control_plane_router(ControlPlaneHttpState::new(plane, join_service));
+        let app = control_plane_router(
+            ControlPlaneHttpState::new(plane, join_service)
+                .require_operator_api_bearer_token(operator_api_bearer_token.to_string()),
+        );
         Self::spawn_router(app, tasks).await
     }
 
@@ -3870,6 +3897,7 @@ impl Drop for RelayNetworkedServices {
 
 struct DaemonProcessGroup {
     control_plane_urls: Vec<String>,
+    control_plane_operator_api_bearer_token: String,
     signal_url: String,
     relay_http_url: String,
     relay_udp_addr: SocketAddr,
@@ -4696,10 +4724,11 @@ impl DaemonProcessGroup {
         )?;
         let control_plane_database_url =
             daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE));
+        let control_plane_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
             let role = format!("control-plane-{index}");
-            startup.children.push(spawn_iparsd(
+            startup.children.push(spawn_iparsd_with_env(
                 &manifest_seed.iparsd_binary.path,
                 &[
                     "control-plane".to_string(),
@@ -4718,6 +4747,10 @@ impl DaemonProcessGroup {
                 ],
                 &role,
                 &runtime_dir,
+                &[(
+                    "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+                    control_plane_operator_api_bearer_token.as_str(),
+                )],
             )?);
             manifest_seed.write(
                 DaemonRuntimePhase::ControlPlaneStartup,
@@ -4946,6 +4979,7 @@ impl DaemonProcessGroup {
             &signal_url,
             &agent_urls,
             &startup.agent_state_paths,
+            &control_plane_operator_api_bearer_token,
             &mut startup.children,
             &manifest_seed,
             options.agent_readiness_timeout,
@@ -4961,6 +4995,7 @@ impl DaemonProcessGroup {
         let (children, agent_state_paths) = startup.finish();
         Ok(Self {
             control_plane_urls,
+            control_plane_operator_api_bearer_token,
             signal_url,
             relay_http_url,
             relay_udp_addr,
@@ -5186,6 +5221,16 @@ fn spawn_iparsd(
     role: &str,
     runtime_dir: &Path,
 ) -> anyhow::Result<DaemonChild> {
+    spawn_iparsd_with_env(iparsd_bin, args, role, runtime_dir, &[])
+}
+
+fn spawn_iparsd_with_env(
+    iparsd_bin: &Path,
+    args: &[String],
+    role: &str,
+    runtime_dir: &Path,
+    extra_env: &[(&str, &str)],
+) -> anyhow::Result<DaemonChild> {
     let log_path = daemon_child_log_path(runtime_dir, role);
     let redacted_argv = redacted_daemon_argv(iparsd_bin, args);
     let redacted_argv_sha256 = daemon_argv_sha256(&redacted_argv);
@@ -5205,6 +5250,9 @@ fn spawn_iparsd(
         .with_context(|| format!("failed to clone iparsd {role} log for stderr"))?;
     let mut command = Command::new(iparsd_bin);
     configure_daemon_child_process(&mut command);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
     let child = command
         .args(args)
         .stdin(Stdio::null())
@@ -6401,6 +6449,7 @@ async fn wait_for_daemon_agents_ready(
     signal_url: &str,
     agent_urls: &[String],
     agent_state_paths: &[PathBuf],
+    control_plane_operator_api_bearer_token: &str,
     children: &mut [DaemonChild],
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -6416,6 +6465,7 @@ async fn wait_for_daemon_agents_ready(
                     signal_url,
                     &statuses,
                     &identities,
+                    control_plane_operator_api_bearer_token,
                 )
                 .await
                 {
@@ -6445,6 +6495,7 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
     signal_url: &str,
     agent_urls: &[String],
     agent_state_paths: &[PathBuf],
+    control_plane_operator_api_bearer_token: &str,
     children: &mut [DaemonChild],
     manifest_seed: &DaemonRuntimeManifestSeed,
     timeout: Duration,
@@ -6455,6 +6506,7 @@ async fn wait_for_daemon_agents_ready_or_manifest_failure(
         signal_url,
         agent_urls,
         agent_state_paths,
+        control_plane_operator_api_bearer_token,
         children,
         timeout,
     )
@@ -6687,6 +6739,7 @@ fn control_plane_reachable_path_count(metrics: &ControlPlaneMetricsResponse) -> 
 async fn control_plane_health_summary(
     client: &reqwest::Client,
     control_plane_urls: &[String],
+    operator_api_bearer_token: &str,
     context: &str,
 ) -> anyhow::Result<ControlPlaneHealthSummary> {
     if control_plane_urls.is_empty() {
@@ -6696,10 +6749,11 @@ async fn control_plane_health_summary(
     let mut metrics_samples = Vec::with_capacity(control_plane_urls.len());
     for control_plane_url in control_plane_urls {
         let request_context = format!("{context} control-plane metrics");
-        let metrics: ControlPlaneMetricsResponse = get_json(
+        let metrics: ControlPlaneMetricsResponse = get_json_with_bearer(
             client,
             format!("{control_plane_url}/v1/metrics"),
             &request_context,
+            operator_api_bearer_token,
         )
         .await?;
         metrics_samples.push(metrics);
@@ -6711,13 +6765,19 @@ async fn control_plane_health_summary(
 async fn wait_for_daemon_control_plane_path_summary(
     client: &reqwest::Client,
     control_plane_urls: &[String],
+    operator_api_bearer_token: &str,
     expected_path_count: usize,
     timeout: Duration,
 ) -> anyhow::Result<ControlPlaneHealthSummary> {
     let started = Instant::now();
     loop {
-        let summary =
-            control_plane_health_summary(client, control_plane_urls, "daemon path-state").await?;
+        let summary = control_plane_health_summary(
+            client,
+            control_plane_urls,
+            operator_api_bearer_token,
+            "daemon path-state",
+        )
+        .await?;
         if summary.path_count_min >= expected_path_count
             && summary.reachable_path_count_min >= expected_path_count
         {
@@ -7018,11 +7078,17 @@ async fn check_daemon_agent_control_and_signal_readiness(
     signal_url: &str,
     statuses: &[AgentStatusResponse],
     identities: &DaemonAgentIdentities,
+    control_plane_operator_api_bearer_token: &str,
 ) -> anyhow::Result<()> {
     let expected_agent_count = statuses.len();
     if expected_agent_count > 0 {
-        let control_summary =
-            control_plane_health_summary(client, control_plane_urls, "daemon readiness").await?;
+        let control_summary = control_plane_health_summary(
+            client,
+            control_plane_urls,
+            control_plane_operator_api_bearer_token,
+            "daemon readiness",
+        )
+        .await?;
         if control_summary.healthy_node_count_min < expected_agent_count {
             bail!(
                 "daemon control-plane endpoints report at least {} healthy nodes; expected at least {}",
@@ -7113,6 +7179,26 @@ where
 {
     let response = client
         .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to send {context} request"))?
+        .error_for_status()
+        .with_context(|| format!("{context} request was rejected"))?;
+    read_bounded_json_response(response, context, MAX_LOAD_HTTP_JSON_RESPONSE_BYTES).await
+}
+
+async fn get_json_with_bearer<Response>(
+    client: &reqwest::Client,
+    url: String,
+    context: &str,
+    bearer_token: &str,
+) -> anyhow::Result<Response>
+where
+    Response: DeserializeOwned,
+{
+    let response = client
+        .get(url)
+        .bearer_auth(bearer_token)
         .send()
         .await
         .with_context(|| format!("failed to send {context} request"))?
@@ -10561,6 +10647,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             &services.signal_url,
             &statuses,
             &identities,
+            &services.control_plane_operator_api_bearer_token,
         )
         .await
     }
@@ -11465,6 +11552,8 @@ fi
         let manifest_seed = synthetic_manifest_seed(runtime_dir.clone());
         DaemonProcessGroup {
             control_plane_urls: Vec::new(),
+            control_plane_operator_api_bearer_token: LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN
+                .to_string(),
             signal_url: "http://127.0.0.1:1".to_string(),
             relay_http_url: "http://127.0.0.1:1".to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),

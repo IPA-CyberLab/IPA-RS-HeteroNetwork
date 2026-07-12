@@ -7,10 +7,13 @@ This runbook covers the current operational path for a Linux-first IPA-RS deploy
 Generate an issuer key, bootstrap services, and a first join token:
 
 ```bash
+umask 077
+head -c 32 /dev/urandom | base64 > ./control-plane-operator-api.token
 ipars init \
   --public-endpoint 203.0.113.10:51820 \
   --issuer-private-key-path ./issuer.key \
   --issuer-key-id root \
+  --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token \
   --allowed-route 100.64.0.0/10 \
   --allow-relay \
   --unlimited-uses \
@@ -18,7 +21,7 @@ ipars init \
   --daemon-state-dir ./ipars-state
 ```
 
-With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and `C` locale rather than the operator's full environment. The bootstrap state directory and `logs/` directory are made owner-only, and service log files must be regular, non-symlink, non-hardlinked owner-only files. Without `--spawn-daemons`, run the emitted `iparsd control-plane`, `iparsd signal`, `iparsd stun`, and `iparsd relay` commands manually or under systemd.
+With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and `C` locale rather than the operator's full environment. The Control Plane receives the operator credential by file path, not token value in argv. Its policy and metric routes are absent when no operator credential is configured. The bootstrap state directory and `logs/` directory are made owner-only, and service log files must be regular, non-symlink, non-hardlinked owner-only files. Without `--spawn-daemons`, run the emitted `iparsd control-plane`, `iparsd signal`, `iparsd stun`, and `iparsd relay` commands manually or under systemd.
 
 Signal must be able to reach at least one control-plane API to authenticate node registrations. Configure repeated `iparsd signal --control-plane-url http://control-plane-a:8443 --control-plane-url http://control-plane-b:8443` values, or the comma-delimited `IPARS_SIGNAL_CONTROL_PLANE_URLS` environment variable. The default authenticated-membership TTL is 90 seconds; agents refresh every 30 seconds. Tune it with `--node-auth-ttl-seconds` or `IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS` between 1 and 3600 seconds, keeping it above the refresh interval and consistent across redundant Signal instances.
 
@@ -78,15 +81,17 @@ an ephemeral STUN bind only because its two host-network agents run with the
 non-mutating `dry-run` backend.
 
 Before starting the bundled stack, place the signed join token at
-`docker/join.token` and create a separate management token:
+`docker/join.token` and create distinct Control Plane and Agent management tokens:
 
 ```bash
 umask 077
+head -c 32 /dev/urandom | base64 > docker/control-plane-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/agent-api.token
 ```
 
-Set `IPARS_AGENT_API_BEARER_TOKEN_FILE` when the management token lives at a
-different host path.
+Set `IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE` or
+`IPARS_AGENT_API_BEARER_TOKEN_FILE` when either token lives at a different host
+path. Keep the two credentials distinct.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait
@@ -202,7 +207,7 @@ Common probes:
 ```bash
 export IPARS_AGENT_API_BEARER_TOKEN_PATH=/etc/ipars/agent-api.token
 ipars status --agent-url http://127.0.0.1:9780
-ipars status --control-plane-url http://127.0.0.1:8443
+ipars --control-plane-operator-api-bearer-token-path /etc/ipars/control-plane-operator-api.token status --control-plane-url http://127.0.0.1:8443
 ipars --agent-state-path /var/lib/ipars/agent.json peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars --agent-state-path /var/lib/ipars/agent.json routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path status --agent-url http://127.0.0.1:9780

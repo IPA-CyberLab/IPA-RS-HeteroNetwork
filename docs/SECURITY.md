@@ -63,6 +63,12 @@ Peer maps and node-scoped path status are available only through `POST /v1/peers
 
 The agent signs peer-map polling requests with its persisted owner-only state. Direct `ipars peers`, `ipars routes`, or `ipars path status` queries against a control-plane URL require `--agent-state-path`; the CLI rejects state/node mismatches and never places the private key in the URL, request body, command arguments, or logs.
 
+## Control-Plane Operator API
+
+Control-plane policy and metrics are available through `GET /v1/policy`, `GET /v1/metrics`, and `GET /metrics` only when `--operator-api-bearer-token` or `--operator-api-bearer-token-path` configures a 32-512 byte printable non-whitespace ASCII credential. When no credential is configured, these routes are not registered and return 404. When configured, missing or rejected credentials return 401 with a Bearer challenge, and comparison runs over a fixed maximum size.
+
+The CLI applies its distinct global `--control-plane-operator-api-bearer-token` or preferred `--control-plane-operator-api-bearer-token-path` source to `ipars status --control-plane-url`. Compose mounts a dedicated file-backed secret, and the Kubernetes live gate mounts a separate Secret key. Do not reuse issuer private keys, join tokens, node identities, Agent management credentials, or relay admission credentials. Bearer authentication does not encrypt policy or metric responses, so TLS remains required outside trusted private transport.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.
@@ -93,6 +99,7 @@ Implemented controls:
 - When using `ipars init --spawn-daemons`, spawned bootstrap services receive a cleared environment with only a fixed system `PATH` and `C` locale so issuer-key environment variables are not propagated.
 - Prefer file-backed join tokens through `--join-token-path` or Kubernetes Secrets over command-line token arguments.
 - Keep Agent API Bearer tokens owner-only, separate from join tokens, and pass them through `--api-bearer-token-path`, Compose secrets, or a distinct Kubernetes Secret key.
+- Keep the Control Plane operator API credential owner-only and distinct from issuer, join, node, Agent, and relay credentials; prefer `--operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable relay admission Bearer tokens for public relays.
 - Scope ACLs and route allowlists by role, tag, route, and protocol. Deny rules take precedence.

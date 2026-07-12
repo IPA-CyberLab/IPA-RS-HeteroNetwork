@@ -36,11 +36,14 @@ services:
     environment:
       IPARS_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
       IPARS_ROLE: control-plane
+      IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-control-plane-operator-api-bearer-token
     ports:
       - "8443:8443"
     depends_on:
       postgres:
         condition: service_healthy
+    secrets:
+      - ipars-control-plane-operator-api-bearer-token
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8443/healthz >/dev/null"]
       interval: 10s
@@ -219,6 +222,8 @@ services:
       - agent-data:/var/lib/ipars
 
 secrets:
+  ipars-control-plane-operator-api-bearer-token:
+    file: ${IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE:-./control-plane-operator-api.token}
   ipars-agent-join-token:
     file: ./join.token
   ipars-agent-api-bearer-token:

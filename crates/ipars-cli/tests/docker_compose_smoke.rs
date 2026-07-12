@@ -10,6 +10,8 @@ use serde_json::Value;
 
 const COMPOSE_RELAY_ADMISSION_BEARER_TOKEN: &str = "compose-relay-admission-secret";
 const COMPOSE_AGENT_API_BEARER_TOKEN: &str = "compose-agent-api-secret-with-at-least-32-bytes";
+const COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
+    "compose-control-plane-operator-secret";
 
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
@@ -104,6 +106,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         rendered.contains("IPARS_AGENT_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-agent-api-bearer-token"),
         "rendered base Compose config did not mount the agent API Bearer secret"
+    );
+    anyhow::ensure!(
+        rendered.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")
+            && rendered.contains("/run/secrets/ipars-control-plane-operator-api-bearer-token"),
+        "rendered base Compose config did not mount the control-plane operator API Bearer secret"
     );
 
     let rootful_discovery_compose = ComposeProject {
@@ -424,6 +431,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             && rendered.contains(COMPOSE_AGENT_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require agent API Bearer auth"
     );
+    anyhow::ensure!(
+        rendered.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN")
+            && rendered.contains(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
+        "rendered smoke Compose config did not require control-plane operator API Bearer auth"
+    );
 
     drop(tcp_ports);
     drop(udp_ports);
@@ -458,6 +470,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     anyhow::ensure!(
         unauthorized_agent_status == 401,
         "agent status without Bearer auth returned {unauthorized_agent_status}, expected 401"
+    );
+    let unauthorized_control_plane_metrics = compose_exec_http_status(
+        &compose,
+        "control-plane",
+        "GET",
+        "http://127.0.0.1:8443/v1/metrics",
+        None,
+        "control-plane metrics without Bearer auth",
+    )?;
+    anyhow::ensure!(
+        unauthorized_control_plane_metrics == 401,
+        "control-plane metrics without Bearer auth returned {unauthorized_control_plane_metrics}, expected 401"
     );
     let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
@@ -548,6 +572,11 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - root
       - --issuer-public-key
       - {issuer_public_key}
+    environment: !override
+      IPARS_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
+      IPARS_ROLE: control-plane
+      IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: {control_plane_operator_api_bearer_token}
+    secrets: !reset []
     ports:
       - "{control_plane_port}:8443"
 
@@ -671,6 +700,8 @@ volumes:
         cluster_id = config.cluster_id,
         issuer_node_id = config.issuer_node_id,
         issuer_public_key = config.issuer_public_key,
+        control_plane_operator_api_bearer_token =
+            yaml_single_quoted(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
         join_token = yaml_single_quoted(config.join_token),
         agent_api_bearer_token = yaml_single_quoted(COMPOSE_AGENT_API_BEARER_TOKEN),
         relay_admission_bearer_token = yaml_single_quoted(config.relay_admission_bearer_token),
@@ -1714,7 +1745,7 @@ fn compose_exec_json(compose: &ComposeProject, service: &str, url: &str) -> Resu
         "-H",
         "Accept: application/json",
     ]);
-    add_agent_api_bearer_header(&mut command, service);
+    add_api_bearer_header(&mut command, service);
     command.arg(url);
     let output = command
         .output()
@@ -1744,7 +1775,7 @@ fn compose_exec_text(compose: &ComposeProject, service: &str, url: &str) -> Resu
         "-H",
         "Accept: text/plain",
     ]);
-    add_agent_api_bearer_header(&mut command, service);
+    add_api_bearer_header(&mut command, service);
     command.arg(url);
     let output = command
         .output()
@@ -1780,7 +1811,7 @@ fn compose_exec_post_json(
         "--data-binary",
         body,
     ]);
-    add_agent_api_bearer_header(&mut command, service);
+    add_api_bearer_header(&mut command, service);
     command.arg(url);
     let output = command
         .output()
@@ -1797,12 +1828,14 @@ fn compose_exec_post_json(
     })
 }
 
-fn add_agent_api_bearer_header(command: &mut Command, service: &str) {
-    if matches!(service, "agent" | "agent-b") {
-        command.args([
-            "-H",
-            &format!("Authorization: Bearer {COMPOSE_AGENT_API_BEARER_TOKEN}"),
-        ]);
+fn add_api_bearer_header(command: &mut Command, service: &str) {
+    let token = match service {
+        "agent" | "agent-b" => Some(COMPOSE_AGENT_API_BEARER_TOKEN),
+        "control-plane" => Some(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
+        _ => None,
+    };
+    if let Some(token) = token {
+        command.args(["-H", &format!("Authorization: Bearer {token}")]);
     }
 }
 

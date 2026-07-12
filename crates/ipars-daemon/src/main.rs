@@ -116,9 +116,9 @@ const CAP_SYS_ADMIN_BIT: u8 = 21;
 const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
-const MIN_AGENT_API_BEARER_TOKEN_BYTES: usize = 32;
-const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
-const MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
+const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
@@ -314,6 +314,14 @@ fn validate_observability_config(args: &ObservabilityArgs) -> anyhow::Result<()>
 struct ControlPlaneArgs {
     #[arg(long, env = "IPARS_LISTEN", default_value = "0.0.0.0:8443")]
     listen: SocketAddr,
+    #[arg(
+        long,
+        env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+        conflicts_with = "operator_api_bearer_token_path"
+    )]
+    operator_api_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")]
+    operator_api_bearer_token_path: Option<PathBuf>,
     #[arg(long, env = "IPARS_CLUSTER_ID")]
     cluster_id: String,
     #[arg(long, env = "IPARS_VPN_POOL", default_value = "100.64.0.0/10")]
@@ -1527,7 +1535,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
 
 fn validate_agent_api_auth_config(args: &AgentArgs) -> anyhow::Result<()> {
     if let Some(token) = args.api_bearer_token.as_deref() {
-        validate_agent_api_bearer_token(token, "--api-bearer-token")?;
+        validate_api_bearer_token(token, "--api-bearer-token")?;
     }
     if !args.listen.ip().is_loopback() {
         anyhow::ensure!(
@@ -1538,12 +1546,12 @@ fn validate_agent_api_auth_config(args: &AgentArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_agent_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
-    if token.len() < MIN_AGENT_API_BEARER_TOKEN_BYTES {
-        anyhow::bail!("{label} must contain at least {MIN_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+fn validate_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
+    if token.len() < MIN_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must contain at least {MIN_API_BEARER_TOKEN_BYTES} bytes");
     }
-    if token.len() > MAX_AGENT_API_BEARER_TOKEN_BYTES {
-        anyhow::bail!("{label} must not exceed {MAX_AGENT_API_BEARER_TOKEN_BYTES} bytes");
+    if token.len() > MAX_API_BEARER_TOKEN_BYTES {
+        anyhow::bail!("{label} must not exceed {MAX_API_BEARER_TOKEN_BYTES} bytes");
     }
     if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         anyhow::bail!("{label} must contain only printable non-whitespace ASCII characters");
@@ -3409,6 +3417,7 @@ where
     L: TokenLedger + 'static,
 {
     validate_control_plane_runtime_config(&args)?;
+    let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
     let mut config =
         ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
     config.cluster_policy.relay_health_ttl_seconds = args.relay_health_ttl_seconds;
@@ -3441,11 +3450,11 @@ where
             otel_metrics_interval.max(Duration::from_secs(1)),
         )
     });
-    let result = serve_router(
-        args.listen,
-        router(ControlPlaneHttpState::new(plane, join_service)),
-    )
-    .await;
+    let mut http_state = ControlPlaneHttpState::new(plane, join_service);
+    if let Some(token) = operator_api_bearer_token {
+        http_state = http_state.require_operator_api_bearer_token(token);
+    }
+    let result = serve_router(args.listen, router(http_state)).await;
     if let Some(task) = otel_metrics_task {
         task.abort();
     }
@@ -3468,7 +3477,24 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
         args.endpoint_candidate_ttl_seconds,
         "--endpoint-candidate-ttl-seconds",
     )?;
-    validate_positive_seconds(args.path_state_ttl_seconds, "--path-state-ttl-seconds")
+    validate_positive_seconds(args.path_state_ttl_seconds, "--path-state-ttl-seconds")?;
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "--operator-api-bearer-token")?;
+    }
+    Ok(())
+}
+
+fn control_plane_operator_api_bearer_token(
+    args: &ControlPlaneArgs,
+) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    read_api_bearer_token_file(path, "control-plane operator API").map(Some)
 }
 
 async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
@@ -10416,61 +10442,63 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
 
 fn agent_api_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.api_bearer_token.as_deref() {
-        validate_agent_api_bearer_token(token, "IPARS_AGENT_API_BEARER_TOKEN")?;
+        validate_api_bearer_token(token, "IPARS_AGENT_API_BEARER_TOKEN")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.api_bearer_token_path.as_deref() else {
         return Ok(None);
     };
+    read_api_bearer_token_file(path, "agent API").map(Some)
+}
+
+fn read_api_bearer_token_file(path: &Path, api_label: &str) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path).with_context(|| {
         format!(
-            "failed to open agent API bearer token file {}",
+            "failed to open {api_label} bearer token file {}",
             path.display()
         )
     })?;
     let metadata = file.metadata().with_context(|| {
         format!(
-            "failed to inspect agent API bearer token file {}",
+            "failed to inspect {api_label} bearer token file {}",
             path.display()
         )
     })?;
     if !metadata.is_file() {
         anyhow::bail!(
-            "agent API bearer token path {} must resolve to a regular file",
+            "{api_label} bearer token path {} must resolve to a regular file",
             path.display()
         );
     }
-    if metadata.len() > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+    if metadata.len() > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
-            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            "{api_label} bearer token file {} exceeds maximum size of {} bytes",
             path.display(),
-            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+            MAX_API_BEARER_TOKEN_FILE_BYTES
         );
     }
 
     let mut token = String::new();
-    let mut reader = file
-        .by_ref()
-        .take(MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES + 1);
+    let mut reader = file.by_ref().take(MAX_API_BEARER_TOKEN_FILE_BYTES + 1);
     reader.read_to_string(&mut token).with_context(|| {
         format!(
-            "failed to read agent API bearer token from {}",
+            "failed to read {api_label} bearer token from {}",
             path.display()
         )
     })?;
-    if token.len() as u64 > MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES {
+    if token.len() as u64 > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
-            "agent API bearer token file {} exceeds maximum size of {} bytes",
+            "{api_label} bearer token file {} exceeds maximum size of {} bytes",
             path.display(),
-            MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES
+            MAX_API_BEARER_TOKEN_FILE_BYTES
         );
     }
     let token = token.trim();
-    validate_agent_api_bearer_token(
+    validate_api_bearer_token(
         token,
-        &format!("agent API bearer token file {}", path.display()),
+        &format!("{api_label} bearer token file {}", path.display()),
     )?;
-    Ok(Some(token.to_string()))
+    Ok(token.to_string())
 }
 
 fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
@@ -14354,6 +14382,63 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_operator_api_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "control-plane-operator-secret-with-32-bytes";
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--operator-api-bearer-token",
+            token,
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        validate_control_plane_runtime_config(&args)?;
+        assert_eq!(
+            control_plane_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ipars-control-plane-operator-api-token-{}-{}.txt",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, format!("{token}\n"))?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--operator-api-bearer-token-path",
+            &path.display().to_string(),
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        assert_eq!(
+            control_plane_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+        std::fs::remove_file(path)?;
         Ok(())
     }
 
@@ -21206,7 +21291,7 @@ exec sleep 60
 
         std::fs::write(
             &path,
-            "x".repeat(MAX_AGENT_API_BEARER_TOKEN_FILE_BYTES as usize + 1),
+            "x".repeat(MAX_API_BEARER_TOKEN_FILE_BYTES as usize + 1),
         )?;
         let error = match agent_api_bearer_token(&args) {
             Ok(_) => anyhow::bail!("oversized agent API token file should be rejected"),
