@@ -34,7 +34,8 @@ use ipars_types::api::{
 use ipars_types::{
     endpoint_addr_is_usable, CandidateSource, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, NatClassification, NatProbeObservation, NodeId, NodeRecord,
-    PathChangeEvent, PathChangeKind, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
+    PathChangeEvent, PathChangeKind, PathQualityObservation, PathRecord, PathScore, PathState,
+    Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -68,6 +69,13 @@ const MAX_LINUX_COMMAND_STDIN_BYTES: usize = 64 * 1024;
 const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
 
+mod peer_probe;
+
+pub use peer_probe::{
+    PeerProbeConfig, PeerProbeMeasurement, PeerQualityProbeTarget, UdpPeerProbe,
+    UdpPeerProbeResponder, DEFAULT_PEER_PROBE_PORT,
+};
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("agent state io error: {0}")]
@@ -94,6 +102,8 @@ pub enum AgentError {
     WireGuard(String),
     #[error("path probe rejected: {0}")]
     PathProbeRejected(String),
+    #[error("peer quality probe failed: {0}")]
+    PeerProbe(String),
     #[error("path state rejected: {0}")]
     PathStateRejected(String),
     #[error("peer path does not exist: {0}")]
@@ -446,6 +456,7 @@ pub struct AgentRuntime {
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
+    path_quality_observations: tokio::sync::RwLock<BTreeMap<NodeId, PathQualityObservation>>,
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     path_change_event_total_count: AtomicU64,
     path_change_event_dropped_count: AtomicU64,
@@ -462,6 +473,16 @@ pub struct AgentRuntime {
     direct_path_probe_started_count: AtomicU64,
     direct_path_probe_confirmed_count: AtomicU64,
     direct_path_probe_timeout_count: AtomicU64,
+    peer_probe_measurement_count: AtomicU64,
+    peer_probe_failure_count: AtomicU64,
+    peer_probe_request_sent_count: AtomicU64,
+    peer_probe_response_received_count: AtomicU64,
+    peer_probe_timeout_count: AtomicU64,
+    peer_probe_responder_request_count: AtomicU64,
+    peer_probe_responder_invalid_count: AtomicU64,
+    peer_probe_responder_unknown_source_count: AtomicU64,
+    peer_probe_responder_rate_limited_count: AtomicU64,
+    peer_probe_responder_send_failure_count: AtomicU64,
     peer_activity_record_count: AtomicU64,
     packet_flow_observation_count: AtomicU64,
     packet_flow_match_count: AtomicU64,
@@ -1109,6 +1130,7 @@ impl AgentRuntime {
             latest_peer_map: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
+            path_quality_observations: tokio::sync::RwLock::new(BTreeMap::new()),
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             path_change_event_total_count: AtomicU64::new(0),
             path_change_event_dropped_count: AtomicU64::new(0),
@@ -1126,6 +1148,16 @@ impl AgentRuntime {
             direct_path_probe_started_count: AtomicU64::new(0),
             direct_path_probe_confirmed_count: AtomicU64::new(0),
             direct_path_probe_timeout_count: AtomicU64::new(0),
+            peer_probe_measurement_count: AtomicU64::new(0),
+            peer_probe_failure_count: AtomicU64::new(0),
+            peer_probe_request_sent_count: AtomicU64::new(0),
+            peer_probe_response_received_count: AtomicU64::new(0),
+            peer_probe_timeout_count: AtomicU64::new(0),
+            peer_probe_responder_request_count: AtomicU64::new(0),
+            peer_probe_responder_invalid_count: AtomicU64::new(0),
+            peer_probe_responder_unknown_source_count: AtomicU64::new(0),
+            peer_probe_responder_rate_limited_count: AtomicU64::new(0),
+            peer_probe_responder_send_failure_count: AtomicU64::new(0),
             peer_activity_record_count: AtomicU64::new(0),
             packet_flow_observation_count: AtomicU64::new(0),
             packet_flow_match_count: AtomicU64::new(0),
@@ -1574,6 +1606,134 @@ impl AgentRuntime {
             .await
             .get(&(self.state().node_id, peer.clone()))
             .cloned()
+    }
+
+    pub async fn peer_quality_probe_targets(&self) -> Vec<PeerQualityProbeTarget> {
+        let Ok(peer_map) = self.peer_map_snapshot().await else {
+            return Vec::new();
+        };
+        let local_node = self.state().node_id;
+        let mut targets = Vec::new();
+        for peer in peer_map.peers {
+            if peer.node_id == local_node || !self.should_connect_peer(&peer).await {
+                continue;
+            }
+            let Some(path) = self.path_record_for_peer(&peer.node_id).await else {
+                continue;
+            };
+            if path.selected_state == PathState::Unreachable {
+                continue;
+            }
+            targets.push(PeerQualityProbeTarget { peer, path });
+        }
+        targets
+    }
+
+    pub async fn record_peer_probe_measurement(
+        &self,
+        target: &PeerQualityProbeTarget,
+        measurement: &PeerProbeMeasurement,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<PathQualityObservation>, AgentError> {
+        self.peer_probe_request_sent_count
+            .fetch_add(u64::from(measurement.sample_count()), Ordering::Relaxed);
+        self.peer_probe_response_received_count.fetch_add(
+            u64::from(measurement.successful_sample_count()),
+            Ordering::Relaxed,
+        );
+        self.peer_probe_timeout_count
+            .fetch_add(u64::from(measurement.timeout_count()), Ordering::Relaxed);
+
+        let Some(current_path) = self.path_record_for_peer(&target.peer.node_id).await else {
+            return Ok(None);
+        };
+        if !peer_probe::path_records_same_path(&current_path, &target.path) {
+            return Ok(None);
+        }
+        let previous = self
+            .path_quality_observations
+            .read()
+            .await
+            .get(&target.peer.node_id)
+            .cloned();
+        let observation =
+            measurement.to_path_observation(&current_path, previous.as_ref(), observed_at)?;
+        observation
+            .metrics
+            .validate()
+            .map_err(|error| AgentError::PeerProbe(error.to_string()))?;
+        self.path_quality_observations
+            .write()
+            .await
+            .insert(target.peer.node_id.clone(), observation.clone());
+        self.peer_probe_measurement_count
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(observation))
+    }
+
+    pub async fn path_quality_observation_for_peer(
+        &self,
+        peer: &NodeId,
+        now: DateTime<Utc>,
+        max_age: Duration,
+    ) -> Option<PathQualityObservation> {
+        let observation = self
+            .path_quality_observations
+            .read()
+            .await
+            .get(peer)
+            .cloned()?;
+        let path = self.path_record_for_peer(peer).await?;
+        if !peer_probe::path_matches_observation(&path, &observation) {
+            return None;
+        }
+        let fresh = now
+            .signed_duration_since(observation.observed_at)
+            .to_std()
+            .map(|age| age <= max_age)
+            .unwrap_or(true);
+        fresh.then_some(observation)
+    }
+
+    pub async fn peer_node_for_vpn_ip(&self, vpn_ip: IpAddr) -> Option<NodeId> {
+        self.latest_peer_map
+            .read()
+            .await
+            .as_ref()?
+            .peers
+            .iter()
+            .find(|peer| peer.vpn_ip.0 == vpn_ip)
+            .map(|peer| peer.node_id.clone())
+    }
+
+    pub fn record_peer_probe_failure(&self) {
+        self.peer_probe_failure_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_probe_responder_request(&self) {
+        self.peer_probe_responder_request_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_probe_responder_invalid(&self) {
+        self.peer_probe_responder_invalid_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_probe_responder_unknown_source(&self) {
+        self.peer_probe_responder_unknown_source_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_probe_responder_rate_limited(&self) {
+        self.peer_probe_responder_rate_limited_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_probe_responder_send_failure(&self) {
+        self.peer_probe_responder_send_failure_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn pending_direct_path_probe(&self, peer: &NodeId) -> Option<PendingDirectPathProbe> {
@@ -2184,6 +2344,15 @@ impl AgentRuntime {
     }
 
     pub async fn record_peer_map_snapshot(&self, peer_map: PeerMap) {
+        let current_peers = peer_map
+            .peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.path_quality_observations
+            .write()
+            .await
+            .retain(|peer, _| current_peers.contains(peer));
         *self.latest_peer_map.write().await = Some(peer_map);
     }
 

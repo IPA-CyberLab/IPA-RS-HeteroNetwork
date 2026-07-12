@@ -238,6 +238,16 @@ fn open_netlink_socket_in_namespace(
     protocol: isize,
     namespace: &LinuxNetworkNamespace,
 ) -> io::Result<Socket> {
+    with_linux_network_namespace(Some(namespace), || Socket::new(protocol))
+}
+
+pub fn with_linux_network_namespace<T>(
+    namespace: Option<&LinuxNetworkNamespace>,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let Some(namespace) = namespace else {
+        return operation();
+    };
     let current_namespace = open_current_thread_netns()?;
     let namespace_path = namespace.path();
     inspect_linux_netns_path(namespace, &namespace_path)?;
@@ -260,13 +270,13 @@ fn open_netlink_socket_in_namespace(
 
     set_thread_netns(&target_namespace)?;
     let restore_guard = ThreadNetnsRestoreGuard::new(current_namespace);
-    let socket = Socket::new(protocol);
+    let result = operation();
     let restore = restore_guard.restore();
 
-    match (socket, restore) {
+    match (result, restore) {
         (_, Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
-        (Ok(socket), Ok(())) => Ok(socket),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
