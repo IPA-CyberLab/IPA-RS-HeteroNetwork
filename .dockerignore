@@ -13,3 +13,4 @@ docker/agent-api.token
 docker/control-plane-operator-api.token
 docker/signal-operator-api.token
 docker/stun-operator-api.token
+docker/relay-operator-api.token

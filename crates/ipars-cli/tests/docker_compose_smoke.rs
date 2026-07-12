@@ -14,6 +14,7 @@ const COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "compose-control-plane-operator-secret";
 const COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "compose-signal-operator-api-secret";
 const COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN: &str = "compose-stun-operator-api-secret";
+const COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN: &str = "compose-relay-operator-api-secret";
 
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
@@ -123,6 +124,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         rendered.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-stun-operator-api-bearer-token"),
         "rendered base Compose config did not mount the STUN operator API Bearer secret"
+    );
+    anyhow::ensure!(
+        rendered.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")
+            && rendered.contains("/run/secrets/ipars-relay-operator-api-bearer-token"),
+        "rendered base Compose config did not mount the relay operator API Bearer secret"
     );
 
     let rootful_discovery_compose = ComposeProject {
@@ -458,6 +464,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             && rendered.contains(COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require STUN operator API Bearer auth"
     );
+    anyhow::ensure!(
+        rendered.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN")
+            && rendered.contains(COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN),
+        "rendered smoke Compose config did not require relay operator API Bearer auth"
+    );
 
     drop(tcp_ports);
     drop(udp_ports);
@@ -528,6 +539,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     anyhow::ensure!(
         unauthorized_stun_metrics == 401,
         "STUN metrics without Bearer auth returned {unauthorized_stun_metrics}, expected 401"
+    );
+    let unauthorized_relay_metrics = compose_exec_http_status(
+        &compose,
+        "relay",
+        "GET",
+        "http://127.0.0.1:9580/metrics",
+        None,
+        "relay metrics without Bearer auth",
+    )?;
+    anyhow::ensure!(
+        unauthorized_relay_metrics == 401,
+        "relay metrics without Bearer auth returned {unauthorized_relay_metrics}, expected 401"
     );
     let agent_nodes = assert_compose_service_apis(&compose, &api_ports)?;
     assert_compose_control_plane_peer_maps(&compose, &agent_nodes)?;
@@ -649,8 +672,19 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
   relay:
     cap_add: !reset []
     devices: !reset []
-    environment:
+    environment: !override
+      IPARS_ROLE: relay
+      IPARS_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
+      IPARS_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
+      IPARS_RELAY_MAX_SESSIONS: "10000"
+      IPARS_RELAY_MAX_SESSIONS_PER_NODE: "0"
+      IPARS_RELAY_MAX_MBPS: "1000"
+      IPARS_RELAY_SESSION_TTL_SECONDS: "300"
+      IPARS_RELAY_ADMISSION_RATE_LIMIT: "4096"
+      IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: "60"
       IPARS_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
+      IPARS_RELAY_OPERATOR_API_BEARER_TOKEN: {relay_operator_api_bearer_token}
+    secrets: !reset []
     ports:
       - "{relay_udp_port}:51820/udp"
       - "{relay_http_port}:9580"
@@ -761,6 +795,8 @@ volumes:
         signal_operator_api_bearer_token =
             yaml_single_quoted(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         stun_operator_api_bearer_token = yaml_single_quoted(COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN),
+        relay_operator_api_bearer_token =
+            yaml_single_quoted(COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN),
         join_token = yaml_single_quoted(config.join_token),
         agent_api_bearer_token = yaml_single_quoted(COMPOSE_AGENT_API_BEARER_TOKEN),
         relay_admission_bearer_token = yaml_single_quoted(config.relay_admission_bearer_token),
@@ -1893,6 +1929,7 @@ fn add_api_bearer_header(command: &mut Command, service: &str) {
         "control-plane" => Some(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
         "signal" => Some(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         "stun" => Some(COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN),
+        "relay" => Some(COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN),
         _ => None,
     };
     if let Some(token) = token {

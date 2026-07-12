@@ -66,6 +66,7 @@ const DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS: u64 = 15;
 const LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "ipars-load-control-plane-operator-token";
 const LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "ipars-load-signal-operator-api-token";
+const LOAD_RELAY_OPERATOR_API_BEARER_TOKEN: &str = "ipars-load-relay-operator-api-token";
 
 #[derive(Debug, Parser)]
 #[command(name = "ipars-load")]
@@ -2483,10 +2484,11 @@ async fn run_relay_udp_scenario(
         Duration::from_secs(2),
     )
     .await?;
-    let metrics = get_text(
+    let metrics = get_text_with_bearer(
         &client,
         format!("{}/metrics", services.http_url),
         "relay metrics",
+        &services.operator_api_bearer_token,
     )
     .await?;
     let forwarded_bytes = prometheus_metric_u64(&metrics, "ipars_relay_bytes_forwarded_total")?;
@@ -2906,10 +2908,11 @@ async fn run_daemon_scenario(
         agent_readiness_timeout,
     )
     .await?;
-    let metrics = get_text(
+    let metrics = get_text_with_bearer(
         &client,
         format!("{}/metrics", services.relay_http_url),
         "daemon relay metrics",
+        &services.relay_operator_api_bearer_token,
     )
     .await?;
     let forwarded_bytes = prometheus_metric_u64(&metrics, "ipars_relay_bytes_forwarded_total")?;
@@ -3860,6 +3863,7 @@ impl Drop for NetworkedServices {
 
 struct RelayNetworkedServices {
     http_url: String,
+    operator_api_bearer_token: String,
     udp_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     http_task: JoinHandle<std::io::Result<()>>,
@@ -3888,11 +3892,16 @@ impl RelayNetworkedServices {
         ));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let udp_task = tokio::spawn(udp_relay.serve(service.table(), shutdown_rx));
-        let app = relay_router(RelayHttpState::new(service));
+        let operator_api_bearer_token = LOAD_RELAY_OPERATOR_API_BEARER_TOKEN.to_string();
+        let app = relay_router(
+            RelayHttpState::new(service)
+                .require_operator_api_bearer_token(operator_api_bearer_token.clone()),
+        );
         let http_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
         Ok(Self {
             http_url: format!("http://{http_addr}"),
+            operator_api_bearer_token,
             udp_addr,
             shutdown_tx,
             http_task,
@@ -3915,6 +3924,7 @@ struct DaemonProcessGroup {
     signal_url: String,
     signal_operator_api_bearer_token: String,
     relay_http_url: String,
+    relay_operator_api_bearer_token: String,
     relay_udp_addr: SocketAddr,
     stun_http_url: String,
     stun_operator_api_bearer_token: String,
@@ -4742,6 +4752,7 @@ impl DaemonProcessGroup {
             daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE));
         let control_plane_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let signal_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
+        let relay_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let stun_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
@@ -4813,7 +4824,7 @@ impl DaemonProcessGroup {
             &agent_urls,
             &startup.children,
         )?;
-        startup.children.push(spawn_iparsd(
+        startup.children.push(spawn_iparsd_with_env(
             &manifest_seed.iparsd_binary.path,
             &[
                 "relay".to_string(),
@@ -4834,6 +4845,10 @@ impl DaemonProcessGroup {
             ],
             "relay",
             &runtime_dir,
+            &[(
+                "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN",
+                relay_operator_api_bearer_token.as_str(),
+            )],
         )?);
         manifest_seed.write(
             DaemonRuntimePhase::ServiceStartup,
@@ -5026,6 +5041,7 @@ impl DaemonProcessGroup {
             signal_url,
             signal_operator_api_bearer_token,
             relay_http_url,
+            relay_operator_api_bearer_token,
             relay_udp_addr,
             stun_http_url,
             stun_operator_api_bearer_token,
@@ -7242,6 +7258,7 @@ where
     read_bounded_json_response(response, context, MAX_LOAD_HTTP_JSON_RESPONSE_BYTES).await
 }
 
+#[cfg(test)]
 async fn get_text(client: &reqwest::Client, url: String, context: &str) -> anyhow::Result<String> {
     let response = client
         .get(url)
@@ -11610,6 +11627,7 @@ fi
             signal_url: "http://127.0.0.1:1".to_string(),
             signal_operator_api_bearer_token: LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN.to_string(),
             relay_http_url: "http://127.0.0.1:1".to_string(),
+            relay_operator_api_bearer_token: LOAD_RELAY_OPERATOR_API_BEARER_TOKEN.to_string(),
             relay_udp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             stun_http_url: "http://127.0.0.1:1".to_string(),
             stun_operator_api_bearer_token: "synthetic-stun-operator-secret-with-32-bytes"

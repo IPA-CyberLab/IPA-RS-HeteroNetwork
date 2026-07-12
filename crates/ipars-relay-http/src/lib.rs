@@ -1,8 +1,9 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,10 +21,11 @@ macro_rules! prometheus_line {
     }};
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RelayHttpState {
     relay: Arc<RelayService>,
-    admission_bearer_token: Option<String>,
+    admission_bearer_token: Option<Arc<str>>,
+    operator_api_bearer_token: Option<Arc<str>>,
 }
 
 impl RelayHttpState {
@@ -31,11 +33,17 @@ impl RelayHttpState {
         Self {
             relay,
             admission_bearer_token: None,
+            operator_api_bearer_token: None,
         }
     }
 
     pub fn require_admission_bearer_token(mut self, token: String) -> Self {
-        self.admission_bearer_token = Some(token);
+        self.admission_bearer_token = Some(Arc::from(token));
+        self
+    }
+
+    pub fn require_operator_api_bearer_token(mut self, token: String) -> Self {
+        self.operator_api_bearer_token = Some(Arc::from(token));
         self
     }
 
@@ -48,7 +56,7 @@ impl RelayHttpState {
                 "relay admission bearer token is required",
             ));
         };
-        if relay_admission_token_matches(expected, provided) {
+        if relay_api_token_matches(expected, provided) {
             Ok(())
         } else {
             Err(ApiError::unauthorized(
@@ -59,12 +67,41 @@ impl RelayHttpState {
 }
 
 pub fn router(state: RelayHttpState) -> Router {
-    Router::new()
+    let protocol = Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(prometheus_metrics))
         .route("/v1/status", get(status))
-        .route("/v1/sessions", post(admit))
-        .with_state(state)
+        .route("/v1/sessions", post(admit));
+    let app = if let Some(token) = state.operator_api_bearer_token.clone() {
+        let operator = Router::new()
+            .route("/metrics", get(prometheus_metrics))
+            .route_layer(middleware::from_fn_with_state(
+                token,
+                require_relay_operator_api_bearer,
+            ));
+        protocol.merge(operator)
+    } else {
+        protocol
+    };
+    app.with_state(state)
+}
+
+async fn require_relay_operator_api_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = bearer_token_from_headers(request.headers());
+    if !provided.is_some_and(|provided| relay_api_token_matches(&expected, provided)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "relay operator API bearer token was rejected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -375,7 +412,7 @@ fn prometheus_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_RELAY_API_BEARER_TOKEN_BYTES: usize = 512;
 
 fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -389,11 +426,11 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     Some(token)
 }
 
-fn relay_admission_token_matches(expected: &str, provided: &str) -> bool {
+fn relay_api_token_matches(expected: &str, provided: &str) -> bool {
     if expected.is_empty()
         || provided.is_empty()
-        || expected.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES
-        || provided.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES
+        || expected.len() > MAX_RELAY_API_BEARER_TOKEN_BYTES
+        || provided.len() > MAX_RELAY_API_BEARER_TOKEN_BYTES
     {
         return false;
     }
@@ -401,7 +438,7 @@ fn relay_admission_token_matches(expected: &str, provided: &str) -> bool {
     let expected = expected.as_bytes();
     let provided = provided.as_bytes();
     let mut diff = expected.len() ^ provided.len();
-    for index in 0..MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+    for index in 0..MAX_RELAY_API_BEARER_TOKEN_BYTES {
         let expected_byte = expected.get(index).copied().unwrap_or_default();
         let provided_byte = provided.get(index).copied().unwrap_or_default();
         diff |= usize::from(expected_byte ^ provided_byte);
@@ -485,6 +522,87 @@ mod tests {
 
     use super::*;
 
+    const OPERATOR_API_BEARER_TOKEN: &str = "relay-test-operator-token-with-32-bytes";
+
+    fn test_relay() -> Arc<RelayService> {
+        Arc::new(RelayService::new(
+            NodeId::from_string("relay-a"),
+            RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some(SocketAddr::from(([203, 0, 113, 10], 51820))),
+                admission_url: Some("http://203.0.113.10:9580".to_string()),
+                max_sessions: 10,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn relay_operator_routes_are_disabled_without_a_credential(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let app = router(RelayHttpState::new(test_relay()));
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(metrics.status(), StatusCode::NOT_FOUND);
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(status.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_operator_routes_require_the_configured_credential(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let app = router(
+            RelayHttpState::new(test_relay())
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
+        );
+        for authorization in [
+            None,
+            Some("Bearer wrong-relay-token-with-at-least-32-bytes"),
+        ] {
+            let mut request = Request::builder().method("GET").uri("/metrics");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE),
+                Some(&header::HeaderValue::from_static("Bearer"))
+            );
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn http_relay_admits_session_and_reports_status() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -500,7 +618,10 @@ mod tests {
                 e2e_only: true,
             },
         ));
-        let app = router(RelayHttpState::new(relay.clone()));
+        let app = router(
+            RelayHttpState::new(relay.clone())
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
+        );
 
         let response = app
             .clone()
@@ -595,6 +716,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;
@@ -657,7 +782,10 @@ mod tests {
                 e2e_only: true,
             },
         ));
-        let app = router(RelayHttpState::new(relay.clone()));
+        let app = router(
+            RelayHttpState::new(relay.clone())
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
+        );
 
         let rejected = app
             .clone()
@@ -692,6 +820,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;
@@ -721,7 +853,8 @@ mod tests {
         ));
         let app = router(
             RelayHttpState::new(relay.clone())
-                .require_admission_bearer_token("cluster-relay-secret".to_string()),
+                .require_admission_bearer_token("cluster-relay-secret".to_string())
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
         );
 
         let request_body = serde_json::to_vec(&RelayAdmissionRequest {
@@ -788,6 +921,10 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
                     .body(Body::empty())?,
             )
             .await?;

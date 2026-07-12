@@ -85,21 +85,23 @@ an ephemeral STUN bind only because its two host-network agents run with the
 non-mutating `dry-run` backend.
 
 Before starting the bundled stack, place the signed join token at
-`docker/join.token` and create distinct Control Plane, Signal, STUN, and Agent management tokens:
+`docker/join.token` and create distinct Control Plane, Signal, STUN, Relay, and Agent management tokens:
 
 ```bash
 umask 077
 head -c 32 /dev/urandom | base64 > docker/control-plane-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/signal-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/stun-operator-api.token
+head -c 32 /dev/urandom | base64 > docker/relay-operator-api.token
 head -c 32 /dev/urandom | base64 > docker/agent-api.token
 ```
 
 Set `IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE`,
 `IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE`, or
+`IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE`,
+`IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE`, or
 `IPARS_AGENT_API_BEARER_TOKEN_FILE` when a token lives at a different host path.
-Keep all four credentials distinct.
+Keep all five credentials distinct, and keep the Relay operator token separate from `IPARS_RELAY_ADMISSION_BEARER_TOKEN`.
 
 ```bash
 docker compose -f docker/compose.yaml up -d --build --wait
@@ -226,7 +228,7 @@ ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 
 ipars stun probe --stun-server 127.0.0.1:3478
 ```
 
-Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and agent HTTP services. Agent metrics use the same Bearer authentication as its `/v1/*` routes when configured. Control Plane, Signal, and STUN metrics require distinct operator Bearer credentials and are absent when those credentials are not configured. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
+Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and agent HTTP services. Agent metrics use the same Bearer authentication as its `/v1/*` routes when configured. Control Plane, Signal, STUN, and Relay metrics require distinct operator Bearer credentials and are absent when those credentials are not configured. Relay `/v1/status` remains public for capability refresh, while relay admission uses its separate optional credential. Control-plane metrics include accepted/rejected WireGuard key-rotation and node-removal counters. OTLP HTTP/protobuf export is available with `--otel-enabled --otel-endpoint http://collector:4318`.
 
 ## Failure Behavior
 

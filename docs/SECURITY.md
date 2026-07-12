@@ -81,6 +81,12 @@ STUN JSON and Prometheus metrics use `GET /v1/metrics` and `GET /metrics` only w
 
 Compose mounts a distinct STUN operator secret. This Bearer control protects HTTP observations but does not encrypt them; use TLS for metric traffic outside trusted private transport and keep the credential separate from all node, issuer, relay, and other operator material.
 
+## Relay Operator API
+
+Relay Prometheus metrics are available through `GET /metrics` only when `iparsd relay --operator-api-bearer-token` or `--operator-api-bearer-token-path` configures a separate 32-512 byte printable non-whitespace ASCII credential. Without one, the route returns 404. With one, missing or rejected credentials return 401 with a Bearer challenge and fixed-bound constant-time comparison. `/healthz` and `/v1/status` remain public orchestration/capability routes; `POST /v1/sessions` retains its independently configured admission Bearer credential and abuse controls.
+
+Compose mounts the Relay operator credential from a dedicated secret. Do not reuse the relay admission token: metric scrapers do not need session-admission authority, and admission clients do not need detailed counters.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers every `/v1/*` route and `/metrics`; only `/healthz` remains public for liveness and readiness probes.
@@ -114,6 +120,7 @@ Implemented controls:
 - Keep the Control Plane operator API credential owner-only and distinct from issuer, join, node, Agent, and relay credentials; prefer `--operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
 - Keep the Signal operator API credential owner-only and distinct from the Control Plane credential and all node/data-plane credentials; prefer `iparsd signal --operator-api-bearer-token-path` and rotate it through the deployment secret mechanism.
 - Keep the STUN operator API credential owner-only and distinct from every other credential; prefer `iparsd stun --operator-api-bearer-token-path` while leaving UDP Binding publicly reachable.
+- Keep the Relay operator API credential distinct from the relay admission token; prefer `iparsd relay --operator-api-bearer-token-path` and grant metric scrapers only that credential.
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable relay admission Bearer tokens for public relays.
 - Scope ACLs and route allowlists by role, tag, route, and protocol. Deny rules take precedence.

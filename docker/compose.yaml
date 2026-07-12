@@ -133,6 +133,7 @@ services:
       - IPARS_RELAY_ADMISSION_RATE_LIMIT=${IPARS_RELAY_ADMISSION_RATE_LIMIT:-4096}
       - IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS=${IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}
       - IPARS_RELAY_ADMISSION_BEARER_TOKEN
+      - IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-operator-api-bearer-token
     ports:
       - "51820:51820/udp"
       - "9580:9580"
@@ -146,6 +147,8 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    secrets:
+      - ipars-relay-operator-api-bearer-token
 
   agent:
     build:
@@ -234,6 +237,8 @@ secrets:
     file: ${IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE:-./signal-operator-api.token}
   ipars-stun-operator-api-bearer-token:
     file: ${IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE:-./stun-operator-api.token}
+  ipars-relay-operator-api-bearer-token:
+    file: ${IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE:-./relay-operator-api.token}
   ipars-agent-join-token:
     file: ./join.token
   ipars-agent-api-bearer-token:

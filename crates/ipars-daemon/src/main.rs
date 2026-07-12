@@ -482,6 +482,14 @@ struct RelayArgs {
     admission_rate_limit_window_seconds: u64,
     #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
     admission_bearer_token: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN",
+        conflicts_with = "operator_api_bearer_token_path"
+    )]
+    operator_api_bearer_token: Option<String>,
+    #[arg(long, env = "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")]
+    operator_api_bearer_token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -6245,6 +6253,7 @@ async fn run_relay(
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
     validate_relay_config(&args)?;
+    let operator_api_bearer_token = relay_operator_api_bearer_token(&args)?;
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
     let udp_addr = udp_relay.local_addr()?;
     let public_endpoint = args
@@ -6295,6 +6304,9 @@ async fn run_relay(
     if let Some(token) = args.admission_bearer_token {
         http_state = http_state.require_admission_bearer_token(token);
     }
+    if let Some(token) = operator_api_bearer_token {
+        http_state = http_state.require_operator_api_bearer_token(token);
+    }
     let http_result = serve_router(args.http_listen, relay_router(http_state)).await;
     udp_task.abort();
     if let Some(task) = otel_metrics_task {
@@ -6338,7 +6350,21 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
     if let Some(token) = args.admission_bearer_token.as_deref() {
         validate_relay_admission_bearer_token(token, "--admission-bearer-token")?;
     }
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "--operator-api-bearer-token")?;
+    }
     Ok(())
+}
+
+fn relay_operator_api_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.operator_api_bearer_token.as_deref() {
+        validate_api_bearer_token(token, "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN")?;
+        return Ok(Some(token.to_string()));
+    }
+    let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
+        return Ok(None);
+    };
+    read_api_bearer_token_file(path, "relay operator API").map(Some)
 }
 
 fn chrono_duration_seconds(value: u64, name: &str) -> anyhow::Result<chrono::Duration> {
@@ -24325,6 +24351,54 @@ exec sleep 60
         }
 
         Err(anyhow::anyhow!("expected relay command"))
+    }
+
+    #[test]
+    fn relay_operator_api_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
+        let token = "relay-operator-secret-with-at-least-32-bytes";
+        let base = [
+            "iparsd",
+            "relay",
+            "--relay-node-id",
+            "relay-a",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ];
+        let cli = Cli::try_parse_from(
+            base.into_iter()
+                .chain(["--operator-api-bearer-token", token]),
+        )?;
+        let Command::Relay(args) = cli.command else {
+            anyhow::bail!("expected relay command");
+        };
+        validate_relay_config(&args)?;
+        assert_eq!(
+            relay_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ipars-relay-operator-api-token-{}-{}.txt",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, format!("{token}\n"))?;
+        let path_arg = path.display().to_string();
+        let cli = Cli::try_parse_from(
+            base.into_iter()
+                .chain(["--operator-api-bearer-token-path", path_arg.as_str()]),
+        )?;
+        let Command::Relay(args) = cli.command else {
+            anyhow::bail!("expected relay command");
+        };
+        assert_eq!(
+            relay_operator_api_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
