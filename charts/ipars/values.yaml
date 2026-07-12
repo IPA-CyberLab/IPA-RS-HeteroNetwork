@@ -49,7 +49,7 @@ agent:
   joinTokenSecretName: ipars-join-token
   joinTokenSecretKey: token
   apiBearerTokenSecretKey: agent-api-token
-  routeProvider: false
+  routeProvider: true
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
   automountServiceAccountToken: true

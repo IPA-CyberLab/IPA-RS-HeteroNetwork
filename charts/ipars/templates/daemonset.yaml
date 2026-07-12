@@ -32,6 +32,7 @@
 {{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
+{{- $agentRouteProvider := printf "%v" .Values.agent.routeProvider -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
 {{- $agentPrivileged := printf "%v" .Values.agent.privileged -}}
 {{- $agentAllowPrivilegeEscalation := printf "%v" .Values.agent.securityContext.allowPrivilegeEscalation -}}
@@ -755,6 +756,12 @@
 {{- if and (ne $serviceExposureRouteProviderNodeId "") (or (gt (len $serviceExposureRouteProviderNodeId) 255) (not (regexMatch "^[A-Za-z0-9._-]+$" $serviceExposureRouteProviderNodeId))) -}}
 {{- fail "serviceExposure.routeProviderNodeId must contain only ASCII letters, digits, '_', '.' or '-' and must not exceed 255 bytes" -}}
 {{- end -}}
+{{- if and .Values.serviceExposure.enabled (eq $agentRouteProvider "true") (ne $serviceExposureRouteProviderNodeId "") -}}
+{{- fail "agent.routeProvider=true cannot be combined with serviceExposure.routeProviderNodeId; choose local or remote route ownership" -}}
+{{- end -}}
+{{- if and .Values.serviceExposure.enabled (eq $agentRouteProvider "false") (eq $serviceExposureRouteProviderNodeId "") -}}
+{{- fail "serviceExposure.routeProviderNodeId is required when agent.routeProvider=false and serviceExposure.enabled=true" -}}
+{{- end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: DaemonSet
@@ -1228,8 +1235,6 @@ spec:
             {{- end }}
             - name: IPARS_AGENT_WIREGUARD_INTERFACE
               value: {{ .Values.agent.interfaceName | quote }}
-            - name: IPARS_ROUTE_PROVIDER
-              value: {{ .Values.agent.routeProvider | quote }}
           securityContext:
             privileged: {{ $agentPrivileged }}
             {{- if ne $agentAllowPrivilegeEscalation "" }}
@@ -1323,10 +1328,6 @@ spec:
           volumeMounts:
             - name: agent-state
               mountPath: {{ $agentStateMountPath | quote }}
-            {{- if eq $agentRuntimeBackend "linux-command" }}
-            - name: dev-net-tun
-              mountPath: /dev/net/tun
-            {{- end }}
             - name: join-token
               mountPath: {{ printf "%s/join-token" $agentStateMountPath | quote }}
               subPath: {{ .Values.agent.joinTokenSecretKey | quote }}
@@ -1341,12 +1342,6 @@ spec:
           hostPath:
             path: {{ $agentStateHostPath | quote }}
             type: {{ $agentStateHostPathType | quote }}
-        {{- if eq $agentRuntimeBackend "linux-command" }}
-        - name: dev-net-tun
-          hostPath:
-            path: /dev/net/tun
-            type: CharDevice
-        {{- end }}
         - name: join-token
           secret:
             secretName: {{ .Values.agent.joinTokenSecretName }}

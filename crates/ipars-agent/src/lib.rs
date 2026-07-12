@@ -453,6 +453,7 @@ pub struct AgentRuntime {
     stun_refresh: tokio::sync::Mutex<()>,
     candidates: tokio::sync::RwLock<Vec<EndpointCandidate>>,
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
+    local_advertised_routes: tokio::sync::RwLock<Vec<Route>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
@@ -1127,6 +1128,7 @@ impl AgentRuntime {
             stun_refresh: tokio::sync::Mutex::new(()),
             candidates: tokio::sync::RwLock::new(Vec::new()),
             nat_classification: tokio::sync::RwLock::new(None),
+            local_advertised_routes: tokio::sync::RwLock::new(Vec::new()),
             latest_peer_map: tokio::sync::RwLock::new(None),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -2362,10 +2364,36 @@ impl AgentRuntime {
         }
     }
 
+    pub async fn replace_local_advertised_routes(
+        &self,
+        routes: Vec<Route>,
+    ) -> Result<(), AgentError> {
+        let local_node = self.state().node_id;
+        validate_local_advertised_routes(&local_node, &routes)?;
+        *self.local_advertised_routes.write().await = routes;
+        Ok(())
+    }
+
+    pub async fn local_advertised_routes(&self) -> Vec<Route> {
+        self.local_advertised_routes.read().await.clone()
+    }
+
     pub async fn observe_peer_map_for_lazy_connect(&self, peers: &[NodeRecord]) {
+        let local_route_cidrs = self
+            .local_advertised_routes
+            .read()
+            .await
+            .iter()
+            .map(|route| route.cidr)
+            .collect::<BTreeSet<_>>();
+        let peer_ids = peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut lazy_connect = self.lazy_connect.write().await;
+        lazy_connect.retain_observed_peers(&peer_ids);
         for peer in peers {
-            lazy_connect.observe_peer(peer);
+            lazy_connect.observe_peer(peer, &local_route_cidrs);
         }
     }
 
@@ -4811,25 +4839,54 @@ where
             peers_removed += 1;
         }
 
-        let mut routes = Vec::new();
-        let mut peer_routes = BTreeMap::new();
-        let mut peers_applied = 0;
-
+        let mut desired_peers = Vec::new();
         for peer in &peer_map.peers {
             if let Some(runtime) = &self.lazy_runtime {
                 if !runtime.should_connect_peer(peer).await {
                     continue;
                 }
             }
+            desired_peers.push(peer);
+        }
+        let local_route_cidrs = match &self.lazy_runtime {
+            Some(runtime) => runtime
+                .local_advertised_routes()
+                .await
+                .into_iter()
+                .map(|route| route.cidr)
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        let selected_advertised_routes =
+            select_peer_advertised_routes(&desired_peers, &local_route_cidrs);
 
+        let mut routes = Vec::new();
+        let mut peer_routes = BTreeMap::new();
+        let mut peers_applied = 0;
+
+        for peer in desired_peers {
+            let desired_routes = peer_routes_for_record(
+                peer,
+                selected_advertised_routes
+                    .get(&peer.node_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?;
             let allowed_ip = peer_overlay_cidr(&peer.vpn_ip);
+            let mut allowed_ips = vec![allowed_ip];
+            allowed_ips.extend(
+                desired_routes
+                    .iter()
+                    .skip(1)
+                    .map(|route| route.cidr.to_string()),
+            );
             let endpoint = self.endpoint_resolver.endpoint_for_peer(peer).await?;
             self.wireguard
                 .upsert_peer(WireGuardPeerConfig {
                     peer: peer.node_id.clone(),
                     public_key: peer.wireguard_public_key.clone(),
                     endpoint: endpoint.clone(),
-                    allowed_ips: vec![allowed_ip],
+                    allowed_ips,
                     persistent_keepalive_seconds: endpoint.map(|_| 25),
                 })
                 .await?;
@@ -4839,7 +4896,6 @@ where
                 .insert(peer.node_id.clone());
             peers_applied += 1;
 
-            let desired_routes = peer_routes_for_record(peer)?;
             let routes_to_remove = self
                 .applied_routes
                 .read()
@@ -4957,16 +5013,91 @@ fn peer_host_route(peer: &NodeRecord) -> Result<Route, AgentError> {
     })
 }
 
-fn peer_routes_for_record(peer: &NodeRecord) -> Result<Vec<Route>, AgentError> {
+fn peer_routes_for_record(
+    peer: &NodeRecord,
+    selected_advertised_routes: &[Route],
+) -> Result<Vec<Route>, AgentError> {
     let mut routes = vec![peer_host_route(peer)?];
-    routes.extend(peer_owned_advertised_routes(peer).cloned());
+    routes.extend_from_slice(selected_advertised_routes);
     Ok(routes)
 }
 
 fn peer_owned_advertised_routes(peer: &NodeRecord) -> impl Iterator<Item = &Route> {
-    peer.routes
-        .iter()
-        .filter(|route| route.advertised_by == peer.node_id)
+    peer.routes.iter().filter(|route| {
+        route.advertised_by == peer.node_id
+            && route.via.as_ref().is_none_or(|via| via == &peer.node_id)
+    })
+}
+
+fn select_peer_advertised_routes(
+    peers: &[&NodeRecord],
+    local_route_cidrs: &BTreeSet<ipnet::IpNet>,
+) -> BTreeMap<NodeId, Vec<Route>> {
+    let mut selected = BTreeMap::<ipnet::IpNet, Route>::new();
+    for peer in peers {
+        for route in peer_owned_advertised_routes(peer) {
+            if local_route_cidrs.contains(&route.cidr) {
+                continue;
+            }
+            let replace = selected.get(&route.cidr).is_none_or(|current| {
+                (route.metric, &route.advertised_by, route.id.as_str())
+                    < (current.metric, &current.advertised_by, current.id.as_str())
+            });
+            if replace {
+                selected.insert(route.cidr, route.clone());
+            }
+        }
+    }
+
+    let mut by_provider = BTreeMap::<NodeId, Vec<Route>>::new();
+    for route in selected.into_values() {
+        by_provider
+            .entry(route.advertised_by.clone())
+            .or_default()
+            .push(route);
+    }
+    by_provider
+}
+
+fn validate_local_advertised_routes(
+    local_node: &NodeId,
+    routes: &[Route],
+) -> Result<(), AgentError> {
+    let mut route_ids = BTreeSet::new();
+    let mut route_cidrs = BTreeSet::new();
+    for route in routes {
+        if route.advertised_by != *local_node {
+            return Err(AgentError::RoutePlanning(format!(
+                "local route {} is advertised by {} instead of {}",
+                route.id, route.advertised_by, local_node
+            )));
+        }
+        if let Some(via) = route.via.as_ref().filter(|via| *via != local_node) {
+            return Err(AgentError::RoutePlanning(format!(
+                "local route {} uses foreign provider {} instead of {}",
+                route.id, via, local_node
+            )));
+        }
+        if route.metric == 0 {
+            return Err(AgentError::RoutePlanning(format!(
+                "local route {} metric must be greater than zero",
+                route.id
+            )));
+        }
+        if !route_ids.insert(route.id.as_str()) {
+            return Err(AgentError::RoutePlanning(format!(
+                "local routes must not repeat route ID {}",
+                route.id
+            )));
+        }
+        if !route_cidrs.insert(route.cidr) {
+            return Err(AgentError::RoutePlanning(format!(
+                "local routes must not repeat CIDR {}",
+                route.cidr
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
@@ -5018,6 +5149,7 @@ fn candidate_kind_rank(kind: EndpointCandidateKind) -> Option<u8> {
 pub struct LazyConnectManager {
     policy: ClusterPolicy,
     pins: BTreeSet<NodeId>,
+    observed_pins: BTreeSet<NodeId>,
     last_used: BTreeMap<NodeId, DateTime<Utc>>,
     peer_vpn_ips: BTreeMap<IpAddr, NodeId>,
     advertised_routes: BTreeMap<NodeId, Vec<ipnet::IpNet>>,
@@ -5028,6 +5160,7 @@ impl LazyConnectManager {
         Self {
             policy,
             pins: BTreeSet::new(),
+            observed_pins: BTreeSet::new(),
             last_used: BTreeMap::new(),
             peer_vpn_ips: BTreeMap::new(),
             advertised_routes: BTreeMap::new(),
@@ -5043,7 +5176,7 @@ impl LazyConnectManager {
     }
 
     pub fn is_pinned(&self, peer: &NodeId) -> bool {
-        self.pins.contains(peer)
+        self.pins.contains(peer) || self.observed_pins.contains(peer)
     }
 
     pub fn is_pinned_by_policy(&self, role: &Role, tags: &BTreeSet<Tag>) -> bool {
@@ -5051,11 +5184,12 @@ impl LazyConnectManager {
             || tags.iter().any(|tag| self.policy.pinned_tags.contains(tag))
     }
 
-    pub fn observe_peer(&mut self, peer: &NodeRecord) {
+    pub fn observe_peer(&mut self, peer: &NodeRecord, local_route_cidrs: &BTreeSet<ipnet::IpNet>) {
         self.remove_observed_peer(&peer.node_id);
         self.peer_vpn_ips
             .insert(peer.vpn_ip.0, peer.node_id.clone());
         let routes = peer_owned_advertised_routes(peer)
+            .filter(|route| !local_route_cidrs.contains(&route.cidr))
             .map(|route| route.cidr)
             .collect::<Vec<_>>();
         let has_owned_routes = !routes.is_empty();
@@ -5064,7 +5198,7 @@ impl LazyConnectManager {
         }
 
         if self.is_pinned_by_policy(&peer.role, &peer.tags) || has_owned_routes {
-            self.pin_peer(peer.node_id.clone());
+            self.observed_pins.insert(peer.node_id.clone());
         }
     }
 
@@ -5099,13 +5233,13 @@ impl LazyConnectManager {
     }
 
     pub fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
-        self.pins.contains(&peer.node_id) || self.last_used.contains_key(&peer.node_id)
+        self.is_pinned(&peer.node_id) || self.last_used.contains_key(&peer.node_id)
     }
 
     pub fn metrics(&self) -> LazyConnectMetrics {
         LazyConnectMetrics {
             active_peer_count: self.last_used.len(),
-            pinned_peer_count: self.pins.len(),
+            pinned_peer_count: self.pins.union(&self.observed_pins).count(),
             observed_peer_vpn_ip_count: self.peer_vpn_ips.len(),
             observed_route_peer_count: self.advertised_routes.len(),
             observed_route_count: self.advertised_routes.values().map(Vec::len).sum(),
@@ -5117,7 +5251,7 @@ impl LazyConnectManager {
         self.last_used
             .iter()
             .filter_map(|(peer, last_used)| {
-                if self.pins.contains(peer) {
+                if self.is_pinned(peer) {
                     return None;
                 }
                 let idle_for = now.signed_duration_since(*last_used).to_std().ok()?;
@@ -5138,6 +5272,16 @@ impl LazyConnectManager {
         self.peer_vpn_ips
             .retain(|_, observed_peer| observed_peer != peer);
         self.advertised_routes.remove(peer);
+        self.observed_pins.remove(peer);
+    }
+
+    fn retain_observed_peers(&mut self, peers: &BTreeSet<NodeId>) {
+        self.peer_vpn_ips
+            .retain(|_, observed_peer| peers.contains(observed_peer));
+        self.advertised_routes
+            .retain(|observed_peer, _| peers.contains(observed_peer));
+        self.observed_pins
+            .retain(|observed_peer| peers.contains(observed_peer));
     }
 }
 
@@ -5939,7 +6083,7 @@ mod tests {
             &relay,
             &ordinary,
         ] {
-            manager.observe_peer(peer);
+            manager.observe_peer(peer, &BTreeSet::new());
         }
 
         assert!(manager.should_connect_peer(&control_plane));
@@ -5970,11 +6114,42 @@ mod tests {
             e2e_only: true,
         });
 
-        manager.observe_peer(&relay);
+        manager.observe_peer(&relay, &BTreeSet::new());
 
         assert!(!manager.should_connect_peer(&relay));
         assert_eq!(manager.metrics().observed_peer_vpn_ip_count, 1);
         assert_eq!(manager.metrics().pinned_peer_count, 0);
+    }
+
+    #[test]
+    fn lazy_manager_drops_only_observed_pins_for_missing_peers() {
+        let mut manager = LazyConnectManager::new(ClusterPolicy::default());
+        let peer_id = NodeId::from_string("route-provider-a");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 25)),
+            "wg-route-provider",
+            Vec::new(),
+            vec![Route {
+                id: "service-route".to_string(),
+                cidr: ipnet::Ipv4Net::new_assert(Ipv4Addr::new(10, 25, 0, 0), 16).into(),
+                advertised_by: peer_id.clone(),
+                via: Some(peer_id.clone()),
+                metric: 10,
+                tags: BTreeSet::new(),
+            }],
+        );
+
+        manager.observe_peer(&peer, &BTreeSet::new());
+        assert!(manager.should_connect_peer(&peer));
+        manager.retain_observed_peers(&BTreeSet::new());
+        assert!(!manager.should_connect_peer(&peer));
+
+        manager.pin_peer(peer_id);
+        manager.observe_peer(&peer, &BTreeSet::new());
+        manager.retain_observed_peers(&BTreeSet::new());
+        assert!(manager.should_connect_peer(&peer));
+        assert_eq!(manager.metrics().pinned_peer_count, 1);
     }
 
     #[test]
@@ -7802,7 +7977,7 @@ mod tests {
             .get(&peer_id)
             .ok_or_else(|| AgentError::MissingPeer(peer_id.clone()))?;
         assert_eq!(config.public_key, "wg-peer-public");
-        assert_eq!(config.allowed_ips, vec!["100.64.0.2/32"]);
+        assert_eq!(config.allowed_ips, vec!["100.64.0.2/32", "10.10.0.0/16"]);
         assert_eq!(config.endpoint.as_deref(), Some("203.0.113.10:51820"));
         assert_eq!(config.persistent_keepalive_seconds, Some(25));
         drop(wireguard_peers);
@@ -7817,6 +7992,227 @@ mod tests {
         assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
         assert_eq!(plan.routes[0].metric, 10);
         assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_selects_one_provider_per_advertised_cidr(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let slower_id = NodeId::from_string("provider-a");
+        let preferred_id = NodeId::from_string("provider-b");
+        let cidr = "10.20.0.0/16".parse()?;
+        let slower_route = Route {
+            id: "service-a".to_string(),
+            cidr,
+            advertised_by: slower_id.clone(),
+            via: Some(slower_id.clone()),
+            metric: 100,
+            tags: Default::default(),
+        };
+        let preferred_route = Route {
+            id: "service-b".to_string(),
+            cidr,
+            advertised_by: preferred_id.clone(),
+            via: Some(preferred_id.clone()),
+            metric: 50,
+            tags: Default::default(),
+        };
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![
+                    peer_record(
+                        slower_id.clone(),
+                        "100.64.0.10".parse()?,
+                        "wg-provider-a",
+                        Vec::new(),
+                        vec![slower_route],
+                    ),
+                    peer_record(
+                        preferred_id.clone(),
+                        "100.64.0.11".parse()?,
+                        "wg-provider-b",
+                        Vec::new(),
+                        vec![preferred_route.clone()],
+                    ),
+                ],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.routes_applied, 3);
+        let peers = applier.wireguard.peers.read().await;
+        assert_eq!(
+            peers
+                .get(&slower_id)
+                .ok_or_else(|| AgentError::MissingPeer(slower_id.clone()))?
+                .allowed_ips,
+            vec!["100.64.0.10/32"]
+        );
+        assert_eq!(
+            peers
+                .get(&preferred_id)
+                .ok_or_else(|| AgentError::MissingPeer(preferred_id.clone()))?
+                .allowed_ips,
+            vec!["100.64.0.11/32", "10.20.0.0/16"]
+        );
+        drop(peers);
+        let applied = applier.route_manager.applied.read().await;
+        let plan = applied
+            .first()
+            .ok_or_else(|| AgentError::RoutePlanning("missing route plan".to_string()))?;
+        assert_eq!(
+            plan.routes
+                .iter()
+                .filter(|route| route.cidr == cidr)
+                .collect::<Vec<_>>(),
+            vec![&preferred_route]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_moves_allowed_cidr_when_provider_disappears(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        );
+        let primary_id = NodeId::from_string("provider-primary");
+        let fallback_id = NodeId::from_string("provider-fallback");
+        let cidr = "10.21.0.0/16".parse()?;
+        let provider = |node_id: NodeId, vpn_ip: IpAddr, metric: u32| {
+            peer_record(
+                node_id.clone(),
+                vpn_ip,
+                &format!("wg-{node_id}"),
+                Vec::new(),
+                vec![Route {
+                    id: format!("service-{node_id}"),
+                    cidr,
+                    advertised_by: node_id.clone(),
+                    via: Some(node_id),
+                    metric,
+                    tags: Default::default(),
+                }],
+            )
+        };
+        let primary = provider(primary_id.clone(), "100.64.0.30".parse()?, 10);
+        let fallback = provider(fallback_id.clone(), "100.64.0.31".parse()?, 20);
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![primary, fallback.clone()],
+                generated_at: Utc::now(),
+            })
+            .await?;
+        assert_eq!(
+            applier
+                .wireguard
+                .peers
+                .read()
+                .await
+                .get(&primary_id)
+                .ok_or_else(|| AgentError::MissingPeer(primary_id.clone()))?
+                .allowed_ips,
+            vec!["100.64.0.30/32", "10.21.0.0/16"]
+        );
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![fallback],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.peers_removed, 1);
+        assert_eq!(summary.routes_removed, 2);
+        let peers = applier.wireguard.peers.read().await;
+        assert!(!peers.contains_key(&primary_id));
+        assert_eq!(
+            peers
+                .get(&fallback_id)
+                .ok_or(AgentError::MissingPeer(fallback_id))?
+                .allowed_ips,
+            vec!["100.64.0.31/32", "10.21.0.0/16"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_does_not_route_locally_advertised_cidrs_to_peers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_id = state.node_id.clone();
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+        let local_route = Route {
+            id: "local-service".to_string(),
+            cidr: "10.30.0.0/16".parse()?,
+            advertised_by: local_id.clone(),
+            via: Some(local_id),
+            metric: 50,
+            tags: Default::default(),
+        };
+        runtime
+            .replace_local_advertised_routes(vec![local_route.clone()])
+            .await?;
+
+        let peer_id = NodeId::from_string("provider-remote");
+        runtime
+            .record_peer_activity(peer_id.clone(), Utc::now(), false)
+            .await;
+        let remote_duplicate = Route {
+            id: "remote-service".to_string(),
+            cidr: local_route.cidr,
+            advertised_by: peer_id.clone(),
+            via: Some(peer_id.clone()),
+            metric: 10,
+            tags: Default::default(),
+        };
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        )
+        .with_lazy_connect_runtime(runtime);
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_record(
+                    peer_id.clone(),
+                    "100.64.0.20".parse()?,
+                    "wg-provider-remote",
+                    Vec::new(),
+                    vec![remote_duplicate],
+                )],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.routes_applied, 1);
+        let peers = applier.wireguard.peers.read().await;
+        assert_eq!(
+            peers
+                .get(&peer_id)
+                .ok_or(AgentError::MissingPeer(peer_id))?
+                .allowed_ips,
+            vec!["100.64.0.20/32"]
+        );
+        let applied = applier.route_manager.applied.read().await;
+        assert!(applied
+            .iter()
+            .flat_map(|plan| &plan.routes)
+            .all(|route| route.cidr != local_route.cidr));
         Ok(())
     }
 

@@ -7178,6 +7178,10 @@ async fn run_agent(
         .context("failed to register agent with control plane")?;
         let response = registration.response;
         registered_control_plane_base = Some(registration.control_plane_url);
+        runtime
+            .replace_local_advertised_routes(response.node.routes.clone())
+            .await
+            .context("failed to retain accepted local advertised routes")?;
         let registered_node = response.node.clone();
         tracing::info!(
             node_id = %response.node.node_id,
@@ -7285,9 +7289,14 @@ async fn run_agent(
     if args.apply_docker_routes {
         background_tasks.push(start_docker_routes(&args).await?);
     }
-    if args.apply_kubernetes_underlay {
+    if args.apply_kubernetes_underlay && args.runtime_backend == AgentRuntimeBackend::DryRun {
         background_tasks
             .push(start_kubernetes_underlay_routes(&args, runtime.state().node_id.clone()).await?);
+    } else if args.apply_kubernetes_underlay {
+        tracing::info!(
+            route_backend = args.route_backend.as_str(),
+            "Kubernetes advertised routes will be reconciled through peer-map route ownership"
+        );
     }
     match args.packet_flow_detector {
         PacketFlowDetector::Disabled => {}
@@ -8543,7 +8552,9 @@ async fn agent_requested_routes(args: &AgentArgs, node_id: NodeId) -> anyhow::Re
         let intent = kubernetes_route_source(args, node_id.clone())?
             .resolve_intent()
             .await?;
-        routes.extend(kubernetes_route_plan(intent).routes);
+        if intent.route_provider == node_id {
+            routes.extend(kubernetes_route_plan(intent).routes);
+        }
     }
     Ok(routes)
 }
@@ -10684,6 +10695,7 @@ async fn run_heartbeat_loop(
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
         let routes = heartbeat_routes(route_reporter.as_ref()).await;
+        let refreshed_routes = routes.clone();
         let request = match heartbeat_request(
             runtime.as_ref(),
             &identity,
@@ -10700,12 +10712,24 @@ async fn run_heartbeat_loop(
             }
         };
         match send_heartbeat_to_control_planes(&client, &control_plane_urls, request).await {
-            Ok(response) => tracing::info!(
-                accepted = response.accepted,
-                policy_version = response.policy_version,
-                peer_delta_available = response.peer_delta_available,
-                "reported agent heartbeat"
-            ),
+            Ok(response) => {
+                if response.accepted {
+                    if let Some(routes) = refreshed_routes {
+                        if let Err(error) = runtime.replace_local_advertised_routes(routes).await {
+                            tracing::warn!(
+                                %error,
+                                "failed to retain heartbeat-accepted local advertised routes"
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    accepted = response.accepted,
+                    policy_version = response.policy_version,
+                    peer_delta_available = response.peer_delta_available,
+                    "reported agent heartbeat"
+                );
+            }
             Err(error) => tracing::warn!(
                 %error,
                 "failed to report agent heartbeat; will retry"
@@ -24827,6 +24851,29 @@ exec sleep 60
             assert_eq!(routes[0].via, Some(NodeId::from_string("route-provider-a")));
             assert_eq!(routes[1].id, "k8s-v4-10-96-0-0-12");
             assert_eq!(routes[1].cidr, "10.96.0.0/12".parse::<ipnet::IpNet>()?);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn kubernetes_underlay_consumer_does_not_advertise_for_remote_provider(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-kubernetes-underlay",
+            "--kubernetes-service-cidr",
+            "10.96.0.0/12",
+            "--kubernetes-route-provider",
+            "route-provider-a",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let routes = agent_requested_routes(&args, NodeId::from_string("consumer-a")).await?;
+            assert!(routes.is_empty());
             return Ok(());
         }
 

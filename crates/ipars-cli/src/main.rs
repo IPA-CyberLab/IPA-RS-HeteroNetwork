@@ -6885,7 +6885,7 @@ fn k8s_install_plan(args: K8sInstallArgs) -> anyhow::Result<InstallPlan> {
         prerequisites: vec![
             "kubectl access with permission to create namespaces, Secrets, DaemonSets, and RBAC when Kubernetes Service discovery is enabled".to_string(),
             "Helm 3".to_string(),
-            "/dev/net/tun plus a writable agent state hostPath available on every scheduled node; the chart initContainer creates/chmods the mounted state directory to 0700".to_string(),
+            "Kernel WireGuard support plus a writable agent state hostPath available on every scheduled node; the chart initContainer creates/chmods the mounted state directory to 0700".to_string(),
             "NET_ADMIN and NET_RAW capability allowance, or equivalent --agent-add-capability overrides, for the DaemonSet agent".to_string(),
             "net.ipv4.ip_forward=1 on Kubernetes route-provider nodes, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 Service/API CIDRs".to_string(),
             "A Kubernetes network plugin that enforces NetworkPolicy when --enable-network-policy is used".to_string(),
@@ -7044,11 +7044,14 @@ fn append_k8s_route_discovery_values(command: &mut String, args: &K8sInstallArgs
         append_helm_set_string(command, "serviceExposure.serviceLabelSelector", selector);
     }
     if let Some(route_provider) = args.kubernetes_route_provider.as_deref() {
+        command.push_str(" --set agent.routeProvider=false");
         append_helm_set_string(
             command,
             "serviceExposure.routeProviderNodeId",
             route_provider,
         );
+    } else {
+        command.push_str(" --set agent.routeProvider=true");
     }
 }
 
@@ -16333,9 +16336,8 @@ fi
         assert!(daemonset.contains("- {{ $agentWireguardListenPortValue | quote }}"));
         assert!(daemonset.contains("- --stun-bind"));
         assert!(daemonset.contains("- {{ $agentStunBind | quote }}"));
-        assert!(daemonset.contains("if eq $agentRuntimeBackend \"linux-command\""));
-        assert!(daemonset.contains("mountPath: /dev/net/tun"));
-        assert!(daemonset.contains("type: CharDevice"));
+        assert!(!daemonset.contains("mountPath: /dev/net/tun"));
+        assert!(!daemonset.contains("type: CharDevice"));
         Ok(())
     }
 
@@ -16623,6 +16625,7 @@ fi
         assert!(
             helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
         );
+        assert!(helm.contains("--set agent.routeProvider=false"));
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
         Ok(())
     }

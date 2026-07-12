@@ -68,7 +68,10 @@ helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
 
 template_ok default
 
-assert_rendered_contains default "mountPath: /dev/net/tun"
+assert_rendered_absent default "mountPath: /dev/net/tun"
+assert_rendered_absent default "name: dev-net-tun"
+assert_rendered_absent default "name: IPARS_ROUTE_PROVIDER"
+assert_rendered_absent default "- --kubernetes-route-provider"
 assert_rendered_contains default "- --wireguard-listen-port"
 assert_rendered_contains default '- "51820"'
 assert_rendered_contains default "- --stun-bind"
@@ -119,6 +122,22 @@ assert_rendered_absent agent-runtime-dry-run "name: dev-net-tun"
 template_fails agent-runtime-invalid \
   "agent.runtimeBackend must be linux-command or dry-run" \
   --set-string agent.runtimeBackend=invalid
+
+template_ok remote-route-provider \
+  --set agent.routeProvider=false \
+  --set-string serviceExposure.routeProviderNodeId=route-provider-a
+
+assert_rendered_contains remote-route-provider "- --kubernetes-route-provider"
+assert_rendered_contains remote-route-provider '- "route-provider-a"'
+
+template_fails local-and-remote-route-provider \
+  "agent.routeProvider=true cannot be combined with serviceExposure.routeProviderNodeId" \
+  --set agent.routeProvider=true \
+  --set-string serviceExposure.routeProviderNodeId=route-provider-a
+
+template_fails missing-route-provider \
+  "serviceExposure.routeProviderNodeId is required when agent.routeProvider=false" \
+  --set agent.routeProvider=false
 
 template_ok agent-http-timeouts \
   --set agent.http.connectTimeoutSeconds=7 \

@@ -183,6 +183,21 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
+      - name: Ensure kernel WireGuard support
+        run: |
+          set -euo pipefail
+          if sudo modprobe wireguard; then
+            exit 0
+          fi
+          sudo apt-get update
+          module_package="linux-modules-extra-$(uname -r)"
+          if ! apt-cache show "$module_package" >/dev/null 2>&1; then
+            echo "WireGuard kernel support is unavailable and ${module_package} does not exist" >&2
+            exit 1
+          fi
+          sudo apt-get install --yes --no-install-recommends "$module_package"
+          sudo modprobe wireguard
+
       - name: Install pinned Kubernetes tools
         env:
           KIND_VERSION: v0.32.0
@@ -224,5 +239,6 @@ jobs:
       - name: Run two-node Kubernetes integration suite
         env:
           CARGO: cargo
+          IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND: linux-command
           IPARS_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS: "300"
         run: scripts/kind-k8s-smoke.sh

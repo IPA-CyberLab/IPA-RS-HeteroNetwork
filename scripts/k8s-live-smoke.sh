@@ -62,6 +62,7 @@ dump_diagnostics() {
   fi
   "$kubectl_bin" -n "$namespace" logs "deployment/${bootstrap_name}" -c control-plane --tail=200 2>&1 || true
   "$kubectl_bin" -n "$namespace" logs "deployment/${bootstrap_name}" -c signal --tail=200 2>&1 || true
+  "$kubectl_bin" -n "$namespace" logs "deployment/${bootstrap_name}" -c stun --tail=200 2>&1 || true
   local pod
   while IFS= read -r pod; do
     [[ -n "$pod" ]] || continue
@@ -109,12 +110,14 @@ wait_for_bootstrap_health() {
       && "$kubectl_bin" -n "$namespace" exec "$pod" -c control-plane -- \
         curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8443/healthz >/dev/null \
       && "$kubectl_bin" -n "$namespace" exec "$pod" -c signal -- \
-        curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9443/healthz >/dev/null; then
+        curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9443/healthz >/dev/null \
+      && "$kubectl_bin" -n "$namespace" exec "$pod" -c stun -- \
+        curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3479/healthz >/dev/null; then
       return 0
     fi
     sleep 2
   done
-  echo "bootstrap control-plane and signal services did not become healthy" >&2
+  echo "bootstrap control-plane, signal, and STUN services did not become healthy" >&2
   return 1
 }
 
@@ -132,7 +135,11 @@ wait_for_agent_runtime() {
       curl --fail --silent --show-error --max-time 5 \
         -H "Authorization: Bearer ${agent_api_token}" \
         http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
-    if jq -e '(.node_id | type == "string") and (.candidate_count | type == "number")' \
+    if jq -e --arg backend "$agent_runtime_backend" \
+      '(.node_id | type == "string")
+       and (.vpn_ip | type == "string")
+       and (.candidate_count | type == "number")
+       and ($backend != "linux-command" or .candidate_count >= 1)' \
       >/dev/null 2>&1 <<<"$status_json" \
       && jq -e '.peer_map_synced == true and (.node_id | type == "string")' \
         >/dev/null 2>&1 <<<"$metrics_json"; then
@@ -142,6 +149,51 @@ wait_for_agent_runtime() {
     sleep 2
   done
   echo "agent pod ${pod} did not report a synchronized peer map" >&2
+  return 1
+}
+
+activate_agent_peer() {
+  local pod="$1"
+  local peer_id="$2"
+  local response
+  response="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+    curl --fail --silent --show-error --max-time 5 \
+      -H "Authorization: Bearer ${agent_api_token}" \
+      -H 'Content-Type: application/json' \
+      -X POST \
+      --data "{\"peer\":\"${peer_id}\",\"pin\":true}" \
+      http://127.0.0.1:9780/v1/peer-activity)"
+  jq -e --arg peer "$peer_id" '.peer == $peer and .pinned == true' >/dev/null <<<"$response"
+}
+
+wait_for_wireguard_path() {
+  local pod="$1"
+  local local_vpn_ip="$2"
+  local remote_vpn_ip="$3"
+  local remote_url_host="$remote_vpn_ip"
+  local attempt
+  if [[ "$remote_url_host" == *:* ]]; then
+    remote_url_host="[${remote_url_host}]"
+  fi
+  for attempt in $(seq 1 90); do
+    if "$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      sh -ec '
+        interface="$1"
+        local_cidr="$2"
+        remote_cidr="$3"
+        remote_url="$4"
+        test "$(wg show "$interface" listen-port)" = "51820"
+        ip -o address show dev "$interface" | grep -F -- "$local_cidr" >/dev/null
+        wg show "$interface" allowed-ips | grep -F -- "$remote_cidr" >/dev/null
+        curl --noproxy "*" --fail --silent --show-error --max-time 5 "$remote_url" >/dev/null
+        wg show "$interface" latest-handshakes | awk '\''$2 > 0 { found = 1 } END { exit !found }'\''
+      ' sh ipars0 "${local_vpn_ip}/32" "${remote_vpn_ip}/32" \
+        "http://${remote_url_host}:9780/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "agent pod ${pod} did not establish a WireGuard path to ${remote_vpn_ip}" >&2
   return 1
 }
 
@@ -248,6 +300,10 @@ spec:
     - name: signal
       port: 9443
       targetPort: signal
+    - name: stun
+      protocol: UDP
+      port: 3478
+      targetPort: stun
 EOF
 
 bootstrap_cluster_ip="$("$kubectl_bin" -n "$namespace" get service "$bootstrap_name" -o jsonpath='{.spec.clusterIP}')"
@@ -346,6 +402,21 @@ spec:
           ports:
             - name: signal
               containerPort: 9443
+        - name: stun
+          image: ${image_ref_json}
+          command: ["/usr/local/bin/iparsd"]
+          args:
+            - stun
+            - --listen
+            - 0.0.0.0:3478
+            - --http-listen
+            - 0.0.0.0:3479
+          ports:
+            - name: stun
+              protocol: UDP
+              containerPort: 3478
+            - name: stun-http
+              containerPort: 3479
       volumes:
         - name: control-plane-state
           emptyDir: {}
@@ -374,11 +445,14 @@ agent_state_path="/var/lib/ipars-live/${release}"
   --set-string "agent.joinTokenSecretName=${token_secret}" \
   --set-string "agent.joinTokenSecretKey=token" \
   --set-string "agent.runtimeBackend=${agent_runtime_backend}" \
+  --set agent.peerMap.pollIntervalSeconds=2 \
+  --set-string 'agent.tolerations[0].operator=Exists' \
   --set agent.hostNetwork=false \
   --set-string "agent.dnsPolicy=ClusterFirst" \
   --set-string "agent.state.hostPath=${agent_state_path}" \
   --set-string "cluster.controlPlaneUrl=${control_plane_url}" \
   --set-string "cluster.signalUrl=${signal_url}" \
+  --set-string "cluster.stunEndpoint=${bootstrap_cluster_ip}:3478" \
   --set serviceExposure.enabled=true \
   --set serviceExposure.discoverServices=true \
   --set serviceExposure.discoverApiServer=false \
@@ -404,13 +478,20 @@ if [[ ! "$desired_agents" =~ ^[1-9][0-9]*$ || ${#agent_pods[@]} -ne $desired_age
   echo "DaemonSet did not create the expected number of agent pods" >&2
   exit 1
 fi
+if [[ "$agent_runtime_backend" == "linux-command" && "$desired_agents" -lt 2 ]]; then
+  echo "linux-command live smoke requires at least two scheduled agent pods" >&2
+  exit 1
+fi
 
 node_ids=()
+vpn_ips=()
 for pod in "${agent_pods[@]}"; do
   "$kubectl_bin" -n "$namespace" wait --for=condition=Ready "pod/${pod}" --timeout="${timeout_seconds}s"
   status_json="$(wait_for_agent_runtime "$pod")"
   node_id="$(jq -er '.node_id | strings | select(test("^node-[A-Za-z0-9._-]+$"))' <<<"$status_json")"
+  vpn_ip="$(jq -er '.vpn_ip | strings' <<<"$status_json")"
   node_ids+=("$node_id")
+  vpn_ips+=("$vpn_ip")
 done
 
 wait_for_control_plane_metrics "$desired_agents"
@@ -424,5 +505,36 @@ for index in "${!node_ids[@]}"; do
   jq -e --arg cluster_id "$cluster_id" '.cluster_id == $cluster_id and (.peers | type == "array")' \
     >/dev/null <<<"$peer_map_json"
 done
+
+if [[ "$agent_runtime_backend" == "linux-command" ]]; then
+  for local_index in "${!node_ids[@]}"; do
+    for remote_index in "${!node_ids[@]}"; do
+      if [[ "$local_index" == "$remote_index" ]]; then
+        continue
+      fi
+      activate_agent_peer "${agent_pods[$local_index]}" "${node_ids[$remote_index]}"
+    done
+  done
+
+  for local_index in "${!node_ids[@]}"; do
+    remote_index=$(( (local_index + 1) % ${#node_ids[@]} ))
+    wait_for_wireguard_path \
+      "${agent_pods[$local_index]}" \
+      "${vpn_ips[$local_index]}" \
+      "${vpn_ips[$remote_index]}"
+    allowed_ips="$("$kubectl_bin" -n "$namespace" exec "${agent_pods[$local_index]}" -c agent -- \
+      wg show ipars0 allowed-ips)"
+    if grep -Fq -- "${bootstrap_cluster_ip}/32" <<<"$allowed_ips"; then
+      echo "agent pod ${agent_pods[$local_index]} routed its locally advertised bootstrap Service through a peer" >&2
+      exit 1
+    fi
+    route_to_bootstrap="$("$kubectl_bin" -n "$namespace" exec "${agent_pods[$local_index]}" -c agent -- \
+      ip route get "$bootstrap_cluster_ip")"
+    if grep -Fq -- "dev ipars0" <<<"$route_to_bootstrap"; then
+      echo "agent pod ${agent_pods[$local_index]} installed its local bootstrap Service route on ipars0" >&2
+      exit 1
+    fi
+  done
+fi
 
 echo "Kubernetes live smoke checks completed for ${#agent_pods[@]} agent pod(s)"

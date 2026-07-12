@@ -231,6 +231,14 @@ before rendering the DaemonSet.
 derived from the supplied port, while conflicting explicit values are rejected
 before Helm is invoked.
 
+Every DaemonSet agent advertises its own discovered Service/API routes by default.
+For a dedicated remote routing peer, set `agent.routeProvider=false` and
+`serviceExposure.routeProviderNodeId=<node-id>` together; the chart rejects both
+local-plus-remote ownership and a disabled local provider without a remote provider.
+The CLI emits this pair automatically when `--route-provider-node-id` is used.
+Kernel WireGuard needs kernel support plus `NET_ADMIN`/`NET_RAW`, but no
+`/dev/net/tun` device mount.
+
 Prepare separate join and Agent API token files. The install plan creates one
 Kubernetes Secret with distinct keys and rejects key reuse:
 
@@ -262,9 +270,10 @@ scripts/helm-smoke.sh
 ```
 
 For a live Kubernetes cluster integration gate, provide an image that the cluster can
-pull and run the disposable-namespace smoke. It verifies Helm's DaemonSet against a
-real control-plane/signal pair, signed token registration, namespace-scoped Service
-discovery RBAC, agent peer-map synchronization, and control-plane health metrics:
+pull and run the disposable-namespace smoke. It verifies Helm's DaemonSet against real
+control-plane, signal, and STUN services, signed token registration, namespace-scoped
+Service discovery RBAC, agent peer-map synchronization, control-plane health metrics,
+and, by default, a cross-agent WireGuard handshake plus encrypted HTTP traffic:
 
 ```bash
 IPARS_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/ipars \
@@ -281,7 +290,7 @@ real WireGuard backend is intentionally unavailable; the default is `linux-comma
 
 For kind-based CI or a local disposable cluster, the wrapper creates a control-plane
 and worker node, builds and loads a local image, invokes the same live smoke with the
-`dry-run` backend, then removes the cluster and generated image:
+production `linux-command` backend, then removes the cluster and generated image:
 
 ```bash
 scripts/kind-k8s-smoke.sh
