@@ -1477,6 +1477,8 @@ impl Display for TokenStatus {
 pub struct TokenLedgerRecord {
     pub cluster_id: ClusterId,
     pub nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_claims: Option<JoinTokenClaims>,
     pub issuer: NodeId,
     pub key_id: KeyId,
     pub role: Role,
@@ -1493,6 +1495,7 @@ impl TokenLedgerRecord {
         Self {
             cluster_id: claims.cluster_id.clone(),
             nonce: claims.nonce.clone(),
+            token_claims: Some(claims.clone()),
             issuer: claims.issuer.clone(),
             key_id: claims.key_id.clone(),
             role: claims.role.clone(),
@@ -1525,6 +1528,22 @@ impl TokenLedgerRecord {
     pub fn remaining_uses(&self) -> Option<u32> {
         self.max_uses
             .map(|max_uses| max_uses.saturating_sub(self.uses))
+    }
+
+    pub fn has_same_definition(&self, other: &Self) -> bool {
+        let legacy_definition_matches = self.cluster_id == other.cluster_id
+            && self.nonce == other.nonce
+            && self.issuer == other.issuer
+            && self.key_id == other.key_id
+            && self.role == other.role
+            && self.tags == other.tags
+            && self.expires_at == other.expires_at
+            && self.max_uses == other.max_uses;
+        legacy_definition_matches
+            && match (&self.token_claims, &other.token_claims) {
+                (Some(stored), Some(requested)) => stored == requested,
+                _ => true,
+            }
     }
 }
 
@@ -18209,6 +18228,27 @@ mod tests {
         assert!(claim_validation_error(&invalid)
             .reason()
             .contains("policy allowed route count 257 exceeds maximum 256"));
+    }
+
+    #[test]
+    fn token_ledger_definition_binds_full_claims_and_reads_legacy_records(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let claims = valid_join_token_claims();
+        let record = TokenLedgerRecord::from_claims(&claims, Utc::now());
+        let mut changed_claims = claims;
+        changed_claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        let changed = TokenLedgerRecord::from_claims(&changed_claims, Utc::now());
+        assert!(!record.has_same_definition(&changed));
+
+        let mut legacy_json = serde_json::to_value(&record)?;
+        let Some(object) = legacy_json.as_object_mut() else {
+            return Err("token ledger record did not serialize as an object".into());
+        };
+        object.remove("token_claims");
+        let legacy: TokenLedgerRecord = serde_json::from_value(legacy_json)?;
+        assert!(legacy.token_claims.is_none());
+        assert!(legacy.has_same_definition(&record));
+        Ok(())
     }
 
     #[test]

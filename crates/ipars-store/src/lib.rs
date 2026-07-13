@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ipars_control_plane::{
-    ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate, RemovedNode, TokenLedger,
+    ensure_token_definition_matches, ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate,
+    RemovedNode, TokenLedger,
 };
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
@@ -421,13 +422,15 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
 
 #[async_trait]
 impl TokenLedger for SqliteControlPlaneStore {
-    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError> {
+    async fn insert_token_if_absent(
+        &self,
+        record: TokenLedgerRecord,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
         sqlx::query(
             r#"
             INSERT INTO tokens (cluster_id, nonce, record_json)
             VALUES (?1, ?2, ?3)
-            ON CONFLICT(cluster_id, nonce)
-            DO UPDATE SET record_json = excluded.record_json
+            ON CONFLICT(cluster_id, nonce) DO NOTHING
             "#,
         )
         .bind(record.cluster_id.as_str())
@@ -436,7 +439,12 @@ impl TokenLedger for SqliteControlPlaneStore {
         .execute(&self.pool)
         .await
         .map_err(sql_error)?;
-        Ok(())
+        let stored = self
+            .get_token(&record.cluster_id, &record.nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(record.nonce.clone()))?;
+        ensure_token_definition_matches(&stored, &record)?;
+        Ok(stored)
     }
 
     async fn get_token(
@@ -460,13 +468,21 @@ impl TokenLedger for SqliteControlPlaneStore {
         nonce: &str,
         revoked_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut record = self
-            .get_token(cluster_id, nonce)
+        let result = sqlx::query(
+            "UPDATE tokens SET record_json = json_set(record_json, '$.revoked_at', json(?3)) WHERE cluster_id = ?1 AND nonce = ?2",
+        )
+        .bind(cluster_id.as_str())
+        .bind(nonce)
+        .bind(serde_json::to_string(&revoked_at).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::TokenNotFound(nonce.to_string()));
+        }
+        self.get_token(cluster_id, nonce)
             .await?
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-        record.revoked_at = Some(revoked_at);
-        self.upsert_token(record.clone()).await?;
-        Ok(record)
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))
     }
 
     async fn record_token_use(
@@ -949,13 +965,15 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
 
 #[async_trait]
 impl TokenLedger for PostgresControlPlaneStore {
-    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError> {
+    async fn insert_token_if_absent(
+        &self,
+        record: TokenLedgerRecord,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
         sqlx::query(
             r#"
             INSERT INTO tokens (cluster_id, nonce, record_json)
             VALUES ($1, $2, $3)
-            ON CONFLICT(cluster_id, nonce)
-            DO UPDATE SET record_json = excluded.record_json
+            ON CONFLICT(cluster_id, nonce) DO NOTHING
             "#,
         )
         .bind(record.cluster_id.as_str())
@@ -964,7 +982,12 @@ impl TokenLedger for PostgresControlPlaneStore {
         .execute(&self.pool)
         .await
         .map_err(sql_error)?;
-        Ok(())
+        let stored = self
+            .get_token(&record.cluster_id, &record.nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(record.nonce.clone()))?;
+        ensure_token_definition_matches(&stored, &record)?;
+        Ok(stored)
     }
 
     async fn get_token(
@@ -988,13 +1011,21 @@ impl TokenLedger for PostgresControlPlaneStore {
         nonce: &str,
         revoked_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut record = self
-            .get_token(cluster_id, nonce)
+        let result = sqlx::query(
+            "UPDATE tokens SET record_json = jsonb_set(record_json, '{revoked_at}', $3) WHERE cluster_id = $1 AND nonce = $2",
+        )
+        .bind(cluster_id.as_str())
+        .bind(nonce)
+        .bind(serde_json::to_value(revoked_at).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::TokenNotFound(nonce.to_string()));
+        }
+        self.get_token(cluster_id, nonce)
             .await?
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-        record.revoked_at = Some(revoked_at);
-        self.upsert_token(record.clone()).await?;
-        Ok(record)
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))
     }
 
     async fn record_token_use(
@@ -1489,7 +1520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_token_admission_enforces_max_uses_under_concurrency(
+    async fn sqlite_first_token_admission_enforces_max_uses_under_concurrency(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (database_url, database_path) = temp_sqlite_url("token-concurrency");
         let store = SqliteControlPlaneStore::connect(&database_url).await?;
@@ -1498,9 +1529,6 @@ mod tests {
         let mut token_claims = claims(cluster_id.clone());
         token_claims.nonce = "concurrent-token".to_string();
         token_claims.policy.max_token_uses = Some(1);
-        admission
-            .issue_from_claims(&token_claims, Utc::now())
-            .await?;
 
         let task_count = 16;
         let barrier = Arc::new(tokio::sync::Barrier::new(task_count));
@@ -1547,6 +1575,67 @@ mod tests {
         assert_eq!(token_metrics.exhausted_count, 1);
         assert_eq!(token_metrics.use_count, 1);
 
+        let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_token_revocation_preserves_concurrent_uses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("token-revocation-concurrency");
+        let store = SqliteControlPlaneStore::connect(&database_url).await?;
+        let admission = Arc::new(TokenAdmission::new(Arc::new(store.clone())));
+        let cluster_id = ClusterId::new();
+        let mut token_claims = claims(cluster_id.clone());
+        token_claims.nonce = "concurrent-revocation".to_string();
+        token_claims.policy.max_token_uses = None;
+        admission
+            .issue_from_claims(&token_claims, Utc::now())
+            .await?;
+
+        let task_count = 64;
+        let barrier = Arc::new(tokio::sync::Barrier::new(task_count + 1));
+        let mut tasks = Vec::new();
+        for _ in 0..task_count {
+            let admission = Arc::clone(&admission);
+            let claims = token_claims.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                admission.admit_join(&claims, Utc::now()).await
+            }));
+        }
+
+        barrier.wait().await;
+        let revoked = admission
+            .revoke_token(&cluster_id, &token_claims.nonce, Utc::now())
+            .await?;
+        assert_eq!(revoked.status(Utc::now()), TokenStatus::Revoked);
+
+        let mut accepted = 0_u32;
+        for task in tasks {
+            match task.await? {
+                Ok(_) => accepted = accepted.saturating_add(1),
+                Err(ControlPlaneError::TokenRejected {
+                    status: TokenStatus::Revoked,
+                    ..
+                }) => {}
+                Err(error) => {
+                    return Err(format!("unexpected concurrent revocation error: {error}").into())
+                }
+            }
+        }
+
+        let final_record = store
+            .get_token(&cluster_id, &token_claims.nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(token_claims.nonce.clone()))?;
+        assert_eq!(final_record.status(Utc::now()), TokenStatus::Revoked);
+        assert_eq!(final_record.uses, accepted);
+        assert!(final_record.has_same_definition(&revoked));
+
+        drop(admission);
+        drop(store);
         let _ = std::fs::remove_file(database_path);
         Ok(())
     }

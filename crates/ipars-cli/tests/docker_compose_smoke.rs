@@ -58,11 +58,14 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let init = generated_init_output(relay_udp_port)?;
     let cluster_id = json_string(&init, "cluster_id")?;
     let issuer_node_id = json_string(&init, "issuer_node_id")?;
+    let issuer_key_id = json_string(&init, "issuer_key_id")?;
     let issuer_public_key = json_string(&init, "issuer_public_key")?;
-    let join_token = init
+    let issuer_private_key = json_string(&init, "issuer_private_key_b64")?;
+    let join_token_value = init
         .get("join_token")
-        .context("init output missing join_token")?
-        .to_string();
+        .context("init output missing join_token")?;
+    let join_token_nonce = json_string_required_at(join_token_value, &["claims", "nonce"])?;
+    let join_token = join_token_value.to_string();
 
     let override_path = temp_dir.join("compose.override.yaml");
     let override_config = ComposeOverrideConfig {
@@ -639,8 +642,76 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_compose_stun_dataplane(&compose)?;
     assert_compose_relay_admission_auth_required(&compose)?;
     assert_compose_relay_dataplane(&compose)?;
+    assert_compose_postgres_token_revocation(
+        &compose,
+        &cluster_id,
+        &join_token_nonce,
+        &issuer_key_id,
+        &issuer_private_key,
+    )?;
     assert_compose_linux_wireguard_dataplane(&compose.repo_root)?;
 
+    Ok(())
+}
+
+fn assert_compose_postgres_token_revocation(
+    compose: &ComposeProject,
+    cluster_id: &str,
+    nonce: &str,
+    issuer_key_id: &str,
+    issuer_private_key: &str,
+) -> Result<()> {
+    let mut command = compose_command(compose);
+    let output = command
+        .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
+        .env_remove("IPARS_ISSUER_PRIVATE_KEY_PATH")
+        .args([
+            "exec",
+            "-T",
+            "-e",
+            "IPARS_ISSUER_PRIVATE_KEY",
+            "control-plane",
+            "/usr/local/bin/ipars",
+            "token",
+            "revoke",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--cluster-id",
+            cluster_id,
+            "--nonce",
+            nonce,
+            "--issuer-key-id",
+            issuer_key_id,
+        ])
+        .output()
+        .context("failed to run PostgreSQL-backed token revocation")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "PostgreSQL-backed token revocation failed with status {}\nstdout:\n{}\nstderr:\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            compose_diagnostics(compose)
+        );
+    }
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .context("failed to parse PostgreSQL-backed token revocation response")?;
+    anyhow::ensure!(
+        json_string_required(&response, "status")? == "revoked",
+        "PostgreSQL-backed token revocation did not return revoked status: {response}"
+    );
+    anyhow::ensure!(
+        json_string_required_at(&response, &["record", "nonce"])? == nonce,
+        "PostgreSQL-backed token revocation returned a different nonce: {response}"
+    );
+    anyhow::ensure!(
+        json_u64_field_at(&response, &["record", "uses"])? >= 2,
+        "PostgreSQL-backed token revocation lost completed Agent token uses: {response}"
+    );
+    anyhow::ensure!(
+        json_string_required_at(&response, &["record", "revoked_at"]).is_ok(),
+        "PostgreSQL-backed token revocation omitted revoked_at: {response}"
+    );
     Ok(())
 }
 

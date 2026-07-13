@@ -171,7 +171,10 @@ pub struct HeartbeatStoreUpdate {
 
 #[async_trait]
 pub trait TokenLedger: Send + Sync {
-    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError>;
+    async fn insert_token_if_absent(
+        &self,
+        record: TokenLedgerRecord,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError>;
     async fn get_token(
         &self,
         cluster_id: &ClusterId,
@@ -387,12 +390,16 @@ pub struct InMemoryTokenLedger {
 
 #[async_trait]
 impl TokenLedger for InMemoryTokenLedger {
-    async fn upsert_token(&self, record: TokenLedgerRecord) -> Result<(), ControlPlaneError> {
-        self.tokens
-            .write()
-            .await
-            .insert(token_key(&record.cluster_id, &record.nonce), record);
-        Ok(())
+    async fn insert_token_if_absent(
+        &self,
+        record: TokenLedgerRecord,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut tokens = self.tokens.write().await;
+        let stored = tokens
+            .entry(token_key(&record.cluster_id, &record.nonce))
+            .or_insert(record.clone());
+        ensure_token_definition_matches(stored, &record)?;
+        Ok(stored.clone())
     }
 
     async fn get_token(
@@ -481,8 +488,7 @@ where
         created_at: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
         let record = TokenLedgerRecord::from_claims(claims, created_at);
-        self.ledger.upsert_token(record.clone()).await?;
-        Ok(record)
+        self.ledger.insert_token_if_absent(record).await
     }
 
     pub async fn admit_join(
@@ -490,21 +496,9 @@ where
         claims: &JoinTokenClaims,
         now: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let record = self
-            .ledger
-            .get_token(&claims.cluster_id, &claims.nonce)
-            .await?
-            .unwrap_or_else(|| TokenLedgerRecord::from_claims(claims, now));
-
-        if self
-            .ledger
-            .get_token(&claims.cluster_id, &claims.nonce)
-            .await?
-            .is_none()
-        {
-            self.ledger.upsert_token(record).await?;
-        }
-
+        self.ledger
+            .insert_token_if_absent(TokenLedgerRecord::from_claims(claims, now))
+            .await?;
         self.ledger
             .record_token_use(&claims.cluster_id, &claims.nonce, now)
             .await
@@ -528,6 +522,19 @@ where
     ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
         self.ledger.token_metrics(cluster_id, now).await
     }
+}
+
+pub fn ensure_token_definition_matches(
+    stored: &TokenLedgerRecord,
+    requested: &TokenLedgerRecord,
+) -> Result<(), ControlPlaneError> {
+    if stored.has_same_definition(requested) {
+        return Ok(());
+    }
+    Err(ControlPlaneError::TokenVerification(format!(
+        "token nonce {} conflicts with its durable definition",
+        requested.nonce
+    )))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6088,6 +6095,11 @@ mod tests {
         let first_use = admission.admit_join(&token_claims, Utc::now()).await?;
         assert_eq!(first_use.uses, 1);
 
+        let reissued = admission
+            .issue_from_claims(&token_claims, Utc::now())
+            .await?;
+        assert_eq!(reissued.uses, 1);
+
         let second_use = admission.admit_join(&token_claims, Utc::now()).await;
         assert!(matches!(
             second_use,
@@ -6095,6 +6107,14 @@ mod tests {
                 status: TokenStatus::Exhausted,
                 ..
             })
+        ));
+
+        let mut conflicting_claims = token_claims.clone();
+        conflicting_claims.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        let conflict = admission.admit_join(&conflicting_claims, Utc::now()).await;
+        assert!(matches!(
+            conflict,
+            Err(ControlPlaneError::TokenVerification(_))
         ));
 
         let mut revoked_claims = claims(cluster_id);
