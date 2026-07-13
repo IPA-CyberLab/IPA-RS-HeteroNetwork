@@ -1550,7 +1550,9 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         },
     )?;
     let token = identity.sign_join_token(claims)?;
-    let relay_admission_bearer_token_path = if args.allow_relay {
+    let relay_admission_bearer_token_path = if args.allow_relay
+        && (args.spawn_daemons || args.relay_admission_bearer_token_path.is_some())
+    {
         Some(prepare_init_relay_admission_token(&args)?)
     } else {
         None
@@ -11471,9 +11473,15 @@ mod tests {
     fn init_outputs_daemon_commands_for_bootstrap_services() -> anyhow::Result<()> {
         let key_path = temp_path("issuer-bootstrap.key");
         let operator_token_path = temp_path("control-plane-operator-api.token");
+        let relay_admission_token_path = temp_path("relay-admission.token");
         std::fs::write(
             &operator_token_path,
             "control-plane-operator-secret-with-32-bytes\n",
+        )?;
+        write_init_secret_file(
+            &relay_admission_token_path,
+            b"relay-admission-secret-with-at-least-32-bytes\n",
+            "relay admission bearer token",
         )?;
         let state_dir = temp_path("bootstrap-state");
         let output = init(InitArgs {
@@ -11504,7 +11512,7 @@ mod tests {
             relay_udp_listen: "0.0.0.0:15182".parse()?,
             relay_http_listen: "127.0.0.1:19580".parse()?,
             relay_admission_url: None,
-            relay_admission_bearer_token_path: None,
+            relay_admission_bearer_token_path: Some(relay_admission_token_path.clone()),
             relay_agent_listen: "127.0.0.1:19781".parse()?,
         })?;
 
@@ -11616,28 +11624,45 @@ mod tests {
         assert!(relay
             .command
             .contains(&"http://203.0.113.10:19580".to_string()));
-        let relay_admission_token_path = output
-            .relay_admission_bearer_token_path
-            .as_ref()
-            .context("expected generated relay admission token path")?;
+        let output_relay_admission_token_path =
+            output
+                .relay_admission_bearer_token_path
+                .as_ref()
+                .context("expected explicit relay admission token path")?;
         assert_eq!(
-            relay_admission_token_path,
-            &state_dir.join("relay-admission.token")
+            output_relay_admission_token_path,
+            &relay_admission_token_path
         );
         assert!(relay
             .command
             .windows(2)
             .any(|values| values[0] == "--admission-bearer-token-path"
-                && values[1] == relay_admission_token_path.display().to_string()));
-        let relay_admission_token = read_init_relay_admission_token(relay_admission_token_path)?;
+                && values[1] == output_relay_admission_token_path.display().to_string()));
+        let relay_admission_token =
+            read_init_relay_admission_token(output_relay_admission_token_path)?;
         validate_relay_admission_bearer_token(
             &relay_admission_token,
-            "generated relay admission bearer token",
+            "relay admission bearer token",
         )?;
 
         let _ = std::fs::remove_file(key_path);
         let _ = std::fs::remove_file(operator_token_path);
+        let _ = std::fs::remove_file(relay_admission_token_path);
         let _ = std::fs::remove_dir_all(state_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn init_without_spawn_does_not_create_default_relay_admission_state() -> anyhow::Result<()> {
+        let mut args = valid_init_args();
+        args.daemon_state_dir = temp_path("manual-bootstrap-state");
+        let state_dir = args.daemon_state_dir.clone();
+
+        let output = init(args)?;
+
+        assert!(output.daemon_processes.is_empty());
+        assert!(output.relay_admission_bearer_token_path.is_none());
+        assert!(!state_dir.exists());
         Ok(())
     }
 
