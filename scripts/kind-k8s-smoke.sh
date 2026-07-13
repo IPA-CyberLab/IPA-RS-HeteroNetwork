@@ -106,6 +106,13 @@ fi
 cat >"$kind_config" <<'EOF'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    apiVersion: kubelet.config.k8s.io/v1beta1
+    allowedUnsafeSysctls:
+      - net.ipv4.ip_forward
+      - net.ipv6.conf.all.forwarding
 nodes:
   - role: control-plane
   - role: worker

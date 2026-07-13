@@ -31,6 +31,7 @@
 {{- $rbacCreate := printf "%v" .Values.rbac.create -}}
 {{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
+{{- $agentKubernetesForwardingSysctls := and .Values.serviceExposure.enabled (eq $agentHostNetwork "false") -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
 {{- $agentRouteProvider := printf "%v" .Values.agent.routeProvider -}}
 {{- $agentTerminationGracePeriodSeconds := printf "%v" .Values.agent.terminationGracePeriodSeconds -}}
@@ -831,7 +832,7 @@ spec:
       {{- if .Values.agent.runtimeClassName }}
       runtimeClassName: {{ .Values.agent.runtimeClassName | quote }}
       {{- end }}
-      {{- if or (ne $agentRunAsUser "") (ne $agentRunAsGroup "") (ne $agentRunAsNonRoot "") (ne $agentFsGroup "") (ne $agentFsGroupChangePolicy "") .Values.agent.podSecurityContext.supplementalGroups }}
+      {{- if or (ne $agentRunAsUser "") (ne $agentRunAsGroup "") (ne $agentRunAsNonRoot "") (ne $agentFsGroup "") (ne $agentFsGroupChangePolicy "") .Values.agent.podSecurityContext.supplementalGroups $agentKubernetesForwardingSysctls }}
       securityContext:
         {{- if ne $agentRunAsUser "" }}
         runAsUser: {{ int64 $agentRunAsUser }}
@@ -853,6 +854,13 @@ spec:
           {{- range . }}
           - {{ int64 . }}
           {{- end }}
+        {{- end }}
+        {{- if $agentKubernetesForwardingSysctls }}
+        sysctls:
+          - name: net.ipv4.ip_forward
+            value: "1"
+          - name: net.ipv6.conf.all.forwarding
+            value: "1"
         {{- end }}
       {{- end }}
       {{- with .Values.agent.nodeSelector }}

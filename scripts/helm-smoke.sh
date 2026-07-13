@@ -130,6 +130,18 @@ template_ok remote-route-provider \
 assert_rendered_contains remote-route-provider "- --kubernetes-route-provider"
 assert_rendered_contains remote-route-provider '- "route-provider-a"'
 
+template_ok pod-network-kubernetes-forwarding \
+  --set agent.hostNetwork=false \
+  --set-string agent.dnsPolicy=ClusterFirst
+
+assert_rendered_contains pod-network-kubernetes-forwarding "name: net.ipv4.ip_forward"
+assert_rendered_contains pod-network-kubernetes-forwarding 'value: "1"'
+
+template_ok host-network-kubernetes-forwarding \
+  --set agent.hostNetwork=true
+
+assert_rendered_absent host-network-kubernetes-forwarding "name: net.ipv4.ip_forward"
+
 template_fails local-and-remote-route-provider \
   "agent.routeProvider=true cannot be combined with serviceExposure.routeProviderNodeId" \
   --set agent.routeProvider=true \

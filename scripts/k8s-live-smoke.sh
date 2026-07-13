@@ -647,6 +647,15 @@ for index in "${!node_ids[@]}"; do
   vpn_ips[$index]="${vpn_ip_by_node[$node_id]}"
 done
 
+for pod in "${agent_pods[@]}"; do
+  ipv4_forwarding="$($kubectl_bin -n "$namespace" exec "pod/${pod}" -c agent -- \
+    cat /proc/sys/net/ipv4/ip_forward)"
+  if [[ "$ipv4_forwarding" != "1" ]]; then
+    echo "agent pod ${pod} did not enable IPv4 forwarding, got ${ipv4_forwarding:-<empty>}" >&2
+    exit 1
+  fi
+done
+
 wait_for_control_plane_metrics "$desired_agents"
 wait_for_agent_api_service "${agent_pods[0]}" "$agent_api_service_name"
 
