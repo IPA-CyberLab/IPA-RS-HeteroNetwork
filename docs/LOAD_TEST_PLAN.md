@@ -19,7 +19,7 @@ Daemon transport can launch fewer Agents than the scenario's design node count. 
 - `in-memory`: exercises control-plane and signal services without HTTP.
 - `http`: drives loopback HTTP control-plane and signal endpoints.
 - `relay-udp`: adds Bearer-authenticated relay HTTP admission and UDP forwarding throughput checks.
-- `daemon`: spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored. Multiple control-plane processes share one SQLite store. Relay and Agents read a generated run-scoped admission credential from one owner-only file, and the harness removes that file after readiness. After agent path convergence, the harness uses each persisted agent identity to sign a baseline negotiation and path-quality observation for every active pair, then validates the Signal disposition counter deltas.
+- `daemon`: spawns separate `iparsd` control-plane, signal, STUN, relay, and dry-run agent processes with inherited environment variables cleared and only a fixed system `PATH` plus `C` locale restored. Multiple control-plane processes share one run-scoped SQLite store by default. Set `IPARS_LOAD_DAEMON_DATABASE_URL` or pass `--daemon-database-url` to run the same HA workload against PostgreSQL; the URL is passed to control-plane children only through their environment and reports record only the backend kind. Relay and Agents read a generated run-scoped admission credential from one owner-only file, and the harness removes that file after readiness. After agent path convergence, the harness uses each persisted agent identity to sign a baseline negotiation and path-quality observation for every active pair, then validates the Signal disposition counter deltas.
 
 ## Required Success Gates
 
@@ -53,6 +53,7 @@ cargo run -p ipars-load -- --transport http --scenario ten
 cargo run -p ipars-load -- --transport relay-udp --scenario ten --relay-packets-per-session 16 --relay-payload-bytes 1200
 cargo build -p ipars-daemon
 cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin target/debug/iparsd --daemon-agent-processes 3 --daemon-control-plane-processes 2 --daemon-agent-readiness-timeout-seconds 30
+IPARS_LOAD_DAEMON_DATABASE_URL='postgresql://ipars:password@127.0.0.1:5432/ipars?sslmode=disable' cargo run -p ipars-load -- --transport daemon --scenario three --iparsd-bin target/debug/iparsd --daemon-agent-processes 3 --daemon-control-plane-processes 2 --daemon-agent-readiness-timeout-seconds 30
 ```
 
 For a repeatable local smoke that also builds the daemon transport binary:

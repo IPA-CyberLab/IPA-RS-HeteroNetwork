@@ -53,6 +53,23 @@ if [[ -n "$daemon_bin" ]]; then
     --daemon-agent-processes "${IPARS_LOAD_SMOKE_DAEMON_AGENTS:-3}" \
     --daemon-control-plane-processes "${IPARS_LOAD_SMOKE_DAEMON_CONTROL_PLANES:-2}" \
     --daemon-agent-readiness-timeout-seconds "${IPARS_LOAD_SMOKE_DAEMON_AGENT_TIMEOUT_SECONDS:-30}"
+
+  postgres_database_url="${IPARS_LOAD_SMOKE_POSTGRES_DATABASE_URL:-}"
+  if [[ -n "$postgres_database_url" ]]; then
+    postgres_report="${output_dir}/ipars-load-daemon-postgres-three.json"
+    IPARS_LOAD_DAEMON_DATABASE_URL="$postgres_database_url" run_load daemon-postgres-three daemon three \
+      --transport daemon \
+      --scenario three \
+      --iparsd-bin "$daemon_bin" \
+      --daemon-agent-processes "${IPARS_LOAD_SMOKE_DAEMON_AGENTS:-3}" \
+      --daemon-control-plane-processes "${IPARS_LOAD_SMOKE_DAEMON_CONTROL_PLANES:-2}" \
+      --daemon-agent-readiness-timeout-seconds "${IPARS_LOAD_SMOKE_DAEMON_AGENT_TIMEOUT_SECONDS:-30}"
+    if ! grep -Fq '"daemon_database_backend": "postgres"' "$postgres_report"; then
+      echo "load smoke report ${postgres_report} did not record PostgreSQL daemon backend" >&2
+      cat "$postgres_report" >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "ipars-load smoke reports written to ${output_dir}/ipars-load-*.json"

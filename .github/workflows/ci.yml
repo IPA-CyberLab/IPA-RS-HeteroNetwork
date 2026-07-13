@@ -203,6 +203,20 @@ jobs:
     name: Scale and daemon failover smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ipars
+          POSTGRES_PASSWORD: ipars-load-password
+          POSTGRES_DB: ipars
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ipars -d ipars"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -216,6 +230,7 @@ jobs:
         env:
           CARGO: cargo
           IPARS_LOAD_SMOKE_BUILD_DAEMON: "1"
+          IPARS_LOAD_SMOKE_POSTGRES_DATABASE_URL: postgresql://ipars:ipars-load-password@127.0.0.1:5432/ipars?sslmode=disable
         run: scripts/load-smoke.sh
 
   helm-smoke:

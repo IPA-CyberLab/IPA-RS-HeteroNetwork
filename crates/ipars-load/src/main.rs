@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use url::Url;
 
 static DAEMON_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static DAEMON_MANIFEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -66,6 +67,7 @@ const MAX_LOAD_HTTP_JSON_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LOAD_HTTP_TEXT_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_DAEMON_HTTP_READINESS_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS: u64 = 15;
+const MAX_DAEMON_DATABASE_URL_BYTES: usize = 4096;
 const LOAD_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
     "ipars-load-control-plane-operator-token";
 const LOAD_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "ipars-load-signal-operator-api-token";
@@ -109,6 +111,14 @@ struct Cli {
 
     #[arg(long, default_value_t = DEFAULT_DAEMON_AGENT_READINESS_TIMEOUT_SECONDS)]
     daemon_agent_readiness_timeout_seconds: u64,
+
+    #[arg(
+        long,
+        env = "IPARS_LOAD_DAEMON_DATABASE_URL",
+        value_name = "URL",
+        help = "External PostgreSQL URL for daemon control-plane load (credentials are passed only through child process environment)"
+    )]
+    daemon_database_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -151,7 +161,7 @@ impl RelayLoadOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DaemonLoadOptions {
     control_plane_processes: usize,
     agent_processes: usize,
@@ -159,6 +169,15 @@ struct DaemonLoadOptions {
     http_readiness_timeout: Duration,
     agent_readiness_timeout: Duration,
     relay_options: RelayLoadOptions,
+    database_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonDatabaseBackend {
+    #[default]
+    Sqlite,
+    Postgres,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,6 +274,8 @@ struct LoadReport {
     relay_admission_failures_by_reason_reported: BTreeMap<RelayAdmissionFailureReason, u64>,
     relay_mbps: f64,
     daemon_processes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_database_backend: Option<DaemonDatabaseBackend>,
     daemon_runtime_dir: Option<PathBuf>,
     daemon_runtime_manifest: Option<PathBuf>,
     daemon_http_readiness_timeout_seconds: u64,
@@ -373,6 +394,9 @@ struct DaemonStunReport {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.daemon_database_url.is_some() && cli.transport != TransportMode::Daemon {
+        bail!("--daemon-database-url is only valid with --transport daemon");
+    }
     let scenario = Scenario::from_name(cli.scenario);
     let report = match cli.transport {
         TransportMode::InMemory => run_in_memory_scenario(scenario).await?,
@@ -407,6 +431,7 @@ async fn main() -> anyhow::Result<()> {
                         packets_per_session: cli.relay_packets_per_session,
                         payload_bytes: cli.relay_payload_bytes,
                     },
+                    database_url: cli.daemon_database_url,
                 },
             )
             .await?
@@ -1244,6 +1269,15 @@ impl LoadReport {
                 workload.daemon_agent_readiness_timeout_seconds,
                 self.daemon_agent_readiness_timeout_seconds
             );
+        }
+        if let Some(database_backend) = self.daemon_database_backend {
+            if workload.daemon_database_backend != database_backend {
+                bail!(
+                    "daemon load scenario retained manifest database backend {:?} does not match report {:?}",
+                    workload.daemon_database_backend,
+                    database_backend
+                );
+            }
         }
         let measurement = manifest.measurement.context(
             "daemon load scenario retained completed manifest is missing measurement summary",
@@ -2136,6 +2170,7 @@ async fn run_in_memory_scenario(scenario: Scenario) -> anyhow::Result<LoadReport
         relay_admission_failures_by_reason_reported: BTreeMap::new(),
         relay_mbps: 0.0,
         daemon_processes: 0,
+        daemon_database_backend: None,
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
         daemon_http_readiness_timeout_seconds: 0,
@@ -2431,6 +2466,7 @@ async fn run_http_scenario(scenario: Scenario) -> anyhow::Result<LoadReport> {
         relay_admission_failures_by_reason_reported: BTreeMap::new(),
         relay_mbps: 0.0,
         daemon_processes: 0,
+        daemon_database_backend: None,
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
         daemon_http_readiness_timeout_seconds: 0,
@@ -2689,6 +2725,7 @@ async fn run_relay_udp_scenario(
         relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: 0,
+        daemon_database_backend: None,
         daemon_runtime_dir: None,
         daemon_runtime_manifest: None,
         daemon_http_readiness_timeout_seconds: 0,
@@ -2853,6 +2890,8 @@ async fn run_daemon_scenario(
     options: DaemonLoadOptions,
 ) -> anyhow::Result<LoadReport> {
     let relay_options = options.relay_options.validate()?;
+    let database_url = validate_daemon_database_url(options.database_url.as_deref())?;
+    let database_backend = daemon_database_backend(database_url.as_deref());
     let control_plane_processes =
         validate_daemon_control_plane_processes(options.control_plane_processes)?;
     let agent_processes = validate_daemon_agent_processes(options.agent_processes, scenario)?;
@@ -2880,6 +2919,7 @@ async fn run_daemon_scenario(
             http_readiness_timeout,
             agent_readiness_timeout,
             relay_options,
+            database_url: database_url.clone(),
         },
     )
     .await?;
@@ -3500,6 +3540,7 @@ async fn run_daemon_scenario(
         relay_admission_failures_by_reason_reported: status.admission_failures_by_reason,
         relay_mbps,
         daemon_processes: services.process_count(),
+        daemon_database_backend: Some(database_backend),
         daemon_runtime_dir: options
             .keep_runtime_dir
             .then(|| services.runtime_dir.clone()),
@@ -3950,6 +3991,44 @@ fn validate_daemon_control_plane_processes(
     Ok(requested_control_plane_processes)
 }
 
+fn validate_daemon_database_url(database_url: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(database_url) = database_url else {
+        return Ok(None);
+    };
+    if database_url.is_empty() {
+        bail!("--daemon-database-url must not be empty");
+    }
+    if database_url.len() > MAX_DAEMON_DATABASE_URL_BYTES {
+        bail!("--daemon-database-url must be at most {MAX_DAEMON_DATABASE_URL_BYTES} bytes");
+    }
+    if database_url
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        bail!("--daemon-database-url must not contain whitespace or control characters");
+    }
+    let parsed =
+        Url::parse(database_url).context("--daemon-database-url must be a valid PostgreSQL URL")?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+        bail!("--daemon-database-url must use postgres:// or postgresql://");
+    }
+    if parsed.host_str().is_none() {
+        bail!("--daemon-database-url must include a database host");
+    }
+    if parsed.fragment().is_some() {
+        bail!("--daemon-database-url must not include a URL fragment");
+    }
+    Ok(Some(database_url.to_string()))
+}
+
+fn daemon_database_backend(database_url: Option<&str>) -> DaemonDatabaseBackend {
+    if database_url.is_some() {
+        DaemonDatabaseBackend::Postgres
+    } else {
+        DaemonDatabaseBackend::Sqlite
+    }
+}
+
 fn daemon_timeout_from_seconds(seconds: u64, flag: &str) -> anyhow::Result<Duration> {
     if seconds == 0 {
         bail!("{flag} must be greater than zero");
@@ -4236,6 +4315,8 @@ struct DaemonRuntimeManifestWorkload {
     daemon_agent_processes: usize,
     daemon_http_readiness_timeout_seconds: u64,
     daemon_agent_readiness_timeout_seconds: u64,
+    #[serde(default)]
+    daemon_database_backend: DaemonDatabaseBackend,
     relay_packets_per_session: usize,
     relay_payload_bytes: usize,
 }
@@ -5016,6 +5097,7 @@ impl DaemonProcessGroup {
                 daemon_agent_processes: options.agent_processes,
                 daemon_http_readiness_timeout_seconds: options.http_readiness_timeout.as_secs(),
                 daemon_agent_readiness_timeout_seconds: options.agent_readiness_timeout.as_secs(),
+                daemon_database_backend: daemon_database_backend(options.database_url.as_deref()),
                 relay_packets_per_session: options.relay_options.packets_per_session,
                 relay_payload_bytes: options.relay_options.payload_bytes,
             },
@@ -5036,8 +5118,6 @@ impl DaemonProcessGroup {
             &agent_urls,
             &startup.children,
         )?;
-        let control_plane_database_url =
-            daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE));
         let control_plane_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let signal_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
         let relay_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
@@ -5046,32 +5126,41 @@ impl DaemonProcessGroup {
             write_daemon_relay_admission_token(&runtime_dir, &relay_admission_bearer_token)?;
         startup.record_relay_admission_token_path(relay_admission_bearer_token_path.clone());
         let stun_operator_api_bearer_token = IdentityKeyPair::generate().signing_key_b64();
+        let database_url = options.database_url.as_deref();
         let client = reqwest::Client::new();
         for (index, control_addr) in control_addrs.iter().enumerate() {
             let role = format!("control-plane-{index}");
+            let mut control_plane_args = vec![
+                "control-plane".to_string(),
+                "--listen".to_string(),
+                control_addr.to_string(),
+                "--cluster-id".to_string(),
+                cluster_id.to_string(),
+                "--issuer-node-id".to_string(),
+                issuer.node_id().to_string(),
+                "--issuer-key-id".to_string(),
+                key_id.to_string(),
+                "--issuer-public-key".to_string(),
+                issuer.public_key_b64(),
+            ];
+            let mut control_plane_env = vec![(
+                "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+                control_plane_operator_api_bearer_token.as_str(),
+            )];
+            if let Some(database_url) = database_url {
+                control_plane_env.push(("IPARS_DATABASE_URL", database_url));
+            } else {
+                control_plane_args.extend([
+                    "--database-url".to_string(),
+                    daemon_sqlite_database_url(&runtime_dir.join(DAEMON_CONTROL_PLANE_SQLITE_FILE)),
+                ]);
+            }
             startup.children.push(spawn_iparsd_with_env(
                 &manifest_seed.iparsd_binary.path,
-                &[
-                    "control-plane".to_string(),
-                    "--listen".to_string(),
-                    control_addr.to_string(),
-                    "--cluster-id".to_string(),
-                    cluster_id.to_string(),
-                    "--database-url".to_string(),
-                    control_plane_database_url.clone(),
-                    "--issuer-node-id".to_string(),
-                    issuer.node_id().to_string(),
-                    "--issuer-key-id".to_string(),
-                    key_id.to_string(),
-                    "--issuer-public-key".to_string(),
-                    issuer.public_key_b64(),
-                ],
+                &control_plane_args,
                 &role,
                 &runtime_dir,
-                &[(
-                    "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
-                    control_plane_operator_api_bearer_token.as_str(),
-                )],
+                &control_plane_env,
             )?);
             manifest_seed.write(
                 DaemonRuntimePhase::ControlPlaneStartup,
@@ -10404,6 +10493,48 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
     }
 
     #[test]
+    fn daemon_database_url_validation_accepts_postgres_and_rejects_unsafe_values(
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            validate_daemon_database_url(None)?,
+            None,
+            "missing database URL keeps the SQLite default"
+        );
+        let postgres = validate_daemon_database_url(Some(
+            "postgresql://load:password@127.0.0.1:5432/ipars?sslmode=disable",
+        ))?;
+        assert_eq!(
+            daemon_database_backend(postgres.as_deref()),
+            DaemonDatabaseBackend::Postgres
+        );
+        assert_eq!(daemon_database_backend(None), DaemonDatabaseBackend::Sqlite);
+
+        for invalid in [
+            "sqlite:///tmp/ipars.sqlite",
+            "postgresql:///ipars",
+            "postgresql://127.0.0.1/ipars#fragment",
+            "postgresql://127.0.0.1/ipars\n",
+        ] {
+            let error = test_error(
+                validate_daemon_database_url(Some(invalid)),
+                "invalid daemon database URL should fail validation",
+            );
+            assert!(
+                !error.to_string().contains("password"),
+                "database URL validation error leaked credentials: {error}"
+            );
+        }
+        let oversized =
+            "postgresql://127.0.0.1/".to_string() + &"x".repeat(MAX_DAEMON_DATABASE_URL_BYTES);
+        let error = test_error(
+            validate_daemon_database_url(Some(&oversized)),
+            "oversized daemon database URL should fail validation",
+        );
+        assert!(error.to_string().contains("at most"));
+        Ok(())
+    }
+
+    #[test]
     fn daemon_readiness_timeouts_reject_zero_seconds() -> anyhow::Result<()> {
         let zero_http =
             match daemon_timeout_from_seconds(0, "--daemon-http-readiness-timeout-seconds") {
@@ -11662,11 +11793,16 @@ fi
                     packets_per_session: 1,
                     payload_bytes: 64,
                 },
+                database_url: None,
             },
         )
         .await?;
 
         assert_eq!(report.transport, TransportMode::Daemon);
+        assert_eq!(
+            report.daemon_database_backend,
+            Some(DaemonDatabaseBackend::Sqlite)
+        );
         assert_eq!(report.daemon_control_plane_processes, 2);
         assert_eq!(report.daemon_control_plane_metrics_endpoints, 2);
         assert_eq!(report.daemon_agent_processes, 3);
@@ -11693,6 +11829,10 @@ fi
         let manifest: DaemonRuntimeManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         assert_eq!(manifest.phase, DaemonRuntimePhase::Completed);
+        assert_eq!(
+            manifest.workload.daemon_database_backend,
+            DaemonDatabaseBackend::Sqlite
+        );
         let manifest_measurement = manifest
             .measurement
             .context("daemon completed manifest did not record measurement summary")?;
@@ -12437,6 +12577,7 @@ fi
             daemon_agent_processes: 2,
             daemon_http_readiness_timeout_seconds: 5,
             daemon_agent_readiness_timeout_seconds: 15,
+            daemon_database_backend: DaemonDatabaseBackend::Sqlite,
             relay_packets_per_session: 1,
             relay_payload_bytes: 64,
         }
@@ -12602,6 +12743,9 @@ fi
                     daemon_agent_processes: report.daemon_agent_processes,
                     daemon_http_readiness_timeout_seconds: 5,
                     daemon_agent_readiness_timeout_seconds: 15,
+                    daemon_database_backend: report
+                        .daemon_database_backend
+                        .unwrap_or(DaemonDatabaseBackend::Sqlite),
                     relay_packets_per_session: report.relay_packets_per_session,
                     relay_payload_bytes: report.relay_payload_bytes_per_packet,
                 },
