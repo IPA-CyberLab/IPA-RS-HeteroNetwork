@@ -70,6 +70,29 @@ dump_diagnostics() {
   local pod
   while IFS= read -r pod; do
     [[ -n "$pod" ]] || continue
+    echo "--- agent network diagnostics: ${pod} ---" >&2
+    "$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- sh -ec '
+      set +e
+      echo "[ip link]"
+      ip -br link
+      echo "[ip address]"
+      ip -br address
+      echo "[ip route]"
+      ip route
+      echo "[wg show]"
+      wg show "$1"
+      echo "[wg endpoints]"
+      wg show "$1" endpoints
+      echo "[wg allowed-ips]"
+      wg show "$1" allowed-ips
+      echo "[wg latest-handshakes]"
+      wg show "$1" latest-handshakes
+      echo "[route to remote VPN]"
+      ip route get "$2"
+      echo "[remote healthz]"
+      curl --noproxy "*" --silent --show-error --max-time 5 \
+        -o /dev/null -w "http_code=%{http_code}\n" "http://${2}:9780/healthz"
+    ' sh ipars0 100.64.0.2 2>&1 || true
     "$kubectl_bin" -n "$namespace" logs "$pod" -c agent --tail=200 2>&1 || true
   done < <("$kubectl_bin" -n "$namespace" get pods \
     -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
