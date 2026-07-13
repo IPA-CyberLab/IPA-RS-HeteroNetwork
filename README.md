@@ -116,7 +116,8 @@ scripts/kind-k8s-smoke.sh
 
 The pinned [GitHub Actions CI workflow](.github/workflows/ci.yml) runs Rust 1.96.1 formatting,
 strict workspace Clippy, all workspace tests, an all-target MSRV 1.88 check, 3/10/1000-node and
-multi-process daemon failover load smoke, the privileged network-namespace suite with kernel
+multi-process daemon failover load smoke, a real `ipars init --spawn-daemons --allow-relay` five-process
+bootstrap readiness smoke, the privileged network-namespace suite with kernel
 WireGuard support, the live Docker Compose management and real two-container WireGuard suite, Helm lint/render coverage, and the disposable
 two-node kind integration suite on every `master` push and pull request. Workflow permissions are
 read-only, checkout is pinned by commit, and the kind, kubectl, and Helm binaries used by the live

@@ -233,6 +233,24 @@ jobs:
           IPARS_LOAD_SMOKE_POSTGRES_DATABASE_URL: postgresql://ipars:ipars-load-password@127.0.0.1:5432/ipars?sslmode=disable
         run: scripts/load-smoke.sh
 
+  init-spawn-smoke:
+    name: Bootstrap init process smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Run init spawn and readiness suite
+        env:
+          CARGO: cargo
+        run: scripts/init-spawn-smoke.sh
+
   helm-smoke:
     name: Helm chart smoke
     runs-on: ubuntu-24.04
