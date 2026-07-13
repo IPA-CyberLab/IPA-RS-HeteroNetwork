@@ -103,7 +103,6 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
       --pidfile="$daemon_pid_file" \
       --storage-driver=fuse-overlayfs \
       --iptables=false \
-      --bridge=none \
       --ip-forward=false
   fi
   exec rootlesskit \
@@ -127,7 +126,6 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
       --pidfile="$daemon_pid_file" \
       --storage-driver=fuse-overlayfs \
       --iptables=false \
-      --bridge=none \
       --ip-forward=false
 ) >"$tmp_dir/dockerd.log" 2>&1 &
 daemon_pid=$!
