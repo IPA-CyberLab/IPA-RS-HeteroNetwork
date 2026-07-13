@@ -5528,9 +5528,15 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
             "Rootless Docker Engine for Compose services that cannot receive host kernel capabilities"
                 .to_string(),
         );
-        prerequisites.push(
-            "Rootless mode is limited to non-mutating control-plane and peer-map validation; use a rootful agent for a WireGuard data plane".to_string(),
-        );
+        if args.agent_runtime_backend == "linux-command" {
+            prerequisites.push(
+                "Rootless Docker must allow the agent container to access /dev/net/tun and grant CAP_NET_ADMIN inside its user namespace for the in-process BoringTun data plane".to_string(),
+            );
+        } else {
+            prerequisites.push(
+                "Rootless dry-run mode is validation-only and does not provide a WireGuard data plane".to_string(),
+            );
+        }
     } else {
         prerequisites.push("net.ipv4.ip_forward=1 on Docker route-provider agents, plus net.ipv6.conf.all.forwarding=1 when routing IPv6 container CIDRs".to_string());
         prerequisites.push("/dev/net/tun available on agent/relay hosts".to_string());
@@ -5552,7 +5558,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     }
     let mut notes = Vec::new();
     if args.rootless {
-        notes.push("The rootless agent service runs with host networking for colocated service access, but docker/compose.rootless.yaml forces the non-mutating dry-run backend because it removes Linux capabilities and /dev/net/tun mounts".to_string());
+        notes.push("The rootless agent service runs with host networking for colocated service access; the default linux-command runtime adds docker/compose.rootless-dataplane.yaml, which selects the in-process BoringTun backend and requests only the user-namespace-scoped CAP_NET_ADMIN plus /dev/net/tun".to_string());
     } else {
         notes.push("The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string());
     }
@@ -5579,9 +5585,13 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute dot-component-free non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
-        notes.push("Rootless Docker install plans add docker/compose.rootless.yaml so the agent and relay services do not request kernel capabilities or /dev/net/tun device mounts from rootless Docker".to_string());
-        notes.push("Rootless Docker install plans reject userspace WireGuard process settings rather than advertising a data plane that cannot create a TUN interface without host capabilities".to_string());
-        notes.push("Use a separate rootful agent for WireGuard data-plane and Docker container CIDR reachability; rootless install plans reject Docker route, Docker API discovery, and userspace WireGuard process settings instead of emitting an unusable runtime".to_string());
+        notes.push("Rootless Docker install plans add docker/compose.rootless.yaml; the default linux-command runtime also adds docker/compose.rootless-dataplane.yaml to request user-namespace CAP_NET_ADMIN and /dev/net/tun".to_string());
+        if args.agent_runtime_backend == "linux-command" {
+            notes.push("If the rootless engine cannot pass /dev/net/tun or grant user-namespace CAP_NET_ADMIN, startup fails during the agent WireGuard preflight instead of falling back to dry-run".to_string());
+            notes.push("The rootless BoringTun mode provides the overlay WireGuard interface but intentionally rejects Docker route/discovery settings; use a separate route-provider agent for Docker container CIDR reachability".to_string());
+        } else {
+            notes.push("Pass --agent-runtime-backend linux-command to enable the rootless BoringTun data plane; explicit dry-run remains validation-only".to_string());
+        }
     } else {
         notes.push("For rootless Docker container CIDR reachability, run a separate rootful route-provider agent or an equivalent userspace routing layer instead of the rootless Compose override".to_string());
     }
@@ -5621,6 +5631,9 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
     let mut files = vec![args.compose_file.display().to_string()];
     if args.rootless {
         files.push(DOCKER_ROOTLESS_COMPOSE_FILE.to_string());
+        if args.agent_runtime_backend == "linux-command" {
+            files.push("docker/compose.rootless-dataplane.yaml".to_string());
+        }
     }
     if args.docker_discover_networks {
         files.push(DOCKER_DISCOVERY_COMPOSE_FILE.to_string());
@@ -5682,12 +5695,12 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
     validate_agent_direct_path_verification_settings(
         args.agent_direct_path_probe_timeout_seconds,
         args.agent_direct_handshake_max_age_seconds,
-        (!args.rootless && args.agent_runtime_backend == "linux-command")
+        (args.agent_runtime_backend == "linux-command")
             .then_some(DEFAULT_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS),
     )?;
     validate_agent_peer_probe_settings(
         &args.agent_peer_probe,
-        !args.rootless && args.agent_runtime_backend == "linux-command",
+        args.agent_runtime_backend == "linux-command",
         DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT,
         DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT,
     )?;
@@ -5774,7 +5787,7 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
             != DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS
     {
         anyhow::bail!(
-            "--rootless does not support userspace WireGuard lifecycle timeout settings because docker/compose.rootless.yaml uses the dry-run backend"
+            "--rootless does not support userspace WireGuard lifecycle timeout settings because the rootless dataplane uses in-process BoringTun and does not launch an external WireGuard process"
         );
     }
     let has_docker_route_settings = args.docker_discover_networks
@@ -5810,7 +5823,7 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
             != DEFAULT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS;
     if has_relay_forwarder_settings {
         anyhow::bail!(
-            "--rootless cannot be combined with relay forwarder settings because docker/compose.rootless.yaml uses the in-memory dry-run WireGuard backend"
+            "--rootless cannot be combined with relay forwarder settings because the rootless Compose contract does not provide the required forwarder namespace and host dataplane boundary"
         );
     }
     Ok(())
@@ -6269,15 +6282,22 @@ fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
 
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
     let apply_docker_routes = !args.rootless;
-    let agent_runtime_backend = if args.rootless {
-        "dry-run"
+    let agent_wireguard_backend = if args.rootless && args.agent_runtime_backend == "linux-command"
+    {
+        "userspace-boringtun"
+    } else if args.userspace_wireguard_command.is_some() {
+        "userspace-command"
     } else {
-        args.agent_runtime_backend.as_str()
+        "command"
     };
     let mut environment = vec![
         InstallEnvironment {
             name: "IPARS_AGENT_RUNTIME_BACKEND".to_string(),
-            value: agent_runtime_backend.to_string(),
+            value: args.agent_runtime_backend.clone(),
+        },
+        InstallEnvironment {
+            name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+            value: agent_wireguard_backend.to_string(),
         },
         InstallEnvironment {
             name: "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
@@ -6298,7 +6318,6 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
             value: (args.agent_peer_probe.disabled
-                || args.rootless
                 || args.agent_runtime_backend != "linux-command")
                 .to_string(),
         },
@@ -12780,7 +12799,7 @@ fi
         })?;
         assert_eq!(
             environment_value(&rootless, "IPARS_AGENT_DISABLE_PEER_PROBE"),
-            Some("true")
+            Some("false")
         );
 
         for (settings, expected) in [
@@ -12869,8 +12888,7 @@ fi
     }
 
     #[test]
-    fn docker_install_plan_wires_runtime_backend_and_forces_rootless_dry_run() -> anyhow::Result<()>
-    {
+    fn docker_install_plan_wires_runtime_backend_and_rootless_boringtun() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             agent_runtime_backend: "dry-run".to_string(),
             ..docker_install_test_args()
@@ -12895,8 +12913,28 @@ fi
         })?;
         assert_eq!(
             environment_value(&rootless, "IPARS_AGENT_RUNTIME_BACKEND"),
+            Some("linux-command")
+        );
+        assert_eq!(
+            environment_value(&rootless, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            Some("userspace-boringtun")
+        );
+        assert!(rootless.commands[0].contains("-f docker/compose.rootless-dataplane.yaml"));
+
+        let rootless_dry_run = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            agent_runtime_backend: "dry-run".to_string(),
+            ..docker_install_test_args()
+        })?;
+        assert_eq!(
+            environment_value(&rootless_dry_run, "IPARS_AGENT_RUNTIME_BACKEND"),
             Some("dry-run")
         );
+        assert_eq!(
+            environment_value(&rootless_dry_run, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            Some("command")
+        );
+        assert!(!rootless_dry_run.commands[0].contains("rootless-dataplane"));
         Ok(())
     }
 
@@ -13197,7 +13235,7 @@ fi
                 DEFAULT_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS,
             agent_direct_handshake_max_age_seconds: DEFAULT_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS,
             agent_peer_probe: AgentPeerProbeInstallArgs::default(),
-            agent_runtime_backend: "linux-command".to_string(),
+            agent_runtime_backend: "dry-run".to_string(),
             route_backend: "command".to_string(),
             userspace_wireguard_command: None,
             userspace_wireguard_args: Vec::new(),
@@ -13234,7 +13272,7 @@ fi
         assert!(plan
             .prerequisites
             .iter()
-            .any(|requirement| requirement.contains("non-mutating control-plane")));
+            .any(|requirement| requirement.contains("Rootless dry-run mode is validation-only")));
         assert!(!plan
             .prerequisites
             .iter()
@@ -13255,7 +13293,7 @@ fi
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
-            None
+            Some("command")
         );
         assert_eq!(
             environment_value(&plan, "IPARS_AGENT_RUNTIME_BACKEND"),
@@ -13302,15 +13340,15 @@ fi
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("non-mutating dry-run backend")));
+            .any(|note| note.contains("explicit dry-run remains validation-only")));
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("do not request kernel capabilities")));
+            .any(|note| note.contains("add docker/compose.rootless.yaml")));
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("separate rootful agent")));
+            .any(|note| note.contains("Pass --agent-runtime-backend linux-command")));
 
         let namespaced_forwarder = match docker_install_plan(DockerInstallArgs {
             rootless: true,
@@ -13369,6 +13407,10 @@ fi
             .join("../../docker/compose.rootless.yaml")
             .canonicalize()?;
         let rootless_compose = std::fs::read_to_string(rootless_compose_path)?;
+        let rootless_dataplane_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.rootless-dataplane.yaml")
+            .canonicalize()?;
+        let rootless_dataplane = std::fs::read_to_string(rootless_dataplane_path)?;
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
@@ -13489,6 +13531,10 @@ fi
             "IPARS_AGENT_RELAY_ADMISSION_URL=${IPARS_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
         ));
         assert!(!rootless_compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
+        assert!(rootless_dataplane.contains("- NET_ADMIN"));
+        assert!(rootless_dataplane.contains("/dev/net/tun:/dev/net/tun"));
+        assert!(rootless_dataplane.contains("IPARS_AGENT_WIREGUARD_BACKEND=userspace-boringtun"));
+        assert!(rootless_dataplane.contains("IPARS_AGENT_RUNTIME_BACKEND=linux-command"));
         Ok(())
     }
 

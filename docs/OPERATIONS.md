@@ -141,8 +141,10 @@ per peer. Configure these through `IPARS_AGENT_PEER_PROBE_*` or the matching
 `--peer-probe-*` flags; `--disable-peer-probe` disables both measurement and the
 responder. `ipars docker install` and `ipars k8s install` expose the same values
 as `--agent-peer-probe-*` and `--disable-agent-peer-probe`. Install plans disable
-the probe automatically for rootless/dry-run agents or disabled peer-map sync,
-where no real WireGuard data plane exists.
+the probe automatically for explicit dry-run agents or disabled peer-map sync,
+where no real WireGuard data plane exists. The default rootless plan uses the
+in-process BoringTun data plane and keeps the probe enabled unless explicitly
+disabled.
 
 Each completed round calculates mean RTT, loss in parts per million, mean
 absolute RTT jitter, and a bounded stability value smoothed only across the
@@ -231,12 +233,15 @@ ipars docker install \
   --docker-network ipars_default
 ```
 
-Set `--agent-runtime-backend dry-run` for rootful Compose validation that must not
-create host networking resources. Rootless deployments are always forced to the
-same `dry-run` backend because their Compose override intentionally removes the
-kernel capabilities required by route and kernel-WireGuard mutation and does
-not provide an unprivileged userspace data plane. Use a rootful agent for
-production WireGuard connectivity.
+Set `--agent-runtime-backend dry-run` for Compose validation that must not create
+networking resources. Rootless installs default to the in-process BoringTun
+backend and add `docker/compose.rootless-dataplane.yaml`; the rootless engine
+must be able to pass `/dev/net/tun` and grant `CAP_NET_ADMIN` inside the agent's
+user namespace. The agent fails preflight if that substrate is unavailable.
+Rootless Docker route discovery and container-CIDR route application remain
+unsupported; use a separate route-provider agent for that traffic. Use the
+explicit `dry-run` runtime when only management/control-plane validation is
+needed.
 
 Run the repeatable Compose smoke with:
 

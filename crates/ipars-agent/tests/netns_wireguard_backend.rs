@@ -4,8 +4,9 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipars_agent::{
-    KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, WireGuardBackend,
-    WireGuardPeerConfig, WireGuardPeerTelemetrySource,
+    BoringTunWireGuardBackend, KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource,
+    WireGuardBackend, WireGuardPeerConfig, WireGuardPeerInventorySource,
+    WireGuardPeerTelemetrySource,
 };
 use ipars_crypto::WireGuardKeyPair;
 use ipars_route_manager::LinuxNetworkNamespace;
@@ -101,6 +102,124 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
         .snapshot()
         .await?
         .contains_key(&peer_key.public_key_b64));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn boringtun_backend_manages_peer_inside_network_namespace(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("IPARS_RUN_BORINGTUN_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "skipping BoringTun netns integration test; set IPARS_RUN_BORINGTUN_NETNS_TESTS=1 to run it"
+        );
+        return Ok(());
+    }
+
+    require_command("ip")?;
+    if !std::path::Path::new("/dev/net/tun").exists() {
+        return Err("/dev/net/tun is required for the BoringTun netns integration test".into());
+    }
+
+    let namespace_name = unique_namespace_name()?;
+    let _guard = NamespaceGuard::create(namespace_name.clone())?;
+    command(
+        "ip",
+        ["-n", namespace_name.as_str(), "link", "set", "lo", "up"],
+    )?;
+
+    let interface = "iparsbt0";
+    let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
+    let backend = BoringTunWireGuardBackend::new_in_namespace(interface, None, Some(&namespace))?;
+    let inventory_source = backend.inventory_source();
+    let telemetry_source = backend.telemetry_source();
+    let local_key = WireGuardKeyPair::generate();
+    backend
+        .configure_interface(&local_key.private_key_b64, 51830)
+        .await?;
+
+    command(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "link",
+            "set",
+            "up",
+            "dev",
+            interface,
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "address",
+            "replace",
+            "100.64.99.3/32",
+            "dev",
+            interface,
+        ],
+    )?;
+    let local_address = command_output(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "-o",
+            "-4",
+            "addr",
+            "show",
+            "dev",
+            interface,
+        ],
+    )?;
+    assert!(local_address.contains("100.64.99.3/32"));
+
+    let peer = NodeId::from_string("boringtun-netns-peer");
+    let peer_key = WireGuardKeyPair::generate();
+    backend
+        .upsert_peer(WireGuardPeerConfig {
+            peer,
+            public_key: peer_key.public_key_b64.clone(),
+            endpoint: Some("127.0.0.1:51831".to_string()),
+            allowed_ips: vec!["100.64.99.4/32".to_string()],
+            persistent_keepalive_seconds: Some(25),
+        })
+        .await?;
+    backend
+        .upsert_peer(WireGuardPeerConfig {
+            peer: NodeId::from_string("boringtun-netns-peer"),
+            public_key: peer_key.public_key_b64.clone(),
+            endpoint: Some("127.0.0.1:51831".to_string()),
+            allowed_ips: vec!["100.64.99.4/32".to_string()],
+            persistent_keepalive_seconds: Some(25),
+        })
+        .await?;
+
+    assert!(inventory_source
+        .public_keys()
+        .await?
+        .contains(&peer_key.public_key_b64));
+    let telemetry = telemetry_source.snapshot().await?;
+    let peer_telemetry = telemetry
+        .get(&peer_key.public_key_b64)
+        .ok_or("BoringTun telemetry did not include the configured peer")?;
+    assert_eq!(peer_telemetry.endpoint.as_deref(), Some("127.0.0.1:51831"));
+    assert_eq!(peer_telemetry.latest_handshake_at, None);
+
+    backend
+        .remove_peer_by_public_key(&peer_key.public_key_b64)
+        .await?;
+    assert!(!inventory_source
+        .public_keys()
+        .await?
+        .contains(&peer_key.public_key_b64));
 
     Ok(())
 }

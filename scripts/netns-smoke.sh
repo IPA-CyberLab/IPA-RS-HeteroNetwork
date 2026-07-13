@@ -156,6 +156,11 @@ run_agent_runtime_preflights() {
   else
     echo "skipping command backend agent preflight because 'wg' is not available"
   fi
+  if [[ -c /dev/net/tun ]]; then
+    run_agent_runtime_preflight boringtun userspace-boringtun command
+  else
+    echo "skipping BoringTun backend agent preflight because /dev/net/tun is not available"
+  fi
   cleanup
   trap - EXIT
 }
@@ -201,6 +206,9 @@ elif command -v wg >/dev/null 2>&1; then
 else
   echo "skipping WireGuard netns smoke because 'wg' is not available"
 fi
+
+run_cargo_test boringtun-netns IPARS_RUN_BORINGTUN_NETNS_TESTS \
+  -p ipars-agent --test netns_wireguard_backend
 
 run_cargo_test_serial hole-punch-netns IPARS_RUN_HOLE_PUNCH_NETNS_TESTS \
   -p ipars-agent --test netns_hole_punch

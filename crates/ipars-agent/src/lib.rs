@@ -76,9 +76,17 @@ const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
 
 mod peer_probe;
 
+#[cfg(target_os = "linux")]
+mod boringtun_backend;
+
 pub use peer_probe::{
     PeerProbeConfig, PeerProbeMeasurement, PeerQualityProbeTarget, UdpPeerProbe,
     UdpPeerProbeResponder, DEFAULT_PEER_PROBE_PORT,
+};
+
+#[cfg(target_os = "linux")]
+pub use boringtun_backend::{
+    BoringTunPeerInventorySource, BoringTunPeerTelemetrySource, BoringTunWireGuardBackend,
 };
 
 #[derive(Debug, Error)]

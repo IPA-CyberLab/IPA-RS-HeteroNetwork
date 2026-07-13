@@ -20,15 +20,15 @@ use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ipars_agent::{
-    AgentError, AgentNodeState, AgentRuntime, CommandWireGuardPeerTelemetrySource,
-    FileAgentStateStore, KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand,
-    LinuxCommandRunner, LinuxWireGuardBackend, MemoryWireGuardBackend,
-    NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier, PeerMapSink, PeerMapSource,
-    PeerMapSync, PeerProbeConfig, PendingDirectPathProbe, RelayForwarderStats, RelaySessionState,
-    RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe,
-    UdpPeerProbeResponder, UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
-    WireGuardPeerInventorySource, WireGuardPeerTelemetry, WireGuardPeerTelemetrySource,
-    DEFAULT_PEER_PROBE_PORT,
+    AgentError, AgentNodeState, AgentRuntime, BoringTunWireGuardBackend,
+    CommandWireGuardPeerTelemetrySource, FileAgentStateStore, KernelWireGuardBackend,
+    KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner, LinuxWireGuardBackend,
+    MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier,
+    PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig, PendingDirectPathProbe,
+    RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner,
+    UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder, UdpRelayFrameForwarder,
+    UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerInventorySource,
+    WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -908,6 +908,8 @@ struct AgentArgs {
         default_value_t = 5
     )]
     userspace_wireguard_shutdown_timeout_seconds: u64,
+    #[arg(long, env = "IPARS_AGENT_USERSPACE_TUN_FD")]
+    userspace_tun_fd: Option<i32>,
     #[arg(
         long,
         env = "IPARS_AGENT_ROUTE_BACKEND",
@@ -1071,6 +1073,8 @@ enum WireGuardApplyBackend {
     KernelNetlink,
     #[value(name = "userspace-command")]
     UserspaceCommand,
+    #[value(name = "userspace-boringtun")]
+    UserspaceBoringTun,
 }
 
 impl WireGuardApplyBackend {
@@ -1079,6 +1083,7 @@ impl WireGuardApplyBackend {
             Self::Command => "command",
             Self::KernelNetlink => "kernel-netlink",
             Self::UserspaceCommand => "userspace-command",
+            Self::UserspaceBoringTun => "userspace-boringtun",
         }
     }
 }
@@ -1144,6 +1149,7 @@ struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
     userspace_wireguard_command: bool,
+    tun_device: bool,
     route_netlink: bool,
     generic_netlink: bool,
     netfilter_netlink: bool,
@@ -1168,6 +1174,7 @@ impl RuntimePreflightNeeds {
             ip_command: false,
             wg_command: false,
             userspace_wireguard_command: false,
+            tun_device: false,
             route_netlink: false,
             generic_netlink: false,
             netfilter_netlink: false,
@@ -1191,6 +1198,7 @@ impl RuntimePreflightNeeds {
         !self.ip_command
             && !self.wg_command
             && !self.userspace_wireguard_command
+            && !self.tun_device
             && !self.route_netlink
             && !self.generic_netlink
             && !self.netfilter_netlink
@@ -1426,6 +1434,9 @@ fn preflight_agent_runtime_with_path_and_checks(
             .context("userspace WireGuard command preflight requested without command")?;
         ensure_runtime_program_ready(command, path)?;
     }
+    if needs.tun_device {
+        ensure_userspace_tun_ready(args.userspace_tun_fd)?;
+    }
     if needs.cap_net_admin {
         (checks.cap_net_admin)()?;
     }
@@ -1513,6 +1524,7 @@ fn preflight_agent_runtime_with_path_and_checks(
         needs_ip = needs.ip_command,
         needs_wg = needs.wg_command,
         needs_userspace_wireguard_command = needs.userspace_wireguard_command,
+        needs_tun_device = needs.tun_device,
         needs_route_netlink = needs.route_netlink,
         needs_generic_netlink = needs.generic_netlink,
         needs_netfilter_netlink = needs.netfilter_netlink,
@@ -1625,6 +1637,16 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         MAX_RUNTIME_COMMAND_TIMEOUT_SECONDS,
     )?;
     validate_userspace_wireguard_config(args)?;
+    if let Some(fd) = args.userspace_tun_fd {
+        anyhow::ensure!(
+            fd > 0,
+            "--userspace-tun-fd must be a positive inherited file descriptor"
+        );
+        anyhow::ensure!(
+            args.wireguard_backend == WireGuardApplyBackend::UserspaceBoringTun,
+            "--userspace-tun-fd requires --wireguard-backend userspace-boringtun"
+        );
+    }
     validate_runtime_backend_specific_args(args)?;
     validate_positive_usize(
         args.runtime_command_output_max_bytes,
@@ -1880,6 +1902,20 @@ fn validate_runtime_backend_specific_args(args: &AgentArgs) -> anyhow::Result<()
         anyhow::ensure!(
             applies_wireguard || manages_userspace_wireguard,
             "--wireguard-backend userspace-command requires --apply-peer-map or --userspace-wireguard-command"
+        );
+    }
+    if args.wireguard_backend == WireGuardApplyBackend::UserspaceBoringTun {
+        anyhow::ensure!(
+            args.runtime_backend == AgentRuntimeBackend::LinuxCommand,
+            "--wireguard-backend userspace-boringtun requires --runtime-backend linux-command"
+        );
+        anyhow::ensure!(
+            applies_wireguard,
+            "--wireguard-backend userspace-boringtun requires --apply-peer-map"
+        );
+        anyhow::ensure!(
+            !manages_userspace_wireguard,
+            "--wireguard-backend userspace-boringtun cannot be combined with an external userspace WireGuard process"
         );
     }
     if args.route_backend == RouteApplyBackend::KernelNetlink {
@@ -2395,6 +2431,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::Command;
     let applies_wireguard_with_userspace_command =
         applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::UserspaceCommand;
+    let applies_wireguard_with_boringtun =
+        applies_wireguard && args.wireguard_backend == WireGuardApplyBackend::UserspaceBoringTun;
     let applies_routes_with_netlink =
         applies_routes && args.route_backend == RouteApplyBackend::KernelNetlink;
     let applies_wireguard_with_netlink =
@@ -2407,11 +2445,13 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
     RuntimePreflightNeeds {
         ip_command: applies_routes_with_command
             || applies_wireguard_with_command
+            || applies_wireguard_with_boringtun
             || uses_namespaced_userspace_wireguard_commands,
         wg_command: applies_wireguard_with_command
             || applies_wireguard_with_userspace_command
             || starts_userspace_wireguard,
         userspace_wireguard_command: starts_userspace_wireguard,
+        tun_device: applies_wireguard_with_boringtun,
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
         generic_netlink: applies_wireguard_with_netlink,
         netfilter_netlink,
@@ -2422,10 +2462,18 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         ipv4_forwarding,
         ipv6_forwarding,
         cap_net_admin: applies_routes
-            || (applies_wireguard && !applies_wireguard_with_userspace_command)
+            || (applies_wireguard
+                && !matches!(
+                    args.wireguard_backend,
+                    WireGuardApplyBackend::UserspaceCommand
+                ))
             || netfilter_netlink
             || ebpf_cgroup,
-        cap_net_raw: applies_wireguard && !applies_wireguard_with_userspace_command,
+        cap_net_raw: applies_wireguard
+            && matches!(
+                args.wireguard_backend,
+                WireGuardApplyBackend::Command | WireGuardApplyBackend::KernelNetlink
+            ),
         cap_sys_admin: (args.linux_netns.is_some()
             && (applies_routes || applies_wireguard || starts_userspace_wireguard))
             || relay_forwarder_netns,
@@ -3164,6 +3212,51 @@ fn ensure_cap_net_raw_if_known() -> anyhow::Result<()> {
             "linux-command runtime backend requires CAP_NET_RAW for WireGuard dataplane sockets"
         );
     }
+    Ok(())
+}
+
+fn ensure_userspace_tun_ready(tun_fd: Option<i32>) -> anyhow::Result<()> {
+    if let Some(tun_fd) = tun_fd {
+        let fd_path = PathBuf::from("/proc/self/fd").join(tun_fd.to_string());
+        let target = std::fs::read_link(&fd_path).with_context(|| {
+            format!(
+                "userspace WireGuard inherited TUN fd {tun_fd} is not open or is unavailable at {}",
+                fd_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !target.as_os_str().is_empty(),
+            "userspace WireGuard inherited TUN fd {tun_fd} has an empty target"
+        );
+        return Ok(());
+    }
+
+    let tun_path = Path::new("/dev/net/tun");
+    let metadata = std::fs::symlink_metadata(tun_path).with_context(|| {
+        format!(
+            "userspace WireGuard requires an accessible TUN device at {}",
+            tun_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        anyhow::ensure!(
+            metadata.file_type().is_char_device(),
+            "userspace WireGuard path {} is not a character device",
+            tun_path.display()
+        );
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tun_path)
+        .with_context(|| {
+            format!(
+                "userspace WireGuard cannot open TUN device {}; pass --userspace-tun-fd for a pre-opened descriptor",
+                tun_path.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -7291,7 +7384,7 @@ async fn run_agent(
             heartbeat_route_reporter,
         ));
     }
-    let peer_map_task = if args.apply_peer_map {
+    let peer_map_handle = if args.apply_peer_map {
         anyhow::ensure!(
             !control_plane_bases.is_empty(),
             "control-plane URL is required when --apply-peer-map is set"
@@ -7304,9 +7397,12 @@ async fn run_agent(
     } else {
         None
     };
-    let wireguard_peer_telemetry_source = agent_wireguard_peer_telemetry_source(&args)?;
-    if let Some(task) = peer_map_task {
-        background_tasks.push(task);
+    let wireguard_peer_telemetry_source = peer_map_handle
+        .as_ref()
+        .and_then(|handle| handle.telemetry_source.clone())
+        .or(agent_wireguard_peer_telemetry_source(&args)?);
+    if let Some(handle) = peer_map_handle {
+        background_tasks.push(handle.task);
     }
     if args.apply_peer_map
         && args.runtime_backend == AgentRuntimeBackend::LinuxCommand
@@ -8151,11 +8247,16 @@ fn runtime_command_diagnostic_component(value: &str) -> String {
     value.chars().flat_map(char::escape_default).collect()
 }
 
+struct PeerMapSyncHandle {
+    task: tokio::task::JoinHandle<()>,
+    telemetry_source: Option<Arc<dyn WireGuardPeerTelemetrySource>>,
+}
+
 async fn start_peer_map_sync(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<PeerMapSyncHandle> {
     let command_timeout = runtime_command_timeout(args);
     let command_output_max_bytes = runtime_command_output_max_bytes(args);
     match args.runtime_backend {
@@ -8282,6 +8383,52 @@ async fn start_peer_map_sync(
                     .await
                 }
                 (
+                    WireGuardApplyBackend::UserspaceBoringTun,
+                    RouteApplyBackend::Command,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_boringtun(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        )),
+                        Some(namespace),
+                    )
+                    .await
+                }
+                (WireGuardApplyBackend::UserspaceBoringTun, RouteApplyBackend::Command, None) => {
+                    start_peer_map_sync_with_boringtun(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        LinuxRouteManager::new(
+                            TimedSystemRouteCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        None,
+                    )
+                    .await
+                }
+                (
                     WireGuardApplyBackend::UserspaceCommand,
                     RouteApplyBackend::KernelNetlink,
                     Some(namespace),
@@ -8297,7 +8444,7 @@ async fn start_peer_map_sync(
                                 command_output_max_bytes,
                             ),
                         ),
-                        LinuxNetlinkRouteManager::new_in_namespace(namespace),
+                        LinuxNetlinkRouteManager::new_in_namespace(namespace.clone()),
                     )
                     .await
                 }
@@ -8315,6 +8462,45 @@ async fn start_peer_map_sync(
                             command_output_max_bytes,
                         ),
                         LinuxNetlinkRouteManager::new(),
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceBoringTun,
+                    RouteApplyBackend::KernelNetlink,
+                    Some(namespace),
+                ) => {
+                    start_peer_map_sync_with_boringtun(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        NamespacedLinuxCommandRunner::new(
+                            namespace.clone(),
+                            TimedSystemCommandRunner::with_output_max_bytes(
+                                command_timeout,
+                                command_output_max_bytes,
+                            ),
+                        ),
+                        LinuxNetlinkRouteManager::new_in_namespace(namespace.clone()),
+                        Some(namespace),
+                    )
+                    .await
+                }
+                (
+                    WireGuardApplyBackend::UserspaceBoringTun,
+                    RouteApplyBackend::KernelNetlink,
+                    None,
+                ) => {
+                    start_peer_map_sync_with_boringtun(
+                        args,
+                        runtime,
+                        control_plane_urls,
+                        TimedSystemCommandRunner::with_output_max_bytes(
+                            command_timeout,
+                            command_output_max_bytes,
+                        ),
+                        LinuxNetlinkRouteManager::new(),
+                        None,
                     )
                     .await
                 }
@@ -8422,6 +8608,7 @@ fn agent_wireguard_peer_telemetry_source(
                 runtime_command_output_max_bytes(args),
             )),
         },
+        WireGuardApplyBackend::UserspaceBoringTun => return Ok(None),
         WireGuardApplyBackend::KernelNetlink => match namespace {
             Some(namespace) => Arc::new(
                 KernelWireGuardPeerTelemetrySource::new_in_namespace(
@@ -8465,6 +8652,7 @@ fn agent_wireguard_peer_inventory_source(
                 runtime_command_output_max_bytes(args),
             )),
         },
+        WireGuardApplyBackend::UserspaceBoringTun => return Ok(None),
         WireGuardApplyBackend::KernelNetlink => match namespace {
             Some(namespace) => Arc::new(
                 KernelWireGuardPeerTelemetrySource::new_in_namespace(
@@ -9929,7 +10117,7 @@ async fn start_peer_map_sync_with_runners<W, R>(
     control_plane_urls: Vec<String>,
     wireguard_runner: W,
     route_runner: R,
-) -> anyhow::Result<tokio::task::JoinHandle<()>>
+) -> anyhow::Result<PeerMapSyncHandle>
 where
     W: LinuxCommandRunner + 'static,
     R: LinuxRouteCommandRunner + 'static,
@@ -9964,7 +10152,7 @@ async fn start_peer_map_sync_with_kernel_wireguard<R>(
     control_plane_urls: Vec<String>,
     route_runner: R,
     namespace: Option<LinuxNetworkNamespace>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>>
+) -> anyhow::Result<PeerMapSyncHandle>
 where
     R: LinuxRouteCommandRunner + 'static,
 {
@@ -9998,7 +10186,7 @@ async fn start_peer_map_sync_with_command_wireguard_netlink_routes<W>(
     control_plane_urls: Vec<String>,
     wireguard_runner: W,
     namespace: Option<LinuxNetworkNamespace>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>>
+) -> anyhow::Result<PeerMapSyncHandle>
 where
     W: LinuxCommandRunner + 'static,
 {
@@ -10032,7 +10220,7 @@ async fn start_peer_map_sync_with_userspace_wireguard<W, R>(
     control_plane_urls: Vec<String>,
     wireguard_runner: W,
     route_manager: R,
-) -> anyhow::Result<tokio::task::JoinHandle<()>>
+) -> anyhow::Result<PeerMapSyncHandle>
 where
     W: LinuxCommandRunner + 'static,
     R: RouteManager + 'static,
@@ -10061,12 +10249,80 @@ where
     start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
 }
 
+async fn start_peer_map_sync_with_boringtun<W, R>(
+    args: &AgentArgs,
+    runtime: Arc<AgentRuntime>,
+    control_plane_urls: Vec<String>,
+    wireguard_runner: W,
+    route_manager: R,
+    namespace: Option<LinuxNetworkNamespace>,
+) -> anyhow::Result<PeerMapSyncHandle>
+where
+    W: LinuxCommandRunner + 'static,
+    R: RouteManager + 'static,
+{
+    let wireguard = BoringTunWireGuardBackend::new_in_namespace(
+        args.wireguard_interface.clone(),
+        args.userspace_tun_fd,
+        namespace.as_ref(),
+    )
+    .map_err(anyhow::Error::from)?;
+    wireguard
+        .configure_interface(
+            &runtime_wireguard_private_key(&runtime)?,
+            args.wireguard_listen_port,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    wireguard_runner
+        .run(LinuxCommand::new(
+            "ip",
+            [
+                "link",
+                "set",
+                "up",
+                "dev",
+                args.wireguard_interface.as_str(),
+            ],
+        ))
+        .await
+        .map_err(anyhow::Error::from)?;
+    wireguard_runner
+        .run(LinuxCommand::new(
+            "ip",
+            [
+                "address".to_string(),
+                "replace".to_string(),
+                runtime_overlay_interface_cidr(&runtime)?,
+                "dev".to_string(),
+                args.wireguard_interface.clone(),
+            ],
+        ))
+        .await
+        .map_err(anyhow::Error::from)?;
+    let inventory = wireguard.inventory_source();
+    let telemetry: Arc<dyn WireGuardPeerTelemetrySource> = Arc::new(wireguard.telemetry_source());
+    let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager)
+        .with_wireguard_peer_inventory(Arc::new(inventory));
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
+    tracing::info!(
+        backend = args.runtime_backend.as_str(),
+        wireguard_backend = args.wireguard_backend.as_str(),
+        route_backend = args.route_backend.as_str(),
+        linux_netns = ?args.linux_netns,
+        "starting peer-map sync with in-process BoringTun userspace backend"
+    );
+    let mut handle = start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)?;
+    handle.telemetry_source = Some(telemetry);
+    Ok(handle)
+}
+
 async fn start_peer_map_sync_with_kernel_backends(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
     namespace: Option<LinuxNetworkNamespace>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<PeerMapSyncHandle> {
     let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace.clone());
     wireguard.ensure_interface().await?;
     wireguard
@@ -10106,6 +10362,15 @@ fn runtime_local_vpn_ip(runtime: &AgentRuntime) -> anyhow::Result<VpnIp> {
         .state()
         .vpn_ip
         .context("local VPN IP is unavailable while configuring the WireGuard interface")
+}
+
+fn runtime_overlay_interface_cidr(runtime: &AgentRuntime) -> anyhow::Result<String> {
+    let vpn_ip = runtime_local_vpn_ip(runtime)?;
+    let prefix = match vpn_ip.0 {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    Ok(format!("{}/{}", vpn_ip.0, prefix))
 }
 
 fn runtime_wireguard_private_key(runtime: &AgentRuntime) -> anyhow::Result<String> {
@@ -10156,7 +10421,7 @@ fn start_peer_map_sync_with_sink<A>(
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
     sink: A,
-) -> anyhow::Result<tokio::task::JoinHandle<()>>
+) -> anyhow::Result<PeerMapSyncHandle>
 where
     A: PeerMapSink + 'static,
 {
@@ -10171,9 +10436,12 @@ where
     );
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds);
     let interface = args.wireguard_interface.clone();
-    Ok(tokio::spawn(async move {
-        run_peer_map_sync_loop(sync, interval, interface).await;
-    }))
+    Ok(PeerMapSyncHandle {
+        task: tokio::spawn(async move {
+            run_peer_map_sync_loop(sync, interval, interface).await;
+        }),
+        telemetry_source: None,
+    })
 }
 
 fn relay_forwarder_supervisor(
@@ -22060,6 +22328,32 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(needs.cap_net_admin);
             assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn runtime_preflight_requires_tun_for_boringtun_backend() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--wireguard-backend",
+            "userspace-boringtun",
+            "--skip-runtime-preflight",
+        ])?;
+
+        if let Command::Agent(args) = cli.command {
+            let needs = runtime_preflight_needs(&args);
+            assert!(needs.ip_command);
+            assert!(!needs.wg_command);
+            assert!(!needs.userspace_wireguard_command);
+            assert!(needs.tun_device);
+            assert!(needs.cap_net_admin);
+            assert!(!needs.cap_net_raw);
+            assert_eq!(args.wireguard_backend.as_str(), "userspace-boringtun");
             return Ok(());
         }
 

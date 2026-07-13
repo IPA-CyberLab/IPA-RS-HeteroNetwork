@@ -89,6 +89,8 @@ jobs:
             sudo apt-get install --yes --no-install-recommends "$module_package"
             sudo modprobe wireguard
           fi
+          sudo modprobe tun
+          sudo test -c /dev/net/tun
           if ! sudo test -r /sys/kernel/tracing/events/syscalls/sys_enter_sendto/id \
             && ! sudo test -r /sys/kernel/debug/tracing/events/syscalls/sys_enter_sendto/id; then
             sudo mount -t tracefs tracefs /sys/kernel/tracing

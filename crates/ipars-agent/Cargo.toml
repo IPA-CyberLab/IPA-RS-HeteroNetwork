@@ -8,9 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+boringtun.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 genetlink.workspace = true
+hex.workspace = true
 ipnet.workspace = true
 ipars-crypto = { path = "../ipars-crypto" }
 ipars-relay = { path = "../ipars-relay" }

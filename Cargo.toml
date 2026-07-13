@@ -31,6 +31,7 @@ async-trait = "0.1"
 aya = { version = "0.13.1", default-features = false }
 axum = "0.8"
 base64 = "0.22"
+boringtun = { version = "0.7.1", default-features = false, features = ["device"] }
 bytes = "1.12"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
