@@ -27,7 +27,8 @@ use ipars_agent::{
     PeerMapSync, PeerProbeConfig, PendingDirectPathProbe, RelayForwarderStats, RelaySessionState,
     RuntimePeerEndpointResolver, TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe,
     UdpPeerProbeResponder, UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
-    WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
+    WireGuardPeerInventorySource, WireGuardPeerTelemetry, WireGuardPeerTelemetrySource,
+    DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -8342,7 +8343,7 @@ async fn start_peer_map_sync(
                 MemoryWireGuardBackend::default(),
                 DryRunLinuxRouteManager,
             );
-            let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+            let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
             start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
         }
     }
@@ -8368,6 +8369,49 @@ fn agent_wireguard_peer_telemetry_source(
         .map(LinuxNetworkNamespace::from_name)
         .transpose()?;
     let source: Arc<dyn WireGuardPeerTelemetrySource> = match args.wireguard_backend {
+        WireGuardApplyBackend::Command | WireGuardApplyBackend::UserspaceCommand => match namespace
+        {
+            Some(namespace) => Arc::new(CommandWireGuardPeerTelemetrySource::new_in_namespace(
+                args.wireguard_interface.clone(),
+                namespace,
+                runtime_command_timeout(args),
+                runtime_command_output_max_bytes(args),
+            )),
+            None => Arc::new(CommandWireGuardPeerTelemetrySource::new(
+                args.wireguard_interface.clone(),
+                runtime_command_timeout(args),
+                runtime_command_output_max_bytes(args),
+            )),
+        },
+        WireGuardApplyBackend::KernelNetlink => match namespace {
+            Some(namespace) => Arc::new(
+                KernelWireGuardPeerTelemetrySource::new_in_namespace(
+                    args.wireguard_interface.clone(),
+                    namespace,
+                )
+                .with_timeout(runtime_command_timeout(args)),
+            ),
+            None => Arc::new(
+                KernelWireGuardPeerTelemetrySource::new(args.wireguard_interface.clone())
+                    .with_timeout(runtime_command_timeout(args)),
+            ),
+        },
+    };
+    Ok(Some(source))
+}
+
+fn agent_wireguard_peer_inventory_source(
+    args: &AgentArgs,
+) -> anyhow::Result<Option<Arc<dyn WireGuardPeerInventorySource>>> {
+    if !args.apply_peer_map || args.runtime_backend != AgentRuntimeBackend::LinuxCommand {
+        return Ok(None);
+    }
+    let namespace = args
+        .linux_netns
+        .as_deref()
+        .map(LinuxNetworkNamespace::from_name)
+        .transpose()?;
+    let source: Arc<dyn WireGuardPeerInventorySource> = match args.wireguard_backend {
         WireGuardApplyBackend::Command | WireGuardApplyBackend::UserspaceCommand => match namespace
         {
             Some(namespace) => Arc::new(CommandWireGuardPeerTelemetrySource::new_in_namespace(
@@ -9935,7 +9979,7 @@ where
         .await?;
     let route_manager = LinuxRouteManager::new(route_runner);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
     tracing::info!(
         backend = args.runtime_backend.as_str(),
         wireguard_backend = args.wireguard_backend.as_str(),
@@ -9969,7 +10013,7 @@ where
         .await?;
     let route_manager = LinuxRouteManager::new(route_runner);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
     tracing::info!(
         backend = args.runtime_backend.as_str(),
         wireguard_backend = args.wireguard_backend.as_str(),
@@ -10003,7 +10047,7 @@ where
         .await?;
     let route_manager = linux_netlink_route_manager(namespace);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
     tracing::info!(
         backend = args.runtime_backend.as_str(),
         wireguard_backend = args.wireguard_backend.as_str(),
@@ -10038,7 +10082,7 @@ where
         .configure_interface_address(runtime_local_vpn_ip(&runtime)?)
         .await?;
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
     tracing::info!(
         backend = args.runtime_backend.as_str(),
         wireguard_backend = args.wireguard_backend.as_str(),
@@ -10068,7 +10112,7 @@ async fn start_peer_map_sync_with_kernel_backends(
         .await?;
     let route_manager = linux_netlink_route_manager(namespace);
     let applier = PeerMapApplier::new(args.wireguard_interface.clone(), wireguard, route_manager);
-    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier);
+    let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
     tracing::info!(
         backend = args.runtime_backend.as_str(),
         wireguard_backend = args.wireguard_backend.as_str(),
@@ -10118,7 +10162,7 @@ fn configure_peer_map_endpoint_resolver<W, R>(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
     mut applier: PeerMapApplier<W, R>,
-) -> PeerMapApplier<W, R>
+) -> anyhow::Result<PeerMapApplier<W, R>>
 where
     W: WireGuardBackend,
     R: RouteManager,
@@ -10133,7 +10177,10 @@ where
         "using negotiated path-aware endpoint resolver for WireGuard peers"
     );
     applier = applier.with_endpoint_resolver(resolver);
-    applier.with_lazy_connect_runtime(runtime)
+    if let Some(inventory) = agent_wireguard_peer_inventory_source(args)? {
+        applier = applier.with_wireguard_peer_inventory(inventory);
+    }
+    Ok(applier.with_lazy_connect_runtime(runtime))
 }
 
 fn start_peer_map_sync_with_sink<A>(
@@ -15260,6 +15307,14 @@ mod tests {
             self.peers.write().await.remove(peer);
             Ok(())
         }
+
+        async fn remove_peer_by_public_key(&self, public_key: &str) -> Result<(), AgentError> {
+            self.peers
+                .write()
+                .await
+                .retain(|_, config| config.public_key != public_key);
+            Ok(())
+        }
     }
 
     #[derive(Debug, Clone, Default)]
@@ -15328,7 +15383,7 @@ mod tests {
         let wireguard = RecordingWireGuardBackend::default();
         let recorded_peers = wireguard.peers.clone();
         let applier = PeerMapApplier::new("ipars0", wireguard, DryRunLinuxRouteManager);
-        let applier = configure_peer_map_endpoint_resolver(&args, runtime.clone(), applier);
+        let applier = configure_peer_map_endpoint_resolver(&args, runtime.clone(), applier)?;
         let peer_map = || PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],

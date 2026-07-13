@@ -34,7 +34,7 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
     let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
     let backend = KernelWireGuardBackend::new_in_namespace(interface, namespace.clone());
     let telemetry_source =
-        KernelWireGuardPeerTelemetrySource::new_in_namespace(interface, namespace)
+        KernelWireGuardPeerTelemetrySource::new_in_namespace(interface, namespace.clone())
             .with_timeout(Duration::from_secs(5));
 
     backend.ensure_interface().await?;
@@ -92,7 +92,11 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
     assert_eq!(peer_telemetry.endpoint.as_deref(), Some("127.0.0.1:51820"));
     assert_eq!(peer_telemetry.latest_handshake_at, None);
 
-    backend.remove_peer(&peer).await?;
+    drop(backend);
+    let restarted_backend = KernelWireGuardBackend::new_in_namespace(interface, namespace);
+    restarted_backend
+        .remove_peer_by_public_key(&peer_key.public_key_b64)
+        .await?;
     assert!(!telemetry_source
         .snapshot()
         .await?

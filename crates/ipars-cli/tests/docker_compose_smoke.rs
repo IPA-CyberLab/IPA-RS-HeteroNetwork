@@ -9,6 +9,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use ipars_crypto::WireGuardKeyPair;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde_json::Value;
 
@@ -1126,6 +1127,12 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
 
     wait_for_compose_wireguard_path(&compose, "agent", agent_vpn_ip, agent_b_vpn_ip)?;
     wait_for_compose_wireguard_path(&compose, "agent-b", agent_b_vpn_ip, agent_vpn_ip)?;
+    assert_compose_reconciles_unknown_wireguard_peer(
+        &compose,
+        "agent",
+        agent_vpn_ip,
+        agent_b_vpn_ip,
+    )?;
     let agent_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent", workload_a_cidr)?;
     let agent_b_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent-b", workload_b_cidr)?;
     let workload_a_ip = compose_service_ipv4_in_subnet(&compose, "workload-a", workload_a_cidr)?;
@@ -2151,6 +2158,64 @@ wg show "$interface" latest-handshakes | awk '$2 > 0 { found = 1 } END { exit !f
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn assert_compose_reconciles_unknown_wireguard_peer(
+    compose: &ComposeProject,
+    service: &str,
+    local_vpn_ip: IpAddr,
+    remote_vpn_ip: IpAddr,
+) -> Result<()> {
+    let stale_public_key = WireGuardKeyPair::generate().public_key_b64;
+    run_compose_with_diagnostics(
+        compose,
+        [
+            "exec",
+            "-T",
+            service,
+            "wg",
+            "set",
+            "ipars0",
+            "peer",
+            stale_public_key.as_str(),
+            "allowed-ips",
+            "192.0.2.254/32",
+        ],
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-ec",
+            "! wg show ipars0 peers | grep -F -x -- \"$1\" >/dev/null",
+            "sh",
+            stale_public_key.as_str(),
+        ]);
+        let last_output = match command.output() {
+            Ok(output) if output.status.success() => break,
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("failed to inspect WireGuard peers: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Docker Agent {service} did not remove an unknown WireGuard peer after authoritative peer-map reconciliation\nlast probe:\n{last_output}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    wait_for_compose_wireguard_path(compose, service, local_vpn_ip, remote_vpn_ip)
 }
 
 fn wait_for_compose_advertised_route<C, A>(

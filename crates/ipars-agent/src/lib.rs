@@ -2646,6 +2646,7 @@ pub trait WireGuardBackend: Send + Sync {
 
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError>;
     async fn remove_peer(&self, peer: &NodeId) -> Result<(), AgentError>;
+    async fn remove_peer_by_public_key(&self, public_key: &str) -> Result<(), AgentError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2717,6 +2718,11 @@ pub trait WireGuardPeerTelemetrySource: Send + Sync {
     async fn snapshot(&self) -> Result<BTreeMap<String, WireGuardPeerTelemetry>, AgentError>;
 }
 
+#[async_trait]
+pub trait WireGuardPeerInventorySource: Send + Sync + std::fmt::Debug {
+    async fn public_keys(&self) -> Result<BTreeSet<String>, AgentError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandWireGuardPeerTelemetrySource {
     interface: String,
@@ -2768,6 +2774,13 @@ impl WireGuardPeerTelemetrySource for CommandWireGuardPeerTelemetrySource {
             self.query("endpoints"),
         )?;
         parse_wireguard_command_telemetry(&handshakes, &transfers, &endpoints)
+    }
+}
+
+#[async_trait]
+impl WireGuardPeerInventorySource for CommandWireGuardPeerTelemetrySource {
+    async fn public_keys(&self) -> Result<BTreeSet<String>, AgentError> {
+        parse_wireguard_command_peer_inventory(&self.query("peers").await?)
     }
 }
 
@@ -2824,6 +2837,17 @@ impl WireGuardPeerTelemetrySource for KernelWireGuardPeerTelemetrySource {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl WireGuardPeerInventorySource for KernelWireGuardPeerTelemetrySource {
+    async fn public_keys(&self) -> Result<BTreeSet<String>, AgentError> {
+        Ok(WireGuardPeerTelemetrySource::snapshot(self)
+            .await?
+            .into_keys()
+            .collect())
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 #[async_trait]
 impl WireGuardPeerTelemetrySource for KernelWireGuardPeerTelemetrySource {
@@ -2832,6 +2856,26 @@ impl WireGuardPeerTelemetrySource for KernelWireGuardPeerTelemetrySource {
             "kernel WireGuard telemetry is only supported on Linux".to_string(),
         ))
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[async_trait]
+impl WireGuardPeerInventorySource for KernelWireGuardPeerTelemetrySource {
+    async fn public_keys(&self) -> Result<BTreeSet<String>, AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard peer inventory is only supported on Linux".to_string(),
+        ))
+    }
+}
+
+fn parse_wireguard_command_peer_inventory(peers: &[u8]) -> Result<BTreeSet<String>, AgentError> {
+    wireguard_command_output_rows(peers, "peers", 1)?
+        .into_iter()
+        .map(|fields| {
+            validate_wireguard_public_key(fields[0])?;
+            Ok(fields[0].to_string())
+        })
+        .collect()
 }
 
 fn parse_wireguard_command_telemetry(
@@ -3980,10 +4024,17 @@ where
             .get(peer)
             .cloned()
             .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
+        self.remove_peer_by_public_key(&public_key).await
+    }
+
+    async fn remove_peer_by_public_key(&self, public_key: &str) -> Result<(), AgentError> {
         self.runner
-            .run(wireguard_remove_peer_command(&self.interface, &public_key))
+            .run(wireguard_remove_peer_command(&self.interface, public_key))
             .await?;
-        self.peer_public_keys.write().await.remove(peer);
+        self.peer_public_keys
+            .write()
+            .await
+            .retain(|_, stored_key| stored_key != public_key);
         Ok(())
     }
 }
@@ -4086,10 +4137,17 @@ where
             .get(peer)
             .cloned()
             .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
+        self.remove_peer_by_public_key(&public_key).await
+    }
+
+    async fn remove_peer_by_public_key(&self, public_key: &str) -> Result<(), AgentError> {
         self.runner
-            .run(wireguard_remove_peer_command(&self.interface, &public_key))
+            .run(wireguard_remove_peer_command(&self.interface, public_key))
             .await?;
-        self.peer_public_keys.write().await.remove(peer);
+        self.peer_public_keys
+            .write()
+            .await
+            .retain(|_, stored_key| stored_key != public_key);
         Ok(())
     }
 }
@@ -4362,6 +4420,12 @@ impl WireGuardBackend for KernelWireGuardBackend {
             .get(peer)
             .copied()
             .ok_or_else(|| AgentError::MissingPeer(peer.clone()))?;
+        self.remove_peer_by_public_key(&encode_bytes(&public_key))
+            .await
+    }
+
+    async fn remove_peer_by_public_key(&self, public_key: &str) -> Result<(), AgentError> {
+        let public_key = parse_wireguard_public_key(public_key)?;
         apply_wireguard_netlink(
             &self.interface,
             self.namespace.as_ref(),
@@ -4371,7 +4435,10 @@ impl WireGuardBackend for KernelWireGuardBackend {
             ])])],
         )
         .await?;
-        self.peer_public_keys.write().await.remove(peer);
+        self.peer_public_keys
+            .write()
+            .await
+            .retain(|_, stored_key| stored_key != &public_key);
         Ok(())
     }
 }
@@ -4390,6 +4457,12 @@ impl WireGuardBackend for KernelWireGuardBackend {
     }
 
     async fn remove_peer(&self, _peer: &NodeId) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+
+    async fn remove_peer_by_public_key(&self, _public_key: &str) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
             "kernel WireGuard netlink backend is only supported on Linux".to_string(),
         ))
@@ -4655,6 +4728,14 @@ impl WireGuardBackend for MemoryWireGuardBackend {
         self.peers.write().await.remove(peer);
         Ok(())
     }
+
+    async fn remove_peer_by_public_key(&self, public_key: &str) -> Result<(), AgentError> {
+        self.peers
+            .write()
+            .await
+            .retain(|_, config| config.public_key != public_key);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -4758,8 +4839,10 @@ pub struct PeerMapApplier<W, R> {
     wireguard: W,
     route_manager: R,
     endpoint_resolver: Arc<dyn PeerEndpointResolver>,
+    wireguard_peer_inventory: Option<Arc<dyn WireGuardPeerInventorySource>>,
     lazy_runtime: Option<Arc<AgentRuntime>>,
-    applied_peers: tokio::sync::RwLock<BTreeSet<NodeId>>,
+    apply_lock: tokio::sync::Mutex<()>,
+    applied_peers: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
     applied_routes: tokio::sync::RwLock<BTreeMap<NodeId, Vec<Route>>>,
 }
 
@@ -4774,8 +4857,10 @@ where
             wireguard,
             route_manager,
             endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
+            wireguard_peer_inventory: None,
             lazy_runtime: None,
-            applied_peers: tokio::sync::RwLock::new(BTreeSet::new()),
+            apply_lock: tokio::sync::Mutex::new(()),
+            applied_peers: tokio::sync::RwLock::new(BTreeMap::new()),
             applied_routes: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
@@ -4793,10 +4878,19 @@ where
         self
     }
 
+    pub fn with_wireguard_peer_inventory(
+        mut self,
+        inventory: Arc<dyn WireGuardPeerInventorySource>,
+    ) -> Self {
+        self.wireguard_peer_inventory = Some(inventory);
+        self
+    }
+
     pub async fn apply_peer_map(
         &self,
         peer_map: PeerMap,
     ) -> Result<PeerMapApplySummary, AgentError> {
+        let _apply_guard = self.apply_lock.lock().await;
         if let Some(runtime) = &self.lazy_runtime {
             self.wireguard
                 .configure_private_key(&runtime.state().wireguard_private_key_b64)
@@ -4819,20 +4913,59 @@ where
         let stale_peers = {
             let applied_peers = self.applied_peers.read().await;
             applied_peers
-                .iter()
+                .keys()
                 .filter(|peer| !peer_map_ids.contains(*peer))
                 .cloned()
                 .collect::<Vec<_>>()
         };
         peers_to_remove.extend(stale_peers);
 
+        let mut desired_peers = Vec::new();
+        for peer in &peer_map.peers {
+            if let Some(runtime) = &self.lazy_runtime {
+                if !runtime.should_connect_peer(peer).await {
+                    continue;
+                }
+            }
+            desired_peers.push(peer);
+        }
+        let mut desired_public_keys = BTreeSet::new();
+        let local_public_key = self
+            .lazy_runtime
+            .as_ref()
+            .map(|runtime| runtime.state().wireguard_public_key_b64);
+        for peer in &desired_peers {
+            if self.wireguard_peer_inventory.is_some() {
+                validate_wireguard_public_key(&peer.wireguard_public_key)?;
+                if local_public_key.as_deref() == Some(peer.wireguard_public_key.as_str()) {
+                    return Err(AgentError::WireGuard(format!(
+                        "peer map assigns the local WireGuard public key to remote peer {}",
+                        peer.node_id
+                    )));
+                }
+                if !desired_public_keys.insert(peer.wireguard_public_key.clone()) {
+                    return Err(AgentError::WireGuard(format!(
+                        "peer map assigns WireGuard public key {} to multiple active peers",
+                        peer.wireguard_public_key
+                    )));
+                }
+            } else {
+                desired_public_keys.insert(peer.wireguard_public_key.clone());
+            }
+        }
+        let actual_public_keys = match &self.wireguard_peer_inventory {
+            Some(inventory) => Some(inventory.public_keys().await?),
+            None => None,
+        };
+
         let mut peers_removed = 0;
         let mut routes_removed = 0;
+        let mut removed_public_keys = BTreeSet::new();
         for peer in peers_to_remove {
-            let was_applied = self.applied_peers.read().await.contains(&peer);
-            if !was_applied {
+            let applied_public_key = self.applied_peers.read().await.get(&peer).cloned();
+            let Some(applied_public_key) = applied_public_key else {
                 continue;
-            }
+            };
             let routes_to_remove = self
                 .applied_routes
                 .read()
@@ -4851,20 +4984,30 @@ where
                 routes_removed += routes_to_remove.len();
                 self.applied_routes.write().await.remove(&peer);
             }
-            self.wireguard.remove_peer(&peer).await?;
+            match &actual_public_keys {
+                Some(actual_public_keys) if actual_public_keys.contains(&applied_public_key) => {
+                    self.wireguard
+                        .remove_peer_by_public_key(&applied_public_key)
+                        .await?;
+                    removed_public_keys.insert(applied_public_key);
+                }
+                Some(_) => {}
+                None => self.wireguard.remove_peer(&peer).await?,
+            }
             self.applied_peers.write().await.remove(&peer);
             self.applied_routes.write().await.remove(&peer);
             peers_removed += 1;
         }
 
-        let mut desired_peers = Vec::new();
-        for peer in &peer_map.peers {
-            if let Some(runtime) = &self.lazy_runtime {
-                if !runtime.should_connect_peer(peer).await {
-                    continue;
-                }
+        if let Some(actual_public_keys) = actual_public_keys {
+            for public_key in actual_public_keys
+                .iter()
+                .filter(|public_key| !desired_public_keys.contains(*public_key))
+                .filter(|public_key| !removed_public_keys.contains(*public_key))
+            {
+                self.wireguard.remove_peer_by_public_key(public_key).await?;
+                peers_removed += 1;
             }
-            desired_peers.push(peer);
         }
         let local_route_cidrs = match &self.lazy_runtime {
             Some(runtime) => runtime
@@ -4911,7 +5054,7 @@ where
             self.applied_peers
                 .write()
                 .await
-                .insert(peer.node_id.clone());
+                .insert(peer.node_id.clone(), peer.wireguard_public_key.clone());
             peers_applied += 1;
 
             let routes_to_remove = self
@@ -5949,6 +6092,41 @@ mod tests {
                 Err(AgentError::ControlPlaneClient(format!(
                     "unexpected node id {node_id}"
                 )))
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StaticWireGuardPeerInventory {
+        public_keys: BTreeSet<String>,
+        fail: bool,
+    }
+
+    impl StaticWireGuardPeerInventory {
+        fn from_public_keys(public_keys: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                public_keys: public_keys.into_iter().collect(),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                public_keys: BTreeSet::new(),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WireGuardPeerInventorySource for StaticWireGuardPeerInventory {
+        async fn public_keys(&self) -> Result<BTreeSet<String>, AgentError> {
+            if self.fail {
+                Err(AgentError::WireGuard(
+                    "test WireGuard peer inventory failed".to_string(),
+                ))
+            } else {
+                Ok(self.public_keys.clone())
             }
         }
     }
@@ -7815,6 +7993,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn command_wireguard_peer_inventory_parser_validates_public_keys() -> Result<(), AgentError> {
+        let first_key = WireGuardKeyPair::generate().public_key_b64;
+        let second_key = WireGuardKeyPair::generate().public_key_b64;
+        let inventory = parse_wireguard_command_peer_inventory(
+            format!("{first_key}\n{second_key}\n").as_bytes(),
+        )?;
+        assert_eq!(
+            inventory,
+            BTreeSet::from([first_key.clone(), second_key.clone()])
+        );
+
+        let malformed =
+            parse_wireguard_command_peer_inventory(format!("{first_key}\tunexpected\n").as_bytes());
+        assert!(matches!(
+            malformed,
+            Err(AgentError::WireGuard(message))
+                if message.contains("expected 1 non-empty tab-separated fields")
+        ));
+        let invalid = parse_wireguard_command_peer_inventory(b"not-a-key\n");
+        assert!(matches!(
+            invalid,
+            Err(AgentError::WireGuard(message))
+                if message.contains("invalid WireGuard public key")
+        ));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_wireguard_telemetry_parser_reads_handshake_and_transfer() -> Result<(), AgentError> {
@@ -7944,6 +8150,221 @@ mod tests {
             Err(AgentError::WireGuard(message))
                 if message.contains("requires socket-address endpoints")
         ));
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_unknown_stale_wireguard_peer_after_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stale_key = WireGuardKeyPair::generate().public_key_b64;
+        let runner = RecordingRunner::default();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            LinuxWireGuardBackend::new("ipars0", runner.clone()),
+            DryRunLinuxRouteManager,
+        )
+        .with_wireguard_peer_inventory(Arc::new(
+            StaticWireGuardPeerInventory::from_public_keys([stale_key.clone()]),
+        ));
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.peers_removed, 1);
+        assert_eq!(summary.peers_applied, 0);
+        assert_eq!(
+            runner.commands().await,
+            vec![wireguard_remove_peer_command("ipars0", &stale_key)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_rotated_wireguard_key_before_upsert(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let old_key = WireGuardKeyPair::generate().public_key_b64;
+        let new_key = WireGuardKeyPair::generate().public_key_b64;
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            &new_key,
+            Vec::new(),
+            Vec::new(),
+        );
+        let runner = RecordingRunner::default();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            LinuxWireGuardBackend::new("ipars0", runner.clone()),
+            DryRunLinuxRouteManager,
+        )
+        .with_wireguard_peer_inventory(Arc::new(
+            StaticWireGuardPeerInventory::from_public_keys([old_key.clone()]),
+        ));
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.peers_removed, 1);
+        assert_eq!(summary.peers_applied, 1);
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                wireguard_remove_peer_command("ipars0", &old_key),
+                LinuxCommand::new(
+                    "wg",
+                    [
+                        "set",
+                        "ipars0",
+                        "peer",
+                        new_key.as_str(),
+                        "allowed-ips",
+                        "100.64.0.2/32",
+                    ],
+                ),
+            ]
+        );
+        assert_eq!(
+            applier
+                .wireguard
+                .peer_public_keys
+                .read()
+                .await
+                .get(&peer_id),
+            Some(&new_key)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_fails_before_upsert_when_peer_inventory_is_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let new_key = WireGuardKeyPair::generate().public_key_b64;
+        let peer = peer_record(
+            NodeId::from_string("peer-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            &new_key,
+            Vec::new(),
+            Vec::new(),
+        );
+        let runner = RecordingRunner::default();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            LinuxWireGuardBackend::new("ipars0", runner.clone()),
+            DryRunLinuxRouteManager,
+        )
+        .with_wireguard_peer_inventory(Arc::new(StaticWireGuardPeerInventory::failing()));
+
+        let result = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::WireGuard(message))
+                if message == "test WireGuard peer inventory failed"
+        ));
+        assert!(runner.commands().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_rejects_duplicate_active_wireguard_keys_before_mutation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let shared_key = WireGuardKeyPair::generate().public_key_b64;
+        let peers = vec![
+            peer_record(
+                NodeId::from_string("peer-a"),
+                IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+                &shared_key,
+                Vec::new(),
+                Vec::new(),
+            ),
+            peer_record(
+                NodeId::from_string("peer-b"),
+                IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)),
+                &shared_key,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+        let runner = RecordingRunner::default();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            LinuxWireGuardBackend::new("ipars0", runner.clone()),
+            DryRunLinuxRouteManager,
+        )
+        .with_wireguard_peer_inventory(Arc::new(
+            StaticWireGuardPeerInventory::from_public_keys([]),
+        ));
+
+        let result = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers,
+                generated_at: Utc::now(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::WireGuard(message))
+                if message.contains("to multiple active peers")
+        ));
+        assert!(runner.commands().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_rejects_local_wireguard_key_as_remote_peer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_public_key = state.wireguard_public_key_b64.clone();
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+        let mut peer = peer_record(
+            NodeId::from_string("peer-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            &local_public_key,
+            Vec::new(),
+            Vec::new(),
+        );
+        peer.role = Role::control_plane();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            DryRunLinuxRouteManager,
+        )
+        .with_wireguard_peer_inventory(Arc::new(StaticWireGuardPeerInventory::from_public_keys([])))
+        .with_lazy_connect_runtime(runtime);
+
+        let result = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: Utc::now(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::WireGuard(message))
+                if message.contains("local WireGuard public key")
+        ));
+        assert!(applier.wireguard.peers.read().await.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

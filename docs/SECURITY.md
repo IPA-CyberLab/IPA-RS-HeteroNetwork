@@ -56,7 +56,7 @@ iparsd control-plane \
 
 Then mint new tokens with the next issuer key. Keep the old public key trusted until all unexpired old tokens have either expired or been revoked.
 
-WireGuard data-plane keys rotate through the local agent API. The agent signs the previous-to-next public-key transition with the persisted node identity key, submits it to the control plane, persists the accepted private key with owner-only state-file permissions, and updates running state after acceptance.
+WireGuard data-plane keys rotate through the local agent API. The agent signs the previous-to-next public-key transition with the persisted node identity key, submits it to the control plane, persists the accepted private key with owner-only state-file permissions, and updates running state after acceptance. Peer-map application rejects one public key assigned to multiple active Node IDs or a remote peer that reuses the local interface key, obtains the actual WireGuard peer-key inventory before mutation, and removes keys outside the latest authoritative active/pinned set by public key, so an old remote key or a peer left in the kernel across an Agent restart cannot remain authorized merely because the new process lost its Node ID/key cache. Reconciliation runs only after an identity-signed peer-map query succeeds and fails closed before peer mutation when the interface inventory cannot be read.
 
 Node removal uses the same node identity boundary. `DELETE /v1/nodes/{node_id}` requires a signed request from the registered node identity before the control plane removes the durable node record, clears health/path state, and releases the VPN IP lease for reuse.
 
