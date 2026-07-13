@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, path::PathBuf};
 
@@ -8,6 +10,8 @@ use ipars_route_manager::{
     SystemRouteCommandRunner,
 };
 use ipars_types::{NodeId, Route};
+
+static NEXT_NAMESPACE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
 async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace(
@@ -357,8 +361,30 @@ impl Drop for NamespaceGuard {
 }
 
 fn unique_namespace_name() -> Result<String, Box<dyn std::error::Error>> {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() % 1_000_000_000;
-    Ok(format!("ipars-it-{}-{nanos}", std::process::id()))
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(unique_namespace_name_from_nanos(nanos))
+}
+
+fn unique_namespace_name_from_nanos(nanos: u128) -> String {
+    let serial = NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed);
+    format!("ipars-it-{}-{nanos}-{serial}", std::process::id())
+}
+
+#[test]
+fn namespace_names_are_unique_when_generated_concurrently() {
+    let names = std::thread::scope(|scope| {
+        (0..32)
+            .map(|_| scope.spawn(|| unique_namespace_name_from_nanos(42)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| match thread.join() {
+                Ok(name) => name,
+                Err(_) => panic!("namespace name generation thread panicked"),
+            })
+            .collect::<BTreeSet<_>>()
+    });
+
+    assert_eq!(names.len(), 32);
 }
 
 fn command<const N: usize>(
