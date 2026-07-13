@@ -3043,9 +3043,14 @@ fn parse_netlink_managed_policy_rule(
             _ => {}
         }
     }
-    let priority = priority.ok_or_else(|| {
-        RouteManagerError::Backend("managed netlink policy rule is missing a priority".to_string())
-    })?;
+    let Some(priority) = priority else {
+        if protocol == owner.protocol() {
+            return Err(RouteManagerError::Backend(
+                "managed netlink policy rule is missing a priority".to_string(),
+            ));
+        }
+        return Ok(None);
+    };
     if protocol != owner.protocol()
         && !(protocol == 0 && owner.legacy_policy_rule_priorities().contains(&priority))
     {
