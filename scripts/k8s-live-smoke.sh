@@ -334,7 +334,7 @@ metadata:
   name: ${bootstrap_name}
   labels:
     app.kubernetes.io/component: ipars-bootstrap
-    ipars.io/live-smoke: "true"
+    ipars.io/live-smoke-bootstrap: "true"
 spec:
   selector:
     app.kubernetes.io/component: ipars-bootstrap
