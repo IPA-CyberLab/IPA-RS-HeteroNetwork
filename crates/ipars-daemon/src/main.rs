@@ -13000,6 +13000,7 @@ fn signal_path_request(
     }
 }
 
+#[cfg(test)]
 fn signal_path_record(
     response: SignalPathResponse,
     updated_at: chrono::DateTime<chrono::Utc>,
