@@ -427,6 +427,25 @@ assert_vpn_http() {
   ' sh "$remote_vpn_ip"
 }
 
+rootless_dataplane_diagnostics() {
+  local reason="$1"
+  echo "rootless dataplane diagnostics (${reason}):" >&2
+  for service in agent agent-b; do
+    echo "--- ${service} paths ---" >&2
+    agent_get "$service" /v1/paths >&2 || true
+    echo "--- ${service} metrics ---" >&2
+    agent_get "$service" /v1/metrics >&2 || true
+    echo "--- ${service} network and WireGuard ---" >&2
+    rootless_e2e_compose exec -T "$service" sh -ec '
+      ip address show
+      ip route show
+      wg show ipars0
+    ' >&2 || true
+  done
+  echo "--- agent logs ---" >&2
+  rootless_e2e_compose logs --no-color --tail=200 agent agent-b >&2 || true
+}
+
 agent_a_status="$(wait_for_agent_status agent)"
 agent_b_status="$(wait_for_agent_status agent-b)"
 agent_a_node="$(jq -er '.node_id' <<<"$agent_a_status")"
@@ -446,8 +465,14 @@ wait_for_agent_path agent "$agent_a_node" "$agent_b_node"
 wait_for_agent_path agent-b "$agent_b_node" "$agent_a_node"
 assert_vpn_route agent "$agent_b_vpn_ip"
 assert_vpn_route agent-b "$agent_a_vpn_ip"
-assert_vpn_http agent "$agent_b_vpn_ip"
-assert_vpn_http agent-b "$agent_a_vpn_ip"
+if ! assert_vpn_http agent "$agent_b_vpn_ip"; then
+  rootless_dataplane_diagnostics "agent HTTP over VPN failed"
+  exit 1
+fi
+if ! assert_vpn_http agent-b "$agent_a_vpn_ip"; then
+  rootless_dataplane_diagnostics "agent-b HTTP over VPN failed"
+  exit 1
+fi
 wait_for_direct_path agent "$agent_a_node" "$agent_b_node"
 wait_for_direct_path agent-b "$agent_b_node" "$agent_a_node"
 
