@@ -19,6 +19,9 @@ bootstrap_name="ipars-bootstrap"
 token_secret="ipars-live-join"
 agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
+service_route_name="ipars-route-target"
+service_route_port="18080"
+service_cidr="${IPARS_K8S_SMOKE_SERVICE_CIDR:-10.96.0.0/12}"
 chart_fullname=""
 tmp_dir=""
 namespace_created=0
@@ -362,7 +365,7 @@ run_ipars init \
   --issuer-key-id live-smoke \
   --token-ttl-seconds "$timeout_seconds" \
   --default-role kubernetes-node \
-  --allowed-route "${bootstrap_cluster_ip}/32" \
+  --allowed-route "$service_cidr" \
   --unlimited-uses >"$init_output"
 
 cluster_id="$(jq -er '.cluster_id | strings' "$init_output")"
@@ -502,7 +505,7 @@ agent_api_service_name="${chart_fullname}-agent"
   --set-string "cluster.stunEndpoint=${bootstrap_cluster_ip}:3478" \
   --set serviceExposure.enabled=true \
   --set serviceExposure.discoverServices=true \
-  --set serviceExposure.discoverApiServer=false \
+  --set serviceExposure.discoverApiServer=true \
   --set-json 'serviceExposure.serviceCidrs=[]' \
   --set-string "serviceExposure.namespaces[0]=${namespace}" \
   --set-string 'serviceExposure.serviceLabelSelector=ipars.io/live-smoke=true'
@@ -539,6 +542,109 @@ for pod in "${agent_pods[@]}"; do
   vpn_ip="$(jq -er '.vpn_ip | strings' <<<"$status_json")"
   node_ids+=("$node_id")
   vpn_ips+=("$vpn_ip")
+done
+
+"$kubectl_bin" -n "$namespace" apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service_route_name}
+  labels:
+    ipars.io/live-smoke: "true"
+spec:
+  selector:
+    app.kubernetes.io/component: ipars-bootstrap
+  ports:
+    - name: http
+      port: ${service_route_port}
+      targetPort: control-plane
+EOF
+
+service_route_ip="$($kubectl_bin -n "$namespace" get service "$service_route_name" -o jsonpath='{.spec.clusterIP}')"
+if [[ ! "$service_route_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo "route target Service did not receive an IPv4 ClusterIP, got ${service_route_ip:-<empty>}" >&2
+  exit 1
+fi
+api_server_service_ip="$($kubectl_bin get service kubernetes -o jsonpath='{.spec.clusterIP}')"
+if [[ ! "$api_server_service_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo "Kubernetes API Service did not expose an IPv4 ClusterIP, got ${api_server_service_ip:-<empty>}" >&2
+  exit 1
+fi
+
+for attempt in $(seq 1 60); do
+  route_target_endpoints="$($kubectl_bin -n "$namespace" get endpoints "$service_route_name" \
+    -o jsonpath='{range .subsets[*].addresses[*]}{.ip}{"\n"}{end}' 2>/dev/null || true)"
+  if [[ -n "$route_target_endpoints" ]]; then
+    break
+  fi
+  if [[ "$attempt" == 60 ]]; then
+    echo "route target Service ${service_route_name} did not receive an endpoint" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+route_provider_node_id="${node_ids[0]}"
+"$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \
+  --namespace "$namespace" \
+  --wait \
+  --timeout "${timeout_seconds}s" \
+  --set-string "image.repository=${image_repository}" \
+  --set-string "image.tag=${image_tag}" \
+  --set-string "image.pullPolicy=${image_pull_policy}" \
+  --set-string "agent.joinTokenSecretName=${token_secret}" \
+  --set-string "agent.joinTokenSecretKey=token" \
+  --set-string "agent.runtimeBackend=${agent_runtime_backend}" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set agent.apiService.port=9780 \
+  --set agent.apiService.targetPort=9780 \
+  --set agent.peerMap.pollIntervalSeconds=2 \
+  --set agent.routeProvider=false \
+  --set-string 'agent.tolerations[0].operator=Exists' \
+  --set agent.hostNetwork=false \
+  --set-string "agent.dnsPolicy=ClusterFirst" \
+  --set-string "agent.state.hostPath=${agent_state_path}" \
+  --set-string "cluster.controlPlaneUrl=${control_plane_url}" \
+  --set-string "cluster.signalUrl=${signal_url}" \
+  --set-string "cluster.stunEndpoint=${bootstrap_cluster_ip}:3478" \
+  --set serviceExposure.enabled=true \
+  --set serviceExposure.discoverServices=true \
+  --set serviceExposure.discoverApiServer=true \
+  --set-json 'serviceExposure.serviceCidrs=[]' \
+  --set-string "serviceExposure.namespaces[0]=${namespace}" \
+  --set-string 'serviceExposure.serviceLabelSelector=ipars.io/live-smoke=true' \
+  --set-string "serviceExposure.routeProviderNodeId=${route_provider_node_id}"
+
+"$kubectl_bin" -n "$namespace" rollout status "daemonset/${chart_fullname}" --timeout="${timeout_seconds}s"
+mapfile -t updated_agent_pods < <("$kubectl_bin" -n "$namespace" get pods \
+  -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+if [[ ${#updated_agent_pods[@]} -ne $desired_agents ]]; then
+  echo "route-provider rollout did not preserve the expected number of agent pods" >&2
+  exit 1
+fi
+declare -A pod_by_node vpn_ip_by_node
+for pod in "${updated_agent_pods[@]}"; do
+  "$kubectl_bin" -n "$namespace" wait --for=condition=Ready "pod/${pod}" --timeout="${timeout_seconds}s"
+  status_json="$(wait_for_agent_runtime "$pod")"
+  node_id="$(jq -er '.node_id | strings' <<<"$status_json")"
+  vpn_ip="$(jq -er '.vpn_ip | strings' <<<"$status_json")"
+  if [[ -n "${pod_by_node[$node_id]+x}" ]]; then
+    echo "route-provider rollout returned duplicate agent identity ${node_id}" >&2
+    exit 1
+  fi
+  pod_by_node["$node_id"]="$pod"
+  vpn_ip_by_node["$node_id"]="$vpn_ip"
+done
+for index in "${!node_ids[@]}"; do
+  node_id="${node_ids[$index]}"
+  if [[ -z "${pod_by_node[$node_id]+x}" ]]; then
+    echo "agent identity ${node_id} was not preserved during route-provider rollout" >&2
+    exit 1
+  fi
+  agent_pods[$index]="${pod_by_node[$node_id]}"
+  vpn_ips[$index]="${vpn_ip_by_node[$node_id]}"
 done
 
 wait_for_control_plane_metrics "$desired_agents"
@@ -583,6 +689,59 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
       exit 1
     fi
   done
+
+  if [[ ${#agent_pods[@]} -ge 2 ]]; then
+    provider_pod="${agent_pods[0]}"
+    consumer_pod="${agent_pods[1]}"
+    service_cidr_route="${service_route_ip}/32"
+    api_server_cidr_route="${api_server_service_ip}/32"
+    for attempt in $(seq 1 90); do
+      consumer_allowed_ips="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
+        wg show ipars0 allowed-ips 2>/dev/null || true)"
+      consumer_service_route="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
+        ip route get "$service_route_ip" 2>/dev/null || true)"
+      consumer_api_route="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
+        ip route get "$api_server_service_ip" 2>/dev/null || true)"
+      service_response_code="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
+        curl --noproxy '*' --silent --show-error --max-time 5 \
+          -o /dev/null -w "%{http_code}" \
+          "http://${service_route_ip}:${service_route_port}/healthz" 2>/dev/null || true)"
+      api_response_code="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
+        sh -ec '
+          token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+          curl --noproxy "*" --silent --show-error --max-time 5 \
+            --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+            -H "Authorization: Bearer ${token}" \
+            -o /dev/null -w "%{http_code}" "https://${1}/version"
+        ' sh "$api_server_service_ip" 2>/dev/null || true)"
+      if grep -Fq -- "$service_cidr_route" <<<"$consumer_allowed_ips" \
+        && grep -Fq -- "$api_server_cidr_route" <<<"$consumer_allowed_ips" \
+        && grep -Fq -- "dev ipars0" <<<"$consumer_service_route" \
+        && grep -Fq -- "dev ipars0" <<<"$consumer_api_route" \
+        && [[ "$service_response_code" == "200" ]] \
+        && [[ "$api_response_code" == "200" ]]; then
+        echo "Kubernetes Service ${service_route_ip} and API ${api_server_service_ip} reached through route provider ${route_provider_node_id}"
+        break
+      fi
+      if [[ "$attempt" == 90 ]]; then
+        echo "consumer pod did not reach Kubernetes Service/API through ipars0" >&2
+        echo "allowed IPs:\n${consumer_allowed_ips}" >&2
+        echo "Service route:\n${consumer_service_route}" >&2
+        echo "API route:\n${consumer_api_route}" >&2
+        echo "Service response code: ${service_response_code}" >&2
+        echo "API response code: ${api_response_code}" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+
+    provider_service_route="$($kubectl_bin -n "$namespace" exec "$provider_pod" -c agent -- \
+      ip route get "$service_route_ip")"
+    if grep -Fq -- "dev ipars0" <<<"$provider_service_route"; then
+      echo "route provider ${route_provider_node_id} routed its local Kubernetes Service through ipars0" >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "Kubernetes live smoke checks completed for ${#agent_pods[@]} agent pod(s)"
