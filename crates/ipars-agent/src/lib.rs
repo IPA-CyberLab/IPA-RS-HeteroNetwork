@@ -9507,9 +9507,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_endpoint_resolver_uses_peer_local_udp_candidate() ->
-        Result<(), Box<dyn std::error::Error>>
-    {
+    async fn runtime_endpoint_resolver_uses_peer_local_udp_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Arc::new(AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
