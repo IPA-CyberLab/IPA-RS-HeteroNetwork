@@ -142,6 +142,7 @@ pub trait ControlPlaneStore: Send + Sync {
         health: NodeHealth,
     ) -> Result<(), ControlPlaneError>;
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
+    async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError>;
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError>;
     async fn replace_node_paths(
         &self,
@@ -156,6 +157,16 @@ pub struct RemovedNode {
     pub node: NodeRecord,
     pub removed_path_count: usize,
     pub removed_health: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeartbeatStoreUpdate {
+    pub node_id: NodeId,
+    pub candidates: Vec<EndpointCandidate>,
+    pub relay_capability: Option<RelayCapability>,
+    pub routes: Option<Vec<Route>>,
+    pub health: NodeHealth,
+    pub paths: Vec<PathRecord>,
 }
 
 #[async_trait]
@@ -304,6 +315,36 @@ impl ControlPlaneStore for InMemoryStore {
 
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError> {
         Ok(self.health.read().await.get(node_id).cloned())
+    }
+
+    async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let mut health = self.health.write().await;
+        let mut paths = self.paths.write().await;
+        let node = nodes
+            .get_mut(&update.node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
+        if let Some(previous) = health.get(&update.node_id) {
+            if update.health.last_seen_at <= previous.last_seen_at {
+                return Err(ControlPlaneError::NodeSignatureRejected {
+                    node_id: update.node_id,
+                    reason: format!(
+                        "signed_at {} is not newer than last accepted heartbeat {}",
+                        update.health.last_seen_at, previous.last_seen_at
+                    ),
+                });
+            }
+        }
+
+        node.endpoint_candidates = update.candidates;
+        node.relay_capability = update.relay_capability;
+        if let Some(routes) = update.routes {
+            node.routes = routes;
+        }
+        health.insert(update.node_id.clone(), update.health);
+        paths.retain(|path| path.key.local != update.node_id);
+        paths.extend(update.paths);
+        Ok(())
     }
 
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
@@ -1095,21 +1136,14 @@ where
             })
             .transpose()?;
         self.store
-            .update_node_candidates(&request.node_id, request.candidates)
-            .await?;
-        self.store
-            .update_node_relay_capability(&request.node_id, relay_capability)
-            .await?;
-        if let Some(routes) = request.routes {
-            self.store
-                .update_node_routes(&request.node_id, routes)
-                .await?;
-        }
-        self.store
-            .upsert_health(request.node_id.clone(), request.health)
-            .await?;
-        self.store
-            .replace_node_paths(&request.node_id, request.path_state)
+            .apply_heartbeat(HeartbeatStoreUpdate {
+                node_id: request.node_id,
+                candidates: request.candidates,
+                relay_capability,
+                routes: request.routes,
+                health: request.health,
+                paths: request.path_state,
+            })
             .await?;
 
         Ok(HeartbeatResponse {
@@ -2707,6 +2741,13 @@ mod tests {
             self.inner.get_health(node_id).await
         }
 
+        async fn apply_heartbeat(
+            &self,
+            update: HeartbeatStoreUpdate,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.apply_heartbeat(update).await
+        }
+
         async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
             self.inner.upsert_path(path).await
         }
@@ -2963,6 +3004,85 @@ mod tests {
             .register_with_claims(claims(cluster_id), registration_request("node-b"))
             .await?;
         assert!(late_registration.relay_map.relays.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_heartbeats_commit_only_monotonic_complete_snapshots(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
+            .await?;
+        let old_at = Utc::now();
+        let new_at = old_at + Duration::milliseconds(1);
+        let heartbeat = |signed_at: chrono::DateTime<Utc>, marker: &str, host_octet: u8| {
+            let mut reported_path = path("node-a", "node-b");
+            reported_path.updated_at = signed_at;
+            signed_heartbeat_at(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: signed_at,
+                        latency_ms: Some(f32::from(host_octet)),
+                        relay_load: None,
+                        message: Some(marker.to_string()),
+                    },
+                    candidates: vec![candidate_at(
+                        "node-a",
+                        std::net::SocketAddr::from(([203, 0, 113, host_octet], 51820)),
+                    )],
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![reported_path],
+                    node_signature: None,
+                },
+                signed_at,
+            )
+        };
+        let old = heartbeat(old_at, "old", 10);
+        let newest = heartbeat(new_at, "new", 11);
+
+        let (old_result, new_result) = tokio::join!(plane.heartbeat(old), plane.heartbeat(newest));
+        assert!(new_result.is_ok());
+        assert!(
+            old_result.is_ok()
+                || matches!(
+                    old_result,
+                    Err(ControlPlaneError::NodeSignatureRejected { .. })
+                )
+        );
+
+        let stored_node = store
+            .get_node(&node_id("node-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("node-a")))?;
+        assert_eq!(
+            stored_node.endpoint_candidates[0].addr,
+            std::net::SocketAddr::from(([203, 0, 113, 11], 51820))
+        );
+        let stored_health = store
+            .get_health(&node_id("node-a"))
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("node-a")))?;
+        assert_eq!(stored_health.last_seen_at, new_at);
+        assert_eq!(stored_health.message.as_deref(), Some("new"));
+        let stored_paths = store.list_paths_for(&node_id("node-a")).await?;
+        assert_eq!(stored_paths.len(), 1);
+        assert_eq!(stored_paths[0].updated_at, new_at);
         Ok(())
     }
 

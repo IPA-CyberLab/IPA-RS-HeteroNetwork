@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use ipars_control_plane::{ControlPlaneError, ControlPlaneStore, RemovedNode, TokenLedger};
+use ipars_control_plane::{
+    ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate, RemovedNode, TokenLedger,
+};
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
     Route, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
@@ -160,17 +162,17 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         node_id: &NodeId,
         candidates: Vec<EndpointCandidate>,
     ) -> Result<(), ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        node.endpoint_candidates = candidates;
-        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+        let result = sqlx::query(
+            "UPDATE nodes SET record_json = json_set(record_json, '$.endpoint_candidates', json(?2)) WHERE node_id = ?1",
+        )
             .bind(node_id.as_str())
-            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .bind(serde_json::to_string(&candidates).map_err(json_error)?)
             .execute(&self.pool)
             .await
             .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
         Ok(())
     }
 
@@ -179,17 +181,17 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         node_id: &NodeId,
         relay_capability: Option<RelayCapability>,
     ) -> Result<(), ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        node.relay_capability = relay_capability;
-        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+        let result = sqlx::query(
+            "UPDATE nodes SET record_json = json_set(record_json, '$.relay_capability', json(?2)) WHERE node_id = ?1",
+        )
             .bind(node_id.as_str())
-            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .bind(serde_json::to_string(&relay_capability).map_err(json_error)?)
             .execute(&self.pool)
             .await
             .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
         Ok(())
     }
 
@@ -198,17 +200,17 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         node_id: &NodeId,
         routes: Vec<Route>,
     ) -> Result<(), ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        node.routes = routes;
-        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+        let result = sqlx::query(
+            "UPDATE nodes SET record_json = json_set(record_json, '$.routes', json(?2)) WHERE node_id = ?1",
+        )
             .bind(node_id.as_str())
-            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .bind(serde_json::to_string(&routes).map_err(json_error)?)
             .execute(&self.pool)
             .await
             .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
         Ok(())
     }
 
@@ -218,38 +220,32 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         expected_current_public_key: &str,
         next_public_key: String,
     ) -> Result<NodeRecord, ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        if node.wireguard_public_key != expected_current_public_key {
-            return Err(ControlPlaneError::NodeUpdateRejected {
-                node_id: node_id.clone(),
-                reason: "wireguard public key changed before rotation completed".to_string(),
-            });
-        }
-        node.wireguard_public_key = next_public_key;
         let result = sqlx::query(
             r#"
             UPDATE nodes
-            SET record_json = ?3
+            SET record_json = json_set(record_json, '$.wireguard_public_key', ?3)
             WHERE node_id = ?1
               AND json_extract(record_json, '$.wireguard_public_key') = ?2
             "#,
         )
         .bind(node_id.as_str())
         .bind(expected_current_public_key)
-        .bind(serde_json::to_string(&node).map_err(json_error)?)
+        .bind(next_public_key)
         .execute(&self.pool)
         .await
         .map_err(sql_error)?;
         if result.rows_affected() == 0 {
+            if self.get_node(node_id).await?.is_none() {
+                return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+            }
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: node_id.clone(),
                 reason: "wireguard public key changed before rotation completed".to_string(),
             });
         }
-        Ok(node)
+        self.get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))
     }
 
     async fn upsert_health(
@@ -280,6 +276,80 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .await
             .map_err(sql_error)?;
         row.map(row_to_health).transpose()
+    }
+
+    async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("UPDATE nodes SET record_json = record_json WHERE node_id = ?1")
+            .bind(update.node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(update.node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
+        let previous_health = sqlx::query("SELECT record_json FROM health WHERE node_id = ?1")
+            .bind(update.node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?
+            .map(row_to_health)
+            .transpose()?;
+        ensure_heartbeat_is_newer(&update, previous_health.as_ref())?;
+
+        node.endpoint_candidates = update.candidates;
+        node.relay_capability = update.relay_capability;
+        if let Some(routes) = update.routes {
+            node.routes = routes;
+        }
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(update.node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO health (node_id, record_json)
+            VALUES (?1, ?2)
+            ON CONFLICT(node_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(update.node_id.as_str())
+        .bind(serde_json::to_string(&update.health).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        sqlx::query("DELETE FROM paths WHERE local_node_id = ?1")
+            .bind(update.node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        for path in update.paths {
+            sqlx::query(
+                r#"
+                INSERT INTO paths (local_node_id, remote_node_id, record_json)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(local_node_id, remote_node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(path.key.local.as_str())
+            .bind(path.key.remote.as_str())
+            .bind(serde_json::to_string(&path).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
     }
 
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
@@ -625,17 +695,17 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         node_id: &NodeId,
         candidates: Vec<EndpointCandidate>,
     ) -> Result<(), ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        node.endpoint_candidates = candidates;
-        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+        let result = sqlx::query(
+            "UPDATE nodes SET record_json = jsonb_set(record_json, '{endpoint_candidates}', $2) WHERE node_id = $1",
+        )
             .bind(node_id.as_str())
-            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .bind(serde_json::to_value(&candidates).map_err(json_error)?)
             .execute(&self.pool)
             .await
             .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
         Ok(())
     }
 
@@ -644,17 +714,17 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         node_id: &NodeId,
         relay_capability: Option<RelayCapability>,
     ) -> Result<(), ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        node.relay_capability = relay_capability;
-        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+        let result = sqlx::query(
+            "UPDATE nodes SET record_json = jsonb_set(record_json, '{relay_capability}', $2) WHERE node_id = $1",
+        )
             .bind(node_id.as_str())
-            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .bind(serde_json::to_value(&relay_capability).map_err(json_error)?)
             .execute(&self.pool)
             .await
             .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
         Ok(())
     }
 
@@ -663,17 +733,17 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         node_id: &NodeId,
         routes: Vec<Route>,
     ) -> Result<(), ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        node.routes = routes;
-        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+        let result = sqlx::query(
+            "UPDATE nodes SET record_json = jsonb_set(record_json, '{routes}', $2) WHERE node_id = $1",
+        )
             .bind(node_id.as_str())
-            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .bind(serde_json::to_value(&routes).map_err(json_error)?)
             .execute(&self.pool)
             .await
             .map_err(sql_error)?;
+        if result.rows_affected() == 0 {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
         Ok(())
     }
 
@@ -683,38 +753,32 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         expected_current_public_key: &str,
         next_public_key: String,
     ) -> Result<NodeRecord, ControlPlaneError> {
-        let mut node = self
-            .get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        if node.wireguard_public_key != expected_current_public_key {
-            return Err(ControlPlaneError::NodeUpdateRejected {
-                node_id: node_id.clone(),
-                reason: "wireguard public key changed before rotation completed".to_string(),
-            });
-        }
-        node.wireguard_public_key = next_public_key;
         let result = sqlx::query(
             r#"
             UPDATE nodes
-            SET record_json = $3
+            SET record_json = jsonb_set(record_json, '{wireguard_public_key}', $3)
             WHERE node_id = $1
               AND record_json->>'wireguard_public_key' = $2
             "#,
         )
         .bind(node_id.as_str())
         .bind(expected_current_public_key)
-        .bind(serde_json::to_value(&node).map_err(json_error)?)
+        .bind(serde_json::Value::String(next_public_key))
         .execute(&self.pool)
         .await
         .map_err(sql_error)?;
         if result.rows_affected() == 0 {
+            if self.get_node(node_id).await?.is_none() {
+                return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+            }
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: node_id.clone(),
                 reason: "wireguard public key changed before rotation completed".to_string(),
             });
         }
-        Ok(node)
+        self.get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))
     }
 
     async fn upsert_health(
@@ -745,6 +809,75 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .await
             .map_err(sql_error)?;
         row.map(pg_row_to_health).transpose()
+    }
+
+    async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
+            .bind(update.node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
+        let previous_health = sqlx::query("SELECT record_json FROM health WHERE node_id = $1")
+            .bind(update.node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?
+            .map(pg_row_to_health)
+            .transpose()?;
+        ensure_heartbeat_is_newer(&update, previous_health.as_ref())?;
+
+        node.endpoint_candidates = update.candidates;
+        node.relay_capability = update.relay_capability;
+        if let Some(routes) = update.routes {
+            node.routes = routes;
+        }
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(update.node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO health (node_id, record_json)
+            VALUES ($1, $2)
+            ON CONFLICT(node_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(update.node_id.as_str())
+        .bind(serde_json::to_value(&update.health).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        sqlx::query("DELETE FROM paths WHERE local_node_id = $1")
+            .bind(update.node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        for path in update.paths {
+            sqlx::query(
+                r#"
+                INSERT INTO paths (local_node_id, remote_node_id, record_json)
+                VALUES ($1, $2, $3)
+                ON CONFLICT(local_node_id, remote_node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(path.key.local.as_str())
+            .bind(path.key.remote.as_str())
+            .bind(serde_json::to_value(&path).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
     }
 
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError> {
@@ -966,6 +1099,24 @@ fn pg_row_to_token(row: sqlx::postgres::PgRow) -> Result<TokenLedgerRecord, Cont
     serde_json::from_value(record_json).map_err(json_error)
 }
 
+fn ensure_heartbeat_is_newer(
+    update: &HeartbeatStoreUpdate,
+    previous: Option<&NodeHealth>,
+) -> Result<(), ControlPlaneError> {
+    if let Some(previous) = previous {
+        if update.health.last_seen_at <= previous.last_seen_at {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: update.node_id.clone(),
+                reason: format!(
+                    "signed_at {} is not newer than last accepted heartbeat {}",
+                    update.health.last_seen_at, previous.last_seen_at
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn sql_error(error: sqlx::Error) -> ControlPlaneError {
     ControlPlaneError::Store(error.to_string())
 }
@@ -1060,6 +1211,62 @@ mod tests {
             max_mbps: 1000,
             e2e_only: true,
         }
+    }
+
+    fn heartbeat_update(
+        local: &NodeRecord,
+        remote: &NodeRecord,
+        accepted_at: chrono::DateTime<Utc>,
+        marker: &str,
+        host_octet: u8,
+    ) -> Result<HeartbeatStoreUpdate, Box<dyn std::error::Error>> {
+        let candidate = EndpointCandidate {
+            node_id: local.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([203, 0, 113, host_octet], 51820)),
+            observed_at: accepted_at,
+            priority: u16::from(host_octet),
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        };
+        let mut relay = relay_capability();
+        relay.active_sessions = u32::from(host_octet);
+        let route = Route {
+            id: format!("route-{marker}"),
+            cidr: format!("10.{host_octet}.0.0/16").parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: u32::from(host_octet),
+            tags: BTreeSet::new(),
+        };
+        let path = PathRecord {
+            key: PeerPathKey::new(local.node_id.clone(), remote.node_id.clone()),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                u32::from(host_octet),
+            ),
+            updated_at: accepted_at,
+            pinned: false,
+        };
+        Ok(HeartbeatStoreUpdate {
+            node_id: local.node_id.clone(),
+            candidates: vec![candidate],
+            relay_capability: Some(relay),
+            routes: Some(vec![route]),
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: accepted_at,
+                latency_ms: Some(f32::from(host_octet)),
+                relay_load: None,
+                message: Some(marker.to_string()),
+            },
+            paths: vec![path],
+        })
     }
 
     fn temp_sqlite_url(name: &str) -> (String, std::path::PathBuf) {
@@ -1171,7 +1378,7 @@ mod tests {
                 .await?
                 .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
                 .routes,
-            vec![advertised_route]
+            vec![advertised_route.clone()]
         );
         let rotated = store
             .rotate_node_wireguard_public_key(
@@ -1181,6 +1388,9 @@ mod tests {
             )
             .await?;
         assert_eq!(rotated.wireguard_public_key, "wg-node-a-rotated");
+        assert_eq!(rotated.endpoint_candidates.len(), 1);
+        assert_eq!(rotated.relay_capability, None);
+        assert_eq!(rotated.routes, vec![advertised_route]);
         assert!(matches!(
             store
                 .rotate_node_wireguard_public_key(
@@ -1236,6 +1446,45 @@ mod tests {
         assert_eq!(token_metrics.active_count, 0);
         assert_eq!(token_metrics.exhausted_count, 1);
         assert_eq!(token_metrics.use_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_heartbeat_commit_is_atomic_and_monotonic(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("heartbeat-monotonic");
+        let store = SqliteControlPlaneStore::connect(&database_url).await?;
+        let local = node("node-a", Ipv4Addr::new(100, 64, 0, 1));
+        let remote = node("node-b", Ipv4Addr::new(100, 64, 0, 2));
+        store.insert_node(local.clone()).await?;
+        store.insert_node(remote.clone()).await?;
+        let old_at = Utc::now();
+        let new_at = old_at + chrono::Duration::seconds(1);
+        let old = heartbeat_update(&local, &remote, old_at, "old", 10)?;
+        let newest = heartbeat_update(&local, &remote, new_at, "new", 11)?;
+
+        store.apply_heartbeat(old.clone()).await?;
+        store.apply_heartbeat(newest.clone()).await?;
+        assert!(matches!(
+            store.apply_heartbeat(old).await,
+            Err(ControlPlaneError::NodeSignatureRejected { .. })
+        ));
+
+        let stored_node = store
+            .get_node(&local.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?;
+        assert_eq!(stored_node.endpoint_candidates, newest.candidates);
+        assert_eq!(stored_node.relay_capability, newest.relay_capability);
+        assert_eq!(
+            stored_node.routes,
+            newest.routes.clone().unwrap_or_default()
+        );
+        assert_eq!(store.get_health(&local.node_id).await?, Some(newest.health));
+        assert_eq!(store.list_paths_for(&local.node_id).await?, newest.paths);
+
+        drop(store);
+        let _ = std::fs::remove_file(database_path);
         Ok(())
     }
 
