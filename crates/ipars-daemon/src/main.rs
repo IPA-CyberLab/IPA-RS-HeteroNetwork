@@ -11955,13 +11955,6 @@ async fn prepare_direct_nat_traversal(
     if direct.selected_state != PathState::DirectNatTraversal {
         return Ok(());
     }
-    if direct
-        .selected_candidate
-        .as_ref()
-        .is_some_and(|candidate| candidate.kind == ipars_types::EndpointCandidateKind::LocalUdp)
-    {
-        return Ok(());
-    }
     let plan = fetch_hole_punch_plan(client, signal_url, &direct.key, identity)
         .await
         .map_err(|error| {
