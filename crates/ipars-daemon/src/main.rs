@@ -7239,6 +7239,8 @@ async fn run_agent(
         return Ok(());
     }
     validate_agent_runtime_config(&args)?;
+    // Validate host prerequisites before reading state or making any network/API changes.
+    preflight_agent_runtime(&args)?;
     let api_bearer_token = agent_api_bearer_token(&args)?;
     let relay_admission_bearer_token = agent_relay_admission_bearer_token(&args)?;
     let http_client = agent_http_client(&args)?;
@@ -7359,7 +7361,6 @@ async fn run_agent(
         &runtime.state().bootstrap_endpoints,
     )
     .unwrap_or_default();
-    preflight_agent_runtime(&args)?;
     let userspace_wireguard_process =
         start_userspace_wireguard_process(&args, runtime.clone()).await?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
@@ -18816,6 +18817,47 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[tokio::test]
+    async fn agent_preflight_runs_before_state_or_join_token_access() -> anyhow::Result<()> {
+        let dir = unique_test_dir("agent-startup-preflight-order")?;
+        let state_path = dir.join("agent.json");
+        let join_token_path = dir.join("missing.join-token");
+        let docker_socket = dir.join("missing/docker.sock");
+        let state_arg = state_path.display().to_string();
+        let join_token_arg = join_token_path.display().to_string();
+        let docker_socket_arg = docker_socket.display().to_string();
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--listen",
+            "127.0.0.1:0",
+            "--state-path",
+            state_arg.as_str(),
+            "--join-token-path",
+            join_token_arg.as_str(),
+            "--runtime-backend",
+            "dry-run",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-socket",
+            docker_socket_arg.as_str(),
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        let error = run_agent(*args, false, Duration::from_secs(1))
+            .await
+            .expect_err("missing Docker API socket should fail during preflight");
+        assert!(error.to_string().contains("Docker API socket"), "{error:#}");
+        assert!(!state_path.exists());
+        assert!(!join_token_path.exists());
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
