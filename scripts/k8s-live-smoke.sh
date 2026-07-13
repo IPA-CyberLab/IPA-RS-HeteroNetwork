@@ -152,6 +152,48 @@ wait_for_agent_runtime() {
   return 1
 }
 
+wait_for_agent_api_service() {
+  local pod="$1"
+  local service_name="$2"
+  local service_ip
+  local endpoint_ips
+  local unauthorized_status
+  local status_json
+  local attempt
+
+  service_ip="$($kubectl_bin -n "$namespace" get service "$service_name" -o jsonpath='{.spec.clusterIP}')"
+  if [[ -z "$service_ip" || "$service_ip" == "None" ]]; then
+    echo "agent API Service ${service_name} did not receive a ClusterIP" >&2
+    return 1
+  fi
+
+  for attempt in $(seq 1 60); do
+    endpoint_ips="$($kubectl_bin -n "$namespace" get endpoints "$service_name" \
+      -o jsonpath='{range .subsets[*].addresses[*]}{.ip}{"\n"}{end}' 2>/dev/null || true)"
+    if [[ -n "$endpoint_ips" ]]; then
+      unauthorized_status="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
+        sh -ec '
+          curl --noproxy "*" --silent --show-error --max-time 5 \
+            -o /dev/null -w "%{http_code}" "http://${1}:${2}/v1/status"
+        ' sh "$service_name" 9780 2>/dev/null || true)"
+      if [[ "$unauthorized_status" == "401" ]]; then
+        status_json="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
+          curl --noproxy "*" --fail --silent --show-error --max-time 5 \
+            -H "Authorization: Bearer ${agent_api_token}" \
+            "http://${service_name}:9780/v1/status" 2>/dev/null || true)"
+        if jq -e '.node_id | type == "string" and length > 0' \
+          >/dev/null 2>&1 <<<"$status_json"; then
+          echo "agent API Service ${service_name} routed an authenticated request to ${endpoint_ips//$'\n'/, }"
+          return 0
+        fi
+      fi
+    fi
+    sleep 2
+  done
+  echo "agent API Service ${service_name} did not expose an authenticated status endpoint" >&2
+  return 1
+}
+
 activate_agent_peer() {
   local pod="$1"
   local peer_id="$2"
@@ -435,6 +477,7 @@ wait_for_bootstrap_health
 control_plane_url="http://${bootstrap_name}.${namespace}.svc:8443"
 signal_url="http://${bootstrap_name}.${namespace}.svc:9443"
 agent_state_path="/var/lib/ipars-live/${release}"
+agent_api_service_name="${chart_fullname}-agent"
 "$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \
   --namespace "$namespace" \
   --wait \
@@ -445,6 +488,10 @@ agent_state_path="/var/lib/ipars-live/${release}"
   --set-string "agent.joinTokenSecretName=${token_secret}" \
   --set-string "agent.joinTokenSecretKey=token" \
   --set-string "agent.runtimeBackend=${agent_runtime_backend}" \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set agent.apiService.port=9780 \
+  --set agent.apiService.targetPort=9780 \
   --set agent.peerMap.pollIntervalSeconds=2 \
   --set-string 'agent.tolerations[0].operator=Exists' \
   --set agent.hostNetwork=false \
@@ -495,6 +542,7 @@ for pod in "${agent_pods[@]}"; do
 done
 
 wait_for_control_plane_metrics "$desired_agents"
+wait_for_agent_api_service "${agent_pods[0]}" "$agent_api_service_name"
 
 for index in "${!node_ids[@]}"; do
   node_id="${node_ids[$index]}"
