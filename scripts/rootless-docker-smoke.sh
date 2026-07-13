@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 docker_bin="${DOCKER:-docker}"
 dockerd_rootless_bin="${DOCKERD_ROOTLESS:-dockerd-rootless.sh}"
+cargo_bin="${CARGO:-cargo}"
 suffix="$$-$(date +%s%N)"
 tmp_dir=""
 runtime_dir=""
@@ -12,6 +13,7 @@ daemon_pid=""
 daemon_pid_file=""
 project_name="ipars-rootless-${suffix}"
 override_path=""
+e2e_started=0
 
 require_command() {
   local command_name="$1"
@@ -31,13 +33,20 @@ cleanup() {
   fi
 
   if [[ -n "$override_path" ]]; then
+    local compose_files=(
+      -f "$repo_root/docker/compose.yaml"
+      -f "$repo_root/docker/compose.rootless.yaml"
+      -f "$repo_root/docker/compose.rootless-dataplane.yaml"
+    )
+    if [[ "$e2e_started" -eq 1 ]]; then
+      compose_files+=( -f "$repo_root/docker/compose.rootless-e2e.yaml" )
+    else
+      compose_files+=( -f "$override_path" )
+    fi
     DOCKER_HOST="unix://${docker_socket}" \
       "$docker_bin" compose \
         -p "$project_name" \
-        -f "$repo_root/docker/compose.yaml" \
-        -f "$repo_root/docker/compose.rootless.yaml" \
-        -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
-        -f "$override_path" \
+        "${compose_files[@]}" \
         down --remove-orphans >/dev/null 2>&1 || true
   fi
 
@@ -55,6 +64,9 @@ cleanup() {
 }
 
 require_command "$docker_bin"
+require_command "$cargo_bin"
+require_command jq
+require_command curl
 if command -v "$dockerd_rootless_bin" >/dev/null 2>&1; then
   rootless_launcher="dockerd-rootless"
 else
@@ -200,3 +212,243 @@ DOCKER_HOST="unix://${docker_socket}" "$docker_bin" compose \
   run --rm --no-deps --build agent
 
 echo "Rootless Docker BoringTun preflight passed"
+
+generate_secret() {
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+run_ipars() {
+  "$cargo_bin" run --locked --quiet -p ipars-cli -- "$@"
+}
+
+issuer_key_path="$tmp_dir/rootless-e2e-issuer.key"
+init_output_path="$tmp_dir/rootless-e2e-init.json"
+token_output_path="$tmp_dir/rootless-e2e-token.json"
+join_token_path="$tmp_dir/rootless-e2e.join.token"
+agent_api_token_path="$tmp_dir/rootless-e2e-agent-api.token"
+control_plane_operator_token_path="$tmp_dir/rootless-e2e-control-plane-operator.token"
+signal_operator_token_path="$tmp_dir/rootless-e2e-signal-operator.token"
+stun_operator_token_path="$tmp_dir/rootless-e2e-stun-operator.token"
+relay_operator_token_path="$tmp_dir/rootless-e2e-relay-operator.token"
+relay_admission_token_path="$tmp_dir/rootless-e2e-relay-admission.token"
+
+run_ipars init \
+  --public-endpoint 172.30.250.3:8443 \
+  --bootstrap-scheme http \
+  --issuer-key-id rootless-e2e \
+  --issuer-private-key-path "$issuer_key_path" \
+  --emit-issuer-private-key \
+  --token-ttl-seconds 3600 \
+  --unlimited-uses \
+  --allowed-route 100.64.0.0/10 \
+  >"$init_output_path"
+
+rootless_cluster_id="$(jq -er '.cluster_id' "$init_output_path")"
+rootless_issuer_node_id="$(jq -er '.issuer_node_id' "$init_output_path")"
+rootless_issuer_key_id="$(jq -er '.issuer_key_id' "$init_output_path")"
+rootless_issuer_public_key="$(jq -er '.issuer_public_key' "$init_output_path")"
+
+run_ipars token create \
+  --cluster-id "$rootless_cluster_id" \
+  --issuer-key-id "$rootless_issuer_key_id" \
+  --issuer-private-key-path "$issuer_key_path" \
+  --role edge \
+  --ttl-seconds 3600 \
+  --unlimited-uses \
+  --allowed-route 100.64.0.0/10 \
+  --control-plane-bootstrap http://172.30.250.3:8443 \
+  --signal-bootstrap http://172.30.250.4:9443 \
+  --stun-bootstrap udp://172.30.250.5:3478 \
+  >"$token_output_path"
+jq -ce '.' "$token_output_path" >"$join_token_path"
+
+for secret_path in \
+  "$agent_api_token_path" \
+  "$control_plane_operator_token_path" \
+  "$signal_operator_token_path" \
+  "$stun_operator_token_path" \
+  "$relay_operator_token_path" \
+  "$relay_admission_token_path"; do
+  generate_secret >"$secret_path"
+done
+
+export IPARS_ROOTLESS_CLUSTER_ID="$rootless_cluster_id"
+export IPARS_ROOTLESS_ISSUER_NODE_ID="$rootless_issuer_node_id"
+export IPARS_ROOTLESS_ISSUER_KEY_ID="$rootless_issuer_key_id"
+export IPARS_ROOTLESS_ISSUER_PUBLIC_KEY="$rootless_issuer_public_key"
+export IPARS_ROOTLESS_JOIN_TOKEN_FILE="$join_token_path"
+export IPARS_ROOTLESS_AGENT_API_TOKEN_FILE="$agent_api_token_path"
+export IPARS_ROOTLESS_CONTROL_PLANE_OPERATOR_TOKEN_FILE="$control_plane_operator_token_path"
+export IPARS_ROOTLESS_SIGNAL_OPERATOR_TOKEN_FILE="$signal_operator_token_path"
+export IPARS_ROOTLESS_STUN_OPERATOR_TOKEN_FILE="$stun_operator_token_path"
+export IPARS_ROOTLESS_RELAY_OPERATOR_TOKEN_FILE="$relay_operator_token_path"
+export IPARS_ROOTLESS_RELAY_ADMISSION_TOKEN_FILE="$relay_admission_token_path"
+
+rootless_e2e_compose() {
+  DOCKER_HOST="unix://${docker_socket}" "$docker_bin" compose \
+    -p "$project_name" \
+    -f "$repo_root/docker/compose.yaml" \
+    -f "$repo_root/docker/compose.rootless.yaml" \
+    -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
+    -f "$repo_root/docker/compose.rootless-e2e.yaml" \
+    "$@"
+}
+
+rootless_e2e_compose config --quiet
+e2e_started=1
+if ! rootless_e2e_compose up -d --build --wait --wait-timeout 300; then
+  rootless_e2e_compose ps >&2 || true
+  rootless_e2e_compose logs --no-color --tail=160 control-plane signal stun agent agent-b >&2 || true
+  exit 1
+fi
+
+agent_get() {
+  local service="$1"
+  local path="$2"
+  rootless_e2e_compose exec -T "$service" sh -ec '
+    token="$(cat /run/secrets/ipars-agent-api-bearer-token)"
+    curl --noproxy "*" -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:9780${1}"
+  ' sh "$path"
+}
+
+agent_post_peer_activity() {
+  local service="$1"
+  local peer="$2"
+  rootless_e2e_compose exec -T "$service" sh -ec '
+    token="$(cat /run/secrets/ipars-agent-api-bearer-token)"
+    body="$(printf '\''{"peer":"%s","pin":true}'\'' "$1")"
+    curl --noproxy "*" -fsS \
+      -H "Authorization: Bearer ${token}" \
+      -H "Content-Type: application/json" \
+      -X POST --data "${body}" \
+      http://127.0.0.1:9780/v1/peer-activity
+  ' sh "$peer"
+}
+
+wait_for_agent_status() {
+  local service="$1"
+  local value=""
+  for _ in $(seq 1 120); do
+    value="$(agent_get "$service" /v1/status 2>/dev/null || true)"
+    if jq -e '
+      (.node_id | type == "string" and length > 0)
+      and (.identity_public_key | type == "string" and length > 0)
+      and (.wireguard_public_key | type == "string" and length > 0)
+      and (.vpn_ip | type == "string" and length > 0)
+    ' <<<"$value" >/dev/null 2>&1; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for ${service} agent status" >&2
+  rootless_e2e_compose logs --no-color --tail=160 "$service" >&2 || true
+  return 1
+}
+
+wait_for_agent_peer_map() {
+  local service="$1"
+  local value=""
+  for _ in $(seq 1 120); do
+    value="$(agent_get "$service" /v1/metrics 2>/dev/null || true)"
+    if jq -e '.peer_map_synced == true and (.peer_map_peer_count // 0) >= 1' <<<"$value" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for ${service} peer-map sync" >&2
+  agent_get "$service" /v1/metrics >&2 || true
+  return 1
+}
+
+wait_for_agent_path() {
+  local service="$1"
+  local local_node="$2"
+  local remote_node="$3"
+  local value=""
+  for _ in $(seq 1 120); do
+    value="$(agent_get "$service" /v1/paths 2>/dev/null || true)"
+    if jq -e --arg local_node "$local_node" --arg remote_node "$remote_node" '
+      any(.paths[]?;
+        .key.local == $local_node
+        and .key.remote == $remote_node
+        and (.selected_state | type == "string" and length > 0)
+      )
+    ' <<<"$value" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for ${service} path record" >&2
+  agent_get "$service" /v1/paths >&2 || true
+  return 1
+}
+
+wait_for_direct_path() {
+  local service="$1"
+  local local_node="$2"
+  local remote_node="$3"
+  local value=""
+  local metrics=""
+  for _ in $(seq 1 120); do
+    value="$(agent_get "$service" /v1/paths 2>/dev/null || true)"
+    metrics="$(agent_get "$service" /v1/metrics 2>/dev/null || true)"
+    if jq -e --arg local_node "$local_node" --arg remote_node "$remote_node" '
+      any(.paths[]?;
+        .key.local == $local_node
+        and .key.remote == $remote_node
+        and (.selected_state | type == "string" and startswith("DIRECT_"))
+      )
+    ' <<<"$value" >/dev/null 2>&1 \
+      && jq -e '(.direct_path_probe_confirmed_count // 0) >= 1' <<<"$metrics" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for ${service} direct path" >&2
+  agent_get "$service" /v1/paths >&2 || true
+  agent_get "$service" /v1/metrics >&2 || true
+  return 1
+}
+
+assert_vpn_route() {
+  local service="$1"
+  local remote_vpn_ip="$2"
+  rootless_e2e_compose exec -T "$service" sh -ec '
+    ip route get "$1" | grep -Eq " dev ipars0( |$)"
+  ' sh "$remote_vpn_ip"
+}
+
+assert_vpn_http() {
+  local service="$1"
+  local remote_vpn_ip="$2"
+  rootless_e2e_compose exec -T "$service" sh -ec '
+    curl --noproxy "*" --connect-timeout 5 --max-time 15 -fsS "http://${1}:9780/healthz" | grep -F '\''"status":"ok"'\'' >/dev/null
+  ' sh "$remote_vpn_ip"
+}
+
+agent_a_status="$(wait_for_agent_status agent)"
+agent_b_status="$(wait_for_agent_status agent-b)"
+agent_a_node="$(jq -er '.node_id' <<<"$agent_a_status")"
+agent_b_node="$(jq -er '.node_id' <<<"$agent_b_status")"
+agent_a_vpn_ip="$(jq -er '.vpn_ip' <<<"$agent_a_status")"
+agent_b_vpn_ip="$(jq -er '.vpn_ip' <<<"$agent_b_status")"
+if [[ "$agent_a_node" == "$agent_b_node" ]]; then
+  echo "rootless E2E agents registered the same node_id ${agent_a_node}" >&2
+  exit 1
+fi
+
+wait_for_agent_peer_map agent
+wait_for_agent_peer_map agent-b
+agent_post_peer_activity agent "$agent_b_node" >/dev/null
+agent_post_peer_activity agent-b "$agent_a_node" >/dev/null
+wait_for_agent_path agent "$agent_a_node" "$agent_b_node"
+wait_for_agent_path agent-b "$agent_b_node" "$agent_a_node"
+assert_vpn_route agent "$agent_b_vpn_ip"
+assert_vpn_route agent-b "$agent_a_vpn_ip"
+assert_vpn_http agent "$agent_b_vpn_ip"
+assert_vpn_http agent-b "$agent_a_vpn_ip"
+wait_for_direct_path agent "$agent_a_node" "$agent_b_node"
+wait_for_direct_path agent-b "$agent_b_node" "$agent_a_node"
+
+echo "Rootless Docker BoringTun two-agent VPN packet and direct-path smoke passed"

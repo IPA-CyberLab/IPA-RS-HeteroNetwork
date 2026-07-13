@@ -1,0 +1,216 @@
+services:
+  postgres:
+    ports: !reset []
+    networks:
+      default:
+        ipv4_address: 172.30.250.2
+
+  control-plane:
+    command: !override
+      - control-plane
+      - --listen
+      - 0.0.0.0:8443
+      - --cluster-id
+      - ${IPARS_ROOTLESS_CLUSTER_ID:?set IPARS_ROOTLESS_CLUSTER_ID}
+      - --issuer-node-id
+      - ${IPARS_ROOTLESS_ISSUER_NODE_ID:?set IPARS_ROOTLESS_ISSUER_NODE_ID}
+      - --issuer-key-id
+      - ${IPARS_ROOTLESS_ISSUER_KEY_ID:?set IPARS_ROOTLESS_ISSUER_KEY_ID}
+      - --issuer-public-key
+      - ${IPARS_ROOTLESS_ISSUER_PUBLIC_KEY:?set IPARS_ROOTLESS_ISSUER_PUBLIC_KEY}
+    environment: !override
+      IPARS_DATABASE_URL: postgres://ipars:ipars-dev@172.30.250.2:5432/ipars
+      IPARS_ROLE: control-plane
+      IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-control-plane-operator-api-bearer-token
+    networks:
+      default:
+        ipv4_address: 172.30.250.3
+    ports: !reset []
+
+  signal:
+    environment: !override
+      IPARS_ROLE: signal
+      IPARS_SIGNAL_CONTROL_PLANE_URLS: http://172.30.250.3:8443
+      IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-signal-operator-api-bearer-token
+      IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS: "120"
+    networks:
+      default:
+        ipv4_address: 172.30.250.4
+    ports: !reset []
+
+  stun:
+    environment: !override
+      IPARS_ROLE: stun
+      IPARS_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
+      IPARS_STUN_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-stun-operator-api-bearer-token
+    networks:
+      default:
+        ipv4_address: 172.30.250.5
+    ports: !reset []
+
+  relay:
+    environment: !override
+      IPARS_ROLE: relay
+      IPARS_RELAY_PUBLIC_ENDPOINT: 172.30.250.6:51820
+      IPARS_RELAY_ADMISSION_URL: http://172.30.250.6:9580
+      IPARS_RELAY_MAX_SESSIONS: "10000"
+      IPARS_RELAY_MAX_MBPS: "1000"
+      IPARS_RELAY_SESSION_TTL_SECONDS: "300"
+      IPARS_RELAY_ADMISSION_RATE_LIMIT: "4096"
+      IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: "60"
+      IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH: /run/secrets/ipars-relay-admission-bearer-token
+      IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/ipars-relay-operator-api-bearer-token
+    networks:
+      default:
+        ipv4_address: 172.30.250.6
+    ports: !reset []
+    cap_add: !reset []
+    devices: !reset []
+
+  agent:
+    build:
+      network: host
+    network_mode: !reset null
+    networks:
+      default:
+        ipv4_address: 172.30.250.11
+    command: !override
+      - agent
+      - --listen
+      - 0.0.0.0:9780
+      - --state-path
+      - /var/lib/ipars/agent.json
+      - --apply-peer-map
+      - --peer-map-poll-interval-seconds
+      - "1"
+      - --signal-path-interval-seconds
+      - "1"
+      - --heartbeat-interval-seconds
+      - "1"
+      - --stun-server
+      - 172.30.250.5:3478
+    environment: !override
+      IPARS_ROLE: agent
+      IPARS_AGENT_JOIN_TOKEN_PATH: /run/secrets/ipars-agent-join-token
+      IPARS_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/ipars-agent-api-bearer-token
+      IPARS_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      IPARS_AGENT_SIGNAL_URL: http://172.30.250.4:9443
+      IPARS_AGENT_STUN_BIND: 0.0.0.0:51821
+      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51821"
+      IPARS_AGENT_RUNTIME_BACKEND: linux-command
+      IPARS_AGENT_WIREGUARD_BACKEND: userspace-boringtun
+      IPARS_AGENT_ROUTE_BACKEND: command
+      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
+      IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
+      IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+    depends_on: !override
+      control-plane:
+        condition: service_healthy
+      signal:
+        condition: service_healthy
+      stun:
+        condition: service_healthy
+    ports: !reset []
+    cap_add: !override
+      - NET_ADMIN
+    devices: !override
+      - /dev/net/tun:/dev/net/tun
+    secrets: !override
+      - ipars-agent-join-token
+      - ipars-agent-api-bearer-token
+    volumes: !override
+      - rootless-agent-a:/var/lib/ipars
+
+  agent-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
+    entrypoint:
+      - /usr/local/bin/iparsd
+    network_mode: !reset null
+    networks:
+      default:
+        ipv4_address: 172.30.250.12
+    command:
+      - agent
+      - --listen
+      - 0.0.0.0:9780
+      - --state-path
+      - /var/lib/ipars/agent-b.json
+      - --apply-peer-map
+      - --peer-map-poll-interval-seconds
+      - "1"
+      - --signal-path-interval-seconds
+      - "1"
+      - --heartbeat-interval-seconds
+      - "1"
+      - --stun-server
+      - 172.30.250.5:3478
+    environment: !override
+      IPARS_ROLE: agent
+      IPARS_AGENT_JOIN_TOKEN_PATH: /run/secrets/ipars-agent-join-token
+      IPARS_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/ipars-agent-api-bearer-token
+      IPARS_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      IPARS_AGENT_SIGNAL_URL: http://172.30.250.4:9443
+      IPARS_AGENT_STUN_BIND: 0.0.0.0:51821
+      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51821"
+      IPARS_AGENT_RUNTIME_BACKEND: linux-command
+      IPARS_AGENT_WIREGUARD_BACKEND: userspace-boringtun
+      IPARS_AGENT_ROUTE_BACKEND: command
+      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
+      IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
+      IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      signal:
+        condition: service_healthy
+      stun:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9780/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    ports: !reset []
+    cap_add: !override
+      - NET_ADMIN
+    devices: !override
+      - /dev/net/tun:/dev/net/tun
+    secrets: !override
+      - ipars-agent-join-token
+      - ipars-agent-api-bearer-token
+    volumes: !override
+      - rootless-agent-b:/var/lib/ipars
+
+secrets:
+  ipars-control-plane-operator-api-bearer-token:
+    file: ${IPARS_ROOTLESS_CONTROL_PLANE_OPERATOR_TOKEN_FILE:?set IPARS_ROOTLESS_CONTROL_PLANE_OPERATOR_TOKEN_FILE}
+  ipars-signal-operator-api-bearer-token:
+    file: ${IPARS_ROOTLESS_SIGNAL_OPERATOR_TOKEN_FILE:?set IPARS_ROOTLESS_SIGNAL_OPERATOR_TOKEN_FILE}
+  ipars-stun-operator-api-bearer-token:
+    file: ${IPARS_ROOTLESS_STUN_OPERATOR_TOKEN_FILE:?set IPARS_ROOTLESS_STUN_OPERATOR_TOKEN_FILE}
+  ipars-relay-operator-api-bearer-token:
+    file: ${IPARS_ROOTLESS_RELAY_OPERATOR_TOKEN_FILE:?set IPARS_ROOTLESS_RELAY_OPERATOR_TOKEN_FILE}
+  ipars-relay-admission-bearer-token:
+    file: ${IPARS_ROOTLESS_RELAY_ADMISSION_TOKEN_FILE:?set IPARS_ROOTLESS_RELAY_ADMISSION_TOKEN_FILE}
+  ipars-agent-join-token:
+    file: ${IPARS_ROOTLESS_JOIN_TOKEN_FILE:?set IPARS_ROOTLESS_JOIN_TOKEN_FILE}
+  ipars-agent-api-bearer-token:
+    file: ${IPARS_ROOTLESS_AGENT_API_TOKEN_FILE:?set IPARS_ROOTLESS_AGENT_API_TOKEN_FILE}
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24
+
+volumes:
+  rootless-agent-a:
+  rootless-agent-b:
