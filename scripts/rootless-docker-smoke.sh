@@ -102,6 +102,7 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
       --exec-root="$tmp_dir/exec" \
       --pidfile="$daemon_pid_file" \
       --storage-driver=fuse-overlayfs \
+      --exec-opt=native.cgroupdriver=cgroupfs \
       --iptables=false \
       --dns=10.0.2.3 \
       --ip-forward=false
@@ -126,6 +127,7 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
       --exec-root="$tmp_dir/exec" \
       --pidfile="$daemon_pid_file" \
       --storage-driver=fuse-overlayfs \
+      --exec-opt=native.cgroupdriver=cgroupfs \
       --iptables=false \
       --dns=10.0.2.3 \
       --ip-forward=false
