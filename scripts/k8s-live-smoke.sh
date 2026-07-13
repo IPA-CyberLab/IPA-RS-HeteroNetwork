@@ -12,6 +12,7 @@ image_pull_policy="${IPARS_K8S_SMOKE_IMAGE_PULL_POLICY:-IfNotPresent}"
 agent_runtime_backend="${IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
 timeout_seconds="${IPARS_K8S_SMOKE_TIMEOUT_SECONDS:-300}"
 keep_resources="${IPARS_K8S_SMOKE_KEEP_RESOURCES:-0}"
+agent_host_network="${IPARS_K8S_SMOKE_AGENT_HOST_NETWORK:-true}"
 suffix="$$-$(date +%s%N)"
 namespace="${IPARS_K8S_SMOKE_NAMESPACE:-ipars-live-${suffix}}"
 release="${IPARS_K8S_SMOKE_RELEASE:-ipars-live-${suffix}}"
@@ -282,6 +283,10 @@ if [[ "$agent_runtime_backend" != "linux-command" && "$agent_runtime_backend" !=
   echo "IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
   exit 1
 fi
+if [[ "$agent_host_network" != "true" && "$agent_host_network" != "false" ]]; then
+  echo "IPARS_K8S_SMOKE_AGENT_HOST_NETWORK must be true or false" >&2
+  exit 1
+fi
 if [[ ! "$timeout_seconds" =~ ^[0-9]+$ || "$timeout_seconds" -lt 1 || "$timeout_seconds" -gt 1800 ]]; then
   echo "IPARS_K8S_SMOKE_TIMEOUT_SECONDS must be an integer between 1 and 1800" >&2
   exit 1
@@ -289,6 +294,12 @@ fi
 if [[ "$keep_resources" != "0" && "$keep_resources" != "1" ]]; then
   echo "IPARS_K8S_SMOKE_KEEP_RESOURCES must be 0 or 1" >&2
   exit 1
+fi
+
+if [[ "$agent_host_network" == "true" ]]; then
+  agent_dns_policy="ClusterFirstWithHostNet"
+else
+  agent_dns_policy="ClusterFirst"
 fi
 
 require_dns_label "$namespace" "IPARS_K8S_SMOKE_NAMESPACE" 63
@@ -497,8 +508,8 @@ agent_api_service_name="${chart_fullname}-agent"
   --set agent.apiService.targetPort=9780 \
   --set agent.peerMap.pollIntervalSeconds=2 \
   --set-string 'agent.tolerations[0].operator=Exists' \
-  --set agent.hostNetwork=false \
-  --set-string "agent.dnsPolicy=ClusterFirst" \
+  --set "agent.hostNetwork=${agent_host_network}" \
+  --set-string "agent.dnsPolicy=${agent_dns_policy}" \
   --set-string "agent.state.hostPath=${agent_state_path}" \
   --set-string "cluster.controlPlaneUrl=${control_plane_url}" \
   --set-string "cluster.signalUrl=${signal_url}" \
@@ -602,8 +613,8 @@ route_provider_node_id="${node_ids[0]}"
   --set agent.peerMap.pollIntervalSeconds=2 \
   --set agent.routeProvider=false \
   --set-string 'agent.tolerations[0].operator=Exists' \
-  --set agent.hostNetwork=false \
-  --set-string "agent.dnsPolicy=ClusterFirst" \
+  --set "agent.hostNetwork=${agent_host_network}" \
+  --set-string "agent.dnsPolicy=${agent_dns_policy}" \
   --set-string "agent.state.hostPath=${agent_state_path}" \
   --set-string "cluster.controlPlaneUrl=${control_plane_url}" \
   --set-string "cluster.signalUrl=${signal_url}" \

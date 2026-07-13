@@ -16,6 +16,7 @@ image_ref="${image_repository}:${image_tag}"
 cluster_wait_seconds="${IPARS_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS:-180}"
 agent_runtime_backend="${IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
 keep_cluster="${IPARS_KIND_K8S_SMOKE_KEEP_CLUSTER:-0}"
+agent_host_network="${IPARS_KIND_K8S_SMOKE_AGENT_HOST_NETWORK:-true}"
 tmp_dir=""
 cluster_requested=0
 image_built=0
@@ -67,6 +68,10 @@ if [[ ! "$cluster_wait_seconds" =~ ^[0-9]+$ || "$cluster_wait_seconds" -lt 30 ||
 fi
 if [[ "$agent_runtime_backend" != "linux-command" && "$agent_runtime_backend" != "dry-run" ]]; then
   echo "IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
+  exit 1
+fi
+if [[ "$agent_host_network" != "true" && "$agent_host_network" != "false" ]]; then
+  echo "IPARS_KIND_K8S_SMOKE_AGENT_HOST_NETWORK must be true or false" >&2
   exit 1
 fi
 if [[ "$keep_cluster" != "0" && "$keep_cluster" != "1" ]]; then
@@ -125,6 +130,25 @@ cluster_requested=1
   --kubeconfig "$kubeconfig" \
   --wait "${cluster_wait_seconds}s"
 
+if [[ "$agent_host_network" == "true" ]]; then
+  mapfile -t kind_nodes < <("$kind_bin" get nodes --name "$cluster_name")
+  if [[ ${#kind_nodes[@]} -eq 0 ]]; then
+    echo "kind cluster did not expose any nodes for forwarding setup" >&2
+    exit 1
+  fi
+  for kind_node in "${kind_nodes[@]}"; do
+    ipv4_forwarding="$("$docker_bin" exec "$kind_node" cat /proc/sys/net/ipv4/ip_forward)"
+    if [[ "$ipv4_forwarding" != "1" ]]; then
+      "$docker_bin" exec "$kind_node" sysctl -w net.ipv4.ip_forward=1 >/dev/null
+      ipv4_forwarding="$("$docker_bin" exec "$kind_node" cat /proc/sys/net/ipv4/ip_forward)"
+    fi
+    if [[ "$ipv4_forwarding" != "1" ]]; then
+      echo "kind node ${kind_node} did not enable IPv4 forwarding, got ${ipv4_forwarding:-<empty>}" >&2
+      exit 1
+    fi
+  done
+fi
+
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" \
   "$docker_bin" build -t "$image_ref" -f "$repo_root/docker/Dockerfile" "$repo_root"
 image_built=1
@@ -137,6 +161,7 @@ IPARS_K8S_SMOKE_IMAGE_REPOSITORY="$image_repository" \
 IPARS_K8S_SMOKE_IMAGE_TAG="$image_tag" \
 IPARS_K8S_SMOKE_IMAGE_PULL_POLICY=Never \
 IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND="$agent_runtime_backend" \
+IPARS_K8S_SMOKE_AGENT_HOST_NETWORK="$agent_host_network" \
 IPARS_K8S_SMOKE_KEEP_RESOURCES="$keep_cluster" \
 "$repo_root/scripts/k8s-live-smoke.sh"
 
