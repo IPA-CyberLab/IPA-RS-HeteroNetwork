@@ -49,7 +49,7 @@ cleanup() {
     wait "$daemon_pid" >/dev/null 2>&1 || true
   fi
   if [[ -n "$tmp_dir" ]]; then
-    rm -rf "$tmp_dir"
+    rm -rf "$tmp_dir" >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
@@ -180,6 +180,8 @@ services:
       - 0.0.0.0:51821
       - --wireguard-listen-port
       - "51821"
+      - --peer-probe-port
+      - "51822"
     cap_add: !override
       - NET_ADMIN
     devices: !override
