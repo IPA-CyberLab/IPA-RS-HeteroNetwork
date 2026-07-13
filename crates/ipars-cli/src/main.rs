@@ -5801,7 +5801,7 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
         || args.route_backend != "command";
     if has_docker_route_settings {
         anyhow::bail!(
-            "--rootless cannot be combined with Docker route or discovery settings because docker/compose.rootless.yaml removes NET_ADMIN and /dev/net/tun; remove Docker route flags or run a rootful route-provider agent for Docker container CIDR reachability"
+            "--rootless cannot be combined with Docker route or discovery settings because the rootless Compose contract does not expose the Docker host API or host route-provider boundary; remove Docker route flags or run a rootful route-provider agent for Docker container CIDR reachability"
         );
     }
     if args.relay_forwarder_netns.is_some() {

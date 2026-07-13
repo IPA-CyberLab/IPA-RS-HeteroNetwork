@@ -153,6 +153,46 @@ jobs:
           CARGO: cargo
         run: scripts/docker-smoke.sh
 
+  rootless-docker-smoke:
+    name: Rootless Docker BoringTun smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install rootless Docker helpers
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            docker-ce-rootless-extras \
+            fuse-overlayfs \
+            slirp4netns \
+            uidmap
+          user_name="$(id -un)"
+          if ! awk -F: -v user="$user_name" '$1 == user && $3 >= 65536 { found = 1 } END { exit !found }' /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 "$user_name"
+          fi
+          if ! awk -F: -v user="$user_name" '$1 == user && $3 >= 65536 { found = 1 } END { exit !found }' /etc/subgid; then
+            sudo usermod --add-subgids 100000-165535 "$user_name"
+          fi
+          command -v dockerd-rootless.sh
+          command -v rootlesskit
+          command -v slirp4netns
+          command -v fuse-overlayfs
+
+      - name: Enable TUN device
+        run: |
+          set -euo pipefail
+          sudo modprobe tun
+          sudo test -c /dev/net/tun
+
+      - name: Run rootless BoringTun Compose preflight
+        run: scripts/rootless-docker-smoke.sh
+
   load-smoke:
     name: Scale and daemon failover smoke
     runs-on: ubuntu-24.04

@@ -249,6 +249,19 @@ Run the repeatable Compose smoke with:
 scripts/docker-smoke.sh
 ```
 
+On a host configured for rootless Docker, run the rootless dataplane preflight
+with:
+
+```bash
+scripts/rootless-docker-smoke.sh
+```
+
+This starts an isolated rootless daemon, renders the rootless Compose overrides,
+and runs the real Agent container with in-process BoringTun, `/dev/net/tun`, and
+user-namespace `CAP_NET_ADMIN`. It does not replace the multi-node traffic smoke;
+Docker route discovery remains a separate route-provider concern for rootless
+deployments.
+
 The suite first validates the full management stack with non-mutating Agents, then starts a second stack with two concurrently initialized Control Planes sharing PostgreSQL, paired Signal/STUN services in the two Control Plane network namespaces, and two production `linux-command` Agents. The production phase discovers isolated IPv4 and dual-stack IPv6 workload bridge CIDRs before signing a multi-bootstrap route-authorized token, requires kernel WireGuard support, and verifies addresses, `AllowedIPs`/routes, handshakes, counters, and bidirectional workload HTTP. It stops the primary namespace, checks all three secondary service endpoints, repeats both address-family traffic checks, then changes a live Docker subnet through surviving heartbeat and peer-map reconciliation. Finally, it starts a third dry-run Agent only after failure and requires secondary STUN discovery, registration with a new VPN IP, Signal registration, heartbeat, peer-map sync, and an identity-signed peer-map query against the secondary Control Plane. The kernel Agents do not mount `/dev/net/tun`; that device is only needed when an operator deliberately selects a userspace WireGuard implementation that consumes TUN.
 
 ## Kubernetes
