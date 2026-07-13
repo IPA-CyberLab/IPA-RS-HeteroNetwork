@@ -240,10 +240,42 @@ networking resources. Rootless installs default to the in-process BoringTun
 backend and add `docker/compose.rootless-dataplane.yaml`; the rootless engine
 must be able to pass `/dev/net/tun` and grant `CAP_NET_ADMIN` inside the agent's
 user namespace. The agent fails preflight if that substrate is unavailable.
-Rootless Docker route discovery and container-CIDR route application remain
-unsupported; use a separate route-provider agent for that traffic. Use the
-explicit `dry-run` runtime when only management/control-plane validation is
-needed.
+The default rootless plan keeps Docker route discovery and container-CIDR route
+application disabled. Use the explicit shared-namespace route-provider contract
+when workload reachability is required:
+
+```bash
+docker network create --driver bridge ipars_workload
+ipars docker install \
+  --rootless \
+  --agent-runtime-backend linux-command \
+  --rootless-workload-network ipars_workload \
+  --docker-container-namespace compose-edge \
+  --docker-container-cidr 172.30.251.0/24
+```
+
+This adds `docker/compose.rootless-route-provider.yaml`. It puts the agent on
+the Compose default network and the existing external workload network, starts
+the bundled STUN sidecar in the agent namespace, and applies routes there with
+no Docker API or iptables mutation. A workload service in the supplied Compose
+manifest must use the agent namespace and must not declare `networks`:
+
+```yaml
+services:
+  workload:
+    network_mode: service:agent
+```
+
+Use `IPARS_ROOTLESS_AGENT_HTTP_PORT` and the `IPARS_ROOTLESS_STUN_*_PORT`
+variables when published ports need to move. Workloads sharing this namespace
+must avoid the published agent/STUN ports. The overlay's numeric relay/STUN
+defaults are suitable for the bundled Compose network; set
+`IPARS_AGENT_RELAY_PUBLIC_ENDPOINT` or `IPARS_ROOTLESS_STUN_SERVER` when using
+a different endpoint. This is an explicit one-agent/one-workload-namespace
+contract; arbitrary rootless Compose services that retain independent
+namespaces or require automatic multi-network attachment remain unsupported.
+Use the explicit `dry-run` runtime when only management/control-plane
+validation is needed.
 
 Run the repeatable Compose smoke with:
 

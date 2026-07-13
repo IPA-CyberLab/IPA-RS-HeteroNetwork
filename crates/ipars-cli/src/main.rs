@@ -103,6 +103,8 @@ const DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
+const DOCKER_ROOTLESS_ROUTE_PROVIDER_COMPOSE_FILE: &str =
+    "docker/compose.rootless-route-provider.yaml";
 const DOCKER_NETWORK_DRIVER_TEMPLATE: &str = "'{{.Driver}}'";
 const DOCKER_NETWORK_SUBNETS_TEMPLATE: &str =
     "'{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}} {{end}}{{end}}'";
@@ -695,6 +697,11 @@ struct DockerInstallArgs {
     project_name: String,
     #[arg(long, default_value_t = false)]
     rootless: bool,
+    #[arg(
+        long = "rootless-workload-network",
+        help = "Attach the rootless agent to an existing external Docker network and use its shared network namespace as the route-provider boundary"
+    )]
+    rootless_workload_network: Option<String>,
     #[arg(long, default_value_t = false)]
     docker_discover_networks: bool,
     #[arg(long = "docker-network")]
@@ -6028,7 +6035,11 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     }
     let mut notes = Vec::new();
     if args.rootless {
-        notes.push("The rootless agent service runs with host networking for colocated service access; the default linux-command runtime adds docker/compose.rootless-dataplane.yaml, which selects the in-process BoringTun backend and requests only the user-namespace-scoped CAP_NET_ADMIN plus /dev/net/tun".to_string());
+        if args.rootless_workload_network.is_some() {
+            notes.push("The rootless route-provider agent service leaves host networking, attaches to the Compose default network plus the external workload network, and uses service DNS for colocated control-plane, signal, and relay access; the default linux-command runtime adds docker/compose.rootless-dataplane.yaml, which selects the in-process BoringTun backend and requests only the user-namespace-scoped CAP_NET_ADMIN plus /dev/net/tun".to_string());
+        } else {
+            notes.push("The rootless agent service runs with host networking for colocated service access; the default linux-command runtime adds docker/compose.rootless-dataplane.yaml, which selects the in-process BoringTun backend and requests only the user-namespace-scoped CAP_NET_ADMIN plus /dev/net/tun".to_string());
+        }
     } else {
         notes.push("The agent service runs with host networking so it can manage WireGuard and Docker bridge routes".to_string());
     }
@@ -6058,7 +6069,12 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("Rootless Docker install plans add docker/compose.rootless.yaml; the default linux-command runtime also adds docker/compose.rootless-dataplane.yaml to request user-namespace CAP_NET_ADMIN and /dev/net/tun".to_string());
         if args.agent_runtime_backend == "linux-command" {
             notes.push("If the rootless engine cannot pass /dev/net/tun or grant user-namespace CAP_NET_ADMIN, startup fails during the agent WireGuard preflight instead of falling back to dry-run".to_string());
-            notes.push("The rootless BoringTun mode provides the overlay WireGuard interface but intentionally rejects Docker route/discovery settings; use a separate route-provider agent for Docker container CIDR reachability".to_string());
+            if let Some(network) = args.rootless_workload_network.as_deref() {
+                notes.push(format!("The rootless route-provider overlay attaches agent to the existing external Docker network `{network}` and applies Docker CIDR routes inside the agent/workload shared network namespace; workload services must use `network_mode: service:agent` and must not declare their own networks"));
+                notes.push("The rootless shared-network route-provider contract is explicit and does not mutate Docker networks or use iptables; use one workload namespace per agent and expose additional workloads through that namespace".to_string());
+            } else {
+                notes.push("The rootless BoringTun mode keeps Docker route/discovery disabled by default; pass --rootless-workload-network together with Docker CIDR/discovery settings to enable the explicit shared-network route-provider overlay".to_string());
+            }
         } else {
             notes.push("Pass --agent-runtime-backend linux-command to enable the rootless BoringTun data plane; explicit dry-run remains validation-only".to_string());
         }
@@ -6072,6 +6088,9 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let mut commands = Vec::new();
     if args.docker_discover_networks {
         commands.push(docker_api_socket_preflight_command(&args));
+    }
+    if let Some(network) = args.rootless_workload_network.as_deref() {
+        commands.push(rootless_workload_network_preflight_command(&args, network));
     }
     commands.push(format!("{compose_prefix} config"));
     commands.push(format!("{compose_prefix} up -d --build"));
@@ -6108,7 +6127,26 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
     if args.docker_discover_networks {
         files.push(DOCKER_DISCOVERY_COMPOSE_FILE.to_string());
     }
+    if args.rootless_workload_network.is_some() {
+        files.push(DOCKER_ROOTLESS_ROUTE_PROVIDER_COMPOSE_FILE.to_string());
+    }
     files
+}
+
+fn rootless_workload_network_preflight_command(args: &DockerInstallArgs, network: &str) -> String {
+    let docker_command = if let Some(socket) = args.docker_api_socket.as_ref() {
+        format!(
+            "docker --host {}",
+            shell_word(&format!("unix://{}", socket.display()))
+        )
+    } else {
+        "docker".to_string()
+    };
+    format!(
+        "{docker_command} network inspect {} >/dev/null 2>&1 || {{ echo \"rootless workload network {} was not found; create it before Compose startup\" >&2; exit 1; }}",
+        shell_word(network),
+        shell_word(network)
+    )
 }
 
 fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
@@ -6144,6 +6182,12 @@ fn docker_network_filter_preflight_command(network: &str) -> String {
 
 fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> {
     parse_agent_runtime_backend(&args.agent_runtime_backend).map_err(anyhow::Error::msg)?;
+    if let Some(network) = args.rootless_workload_network.as_deref() {
+        if !args.rootless {
+            anyhow::bail!("--rootless-workload-network requires --rootless");
+        }
+        validate_docker_network_filter(network)?;
+    }
     validate_linux_interface_name(&args.docker_host_interface)?;
     if let Some(namespace) = args.docker_container_namespace.as_deref() {
         validate_linux_namespace_name(namespace)?;
@@ -6269,9 +6313,23 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
         || args.disable_docker_expose_host_routes
         || args.docker_route_interval_seconds != DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS
         || args.route_backend != "command";
-    if has_docker_route_settings {
+    let has_route_provider_boundary = args.rootless_workload_network.is_some();
+    if has_docker_route_settings && !has_route_provider_boundary {
         anyhow::bail!(
-            "--rootless cannot be combined with Docker route or discovery settings because the rootless Compose contract does not expose the Docker host API or host route-provider boundary; remove Docker route flags or run a rootful route-provider agent for Docker container CIDR reachability"
+            "--rootless Docker route or discovery settings require --rootless-workload-network so the Compose plan has an explicit shared network-namespace route-provider boundary"
+        );
+    }
+    if has_route_provider_boundary && args.agent_runtime_backend != "linux-command" {
+        anyhow::bail!(
+            "--rootless-workload-network requires --agent-runtime-backend linux-command because dry-run does not apply routes"
+        );
+    }
+    if has_route_provider_boundary
+        && !args.docker_discover_networks
+        && args.docker_container_cidrs.is_empty()
+    {
+        anyhow::bail!(
+            "--rootless-workload-network requires at least one --docker-container-cidr unless --docker-discover-networks is set"
         );
     }
     if args.relay_forwarder_netns.is_some() {
@@ -6751,7 +6809,7 @@ fn validate_docker_network_filters(filters: &[String]) -> anyhow::Result<()> {
 }
 
 fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironment> {
-    let apply_docker_routes = !args.rootless;
+    let apply_docker_routes = !args.rootless || args.rootless_workload_network.is_some();
     let agent_wireguard_backend = if args.rootless && args.agent_runtime_backend == "linux-command"
     {
         "userspace-boringtun"
@@ -6909,6 +6967,12 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             environment.push(InstallEnvironment {
                 name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
                 value: container_cidrs,
+            });
+        }
+        if let Some(network) = args.rootless_workload_network.as_deref() {
+            environment.push(InstallEnvironment {
+                name: "IPARS_ROOTLESS_WORKLOAD_NETWORK".to_string(),
+                value: network.to_string(),
             });
         }
     }
@@ -12988,6 +13052,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -13037,6 +13102,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -13222,6 +13288,7 @@ fi
             compose_file: PathBuf::from("ops/compose file.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -13867,6 +13934,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: true,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14057,6 +14125,10 @@ fi
             .join("../../docker/compose.rootless-dataplane.yaml")
             .canonicalize()?;
         let rootless_dataplane = std::fs::read_to_string(rootless_dataplane_path)?;
+        let rootless_route_provider_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.rootless-route-provider.yaml")
+            .canonicalize()?;
+        let rootless_route_provider = std::fs::read_to_string(rootless_route_provider_path)?;
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
@@ -14181,6 +14253,31 @@ fi
         assert!(rootless_dataplane.contains("/dev/net/tun:/dev/net/tun"));
         assert!(rootless_dataplane.contains("IPARS_AGENT_WIREGUARD_BACKEND=userspace-boringtun"));
         assert!(rootless_dataplane.contains("IPARS_AGENT_RUNTIME_BACKEND=linux-command"));
+        assert!(rootless_dataplane.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=false"));
+        assert!(rootless_dataplane.contains("IPARS_DOCKER_DISCOVER_NETWORKS=false"));
+        assert!(rootless_route_provider.contains("network_mode: !reset null"));
+        assert!(rootless_route_provider.contains("command: !override"));
+        assert!(rootless_route_provider
+            .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-true}"));
+        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_NETWORKS\n"));
+        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_CONTAINER_CIDRS\n"));
+        assert!(rootless_route_provider.contains("${IPARS_ROOTLESS_STUN_SERVER:-127.0.0.1:3478}"));
+        assert!(rootless_route_provider.contains(
+            "IPARS_AGENT_CONTROL_PLANE_URL=${IPARS_ROOTLESS_CONTROL_PLANE_URL:-http://control-plane:8443}"
+        ));
+        assert!(rootless_route_provider
+            .contains("IPARS_AGENT_SIGNAL_URL=${IPARS_ROOTLESS_SIGNAL_URL:-http://signal:9443}"));
+        assert!(rootless_route_provider.contains("network_mode: service:agent"));
+        assert!(rootless_route_provider.contains(
+            "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-172.31.254.5:51820}"
+        ));
+        assert!(rootless_route_provider
+            .contains("ipv4_address: ${IPARS_ROOTLESS_RELAY_ADDRESS:-172.31.254.5}"));
+        assert!(rootless_route_provider.contains("${IPARS_ROOTLESS_AGENT_HTTP_PORT:-9780}:9780"));
+        assert!(rootless_route_provider.contains(
+            "name: ${IPARS_ROOTLESS_WORKLOAD_NETWORK:?set IPARS_ROOTLESS_WORKLOAD_NETWORK}"
+        ));
+        assert!(rootless_route_provider.contains("external: true"));
         Ok(())
     }
 
@@ -14190,6 +14287,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
@@ -14286,6 +14384,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: vec!["edge_default".to_string()],
             docker_api_socket: None,
@@ -14338,6 +14437,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: vec!["edge_default".to_string()],
             docker_api_socket: None,
@@ -14390,6 +14490,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: vec!["edge/default".to_string()],
             docker_api_socket: None,
@@ -14454,6 +14555,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14524,6 +14626,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: false,
+            rootless_workload_network: None,
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14631,6 +14734,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: true,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14683,6 +14787,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: true,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14735,6 +14840,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: true,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14789,6 +14895,7 @@ fi
             compose_file: PathBuf::from("ops/compose.yaml"),
             project_name: "edge".to_string(),
             rootless: true,
+            rootless_workload_network: None,
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
@@ -14979,7 +15086,7 @@ fi
     }
 
     #[test]
-    fn docker_install_plan_rejects_rootless_docker_route_settings() -> anyhow::Result<()> {
+    fn docker_install_plan_validates_rootless_docker_route_settings() -> anyhow::Result<()> {
         let static_routes = match docker_install_plan(DockerInstallArgs {
             rootless: true,
             docker_container_namespace: Some("compose-edge".to_string()),
@@ -14991,7 +15098,7 @@ fi
         };
         assert!(static_routes
             .to_string()
-            .contains("--rootless cannot be combined with Docker route or discovery settings"));
+            .contains("require --rootless-workload-network"));
 
         let discovery = match docker_install_plan(DockerInstallArgs {
             rootless: true,
@@ -15004,7 +15111,56 @@ fi
         };
         assert!(discovery
             .to_string()
-            .contains("--rootless cannot be combined with Docker route or discovery settings"));
+            .contains("require --rootless-workload-network"));
+
+        let route_provider = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            rootless_workload_network: Some("edge_workload".to_string()),
+            docker_container_namespace: Some("compose-edge".to_string()),
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            ..docker_install_test_args()
+        })?;
+        assert!(route_provider.commands[0].contains("docker network inspect edge_workload"));
+        assert!(route_provider.commands[1]
+            .contains("-f docker/compose.rootless-route-provider.yaml config"));
+        assert_eq!(
+            environment_value(&route_provider, "IPARS_AGENT_APPLY_DOCKER_ROUTES"),
+            Some("true")
+        );
+        assert_eq!(
+            environment_value(&route_provider, "IPARS_ROOTLESS_WORKLOAD_NETWORK"),
+            Some("edge_workload")
+        );
+        assert!(route_provider.notes.iter().any(|note| {
+            note.contains("network_mode: service:agent")
+                && note.contains("shared network namespace")
+        }));
+
+        let socket_route_provider = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            rootless_workload_network: Some("edge_workload".to_string()),
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string()],
+            docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
+            ..docker_install_test_args()
+        })?;
+        assert!(socket_route_provider.commands[1].contains(
+            "docker --host unix:///run/user/1000/docker.sock network inspect edge_workload"
+        ));
+
+        let dry_run = match docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            rootless_workload_network: Some("edge_workload".to_string()),
+            docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
+            agent_runtime_backend: "dry-run".to_string(),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("rootless route provider should require linux-command"),
+            Err(error) => error,
+        };
+        assert!(dry_run
+            .to_string()
+            .contains("requires --agent-runtime-backend linux-command"));
 
         let userspace_command = match docker_install_plan(DockerInstallArgs {
             rootless: true,
@@ -19056,6 +19212,8 @@ fi
             "--project-name",
             "edge",
             "--rootless",
+            "--rootless-workload-network",
+            "edge_workload",
             "--docker-discover-networks",
             "--docker-network",
             "edge_default",
@@ -19096,6 +19254,10 @@ fi
             assert_eq!(args.compose_file, PathBuf::from("ops/compose.yaml"));
             assert_eq!(args.project_name, "edge");
             assert!(args.rootless);
+            assert_eq!(
+                args.rootless_workload_network.as_deref(),
+                Some("edge_workload")
+            );
             assert!(args.docker_discover_networks);
             assert_eq!(args.docker_networks, vec!["edge_default", "edge_apps"]);
             assert_eq!(
