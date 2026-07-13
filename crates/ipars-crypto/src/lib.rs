@@ -8,7 +8,9 @@ use ipars_types::api::{
     RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
     SignalNodeUpsertRequest, SignalPathRequest,
 };
-use ipars_types::{ClusterId, JoinTokenClaims, NodeId, SignedJoinToken};
+use ipars_types::{
+    ClusterId, JoinTokenBootstrapValidationError, JoinTokenClaims, NodeId, SignedJoinToken,
+};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -28,6 +30,8 @@ pub enum CryptoError {
     InvalidRequestNonce,
     #[error("token serialization failed")]
     TokenSerialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    InvalidJoinTokenBootstrap(#[from] JoinTokenBootstrapValidationError),
     #[error("token is not valid at {0}")]
     TokenTime(DateTime<Utc>),
     #[error("token cluster mismatch: expected {expected}, got {actual}")]
@@ -78,6 +82,7 @@ impl IdentityKeyPair {
     }
 
     pub fn sign_join_token(&self, claims: JoinTokenClaims) -> Result<SignedJoinToken, CryptoError> {
+        claims.validate_bootstrap_endpoints()?;
         let payload = serde_json::to_vec(&claims)?;
         let signature = self.signing_key.sign(&payload);
         Ok(SignedJoinToken {
@@ -237,6 +242,7 @@ pub fn verify_join_token(
     now: DateTime<Utc>,
     expected_cluster: &ClusterId,
 ) -> Result<(), CryptoError> {
+    token.claims.validate_bootstrap_endpoints()?;
     if !token.claims.is_time_valid(now) {
         return Err(CryptoError::TokenTime(now));
     }
@@ -477,6 +483,7 @@ mod tests {
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord,
         PathMetrics, PathQualityObservation, PathState, Role, Tag, TokenPolicy, VpnIp,
+        MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
     };
 
     use super::*;
@@ -506,6 +513,46 @@ mod tests {
 
         let token = issuer.sign_join_token(claims)?;
         verify_join_token(&token, &issuer.public_key_b64(), now, &cluster_id)
+    }
+
+    #[test]
+    fn token_signing_and_verification_reject_unbounded_bootstrap_sets() -> Result<(), CryptoError> {
+        let issuer = IdentityKeyPair::generate();
+        let cluster_id = ClusterId::new();
+        let now = Utc::now();
+        let mut claims = JoinTokenClaims {
+            cluster_id: cluster_id.clone(),
+            bootstrap_endpoints: vec![BootstrapEndpoint {
+                url: "https://control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            }],
+            expires_at: now + Duration::hours(1),
+            not_before: now - Duration::seconds(5),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            issuer: issuer.node_id(),
+            key_id: KeyId::from_string("root"),
+            policy: TokenPolicy::default(),
+            nonce: "nonce-bounded-bootstrap".to_string(),
+        };
+        let mut token = issuer.sign_join_token(claims.clone())?;
+        claims.bootstrap_endpoints = (0..=MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+            .map(|index| BootstrapEndpoint {
+                url: format!("https://control-{index}.example:8443"),
+                kind: BootstrapEndpointKind::ControlPlane,
+            })
+            .collect();
+        assert!(matches!(
+            issuer.sign_join_token(claims.clone()),
+            Err(CryptoError::InvalidJoinTokenBootstrap(_))
+        ));
+
+        token.claims = claims;
+        assert!(matches!(
+            verify_join_token(&token, &issuer.public_key_b64(), now, &cluster_id),
+            Err(CryptoError::InvalidJoinTokenBootstrap(_))
+        ));
+        Ok(())
     }
 
     #[test]

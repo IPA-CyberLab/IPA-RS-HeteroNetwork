@@ -18,7 +18,7 @@ Implemented controls:
 
 - token TTL is capped at 30 days;
 - tags are bounded and path-safe;
-- bootstrap endpoints are typed and validated before signing;
+- bootstrap endpoints are typed and validated before signing and after parsing: at most 32 total, 8 per service kind, and 2048 bytes per URL, with duplicate, control-character, userinfo, query, fragment, scheme/kind mismatch, and unusable numeric-address rejection;
 - unsafe, duplicate, non-canonical, and overlapping route allowlists are rejected;
 - relay permission is explicit;
 - control-plane token ledgers persist max-use and revocation state;

@@ -93,6 +93,7 @@ use ipars_types::{
     ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
     NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
     Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -120,6 +121,7 @@ const CAP_SYS_ADMIN_BIT: u8 = 21;
 const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_AGENT_STUN_SERVERS: usize = MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND;
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
@@ -11812,9 +11814,13 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
     let Some(token) = raw_agent_join_token(args)? else {
         return Ok(None);
     };
-    serde_json::from_str(&token)
-        .map(Some)
-        .context("agent join token must be JSON signed token")
+    let token: SignedJoinToken =
+        serde_json::from_str(&token).context("agent join token must be JSON signed token")?;
+    token
+        .claims
+        .validate_bootstrap_endpoints()
+        .context("agent join token bootstrap validation failed")?;
+    Ok(Some(token))
 }
 
 fn agent_api_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
@@ -14900,6 +14906,14 @@ fn control_plane_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
+    if override_url.is_none() {
+        if let Some(token) = token {
+            token
+                .claims
+                .validate_bootstrap_endpoints()
+                .context("agent join token bootstrap validation failed")?;
+        }
+    }
     let (base_urls, name) = if let Some(url) = override_url {
         (vec![url.to_string()], "control-plane URL")
     } else if let Some(token) = token {
@@ -14970,6 +14984,14 @@ fn signal_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
+    if override_url.is_none() {
+        if let Some(token) = token {
+            token
+                .claims
+                .validate_bootstrap_endpoints()
+                .context("agent join token bootstrap validation failed")?;
+        }
+    }
     let (base_urls, name) = if let Some(url) = override_url {
         (vec![url.to_string()], "signal URL")
     } else if let Some(token) = token {
@@ -15006,18 +15028,36 @@ async fn agent_stun_servers(
         }
         servers.push(*server);
     }
+    servers = dedupe_socket_addrs_preserve_order(servers);
+    anyhow::ensure!(
+        servers.len() <= MAX_AGENT_STUN_SERVERS,
+        "--stun-server may contain at most {MAX_AGENT_STUN_SERVERS} unique socket addresses"
+    );
     if let Some(token) = token {
+        token
+            .claims
+            .validate_bootstrap_endpoints()
+            .context("agent join token bootstrap validation failed")?;
         for endpoint in token
             .claims
             .bootstrap_endpoints
             .iter()
             .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
         {
-            servers
-                .extend(resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await?);
+            if servers.len() == MAX_AGENT_STUN_SERVERS {
+                break;
+            }
+            for addr in resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await? {
+                if !servers.contains(&addr) {
+                    servers.push(addr);
+                    if servers.len() == MAX_AGENT_STUN_SERVERS {
+                        break;
+                    }
+                }
+            }
         }
     }
-    Ok(dedupe_socket_addrs_preserve_order(servers))
+    Ok(servers)
 }
 
 async fn resolve_udp_bootstrap_socket_addrs(
@@ -15035,13 +15075,29 @@ async fn resolve_udp_bootstrap_socket_addrs(
     let port = parsed
         .port()
         .with_context(|| format!("{name} must include a port"))?;
-    let addrs = tokio::net::lookup_host((host, port))
+    let resolved = tokio::net::lookup_host((host, port))
         .await
-        .with_context(|| format!("failed to resolve {name} {url}"))?
-        .filter(|addr| endpoint_addr_is_usable(*addr))
-        .collect::<Vec<_>>();
+        .with_context(|| format!("failed to resolve {name} {url}"))?;
+    let mut addrs = Vec::new();
+    for addr in resolved.filter(|addr| endpoint_addr_is_usable(*addr)) {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+            if addrs.len() > MAX_AGENT_STUN_SERVERS {
+                break;
+            }
+        }
+    }
     if addrs.is_empty() {
         anyhow::bail!("{name} {url} resolved to no usable socket addresses");
+    }
+    if addrs.len() > MAX_AGENT_STUN_SERVERS {
+        tracing::warn!(
+            endpoint = %url,
+            resolved = addrs.len(),
+            retained = MAX_AGENT_STUN_SERVERS,
+            "truncating STUN bootstrap DNS results"
+        );
+        addrs.truncate(MAX_AGENT_STUN_SERVERS);
     }
     Ok(addrs)
 }
@@ -17949,6 +18005,29 @@ mod tests {
         }
 
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[test]
+    fn agent_join_token_rejects_unbounded_bootstrap_endpoints() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(
+            (0..=MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+                .map(|index| BootstrapEndpoint {
+                    url: format!("https://control-{index}.example:8443"),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                })
+                .collect(),
+        );
+        let token = serde_json::to_string(&token)?;
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--join-token", token.as_str()])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match agent_join_token(&args) {
+            Ok(_) => anyhow::bail!("unbounded token bootstrap endpoints should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("endpoint count 9 exceeds maximum 8"));
+        Ok(())
     }
 
     #[test]
@@ -30027,9 +30106,7 @@ exec sleep 60
             Ok(_) => anyhow::bail!("non-HTTP control-plane bootstrap should be rejected"),
             Err(error) => error,
         };
-        assert!(error
-            .to_string()
-            .contains("control-plane bootstrap endpoint must use http or https"));
+        assert!(format!("{error:#}").contains("does not match its control_plane service kind"));
         Ok(())
     }
 
@@ -30162,9 +30239,7 @@ exec sleep 60
             Ok(_) => anyhow::bail!("non-HTTP signal bootstrap should be rejected"),
             Err(error) => error,
         };
-        assert!(error
-            .to_string()
-            .contains("signal bootstrap endpoint must use http or https"));
+        assert!(format!("{error:#}").contains("does not match its signal service kind"));
         Ok(())
     }
 
@@ -30238,7 +30313,7 @@ exec sleep 60
             Ok(_) => anyhow::bail!("invalid STUN bootstrap should be rejected"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("STUN bootstrap must use udp"));
+        assert!(format!("{error:#}").contains("does not match its stun service kind"));
 
         let unusable_token = token_with_bootstrap(vec![BootstrapEndpoint {
             url: "udp://0.0.0.0:3478".to_string(),
@@ -30248,9 +30323,29 @@ exec sleep 60
             Ok(_) => anyhow::bail!("unusable STUN bootstrap should be rejected"),
             Err(error) => error,
         };
+        let message = format!("{error:#}");
+        assert!(message.contains("uses an unusable address"), "{message}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_reject_too_many_explicit_servers() -> anyhow::Result<()> {
+        let mut argv = vec!["iparsd".to_string(), "agent".to_string()];
+        for index in 1..=MAX_AGENT_STUN_SERVERS + 1 {
+            argv.push("--stun-server".to_string());
+            argv.push(format!("203.0.113.{index}:3478"));
+        }
+        let cli = Cli::try_parse_from(argv)?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match agent_stun_servers(&args, None).await {
+            Ok(_) => anyhow::bail!("unbounded explicit STUN server set should be rejected"),
+            Err(error) => error,
+        };
         assert!(error
             .to_string()
-            .contains("resolved to no usable socket addresses"));
+            .contains("at most 8 unique socket addresses"));
         Ok(())
     }
 

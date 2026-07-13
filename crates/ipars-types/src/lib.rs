@@ -155,13 +155,154 @@ pub struct BootstrapEndpoint {
     pub kind: BootstrapEndpointKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS: usize = 32;
+pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND: usize = 8;
+pub const MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES: usize = 2048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapEndpointKind {
     ControlPlane,
     Signal,
     Stun,
     Relay,
+}
+
+impl Display for BootstrapEndpointKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ControlPlane => "control_plane",
+            Self::Signal => "signal",
+            Self::Stun => "stun",
+            Self::Relay => "relay",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinTokenBootstrapValidationError {
+    reason: String,
+}
+
+impl JoinTokenBootstrapValidationError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl Display for JoinTokenBootstrapValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join token bootstrap endpoints are invalid: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for JoinTokenBootstrapValidationError {}
+
+pub fn validate_join_token_bootstrap_endpoints(
+    endpoints: &[BootstrapEndpoint],
+) -> Result<(), JoinTokenBootstrapValidationError> {
+    if endpoints.len() > MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS {
+        return Err(JoinTokenBootstrapValidationError::new(format!(
+            "endpoint count {} exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS}",
+            endpoints.len()
+        )));
+    }
+
+    let mut counts = BTreeMap::<BootstrapEndpointKind, usize>::new();
+    let mut seen = BTreeSet::<(BootstrapEndpointKind, String)>::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let count = counts.entry(endpoint.kind).or_default();
+        *count += 1;
+        if *count > MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "{} endpoint count {} exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND}",
+                endpoint.kind, *count
+            )));
+        }
+        if endpoint.url.is_empty() {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} URL is empty"
+            )));
+        }
+        if endpoint.url.len() > MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} URL exceeds {MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES} bytes"
+            )));
+        }
+        if endpoint.url.chars().any(char::is_control) {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} URL contains control characters"
+            )));
+        }
+
+        let parsed = url::Url::parse(&endpoint.url).map_err(|_| {
+            JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} is not an absolute URL"
+            ))
+        })?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} must not include userinfo, query, or fragment components"
+            )));
+        }
+        let valid = match endpoint.kind {
+            BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::Signal => {
+                http_url_is_usable_endpoint(&endpoint.url)
+            }
+            BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay => {
+                udp_bootstrap_url_is_usable(&parsed)
+            }
+        };
+        if !valid {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} does not match its {} service kind or uses an unusable address",
+                endpoint.kind
+            )));
+        }
+
+        let normalized = parsed.as_str().trim_end_matches('/').to_string();
+        if !seen.insert((endpoint.kind, normalized)) {
+            return Err(JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} duplicates an earlier {} endpoint",
+                endpoint.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn udp_bootstrap_url_is_usable(url: &url::Url) -> bool {
+    if url.scheme() != "udp" || url.port().is_none() || !matches!(url.path(), "" | "/") {
+        return false;
+    }
+    let Some(host) = url.host() else {
+        return false;
+    };
+    let Some(port) = url.port() else {
+        return false;
+    };
+    match host {
+        url::Host::Domain(domain) => match domain.parse::<IpAddr>() {
+            Ok(ip) => endpoint_addr_is_usable(SocketAddr::new(ip, port)),
+            Err(_) => !domain.is_empty(),
+        },
+        url::Host::Ipv4(ip) => endpoint_addr_is_usable(SocketAddr::new(IpAddr::V4(ip), port)),
+        url::Host::Ipv6(ip) => endpoint_addr_is_usable(SocketAddr::new(IpAddr::V6(ip), port)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -969,6 +1110,10 @@ pub struct JoinTokenClaims {
 impl JoinTokenClaims {
     pub fn is_time_valid(&self, now: DateTime<Utc>) -> bool {
         now >= self.not_before && now < self.expires_at
+    }
+
+    pub fn validate_bootstrap_endpoints(&self) -> Result<(), JoinTokenBootstrapValidationError> {
+        validate_join_token_bootstrap_endpoints(&self.bootstrap_endpoints)
     }
 }
 
@@ -17488,6 +17633,102 @@ mod tests {
             assert!(
                 !relay_admission_url_is_usable(url),
                 "{url} should be unusable"
+            );
+        }
+    }
+
+    #[test]
+    fn join_token_bootstrap_validation_bounds_and_validates_endpoints() {
+        let valid = vec![
+            BootstrapEndpoint {
+                url: "https://control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://signal.example:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "udp://stun.example:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://relay.example:51820".to_string(),
+                kind: BootstrapEndpointKind::Relay,
+            },
+        ];
+        assert!(validate_join_token_bootstrap_endpoints(&valid).is_ok());
+
+        let too_many_for_kind = (0..=MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+            .map(|index| BootstrapEndpoint {
+                url: format!("https://control-{index}.example:8443"),
+                kind: BootstrapEndpointKind::ControlPlane,
+            })
+            .collect::<Vec<_>>();
+        let error = match validate_join_token_bootstrap_endpoints(&too_many_for_kind) {
+            Ok(()) => panic!("per-kind endpoint limit should be enforced"),
+            Err(error) => error,
+        };
+        assert!(error.reason().contains("control_plane endpoint count"));
+
+        let too_many_total = (0..=MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS)
+            .map(|index| BootstrapEndpoint {
+                url: format!("https://bootstrap-{index}.example:8443"),
+                kind: BootstrapEndpointKind::ControlPlane,
+            })
+            .collect::<Vec<_>>();
+        let error = match validate_join_token_bootstrap_endpoints(&too_many_total) {
+            Ok(()) => panic!("total endpoint limit should be enforced"),
+            Err(error) => error,
+        };
+        assert!(error
+            .reason()
+            .contains("endpoint count 33 exceeds maximum 32"));
+
+        let duplicate = vec![
+            BootstrapEndpoint {
+                url: "https://control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://control.example:8443/".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ];
+        let error = match validate_join_token_bootstrap_endpoints(&duplicate) {
+            Ok(()) => panic!("normalized duplicate endpoint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.reason().contains("duplicates"));
+
+        for invalid in [
+            BootstrapEndpoint {
+                url: "udp://control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "udp://stun.example:3478/path".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://0.0.0.0:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "https://user@control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: format!(
+                    "https://{}.example:8443",
+                    "a".repeat(MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES)
+                ),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ] {
+            assert!(
+                validate_join_token_bootstrap_endpoints(&[invalid]).is_err(),
+                "invalid bootstrap endpoint should be rejected"
             );
         }
     }

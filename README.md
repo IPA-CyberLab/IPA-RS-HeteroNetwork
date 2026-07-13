@@ -6,7 +6,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 
 - a Rust workspace split by control plane, signal, relay, STUN, agent, route manager, crypto, shared types, and CLI boundaries
 - typed node, peer, path, relay, token, policy, ACL, route, and health models
-- signed join token creation and verification primitives
+- signed join token creation and verification with shared bootstrap validation capped at 32 endpoints total, 8 per service kind, and 2048 bytes per absolute typed URL
 - pair-scoped path state and scoring primitives
 - control-plane registration/IP-allocation service that skips already assigned VPN IPs and retries after durable-store insert races
 - SQLite and PostgreSQL control-plane store implementations with typed node-ID/VPN-IP uniqueness guards and transaction-locked PostgreSQL schema initialization for concurrent HA startup
@@ -17,7 +17,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - typed control-plane HTTP routes for health, join registration, trusted-issuer-signed token revocation, signed node removal, signed WireGuard key rotation, identity-signed and replay-protected ACL-filtered peer-map/path-status retrieval, and Bearer-protected policy plus JSON/Prometheus operator metrics including VPN pool and join-token ledger gauges
 - `iparsd control-plane` daemon for serving the control-plane HTTP API with in-memory, SQLite, or PostgreSQL stores
 - signal registry, node-identity-signed and replay-protected signal HTTP routes, JSON/Prometheus metrics, and `iparsd signal` for endpoint candidate exchange, path negotiation, and hole-punch planning
-- RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, partial-outage-tolerant multi-server NAT mapping/filtering classification, and `iparsd stun` daemon for public endpoint detection
+- RFC 5389 STUN Binding request/response handling, RFC 5780 change-request/other-address probes, partial-outage-tolerant multi-server NAT mapping/filtering classification, bounded discovery of at most 8 unique usable STUN server sockets, and `iparsd stun` daemon for public endpoint detection
 - relay session admission/status HTTP API with optional Bearer-token admission gating, configurable admission burst limiting that also covers unauthorized admission attempts, Prometheus relay metrics with cumulative dataplane/drop counters, expiring credentialed non-empty opaque UDP payload forwarding with per-session rate limits, bounded relay-frame metadata/payload sizes, and `iparsd relay`
 - control-plane relay maps and relay-candidate metrics that require relay policy, capacity, E2E-only mode, and a fresh healthy heartbeat within the configured relay health TTL
 - `ipars join <token>` now builds a typed join request, generates node keys, and posts to the token's control-plane bootstrap endpoints with ordered failover

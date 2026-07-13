@@ -21,10 +21,10 @@ use ipars_types::api::{
     RelayAdmissionResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, http_url_is_usable_endpoint, BootstrapEndpoint, BootstrapEndpointKind,
-    CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId,
-    NatProbeObservation, NodeId, PathMetrics, PathState, Role, Route, SignedJoinToken, Tag,
-    TokenPolicy,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, validate_join_token_bootstrap_endpoints,
+    BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
+    EndpointCandidateKind, JoinTokenClaims, KeyId, NatProbeObservation, NodeId, PathMetrics,
+    PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1917,6 +1917,10 @@ fn reject_multi_linked_log(path: &Path, metadata: &std::fs::Metadata) -> anyhow:
 async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
     let token: SignedJoinToken =
         serde_json::from_str(&args.token).context("join token must be JSON signed token")?;
+    token
+        .claims
+        .validate_bootstrap_endpoints()
+        .context("join token bootstrap validation failed")?;
     let identity = IdentityKeyPair::generate();
     let wireguard = WireGuardKeyPair::generate();
     let control_plane_urls = control_plane_join_urls(&token, args.control_plane_url.as_deref())?;
@@ -2059,6 +2063,7 @@ fn token_create_bootstrap_endpoints(
             "--relay-bootstrap",
         )?);
     }
+    validate_join_token_bootstrap_endpoints(&endpoints)?;
     Ok(endpoints)
 }
 
@@ -5230,7 +5235,7 @@ fn claims(
         ..TokenPolicy::default()
     };
 
-    Ok(JoinTokenClaims {
+    let claims = JoinTokenClaims {
         cluster_id,
         bootstrap_endpoints,
         expires_at: now + ttl,
@@ -5241,7 +5246,9 @@ fn claims(
         key_id: issuer.key_id,
         policy,
         nonce: format!("nonce-{}", now.timestamp_nanos_opt().unwrap_or_default()),
-    })
+    };
+    claims.validate_bootstrap_endpoints()?;
+    Ok(claims)
 }
 
 fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
@@ -9984,16 +9991,16 @@ mod tests {
 
     #[test]
     fn join_urls_reject_unusable_control_plane_endpoints() -> anyhow::Result<()> {
-        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+        let error = match token_with_bootstrap(vec![BootstrapEndpoint {
             url: "http://0.0.0.0:8443".to_string(),
             kind: BootstrapEndpointKind::ControlPlane,
-        }])?;
-        let error = match control_plane_join_urls(&token, None) {
-            Ok(_) => panic!("unusable token control-plane bootstrap should be rejected"),
+        }]) {
+            Ok(_) => panic!("unusable token control-plane bootstrap should fail before signing"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("control-plane bootstrap URL"));
-        assert!(error.to_string().contains("usable non-unspecified"));
+        assert!(error
+            .to_string()
+            .contains("does not match its control_plane service kind"));
 
         let token = token_with_bootstrap(Vec::new())?;
         let error = match control_plane_join_url(&token, Some("udp://127.0.0.1:8443")) {
@@ -10315,6 +10322,52 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn token_create_rejects_unbounded_or_duplicate_bootstrap_endpoints() {
+        let control_plane_bootstrap_endpoints = (0
+            ..=ipars_types::MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+            .map(|index| format!("https://control-{index}.example:8443"))
+            .collect();
+        let args = TokenCreateArgs {
+            cluster_id: Some("cluster-a".to_string()),
+            issuer_key_id: "root".to_string(),
+            issuer_private_key_b64: None,
+            issuer_private_key_path: None,
+            role: "edge".to_string(),
+            tags: Vec::new(),
+            allowed_routes: Vec::new(),
+            ttl_seconds: 300,
+            bootstrap_endpoints: Vec::new(),
+            control_plane_bootstrap_endpoints,
+            signal_bootstrap_endpoints: Vec::new(),
+            stun_bootstrap_endpoints: Vec::new(),
+            relay_bootstrap_endpoints: Vec::new(),
+            allow_relay: false,
+            max_uses: Some(1),
+            unlimited_uses: false,
+        };
+        let error = match token_create_bootstrap_endpoints(&args) {
+            Ok(_) => panic!("unbounded control-plane bootstrap set should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("endpoint count 9 exceeds maximum 8"));
+
+        let duplicate = TokenCreateArgs {
+            control_plane_bootstrap_endpoints: vec![
+                "https://control.example:8443".to_string(),
+                "https://control.example:8443/".to_string(),
+            ],
+            ..args
+        };
+        let error = match token_create_bootstrap_endpoints(&duplicate) {
+            Ok(_) => panic!("normalized duplicate bootstrap should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("duplicates"));
     }
 
     #[test]
