@@ -37,10 +37,10 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, CandidateSource, ClusterPolicy, EndpointCandidate,
-    EndpointCandidateKind, NatClassification, NatProbeObservation, NodeId, NodeRecord,
-    PathChangeEvent, PathChangeKind, PathQualityObservation, PathRecord, PathScore, PathState,
-    Role, Route, Tag, VpnIp,
+    endpoint_addr_is_usable, validate_join_token_bootstrap_endpoints, BootstrapEndpoint,
+    CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
+    NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
+    PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -128,6 +128,10 @@ pub struct AgentNodeState {
     pub wireguard_public_key_b64: String,
     #[serde(default)]
     pub vpn_ip: Option<VpnIp>,
+    #[serde(default)]
+    pub registered_node: Option<NodeRecord>,
+    #[serde(default)]
+    pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -143,6 +147,8 @@ impl AgentNodeState {
             wireguard_private_key_b64: wireguard.private_key_b64,
             wireguard_public_key_b64: wireguard.public_key_b64,
             vpn_ip: None,
+            registered_node: None,
+            bootstrap_endpoints: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -184,6 +190,37 @@ impl AgentNodeState {
                 "updated_at {} is before created_at {}",
                 self.updated_at, self.created_at
             )));
+        }
+        validate_join_token_bootstrap_endpoints(&self.bootstrap_endpoints).map_err(|error| {
+            AgentError::InvalidState(format!(
+                "persisted bootstrap endpoints are invalid: {}",
+                error.reason()
+            ))
+        })?;
+        if let Some(node) = &self.registered_node {
+            if node.node_id != self.node_id {
+                return Err(AgentError::InvalidState(format!(
+                    "registered node ID {} does not match state node ID {}",
+                    node.node_id, self.node_id
+                )));
+            }
+            if node.identity_public_key != self.identity_public_key_b64 {
+                return Err(AgentError::InvalidState(
+                    "registered node identity public key does not match state identity public key"
+                        .to_string(),
+                ));
+            }
+            if node.wireguard_public_key != self.wireguard_public_key_b64 {
+                return Err(AgentError::InvalidState(
+                    "registered node WireGuard public key does not match state WireGuard public key"
+                        .to_string(),
+                ));
+            }
+            if self.vpn_ip != Some(node.vpn_ip) {
+                return Err(AgentError::InvalidState(
+                    "registered node VPN IP does not match state VPN IP".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -5527,8 +5564,9 @@ mod tests {
         PACKET_FLOW_PAYLOAD_PREFIX_MAX_BYTES,
     };
     use ipars_types::{
-        CandidateSource, ClusterId, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy,
-        PathMetrics, PeerPathKey, RelayCapability, TokenPolicy, TransportProtocol,
+        BootstrapEndpointKind, CandidateSource, ClusterId, NatFilteringBehavior,
+        NatMappingBehavior, NatTraversalStrategy, PathMetrics, PeerPathKey, RelayCapability,
+        TokenPolicy, TransportProtocol,
     };
 
     use super::*;
@@ -11249,6 +11287,96 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    #[test]
+    fn file_state_store_persists_registration_and_bootstrap_state() -> Result<(), AgentError> {
+        let dir = temp_state_dir("state-registration");
+        let path = dir.join("state.json");
+        let store = FileAgentStateStore::new(&path);
+        let mut state = store.load_or_create(Utc::now())?;
+        let mut node = peer_record(
+            state.node_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            &state.wireguard_public_key_b64,
+            Vec::new(),
+            Vec::new(),
+        );
+        node.identity_public_key = state.identity_public_key_b64.clone();
+        state.vpn_ip = Some(node.vpn_ip);
+        state.registered_node = Some(node.clone());
+        state.bootstrap_endpoints = vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443/".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.11:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+        ];
+
+        store.save(&state)?;
+        let loaded = store.load()?;
+
+        assert_eq!(loaded.registered_node, Some(node));
+        assert_eq!(loaded.bootstrap_endpoints, state.bootstrap_endpoints);
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_node_state_rejects_inconsistent_registration_state() {
+        fn validation_error(state: &AgentNodeState, context: &str) -> AgentError {
+            match state.validate() {
+                Ok(()) => panic!("{context}"),
+                Err(error) => error,
+            }
+        }
+
+        let mut state = AgentNodeState::generate(Utc::now());
+        let mut node = peer_record(
+            state.node_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            &state.wireguard_public_key_b64,
+            Vec::new(),
+            Vec::new(),
+        );
+        node.identity_public_key = state.identity_public_key_b64.clone();
+        state.vpn_ip = Some(node.vpn_ip);
+        state.registered_node = Some(node.clone());
+        assert!(state.validate().is_ok());
+
+        let mut invalid = state.clone();
+        let Some(node) = invalid.registered_node.as_mut() else {
+            panic!("registration state should contain a node");
+        };
+        node.node_id = NodeId::from_string("other-node");
+        let error = validation_error(&invalid, "registered node ID must match state");
+        assert!(error.to_string().contains("registered node ID"));
+
+        let mut invalid = state.clone();
+        let Some(node) = invalid.registered_node.as_mut() else {
+            panic!("registration state should contain a node");
+        };
+        node.identity_public_key = "different-identity".to_string();
+        let error = validation_error(&invalid, "registered identity key must match state");
+        assert!(error
+            .to_string()
+            .contains("registered node identity public key"));
+
+        let mut invalid = state.clone();
+        invalid.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3))));
+        let error = validation_error(&invalid, "registered VPN IP must match state");
+        assert!(error.to_string().contains("registered node VPN IP"));
+
+        let mut invalid = state;
+        invalid.bootstrap_endpoints = vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }];
+        let error = validation_error(&invalid, "persisted bootstrap kind must be validated");
+        assert!(error.to_string().contains("persisted bootstrap endpoints"));
     }
 
     #[test]

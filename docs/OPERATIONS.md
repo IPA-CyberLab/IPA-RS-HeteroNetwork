@@ -88,10 +88,12 @@ iparsd agent \
   --apply-peer-map
 ```
 
-`ipars join` never prints private keys. It rejects an existing state path
-instead of silently replacing another node identity; use a new state path for
-a new node. `--dry-run` validates the token and bootstrap selection but does
-not write state.
+`ipars join` never prints private keys. It persists the accepted NodeRecord and
+bootstrap endpoints with the credentials, so a later `iparsd agent` startup
+can resume the registration without reusing the single-use join token. It
+rejects an existing state path instead of silently replacing another node
+identity; use a new state path for a new node. `--dry-run` validates the token
+and bootstrap selection but does not write state.
 
 The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/ipars/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
 

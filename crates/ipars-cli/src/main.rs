@@ -1959,7 +1959,7 @@ async fn join(
         let (url, response) =
             post_join_request(&reqwest::Client::new(), &control_plane_urls, &join_request).await?;
         validate_join_registration_response(&response.node, &identity, &wireguard, &token)?;
-        persist_joined_agent_state(&state_path, &identity, &wireguard, &response)?;
+        persist_joined_agent_state(&state_path, &identity, &wireguard, &token, &response)?;
         (url, Some(response))
     };
 
@@ -2038,6 +2038,7 @@ fn persist_joined_agent_state(
     path: &Path,
     identity: &IdentityKeyPair,
     wireguard: &WireGuardKeyPair,
+    token: &SignedJoinToken,
     response: &RegisterNodeResponse,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
@@ -2048,6 +2049,8 @@ fn persist_joined_agent_state(
         wireguard_private_key_b64: wireguard.private_key_b64.clone(),
         wireguard_public_key_b64: wireguard.public_key_b64.clone(),
         vpn_ip: Some(response.node.vpn_ip),
+        registered_node: Some(response.node.clone()),
+        bootstrap_endpoints: token.claims.bootstrap_endpoints.clone(),
         created_at: now,
         updated_at: now,
     };
@@ -10069,6 +10072,10 @@ mod tests {
         node.identity_public_key = identity.public_key_b64();
         node.wireguard_public_key = wireguard.public_key_b64.clone();
         node.vpn_ip = ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)));
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }])?;
         let state_dir = temp_path("join-state");
         let state_path = state_dir.join("agent.json");
 
@@ -10076,6 +10083,7 @@ mod tests {
             &state_path,
             &identity,
             &wireguard,
+            &token,
             &RegisterNodeResponse {
                 node: node.clone(),
                 peer_map: PeerMap {
@@ -10097,6 +10105,8 @@ mod tests {
         assert_eq!(state.identity_public_key_b64, identity.public_key_b64());
         assert_eq!(state.wireguard_public_key_b64, wireguard.public_key_b64);
         assert_eq!(state.vpn_ip, Some(node.vpn_ip));
+        assert_eq!(state.registered_node, Some(node));
+        assert_eq!(state.bootstrap_endpoints, token.claims.bootstrap_endpoints);
         assert_eq!(state.identity_key_pair()?.node_id(), identity.node_id());
         assert_eq!(state.wireguard_private_key_b64, wireguard.private_key_b64);
         std::fs::remove_dir_all(state_dir)?;

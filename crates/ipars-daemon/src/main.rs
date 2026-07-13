@@ -92,11 +92,11 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_TIME_WAIT, PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpointKind,
-    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
-    NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
-    Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpoint,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
+    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
+    PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
+    VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -7150,12 +7150,19 @@ async fn run_agent(
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+    let persisted_registered_node = runtime.state().registered_node.clone();
+    let persisted_bootstrap_endpoints = runtime.state().bootstrap_endpoints.clone();
     let relay_capability_reporter = agent_relay_capability_reporter(&args)?;
     let relay_capability = relay_capability_reporter
         .as_ref()
         .map(|reporter| reporter.advertised.clone());
     let join_token = agent_join_token(&args)?;
-    let stun_servers = agent_stun_servers(&args, join_token.as_ref()).await?;
+    let stun_servers = agent_stun_servers_with_persisted(
+        &args,
+        join_token.as_ref(),
+        &persisted_bootstrap_endpoints,
+    )
+    .await?;
     if stun_servers.len() > 1 {
         if let Err(error) = runtime
             .classify_nat(args.stun_bind, stun_servers.clone())
@@ -7206,27 +7213,57 @@ async fn run_agent(
             "registered agent with control plane"
         );
         Some(registered_node)
+    } else if let Some(node) = persisted_registered_node {
+        runtime
+            .replace_local_advertised_routes(node.routes.clone())
+            .await
+            .context("failed to restore persisted local advertised routes")?;
+        tracing::info!(
+            node_id = %node.node_id,
+            vpn_ip = %node.vpn_ip,
+            "resuming registered agent from persisted state without reusing the join token"
+        );
+        Some(node)
     } else {
         None
     };
     if let Some(node) = registered_node.as_ref() {
         let mut persisted_state = runtime.state();
+        let mut state_changed = false;
         if persisted_state.vpn_ip.as_ref() != Some(&node.vpn_ip) {
             persisted_state.vpn_ip = Some(node.vpn_ip);
+            state_changed = true;
+        }
+        if join_token.is_some() && persisted_state.registered_node.as_ref() != Some(node) {
+            persisted_state.registered_node = Some(node.clone());
+            state_changed = true;
+        }
+        if let Some(token) = join_token.as_ref() {
+            if persisted_state.bootstrap_endpoints != token.claims.bootstrap_endpoints {
+                persisted_state.bootstrap_endpoints = token.claims.bootstrap_endpoints.clone();
+                state_changed = true;
+            }
+        }
+        if state_changed {
             persisted_state.updated_at = chrono::Utc::now();
             store
                 .save(&persisted_state)
-                .context("failed to persist registered agent VPN IP")?;
+                .context("failed to persist registered agent registration state")?;
             runtime.replace_state(persisted_state)?;
         }
     }
-    let control_plane_bases = agent_control_plane_base_urls(
+    let control_plane_bases = agent_control_plane_base_urls_with_persisted(
         join_token.as_ref(),
         args.control_plane_url.as_deref(),
         registered_control_plane_base.as_deref(),
+        &runtime.state().bootstrap_endpoints,
     )?;
-    let signal_bases =
-        signal_base_urls(join_token.as_ref(), args.signal_url.as_deref()).unwrap_or_default();
+    let signal_bases = signal_base_urls_with_persisted(
+        join_token.as_ref(),
+        args.signal_url.as_deref(),
+        &runtime.state().bootstrap_endpoints,
+    )
+    .unwrap_or_default();
     preflight_agent_runtime(&args)?;
     let userspace_wireguard_process =
         start_userspace_wireguard_process(&args, runtime.clone()).await?;
@@ -14870,10 +14907,20 @@ fn control_plane_base_url(
         .context("control-plane URL is required and no control-plane bootstrap exists")
 }
 
+#[cfg(test)]
 fn agent_control_plane_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
     registered_url: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    agent_control_plane_base_urls_with_persisted(token, override_url, registered_url, &[])
+}
+
+fn agent_control_plane_base_urls_with_persisted(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+    registered_url: Option<&str>,
+    persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<String>> {
     if override_url.is_some() {
         return control_plane_base_urls(token, override_url);
@@ -14886,7 +14933,15 @@ fn agent_control_plane_base_urls(
     if let Some(token) = token {
         base_urls.extend(control_plane_base_urls(Some(token), None)?);
     }
-    Ok(dedupe_urls_preserve_order(base_urls))
+    if token.is_none() {
+        base_urls.extend(
+            persisted_bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.clone()),
+        );
+    }
+    normalize_http_base_urls(base_urls, "control-plane endpoint")
 }
 
 fn control_plane_base_urls(
@@ -14966,9 +15021,18 @@ fn signal_base_url(
         .context("signal URL is required and no signal bootstrap exists")
 }
 
+#[cfg(test)]
 fn signal_base_urls(
     token: Option<&SignedJoinToken>,
     override_url: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    signal_base_urls_with_persisted(token, override_url, &[])
+}
+
+fn signal_base_urls_with_persisted(
+    token: Option<&SignedJoinToken>,
+    override_url: Option<&str>,
+    persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<String>> {
     if override_url.is_none() {
         if let Some(token) = token {
@@ -14990,6 +15054,15 @@ fn signal_base_urls(
                 .collect::<Vec<_>>(),
             "signal bootstrap endpoint",
         )
+    } else if !persisted_bootstrap_endpoints.is_empty() {
+        (
+            persisted_bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
+                .map(|endpoint| endpoint.url.clone())
+                .collect::<Vec<_>>(),
+            "persisted signal bootstrap endpoint",
+        )
     } else {
         anyhow::bail!("signal URL is required and no signal bootstrap exists");
     };
@@ -15000,9 +15073,18 @@ fn signal_base_urls(
     Ok(base_urls)
 }
 
+#[cfg(test)]
 async fn agent_stun_servers(
     args: &AgentArgs,
     token: Option<&SignedJoinToken>,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    agent_stun_servers_with_persisted(args, token, &[]).await
+}
+
+async fn agent_stun_servers_with_persisted(
+    args: &AgentArgs,
+    token: Option<&SignedJoinToken>,
+    persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<SocketAddr>> {
     let mut servers = Vec::new();
     for server in &args.stun_servers {
@@ -15022,21 +15104,22 @@ async fn agent_stun_servers(
         token
             .validate_shape()
             .context("agent signed join token validation failed")?;
-        for endpoint in token
-            .claims
-            .bootstrap_endpoints
-            .iter()
-            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
-        {
-            if servers.len() == MAX_AGENT_STUN_SERVERS {
-                break;
-            }
-            for addr in resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await? {
-                if !servers.contains(&addr) {
-                    servers.push(addr);
-                    if servers.len() == MAX_AGENT_STUN_SERVERS {
-                        break;
-                    }
+    }
+    let bootstrap_endpoints = token
+        .map(|token| token.claims.bootstrap_endpoints.as_slice())
+        .unwrap_or(persisted_bootstrap_endpoints);
+    for endpoint in bootstrap_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
+    {
+        if servers.len() == MAX_AGENT_STUN_SERVERS {
+            break;
+        }
+        for addr in resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await? {
+            if !servers.contains(&addr) {
+                servers.push(addr);
+                if servers.len() == MAX_AGENT_STUN_SERVERS {
+                    break;
                 }
             }
         }
@@ -30231,6 +30314,42 @@ exec sleep 60
     }
 
     #[test]
+    fn agent_control_plane_base_urls_resume_from_persisted_bootstraps() -> anyhow::Result<()> {
+        let persisted = vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443/".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.11:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ];
+
+        assert_eq!(
+            agent_control_plane_base_urls_with_persisted(None, None, None, &persisted)?,
+            vec!["https://203.0.113.10:8443".to_string()]
+        );
+        assert_eq!(
+            agent_control_plane_base_urls_with_persisted(
+                None,
+                None,
+                Some("https://203.0.113.12:8443/"),
+                &persisted,
+            )?,
+            vec![
+                "https://203.0.113.12:8443".to_string(),
+                "https://203.0.113.10:8443".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn control_plane_base_url_override_must_be_http() -> anyhow::Result<()> {
         let error = match control_plane_base_url(None, Some("udp://127.0.0.1:8443")) {
             Ok(_) => anyhow::bail!("non-HTTP control-plane override should be rejected"),
@@ -30336,6 +30455,29 @@ exec sleep 60
         Ok(())
     }
 
+    #[test]
+    fn signal_base_urls_resume_from_persisted_bootstraps() -> anyhow::Result<()> {
+        let persisted = vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.11:9443/".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.12:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+        ];
+
+        assert_eq!(
+            signal_base_urls_with_persisted(None, None, &persisted)?,
+            vec![
+                "https://203.0.113.11:9443".to_string(),
+                "https://203.0.113.12:9443".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn agent_stun_servers_merge_explicit_and_token_bootstraps() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["iparsd", "agent", "--stun-server", "203.0.113.9:3478"])?;
@@ -30432,6 +30574,24 @@ exec sleep 60
         };
         assert!(error.to_string().contains("--stun-server"));
         assert!(error.to_string().contains("usable nonzero"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_resume_from_persisted_bootstraps() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let persisted = vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }];
+
+        assert_eq!(
+            agent_stun_servers_with_persisted(&args, None, &persisted).await?,
+            vec![SocketAddr::from(([203, 0, 113, 10], 3478))]
+        );
         Ok(())
     }
 

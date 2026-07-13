@@ -196,9 +196,16 @@ sudo env PATH="$PATH" CARGO="$(command -v cargo)" IPARS_RUN_EBPF_ATTACH_TESTS=1 
 
 ## CLI Surface
 
+After a successful `ipars join`, the owner-only state file contains the
+accepted NodeRecord and bootstrap endpoints as well as the generated keys and
+VPN IP. `iparsd agent` can resume from that state without consuming the
+single-use join token again; explicit Control Plane or Signal URLs still take
+precedence when supplied.
+
 ```bash
 ipars init --public-endpoint 203.0.113.10:51820 --issuer-private-key-path ./issuer.key --issuer-key-id root --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token --allowed-route 10.43.0.0/16 --allow-relay --unlimited-uses --daemon-state-dir ./ipars-state --spawn-daemons
 ipars join '<signed-token>' --state-path ~/.local/state/ipars/agent.json
+iparsd agent --state-path ~/.local/state/ipars/agent.json --apply-peer-map
 ipars status --agent-url http://127.0.0.1:9780
 ipars --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token status --control-plane-url http://127.0.0.1:8443
 ipars --agent-state-path /var/lib/ipars/agent.json peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
