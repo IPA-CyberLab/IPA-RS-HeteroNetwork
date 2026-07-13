@@ -18849,9 +18849,10 @@ mod tests {
             anyhow::bail!("expected agent command");
         };
 
-        let error = run_agent(*args, false, Duration::from_secs(1))
-            .await
-            .expect_err("missing Docker API socket should fail during preflight");
+        let error = match run_agent(*args, false, Duration::from_secs(1)).await {
+            Ok(()) => anyhow::bail!("missing Docker API socket unexpectedly passed preflight"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("Docker API socket"), "{error:#}");
         assert!(!state_path.exists());
         assert!(!join_token_path.exists());
