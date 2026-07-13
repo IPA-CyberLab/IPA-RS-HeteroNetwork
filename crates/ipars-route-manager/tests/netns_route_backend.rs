@@ -420,6 +420,7 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
         metric: 779,
         table: 10_065,
         protocol: 240,
+        scope: 253,
     }));
     let reconciliation = restarted_manager.reconcile_routes(plan.clone()).await?;
     assert_eq!(reconciliation.routes_removed, 1);

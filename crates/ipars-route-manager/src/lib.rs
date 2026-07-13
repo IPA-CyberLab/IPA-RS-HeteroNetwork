@@ -114,6 +114,7 @@ pub struct ManagedRoute {
     pub metric: u32,
     pub table: u32,
     pub protocol: u8,
+    pub scope: u8,
 }
 
 impl ManagedRoute {
@@ -123,6 +124,7 @@ impl ManagedRoute {
             metric,
             table,
             protocol: owner.protocol(),
+            scope: u8::from(RouteScope::Universe),
         }
     }
 }
@@ -2055,6 +2057,8 @@ where
             route.cidr.to_string(),
             "dev".to_string(),
             plan.interface.clone(),
+            "scope".to_string(),
+            "global".to_string(),
             "protocol".to_string(),
             plan.owner.protocol().to_string(),
         ];
@@ -2409,12 +2413,38 @@ fn parse_managed_route_row(
             "route inventory row {index} metric must be greater than zero"
         )));
     }
+    let scope = object
+        .get("scope")
+        .map(|value| parse_route_scope(value, index))
+        .transpose()?
+        .unwrap_or_else(|| u8::from(RouteScope::Universe));
     Ok(Some(ManagedRoute {
         cidr,
         metric,
         table,
         protocol,
+        scope,
     }))
+}
+
+fn parse_route_scope(value: &serde_json::Value, index: usize) -> Result<u8, RouteManagerError> {
+    if let Some(scope) = value.as_str() {
+        let named_scope = match scope {
+            "global" | "universe" => Some(u8::from(RouteScope::Universe)),
+            "site" => Some(u8::from(RouteScope::Site)),
+            "link" => Some(u8::from(RouteScope::Link)),
+            "host" => Some(u8::from(RouteScope::Host)),
+            "nowhere" | "no_where" => Some(u8::from(RouteScope::NoWhere)),
+            _ => None,
+        };
+        if let Some(named_scope) = named_scope {
+            return Ok(named_scope);
+        }
+    }
+    let scope = parse_numeric_json_u32(value, "scope", index)?;
+    u8::try_from(scope).map_err(|_| {
+        RouteManagerError::Backend(format!("route inventory row {index} scope exceeds u8"))
+    })
 }
 
 fn parse_managed_policy_rules(
@@ -2691,11 +2721,12 @@ impl LinuxNetlinkRouteManager {
         };
         handle
             .route()
-            .del(netlink_route_message_with_protocol(
+            .del(netlink_route_message_with_protocol_and_scope(
                 &route_record,
                 interface_index,
                 Some(route.table),
                 route.protocol,
+                route.scope,
             ))
             .execute()
             .await
@@ -3010,6 +3041,7 @@ fn parse_netlink_managed_route(
         metric,
         table,
         protocol: u8::from(message.header.protocol),
+        scope: u8::from(message.header.scope),
     }))
 }
 
@@ -3126,12 +3158,29 @@ fn netlink_route_message_with_protocol(
     table: Option<u32>,
     protocol: u8,
 ) -> RouteMessage {
+    netlink_route_message_with_protocol_and_scope(
+        route,
+        interface_index,
+        table,
+        protocol,
+        u8::from(RouteScope::Universe),
+    )
+}
+
+fn netlink_route_message_with_protocol_and_scope(
+    route: &Route,
+    interface_index: u32,
+    table: Option<u32>,
+    protocol: u8,
+    scope: u8,
+) -> RouteMessage {
     match route.cidr {
         IpNet::V4(network) => {
             let mut builder = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
                 .destination_prefix(network.addr(), network.prefix_len())
                 .output_interface(interface_index)
                 .protocol(RouteProtocol::Other(protocol))
+                .scope(RouteScope::from(scope))
                 .priority(route.metric);
             if let Some(table) = table {
                 builder = builder.table_id(table);
@@ -3143,6 +3192,7 @@ fn netlink_route_message_with_protocol(
                 .destination_prefix(network.addr(), network.prefix_len())
                 .output_interface(interface_index)
                 .protocol(RouteProtocol::Other(protocol))
+                .scope(RouteScope::from(scope))
                 .priority(route.metric);
             if let Some(table) = table {
                 builder = builder.table_id(table);
@@ -4508,6 +4558,7 @@ mod tests {
                     metric: 50,
                     table: LINUX_MAIN_ROUTE_TABLE,
                     protocol: LINUX_ROUTE_PROTOCOL_BOOT,
+                    scope: u8::from(RouteScope::Link),
                 },
             ])
         );
@@ -4549,18 +4600,21 @@ mod tests {
                     metric: 100,
                     table: 10_064,
                     protocol: IPARS_DOCKER_ROUTE_PROTOCOL,
+                    scope: u8::from(RouteScope::Universe),
                 },
                 ManagedRoute {
                     cidr: "172.19.0.0/16".parse()?,
                     metric: 777,
                     table: 10_065,
                     protocol: IPARS_DOCKER_ROUTE_PROTOCOL,
+                    scope: u8::from(RouteScope::Universe),
                 },
                 ManagedRoute {
                     cidr: "172.20.0.0/16".parse()?,
                     metric: 50,
                     table: 10_064,
                     protocol: LINUX_ROUTE_PROTOCOL_BOOT,
+                    scope: u8::from(RouteScope::Universe),
                 },
             ])
         );
@@ -4737,6 +4791,8 @@ mod tests {
                         "10.42.0.0/16",
                         "dev",
                         "ipars0",
+                        "scope",
+                        "global",
                         "protocol",
                         "241",
                         "table",
@@ -4807,6 +4863,8 @@ mod tests {
                         "10.42.0.0/16",
                         "dev",
                         "ipars0",
+                        "scope",
+                        "global",
                         "protocol",
                         "241",
                         "table",
@@ -4839,6 +4897,8 @@ mod tests {
                         "10.42.0.0/16",
                         "dev",
                         "ipars0",
+                        "scope",
+                        "global",
                         "protocol",
                         "241",
                         "table",
@@ -4916,6 +4976,8 @@ mod tests {
                         "172.18.0.0/16",
                         "dev",
                         "ipars0",
+                        "scope",
+                        "global",
                         "protocol",
                         "241",
                         "table",
