@@ -1427,6 +1427,10 @@ fn generated_dataplane_join_token(
 }
 
 fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
+    let relay_admission_token_path = std::env::temp_dir().join(format!(
+        "ipars-compose-init-relay-admission-{}.token",
+        unique_suffix()?
+    ));
     let output = Command::new(env!("CARGO_BIN_EXE_ipars"))
         .args([
             "init",
@@ -1436,6 +1440,10 @@ fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
             "http",
             "--emit-issuer-private-key",
             "--allow-relay",
+            "--relay-admission-bearer-token-path",
+            relay_admission_token_path
+                .to_str()
+                .context("generated init relay admission token path was not valid UTF-8")?,
             "--unlimited-uses",
             "--token-ttl-seconds",
             "3600",
@@ -1446,6 +1454,7 @@ fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
         ])
         .output()
         .context("failed to run ipars init")?;
+    let _ = fs::remove_file(&relay_admission_token_path);
     ensure_success("ipars init", &output)?;
     serde_json::from_slice(&output.stdout).context("failed to parse ipars init output")
 }

@@ -1654,6 +1654,11 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
     if args.relay_admission_bearer_token_path.is_some() && !args.allow_relay {
         anyhow::bail!("--relay-admission-bearer-token-path requires --allow-relay");
     }
+    if args.allow_relay && !args.spawn_daemons && args.relay_admission_bearer_token_path.is_none() {
+        anyhow::bail!(
+            "--relay-admission-bearer-token-path is required with --allow-relay when --spawn-daemons is not set"
+        );
+    }
     Ok(())
 }
 
@@ -10953,6 +10958,7 @@ mod tests {
     fn init_rejects_invalid_default_token_claim_inputs() -> anyhow::Result<()> {
         let error = match init(InitArgs {
             default_role: "edge role".to_string(),
+            allow_relay: false,
             ..valid_init_args()
         }) {
             Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
@@ -10964,6 +10970,7 @@ mod tests {
 
         let error = match init(InitArgs {
             allowed_routes: vec!["0.0.0.0/0".parse()?],
+            allow_relay: false,
             ..valid_init_args()
         }) {
             Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
@@ -11336,6 +11343,7 @@ mod tests {
         let mut explicit_admission = valid_init_args();
         explicit_admission.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
         explicit_admission.relay_admission_url = Some("http://relay.example.test:9580".to_string());
+        explicit_admission.allow_relay = false;
         assert!(init(explicit_admission).is_ok());
     }
 
@@ -11363,6 +11371,7 @@ mod tests {
     #[test]
     fn init_can_persist_generated_issuer_key() -> anyhow::Result<()> {
         let key_path = temp_path("issuer.key");
+        let relay_admission_token_path = temp_path("issuer-relay-admission.token");
         let output = init(InitArgs {
             public_endpoint: SocketAddr::from(([203, 0, 113, 10], 51820)),
             bootstrap_scheme: "http".to_string(),
@@ -11391,7 +11400,7 @@ mod tests {
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
-            relay_admission_bearer_token_path: None,
+            relay_admission_bearer_token_path: Some(relay_admission_token_path.clone()),
             relay_agent_listen: SocketAddr::from(([127, 0, 0, 1], 9781)),
         })?;
 
@@ -11414,6 +11423,7 @@ mod tests {
             &output.cluster_id,
         )?;
         let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(relay_admission_token_path);
         let _ = std::fs::remove_dir_all(output.daemon_state_dir);
         Ok(())
     }
@@ -11653,15 +11663,21 @@ mod tests {
     }
 
     #[test]
-    fn init_without_spawn_does_not_create_default_relay_admission_state() -> anyhow::Result<()> {
+    fn init_without_spawn_requires_explicit_relay_admission_state() -> anyhow::Result<()> {
         let mut args = valid_init_args();
         args.daemon_state_dir = temp_path("manual-bootstrap-state");
         let state_dir = args.daemon_state_dir.clone();
 
-        let output = init(args)?;
+        let error = match init(args) {
+            Ok(output) => anyhow::bail!(
+                "manual relay bootstrap without an admission token path was accepted: {output:?}"
+            ),
+            Err(error) => error,
+        };
 
-        assert!(output.daemon_processes.is_empty());
-        assert!(output.relay_admission_bearer_token_path.is_none());
+        assert!(error.to_string().contains(
+            "--relay-admission-bearer-token-path is required with --allow-relay when --spawn-daemons is not set"
+        ));
         assert!(!state_dir.exists());
         Ok(())
     }
