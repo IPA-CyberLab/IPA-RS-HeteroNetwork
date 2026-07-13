@@ -473,7 +473,13 @@ if ! assert_vpn_http agent-b "$agent_a_vpn_ip"; then
   rootless_dataplane_diagnostics "agent-b HTTP over VPN failed"
   exit 1
 fi
-wait_for_direct_path agent "$agent_a_node" "$agent_b_node"
-wait_for_direct_path agent-b "$agent_b_node" "$agent_a_node"
+if ! wait_for_direct_path agent "$agent_a_node" "$agent_b_node"; then
+  rootless_dataplane_diagnostics "agent direct path failed"
+  exit 1
+fi
+if ! wait_for_direct_path agent-b "$agent_b_node" "$agent_a_node"; then
+  rootless_dataplane_diagnostics "agent-b direct path failed"
+  exit 1
+fi
 
 echo "Rootless Docker BoringTun two-agent VPN packet and direct-path smoke passed"
