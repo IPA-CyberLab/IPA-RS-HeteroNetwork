@@ -54,6 +54,8 @@ WireGuard data-plane keys rotate through the local agent API. The agent signs th
 
 Node removal uses the same node identity boundary. `DELETE /v1/nodes/{node_id}` requires a signed request from the registered node identity before the control plane removes the durable node record, clears health/path state, and releases the VPN IP lease for reuse.
 
+Every signed management request uses the same fixed signature envelope as join tokens: canonical standard Base64 encoding of exactly one 64-byte Ed25519 signature, or 88 encoded bytes including padding. Heartbeat, WireGuard key rotation, node removal, token revocation, Control Plane node query, and Signal upsert/path/hole-punch verifiers reject malformed, non-canonical, wrong-length, and oversized envelopes before public-key parsing or cryptographic verification. Signature-shape rejection is distinct from a correctly shaped signature that fails authentication.
+
 ## Signal Authentication
 
 Signal node upserts, path negotiations, and hole-punch plan requests require an Ed25519 signature from the requesting node's persisted identity key. Each signed payload includes the complete request body, a bounded-fresh timestamp, and a random 192-bit nonce. Signal keeps a bounded accepted-nonce cache and rejects duplicates, stale signatures, body tampering, source-ID mismatches, and requests from nodes without fresh authenticated membership.

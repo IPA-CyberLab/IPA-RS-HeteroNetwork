@@ -9,8 +9,8 @@ use ipars_types::api::{
     SignalNodeUpsertRequest, SignalPathRequest,
 };
 use ipars_types::{
-    ClusterId, JoinTokenClaims, JoinTokenClaimsValidationError, NodeId, SignedJoinToken,
-    SignedJoinTokenValidationError,
+    ClusterId, Ed25519SignatureValidationError, JoinTokenClaims, JoinTokenClaimsValidationError,
+    NodeId, SignedJoinToken, SignedJoinTokenValidationError,
 };
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,8 @@ pub enum CryptoError {
     InvalidWireGuardKey,
     #[error("ed25519 signature is invalid")]
     InvalidSignature,
+    #[error(transparent)]
+    InvalidSignatureEnvelope(#[from] Ed25519SignatureValidationError),
     #[error("node API request nonce is invalid")]
     InvalidRequestNonce,
     #[error("token serialization failed")]
@@ -275,16 +277,8 @@ pub fn verify_heartbeat_request_signature(
         .node_signature
         .as_ref()
         .ok_or(CryptoError::InvalidSignature)?;
-    let key_bytes = decode_32(node_public_key_b64)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    let signature_bytes = STANDARD.decode(&node_signature.signature)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_| CryptoError::InvalidSignature)?;
     let payload = serde_json::to_vec(&request.signature_payload(node_signature.signed_at))?;
-    verifying_key
-        .verify(&payload, &signature)
-        .map_err(|_| CryptoError::InvalidSignature)
+    verify_node_request_payload(&payload, node_signature, node_public_key_b64)
 }
 
 pub fn verify_wireguard_key_rotation_signature(
@@ -295,16 +289,8 @@ pub fn verify_wireguard_key_rotation_signature(
         .node_signature
         .as_ref()
         .ok_or(CryptoError::InvalidSignature)?;
-    let key_bytes = decode_32(node_public_key_b64)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    let signature_bytes = STANDARD.decode(&node_signature.signature)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_| CryptoError::InvalidSignature)?;
     let payload = serde_json::to_vec(&request.signature_payload(node_signature.signed_at))?;
-    verifying_key
-        .verify(&payload, &signature)
-        .map_err(|_| CryptoError::InvalidSignature)
+    verify_node_request_payload(&payload, node_signature, node_public_key_b64)
 }
 
 pub fn verify_remove_node_signature(
@@ -315,16 +301,8 @@ pub fn verify_remove_node_signature(
         .node_signature
         .as_ref()
         .ok_or(CryptoError::InvalidSignature)?;
-    let key_bytes = decode_32(node_public_key_b64)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    let signature_bytes = STANDARD.decode(&node_signature.signature)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_| CryptoError::InvalidSignature)?;
     let payload = serde_json::to_vec(&request.signature_payload(node_signature.signed_at))?;
-    verifying_key
-        .verify(&payload, &signature)
-        .map_err(|_| CryptoError::InvalidSignature)
+    verify_node_request_payload(&payload, node_signature, node_public_key_b64)
 }
 
 pub fn verify_token_revocation_signature(
@@ -335,15 +313,30 @@ pub fn verify_token_revocation_signature(
         .issuer_signature
         .as_ref()
         .ok_or(CryptoError::InvalidSignature)?;
-    let key_bytes = decode_32(issuer_public_key_b64)?;
+    let payload = serde_json::to_vec(&request.signature_payload(issuer_signature.signed_at))?;
+    verify_node_request_payload(&payload, issuer_signature, issuer_public_key_b64)
+}
+
+fn verify_node_request_payload(
+    payload: &[u8],
+    request_signature: &NodeRequestSignature,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let signature_bytes = request_signature.signature_bytes()?;
+    verify_ed25519_payload(payload, signature_bytes, node_public_key_b64)
+}
+
+fn verify_ed25519_payload(
+    payload: &[u8],
+    signature_bytes: [u8; ipars_types::ED25519_SIGNATURE_BYTES],
+    public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let key_bytes = decode_32(public_key_b64)?;
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    let signature_bytes = STANDARD.decode(&issuer_signature.signature)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_| CryptoError::InvalidSignature)?;
-    let payload = serde_json::to_vec(&request.signature_payload(issuer_signature.signed_at))?;
+    let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(&payload, &signature)
+        .verify(payload, &signature)
         .map_err(|_| CryptoError::InvalidSignature)
 }
 
@@ -411,16 +404,9 @@ fn verify_node_api_payload(
     request_signature: &NodeApiRequestSignature,
     node_public_key_b64: &str,
 ) -> Result<(), CryptoError> {
+    let signature_bytes = request_signature.signature_bytes()?;
     validate_node_api_request_nonce(&request_signature.nonce)?;
-    let key_bytes = decode_32(node_public_key_b64)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    let signature_bytes = STANDARD.decode(&request_signature.signature)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_| CryptoError::InvalidSignature)?;
-    verifying_key
-        .verify(payload, &signature)
-        .map_err(|_| CryptoError::InvalidSignature)
+    verify_ed25519_payload(payload, signature_bytes, node_public_key_b64)
 }
 
 pub fn validate_node_api_request_nonce(value: &str) -> Result<(), CryptoError> {
@@ -663,6 +649,15 @@ mod tests {
         request.node_signature = Some(key.sign_heartbeat_request(&request, now)?);
 
         verify_heartbeat_request_signature(&request, &key.public_key_b64())?;
+        let valid_signature = request.node_signature.clone();
+        if let Some(signature) = request.node_signature.as_mut() {
+            signature.signature = "A".repeat(64 * 1024);
+        }
+        assert!(matches!(
+            verify_heartbeat_request_signature(&request, &key.public_key_b64()),
+            Err(CryptoError::InvalidSignatureEnvelope(_))
+        ));
+        request.node_signature = valid_signature;
         request.health.message = Some("tampered".to_string());
         assert!(matches!(
             verify_heartbeat_request_signature(&request, &key.public_key_b64()),
@@ -761,6 +756,15 @@ mod tests {
         request.request_signature = Some(identity.sign_signal_node_upsert_request(&request, now)?);
 
         verify_signal_node_upsert_signature(&request, &identity.public_key_b64())?;
+        let valid_signature = request.request_signature.clone();
+        if let Some(signature) = request.request_signature.as_mut() {
+            signature.signature = "A".repeat(64 * 1024);
+        }
+        assert!(matches!(
+            verify_signal_node_upsert_signature(&request, &identity.public_key_b64()),
+            Err(CryptoError::InvalidSignatureEnvelope(_))
+        ));
+        request.request_signature = valid_signature;
         request.health = Some(NodeHealth {
             state: HealthState::Healthy,
             last_seen_at: now,

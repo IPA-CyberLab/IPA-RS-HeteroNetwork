@@ -1358,6 +1358,57 @@ pub struct SignedJoinToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ed25519SignatureValidationError {
+    reason: String,
+}
+
+impl Ed25519SignatureValidationError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl Display for Ed25519SignatureValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ed25519 signature envelope is invalid: {}", self.reason)
+    }
+}
+
+impl std::error::Error for Ed25519SignatureValidationError {}
+
+pub fn decode_ed25519_signature(
+    value: &str,
+) -> Result<[u8; ED25519_SIGNATURE_BYTES], Ed25519SignatureValidationError> {
+    if value.len() != ED25519_SIGNATURE_BASE64_BYTES {
+        return Err(Ed25519SignatureValidationError::new(format!(
+            "signature must be exactly {ED25519_SIGNATURE_BASE64_BYTES} bytes of standard base64"
+        )));
+    }
+    let decoded = STANDARD.decode(value).map_err(|_| {
+        Ed25519SignatureValidationError::new("signature is not valid standard base64")
+    })?;
+    let signature: [u8; ED25519_SIGNATURE_BYTES] =
+        decoded.try_into().map_err(|decoded: Vec<u8>| {
+            Ed25519SignatureValidationError::new(format!(
+                "signature decodes to {} bytes instead of {ED25519_SIGNATURE_BYTES}",
+                decoded.len()
+            ))
+        })?;
+    if STANDARD.encode(signature) != value {
+        return Err(Ed25519SignatureValidationError::new(
+            "signature is not canonical standard base64",
+        ));
+    }
+    Ok(signature)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedJoinTokenValidationError {
     reason: String,
 }
@@ -1386,27 +1437,8 @@ impl SignedJoinToken {
     pub fn signature_bytes(
         &self,
     ) -> Result<[u8; ED25519_SIGNATURE_BYTES], SignedJoinTokenValidationError> {
-        if self.signature.len() != ED25519_SIGNATURE_BASE64_BYTES {
-            return Err(SignedJoinTokenValidationError::new(format!(
-                "signature must be exactly {ED25519_SIGNATURE_BASE64_BYTES} bytes of standard base64"
-            )));
-        }
-        let decoded = STANDARD.decode(&self.signature).map_err(|_| {
-            SignedJoinTokenValidationError::new("signature is not valid standard base64")
-        })?;
-        let signature: [u8; ED25519_SIGNATURE_BYTES] =
-            decoded.try_into().map_err(|decoded: Vec<u8>| {
-                SignedJoinTokenValidationError::new(format!(
-                    "signature decodes to {} bytes instead of {ED25519_SIGNATURE_BYTES}",
-                    decoded.len()
-                ))
-            })?;
-        if STANDARD.encode(signature) != self.signature {
-            return Err(SignedJoinTokenValidationError::new(
-                "signature is not canonical standard base64",
-            ));
-        }
-        Ok(signature)
+        decode_ed25519_signature(&self.signature)
+            .map_err(|error| SignedJoinTokenValidationError::new(error.reason()))
     }
 
     pub fn validate_shape(&self) -> Result<(), SignedJoinTokenValidationError> {
@@ -1610,11 +1642,27 @@ pub mod api {
         pub signature: String,
     }
 
+    impl NodeRequestSignature {
+        pub fn signature_bytes(
+            &self,
+        ) -> Result<[u8; ED25519_SIGNATURE_BYTES], Ed25519SignatureValidationError> {
+            decode_ed25519_signature(&self.signature)
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct NodeApiRequestSignature {
         pub signed_at: DateTime<Utc>,
         pub nonce: String,
         pub signature: String,
+    }
+
+    impl NodeApiRequestSignature {
+        pub fn signature_bytes(
+            &self,
+        ) -> Result<[u8; ED25519_SIGNATURE_BYTES], Ed25519SignatureValidationError> {
+            decode_ed25519_signature(&self.signature)
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -18200,6 +18248,44 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.reason().contains("claim validation failed"));
+    }
+
+    #[test]
+    fn request_signature_types_require_canonical_fixed_size_envelopes() {
+        let valid_signature = format!("{}==", "A".repeat(86));
+        let mut node_signature = api::NodeRequestSignature {
+            signed_at: Utc::now(),
+            signature: valid_signature.clone(),
+        };
+        let mut api_signature = api::NodeApiRequestSignature {
+            signed_at: Utc::now(),
+            nonce: "nonce".to_string(),
+            signature: valid_signature,
+        };
+        assert_eq!(
+            node_signature
+                .signature_bytes()
+                .unwrap_or_else(|error| panic!("valid node signature shape failed: {error}")),
+            [0; ED25519_SIGNATURE_BYTES]
+        );
+        assert_eq!(
+            api_signature
+                .signature_bytes()
+                .unwrap_or_else(|error| panic!("valid API signature shape failed: {error}")),
+            [0; ED25519_SIGNATURE_BYTES]
+        );
+
+        for invalid in [
+            "short".to_string(),
+            "!".repeat(ED25519_SIGNATURE_BASE64_BYTES),
+            format!("{}B==", "A".repeat(85)),
+            "A".repeat(64 * 1024),
+        ] {
+            node_signature.signature = invalid.clone();
+            api_signature.signature = invalid;
+            assert!(node_signature.signature_bytes().is_err());
+            assert!(api_signature.signature_bytes().is_err());
+        }
     }
 
     #[test]
