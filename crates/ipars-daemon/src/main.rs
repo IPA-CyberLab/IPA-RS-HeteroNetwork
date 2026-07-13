@@ -43,8 +43,6 @@ use ipars_relay::{
     encode_relay_datagram, RelayAdmissionRateLimit, RelayService, RelaySessionId, UdpRelay,
 };
 use ipars_relay_http::{router as relay_router, RelayHttpState};
-#[cfg(test)]
-use ipars_route_manager::ManagedMainTableRoute;
 use ipars_route_manager::{
     checked_docker_route_plan, checked_kubernetes_route_plan, kubernetes_route_plan,
     DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
@@ -52,6 +50,8 @@ use ipars_route_manager::{
     NamespacedLinuxRouteCommandRunner, RouteManager, RouteManagerError, RoutePlan,
     TimedSystemRouteCommandRunner,
 };
+#[cfg(test)]
+use ipars_route_manager::{ManagedRouteInventory, RoutePlanOwner};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
 #[cfg(test)]
@@ -9095,12 +9095,11 @@ async fn run_docker_route_loop<M>(manager: M, source: DockerRouteSource, interva
 where
     M: RouteManager + 'static,
 {
-    let mut applied_plan = None;
     loop {
         match source.resolve_intent().await {
             Ok(intent) => {
                 let result = match checked_docker_route_plan(intent.clone()) {
-                    Ok(plan) => apply_managed_route_plan(&manager, &mut applied_plan, plan).await,
+                    Ok(plan) => apply_managed_route_plan(&manager, plan).await,
                     Err(error) => Err(error),
                 };
                 match result {
@@ -9134,29 +9133,16 @@ where
 
 async fn apply_managed_route_plan<M>(
     manager: &M,
-    applied_plan: &mut Option<RoutePlan>,
     plan: RoutePlan,
 ) -> Result<ManagedRouteApplySummary, RouteManagerError>
 where
     M: RouteManager + ?Sized,
 {
-    let mut routes_removed = 0;
-    let mut policy_rules_removed = 0;
-    if let Some(previous) = applied_plan.as_ref().cloned() {
-        let stale = stale_managed_route_plan(&previous, &plan);
-        if !stale.routes.is_empty() || !stale.policy_rules.is_empty() {
-            routes_removed = stale.routes.len();
-            policy_rules_removed = stale.policy_rules.len();
-            manager.remove_routes(stale).await?;
-            *applied_plan = Some(retained_managed_route_plan(&previous, &plan));
-        }
-    }
-    manager.apply_routes(plan.clone()).await?;
-    *applied_plan = Some(plan.clone());
+    let reconciliation = manager.reconcile_routes(plan.clone()).await?;
     Ok(ManagedRouteApplySummary {
         plan,
-        routes_removed,
-        policy_rules_removed,
+        routes_removed: reconciliation.routes_removed,
+        policy_rules_removed: reconciliation.policy_rules_removed,
     })
 }
 
@@ -9165,62 +9151,6 @@ struct ManagedRouteApplySummary {
     plan: RoutePlan,
     routes_removed: usize,
     policy_rules_removed: usize,
-}
-
-fn stale_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
-    if previous.interface != current.interface {
-        return previous.clone();
-    }
-    RoutePlan {
-        interface: previous.interface.clone(),
-        routes: previous
-            .routes
-            .iter()
-            .filter(|route| {
-                !current
-                    .routes
-                    .iter()
-                    .any(|current| current.cidr == route.cidr)
-            })
-            .cloned()
-            .collect(),
-        policy_rules: previous
-            .policy_rules
-            .iter()
-            .filter(|rule| !current.policy_rules.contains(rule))
-            .cloned()
-            .collect(),
-    }
-}
-
-fn retained_managed_route_plan(previous: &RoutePlan, current: &RoutePlan) -> RoutePlan {
-    if previous.interface != current.interface {
-        return RoutePlan {
-            interface: current.interface.clone(),
-            routes: Vec::new(),
-            policy_rules: Vec::new(),
-        };
-    }
-    RoutePlan {
-        interface: previous.interface.clone(),
-        routes: previous
-            .routes
-            .iter()
-            .filter(|route| {
-                current
-                    .routes
-                    .iter()
-                    .any(|current| current.cidr == route.cidr)
-            })
-            .cloned()
-            .collect(),
-        policy_rules: previous
-            .policy_rules
-            .iter()
-            .filter(|rule| current.policy_rules.contains(rule))
-            .cloned()
-            .collect(),
-    }
 }
 
 async fn start_kubernetes_underlay_routes(
@@ -9920,12 +9850,11 @@ async fn run_kubernetes_underlay_route_loop<M>(
 ) where
     M: RouteManager + 'static,
 {
-    let mut applied_plan = None;
     loop {
         match source.resolve_intent().await {
             Ok(intent) => {
                 let result = match checked_kubernetes_route_plan(intent.clone()) {
-                    Ok(plan) => apply_managed_route_plan(&manager, &mut applied_plan, plan).await,
+                    Ok(plan) => apply_managed_route_plan(&manager, plan).await,
                     Err(error) => Err(error),
                 };
                 match result {
@@ -15436,6 +15365,7 @@ mod tests {
         priorities: &[u32],
     ) -> anyhow::Result<RoutePlan> {
         Ok(RoutePlan {
+            owner: RoutePlanOwner::Docker,
             interface: interface.to_string(),
             routes: cidrs
                 .iter()
@@ -15469,33 +15399,45 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingManagedRouteManager {
         applied: tokio::sync::RwLock<Vec<RoutePlan>>,
-        removed: tokio::sync::RwLock<Vec<RoutePlan>>,
+        removed: tokio::sync::RwLock<Vec<ManagedRouteInventory>>,
+        managed_inventory: tokio::sync::RwLock<Option<ManagedRouteInventory>>,
     }
 
     #[async_trait]
     impl RouteManager for RecordingManagedRouteManager {
         async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            *self.managed_inventory.write().await =
+                Some(ipars_route_manager::desired_managed_route_inventory(&plan)?);
             self.applied.write().await.push(plan);
             Ok(())
         }
 
         async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
-            self.removed.write().await.push(plan);
+            ipars_route_manager::validate_route_plan(&plan)?;
             Ok(())
         }
 
-        async fn managed_main_table_routes(
+        async fn managed_route_inventory(
             &self,
-            _interface: &str,
-        ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
-            Ok(None)
+            _plan: &RoutePlan,
+        ) -> Result<Option<ManagedRouteInventory>, RouteManagerError> {
+            Ok(self.managed_inventory.read().await.clone())
         }
 
-        async fn remove_managed_main_table_routes(
+        async fn remove_managed_route_inventory(
             &self,
             _interface: &str,
-            _routes: &BTreeSet<ManagedMainTableRoute>,
+            inventory: &ManagedRouteInventory,
         ) -> Result<(), RouteManagerError> {
+            if let Some(current) = self.managed_inventory.write().await.as_mut() {
+                current
+                    .routes
+                    .retain(|route| !inventory.routes.contains(route));
+                current
+                    .policy_rules
+                    .retain(|rule| !inventory.policy_rules.contains(rule));
+            }
+            self.removed.write().await.push(inventory.clone());
             Ok(())
         }
 
@@ -15800,78 +15742,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn stale_managed_route_plan_tracks_dropped_routes_and_rules() -> anyhow::Result<()> {
-        let previous = test_route_plan(
-            "ipars0",
-            &["10.10.0.0/16", "10.11.0.0/16"],
-            &[10_050, 10_051],
-        )?;
-        let current = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
-
-        let stale = stale_managed_route_plan(&previous, &current);
-
-        assert_eq!(stale.interface, "ipars0");
-        assert_eq!(stale.routes.len(), 1);
-        assert_eq!(
-            stale.routes[0].cidr,
-            "10.10.0.0/16".parse::<ipnet::IpNet>()?
-        );
-        assert_eq!(stale.policy_rules.len(), 1);
-        assert_eq!(stale.policy_rules[0].priority, 10_050);
-        Ok(())
-    }
-
-    #[test]
-    fn stale_managed_route_plan_removes_all_previous_routes_on_interface_change(
-    ) -> anyhow::Result<()> {
-        let previous = test_route_plan("ipars0", &["10.10.0.0/16"], &[10_050])?;
-        let current = test_route_plan("ipars1", &["10.10.0.0/16"], &[10_050])?;
-
-        assert_eq!(stale_managed_route_plan(&previous, &current), previous);
-        Ok(())
-    }
-
-    #[test]
-    fn retained_managed_route_plan_keeps_only_routes_still_present_by_cidr() -> anyhow::Result<()> {
-        let previous = test_route_plan(
-            "ipars0",
-            &["10.10.0.0/16", "10.11.0.0/16"],
-            &[10_050, 10_051],
-        )?;
-        let current = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
-
-        let retained = retained_managed_route_plan(&previous, &current);
-
-        assert_eq!(retained.interface, "ipars0");
-        assert_eq!(retained.routes.len(), 1);
-        assert_eq!(
-            retained.routes[0].cidr,
-            "10.11.0.0/16".parse::<ipnet::IpNet>()?
-        );
-        assert_eq!(retained.policy_rules.len(), 1);
-        assert_eq!(retained.policy_rules[0].priority, 10_051);
-        Ok(())
-    }
-
-    #[test]
-    fn retained_managed_route_plan_clears_state_on_interface_change() -> anyhow::Result<()> {
-        let previous = test_route_plan("ipars0", &["10.10.0.0/16"], &[10_050])?;
-        let current = test_route_plan("ipars1", &["10.10.0.0/16"], &[10_050])?;
-
-        let retained = retained_managed_route_plan(&previous, &current);
-
-        assert_eq!(retained.interface, "ipars1");
-        assert!(retained.routes.is_empty());
-        assert!(retained.policy_rules.is_empty());
-        Ok(())
-    }
-
     #[tokio::test]
     async fn managed_route_plan_reconciles_removed_routes_and_rules_before_apply(
     ) -> anyhow::Result<()> {
         let manager = RecordingManagedRouteManager::default();
-        let mut applied_plan = None;
         let first = test_route_plan(
             "ipars0",
             &["10.10.0.0/16", "10.11.0.0/16"],
@@ -15879,12 +15753,9 @@ mod tests {
         )?;
         let second = test_route_plan("ipars0", &["10.11.0.0/16"], &[10_051])?;
 
-        let first_summary =
-            apply_managed_route_plan(&manager, &mut applied_plan, first.clone()).await?;
-        let second_summary =
-            apply_managed_route_plan(&manager, &mut applied_plan, second.clone()).await?;
+        let first_summary = apply_managed_route_plan(&manager, first.clone()).await?;
+        let second_summary = apply_managed_route_plan(&manager, second.clone()).await?;
 
-        assert_eq!(applied_plan, Some(second.clone()));
         assert_eq!(
             first_summary,
             ManagedRouteApplySummary {
@@ -15898,7 +15769,7 @@ mod tests {
             ManagedRouteApplySummary {
                 plan: second.clone(),
                 routes_removed: 1,
-                policy_rules_removed: 1,
+                policy_rules_removed: 2,
             }
         );
         assert_eq!(manager.applied.read().await.as_slice(), &[first, second]);
@@ -15906,11 +15777,18 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].routes.len(), 1);
         assert_eq!(
-            removed[0].routes[0].cidr,
-            "10.10.0.0/16".parse::<ipnet::IpNet>()?
+            removed[0].routes.iter().next().map(|route| route.cidr),
+            Some("10.10.0.0/16".parse::<ipnet::IpNet>()?)
         );
-        assert_eq!(removed[0].policy_rules.len(), 1);
-        assert_eq!(removed[0].policy_rules[0].priority, 10_050);
+        assert_eq!(removed[0].policy_rules.len(), 2);
+        assert_eq!(
+            removed[0]
+                .policy_rules
+                .iter()
+                .next()
+                .map(|rule| rule.rule.priority),
+            Some(10_050)
+        );
         Ok(())
     }
 

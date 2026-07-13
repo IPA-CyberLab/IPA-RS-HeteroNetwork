@@ -6,8 +6,8 @@ use std::{fs, path::PathBuf};
 
 use ipars_route_manager::{
     DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetlinkRouteManager, LinuxNetworkNamespace,
-    LinuxRouteManager, ManagedMainTableRoute, NamespacedLinuxRouteCommandRunner, RouteManager,
-    RoutePlan, SystemRouteCommandRunner,
+    LinuxRouteManager, ManagedRoute, ManagedRouteInventory, NamespacedLinuxRouteCommandRunner,
+    RouteManager, RoutePlan, RoutePlanOwner, SystemRouteCommandRunner,
 };
 use ipars_types::{NodeId, Route};
 
@@ -34,6 +34,7 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
         SystemRouteCommandRunner,
     ));
     let plan = RoutePlan {
+        owner: RoutePlanOwner::PeerMap,
         interface: "lo".to_string(),
         routes: vec![Route {
             id: "netns-smoke".to_string(),
@@ -66,18 +67,23 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
         SystemRouteCommandRunner,
     ));
     let inventory = restarted_manager
-        .managed_main_table_routes("lo")
+        .managed_route_inventory(&plan)
         .await?
         .ok_or("command route inventory unexpectedly unavailable")?;
     assert_eq!(
         inventory,
-        BTreeSet::from([ManagedMainTableRoute::current(
-            "198.51.100.0/24".parse()?,
-            77,
-        )])
+        ManagedRouteInventory {
+            routes: BTreeSet::from([ManagedRoute::current(
+                RoutePlanOwner::PeerMap,
+                "198.51.100.0/24".parse()?,
+                77,
+                254,
+            )]),
+            policy_rules: BTreeSet::new(),
+        }
     );
     restarted_manager
-        .remove_managed_main_table_routes("lo", &inventory)
+        .remove_managed_route_inventory("lo", &inventory)
         .await?;
     let route_after_remove = command_output(
         "ip",
@@ -124,6 +130,83 @@ async fn linux_route_manager_applies_docker_and_kubernetes_intents_inside_networ
             expose_host_routes: true,
         })
         .await?;
+    command(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "route",
+            "replace",
+            "172.19.0.0/16",
+            "dev",
+            "lo",
+            "protocol",
+            "241",
+            "table",
+            "10065",
+            "metric",
+            "777",
+        ],
+    )?;
+    command(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "-4",
+            "rule",
+            "add",
+            "priority",
+            "10063",
+            "table",
+            "10065",
+            "protocol",
+            "241",
+        ],
+    )?;
+    let restarted_manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+        LinuxNetworkNamespace::from_name(namespace_name.as_str())?,
+        SystemRouteCommandRunner,
+    ));
+    let inventory = restarted_manager
+        .managed_route_inventory(&docker_plan)
+        .await?
+        .ok_or("Docker route inventory unexpectedly unavailable")?;
+    assert_eq!(inventory.routes.len(), 2);
+    assert_eq!(inventory.policy_rules.len(), 3);
+    let reconciliation = restarted_manager
+        .reconcile_routes(docker_plan.clone())
+        .await?;
+    assert_eq!(reconciliation.routes_removed, 1);
+    assert_eq!(reconciliation.policy_rules_removed, 1);
+    assert!(command_output(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "route",
+            "show",
+            "table",
+            "10065",
+            "172.19.0.0/16",
+        ],
+    )?
+    .trim()
+    .is_empty());
+    assert!(command_output(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "-4",
+            "rule",
+            "show",
+            "priority",
+            "10063",
+        ],
+    )?
+    .trim()
+    .is_empty());
     let docker_route = command_output(
         "ip",
         [
@@ -279,6 +362,7 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
     let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
     let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace.clone());
     let plan = RoutePlan {
+        owner: RoutePlanOwner::PeerMap,
         interface: "lo".to_string(),
         routes: vec![Route {
             id: "netns-netlink-smoke".to_string(),
@@ -306,20 +390,57 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
     assert!(route_after_apply.contains("dev lo"));
     assert!(route_after_apply.contains("metric 78"));
 
+    command(
+        "ip",
+        [
+            "-n",
+            namespace_name.as_str(),
+            "route",
+            "replace",
+            "198.51.102.0/24",
+            "dev",
+            "lo",
+            "protocol",
+            "240",
+            "table",
+            "10065",
+            "metric",
+            "779",
+        ],
+    )?;
+
     let restarted_manager = LinuxNetlinkRouteManager::new_in_namespace(namespace);
     let inventory = restarted_manager
-        .managed_main_table_routes("lo")
+        .managed_route_inventory(&plan)
         .await?
         .ok_or("netlink route inventory unexpectedly unavailable")?;
+    assert_eq!(inventory.routes.len(), 2);
+    assert!(inventory.routes.contains(&ManagedRoute {
+        cidr: "198.51.102.0/24".parse()?,
+        metric: 779,
+        table: 10_065,
+        protocol: 240,
+    }));
+    let reconciliation = restarted_manager.reconcile_routes(plan.clone()).await?;
+    assert_eq!(reconciliation.routes_removed, 1);
+    let inventory = restarted_manager
+        .managed_route_inventory(&plan)
+        .await?
+        .ok_or("netlink route inventory unexpectedly available after reconcile")?;
     assert_eq!(
         inventory,
-        BTreeSet::from([ManagedMainTableRoute::current(
-            "198.51.101.0/24".parse()?,
-            78,
-        )])
+        ManagedRouteInventory {
+            routes: BTreeSet::from([ManagedRoute::current(
+                RoutePlanOwner::PeerMap,
+                "198.51.101.0/24".parse()?,
+                78,
+                254,
+            )]),
+            policy_rules: BTreeSet::new(),
+        }
     );
     restarted_manager
-        .remove_managed_main_table_routes("lo", &inventory)
+        .remove_managed_route_inventory("lo", &inventory)
         .await?;
     let route_after_remove = command_output(
         "ip",

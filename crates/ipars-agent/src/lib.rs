@@ -18,10 +18,12 @@ use ipars_crypto::{
 };
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_route_manager::{
-    validate_route_plan, warn_if_linux_netns_is_current, with_netlink_namespace,
-    LinuxNetlinkSocket, LinuxNetworkNamespace, ManagedMainTableRoute, RouteManager,
-    RouteManagerError, RoutePlan,
+    desired_managed_route_inventory, validate_route_plan, warn_if_linux_netns_is_current,
+    with_netlink_namespace, LinuxNetlinkSocket, LinuxNetworkNamespace, RouteManager,
+    RouteManagerError, RoutePlan, RoutePlanOwner,
 };
+#[cfg(test)]
+use ipars_route_manager::{ManagedRoute, ManagedRouteInventory};
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentManagedProcessStatus,
@@ -4983,33 +4985,28 @@ where
             routes.extend(peer_routes.iter().cloned());
             desired_peer_routes.insert(peer.node_id.clone(), peer_routes);
         }
-        let desired_managed_routes = routes
-            .iter()
-            .map(|route| ManagedMainTableRoute::current(route.cidr, route.metric))
-            .collect::<BTreeSet<_>>();
         let desired_route_plan = RoutePlan {
+            owner: RoutePlanOwner::PeerMap,
             interface: self.interface.clone(),
             routes,
             policy_rules: Vec::new(),
         };
         validate_route_plan(&desired_route_plan)?;
-        let actual_managed_routes = self
+        let desired_managed_inventory = desired_managed_route_inventory(&desired_route_plan)?;
+        let actual_managed_inventory = self
             .route_manager
-            .managed_main_table_routes(&self.interface)
+            .managed_route_inventory(&desired_route_plan)
             .await?;
 
         let mut peers_removed = 0;
         let mut routes_removed = 0;
-        if let Some(actual_managed_routes) = &actual_managed_routes {
-            let stale_routes = actual_managed_routes
-                .difference(&desired_managed_routes)
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if !stale_routes.is_empty() {
+        if let Some(actual_managed_inventory) = &actual_managed_inventory {
+            let stale_inventory = actual_managed_inventory.difference(&desired_managed_inventory);
+            if !stale_inventory.is_empty() {
                 self.route_manager
-                    .remove_managed_main_table_routes(&self.interface, &stale_routes)
+                    .remove_managed_route_inventory(&self.interface, &stale_inventory)
                     .await?;
-                routes_removed += stale_routes.len();
+                routes_removed += stale_inventory.routes.len();
             }
         }
         let mut removed_public_keys = BTreeSet::new();
@@ -5025,9 +5022,10 @@ where
                 .get(&peer)
                 .cloned()
                 .unwrap_or_default();
-            if actual_managed_routes.is_none() && !routes_to_remove.is_empty() {
+            if actual_managed_inventory.is_none() && !routes_to_remove.is_empty() {
                 self.route_manager
                     .remove_routes(RoutePlan {
+                        owner: RoutePlanOwner::PeerMap,
                         interface: self.interface.clone(),
                         routes: routes_to_remove.clone(),
                         policy_rules: Vec::new(),
@@ -5108,9 +5106,10 @@ where
                 .into_iter()
                 .filter(|route| !desired_routes.contains(route))
                 .collect::<Vec<_>>();
-            if actual_managed_routes.is_none() && !routes_to_remove.is_empty() {
+            if actual_managed_inventory.is_none() && !routes_to_remove.is_empty() {
                 self.route_manager
                     .remove_routes(RoutePlan {
+                        owner: RoutePlanOwner::PeerMap,
                         interface: self.interface.clone(),
                         routes: routes_to_remove.clone(),
                         policy_rules: Vec::new(),
@@ -6038,15 +6037,18 @@ mod tests {
     struct RecordingRouteManager {
         applied: tokio::sync::RwLock<Vec<RoutePlan>>,
         removed: tokio::sync::RwLock<Vec<RoutePlan>>,
-        managed_inventory: tokio::sync::RwLock<Option<BTreeSet<ManagedMainTableRoute>>>,
-        managed_removed: tokio::sync::RwLock<Vec<BTreeSet<ManagedMainTableRoute>>>,
+        managed_inventory: tokio::sync::RwLock<Option<ManagedRouteInventory>>,
+        managed_removed: tokio::sync::RwLock<Vec<ManagedRouteInventory>>,
         fail_managed_inventory: bool,
     }
 
     impl RecordingRouteManager {
-        fn with_managed_inventory(routes: impl IntoIterator<Item = ManagedMainTableRoute>) -> Self {
+        fn with_managed_inventory(routes: impl IntoIterator<Item = ManagedRoute>) -> Self {
             Self {
-                managed_inventory: tokio::sync::RwLock::new(Some(routes.into_iter().collect())),
+                managed_inventory: tokio::sync::RwLock::new(Some(ManagedRouteInventory {
+                    routes: routes.into_iter().collect(),
+                    policy_rules: BTreeSet::new(),
+                })),
                 ..Self::default()
             }
         }
@@ -6063,11 +6065,9 @@ mod tests {
     impl RouteManager for RecordingRouteManager {
         async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
             if let Some(inventory) = self.managed_inventory.write().await.as_mut() {
-                inventory.extend(
-                    plan.routes
-                        .iter()
-                        .map(|route| ManagedMainTableRoute::current(route.cidr, route.metric)),
-                );
+                let desired = desired_managed_route_inventory(&plan)?;
+                inventory.routes.extend(desired.routes);
+                inventory.policy_rules.extend(desired.policy_rules);
             }
             self.applied.write().await.push(plan);
             Ok(())
@@ -6078,10 +6078,10 @@ mod tests {
             Ok(())
         }
 
-        async fn managed_main_table_routes(
+        async fn managed_route_inventory(
             &self,
-            _interface: &str,
-        ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
+            _plan: &RoutePlan,
+        ) -> Result<Option<ManagedRouteInventory>, RouteManagerError> {
             if self.fail_managed_inventory {
                 return Err(RouteManagerError::Backend(
                     "injected managed route inventory failure".to_string(),
@@ -6090,15 +6090,20 @@ mod tests {
             Ok(self.managed_inventory.read().await.clone())
         }
 
-        async fn remove_managed_main_table_routes(
+        async fn remove_managed_route_inventory(
             &self,
             _interface: &str,
-            routes: &BTreeSet<ManagedMainTableRoute>,
+            stale: &ManagedRouteInventory,
         ) -> Result<(), RouteManagerError> {
             if let Some(inventory) = self.managed_inventory.write().await.as_mut() {
-                inventory.retain(|route| !routes.contains(route));
+                inventory
+                    .routes
+                    .retain(|route| !stale.routes.contains(route));
+                inventory
+                    .policy_rules
+                    .retain(|rule| !stale.policy_rules.contains(rule));
             }
-            self.managed_removed.write().await.push(routes.clone());
+            self.managed_removed.write().await.push(stale.clone());
             Ok(())
         }
 
@@ -8532,8 +8537,10 @@ mod tests {
     #[tokio::test]
     async fn peer_map_applier_removes_unknown_managed_route_after_restart(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let desired = ManagedMainTableRoute::current("100.64.0.70/32".parse()?, 10);
-        let stale = ManagedMainTableRoute::current("10.70.0.0/16".parse()?, 50);
+        let desired =
+            ManagedRoute::current(RoutePlanOwner::PeerMap, "100.64.0.70/32".parse()?, 10, 254);
+        let stale =
+            ManagedRoute::current(RoutePlanOwner::PeerMap, "10.70.0.0/16".parse()?, 50, 254);
         let route_manager = RecordingRouteManager::with_managed_inventory([desired, stale.clone()]);
         let applier =
             PeerMapApplier::new("ipars0", MemoryWireGuardBackend::default(), route_manager);
@@ -8562,7 +8569,10 @@ mod tests {
                 .read()
                 .await
                 .as_slice(),
-            &[BTreeSet::from([stale])]
+            &[ManagedRouteInventory {
+                routes: BTreeSet::from([stale]),
+                policy_rules: BTreeSet::new(),
+            }]
         );
         assert!(applier.wireguard.peers.read().await.contains_key(&peer_id));
         Ok(())
