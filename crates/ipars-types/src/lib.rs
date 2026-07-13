@@ -708,6 +708,7 @@ impl PathState {
                     Self::DirectNatTraversal,
                     EndpointCandidateKind::StunReflexive
                 )
+                | (Self::DirectNatTraversal, EndpointCandidateKind::LocalUdp)
         )
     }
 }
@@ -18371,13 +18372,10 @@ mod tests {
 
     #[test]
     fn path_state_allows_only_matching_selected_candidate_kinds() {
-        for (state, expected_kind) in [
-            (PathState::DirectPublic, EndpointCandidateKind::PublicUdp),
-            (PathState::DirectIpv6, EndpointCandidateKind::Ipv6),
-            (
-                PathState::DirectNatTraversal,
-                EndpointCandidateKind::StunReflexive,
-            ),
+        for state in [
+            PathState::DirectPublic,
+            PathState::DirectIpv6,
+            PathState::DirectNatTraversal,
         ] {
             for kind in [
                 EndpointCandidateKind::PublicUdp,
@@ -18386,9 +18384,18 @@ mod tests {
                 EndpointCandidateKind::LocalUdp,
                 EndpointCandidateKind::Relay,
             ] {
+                let expected = match state {
+                    PathState::DirectPublic => kind == EndpointCandidateKind::PublicUdp,
+                    PathState::DirectIpv6 => kind == EndpointCandidateKind::Ipv6,
+                    PathState::DirectNatTraversal => matches!(
+                        kind,
+                        EndpointCandidateKind::StunReflexive | EndpointCandidateKind::LocalUdp
+                    ),
+                    _ => false,
+                };
                 assert_eq!(
                     state.allows_selected_candidate_kind(kind),
-                    kind == expected_kind,
+                    expected,
                     "{state:?} candidate kind {kind:?}"
                 );
             }

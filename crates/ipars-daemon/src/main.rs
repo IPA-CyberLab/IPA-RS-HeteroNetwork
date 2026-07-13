@@ -20,15 +20,16 @@ use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ipars_agent::{
-    AgentError, AgentNodeState, AgentRuntime, BoringTunWireGuardBackend,
-    CommandWireGuardPeerTelemetrySource, FileAgentStateStore, KernelWireGuardBackend,
-    KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner, LinuxWireGuardBackend,
-    MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier,
-    PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig, PendingDirectPathProbe,
-    RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner,
-    UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder, UdpRelayFrameForwarder,
-    UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerInventorySource,
-    WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
+    preferred_local_udp_candidate, AgentError, AgentNodeState, AgentRuntime,
+    BoringTunWireGuardBackend, CommandWireGuardPeerTelemetrySource, FileAgentStateStore,
+    KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner,
+    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
+    PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig,
+    PendingDirectPathProbe, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
+    TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder,
+    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
+    WireGuardPeerInventorySource, WireGuardPeerTelemetry, WireGuardPeerTelemetrySource,
+    DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -11639,7 +11640,11 @@ async fn negotiate_signal_paths(
             send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
         let mut relay_candidates = selected_relay_candidates(&response);
         promote_active_relay_candidate(runtime, &peer.node_id, &mut relay_candidates).await;
-        let candidate_record = signal_path_record(response, chrono::Utc::now());
+        let candidate_record = signal_path_record_with_local_candidates(
+            response,
+            chrono::Utc::now(),
+            &status.candidates,
+        );
         let (mut record, mut path_selection) =
             stable_signal_path_record(runtime, candidate_record).await;
         if record.selected_state.is_direct()
@@ -11948,6 +11953,13 @@ async fn prepare_direct_nat_traversal(
     hole_puncher: &UdpHolePuncher,
 ) -> Result<(), AgentError> {
     if direct.selected_state != PathState::DirectNatTraversal {
+        return Ok(());
+    }
+    if direct
+        .selected_candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.kind == ipars_types::EndpointCandidateKind::LocalUdp)
+    {
         return Ok(());
     }
     let plan = fetch_hole_punch_plan(client, signal_url, &direct.key, identity)
@@ -12992,8 +13004,20 @@ fn signal_path_record(
     response: SignalPathResponse,
     updated_at: chrono::DateTime<chrono::Utc>,
 ) -> PathRecord {
-    let selected_candidate =
-        selected_path_candidate(response.preferred_state, &response.target_candidates);
+    signal_path_record_with_local_candidates(response, updated_at, &[])
+}
+
+fn signal_path_record_with_local_candidates(
+    response: SignalPathResponse,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    local_candidates: &[EndpointCandidate],
+) -> PathRecord {
+    let selected_candidate = if response.preferred_state == PathState::DirectNatTraversal {
+        preferred_local_udp_candidate(local_candidates, &response.target_candidates)
+    } else {
+        None
+    }
+    .or_else(|| selected_path_candidate(response.preferred_state, &response.target_candidates));
     let relay_node = if response.preferred_state == PathState::Relay {
         response
             .relay_candidates
@@ -13022,11 +13046,23 @@ fn selected_path_candidate(
         .iter()
         .filter(|candidate| state.allows_selected_candidate_kind(candidate.kind))
         .min_by(|left, right| {
-            left.cost
-                .cmp(&right.cost)
+            selected_path_candidate_kind_rank(state, left.kind)
+                .cmp(&selected_path_candidate_kind_rank(state, right.kind))
+                .then_with(|| left.cost.cmp(&right.cost))
                 .then_with(|| right.priority.cmp(&left.priority))
         })
         .cloned()
+}
+
+fn selected_path_candidate_kind_rank(
+    state: PathState,
+    kind: ipars_types::EndpointCandidateKind,
+) -> u8 {
+    match (state, kind) {
+        (PathState::DirectNatTraversal, ipars_types::EndpointCandidateKind::StunReflexive) => 0,
+        (PathState::DirectNatTraversal, ipars_types::EndpointCandidateKind::LocalUdp) => 1,
+        _ => 0,
+    }
 }
 
 async fn run_peer_map_sync_loop<S, A>(

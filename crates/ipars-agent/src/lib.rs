@@ -24,7 +24,7 @@ use ipars_route_manager::{
 };
 #[cfg(test)]
 use ipars_route_manager::{ManagedRoute, ManagedRouteInventory};
-use ipars_stun::{StunError, StunProbe, UdpStunProbe};
+use ipars_stun::{StunError, UdpStunProbe};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentManagedProcessStatus,
     AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowApplicationCount,
@@ -1477,10 +1477,13 @@ impl AgentRuntime {
         stun_server: std::net::SocketAddr,
     ) -> Result<EndpointCandidate, AgentError> {
         let _refresh = self.stun_refresh.lock().await;
-        let candidate = UdpStunProbe
-            .probe(self.state().node_id, local_bind, stun_server)
+        let observation = UdpStunProbe
+            .observe_binding(local_bind, stun_server)
             .await?;
-        self.replace_stun_candidates(vec![candidate.clone()]).await;
+        let candidate = self.stun_candidate_from_observation(&observation);
+        let local_candidate = self.local_candidate_from_observation(&observation);
+        self.replace_stun_candidates(vec![candidate.clone(), local_candidate])
+            .await;
         *self.nat_classification.write().await = None;
         Ok(candidate)
     }
@@ -1521,13 +1524,16 @@ impl AgentRuntime {
             Utc::now(),
         );
 
-        self.replace_stun_candidates(
-            observations
-                .iter()
-                .map(|observation| self.stun_candidate_from_observation(observation))
-                .collect(),
-        )
-        .await;
+        let refreshed_candidates = observations
+            .iter()
+            .flat_map(|observation| {
+                vec![
+                    self.stun_candidate_from_observation(observation),
+                    self.local_candidate_from_observation(observation),
+                ]
+            })
+            .collect();
+        self.replace_stun_candidates(refreshed_candidates).await;
         *self.nat_classification.write().await = Some(classification.clone());
 
         Ok(classification)
@@ -1565,6 +1571,21 @@ impl AgentRuntime {
             observed_at: observation.observed_at,
             priority: 80,
             cost: 20,
+            source: CandidateSource::StunProbe,
+        }
+    }
+
+    fn local_candidate_from_observation(
+        &self,
+        observation: &NatProbeObservation,
+    ) -> EndpointCandidate {
+        EndpointCandidate {
+            node_id: self.state().node_id,
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: observation.local_addr,
+            observed_at: observation.observed_at,
+            priority: 70,
+            cost: 30,
             source: CandidateSource::StunProbe,
         }
     }
@@ -4837,12 +4858,20 @@ impl RuntimePeerEndpointResolver {
 #[async_trait]
 impl PeerEndpointResolver for RuntimePeerEndpointResolver {
     async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
+        let local_candidates = self.runtime.status().await.candidates;
         if let Some(probe) = self
             .runtime
             .pending_direct_path_probe(&peer.node_id)
             .await
             .filter(|probe| probe.is_active_at(Utc::now()))
         {
+            if probe.selected_state == PathState::DirectNatTraversal {
+                if let Some(candidate) =
+                    preferred_local_udp_candidate(&local_candidates, &peer.endpoint_candidates)
+                {
+                    return Ok(wireguard_endpoint_for_candidate(&candidate, &peer.node_id));
+                }
+            }
             return Ok(wireguard_endpoint_for_candidate(
                 &probe.selected_candidate,
                 &peer.node_id,
@@ -4850,7 +4879,13 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
         }
         let path = self.runtime.path_record_for_peer(&peer.node_id).await;
         let Some(path) = path else {
-            return Ok(preferred_endpoint(peer));
+            return Ok(
+                preferred_local_udp_candidate(&local_candidates, &peer.endpoint_candidates)
+                    .and_then(|candidate| {
+                        wireguard_endpoint_for_candidate(&candidate, &peer.node_id)
+                    })
+                    .or_else(|| preferred_endpoint(peer)),
+            );
         };
 
         match path.selected_state {
@@ -4864,12 +4899,80 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
                 .await
                 .map(|endpoint| endpoint.to_string())),
             PathState::Unreachable => Ok(None),
+            PathState::DirectNatTraversal => Ok(preferred_local_udp_candidate(
+                &local_candidates,
+                &peer.endpoint_candidates,
+            )
+            .and_then(|candidate| wireguard_endpoint_for_candidate(&candidate, &peer.node_id))
+            .or_else(|| {
+                path.selected_candidate.as_ref().and_then(|candidate| {
+                    wireguard_endpoint_for_candidate(candidate, &peer.node_id)
+                })
+            })
+            .or_else(|| preferred_endpoint(peer))),
             _ => Ok(path
                 .selected_candidate
                 .as_ref()
                 .and_then(|candidate| wireguard_endpoint_for_candidate(candidate, &peer.node_id))
                 .or_else(|| preferred_endpoint(peer))),
         }
+    }
+}
+
+/// Select a local UDP candidate only when the peer's reflexive endpoint is
+/// private and both local addresses share a directly routable subnet.
+pub fn preferred_local_udp_candidate(
+    local_candidates: &[EndpointCandidate],
+    peer_candidates: &[EndpointCandidate],
+) -> Option<EndpointCandidate> {
+    if !peer_candidates.iter().any(|candidate| {
+        candidate.kind == EndpointCandidateKind::StunReflexive
+            && private_or_link_local(candidate.addr.ip())
+    }) {
+        return None;
+    }
+
+    local_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == EndpointCandidateKind::LocalUdp
+                && endpoint_addr_is_usable(candidate.addr)
+        })
+        .filter(|candidate| {
+            peer_candidates.iter().any(|peer_candidate| {
+                peer_candidate.kind == EndpointCandidateKind::LocalUdp
+                    && endpoint_addr_is_usable(peer_candidate.addr)
+                    && local_addresses_share_subnet(candidate.addr.ip(), peer_candidate.addr.ip())
+            })
+        })
+        .min_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| right.priority.cmp(&left.priority))
+        })
+        .cloned()
+}
+
+fn private_or_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
+fn local_addresses_share_subnet(left: IpAddr, right: IpAddr) -> bool {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => {
+            private_or_link_local(IpAddr::V4(left))
+                && private_or_link_local(IpAddr::V4(right))
+                && (u32::from(left) & 0xffff_ff00) == (u32::from(right) & 0xffff_ff00)
+        }
+        (IpAddr::V6(left), IpAddr::V6(right)) => {
+            private_or_link_local(IpAddr::V6(left))
+                && private_or_link_local(IpAddr::V6(right))
+                && (u128::from(left) >> 64) == (u128::from(right) >> 64)
+        }
+        _ => false,
     }
 }
 
@@ -6552,6 +6655,70 @@ mod tests {
             preferred_endpoint(&peer).as_deref(),
             Some("198.51.100.20:51820")
         );
+    }
+
+    #[test]
+    fn preferred_local_udp_candidate_requires_private_reflexive_peer_on_same_subnet() {
+        let peer_id = NodeId::from_string("peer-a");
+        let local_candidates = vec![EndpointCandidate {
+            node_id: NodeId::from_string("local"),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([172, 18, 0, 3], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        }];
+        let peer_candidates = vec![
+            EndpointCandidate {
+                node_id: peer_id.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([10, 244, 1, 1], 18_410)),
+                observed_at: Utc::now(),
+                priority: 80,
+                cost: 20,
+                source: CandidateSource::StunProbe,
+            },
+            EndpointCandidate {
+                node_id: peer_id,
+                kind: EndpointCandidateKind::LocalUdp,
+                addr: SocketAddr::from(([172, 18, 0, 2], 51_820)),
+                observed_at: Utc::now(),
+                priority: 70,
+                cost: 30,
+                source: CandidateSource::StunProbe,
+            },
+        ];
+
+        assert_eq!(
+            preferred_local_udp_candidate(&local_candidates, &peer_candidates)
+                .map(|candidate| candidate.addr),
+            Some(SocketAddr::from(([172, 18, 0, 3], 51_820)))
+        );
+    }
+
+    #[test]
+    fn preferred_local_udp_candidate_keeps_public_stun_endpoint_preferred() {
+        let local_candidates = vec![EndpointCandidate {
+            node_id: NodeId::from_string("local"),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([10, 0, 0, 3], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        }];
+        let peer_candidates = vec![EndpointCandidate {
+            node_id: NodeId::from_string("peer-a"),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 2], 51_820)),
+            observed_at: Utc::now(),
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        }];
+
+        assert!(preferred_local_udp_candidate(&local_candidates, &peer_candidates).is_none());
     }
 
     #[tokio::test]
@@ -11551,7 +11718,7 @@ mod tests {
         server_task.await??;
 
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(runtime.status().await.candidate_count, 1);
+        assert_eq!(runtime.status().await.candidate_count, 2);
         Ok(())
     }
 
@@ -11692,7 +11859,7 @@ mod tests {
             NatTraversalStrategy::DirectCandidate
         );
         let status = runtime.status().await;
-        assert_eq!(status.candidate_count, 1);
+        assert_eq!(status.candidate_count, 2);
         assert_eq!(status.nat_classification, Some(classification));
         Ok(())
     }
