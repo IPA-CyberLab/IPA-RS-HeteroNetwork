@@ -140,6 +140,7 @@ const MAX_DOCKER_API_NETWORKS_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCKER_API_NETWORKS: usize = 1024;
 const MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK: usize = 64;
 const MAX_DOCKER_API_SUBNET_BYTES: usize = 128;
+const MAX_DOCKER_API_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -970,6 +971,14 @@ struct AgentArgs {
     docker_discover_networks: bool,
     #[arg(long, env = "IPARS_DOCKER_API_SOCKET")]
     docker_api_socket: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "IPARS_DOCKER_API_URL",
+        conflicts_with = "docker_api_socket"
+    )]
+    docker_api_url: Option<String>,
+    #[arg(long, env = "IPARS_DOCKER_API_CA_CERT_PATH")]
+    docker_api_ca_cert_path: Option<PathBuf>,
     #[arg(long, env = "IPARS_DOCKER_API_VERSION", default_value = "v1.43")]
     docker_api_version: String,
     #[arg(
@@ -1750,6 +1759,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             validate_docker_discovery_config(args)?;
         } else if args.docker_api_socket.is_some() {
             anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
+        } else if args.docker_api_url.is_some() {
+            anyhow::bail!("--docker-api-url requires --docker-discover-networks");
+        } else if args.docker_api_ca_cert_path.is_some() {
+            anyhow::bail!("--docker-api-ca-cert-path requires --docker-discover-networks");
         } else if !args.docker_networks.is_empty() {
             anyhow::bail!("--docker-network requires --docker-discover-networks");
         } else {
@@ -2392,7 +2405,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         && (!args.packet_flow_ebpf_cgroup_attach.is_empty()
             || !args.packet_flow_ebpf_sockops_attach.is_empty());
     let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
-    let docker_api_socket = args.apply_docker_routes && args.docker_discover_networks;
+    let docker_api_socket =
+        args.apply_docker_routes && args.docker_discover_networks && args.docker_api_url.is_none();
     let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
         && (args.relay_forwarder_netns.is_some() || args.linux_netns.is_some());
     if args.runtime_backend == AgentRuntimeBackend::DryRun {
@@ -2561,6 +2575,22 @@ fn validate_docker_discovery_config(args: &AgentArgs) -> anyhow::Result<()> {
     if let Some(socket) = args.docker_api_socket.as_deref() {
         validate_docker_api_socket_path(socket, "--docker-api-socket")?;
     }
+    if let Some(url) = args.docker_api_url.as_deref() {
+        validate_docker_api_url(url)?;
+    }
+    if let Some(ca_cert_path) = args.docker_api_ca_cert_path.as_deref() {
+        let api_url = args
+            .docker_api_url
+            .as_deref()
+            .context("--docker-api-ca-cert-path requires --docker-api-url")?;
+        let api_url = reqwest::Url::parse(api_url)
+            .context("--docker-api-url must be an absolute HTTP(S) URL")?;
+        anyhow::ensure!(
+            api_url.scheme() == "https",
+            "--docker-api-ca-cert-path requires an https --docker-api-url"
+        );
+        validate_docker_api_ca_certificate(ca_cert_path)?;
+    }
     validate_docker_network_filters(&args.docker_networks)?;
     if !args.docker_container_cidrs.is_empty() {
         anyhow::bail!(
@@ -2576,6 +2606,12 @@ fn validate_inactive_docker_route_config(args: &AgentArgs) -> anyhow::Result<()>
     }
     if args.docker_api_socket.is_some() {
         anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
+    }
+    if args.docker_api_url.is_some() {
+        anyhow::bail!("--docker-api-url requires --docker-discover-networks");
+    }
+    if args.docker_api_ca_cert_path.is_some() {
+        anyhow::bail!("--docker-api-ca-cert-path requires --docker-discover-networks");
     }
     if !args.docker_networks.is_empty() {
         anyhow::bail!("--docker-network requires --docker-discover-networks");
@@ -8698,6 +8734,7 @@ impl DockerRouteSource {
 #[derive(Debug, Clone)]
 struct DockerApiNetworkDiscovery {
     client: reqwest::Client,
+    api_base_url: String,
     api_version: String,
     network_filters: Vec<String>,
     container_namespace: Option<String>,
@@ -8750,15 +8787,30 @@ struct DockerDiscoveredRoutes {
 
 impl DockerApiNetworkDiscovery {
     fn new(args: &AgentArgs) -> anyhow::Result<Self> {
-        let socket = docker_api_socket_path(args)?;
-        let client = reqwest::Client::builder()
-            .unix_socket(socket)
+        let mut client_builder = reqwest::Client::builder()
             .connect_timeout(agent_http_connect_timeout(args))
-            .timeout(agent_http_request_timeout(args))
+            .timeout(agent_http_request_timeout(args));
+        let api_base_url = if let Some(api_url) = args.docker_api_url.as_deref() {
+            validate_docker_api_url(api_url)?;
+            if let Some(ca_cert_path) = args.docker_api_ca_cert_path.as_deref() {
+                let ca = read_docker_api_ca_certificate(ca_cert_path)?;
+                client_builder = client_builder.add_root_certificate(
+                    reqwest::Certificate::from_pem(&ca)
+                        .context("failed to parse Docker API CA certificate")?,
+                );
+            }
+            api_url.trim_end_matches('/').to_string()
+        } else {
+            let socket = docker_api_socket_path(args)?;
+            client_builder = client_builder.unix_socket(socket);
+            "http://docker".to_string()
+        };
+        let client = client_builder
             .build()
             .context("failed to build Docker API client")?;
         Ok(Self {
             client,
+            api_base_url,
             api_version: args.docker_api_version.clone(),
             network_filters: args.docker_networks.clone(),
             container_namespace: args.docker_container_namespace.clone(),
@@ -8771,7 +8823,10 @@ impl DockerApiNetworkDiscovery {
     async fn discover_intent(&self) -> anyhow::Result<DockerNetworkIntent> {
         let response = self
             .client
-            .get(docker_api_networks_url(&self.api_version))
+            .get(docker_api_networks_request_url(
+                &self.api_base_url,
+                &self.api_version,
+            )?)
             .send()
             .await
             .context("failed to query Docker networks")?
@@ -8791,6 +8846,28 @@ impl DockerApiNetworkDiscovery {
             expose_host_routes: self.expose_host_routes,
         })
     }
+}
+
+fn docker_api_networks_request_url(
+    api_base_url: &str,
+    api_version: &str,
+) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(api_base_url)
+        .context("Docker API base URL must be an absolute HTTP(S) URL")?;
+    let base_path = url.path().trim_end_matches('/');
+    let version = api_version.trim_matches('/');
+    let suffix = if version.is_empty() {
+        "networks".to_string()
+    } else {
+        format!("{version}/networks")
+    };
+    let path = if base_path.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("{base_path}/{suffix}")
+    };
+    url.set_path(&path);
+    Ok(url.to_string())
 }
 
 async fn read_docker_api_networks_response(
@@ -8933,15 +9010,6 @@ async fn heartbeat_routes(reporter: Option<&HeartbeatRouteReporter>) -> Option<V
     }
 }
 
-fn docker_api_networks_url(api_version: &str) -> String {
-    let version = api_version.trim_matches('/');
-    if version.is_empty() {
-        "http://docker/networks".to_string()
-    } else {
-        format!("http://docker/{version}/networks")
-    }
-}
-
 fn docker_api_socket_path(args: &AgentArgs) -> anyhow::Result<PathBuf> {
     resolve_docker_api_socket(
         args.docker_api_socket.as_deref(),
@@ -9028,6 +9096,115 @@ fn validate_docker_api_socket_path_components(value: &str, label: &str) -> anyho
         anyhow::bail!("{label} must not contain '.' or '..' path components");
     }
     Ok(())
+}
+
+fn validate_docker_api_url(value: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(value)
+        .with_context(|| "--docker-api-url must be an absolute HTTP(S) URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "--docker-api-url must use http or https"
+    );
+    anyhow::ensure!(
+        url.host_str().is_some(),
+        "--docker-api-url must include a host"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "--docker-api-url must not embed userinfo; configure Docker client credentials separately"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "--docker-api-url must not include a query or fragment"
+    );
+    anyhow::ensure!(
+        http_url_is_usable_endpoint(value),
+        "--docker-api-url must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast endpoint"
+    );
+    if url.scheme() == "http" {
+        let host = url.host_str().unwrap_or_default();
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        anyhow::ensure!(
+            loopback,
+            "--docker-api-url must use https for non-loopback Docker endpoints"
+        );
+    }
+    Ok(())
+}
+
+fn validate_docker_api_ca_certificate(path: &Path) -> anyhow::Result<()> {
+    let certificate = read_docker_api_ca_certificate(path)?;
+    reqwest::Certificate::from_pem(&certificate)
+        .context("--docker-api-ca-cert-path does not contain a valid PEM certificate")?;
+    Ok(())
+}
+
+fn read_docker_api_ca_certificate(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect Docker API CA certificate at {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "Docker API CA certificate path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Docker API CA certificate path {} must resolve to a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_DOCKER_API_CA_CERT_BYTES,
+        "Docker API CA certificate file {} exceeds maximum size of {} bytes",
+        path.display(),
+        MAX_DOCKER_API_CA_CERT_BYTES
+    );
+    let mut file = File::open(path).with_context(|| {
+        format!(
+            "failed to open Docker API CA certificate from {}",
+            path.display()
+        )
+    })?;
+    let mut certificate = Vec::new();
+    file.by_ref()
+        .take(MAX_DOCKER_API_CA_CERT_BYTES + 1)
+        .read_to_end(&mut certificate)
+        .with_context(|| {
+            format!(
+                "failed to read Docker API CA certificate from {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        certificate.len() as u64 <= MAX_DOCKER_API_CA_CERT_BYTES,
+        "Docker API CA certificate file {} exceeds maximum size of {} bytes",
+        path.display(),
+        MAX_DOCKER_API_CA_CERT_BYTES
+    );
+    anyhow::ensure!(
+        !certificate.is_empty(),
+        "Docker API CA certificate at {} is empty",
+        path.display()
+    );
+    let certificate_text = std::str::from_utf8(&certificate).with_context(|| {
+        format!(
+            "Docker API CA certificate at {} must be UTF-8 PEM",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        certificate_text.contains("-----BEGIN CERTIFICATE-----")
+            && certificate_text.contains("-----END CERTIFICATE-----"),
+        "Docker API CA certificate at {} must contain a PEM CERTIFICATE block",
+        path.display()
+    );
+    Ok(certificate)
 }
 
 fn docker_discovered_routes(
@@ -26255,6 +26432,36 @@ exec sleep 60
             "docker.sock",
         ])?;
         assert!(relative_error.contains("--docker-api-socket must be an absolute Unix socket path"));
+
+        let inactive_url_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--docker-api-url",
+            "http://127.0.0.1:2375",
+        ])?;
+        assert!(inactive_url_error.contains("--docker-api-url requires --docker-discover-networks"));
+
+        let ca_without_url_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-ca-cert-path",
+            "/tmp/docker-ca.crt",
+        ])?;
+        assert!(
+            ca_without_url_error.contains("--docker-api-ca-cert-path requires --docker-api-url")
+        );
+
+        let remote_plaintext_error = agent_runtime_config_error(vec![
+            "iparsd",
+            "agent",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-url",
+            "http://docker.example:2375",
+        ])?;
+        assert!(remote_plaintext_error.contains("must use https"));
         Ok(())
     }
 
@@ -27068,6 +27275,7 @@ exec sleep 60
             .context("failed to build test Docker API client")?;
         let discovery = DockerApiNetworkDiscovery {
             client,
+            api_base_url: "http://docker".to_string(),
             api_version: "v1.43".to_string(),
             network_filters: vec!["default-id".to_string(), "compose_extra".to_string()],
             container_namespace: None,
@@ -27109,6 +27317,151 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn docker_api_discovery_reads_networks_over_loopback_http_url() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request).into_owned();
+            anyhow::ensure!(
+                request_text.starts_with("GET /engine/v1.43/networks "),
+                "unexpected remote Docker API request line: {request_text}"
+            );
+            let body = r#"[{"Id":"remote-id","Name":"remote_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.30.0.0/16"}]}}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let api_url = format!("http://{address}/engine");
+        let api_url_arg = api_url.clone();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--apply-docker-routes",
+            "--docker-discover-networks",
+            "--docker-api-url",
+            api_url_arg.as_str(),
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_agent_runtime_config(&args)?;
+        assert!(!runtime_preflight_needs(&args).docker_api_socket);
+        preflight_agent_runtime_with_path(&args, Some(OsStr::new(SANITIZED_RUNTIME_COMMAND_PATH)))?;
+
+        let discovery = DockerApiNetworkDiscovery::new(&args)?;
+        let intent = discovery.discover_intent().await?;
+        assert!(intent
+            .container_namespace
+            .starts_with("docker-remote_default-"));
+        assert!(intent.container_namespace.len() <= 64);
+        assert_eq!(
+            intent.container_cidrs,
+            vec!["172.30.0.0/16".parse::<ipnet::IpNet>()?]
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for remote Docker API response")???;
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_remote_url_requires_tls_and_rejects_unsafe_parts() -> anyhow::Result<()> {
+        let plaintext_remote = match validate_docker_api_url("http://docker.example:2375") {
+            Ok(()) => anyhow::bail!("non-loopback plaintext Docker API URL should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(plaintext_remote.contains("must use https"));
+
+        let userinfo = match validate_docker_api_url("https://user@example.com:2376") {
+            Ok(()) => anyhow::bail!("Docker API URL userinfo should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(userinfo.contains("must not embed userinfo"));
+
+        let query = match validate_docker_api_url("https://docker.example:2376/engine?scope=all") {
+            Ok(()) => anyhow::bail!("Docker API URL query should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(query.contains("must not include a query or fragment"));
+
+        validate_docker_api_url("https://docker.example:2376")?;
+        validate_docker_api_url("http://127.0.0.1:2375")?;
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_ca_certificate_validation_rejects_invalid_files() -> anyhow::Result<()> {
+        let base = unique_test_dir("docker-api-ca-certificate")?;
+        let certificate_path = base.join("ca.crt");
+        std::fs::write(&certificate_path, b"not a PEM certificate")?;
+        let error = match validate_docker_api_ca_certificate(&certificate_path) {
+            Ok(()) => anyhow::bail!("invalid Docker API CA certificate should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("PEM CERTIFICATE block"));
+
+        let directory = base.join("ca-dir");
+        std::fs::create_dir(&directory)?;
+        let directory_error = match read_docker_api_ca_certificate(&directory) {
+            Ok(_) => anyhow::bail!("Docker API CA certificate directory should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(directory_error.contains("must resolve to a regular file"));
+
+        let oversized = base.join("oversized-ca.crt");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; MAX_DOCKER_API_CA_CERT_BYTES as usize + 1],
+        )?;
+        let oversized_error = match read_docker_api_ca_certificate(&oversized) {
+            Ok(_) => anyhow::bail!("oversized Docker API CA certificate should be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(oversized_error.contains("exceeds maximum size"));
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_networks_request_url_preserves_remote_base_path() -> anyhow::Result<()> {
+        assert_eq!(
+            docker_api_networks_request_url("https://docker.example:2376", "v1.43")?,
+            "https://docker.example:2376/v1.43/networks"
+        );
+        assert_eq!(
+            docker_api_networks_request_url("https://docker.example:2376/engine/", "v1.43")?,
+            "https://docker.example:2376/engine/v1.43/networks"
+        );
+        assert_eq!(
+            docker_api_networks_request_url("https://docker.example:2376/engine", "")?,
+            "https://docker.example:2376/engine/networks"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn docker_api_discovery_rejects_oversized_network_response() -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -27143,6 +27496,7 @@ exec sleep 60
             .context("failed to build test Docker API client")?;
         let discovery = DockerApiNetworkDiscovery {
             client,
+            api_base_url: "http://docker".to_string(),
             api_version: "v1.43".to_string(),
             network_filters: Vec::new(),
             container_namespace: None,

@@ -14161,6 +14161,8 @@ fi
         ));
         assert!(compose
             .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
+        assert!(compose.contains("IPARS_DOCKER_API_URL"));
+        assert!(compose.contains("IPARS_DOCKER_API_CA_CERT_PATH"));
         assert!(!compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
         assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
         assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
