@@ -831,11 +831,15 @@ where
             || existing.wireguard_public_key != request.wireguard_public_key
             || existing.role != claims.role
             || existing.tags != claims.tags
-            || existing.routes != request.requested_routes
         {
             return Err(ControlPlaneError::NodeAlreadyExists(request.node_id));
         }
 
+        if existing.routes != request.requested_routes {
+            self.store
+                .update_node_routes(&request.node_id, request.requested_routes)
+                .await?;
+        }
         self.store
             .update_node_candidates(&request.node_id, request.candidates)
             .await?;
@@ -3264,6 +3268,43 @@ mod tests {
         assert_eq!(second.node.vpn_ip, first.node.vpn_ip);
         assert_eq!(second.node.endpoint_candidates, request.candidates);
         assert_eq!(plane.peer_map_for(&request.node_id).await?.peers.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejoin_updates_routes_within_token_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, store.clone());
+        let mut token_claims = claims(cluster_id.clone());
+        token_claims.policy.allowed_routes = vec!["10.96.0.0/12".parse()?];
+        let mut request = registration_request("node-a");
+        let initial_route = route("service-a", "10.96.10.0/24", "node-a")?;
+        request.requested_routes = vec![initial_route.clone()];
+
+        plane
+            .register_with_claims(token_claims.clone(), request.clone())
+            .await?;
+        let replacement_route = route("service-b", "10.96.20.0/24", "node-a")?;
+        request.requested_routes = vec![replacement_route.clone()];
+
+        let response = plane.register_with_claims(token_claims, request).await?;
+
+        assert_eq!(response.node.routes, vec![replacement_route.clone()]);
+        assert_eq!(
+            store
+                .get_node(&response.node.node_id)
+                .await?
+                .ok_or("rejoined node was not persisted")?
+                .routes,
+            vec![replacement_route]
+        );
+        assert_ne!(response.node.routes, vec![initial_route]);
         Ok(())
     }
 
