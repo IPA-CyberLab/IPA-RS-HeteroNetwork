@@ -4925,10 +4925,7 @@ pub fn preferred_local_udp_candidate(
     local_candidates: &[EndpointCandidate],
     peer_candidates: &[EndpointCandidate],
 ) -> Option<EndpointCandidate> {
-    if !peer_candidates.iter().any(|candidate| {
-        candidate.kind == EndpointCandidateKind::StunReflexive
-            && private_or_link_local(candidate.addr.ip())
-    }) {
+    if !peer_has_private_reflexive_candidate(peer_candidates) {
         return None;
     }
 
@@ -4951,6 +4948,47 @@ pub fn preferred_local_udp_candidate(
                 .then_with(|| right.priority.cmp(&left.priority))
         })
         .cloned()
+}
+
+/// Select the peer-side local UDP candidate that is directly routable from a
+/// local UDP candidate on a private subnet.
+pub fn preferred_peer_local_udp_candidate(
+    local_candidates: &[EndpointCandidate],
+    peer_candidates: &[EndpointCandidate],
+) -> Option<EndpointCandidate> {
+    if !peer_has_private_reflexive_candidate(peer_candidates) {
+        return None;
+    }
+
+    peer_candidates
+        .iter()
+        .filter(|peer_candidate| {
+            peer_candidate.kind == EndpointCandidateKind::LocalUdp
+                && endpoint_addr_is_usable(peer_candidate.addr)
+        })
+        .filter(|peer_candidate| {
+            local_candidates.iter().any(|local_candidate| {
+                local_candidate.kind == EndpointCandidateKind::LocalUdp
+                    && endpoint_addr_is_usable(local_candidate.addr)
+                    && local_addresses_share_subnet(
+                        local_candidate.addr.ip(),
+                        peer_candidate.addr.ip(),
+                    )
+            })
+        })
+        .min_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then_with(|| right.priority.cmp(&left.priority))
+        })
+        .cloned()
+}
+
+fn peer_has_private_reflexive_candidate(peer_candidates: &[EndpointCandidate]) -> bool {
+    peer_candidates.iter().any(|candidate| {
+        candidate.kind == EndpointCandidateKind::StunReflexive
+            && private_or_link_local(candidate.addr.ip())
+    })
 }
 
 fn private_or_link_local(ip: IpAddr) -> bool {
@@ -6719,6 +6757,45 @@ mod tests {
         }];
 
         assert!(preferred_local_udp_candidate(&local_candidates, &peer_candidates).is_none());
+    }
+
+    #[test]
+    fn preferred_peer_local_udp_candidate_returns_peer_candidate() {
+        let local_candidates = vec![EndpointCandidate {
+            node_id: NodeId::from_string("local"),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([172, 18, 0, 3], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        }];
+        let peer_id = NodeId::from_string("peer-a");
+        let peer_candidates = vec![
+            EndpointCandidate {
+                node_id: peer_id.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([10, 244, 1, 1], 18_410)),
+                observed_at: Utc::now(),
+                priority: 80,
+                cost: 20,
+                source: CandidateSource::StunProbe,
+            },
+            EndpointCandidate {
+                node_id: peer_id.clone(),
+                kind: EndpointCandidateKind::LocalUdp,
+                addr: SocketAddr::from(([172, 18, 0, 2], 51_820)),
+                observed_at: Utc::now(),
+                priority: 70,
+                cost: 30,
+                source: CandidateSource::StunProbe,
+            },
+        ];
+
+        let selected = preferred_peer_local_udp_candidate(&local_candidates, &peer_candidates)
+            .expect("same-subnet peer candidate should be selected");
+        assert_eq!(selected.node_id, peer_id);
+        assert_eq!(selected.addr, SocketAddr::from(([172, 18, 0, 2], 51_820)));
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ipars_agent::{
-    preferred_local_udp_candidate, AgentError, AgentNodeState, AgentRuntime,
+    preferred_peer_local_udp_candidate, AgentError, AgentNodeState, AgentRuntime,
     BoringTunWireGuardBackend, CommandWireGuardPeerTelemetrySource, FileAgentStateStore,
     KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner,
     LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
@@ -13007,7 +13007,7 @@ fn signal_path_record_with_local_candidates(
     local_candidates: &[EndpointCandidate],
 ) -> PathRecord {
     let selected_candidate = if response.preferred_state == PathState::DirectNatTraversal {
-        preferred_local_udp_candidate(local_candidates, &response.target_candidates)
+        preferred_peer_local_udp_candidate(local_candidates, &response.target_candidates)
     } else {
         None
     }
