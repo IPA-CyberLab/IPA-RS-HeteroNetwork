@@ -23,7 +23,8 @@ use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
     ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId,
     NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
-    TokenLedgerRecord, TokenStatus, TransportProtocol, VpnIp,
+    TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
+    TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -180,18 +181,15 @@ pub trait TokenLedger: Send + Sync {
         cluster_id: &ClusterId,
         nonce: &str,
     ) -> Result<Option<TokenLedgerRecord>, ControlPlaneError>;
-    async fn revoke_token(
+    async fn admit_token(
         &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
-        revoked_at: chrono::DateTime<Utc>,
-    ) -> Result<TokenLedgerRecord, ControlPlaneError>;
-    async fn record_token_use(
-        &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
+        record: TokenLedgerRecord,
         now: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError>;
+    async fn revoke_token(
+        &self,
+        revocation: TokenRevocationRecord,
+    ) -> Result<TokenRevocationOutcome, ControlPlaneError>;
     async fn token_metrics(
         &self,
         cluster_id: &ClusterId,
@@ -384,8 +382,14 @@ impl ControlPlaneStore for InMemoryStore {
 }
 
 #[derive(Debug, Default)]
+struct InMemoryTokenLedgerState {
+    tokens: BTreeMap<String, TokenLedgerRecord>,
+    revocations: BTreeMap<String, TokenRevocationRecord>,
+}
+
+#[derive(Debug, Default)]
 pub struct InMemoryTokenLedger {
-    tokens: RwLock<BTreeMap<String, TokenLedgerRecord>>,
+    state: RwLock<InMemoryTokenLedgerState>,
 }
 
 #[async_trait]
@@ -394,11 +398,17 @@ impl TokenLedger for InMemoryTokenLedger {
         &self,
         record: TokenLedgerRecord,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut tokens = self.tokens.write().await;
-        let stored = tokens
-            .entry(token_key(&record.cluster_id, &record.nonce))
-            .or_insert(record.clone());
+        let mut state = self.state.write().await;
+        let key = token_key(&record.cluster_id, &record.nonce);
+        let revoked_at = state
+            .revocations
+            .get(&key)
+            .map(|revocation| revocation.revoked_at);
+        let stored = state.tokens.entry(key).or_insert(record.clone());
         ensure_token_definition_matches(stored, &record)?;
+        if let Some(revoked_at) = revoked_at {
+            stored.revoked_at = Some(revoked_at);
+        }
         Ok(stored.clone())
     }
 
@@ -408,46 +418,60 @@ impl TokenLedger for InMemoryTokenLedger {
         nonce: &str,
     ) -> Result<Option<TokenLedgerRecord>, ControlPlaneError> {
         Ok(self
-            .tokens
+            .state
             .read()
             .await
+            .tokens
             .get(&token_key(cluster_id, nonce))
             .cloned())
     }
 
-    async fn revoke_token(
+    async fn admit_token(
         &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
-        revoked_at: chrono::DateTime<Utc>,
-    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut tokens = self.tokens.write().await;
-        let record = tokens
-            .get_mut(&token_key(cluster_id, nonce))
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-        record.revoked_at = Some(revoked_at);
-        Ok(record.clone())
-    }
-
-    async fn record_token_use(
-        &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
+        record: TokenLedgerRecord,
         now: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let mut tokens = self.tokens.write().await;
-        let record = tokens
-            .get_mut(&token_key(cluster_id, nonce))
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-        let status = record.status(now);
+        let mut state = self.state.write().await;
+        let key = token_key(&record.cluster_id, &record.nonce);
+        let revoked_at = state
+            .revocations
+            .get(&key)
+            .map(|revocation| revocation.revoked_at);
+        let stored = state.tokens.entry(key).or_insert(record.clone());
+        ensure_token_definition_matches(stored, &record)?;
+        if let Some(revoked_at) = revoked_at {
+            stored.revoked_at = Some(revoked_at);
+        }
+        let status = stored.status(now);
         if status != TokenStatus::Active {
             return Err(ControlPlaneError::TokenRejected {
-                nonce: nonce.to_string(),
+                nonce: record.nonce,
                 status,
             });
         }
-        record.uses = record.uses.saturating_add(1);
-        Ok(record.clone())
+        stored.uses = stored.uses.saturating_add(1);
+        Ok(stored.clone())
+    }
+
+    async fn revoke_token(
+        &self,
+        revocation: TokenRevocationRecord,
+    ) -> Result<TokenRevocationOutcome, ControlPlaneError> {
+        let mut state = self.state.write().await;
+        let key = token_key(&revocation.cluster_id, &revocation.nonce);
+        let stored_revocation = state
+            .revocations
+            .entry(key.clone())
+            .or_insert(revocation)
+            .clone();
+        let record = state.tokens.get_mut(&key).map(|record| {
+            record.revoked_at = Some(stored_revocation.revoked_at);
+            record.clone()
+        });
+        Ok(TokenRevocationOutcome {
+            revocation: stored_revocation,
+            record,
+        })
     }
 
     async fn token_metrics(
@@ -455,15 +479,19 @@ impl TokenLedger for InMemoryTokenLedger {
         cluster_id: &ClusterId,
         now: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerMetrics, ControlPlaneError> {
+        let state = self.state.read().await;
         let mut metrics = TokenLedgerMetrics::default();
-        for record in self
+        for record in state
             .tokens
-            .read()
-            .await
             .values()
             .filter(|record| &record.cluster_id == cluster_id)
         {
             metrics.observe_record(record, now);
+        }
+        for (key, revocation) in &state.revocations {
+            if &revocation.cluster_id == cluster_id && !state.tokens.contains_key(key) {
+                metrics.observe_revocation_tombstone();
+            }
         }
         Ok(metrics)
     }
@@ -497,22 +525,15 @@ where
         now: chrono::DateTime<Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
         self.ledger
-            .insert_token_if_absent(TokenLedgerRecord::from_claims(claims, now))
-            .await?;
-        self.ledger
-            .record_token_use(&claims.cluster_id, &claims.nonce, now)
+            .admit_token(TokenLedgerRecord::from_claims(claims, now), now)
             .await
     }
 
     pub async fn revoke_token(
         &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
-        revoked_at: chrono::DateTime<Utc>,
-    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        self.ledger
-            .revoke_token(cluster_id, nonce, revoked_at)
-            .await
+        revocation: TokenRevocationRecord,
+    ) -> Result<TokenRevocationOutcome, ControlPlaneError> {
+        self.ledger.revoke_token(revocation).await
     }
 
     pub async fn token_metrics(
@@ -612,7 +633,7 @@ where
         &self,
         request: &RevokeTokenRequest,
         revoked_at: chrono::DateTime<Utc>,
-    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+    ) -> Result<TokenRevocationOutcome, ControlPlaneError> {
         if request.cluster_id != self.plane.config.cluster_id {
             return Err(ControlPlaneError::TokenVerification(format!(
                 "token revocation cluster mismatch: expected {}, got {}",
@@ -644,7 +665,13 @@ where
             )));
         }
         self.admission
-            .revoke_token(&request.cluster_id, &request.nonce, revoked_at)
+            .revoke_token(TokenRevocationRecord {
+                cluster_id: request.cluster_id.clone(),
+                nonce: request.nonce.clone(),
+                issuer: request.issuer.clone(),
+                key_id: request.key_id.clone(),
+                revoked_at,
+            })
             .await
     }
 
@@ -6123,11 +6150,13 @@ mod tests {
             .issue_from_claims(&revoked_claims, Utc::now())
             .await?;
         ledger
-            .revoke_token(
-                &revoked_claims.cluster_id,
-                &revoked_claims.nonce,
-                Utc::now(),
-            )
+            .revoke_token(TokenRevocationRecord {
+                cluster_id: revoked_claims.cluster_id.clone(),
+                nonce: revoked_claims.nonce.clone(),
+                issuer: revoked_claims.issuer.clone(),
+                key_id: revoked_claims.key_id.clone(),
+                revoked_at: Utc::now(),
+            })
             .await?;
         let revoked = admission.admit_join(&revoked_claims, Utc::now()).await;
         assert!(matches!(
@@ -6326,9 +6355,40 @@ mod tests {
             Err(ControlPlaneError::TokenVerification(_))
         ));
 
-        let request = signed_token_revocation(&issuer, cluster_id, nonce, key_id, now)?;
+        let request =
+            signed_token_revocation(&issuer, cluster_id.clone(), nonce, key_id.clone(), now)?;
         let revoked = service.revoke_token(&request, now).await?;
-        assert_eq!(revoked.status(now), TokenStatus::Revoked);
+        assert_eq!(
+            revoked.record.map(|record| record.status(now)),
+            Some(TokenStatus::Revoked)
+        );
+
+        let unused_nonce = "unused-signed-revocation";
+        let unused_token = issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            issuer.node_id(),
+            key_id.clone(),
+            unused_nonce,
+        ))?;
+        let unused_request =
+            signed_token_revocation(&issuer, cluster_id, unused_nonce, key_id, now)?;
+        let unused_revocation = service.revoke_token(&unused_request, now).await?;
+        assert!(unused_revocation.record.is_none());
+        assert_eq!(unused_revocation.revocation.nonce, unused_nonce);
+        let rejected = service
+            .join(
+                unused_token,
+                registration_request("node-unused-revocation"),
+                now,
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(ControlPlaneError::TokenRejected {
+                status: TokenStatus::Revoked,
+                ..
+            })
+        ));
         Ok(())
     }
 

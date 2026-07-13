@@ -250,12 +250,15 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let record = state
+    let outcome = state
         .join_service
         .revoke_token(&request, Utc::now())
         .await?;
-    let status = record.status(Utc::now());
-    Ok(Json(RevokeTokenResponse { record, status }))
+    Ok(Json(RevokeTokenResponse {
+        revocation: outcome.revocation,
+        record: outcome.record,
+        status: ipars_types::TokenStatus::Revoked,
+    }))
 }
 
 async fn authenticate_signal_node_upsert<S, L>(
@@ -1305,6 +1308,8 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let response: RevokeTokenResponse = serde_json::from_slice(&body)?;
         assert_eq!(response.status, TokenStatus::Revoked);
+        assert!(response.record.is_some());
+        assert_eq!(response.revocation.nonce, request_body.token.claims.nonce);
 
         let rejected_join = JoinNodeRequest {
             token: request_body.token.clone(),

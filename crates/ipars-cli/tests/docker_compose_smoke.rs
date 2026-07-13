@@ -661,41 +661,13 @@ fn assert_compose_postgres_token_revocation(
     issuer_key_id: &str,
     issuer_private_key: &str,
 ) -> Result<()> {
-    let mut command = compose_command(compose);
-    let output = command
-        .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
-        .env_remove("IPARS_ISSUER_PRIVATE_KEY_PATH")
-        .args([
-            "exec",
-            "-T",
-            "-e",
-            "IPARS_ISSUER_PRIVATE_KEY",
-            "control-plane",
-            "/usr/local/bin/ipars",
-            "token",
-            "revoke",
-            "--control-plane-url",
-            "http://127.0.0.1:8443",
-            "--cluster-id",
-            cluster_id,
-            "--nonce",
-            nonce,
-            "--issuer-key-id",
-            issuer_key_id,
-        ])
-        .output()
-        .context("failed to run PostgreSQL-backed token revocation")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "PostgreSQL-backed token revocation failed with status {}\nstdout:\n{}\nstderr:\n{}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            compose_diagnostics(compose)
-        );
-    }
-    let response: Value = serde_json::from_slice(&output.stdout)
-        .context("failed to parse PostgreSQL-backed token revocation response")?;
+    let response = run_compose_token_revocation(
+        compose,
+        cluster_id,
+        nonce,
+        issuer_key_id,
+        issuer_private_key,
+    )?;
     anyhow::ensure!(
         json_string_required(&response, "status")? == "revoked",
         "PostgreSQL-backed token revocation did not return revoked status: {response}"
@@ -712,7 +684,145 @@ fn assert_compose_postgres_token_revocation(
         json_string_required_at(&response, &["record", "revoked_at"]).is_ok(),
         "PostgreSQL-backed token revocation omitted revoked_at: {response}"
     );
+
+    let mut create_command = compose_issuer_ipars_command(compose, issuer_private_key);
+    let create_output = create_command
+        .args([
+            "token",
+            "create",
+            "--cluster-id",
+            cluster_id,
+            "--issuer-key-id",
+            issuer_key_id,
+            "--ttl-seconds",
+            "3600",
+            "--control-plane-bootstrap",
+            "http://127.0.0.1:8443",
+        ])
+        .output()
+        .context("failed to create unused PostgreSQL revocation token")?;
+    ensure_compose_command_success(
+        compose,
+        "create unused PostgreSQL revocation token",
+        &create_output,
+    )?;
+    let unused_token: Value = serde_json::from_slice(&create_output.stdout)
+        .context("failed to parse unused PostgreSQL revocation token")?;
+    let unused_nonce = json_string_required_at(&unused_token, &["claims", "nonce"])?;
+    let unused_token_json = unused_token.to_string();
+    let unused_revocation = run_compose_token_revocation(
+        compose,
+        cluster_id,
+        &unused_nonce,
+        issuer_key_id,
+        issuer_private_key,
+    )?;
+    anyhow::ensure!(
+        unused_revocation.get("record").is_none(),
+        "unused PostgreSQL token revocation unexpectedly returned a token record: {unused_revocation}"
+    );
+    anyhow::ensure!(
+        json_string_required_at(&unused_revocation, &["revocation", "nonce"])? == unused_nonce,
+        "unused PostgreSQL token revocation returned the wrong tombstone: {unused_revocation}"
+    );
+
+    let mut join_command = compose_command(compose);
+    let join_output = join_command
+        .env("IPARS_UNUSED_JOIN_TOKEN", &unused_token_json)
+        .args([
+            "exec",
+            "-T",
+            "-e",
+            "IPARS_UNUSED_JOIN_TOKEN",
+            "control-plane",
+            "/bin/sh",
+            "-c",
+            "exec /usr/local/bin/ipars join \"$IPARS_UNUSED_JOIN_TOKEN\" --control-plane-url http://127.0.0.1:8443",
+        ])
+        .output()
+        .context("failed to attempt preemptively revoked PostgreSQL token join")?;
+    anyhow::ensure!(
+        !join_output.status.success()
+            && String::from_utf8_lossy(&join_output.stderr).contains("403 Forbidden"),
+        "preemptively revoked PostgreSQL token join was not rejected with 403\nstdout:\n{}\nstderr:\n{}\n{}",
+        String::from_utf8_lossy(&join_output.stdout),
+        String::from_utf8_lossy(&join_output.stderr),
+        compose_diagnostics(compose)
+    );
+
+    let persisted = run_compose_token_revocation(
+        compose,
+        cluster_id,
+        &unused_nonce,
+        issuer_key_id,
+        issuer_private_key,
+    )?;
+    anyhow::ensure!(
+        json_u64_field_at(&persisted, &["record", "uses"])? == 0,
+        "preemptively revoked PostgreSQL token recorded a successful use: {persisted}"
+    );
     Ok(())
+}
+
+fn compose_issuer_ipars_command(compose: &ComposeProject, issuer_private_key: &str) -> Command {
+    let mut command = compose_command(compose);
+    command
+        .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
+        .env_remove("IPARS_ISSUER_PRIVATE_KEY_PATH")
+        .args([
+            "exec",
+            "-T",
+            "-e",
+            "IPARS_ISSUER_PRIVATE_KEY",
+            "control-plane",
+            "/usr/local/bin/ipars",
+        ]);
+    command
+}
+
+fn run_compose_token_revocation(
+    compose: &ComposeProject,
+    cluster_id: &str,
+    nonce: &str,
+    issuer_key_id: &str,
+    issuer_private_key: &str,
+) -> Result<Value> {
+    let mut command = compose_issuer_ipars_command(compose, issuer_private_key);
+    let output = command
+        .args([
+            "token",
+            "revoke",
+            "--control-plane-url",
+            "http://127.0.0.1:8443",
+            "--cluster-id",
+            cluster_id,
+            "--nonce",
+            nonce,
+            "--issuer-key-id",
+            issuer_key_id,
+        ])
+        .output()
+        .context("failed to run PostgreSQL-backed token revocation")?;
+    ensure_compose_command_success(compose, "PostgreSQL-backed token revocation", &output)?;
+    serde_json::from_slice(&output.stdout)
+        .context("failed to parse PostgreSQL-backed token revocation response")
+}
+
+fn ensure_compose_command_success(
+    compose: &ComposeProject,
+    label: &str,
+    output: &Output,
+) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{label} failed with status {}\nstdout:\n{}\nstderr:\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        compose_diagnostics(compose)
+    )
 }
 
 fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {

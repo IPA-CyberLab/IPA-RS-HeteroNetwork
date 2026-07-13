@@ -1490,6 +1490,21 @@ pub struct TokenLedgerRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenRevocationRecord {
+    pub cluster_id: ClusterId,
+    pub nonce: String,
+    pub issuer: NodeId,
+    pub key_id: KeyId,
+    pub revoked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRevocationOutcome {
+    pub revocation: TokenRevocationRecord,
+    pub record: Option<TokenLedgerRecord>,
+}
+
 impl TokenLedgerRecord {
     pub fn from_claims(claims: &JoinTokenClaims, created_at: DateTime<Utc>) -> Self {
         Self {
@@ -1569,6 +1584,11 @@ impl TokenLedgerMetrics {
                 self.exhausted_count = self.exhausted_count.saturating_add(1);
             }
         }
+    }
+
+    pub fn observe_revocation_tombstone(&mut self) {
+        self.issued_count = self.issued_count.saturating_add(1);
+        self.revoked_count = self.revoked_count.saturating_add(1);
     }
 }
 
@@ -1869,7 +1889,9 @@ pub mod api {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct RevokeTokenResponse {
-        pub record: TokenLedgerRecord,
+        pub revocation: TokenRevocationRecord,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub record: Option<TokenLedgerRecord>,
         pub status: TokenStatus,
     }
 

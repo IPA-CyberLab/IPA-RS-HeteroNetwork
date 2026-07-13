@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use ipars_control_plane::{
     ensure_token_definition_matches, ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate,
@@ -5,7 +7,8 @@ use ipars_control_plane::{
 };
 use ipars_types::{
     ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
-    Route, TokenLedgerMetrics, TokenLedgerRecord, TokenStatus, VpnIp,
+    Route, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord,
+    TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -77,6 +80,19 @@ impl SqliteControlPlaneStore {
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS tokens (
+                    cluster_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (cluster_id, nonce)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS token_revocations (
                     cluster_id TEXT NOT NULL,
                     nonce TEXT NOT NULL,
                     record_json TEXT NOT NULL,
@@ -426,6 +442,7 @@ impl TokenLedger for SqliteControlPlaneStore {
         &self,
         record: TokenLedgerRecord,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
         sqlx::query(
             r#"
             INSERT INTO tokens (cluster_id, nonce, record_json)
@@ -436,14 +453,36 @@ impl TokenLedger for SqliteControlPlaneStore {
         .bind(record.cluster_id.as_str())
         .bind(record.nonce.as_str())
         .bind(serde_json::to_string(&record).map_err(json_error)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(sql_error)?;
-        let stored = self
-            .get_token(&record.cluster_id, &record.nonce)
-            .await?
+        let row =
+            sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = ?1 AND nonce = ?2")
+                .bind(record.cluster_id.as_str())
+                .bind(record.nonce.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        let mut stored = row
+            .map(row_to_token)
+            .transpose()?
             .ok_or_else(|| ControlPlaneError::TokenNotFound(record.nonce.clone()))?;
         ensure_token_definition_matches(&stored, &record)?;
+        let revocation = sqlx::query(
+            "SELECT record_json FROM token_revocations WHERE cluster_id = ?1 AND nonce = ?2",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(row_to_revocation)
+        .transpose()?;
+        if let Some(revocation) = revocation {
+            stored.revoked_at = Some(revocation.revoked_at);
+            update_sqlite_token(&mut transaction, &stored).await?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
         Ok(stored)
     }
 
@@ -462,71 +501,113 @@ impl TokenLedger for SqliteControlPlaneStore {
         row.map(row_to_token).transpose()
     }
 
-    async fn revoke_token(
+    async fn admit_token(
         &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
-        revoked_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let result = sqlx::query(
-            "UPDATE tokens SET record_json = json_set(record_json, '$.revoked_at', json(?3)) WHERE cluster_id = ?1 AND nonce = ?2",
-        )
-        .bind(cluster_id.as_str())
-        .bind(nonce)
-        .bind(serde_json::to_string(&revoked_at).map_err(json_error)?)
-        .execute(&self.pool)
-        .await
-        .map_err(sql_error)?;
-        if result.rows_affected() == 0 {
-            return Err(ControlPlaneError::TokenNotFound(nonce.to_string()));
-        }
-        self.get_token(cluster_id, nonce)
-            .await?
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))
-    }
-
-    async fn record_token_use(
-        &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
+        record: TokenLedgerRecord,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        loop {
-            let record = self
-                .get_token(cluster_id, nonce)
-                .await?
-                .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-            let status = record.status(now);
-            if status != TokenStatus::Active {
-                return Err(ControlPlaneError::TokenRejected {
-                    nonce: nonce.to_string(),
-                    status,
-                });
-            }
-            let previous_json = serde_json::to_string(&record).map_err(json_error)?;
-            let mut updated = record;
-            updated.uses = updated.uses.saturating_add(1);
-            let updated_json = serde_json::to_string(&updated).map_err(json_error)?;
-            let result = sqlx::query(
-                r#"
-                UPDATE tokens
-                SET record_json = ?4
-                WHERE cluster_id = ?1
-                  AND nonce = ?2
-                  AND record_json = ?3
-                "#,
-            )
-            .bind(cluster_id.as_str())
-            .bind(nonce)
-            .bind(previous_json)
-            .bind(updated_json)
-            .execute(&self.pool)
-            .await
-            .map_err(sql_error)?;
-            if result.rows_affected() == 1 {
-                return Ok(updated);
-            }
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (cluster_id, nonce, record_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(cluster_id, nonce) DO NOTHING
+            "#,
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .bind(serde_json::to_string(&record).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let row =
+            sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = ?1 AND nonce = ?2")
+                .bind(record.cluster_id.as_str())
+                .bind(record.nonce.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        let mut stored = row
+            .map(row_to_token)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(record.nonce.clone()))?;
+        ensure_token_definition_matches(&stored, &record)?;
+        let revocation = sqlx::query(
+            "SELECT record_json FROM token_revocations WHERE cluster_id = ?1 AND nonce = ?2",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(row_to_revocation)
+        .transpose()?;
+        if let Some(revocation) = revocation {
+            stored.revoked_at = Some(revocation.revoked_at);
         }
+        let status = stored.status(now);
+        if status != TokenStatus::Active {
+            update_sqlite_token(&mut transaction, &stored).await?;
+            transaction.commit().await.map_err(sql_error)?;
+            return Err(ControlPlaneError::TokenRejected {
+                nonce: record.nonce,
+                status,
+            });
+        }
+        stored.uses = stored.uses.saturating_add(1);
+        update_sqlite_token(&mut transaction, &stored).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(stored)
+    }
+
+    async fn revoke_token(
+        &self,
+        revocation: TokenRevocationRecord,
+    ) -> Result<TokenRevocationOutcome, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO token_revocations (cluster_id, nonce, record_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(cluster_id, nonce) DO NOTHING
+            "#,
+        )
+        .bind(revocation.cluster_id.as_str())
+        .bind(revocation.nonce.as_str())
+        .bind(serde_json::to_string(&revocation).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let stored_revocation = sqlx::query(
+            "SELECT record_json FROM token_revocations WHERE cluster_id = ?1 AND nonce = ?2",
+        )
+        .bind(revocation.cluster_id.as_str())
+        .bind(revocation.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(row_to_revocation)
+        .transpose()?
+        .ok_or_else(|| ControlPlaneError::TokenNotFound(revocation.nonce.clone()))?;
+        let row =
+            sqlx::query("SELECT record_json FROM tokens WHERE cluster_id = ?1 AND nonce = ?2")
+                .bind(revocation.cluster_id.as_str())
+                .bind(revocation.nonce.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        let record = row.map(row_to_token).transpose()?.map(|mut record| {
+            record.revoked_at = Some(stored_revocation.revoked_at);
+            record
+        });
+        if let Some(record) = &record {
+            update_sqlite_token(&mut transaction, record).await?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(TokenRevocationOutcome {
+            revocation: stored_revocation,
+            record,
+        })
     }
 
     async fn token_metrics(
@@ -539,9 +620,24 @@ impl TokenLedger for SqliteControlPlaneStore {
             .fetch_all(&self.pool)
             .await
             .map_err(sql_error)?;
+        let revocations =
+            sqlx::query("SELECT record_json FROM token_revocations WHERE cluster_id = ?1")
+                .bind(cluster_id.as_str())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sql_error)?;
         let mut metrics = TokenLedgerMetrics::default();
+        let mut token_nonces = BTreeSet::new();
         for record in records.into_iter().map(row_to_token) {
-            metrics.observe_record(&record?, now);
+            let record = record?;
+            token_nonces.insert(record.nonce.clone());
+            metrics.observe_record(&record, now);
+        }
+        for revocation in revocations.into_iter().map(row_to_revocation) {
+            let revocation = revocation?;
+            if !token_nonces.contains(&revocation.nonce) {
+                metrics.observe_revocation_tombstone();
+            }
         }
         Ok(metrics)
     }
@@ -624,6 +720,19 @@ impl PostgresControlPlaneStore {
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS tokens (
+                    cluster_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    record_json JSONB NOT NULL,
+                    PRIMARY KEY (cluster_id, nonce)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS token_revocations (
                     cluster_id TEXT NOT NULL,
                     nonce TEXT NOT NULL,
                     record_json JSONB NOT NULL,
@@ -969,6 +1078,8 @@ impl TokenLedger for PostgresControlPlaneStore {
         &self,
         record: TokenLedgerRecord,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_token(&mut transaction, &record.cluster_id, &record.nonce).await?;
         sqlx::query(
             r#"
             INSERT INTO tokens (cluster_id, nonce, record_json)
@@ -979,14 +1090,37 @@ impl TokenLedger for PostgresControlPlaneStore {
         .bind(record.cluster_id.as_str())
         .bind(record.nonce.as_str())
         .bind(serde_json::to_value(&record).map_err(json_error)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(sql_error)?;
-        let stored = self
-            .get_token(&record.cluster_id, &record.nonce)
-            .await?
+        let row = sqlx::query(
+            "SELECT record_json FROM tokens WHERE cluster_id = $1 AND nonce = $2 FOR UPDATE",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let mut stored = row
+            .map(pg_row_to_token)
+            .transpose()?
             .ok_or_else(|| ControlPlaneError::TokenNotFound(record.nonce.clone()))?;
         ensure_token_definition_matches(&stored, &record)?;
+        let revocation = sqlx::query(
+            "SELECT record_json FROM token_revocations WHERE cluster_id = $1 AND nonce = $2",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(pg_row_to_revocation)
+        .transpose()?;
+        if let Some(revocation) = revocation {
+            stored.revoked_at = Some(revocation.revoked_at);
+            update_postgres_token(&mut transaction, &stored).await?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
         Ok(stored)
     }
 
@@ -1005,71 +1139,117 @@ impl TokenLedger for PostgresControlPlaneStore {
         row.map(pg_row_to_token).transpose()
     }
 
-    async fn revoke_token(
+    async fn admit_token(
         &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
-        revoked_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        let result = sqlx::query(
-            "UPDATE tokens SET record_json = jsonb_set(record_json, '{revoked_at}', $3) WHERE cluster_id = $1 AND nonce = $2",
-        )
-        .bind(cluster_id.as_str())
-        .bind(nonce)
-        .bind(serde_json::to_value(revoked_at).map_err(json_error)?)
-        .execute(&self.pool)
-        .await
-        .map_err(sql_error)?;
-        if result.rows_affected() == 0 {
-            return Err(ControlPlaneError::TokenNotFound(nonce.to_string()));
-        }
-        self.get_token(cluster_id, nonce)
-            .await?
-            .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))
-    }
-
-    async fn record_token_use(
-        &self,
-        cluster_id: &ClusterId,
-        nonce: &str,
+        record: TokenLedgerRecord,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<TokenLedgerRecord, ControlPlaneError> {
-        loop {
-            let record = self
-                .get_token(cluster_id, nonce)
-                .await?
-                .ok_or_else(|| ControlPlaneError::TokenNotFound(nonce.to_string()))?;
-            let status = record.status(now);
-            if status != TokenStatus::Active {
-                return Err(ControlPlaneError::TokenRejected {
-                    nonce: nonce.to_string(),
-                    status,
-                });
-            }
-            let previous_json = serde_json::to_value(&record).map_err(json_error)?;
-            let mut updated = record;
-            updated.uses = updated.uses.saturating_add(1);
-            let updated_json = serde_json::to_value(&updated).map_err(json_error)?;
-            let result = sqlx::query(
-                r#"
-                UPDATE tokens
-                SET record_json = $4
-                WHERE cluster_id = $1
-                  AND nonce = $2
-                  AND record_json = $3
-                "#,
-            )
-            .bind(cluster_id.as_str())
-            .bind(nonce)
-            .bind(previous_json)
-            .bind(updated_json)
-            .execute(&self.pool)
-            .await
-            .map_err(sql_error)?;
-            if result.rows_affected() == 1 {
-                return Ok(updated);
-            }
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_token(&mut transaction, &record.cluster_id, &record.nonce).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (cluster_id, nonce, record_json)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(cluster_id, nonce) DO NOTHING
+            "#,
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .bind(serde_json::to_value(&record).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let row = sqlx::query(
+            "SELECT record_json FROM tokens WHERE cluster_id = $1 AND nonce = $2 FOR UPDATE",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let mut stored = row
+            .map(pg_row_to_token)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(record.nonce.clone()))?;
+        ensure_token_definition_matches(&stored, &record)?;
+        let revocation = sqlx::query(
+            "SELECT record_json FROM token_revocations WHERE cluster_id = $1 AND nonce = $2",
+        )
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(pg_row_to_revocation)
+        .transpose()?;
+        if let Some(revocation) = revocation {
+            stored.revoked_at = Some(revocation.revoked_at);
         }
+        let status = stored.status(now);
+        if status != TokenStatus::Active {
+            update_postgres_token(&mut transaction, &stored).await?;
+            transaction.commit().await.map_err(sql_error)?;
+            return Err(ControlPlaneError::TokenRejected {
+                nonce: record.nonce,
+                status,
+            });
+        }
+        stored.uses = stored.uses.saturating_add(1);
+        update_postgres_token(&mut transaction, &stored).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(stored)
+    }
+
+    async fn revoke_token(
+        &self,
+        revocation: TokenRevocationRecord,
+    ) -> Result<TokenRevocationOutcome, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_token(&mut transaction, &revocation.cluster_id, &revocation.nonce).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO token_revocations (cluster_id, nonce, record_json)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(cluster_id, nonce) DO NOTHING
+            "#,
+        )
+        .bind(revocation.cluster_id.as_str())
+        .bind(revocation.nonce.as_str())
+        .bind(serde_json::to_value(&revocation).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let stored_revocation = sqlx::query(
+            "SELECT record_json FROM token_revocations WHERE cluster_id = $1 AND nonce = $2",
+        )
+        .bind(revocation.cluster_id.as_str())
+        .bind(revocation.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(pg_row_to_revocation)
+        .transpose()?
+        .ok_or_else(|| ControlPlaneError::TokenNotFound(revocation.nonce.clone()))?;
+        let row = sqlx::query(
+            "SELECT record_json FROM tokens WHERE cluster_id = $1 AND nonce = $2 FOR UPDATE",
+        )
+        .bind(revocation.cluster_id.as_str())
+        .bind(revocation.nonce.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        let record = row.map(pg_row_to_token).transpose()?.map(|mut record| {
+            record.revoked_at = Some(stored_revocation.revoked_at);
+            record
+        });
+        if let Some(record) = &record {
+            update_postgres_token(&mut transaction, record).await?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(TokenRevocationOutcome {
+            revocation: stored_revocation,
+            record,
+        })
     }
 
     async fn token_metrics(
@@ -1082,9 +1262,24 @@ impl TokenLedger for PostgresControlPlaneStore {
             .fetch_all(&self.pool)
             .await
             .map_err(sql_error)?;
+        let revocations =
+            sqlx::query("SELECT record_json FROM token_revocations WHERE cluster_id = $1")
+                .bind(cluster_id.as_str())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sql_error)?;
         let mut metrics = TokenLedgerMetrics::default();
+        let mut token_nonces = BTreeSet::new();
         for record in records.into_iter().map(pg_row_to_token) {
-            metrics.observe_record(&record?, now);
+            let record = record?;
+            token_nonces.insert(record.nonce.clone());
+            metrics.observe_record(&record, now);
+        }
+        for revocation in revocations.into_iter().map(pg_row_to_revocation) {
+            let revocation = revocation?;
+            if !token_nonces.contains(&revocation.nonce) {
+                metrics.observe_revocation_tombstone();
+            }
         }
         Ok(metrics)
     }
@@ -1110,6 +1305,13 @@ fn row_to_token(row: sqlx::sqlite::SqliteRow) -> Result<TokenLedgerRecord, Contr
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_revocation(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<TokenRevocationRecord, ControlPlaneError> {
+    let record_json: String = row.get("record_json");
+    serde_json::from_str(&record_json).map_err(json_error)
+}
+
 fn pg_row_to_node(row: sqlx::postgres::PgRow) -> Result<NodeRecord, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
@@ -1128,6 +1330,60 @@ fn pg_row_to_health(row: sqlx::postgres::PgRow) -> Result<NodeHealth, ControlPla
 fn pg_row_to_token(row: sqlx::postgres::PgRow) -> Result<TokenLedgerRecord, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_revocation(
+    row: sqlx::postgres::PgRow,
+) -> Result<TokenRevocationRecord, ControlPlaneError> {
+    let record_json: serde_json::Value = row.get("record_json");
+    serde_json::from_value(record_json).map_err(json_error)
+}
+
+async fn update_sqlite_token(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &TokenLedgerRecord,
+) -> Result<(), ControlPlaneError> {
+    sqlx::query("UPDATE tokens SET record_json = ?3 WHERE cluster_id = ?1 AND nonce = ?2")
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .bind(serde_json::to_string(record).map_err(json_error)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+async fn lock_postgres_token(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cluster_id: &ClusterId,
+    nonce: &str,
+) -> Result<(), ControlPlaneError> {
+    let lock_key = format!(
+        "{}:{}{}",
+        cluster_id.as_str().len(),
+        cluster_id.as_str(),
+        nonce
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+async fn update_postgres_token(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &TokenLedgerRecord,
+) -> Result<(), ControlPlaneError> {
+    sqlx::query("UPDATE tokens SET record_json = $3 WHERE cluster_id = $1 AND nonce = $2")
+        .bind(record.cluster_id.as_str())
+        .bind(record.nonce.as_str())
+        .bind(serde_json::to_value(record).map_err(json_error)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sql_error)?;
+    Ok(())
 }
 
 fn ensure_heartbeat_is_newer(
@@ -1589,9 +1845,6 @@ mod tests {
         let mut token_claims = claims(cluster_id.clone());
         token_claims.nonce = "concurrent-revocation".to_string();
         token_claims.policy.max_token_uses = None;
-        admission
-            .issue_from_claims(&token_claims, Utc::now())
-            .await?;
 
         let task_count = 64;
         let barrier = Arc::new(tokio::sync::Barrier::new(task_count + 1));
@@ -1608,9 +1861,15 @@ mod tests {
 
         barrier.wait().await;
         let revoked = admission
-            .revoke_token(&cluster_id, &token_claims.nonce, Utc::now())
+            .revoke_token(TokenRevocationRecord {
+                cluster_id: cluster_id.clone(),
+                nonce: token_claims.nonce.clone(),
+                issuer: token_claims.issuer.clone(),
+                key_id: token_claims.key_id.clone(),
+                revoked_at: Utc::now(),
+            })
             .await?;
-        assert_eq!(revoked.status(Utc::now()), TokenStatus::Revoked);
+        assert_eq!(revoked.revocation.nonce, token_claims.nonce);
 
         let mut accepted = 0_u32;
         for task in tasks {
@@ -1632,7 +1891,63 @@ mod tests {
             .ok_or_else(|| ControlPlaneError::TokenNotFound(token_claims.nonce.clone()))?;
         assert_eq!(final_record.status(Utc::now()), TokenStatus::Revoked);
         assert_eq!(final_record.uses, accepted);
-        assert!(final_record.has_same_definition(&revoked));
+        if let Some(revoked_record) = revoked.record {
+            assert!(final_record.has_same_definition(&revoked_record));
+        }
+
+        drop(admission);
+        drop(store);
+        let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_preemptive_token_revocation_survives_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("preemptive-token-revocation");
+        let store = SqliteControlPlaneStore::connect(&database_url).await?;
+        let admission = TokenAdmission::new(Arc::new(store.clone()));
+        let cluster_id = ClusterId::new();
+        let mut token_claims = claims(cluster_id.clone());
+        token_claims.nonce = "preemptively-revoked".to_string();
+        let revoked_at = Utc::now();
+        let outcome = admission
+            .revoke_token(TokenRevocationRecord {
+                cluster_id: cluster_id.clone(),
+                nonce: token_claims.nonce.clone(),
+                issuer: token_claims.issuer.clone(),
+                key_id: token_claims.key_id.clone(),
+                revoked_at,
+            })
+            .await?;
+        assert!(outcome.record.is_none());
+        assert_eq!(outcome.revocation.revoked_at, revoked_at);
+        assert!(store
+            .get_token(&cluster_id, &token_claims.nonce)
+            .await?
+            .is_none());
+        let metrics = store.token_metrics(&cluster_id, Utc::now()).await?;
+        assert_eq!(metrics.issued_count, 1);
+        assert_eq!(metrics.revoked_count, 1);
+        assert_eq!(metrics.use_count, 0);
+
+        drop(admission);
+        drop(store);
+        let store = SqliteControlPlaneStore::connect(&database_url).await?;
+        let admission = TokenAdmission::new(Arc::new(store.clone()));
+        assert!(matches!(
+            admission.admit_join(&token_claims, Utc::now()).await,
+            Err(ControlPlaneError::TokenRejected {
+                status: TokenStatus::Revoked,
+                ..
+            })
+        ));
+        let stored = store
+            .get_token(&cluster_id, &token_claims.nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(token_claims.nonce.clone()))?;
+        assert_eq!(stored.status(Utc::now()), TokenStatus::Revoked);
+        assert_eq!(stored.uses, 0);
 
         drop(admission);
         drop(store);
