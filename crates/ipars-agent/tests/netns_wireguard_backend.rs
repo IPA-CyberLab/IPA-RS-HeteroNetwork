@@ -338,24 +338,22 @@ async fn boringtun_backends_transport_vpn_packets_between_network_namespaces(
         )?;
     }
 
-    backend_a
-        .upsert_peer(WireGuardPeerConfig {
-            peer: NodeId::from_string("boringtun-packet-peer-b"),
-            public_key: key_b.public_key_b64.clone(),
-            endpoint: Some(format!("10.241.99.2:{listen_b}")),
-            allowed_ips: vec![format!("{vpn_ip_b}/32")],
-            persistent_keepalive_seconds: Some(5),
-        })
-        .await?;
-    backend_b
-        .upsert_peer(WireGuardPeerConfig {
-            peer: NodeId::from_string("boringtun-packet-peer-a"),
-            public_key: key_a.public_key_b64.clone(),
-            endpoint: Some(format!("10.241.99.1:{listen_a}")),
-            allowed_ips: vec![format!("{vpn_ip_a}/32")],
-            persistent_keepalive_seconds: Some(5),
-        })
-        .await?;
+    let peer_a_config = WireGuardPeerConfig {
+        peer: NodeId::from_string("boringtun-packet-peer-b"),
+        public_key: key_b.public_key_b64.clone(),
+        endpoint: Some(format!("10.241.99.2:{listen_b}")),
+        allowed_ips: vec![format!("{vpn_ip_b}/32")],
+        persistent_keepalive_seconds: Some(5),
+    };
+    let peer_b_config = WireGuardPeerConfig {
+        peer: NodeId::from_string("boringtun-packet-peer-a"),
+        public_key: key_a.public_key_b64.clone(),
+        endpoint: Some(format!("10.241.99.1:{listen_a}")),
+        allowed_ips: vec![format!("{vpn_ip_a}/32")],
+        persistent_keepalive_seconds: Some(5),
+    };
+    backend_a.upsert_peer(peer_a_config.clone()).await?;
+    backend_b.upsert_peer(peer_b_config.clone()).await?;
     command(
         "ip",
         [
@@ -450,6 +448,21 @@ async fn boringtun_backends_transport_vpn_packets_between_network_namespaces(
         .get(&key_a.public_key_b64)
         .ok_or("BoringTun packet telemetry did not include peer A")?;
     assert!(reverse_peer_telemetry.latest_handshake_at.is_some());
+
+    backend_a.upsert_peer(peer_a_config).await?;
+    backend_b.upsert_peer(peer_b_config).await?;
+    assert!(telemetry_a
+        .snapshot()
+        .await?
+        .get(&key_b.public_key_b64)
+        .and_then(|peer| peer.latest_handshake_at)
+        .is_some());
+    assert!(telemetry_b
+        .snapshot()
+        .await?
+        .get(&key_a.public_key_b64)
+        .and_then(|peer| peer.latest_handshake_at)
+        .is_some());
 
     Ok(())
 }

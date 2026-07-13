@@ -219,6 +219,7 @@ pub struct BoringTunWireGuardBackend {
     interface: String,
     uapi: Arc<BoringTunUapi>,
     peer_public_keys: Arc<tokio::sync::RwLock<BTreeMap<ipars_types::NodeId, String>>>,
+    peer_configs: Arc<tokio::sync::RwLock<BTreeMap<ipars_types::NodeId, WireGuardPeerConfig>>>,
 }
 
 impl fmt::Debug for BoringTunWireGuardBackend {
@@ -237,6 +238,7 @@ impl Clone for BoringTunWireGuardBackend {
             interface: self.interface.clone(),
             uapi: Arc::clone(&self.uapi),
             peer_public_keys: Arc::clone(&self.peer_public_keys),
+            peer_configs: Arc::clone(&self.peer_configs),
         }
     }
 }
@@ -270,6 +272,7 @@ impl BoringTunWireGuardBackend {
             interface,
             uapi: Arc::new(uapi),
             peer_public_keys: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
+            peer_configs: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
         })
     }
 
@@ -337,6 +340,15 @@ impl WireGuardBackend for BoringTunWireGuardBackend {
     }
 
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
+        if self
+            .peer_configs
+            .read()
+            .await
+            .get(&config.peer)
+            .is_some_and(|applied| applied == &config)
+        {
+            return Ok(());
+        }
         let previous = self
             .peer_public_keys
             .read()
@@ -365,10 +377,13 @@ impl WireGuardBackend for BoringTunWireGuardBackend {
                 "userspace WireGuard peer configuration task failed: {error}"
             ))
         })??;
+        let peer = config.peer.clone();
+        let public_key = config.public_key.clone();
         self.peer_public_keys
             .write()
             .await
-            .insert(config.peer, config.public_key);
+            .insert(peer.clone(), public_key);
+        self.peer_configs.write().await.insert(peer, config);
         Ok(())
     }
 
@@ -398,6 +413,10 @@ impl WireGuardBackend for BoringTunWireGuardBackend {
             .write()
             .await
             .retain(|_, stored_key| *stored_key != public_key);
+        self.peer_configs
+            .write()
+            .await
+            .retain(|_, config| config.public_key != public_key);
         Ok(())
     }
 }
