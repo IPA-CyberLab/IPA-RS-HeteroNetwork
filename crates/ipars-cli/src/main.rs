@@ -57,6 +57,7 @@ const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
+const MAX_DOCKER_API_CA_CERT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_RELAY_FORWARDER_MAX_SESSIONS: usize = 1024;
 const DEFAULT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS: u64 = 5;
 const DEFAULT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS: u64 = 60;
@@ -105,6 +106,7 @@ const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
 const DOCKER_ROOTLESS_DISCOVERY_COMPOSE_FILE: &str =
     "docker/compose.rootless-docker-discovery.yaml";
+const DOCKER_REMOTE_CA_COMPOSE_FILE: &str = "docker/compose.docker-remote-ca.yaml";
 const DOCKER_ROOTLESS_ROUTE_PROVIDER_COMPOSE_FILE: &str =
     "docker/compose.rootless-route-provider.yaml";
 const DOCKER_NETWORK_DRIVER_TEMPLATE: &str = "'{{.Driver}}'";
@@ -710,6 +712,10 @@ struct DockerInstallArgs {
     docker_networks: Vec<String>,
     #[arg(long)]
     docker_api_socket: Option<PathBuf>,
+    #[arg(long, conflicts_with = "docker_api_socket")]
+    docker_api_url: Option<String>,
+    #[arg(long)]
+    docker_api_ca_cert_path: Option<PathBuf>,
     #[arg(long)]
     docker_container_namespace: Option<String>,
     #[arg(long, default_value = "docker0")]
@@ -6060,11 +6066,18 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file passes the relay admission secret through IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
     ]);
-    if args.docker_discover_networks {
+    if args.docker_discover_networks && args.docker_api_url.is_none() {
         notes.push("Docker network discovery plans add a read-only Docker API socket override so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock; rootful plans use docker/compose.docker-discovery.yaml and explicit rootless route-provider plans use docker/compose.rootless-docker-discovery.yaml with XDG_RUNTIME_DIR/docker.sock as the default host path".to_string());
         notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string());
     }
-    if args.docker_discover_networks {
+    if let Some(url) = args.docker_api_url.as_deref() {
+        notes.push(format!("Docker network discovery uses the explicit remote API URL `{url}`; no local Docker socket bind or socket preflight is added").to_string());
+        notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments; filters are checked by the agent against the remote Engine".to_string());
+    }
+    if let Some(path) = args.docker_api_ca_cert_path.as_ref() {
+        notes.push(format!("The Docker API CA certificate `{}` is validated as a bounded PEM file and mounted read-only at /run/ipars/docker-api-ca.crt", path.display()));
+    }
+    if args.docker_discover_networks && args.docker_api_url.is_none() {
         notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute dot-component-free non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
@@ -6089,7 +6102,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
 
     let mut commands = Vec::new();
     if args.docker_discover_networks {
-        commands.push(docker_api_socket_preflight_command(&args));
+        commands.push(docker_api_preflight_command(&args));
     }
     if let Some(network) = args.rootless_workload_network.as_deref() {
         commands.push(rootless_workload_network_preflight_command(&args, network));
@@ -6126,7 +6139,7 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
             files.push("docker/compose.rootless-dataplane.yaml".to_string());
         }
     }
-    if args.docker_discover_networks {
+    if args.docker_discover_networks && args.docker_api_url.is_none() {
         files.push(if args.rootless {
             DOCKER_ROOTLESS_DISCOVERY_COMPOSE_FILE.to_string()
         } else {
@@ -6136,11 +6149,16 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
     if args.rootless_workload_network.is_some() {
         files.push(DOCKER_ROOTLESS_ROUTE_PROVIDER_COMPOSE_FILE.to_string());
     }
+    if args.docker_api_ca_cert_path.is_some() {
+        files.push(DOCKER_REMOTE_CA_COMPOSE_FILE.to_string());
+    }
     files
 }
 
 fn rootless_workload_network_preflight_command(args: &DockerInstallArgs, network: &str) -> String {
-    let docker_command = if let Some(socket) = args.docker_api_socket.as_ref() {
+    let docker_command = if let Some(url) = args.docker_api_url.as_deref() {
+        format!("docker --host {}", shell_word(url))
+    } else if let Some(socket) = args.docker_api_socket.as_ref() {
         format!(
             "docker --host {}",
             shell_word(&format!("unix://{}", socket.display()))
@@ -6153,6 +6171,23 @@ fn rootless_workload_network_preflight_command(args: &DockerInstallArgs, network
         shell_word(network),
         shell_word(network)
     )
+}
+
+fn docker_api_preflight_command(args: &DockerInstallArgs) -> String {
+    if let Some(url) = args.docker_api_url.as_deref() {
+        let mut command = format!(
+            "docker_api_url={}; test -n \"$docker_api_url\"",
+            shell_word(url)
+        );
+        if let Some(path) = args.docker_api_ca_cert_path.as_ref() {
+            let path = shell_word(&path.display().to_string());
+            command.push_str(&format!(
+                "; docker_api_ca_cert={path}; test ! -L \"$docker_api_ca_cert\" && test -f \"$docker_api_ca_cert\" && test $(wc -c < \"$docker_api_ca_cert\") -le {MAX_DOCKER_API_CA_CERT_BYTES} && grep -q -- '-----BEGIN CERTIFICATE-----' \"$docker_api_ca_cert\" && grep -q -- '-----END CERTIFICATE-----' \"$docker_api_ca_cert\""
+            ));
+        }
+        return command;
+    }
+    docker_api_socket_preflight_command(args)
 }
 
 fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
@@ -6203,6 +6238,28 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         if !args.docker_discover_networks {
             anyhow::bail!("--docker-api-socket requires --docker-discover-networks");
         }
+    }
+    if args.docker_api_socket.is_some() && args.docker_api_url.is_some() {
+        anyhow::bail!("--docker-api-url cannot be combined with --docker-api-socket");
+    }
+    if let Some(url) = args.docker_api_url.as_deref() {
+        if !args.docker_discover_networks {
+            anyhow::bail!("--docker-api-url requires --docker-discover-networks");
+        }
+        validate_docker_api_url_arg(url)?;
+    }
+    if let Some(path) = args.docker_api_ca_cert_path.as_deref() {
+        let url = args
+            .docker_api_url
+            .as_deref()
+            .context("--docker-api-ca-cert-path requires --docker-api-url")?;
+        let parsed_url =
+            reqwest::Url::parse(url).context("--docker-api-url must be an absolute HTTP(S) URL")?;
+        anyhow::ensure!(
+            parsed_url.scheme() == "https",
+            "--docker-api-ca-cert-path requires an https --docker-api-url"
+        );
+        validate_docker_api_ca_certificate_path(path)?;
     }
     validate_positive_docker_seconds(
         args.docker_route_interval_seconds,
@@ -6313,6 +6370,8 @@ fn validate_rootless_docker_install_args(args: &DockerInstallArgs) -> anyhow::Re
     let has_docker_route_settings = args.docker_discover_networks
         || !args.docker_networks.is_empty()
         || args.docker_api_socket.is_some()
+        || args.docker_api_url.is_some()
+        || args.docker_api_ca_cert_path.is_some()
         || args.docker_container_namespace.is_some()
         || !args.docker_container_cidrs.is_empty()
         || args.docker_host_interface != DEFAULT_DOCKER_HOST_INTERFACE
@@ -6385,6 +6444,122 @@ fn validate_docker_api_socket_path_components(value: &str, label: &str) -> anyho
     {
         anyhow::bail!("{label} must not contain '.' or '..' path components");
     }
+    Ok(())
+}
+
+fn validate_docker_api_url_arg(value: &str) -> anyhow::Result<()> {
+    let url =
+        reqwest::Url::parse(value).context("--docker-api-url must be an absolute HTTP(S) URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "--docker-api-url must use http or https"
+    );
+    anyhow::ensure!(
+        url.host_str().is_some(),
+        "--docker-api-url must include a host"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "--docker-api-url must not embed userinfo; configure Docker client credentials separately"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "--docker-api-url must not include a query or fragment"
+    );
+    anyhow::ensure!(
+        http_url_is_usable_endpoint(value),
+        "--docker-api-url must use a nonzero port and a usable non-unspecified, non-multicast, non-broadcast endpoint"
+    );
+    if url.scheme() == "http" {
+        let host = url.host_str().unwrap_or_default();
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        anyhow::ensure!(
+            loopback,
+            "--docker-api-url must use https for non-loopback Docker endpoints"
+        );
+    }
+    Ok(())
+}
+
+fn validate_docker_api_ca_certificate_path(path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("--docker-api-ca-cert-path must be an absolute file path");
+    }
+    let value = path
+        .as_os_str()
+        .to_str()
+        .context("--docker-api-ca-cert-path must be valid UTF-8")?;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("--docker-api-ca-cert-path must not contain control characters");
+    }
+    validate_docker_api_socket_path_components(value, "--docker-api-ca-cert-path")?;
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect Docker API CA certificate at {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "Docker API CA certificate path {} must not be a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Docker API CA certificate path {} must resolve to a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_DOCKER_API_CA_CERT_BYTES,
+        "Docker API CA certificate file {} exceeds maximum size of {} bytes",
+        path.display(),
+        MAX_DOCKER_API_CA_CERT_BYTES
+    );
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open Docker API CA certificate from {}",
+            path.display()
+        )
+    })?;
+    let mut certificate = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_DOCKER_API_CA_CERT_BYTES + 1)
+        .read_to_end(&mut certificate)
+        .with_context(|| {
+            format!(
+                "failed to read Docker API CA certificate from {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        certificate.len() as u64 <= MAX_DOCKER_API_CA_CERT_BYTES,
+        "Docker API CA certificate file {} exceeds maximum size of {} bytes",
+        path.display(),
+        MAX_DOCKER_API_CA_CERT_BYTES
+    );
+    anyhow::ensure!(
+        !certificate.is_empty(),
+        "Docker API CA certificate at {} is empty",
+        path.display()
+    );
+    let certificate_text = std::str::from_utf8(&certificate).with_context(|| {
+        format!(
+            "Docker API CA certificate at {} must be UTF-8 PEM",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        certificate_text.contains("-----BEGIN CERTIFICATE-----")
+            && certificate_text.contains("-----END CERTIFICATE-----"),
+        "Docker API CA certificate at {} must contain a PEM CERTIFICATE block",
+        path.display()
+    );
+    reqwest::Certificate::from_pem(&certificate)
+        .context("--docker-api-ca-cert-path does not contain a valid PEM certificate")?;
     Ok(())
 }
 
@@ -6931,10 +7106,17 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
                 name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
                 value: "true".to_string(),
             });
-            environment.push(InstallEnvironment {
-                name: "IPARS_DOCKER_API_SOCKET".to_string(),
-                value: "/run/ipars/docker.sock".to_string(),
-            });
+            if let Some(url) = args.docker_api_url.as_ref() {
+                environment.push(InstallEnvironment {
+                    name: "IPARS_DOCKER_API_URL".to_string(),
+                    value: url.clone(),
+                });
+            } else {
+                environment.push(InstallEnvironment {
+                    name: "IPARS_DOCKER_API_SOCKET".to_string(),
+                    value: "/run/ipars/docker.sock".to_string(),
+                });
+            }
         }
         if !args.docker_networks.is_empty() {
             environment.push(InstallEnvironment {
@@ -6946,6 +7128,12 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             environment.push(InstallEnvironment {
                 name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
                 value: socket.display().to_string(),
+            });
+        }
+        if let Some(path) = args.docker_api_ca_cert_path.as_ref() {
+            environment.push(InstallEnvironment {
+                name: "IPARS_DOCKER_API_CA_CERT_PATH_HOST".to_string(),
+                value: path.display().to_string(),
             });
         }
         let container_namespace = args
@@ -13062,6 +13250,8 @@ fi
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -13112,6 +13302,8 @@ fi
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -13298,6 +13490,8 @@ fi
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -13944,6 +14138,8 @@ fi
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: DEFAULT_DOCKER_HOST_INTERFACE.to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14131,6 +14327,10 @@ fi
             .join("../../docker/compose.rootless.yaml")
             .canonicalize()?;
         let rootless_compose = std::fs::read_to_string(rootless_compose_path)?;
+        let remote_ca_compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.docker-remote-ca.yaml")
+            .canonicalize()?;
+        let remote_ca_compose = std::fs::read_to_string(remote_ca_compose_path)?;
         let rootless_dataplane_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docker/compose.rootless-dataplane.yaml")
             .canonicalize()?;
@@ -14229,6 +14429,14 @@ fi
         assert!(discovery_compose.contains("target: /run/ipars/docker.sock"));
         assert!(discovery_compose.contains("read_only: true"));
         assert!(discovery_compose.contains("create_host_path: false"));
+        assert!(remote_ca_compose
+            .contains("IPARS_DOCKER_API_CA_CERT_PATH=/run/ipars/docker-api-ca.crt"));
+        assert!(remote_ca_compose.contains(
+            "source: ${IPARS_DOCKER_API_CA_CERT_PATH_HOST:?set IPARS_DOCKER_API_CA_CERT_PATH_HOST}"
+        ));
+        assert!(remote_ca_compose.contains("target: /run/ipars/docker-api-ca.crt"));
+        assert!(remote_ca_compose.contains("read_only: true"));
+        assert!(remote_ca_compose.contains("create_host_path: false"));
         assert!(
             rootless_docker_discovery.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock")
         );
@@ -14283,6 +14491,8 @@ fi
         assert!(rootless_route_provider.contains("command: !override"));
         assert!(rootless_route_provider
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-true}"));
+        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_API_URL\n"));
+        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_API_CA_CERT_PATH\n"));
         assert!(rootless_route_provider.contains("      - IPARS_DOCKER_NETWORKS\n"));
         assert!(rootless_route_provider.contains("      - IPARS_DOCKER_CONTAINER_CIDRS\n"));
         assert!(rootless_route_provider.contains("${IPARS_ROOTLESS_STUN_SERVER:-127.0.0.1:3478}"));
@@ -14321,6 +14531,8 @@ fi
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: Some(PathBuf::from("/run/user/1000/docker.sock")),
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14378,6 +14590,81 @@ fi
     }
 
     #[test]
+    fn docker_install_plan_wires_remote_api_url_without_socket_bind() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string()],
+            docker_api_url: Some("https://docker.example:2376/engine".to_string()),
+            ..docker_install_test_args()
+        })?;
+
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_URL"),
+            Some("https://docker.example:2376/engine")
+        );
+        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
+        assert_eq!(
+            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            None
+        );
+        assert!(plan.commands[0].contains("docker_api_url=https://docker.example:2376/engine"));
+        assert!(!plan.commands[0].contains("docker_socket"));
+        assert!(plan.commands[0].contains("test -n \"$docker_api_url\""));
+        assert!(!plan.commands[1].contains("compose.docker-discovery.yaml"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("no local Docker socket bind or socket preflight")));
+
+        let mut compose_args = docker_install_test_args();
+        compose_args.docker_discover_networks = true;
+        compose_args.docker_api_url = Some("https://docker.example:2376".to_string());
+        compose_args.docker_api_ca_cert_path = Some(PathBuf::from("/etc/docker/ca.pem"));
+        let compose_files = docker_install_compose_files(&compose_args);
+        assert!(compose_files.contains(&DOCKER_REMOTE_CA_COMPOSE_FILE.to_string()));
+        assert!(!compose_files.contains(&DOCKER_DISCOVERY_COMPOSE_FILE.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_rejects_unsafe_remote_api_settings() -> anyhow::Result<()> {
+        let plaintext = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_api_url: Some("http://docker.example:2375".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("non-loopback plaintext Docker API URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(plaintext.to_string().contains("must use https"));
+
+        let inactive = match docker_install_plan(DockerInstallArgs {
+            docker_api_url: Some("http://127.0.0.1:2375".to_string()),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("inactive Docker API URL should be rejected"),
+            Err(error) => error,
+        };
+        assert!(inactive
+            .to_string()
+            .contains("--docker-api-url requires --docker-discover-networks"));
+
+        let relative_ca = match docker_install_plan(DockerInstallArgs {
+            docker_discover_networks: true,
+            docker_api_url: Some("https://docker.example:2376".to_string()),
+            docker_api_ca_cert_path: Some(PathBuf::from("docker/ca.pem")),
+            ..docker_install_test_args()
+        }) {
+            Ok(_) => anyhow::bail!("relative Docker API CA path should be rejected"),
+            Err(error) => error,
+        };
+        assert!(relative_ca
+            .to_string()
+            .contains("--docker-api-ca-cert-path must be an absolute file path"));
+        Ok(())
+    }
+
+    #[test]
     fn docker_install_plan_preflights_requested_docker_networks() -> anyhow::Result<()> {
         let plan = docker_install_plan(DockerInstallArgs {
             docker_discover_networks: true,
@@ -14418,6 +14705,8 @@ fi
             docker_discover_networks: true,
             docker_networks: vec!["edge_default".to_string()],
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: vec!["172.20.0.0/16".parse()?],
@@ -14471,6 +14760,8 @@ fi
             docker_discover_networks: false,
             docker_networks: vec!["edge_default".to_string()],
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14524,6 +14815,8 @@ fi
             docker_discover_networks: true,
             docker_networks: vec!["edge/default".to_string()],
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14589,6 +14882,8 @@ fi
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker/0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14660,6 +14955,8 @@ fi
             docker_discover_networks: false,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: Some("../compose".to_string()),
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14768,6 +15065,8 @@ fi
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14821,6 +15120,8 @@ fi
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14874,6 +15175,8 @@ fi
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -14929,6 +15232,8 @@ fi
             docker_discover_networks: true,
             docker_networks: Vec::new(),
             docker_api_socket: None,
+            docker_api_url: None,
+            docker_api_ca_cert_path: None,
             docker_container_namespace: None,
             docker_host_interface: "docker0".to_string(),
             docker_container_cidrs: Vec::new(),
@@ -19324,6 +19629,33 @@ fi
             assert_eq!(args.userspace_wireguard_shutdown_timeout_seconds, 20);
         } else {
             anyhow::bail!("expected docker install command");
+        }
+
+        let remote_docker = Cli::try_parse_from([
+            "ipars",
+            "docker",
+            "install",
+            "--docker-discover-networks",
+            "--docker-api-url",
+            "https://docker.example:2376/engine",
+            "--docker-api-ca-cert-path",
+            "/etc/docker/ca.pem",
+        ])?;
+        if let Command::Docker {
+            command: DockerCommand::Install(args),
+        } = remote_docker.command
+        {
+            assert_eq!(
+                args.docker_api_url.as_deref(),
+                Some("https://docker.example:2376/engine")
+            );
+            assert_eq!(
+                args.docker_api_ca_cert_path,
+                Some(PathBuf::from("/etc/docker/ca.pem"))
+            );
+            assert_eq!(args.docker_api_socket, None);
+        } else {
+            anyhow::bail!("expected remote docker install command");
         }
 
         let k8s = Cli::try_parse_from([

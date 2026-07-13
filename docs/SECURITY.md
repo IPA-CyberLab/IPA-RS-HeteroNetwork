@@ -165,4 +165,4 @@ Implemented controls:
 - Keep agent state directories and files owner-only. The daemon rejects symlinked or group/world-accessible key state.
 - Enable file-backed relay admission Bearer tokens for public relays and distribute the same scoped secret only to authorized Agents.
 - Scope ACLs and route allowlists by role, tag, route, and protocol. Deny rules take precedence.
-- Treat Docker API socket mounts as discovery-only and opt-in; the base Compose agent does not mount the Docker socket.
+- Treat Docker API socket mounts as discovery-only and opt-in; the base Compose agent does not mount the Docker socket. For remote Docker Engines, prefer `--docker-api-url` with HTTPS and use `--docker-api-ca-cert-path` only for a bounded, non-symlink PEM trust bundle; URL-backed installs do not bind a local Docker socket.

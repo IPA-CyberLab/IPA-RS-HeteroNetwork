@@ -261,8 +261,11 @@ no iptables mutation. For Docker API discovery, add
 `--docker-discover-networks` and one or more `--docker-network` filters; the
 generated plan adds `docker/compose.rootless-docker-discovery.yaml`, mounts the host
 Docker socket read-only at `/run/ipars/docker.sock`, and reconciles discovered
-CIDR changes without creating, disconnecting, or deleting Docker networks. For
-example, when the external workload network is the route provider:
+CIDR changes without creating, disconnecting, or deleting Docker networks. For a
+remote Engine, use `--docker-api-url https://docker.example:2376` instead; the
+plan omits the socket bind and accepts an optional bounded PEM trust bundle via
+`--docker-api-ca-cert-path`, mounted read-only inside the Agent. For example,
+when the external workload network is the route provider:
 
 ```bash
 ipars docker install \
