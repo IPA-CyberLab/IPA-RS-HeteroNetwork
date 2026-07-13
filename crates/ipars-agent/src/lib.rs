@@ -4867,7 +4867,7 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
         {
             if probe.selected_state == PathState::DirectNatTraversal {
                 if let Some(candidate) =
-                    preferred_local_udp_candidate(&local_candidates, &peer.endpoint_candidates)
+                    preferred_peer_local_udp_candidate(&local_candidates, &peer.endpoint_candidates)
                 {
                     return Ok(wireguard_endpoint_for_candidate(&candidate, &peer.node_id));
                 }
@@ -4879,13 +4879,12 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
         }
         let path = self.runtime.path_record_for_peer(&peer.node_id).await;
         let Some(path) = path else {
-            return Ok(
-                preferred_local_udp_candidate(&local_candidates, &peer.endpoint_candidates)
-                    .and_then(|candidate| {
-                        wireguard_endpoint_for_candidate(&candidate, &peer.node_id)
-                    })
-                    .or_else(|| preferred_endpoint(peer)),
-            );
+            return Ok(preferred_peer_local_udp_candidate(
+                &local_candidates,
+                &peer.endpoint_candidates,
+            )
+            .and_then(|candidate| wireguard_endpoint_for_candidate(&candidate, &peer.node_id))
+            .or_else(|| preferred_endpoint(peer)));
         };
 
         match path.selected_state {
@@ -4899,7 +4898,7 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
                 .await
                 .map(|endpoint| endpoint.to_string())),
             PathState::Unreachable => Ok(None),
-            PathState::DirectNatTraversal => Ok(preferred_local_udp_candidate(
+            PathState::DirectNatTraversal => Ok(preferred_peer_local_udp_candidate(
                 &local_candidates,
                 &peer.endpoint_candidates,
             )
@@ -9504,6 +9503,106 @@ mod tests {
                 .and_then(|config| config.endpoint.as_deref()),
             Some("127.0.0.1:52000")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_endpoint_resolver_uses_peer_local_udp_candidate() ->
+        Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local_id = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-local-udp");
+        let local_candidate = EndpointCandidate {
+            node_id: local_id.clone(),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([172, 18, 0, 3], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        };
+        let peer_reflexive_candidate = EndpointCandidate {
+            node_id: peer_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([172, 18, 0, 2], 18_410)),
+            observed_at: Utc::now(),
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        };
+        let peer_local_candidate = EndpointCandidate {
+            node_id: peer_id.clone(),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([172, 18, 0, 2], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        };
+        runtime.replace_candidates(vec![local_candidate]).await;
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)),
+            "wg-peer-local-udp",
+            vec![peer_reflexive_candidate, peer_local_candidate.clone()],
+            Vec::new(),
+        );
+        let resolver = RuntimePeerEndpointResolver::new(runtime.clone());
+        let expected = Some("172.18.0.2:51820".to_string());
+
+        assert_eq!(resolver.endpoint_for_peer(&peer).await?, expected);
+
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id.clone(), peer_id.clone()),
+                selected_state: PathState::DirectNatTraversal,
+                selected_candidate: Some(peer_local_candidate.clone()),
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::DirectNatTraversal,
+                    &PathMetrics::default(),
+                    true,
+                    0,
+                ),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+        assert_eq!(resolver.endpoint_for_peer(&peer).await?, expected);
+
+        let now = Utc::now();
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectNatTraversal,
+                selected_candidate: peer_local_candidate,
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(60),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: None,
+                baseline_tx_bytes: None,
+            })
+            .await?;
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer_id),
+                selected_state: PathState::Unreachable,
+                selected_candidate: None,
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::Unreachable,
+                    &PathMetrics::default(),
+                    true,
+                    0,
+                ),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+        assert_eq!(resolver.endpoint_for_peer(&peer).await?, expected);
         Ok(())
     }
 
