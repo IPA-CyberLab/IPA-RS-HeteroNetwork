@@ -1,5 +1,6 @@
 services:
   agent:
+    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
     networks: !override
       default:
         ipv4_address: 172.30.250.11
@@ -33,6 +34,8 @@ services:
       - ipars-agent-api-bearer-token
 
   agent-b:
+    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    build: !reset null
     networks: !override
       default:
         ipv4_address: 172.30.250.12
@@ -66,9 +69,8 @@ services:
       - ipars-agent-api-bearer-token
 
   workload-a:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    build: !reset null
     entrypoint:
       - /usr/local/bin/iparsd
     command:
@@ -89,9 +91,8 @@ services:
       start_period: 5s
 
   workload-b:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    build: !reset null
     entrypoint:
       - /usr/local/bin/iparsd
     command:
