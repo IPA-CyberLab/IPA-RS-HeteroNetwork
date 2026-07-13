@@ -114,6 +114,7 @@ use opentelemetry_sdk::{
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing_subscriber::prelude::*;
@@ -9221,8 +9222,17 @@ fn docker_namespace_from_networks(network_names: &[String]) -> String {
     if network_names.is_empty() {
         return "docker-api".to_string();
     }
-    let joined = network_names.join("+");
-    format!("docker:{joined}")
+    let mut sorted_names = network_names.to_vec();
+    sorted_names.sort();
+    let joined = sorted_names.join("-");
+    let mut hasher = Sha256::new();
+    for network_name in &sorted_names {
+        hasher.update(network_name.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    let readable = joined.chars().take(32).collect::<String>();
+    format!("docker-{readable}-{}", &digest[..16])
 }
 
 async fn start_docker_routes(args: &AgentArgs) -> anyhow::Result<tokio::task::JoinHandle<()>> {
@@ -26731,11 +26741,44 @@ exec sleep 60
                 "172.19.0.0/16".parse::<ipnet::IpNet>()?,
             ]
         );
-        assert_eq!(
-            docker_namespace_from_networks(&discovered.network_names),
-            "docker:compose_default+compose_extra"
-        );
+        let namespace = docker_namespace_from_networks(&discovered.network_names);
+        assert!(namespace.starts_with("docker-compose_default-compose_extra-"));
+        assert!(namespace.len() <= 64);
+        checked_docker_route_plan(DockerNetworkIntent {
+            container_namespace: namespace,
+            host_interface: "br-edge".to_string(),
+            overlay_interface: "ipars0".to_string(),
+            container_cidrs: discovered.cidrs,
+            expose_host_routes: true,
+        })?;
         Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_namespace_is_bounded_for_long_network_names() -> anyhow::Result<()> {
+        let namespace = docker_namespace_from_networks(&["a".repeat(255), "b".repeat(255)]);
+        assert!(namespace.len() <= 64);
+        assert!(namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')));
+        checked_docker_route_plan(DockerNetworkIntent {
+            container_namespace: namespace,
+            host_interface: "br-edge".to_string(),
+            overlay_interface: "ipars0".to_string(),
+            container_cidrs: vec!["172.18.0.0/16".parse()?],
+            expose_host_routes: true,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn docker_api_discovery_namespace_is_stable_for_same_networks() {
+        let network_names = vec!["compose_extra".to_string(), "compose_default".to_string()];
+        let sorted_network_names = vec!["compose_default".to_string(), "compose_extra".to_string()];
+        assert_eq!(
+            docker_namespace_from_networks(&network_names),
+            docker_namespace_from_networks(&sorted_network_names)
+        );
     }
 
     #[test]
@@ -26996,10 +27039,10 @@ exec sleep 60
             .context("timed out waiting for mock Docker API request")???;
         assert!(request_text.to_ascii_lowercase().contains("host: docker"));
         let intent = intent_result?;
-        assert_eq!(
-            intent.container_namespace,
-            "docker:compose_default+compose_extra"
-        );
+        assert!(intent
+            .container_namespace
+            .starts_with("docker-compose_default-compose_extra-"));
+        assert!(intent.container_namespace.len() <= 64);
         assert_eq!(intent.host_interface, "br-edge");
         assert_eq!(intent.overlay_interface, "ipars0");
         assert!(intent.expose_host_routes);

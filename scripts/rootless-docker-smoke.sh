@@ -9,6 +9,8 @@ suffix="$$-$(date +%s%N)"
 tmp_dir=""
 runtime_dir=""
 docker_socket=""
+workload_network_a=""
+workload_network_b=""
 daemon_pid=""
 daemon_pid_file=""
 project_name="ipars-rootless-${suffix}"
@@ -41,6 +43,8 @@ cleanup() {
     if [[ "$e2e_started" -eq 1 ]]; then
       compose_files+=( -f "$repo_root/docker/compose.rootless-e2e.yaml" )
       compose_files+=( -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml" )
+      compose_files+=( -f "$repo_root/docker/compose.rootless-discovery-e2e.yaml" )
+      compose_files+=( -f "$repo_root/docker/compose.rootless-docker-discovery.yaml" )
     else
       compose_files+=( -f "$override_path" )
     fi
@@ -49,6 +53,13 @@ cleanup() {
         -p "$project_name" \
         "${compose_files[@]}" \
         down --remove-orphans >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$workload_network_a" ]]; then
+    DOCKER_HOST="unix://${docker_socket}" "$docker_bin" network rm "$workload_network_a" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$workload_network_b" ]]; then
+    DOCKER_HOST="unix://${docker_socket}" "$docker_bin" network rm "$workload_network_b" >/dev/null 2>&1 || true
   fi
 
   if [[ -n "$daemon_pid_file" && -f "$daemon_pid_file" ]]; then
@@ -244,6 +255,7 @@ run_ipars init \
   --allowed-route 100.64.0.0/10 \
   --allowed-route 172.30.251.0/24 \
   --allowed-route 172.30.252.0/24 \
+  --allowed-route 172.30.253.0/24 \
   >"$init_output_path"
 
 rootless_cluster_id="$(jq -er '.cluster_id' "$init_output_path")"
@@ -261,6 +273,7 @@ run_ipars token create \
   --allowed-route 100.64.0.0/10 \
   --allowed-route 172.30.251.0/24 \
   --allowed-route 172.30.252.0/24 \
+  --allowed-route 172.30.253.0/24 \
   --control-plane-bootstrap http://172.30.250.3:8443 \
   --signal-bootstrap http://172.30.250.4:9443 \
   --stun-bootstrap udp://172.30.250.5:3478 \
@@ -288,6 +301,11 @@ export IPARS_ROOTLESS_SIGNAL_OPERATOR_TOKEN_FILE="$signal_operator_token_path"
 export IPARS_ROOTLESS_STUN_OPERATOR_TOKEN_FILE="$stun_operator_token_path"
 export IPARS_ROOTLESS_RELAY_OPERATOR_TOKEN_FILE="$relay_operator_token_path"
 export IPARS_ROOTLESS_RELAY_ADMISSION_TOKEN_FILE="$relay_admission_token_path"
+workload_network_a="${project_name}_workload-a"
+workload_network_b="${project_name}_workload-b"
+export IPARS_DOCKER_API_SOCKET_HOST="$docker_socket"
+export IPARS_ROOTLESS_DOCKER_NETWORK_A="$workload_network_a"
+export IPARS_ROOTLESS_DOCKER_NETWORK_B="$workload_network_b"
 
 rootless_e2e_compose() {
   DOCKER_HOST="unix://${docker_socket}" "$docker_bin" compose \
@@ -297,10 +315,22 @@ rootless_e2e_compose() {
     -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
     -f "$repo_root/docker/compose.rootless-e2e.yaml" \
     -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml" \
+    -f "$repo_root/docker/compose.rootless-discovery-e2e.yaml" \
+    -f "$repo_root/docker/compose.rootless-docker-discovery.yaml" \
     "$@"
 }
 
-rootless_e2e_compose config --quiet
+rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-config.json"
+jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_network_b" '
+  .services.agent.environment.IPARS_DOCKER_DISCOVER_NETWORKS == "true"
+  and .services.agent.environment.IPARS_DOCKER_NETWORKS == $network_a
+  and .services.agent.environment.IPARS_DOCKER_CONTAINER_CIDRS == null
+  and .services["agent-b"].environment.IPARS_DOCKER_DISCOVER_NETWORKS == "true"
+  and .services["agent-b"].environment.IPARS_DOCKER_NETWORKS == $network_b
+  and .services["agent-b"].environment.IPARS_DOCKER_CONTAINER_CIDRS == null
+  and any(.services.agent.volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and .bind.create_host_path == false)
+  and any(.services["agent-b"].volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and .bind.create_host_path == false)
+' "$tmp_dir/rootless-e2e-config.json" >/dev/null
 e2e_started=1
 if ! rootless_e2e_compose up -d --build --wait --wait-timeout 300; then
   rootless_e2e_compose ps >&2 || true
@@ -442,6 +472,38 @@ assert_workload_http() {
   ' sh "$remote_workload_ip"
 }
 
+wait_for_workload_http() {
+  local service="$1"
+  local remote_workload_ip="$2"
+  for _ in $(seq 1 120); do
+    if assert_workload_http "$service" "$remote_workload_ip" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_workload_route_churn() {
+  local service="$1"
+  local remote_workload_ip="$2"
+  local stale_workload_cidr="$3"
+  local stale_workload_ip="${stale_workload_cidr%/*}"
+  for _ in $(seq 1 120); do
+    if assert_workload_http "$service" "$remote_workload_ip" >/dev/null 2>&1 \
+      && ! rootless_e2e_compose exec -T "$service" sh -ec '
+        wg show ipars0 allowed-ips | grep -F -- "$1" >/dev/null
+      ' sh "$stale_workload_cidr" \
+      && ! rootless_e2e_compose exec -T "$service" sh -ec '
+        ip route get "$1" | grep -Eq " dev ipars0( |$)"
+      ' sh "$stale_workload_ip"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 rootless_dataplane_diagnostics() {
   local reason="$1"
   echo "rootless dataplane diagnostics (${reason}):" >&2
@@ -505,6 +567,28 @@ if ! assert_workload_http agent 172.30.252.2; then
 fi
 if ! assert_workload_http agent-b 172.30.251.2; then
   rootless_dataplane_diagnostics "agent-b could not reach remote rootless workload"
+  exit 1
+fi
+
+agent_a_container="$(rootless_e2e_compose ps -q agent)"
+if [[ -z "$agent_a_container" ]]; then
+  rootless_dataplane_diagnostics "could not identify Agent A container for Docker network churn"
+  exit 1
+fi
+DOCKER_HOST="unix://${docker_socket}" "$docker_bin" network disconnect -f \
+  "$workload_network_a" "$agent_a_container"
+DOCKER_HOST="unix://${docker_socket}" "$docker_bin" network rm "$workload_network_a"
+DOCKER_HOST="unix://${docker_socket}" "$docker_bin" network create \
+  --driver bridge \
+  --subnet 172.30.253.0/24 \
+  --gateway 172.30.253.1 \
+  "$workload_network_a" >/dev/null
+DOCKER_HOST="unix://${docker_socket}" "$docker_bin" network connect \
+  --ip 172.30.253.2 \
+  "$workload_network_a" "$agent_a_container"
+
+if ! wait_for_workload_route_churn agent-b 172.30.253.2 172.30.251.0/24; then
+  rootless_dataplane_diagnostics "Docker API network discovery did not reconcile the live workload subnet change"
   exit 1
 fi
 

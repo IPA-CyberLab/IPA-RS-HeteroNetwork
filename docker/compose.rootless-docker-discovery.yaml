@@ -1,0 +1,22 @@
+services:
+  agent:
+    environment:
+      - IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock
+    volumes:
+      - type: bind
+        source: ${IPARS_DOCKER_API_SOCKET_HOST:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/docker.sock}
+        target: /run/ipars/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+
+  agent-b:
+    environment:
+      - IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock
+    volumes:
+      - type: bind
+        source: ${IPARS_DOCKER_API_SOCKET_HOST:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/docker.sock}
+        target: /run/ipars/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false

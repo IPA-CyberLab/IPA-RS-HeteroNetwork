@@ -257,7 +257,23 @@ ipars docker install \
 This adds `docker/compose.rootless-route-provider.yaml`. It puts the agent on
 the Compose default network and the existing external workload network, starts
 the bundled STUN sidecar in the agent namespace, and applies routes there with
-no Docker API or iptables mutation. A workload service in the supplied Compose
+no iptables mutation. For Docker API discovery, add
+`--docker-discover-networks` and one or more `--docker-network` filters; the
+generated plan adds `docker/compose.rootless-docker-discovery.yaml`, mounts the host
+Docker socket read-only at `/run/ipars/docker.sock`, and reconciles discovered
+CIDR changes without creating, disconnecting, or deleting Docker networks. For
+example, when the external workload network is the route provider:
+
+```bash
+ipars docker install \
+  --rootless \
+  --agent-runtime-backend linux-command \
+  --rootless-workload-network ipars_workload \
+  --docker-discover-networks \
+  --docker-network ipars_workload
+```
+
+The API filter is matched by Docker network name or ID. A workload service in the supplied Compose
 manifest must use the agent namespace and must not declare `networks`:
 
 ```yaml

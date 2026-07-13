@@ -103,6 +103,8 @@ const DEFAULT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS: u64 = 5;
 const DOCKER_ROOTLESS_COMPOSE_FILE: &str = "docker/compose.rootless.yaml";
 const DOCKER_DISCOVERY_COMPOSE_FILE: &str = "docker/compose.docker-discovery.yaml";
+const DOCKER_ROOTLESS_DISCOVERY_COMPOSE_FILE: &str =
+    "docker/compose.rootless-docker-discovery.yaml";
 const DOCKER_ROOTLESS_ROUTE_PROVIDER_COMPOSE_FILE: &str =
     "docker/compose.rootless-route-provider.yaml";
 const DOCKER_NETWORK_DRIVER_TEMPLATE: &str = "'{{.Driver}}'";
@@ -6058,8 +6060,8 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         "The bundled Compose file passes the relay admission secret through IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
     ]);
-    if !args.rootless {
-        notes.push("Docker network discovery plans add docker/compose.docker-discovery.yaml so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock and a read-only IPARS_DOCKER_API_SOCKET_HOST bind mount only when discovery is enabled".to_string());
+    if args.docker_discover_networks {
+        notes.push("Docker network discovery plans add a read-only Docker API socket override so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock; rootful plans use docker/compose.docker-discovery.yaml and explicit rootless route-provider plans use docker/compose.rootless-docker-discovery.yaml with XDG_RUNTIME_DIR/docker.sock as the default host path".to_string());
         notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string());
     }
     if args.docker_discover_networks {
@@ -6125,7 +6127,11 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
         }
     }
     if args.docker_discover_networks {
-        files.push(DOCKER_DISCOVERY_COMPOSE_FILE.to_string());
+        files.push(if args.rootless {
+            DOCKER_ROOTLESS_DISCOVERY_COMPOSE_FILE.to_string()
+        } else {
+            DOCKER_DISCOVERY_COMPOSE_FILE.to_string()
+        });
     }
     if args.rootless_workload_network.is_some() {
         files.push(DOCKER_ROOTLESS_ROUTE_PROVIDER_COMPOSE_FILE.to_string());
@@ -14117,6 +14123,10 @@ fi
             .join("../../docker/compose.docker-discovery.yaml")
             .canonicalize()?;
         let discovery_compose = std::fs::read_to_string(discovery_compose_path)?;
+        let rootless_docker_discovery_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.rootless-docker-discovery.yaml")
+            .canonicalize()?;
+        let rootless_docker_discovery = std::fs::read_to_string(rootless_docker_discovery_path)?;
         let rootless_compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docker/compose.rootless.yaml")
             .canonicalize()?;
@@ -14129,6 +14139,10 @@ fi
             .join("../../docker/compose.rootless-route-provider.yaml")
             .canonicalize()?;
         let rootless_route_provider = std::fs::read_to_string(rootless_route_provider_path)?;
+        let rootless_discovery_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/compose.rootless-discovery-e2e.yaml")
+            .canonicalize()?;
+        let rootless_discovery = std::fs::read_to_string(rootless_discovery_path)?;
 
         assert!(compose
             .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
@@ -14213,6 +14227,14 @@ fi
         assert!(discovery_compose.contains("target: /run/ipars/docker.sock"));
         assert!(discovery_compose.contains("read_only: true"));
         assert!(discovery_compose.contains("create_host_path: false"));
+        assert!(
+            rootless_docker_discovery.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock")
+        );
+        assert!(rootless_docker_discovery.contains(
+            "${IPARS_DOCKER_API_SOCKET_HOST:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/docker.sock}"
+        ));
+        assert!(rootless_docker_discovery.contains("read_only: true"));
+        assert!(rootless_docker_discovery.contains("create_host_path: false"));
         assert!(rootless_compose.contains("cap_add: !reset []"));
         assert!(rootless_compose.contains("devices: !reset []"));
         assert!(rootless_compose.contains("environment: !override"));
@@ -14278,6 +14300,12 @@ fi
             "name: ${IPARS_ROOTLESS_WORKLOAD_NETWORK:?set IPARS_ROOTLESS_WORKLOAD_NETWORK}"
         ));
         assert!(rootless_route_provider.contains("external: true"));
+        assert!(rootless_discovery.contains("IPARS_DOCKER_DISCOVER_NETWORKS: \"true\""));
+        assert!(rootless_discovery.contains("IPARS_DOCKER_CONTAINER_CIDRS: !reset null"));
+        assert!(rootless_discovery
+            .contains("${IPARS_ROOTLESS_DOCKER_NETWORK_A:?set IPARS_ROOTLESS_DOCKER_NETWORK_A}"));
+        assert!(rootless_discovery
+            .contains("${IPARS_ROOTLESS_DOCKER_NETWORK_B:?set IPARS_ROOTLESS_DOCKER_NETWORK_B}"));
         Ok(())
     }
 
@@ -15147,6 +15175,14 @@ fi
         assert!(socket_route_provider.commands[1].contains(
             "docker --host unix:///run/user/1000/docker.sock network inspect edge_workload"
         ));
+        assert!(socket_route_provider.commands[2]
+            .contains("-f docker/compose.rootless-docker-discovery.yaml"));
+        assert!(socket_route_provider.commands[2]
+            .contains("-f docker/compose.rootless-route-provider.yaml config"));
+        assert_eq!(
+            environment_value(&socket_route_provider, "IPARS_DOCKER_API_SOCKET"),
+            Some("/run/ipars/docker.sock")
+        );
 
         let dry_run = match docker_install_plan(DockerInstallArgs {
             rootless: true,
