@@ -55,7 +55,12 @@ cleanup() {
 }
 
 require_command "$docker_bin"
-require_command "$dockerd_rootless_bin"
+if command -v "$dockerd_rootless_bin" >/dev/null 2>&1; then
+  rootless_launcher="dockerd-rootless"
+else
+  require_command dockerd
+  rootless_launcher="rootlesskit"
+fi
 require_command rootlesskit
 require_command fuse-overlayfs
 require_command newuidmap
@@ -90,15 +95,31 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
 (
   export XDG_RUNTIME_DIR="$runtime_dir"
   export DOCKER_HOST="unix://${docker_socket}"
-  exec "$dockerd_rootless_bin" \
-    --host="$DOCKER_HOST" \
-    --data-root="$tmp_dir/data" \
-    --exec-root="$tmp_dir/exec" \
-    --pidfile="$daemon_pid_file" \
-    --storage-driver=fuse-overlayfs \
-    --iptables=false \
-    --bridge=none \
-    --ip-forward=false
+  if [[ "$rootless_launcher" == "dockerd-rootless" ]]; then
+    exec "$dockerd_rootless_bin" \
+      --host="$DOCKER_HOST" \
+      --data-root="$tmp_dir/data" \
+      --exec-root="$tmp_dir/exec" \
+      --pidfile="$daemon_pid_file" \
+      --storage-driver=fuse-overlayfs \
+      --iptables=false \
+      --bridge=none \
+      --ip-forward=false
+  fi
+  exec rootlesskit \
+    --net=slirp4netns \
+    --copy-up=/etc \
+    --copy-up=/run \
+    --state-dir="$tmp_dir/rootlesskit" \
+    dockerd \
+      --host="$DOCKER_HOST" \
+      --data-root="$tmp_dir/data" \
+      --exec-root="$tmp_dir/exec" \
+      --pidfile="$daemon_pid_file" \
+      --storage-driver=fuse-overlayfs \
+      --iptables=false \
+      --bridge=none \
+      --ip-forward=false
 ) >"$tmp_dir/dockerd.log" 2>&1 &
 daemon_pid=$!
 
