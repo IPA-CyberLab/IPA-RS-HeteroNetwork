@@ -1,0 +1,126 @@
+services:
+  agent:
+    networks: !override
+      default:
+        ipv4_address: 172.30.250.11
+      workload-a:
+        ipv4_address: 172.30.251.2
+    environment: !override
+      IPARS_ROLE: agent
+      IPARS_AGENT_JOIN_TOKEN_PATH: /run/secrets/ipars-agent-join-token
+      IPARS_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/ipars-agent-api-bearer-token
+      IPARS_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      IPARS_AGENT_SIGNAL_URL: http://172.30.250.4:9443
+      IPARS_AGENT_STUN_BIND: 0.0.0.0:51821
+      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51821"
+      IPARS_AGENT_RUNTIME_BACKEND: linux-command
+      IPARS_AGENT_WIREGUARD_BACKEND: userspace-boringtun
+      IPARS_AGENT_ROUTE_BACKEND: command
+      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
+      IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
+      IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_DOCKER_CONTAINER_NAMESPACE: rootless-workload-a
+      IPARS_DOCKER_CONTAINER_CIDRS: 172.30.251.0/24
+      IPARS_DOCKER_HOST_INTERFACE: eth0
+      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
+    volumes: !override
+      - rootless-agent-a:/var/lib/ipars
+    secrets: !override
+      - ipars-agent-join-token
+      - ipars-agent-api-bearer-token
+
+  agent-b:
+    networks: !override
+      default:
+        ipv4_address: 172.30.250.12
+      workload-b:
+        ipv4_address: 172.30.252.2
+    environment: !override
+      IPARS_ROLE: agent
+      IPARS_AGENT_JOIN_TOKEN_PATH: /run/secrets/ipars-agent-join-token
+      IPARS_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/ipars-agent-api-bearer-token
+      IPARS_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      IPARS_AGENT_SIGNAL_URL: http://172.30.250.4:9443
+      IPARS_AGENT_STUN_BIND: 0.0.0.0:51821
+      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51821"
+      IPARS_AGENT_RUNTIME_BACKEND: linux-command
+      IPARS_AGENT_WIREGUARD_BACKEND: userspace-boringtun
+      IPARS_AGENT_ROUTE_BACKEND: command
+      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
+      IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
+      IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
+      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
+      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      IPARS_DOCKER_CONTAINER_NAMESPACE: rootless-workload-b
+      IPARS_DOCKER_CONTAINER_CIDRS: 172.30.252.0/24
+      IPARS_DOCKER_HOST_INTERFACE: eth0
+      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
+    volumes: !override
+      - rootless-agent-b:/var/lib/ipars
+    secrets: !override
+      - ipars-agent-join-token
+      - ipars-agent-api-bearer-token
+
+  workload-a:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
+    command:
+      - stun
+      - --listen
+      - 0.0.0.0:3478
+      - --http-listen
+      - 0.0.0.0:8080
+    network_mode: service:agent
+    depends_on:
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  workload-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
+    command:
+      - stun
+      - --listen
+      - 0.0.0.0:3478
+      - --http-listen
+      - 0.0.0.0:8080
+    network_mode: service:agent-b
+    depends_on:
+      agent-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+networks:
+  workload-a:
+    ipam:
+      config:
+        - subnet: 172.30.251.0/24
+  workload-b:
+    ipam:
+      config:
+        - subnet: 172.30.252.0/24
+
+volumes:
+  rootless-agent-a:
+  rootless-agent-b:

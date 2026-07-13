@@ -40,6 +40,7 @@ cleanup() {
     )
     if [[ "$e2e_started" -eq 1 ]]; then
       compose_files+=( -f "$repo_root/docker/compose.rootless-e2e.yaml" )
+      compose_files+=( -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml" )
     else
       compose_files+=( -f "$override_path" )
     fi
@@ -291,6 +292,7 @@ rootless_e2e_compose() {
     -f "$repo_root/docker/compose.rootless.yaml" \
     -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
     -f "$repo_root/docker/compose.rootless-e2e.yaml" \
+    -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml" \
     "$@"
 }
 
@@ -298,7 +300,7 @@ rootless_e2e_compose config --quiet
 e2e_started=1
 if ! rootless_e2e_compose up -d --build --wait --wait-timeout 300; then
   rootless_e2e_compose ps >&2 || true
-  rootless_e2e_compose logs --no-color --tail=160 control-plane signal stun agent agent-b >&2 || true
+  rootless_e2e_compose logs --no-color --tail=160 control-plane signal stun agent agent-b workload-a workload-b >&2 || true
   exit 1
 fi
 
@@ -427,6 +429,15 @@ assert_vpn_http() {
   ' sh "$remote_vpn_ip"
 }
 
+assert_workload_http() {
+  local service="$1"
+  local remote_workload_ip="$2"
+  rootless_e2e_compose exec -T "$service" sh -ec '
+    ip route get "$1" | grep -Eq " dev ipars0( |$)"
+    curl --noproxy "*" --connect-timeout 5 --max-time 15 -fsS "http://${1}:8080/healthz" | grep -F '\''"status":"ok"'\'' >/dev/null
+  ' sh "$remote_workload_ip"
+}
+
 rootless_dataplane_diagnostics() {
   local reason="$1"
   echo "rootless dataplane diagnostics (${reason}):" >&2
@@ -443,7 +454,7 @@ rootless_dataplane_diagnostics() {
     ' >&2 || true
   done
   echo "--- agent logs ---" >&2
-  rootless_e2e_compose logs --no-color --tail=200 agent agent-b >&2 || true
+  rootless_e2e_compose logs --no-color --tail=200 agent agent-b workload-a workload-b >&2 || true
 }
 
 agent_a_status="$(wait_for_agent_status agent)"
@@ -483,3 +494,14 @@ if ! wait_for_direct_path agent-b "$agent_b_node" "$agent_a_node"; then
 fi
 
 echo "Rootless Docker BoringTun two-agent VPN packet and direct-path smoke passed"
+
+if ! assert_workload_http agent 172.30.252.2; then
+  rootless_dataplane_diagnostics "agent could not reach remote rootless workload"
+  exit 1
+fi
+if ! assert_workload_http agent-b 172.30.251.2; then
+  rootless_dataplane_diagnostics "agent-b could not reach remote rootless workload"
+  exit 1
+fi
+
+echo "Rootless Docker route-provider workload namespace smoke passed"
