@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
@@ -40,6 +42,8 @@ const MAX_CLI_HTTP_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const SANITIZED_INIT_DAEMON_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
+const DEFAULT_INIT_DAEMON_READY_TIMEOUT_SECONDS: u64 = 30;
+const MAX_INIT_DAEMON_READY_TIMEOUT_SECONDS: u64 = 3600;
 const DEFAULT_LOCAL_AGENT_URL: &str = "http://127.0.0.1:9780";
 const DEFAULT_LOCAL_RELAY_URL: &str = "http://127.0.0.1:9580";
 const DEFAULT_LOCAL_RELAY_UDP: &str = "127.0.0.1:51820";
@@ -337,6 +341,8 @@ struct InitArgs {
     unlimited_uses: bool,
     #[arg(long, default_value_t = false)]
     spawn_daemons: bool,
+    #[arg(long, default_value_t = DEFAULT_INIT_DAEMON_READY_TIMEOUT_SECONDS)]
+    daemon_ready_timeout_seconds: u64,
     #[arg(long, env = "IPARS_IPARSD_BIN", default_value = "iparsd")]
     daemon_binary: PathBuf,
     #[arg(long, default_value = "/var/lib/ipars/bootstrap")]
@@ -1552,7 +1558,12 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         .map(|spec| spec.command_output(&args.daemon_binary))
         .collect::<Vec<_>>();
     let daemon_processes = if args.spawn_daemons {
-        spawn_init_daemons(&args.daemon_binary, &args.daemon_state_dir, &daemon_specs)?
+        spawn_init_daemons(
+            &args.daemon_binary,
+            &args.daemon_state_dir,
+            &daemon_specs,
+            args.daemon_ready_timeout_seconds,
+        )?
     } else {
         Vec::new()
     };
@@ -1594,6 +1605,14 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
     validate_listen_port_for_bootstrap(args.control_plane_listen, "--control-plane-listen")?;
     validate_listen_port_for_bootstrap(args.signal_listen, "--signal-listen")?;
     validate_listen_port_for_bootstrap(args.stun_listen, "--stun-listen")?;
+    anyhow::ensure!(
+        args.daemon_ready_timeout_seconds > 0,
+        "--daemon-ready-timeout-seconds must be greater than zero"
+    );
+    anyhow::ensure!(
+        args.daemon_ready_timeout_seconds <= MAX_INIT_DAEMON_READY_TIMEOUT_SECONDS,
+        "--daemon-ready-timeout-seconds must be at most {MAX_INIT_DAEMON_READY_TIMEOUT_SECONDS}"
+    );
     if args.relay_http_listen.port() == 0 && args.relay_admission_url.is_none() {
         anyhow::bail!(
             "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
@@ -1617,6 +1636,7 @@ struct InitDaemonSpec {
     service: &'static str,
     args: Vec<String>,
     log_path: PathBuf,
+    health_listen: SocketAddr,
 }
 
 impl InitDaemonSpec {
@@ -1692,6 +1712,7 @@ fn init_daemon_specs(
             service: "control-plane",
             args: control_plane_args,
             log_path: log_dir.join("control-plane.log"),
+            health_listen: local_health_listen(args.control_plane_listen),
         },
         InitDaemonSpec {
             service: "signal",
@@ -1699,13 +1720,17 @@ fn init_daemon_specs(
                 "signal".to_string(),
                 "--listen".to_string(),
                 args.signal_listen.to_string(),
+                "--control-plane-url".to_string(),
+                local_http_url(args.control_plane_listen),
             ],
             log_path: log_dir.join("signal.log"),
+            health_listen: local_health_listen(args.signal_listen),
         },
         InitDaemonSpec {
             service: "stun",
             args: stun_args,
             log_path: log_dir.join("stun.log"),
+            health_listen: local_health_listen(args.stun_http_listen),
         },
         InitDaemonSpec {
             service: "relay",
@@ -1723,6 +1748,7 @@ fn init_daemon_specs(
                 relay_admission_url,
             ],
             log_path: log_dir.join("relay.log"),
+            health_listen: local_health_listen(args.relay_http_listen),
         },
     ]
 }
@@ -1741,6 +1767,7 @@ fn spawn_init_daemons(
     binary: &Path,
     state_dir: &Path,
     specs: &[InitDaemonSpec],
+    ready_timeout_seconds: u64,
 ) -> anyhow::Result<Vec<InitDaemonProcess>> {
     prepare_init_daemon_directory(state_dir, "daemon state dir")?;
     let log_dir = state_dir.join("logs");
@@ -1768,7 +1795,107 @@ fn spawn_init_daemons(
         spawned.push(child);
     }
 
+    if let Err(error) = wait_for_init_daemons(&mut spawned, specs, ready_timeout_seconds) {
+        for mut child in spawned {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(error);
+    }
+
     Ok(processes)
+}
+
+fn local_health_listen(listen: SocketAddr) -> SocketAddr {
+    let ip = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, listen.port())
+}
+
+fn local_http_url(listen: SocketAddr) -> String {
+    format!("http://{}", local_health_listen(listen))
+}
+
+fn wait_for_init_daemons(
+    spawned: &mut [Child],
+    specs: &[InitDaemonSpec],
+    timeout_seconds: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        spawned.len() == specs.len(),
+        "spawned daemon count does not match daemon specification count"
+    );
+    let deadline = Instant::now()
+        .checked_add(StdDuration::from_secs(timeout_seconds))
+        .context("daemon readiness timeout overflowed")?;
+
+    for (index, spec) in specs.iter().enumerate() {
+        loop {
+            if let Some(status) = spawned[index]
+                .try_wait()
+                .with_context(|| format!("failed to inspect {} daemon process", spec.service))?
+            {
+                anyhow::bail!(
+                    "{} daemon exited before becoming ready with status {status}; see log {}",
+                    spec.service,
+                    spec.log_path.display()
+                );
+            }
+            if let Err(error) = probe_http_healthz(spec.health_listen) {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out after {timeout_seconds}s waiting for {} daemon at {}: {error}; see log {}",
+                        spec.service,
+                        spec.health_listen,
+                        spec.log_path.display()
+                    );
+                }
+            } else {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+    Ok(())
+}
+
+fn probe_http_healthz(listen: SocketAddr) -> anyhow::Result<()> {
+    let timeout = StdDuration::from_millis(250);
+    let mut stream = TcpStream::connect_timeout(&listen, timeout)
+        .with_context(|| format!("failed to connect to {listen}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("failed to configure health check read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("failed to configure health check write timeout")?;
+    write!(
+        stream,
+        "GET /healthz HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = Vec::new();
+    stream
+        .take(4096)
+        .read_to_end(&mut response)
+        .context("failed to read health check response")?;
+    let status_line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .context("health check response was empty")?;
+    let status_line = std::str::from_utf8(status_line)?.trim();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .context("health check response did not contain an HTTP status")?
+        .parse::<u16>()?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "health check returned HTTP status {status}"
+    );
+    Ok(())
 }
 
 fn spawn_init_daemon(binary: &Path, spec: &InitDaemonSpec) -> anyhow::Result<Child> {
@@ -9685,6 +9812,7 @@ mod tests {
             max_uses: Some(10),
             unlimited_uses: false,
             spawn_daemons: false,
+            daemon_ready_timeout_seconds: DEFAULT_INIT_DAEMON_READY_TIMEOUT_SECONDS,
             daemon_binary: PathBuf::from("iparsd"),
             daemon_state_dir: temp_path("state"),
             control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
@@ -10897,6 +11025,7 @@ mod tests {
             max_uses: None,
             unlimited_uses: true,
             spawn_daemons: false,
+            daemon_ready_timeout_seconds: DEFAULT_INIT_DAEMON_READY_TIMEOUT_SECONDS,
             daemon_binary: PathBuf::from("iparsd"),
             daemon_state_dir: temp_path("state"),
             control_plane_listen: SocketAddr::from(([0, 0, 0, 0], 8443)),
@@ -11008,6 +11137,7 @@ mod tests {
             max_uses: Some(10),
             unlimited_uses: false,
             spawn_daemons: false,
+            daemon_ready_timeout_seconds: DEFAULT_INIT_DAEMON_READY_TIMEOUT_SECONDS,
             daemon_binary: PathBuf::from("iparsd"),
             daemon_state_dir: state_dir.clone(),
             control_plane_listen: "127.0.0.1:18443".parse()?,
@@ -11093,6 +11223,21 @@ mod tests {
         assert_eq!(
             output.control_plane_operator_api_bearer_token_path.as_ref(),
             Some(&operator_token_path)
+        );
+
+        let signal = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "signal")
+            .context("expected signal daemon command")?;
+        let control_plane_url_index = signal
+            .command
+            .iter()
+            .position(|value| value == "--control-plane-url")
+            .context("signal daemon command must specify its control-plane URL")?;
+        assert_eq!(
+            signal.command.get(control_plane_url_index + 1),
+            Some(&"http://127.0.0.1:18443".to_string())
         );
 
         let stun = output
