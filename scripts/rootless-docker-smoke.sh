@@ -320,8 +320,12 @@ rootless_e2e_compose() {
     "$@"
 }
 
-rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-config.json"
-jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_network_b" '
+if ! rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-config.json"; then
+  echo "rootless e2e Compose config rendering failed" >&2
+  "$docker_bin" compose version >&2 || true
+  exit 1
+fi
+if ! jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_network_b" '
   .services.agent.environment.IPARS_DOCKER_DISCOVER_NETWORKS == "true"
   and .services.agent.environment.IPARS_DOCKER_NETWORKS == $network_a
   and .services.agent.environment.IPARS_DOCKER_CONTAINER_CIDRS == null
@@ -330,7 +334,13 @@ jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_network_b
   and .services["agent-b"].environment.IPARS_DOCKER_CONTAINER_CIDRS == null
   and any(.services.agent.volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and .bind.create_host_path == false)
   and any(.services["agent-b"].volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and .bind.create_host_path == false)
-' "$tmp_dir/rootless-e2e-config.json" >/dev/null
+' "$tmp_dir/rootless-e2e-config.json" >/dev/null; then
+  echo "rootless e2e Compose discovery contract mismatch" >&2
+  "$docker_bin" compose version >&2 || true
+  jq '{agent: {environment: .services.agent.environment, volumes: .services.agent.volumes}, agent_b: {environment: .services["agent-b"].environment, volumes: .services["agent-b"].volumes}}' \
+    "$tmp_dir/rootless-e2e-config.json" >&2 || true
+  exit 1
+fi
 e2e_started=1
 if ! rootless_e2e_compose up -d --build --wait --wait-timeout 300; then
   rootless_e2e_compose ps >&2 || true
