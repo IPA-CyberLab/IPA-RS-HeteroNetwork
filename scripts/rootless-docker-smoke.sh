@@ -332,8 +332,9 @@ if ! jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_netw
   and .services["agent-b"].environment.IPARS_DOCKER_DISCOVER_NETWORKS == "true"
   and .services["agent-b"].environment.IPARS_DOCKER_NETWORKS == $network_b
   and .services["agent-b"].environment.IPARS_DOCKER_CONTAINER_CIDRS == null
-  and any(.services.agent.volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and .bind.create_host_path == false)
-  and any(.services["agent-b"].volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and .bind.create_host_path == false)
+  # Compose v2.38 omits false-valued bind fields from JSON; reject only true.
+  and any(.services.agent.volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and ((.bind.create_host_path // false) == false))
+  and any(.services["agent-b"].volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and ((.bind.create_host_path // false) == false))
 ' "$tmp_dir/rootless-e2e-config.json" >/dev/null; then
   echo "rootless e2e Compose discovery contract mismatch" >&2
   "$docker_bin" compose version >&2 || true
