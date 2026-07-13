@@ -25,6 +25,8 @@ With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and 
 
 All file-backed daemon Bearer credentials must be direct regular files with one hard link, an owner-read bit, and no group or world permissions. Use mode `0400` or `0600`; the `umask 077` examples in this runbook create compliant files. The daemon rejects a final symlink component and verifies file identity across open/read, so mount the credential file itself rather than a symlink managed outside the deployment's trust boundary.
 
+When `--allow-relay` is used, `init` creates or validates the owner-only relay admission credential at `--relay-admission-bearer-token-path` or `<daemon-state-dir>/relay-admission.token`. The value is passed to Relay and relay-agent by file path only and is never included in daemon argv or JSON output.
+
 Signal metrics also require a distinct operator token. For a manually supervised Signal service, generate one with `umask 077`, pass `--operator-api-bearer-token-path /etc/ipars/signal-operator-api.token`, and configure the same credential in the metrics scraper. If omitted, Signal metric routes remain absent while health and signed protocol routes continue operating.
 
 STUN HTTP metrics require another distinct token through `iparsd stun --operator-api-bearer-token-path /etc/ipars/stun-operator-api.token`. Omitting it removes only `/metrics` and `/v1/metrics`; UDP Binding, RFC5780 probes, and `/healthz` remain available.

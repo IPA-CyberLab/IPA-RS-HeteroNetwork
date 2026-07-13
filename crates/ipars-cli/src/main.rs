@@ -367,6 +367,8 @@ struct InitArgs {
     relay_http_listen: SocketAddr,
     #[arg(long)]
     relay_admission_url: Option<String>,
+    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    relay_admission_bearer_token_path: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:9781")]
     relay_agent_listen: SocketAddr,
 }
@@ -1548,6 +1550,11 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         },
     )?;
     let token = identity.sign_join_token(claims)?;
+    let relay_admission_bearer_token_path = if args.allow_relay {
+        Some(prepare_init_relay_admission_token(&args)?)
+    } else {
+        None
+    };
     let relay_agent = if args.spawn_daemons && args.allow_relay {
         Some(prepare_init_relay_agent(
             &args,
@@ -1565,6 +1572,7 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         &issuer_key_id,
         &issuer_public_key,
         relay_agent.as_ref(),
+        relay_admission_bearer_token_path.as_deref(),
     );
     let daemon_commands = daemon_specs
         .iter()
@@ -1603,6 +1611,7 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         issuer_private_key_path: args.issuer_private_key_path,
         control_plane_operator_api_bearer_token_path: args
             .control_plane_operator_api_bearer_token_path,
+        relay_admission_bearer_token_path,
         identity_public_key: identity.public_key_b64(),
         wireguard_public_key: wireguard.public_key_b64,
         bootstrap_endpoints,
@@ -1639,6 +1648,9 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
     }
     if let Some(path) = args.control_plane_operator_api_bearer_token_path.as_deref() {
         read_api_bearer_token_file(path, "control-plane operator API")?;
+    }
+    if args.relay_admission_bearer_token_path.is_some() && !args.allow_relay {
+        anyhow::bail!("--relay-admission-bearer-token-path requires --allow-relay");
     }
     Ok(())
 }
@@ -1682,6 +1694,7 @@ fn init_daemon_specs(
     issuer_key_id: &str,
     issuer_public_key: &str,
     relay_agent: Option<&InitRelayAgentBootstrap>,
+    relay_admission_bearer_token_path: Option<&Path>,
 ) -> Vec<InitDaemonSpec> {
     let log_dir = args.daemon_state_dir.join("logs");
     let control_plane_database_url = effective_control_plane_database_url(args);
@@ -1730,6 +1743,23 @@ fn init_daemon_specs(
     let relay_node_id = relay_agent
         .map(|agent| agent.node_id.clone())
         .unwrap_or_else(|| node_id.clone());
+    let mut relay_args = vec![
+        "relay".to_string(),
+        "--relay-node-id".to_string(),
+        relay_node_id.as_str().to_string(),
+        "--udp-listen".to_string(),
+        args.relay_udp_listen.to_string(),
+        "--http-listen".to_string(),
+        args.relay_http_listen.to_string(),
+        "--public-endpoint".to_string(),
+        args.public_endpoint.to_string(),
+        "--admission-url".to_string(),
+        relay_admission_url.clone(),
+    ];
+    if let Some(path) = relay_admission_bearer_token_path {
+        relay_args.push("--admission-bearer-token-path".to_string());
+        relay_args.push(path.display().to_string());
+    }
     let mut specs = vec![
         InitDaemonSpec {
             service: "control-plane",
@@ -1757,19 +1787,7 @@ fn init_daemon_specs(
         },
         InitDaemonSpec {
             service: "relay",
-            args: vec![
-                "relay".to_string(),
-                "--relay-node-id".to_string(),
-                relay_node_id.as_str().to_string(),
-                "--udp-listen".to_string(),
-                args.relay_udp_listen.to_string(),
-                "--http-listen".to_string(),
-                args.relay_http_listen.to_string(),
-                "--public-endpoint".to_string(),
-                args.public_endpoint.to_string(),
-                "--admission-url".to_string(),
-                relay_admission_url.clone(),
-            ],
+            args: relay_args,
             log_path: log_dir.join("relay.log"),
             health_listen: local_health_listen(args.relay_http_listen),
         },
@@ -1777,27 +1795,12 @@ fn init_daemon_specs(
     if let Some(relay_agent) = relay_agent {
         specs.push(InitDaemonSpec {
             service: "relay-agent",
-            args: vec![
-                "agent".to_string(),
-                "--listen".to_string(),
-                args.relay_agent_listen.to_string(),
-                "--state-path".to_string(),
-                relay_agent.state_path.display().to_string(),
-                "--join-token-path".to_string(),
-                relay_agent.join_token_path.display().to_string(),
-                "--runtime-backend".to_string(),
-                "dry-run".to_string(),
-                "--control-plane-url".to_string(),
-                local_http_url(args.control_plane_listen),
-                "--relay-public-endpoint".to_string(),
-                args.public_endpoint.to_string(),
-                "--relay-admission-url".to_string(),
-                relay_admission_url.clone(),
-                "--relay-status-url".to_string(),
-                local_http_url(args.relay_http_listen),
-                "--stun-bind".to_string(),
-                local_health_listen(args.relay_agent_listen).to_string(),
-            ],
+            args: init_relay_agent_args(
+                args,
+                relay_agent,
+                &relay_admission_url,
+                relay_admission_bearer_token_path,
+            ),
             log_path: log_dir.join("relay-agent.log"),
             health_listen: local_health_listen(args.relay_agent_listen),
         });
@@ -1805,11 +1808,134 @@ fn init_daemon_specs(
     specs
 }
 
+fn init_relay_agent_args(
+    args: &InitArgs,
+    relay_agent: &InitRelayAgentBootstrap,
+    relay_admission_url: &str,
+    relay_admission_bearer_token_path: Option<&Path>,
+) -> Vec<String> {
+    let mut agent_args = vec![
+        "agent".to_string(),
+        "--listen".to_string(),
+        args.relay_agent_listen.to_string(),
+        "--state-path".to_string(),
+        relay_agent.state_path.display().to_string(),
+        "--join-token-path".to_string(),
+        relay_agent.join_token_path.display().to_string(),
+        "--runtime-backend".to_string(),
+        "dry-run".to_string(),
+        "--control-plane-url".to_string(),
+        local_http_url(args.control_plane_listen),
+        "--relay-public-endpoint".to_string(),
+        args.public_endpoint.to_string(),
+        "--relay-admission-url".to_string(),
+        relay_admission_url.to_string(),
+        "--relay-status-url".to_string(),
+        local_http_url(args.relay_http_listen),
+        "--stun-bind".to_string(),
+        local_health_listen(args.relay_agent_listen).to_string(),
+    ];
+    if let Some(path) = relay_admission_bearer_token_path {
+        agent_args.push("--relay-admission-bearer-token-path".to_string());
+        agent_args.push(path.display().to_string());
+    }
+    agent_args
+}
+
 #[derive(Debug, Clone)]
 struct InitRelayAgentBootstrap {
     node_id: NodeId,
     state_path: PathBuf,
     join_token_path: PathBuf,
+}
+
+fn prepare_init_relay_admission_token(args: &InitArgs) -> anyhow::Result<PathBuf> {
+    let uses_default_path = args.relay_admission_bearer_token_path.is_none();
+    if uses_default_path {
+        prepare_init_daemon_directory(&args.daemon_state_dir, "daemon state dir")?;
+    }
+    let path = args
+        .relay_admission_bearer_token_path
+        .clone()
+        .unwrap_or_else(|| args.daemon_state_dir.join("relay-admission.token"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "relay admission bearer token {} must not be a symlink",
+                    path.display()
+                );
+            }
+            let token = read_init_relay_admission_token(&path)?;
+            validate_relay_admission_bearer_token(
+                &token,
+                &format!("relay admission bearer token file {}", path.display()),
+            )?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let token = IdentityKeyPair::generate().signing_key_b64();
+            validate_relay_admission_bearer_token(
+                &token,
+                "generated relay admission bearer token",
+            )?;
+            write_init_secret_file(
+                &path,
+                format!("{token}\n").as_bytes(),
+                "relay admission bearer token",
+            )?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect relay admission bearer token {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    Ok(path)
+}
+
+fn read_init_relay_admission_token(path: &Path) -> anyhow::Result<String> {
+    let file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open relay admission bearer token file {}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect relay admission bearer token file {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "relay admission bearer token path {} must resolve to a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_API_BEARER_TOKEN_FILE_BYTES,
+        "relay admission bearer token file {} exceeds maximum size of {} bytes",
+        path.display(),
+        MAX_API_BEARER_TOKEN_FILE_BYTES
+    );
+    let mut contents = Vec::new();
+    file.take(MAX_API_BEARER_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .with_context(|| {
+            format!(
+                "failed to read relay admission bearer token file {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        contents.len() as u64 <= MAX_API_BEARER_TOKEN_FILE_BYTES,
+        "relay admission bearer token file {} exceeds maximum size of {} bytes",
+        path.display(),
+        MAX_API_BEARER_TOKEN_FILE_BYTES
+    );
+    Ok(String::from_utf8(contents)?.trim().to_string())
 }
 
 fn prepare_init_relay_agent(
@@ -2142,8 +2268,28 @@ fn open_init_daemon_log(path: &Path) -> anyhow::Result<std::fs::File> {
 }
 
 fn write_init_secret_file(path: &Path, contents: &[u8], label: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        prepare_init_daemon_directory(parent, "daemon state dir")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    {
+        let metadata = std::fs::symlink_metadata(parent).with_context(|| {
+            format!(
+                "failed to inspect parent directory for {label} {}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "parent directory for {label} {} must not be a symlink",
+                path.display()
+            );
+        }
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "parent directory for {label} {} must be a directory",
+            path.display()
+        );
     }
     match std::fs::symlink_metadata(path) {
         Ok(_) => anyhow::bail!("{label} {} already exists", path.display()),
@@ -5748,6 +5894,7 @@ struct InitOutput {
     issuer_private_key_b64: Option<String>,
     issuer_private_key_path: Option<PathBuf>,
     control_plane_operator_api_bearer_token_path: Option<PathBuf>,
+    relay_admission_bearer_token_path: Option<PathBuf>,
     identity_public_key: String,
     wireguard_public_key: String,
     bootstrap_endpoints: Vec<BootstrapEndpoint>,
@@ -10014,6 +10161,7 @@ mod tests {
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
+            relay_admission_bearer_token_path: None,
             relay_agent_listen: SocketAddr::from(([127, 0, 0, 1], 9781)),
         }
     }
@@ -10822,6 +10970,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--allowed-route must not include unrestricted"));
+
+        let mut args = valid_init_args();
+        args.allow_relay = false;
+        args.relay_admission_bearer_token_path = Some(temp_path("unused-relay-token"));
+        let error = match init(args) {
+            Ok(output) => {
+                anyhow::bail!("unused relay admission token path was accepted: {output:?}")
+            }
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--relay-admission-bearer-token-path requires --allow-relay"));
         Ok(())
     }
 
@@ -11228,6 +11389,7 @@ mod tests {
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
+            relay_admission_bearer_token_path: None,
             relay_agent_listen: SocketAddr::from(([127, 0, 0, 1], 9781)),
         })?;
 
@@ -11250,6 +11412,7 @@ mod tests {
             &output.cluster_id,
         )?;
         let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_dir_all(output.daemon_state_dir);
         Ok(())
     }
 
@@ -11341,6 +11504,7 @@ mod tests {
             relay_udp_listen: "0.0.0.0:15182".parse()?,
             relay_http_listen: "127.0.0.1:19580".parse()?,
             relay_admission_url: None,
+            relay_admission_bearer_token_path: None,
             relay_agent_listen: "127.0.0.1:19781".parse()?,
         })?;
 
@@ -11452,9 +11616,28 @@ mod tests {
         assert!(relay
             .command
             .contains(&"http://203.0.113.10:19580".to_string()));
+        let relay_admission_token_path = output
+            .relay_admission_bearer_token_path
+            .as_ref()
+            .context("expected generated relay admission token path")?;
+        assert_eq!(
+            relay_admission_token_path,
+            &state_dir.join("relay-admission.token")
+        );
+        assert!(relay
+            .command
+            .windows(2)
+            .any(|values| values[0] == "--admission-bearer-token-path"
+                && values[1] == relay_admission_token_path.display().to_string()));
+        let relay_admission_token = read_init_relay_admission_token(relay_admission_token_path)?;
+        validate_relay_admission_bearer_token(
+            &relay_admission_token,
+            "generated relay admission bearer token",
+        )?;
 
         let _ = std::fs::remove_file(key_path);
         let _ = std::fs::remove_file(operator_token_path);
+        let _ = std::fs::remove_dir_all(state_dir);
         Ok(())
     }
 
@@ -11467,6 +11650,7 @@ mod tests {
         let issuer = IdentityKeyPair::generate();
         let cluster_id = ClusterId::new();
         let bootstrap_endpoints = bootstrap_from_public_endpoint(&args);
+        let relay_admission_token_path = prepare_init_relay_admission_token(&args)?;
         let relay_agent =
             prepare_init_relay_agent(&args, &issuer, &cluster_id, &bootstrap_endpoints)?;
         let specs = init_daemon_specs(
@@ -11476,6 +11660,7 @@ mod tests {
             "root",
             &issuer.public_key_b64(),
             Some(&relay_agent),
+            Some(&relay_admission_token_path),
         );
 
         assert_eq!(specs.len(), 5);
@@ -11485,6 +11670,10 @@ mod tests {
             .context("expected relay daemon spec")?;
         assert!(relay.args.windows(2).any(|values| {
             values[0] == "--relay-node-id" && values[1] == relay_agent.node_id.as_str()
+        }));
+        assert!(relay.args.windows(2).any(|values| {
+            values[0] == "--admission-bearer-token-path"
+                && values[1] == relay_admission_token_path.display().to_string()
         }));
         let relay_agent_spec = specs
             .iter()
@@ -11496,6 +11685,10 @@ mod tests {
         assert!(relay_agent_spec
             .args
             .contains(&relay_agent.join_token_path.display().to_string()));
+        assert!(relay_agent_spec.args.windows(2).any(|values| {
+            values[0] == "--relay-admission-bearer-token-path"
+                && values[1] == relay_admission_token_path.display().to_string()
+        }));
 
         let state = FileAgentStateStore::new(&relay_agent.state_path).load()?;
         assert_eq!(state.node_id, relay_agent.node_id);
