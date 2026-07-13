@@ -242,6 +242,8 @@ run_ipars init \
   --token-ttl-seconds 3600 \
   --unlimited-uses \
   --allowed-route 100.64.0.0/10 \
+  --allowed-route 172.30.251.0/24 \
+  --allowed-route 172.30.252.0/24 \
   >"$init_output_path"
 
 rootless_cluster_id="$(jq -er '.cluster_id' "$init_output_path")"
@@ -257,6 +259,8 @@ run_ipars token create \
   --ttl-seconds 3600 \
   --unlimited-uses \
   --allowed-route 100.64.0.0/10 \
+  --allowed-route 172.30.251.0/24 \
+  --allowed-route 172.30.252.0/24 \
   --control-plane-bootstrap http://172.30.250.3:8443 \
   --signal-bootstrap http://172.30.250.4:9443 \
   --stun-bootstrap udp://172.30.250.5:3478 \

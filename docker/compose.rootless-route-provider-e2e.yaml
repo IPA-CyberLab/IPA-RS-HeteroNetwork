@@ -36,6 +36,7 @@ services:
   agent-b:
     image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
     build: !reset null
+    pull_policy: never
     networks: !override
       default:
         ipv4_address: 172.30.250.12
@@ -71,6 +72,7 @@ services:
   workload-a:
     image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
     build: !reset null
+    pull_policy: never
     entrypoint:
       - /usr/local/bin/iparsd
     command:
@@ -93,6 +95,7 @@ services:
   workload-b:
     image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
     build: !reset null
+    pull_policy: never
     entrypoint:
       - /usr/local/bin/iparsd
     command:
