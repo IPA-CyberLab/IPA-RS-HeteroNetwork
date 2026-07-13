@@ -76,6 +76,7 @@ assert_rendered_contains default "- --wireguard-listen-port"
 assert_rendered_contains default '- "51820"'
 assert_rendered_contains default "- --stun-bind"
 assert_rendered_contains default '- "0.0.0.0:51820"'
+assert_rendered_contains default '- "ip link delete dev ipars0 2>/dev/null || true"'
 assert_rendered_contains default "- --peer-probe-port"
 assert_rendered_contains default '- "51821"'
 assert_rendered_contains default "name: IPARS_AGENT_API_BEARER_TOKEN"
@@ -136,6 +137,7 @@ template_ok pod-network-kubernetes-forwarding \
 
 assert_rendered_contains pod-network-kubernetes-forwarding "name: net.ipv4.ip_forward"
 assert_rendered_contains pod-network-kubernetes-forwarding 'value: "1"'
+assert_rendered_absent pod-network-kubernetes-forwarding "ip link delete dev ipars0"
 
 template_ok host-network-kubernetes-forwarding \
   --set agent.hostNetwork=true
@@ -326,7 +328,7 @@ assert_rendered_contains pod-lifecycle "preStop:"
 assert_rendered_contains pod-lifecycle "command:"
 assert_rendered_contains pod-lifecycle "- /bin/sh"
 assert_rendered_contains pod-lifecycle "- -c"
-assert_rendered_contains pod-lifecycle '- "sleep 20"'
+assert_rendered_contains pod-lifecycle '- "sleep 20; ip link delete dev ipars0 2>/dev/null || true"'
 assert_rendered_contains pod-lifecycle "terminationGracePeriodSeconds: 60"
 
 template_fails pod-lifecycle-zero \

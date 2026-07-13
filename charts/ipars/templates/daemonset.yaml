@@ -1294,14 +1294,22 @@ spec:
               {{- end }}
             {{- end }}
           {{- end }}
-          {{- if ne $agentPreStopSleepSeconds "" }}
+{{- if or (eq $agentHostNetwork "true") (ne $agentPreStopSleepSeconds "") }}
           lifecycle:
             preStop:
               exec:
                 command:
                   - /bin/sh
                   - -c
+{{- if eq $agentHostNetwork "true" }}
+{{- if ne $agentPreStopSleepSeconds "" }}
+                  - {{ printf "sleep %d; ip link delete dev %s 2>/dev/null || true" (int $agentPreStopSleepSeconds) .Values.agent.interfaceName | quote }}
+{{- else }}
+                  - {{ printf "ip link delete dev %s 2>/dev/null || true" .Values.agent.interfaceName | quote }}
+{{- end }}
+{{- else }}
                   - {{ printf "sleep %d" (int $agentPreStopSleepSeconds) | quote }}
+{{- end }}
           {{- end }}
           {{- if eq $agentLivenessProbeEnabled "true" }}
           livenessProbe:
