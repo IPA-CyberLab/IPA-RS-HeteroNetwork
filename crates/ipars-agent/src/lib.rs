@@ -6792,10 +6792,11 @@ mod tests {
             },
         ];
 
-        let selected = preferred_peer_local_udp_candidate(&local_candidates, &peer_candidates)
-            .expect("same-subnet peer candidate should be selected");
-        assert_eq!(selected.node_id, peer_id);
-        assert_eq!(selected.addr, SocketAddr::from(([172, 18, 0, 2], 51_820)));
+        assert_eq!(
+            preferred_peer_local_udp_candidate(&local_candidates, &peer_candidates)
+                .map(|candidate| (candidate.node_id, candidate.addr)),
+            Some((peer_id, SocketAddr::from(([172, 18, 0, 2], 51_820)),))
+        );
     }
 
     #[tokio::test]
