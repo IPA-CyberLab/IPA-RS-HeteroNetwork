@@ -1916,9 +1916,8 @@ async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
     let token: SignedJoinToken =
         serde_json::from_str(&args.token).context("join token must be JSON signed token")?;
     token
-        .claims
         .validate_shape()
-        .context("join token claim validation failed")?;
+        .context("signed join token validation failed")?;
     let identity = IdentityKeyPair::generate();
     let wireguard = WireGuardKeyPair::generate();
     let control_plane_urls = control_plane_join_urls(&token, args.control_plane_url.as_deref())?;
@@ -9547,7 +9546,7 @@ mod tests {
                     max_token_uses: Some(1),
                 },
             )?,
-            signature: "signature".to_string(),
+            signature: format!("{}==", "A".repeat(86)),
         })
     }
 
@@ -9937,6 +9936,27 @@ mod tests {
             control_plane_join_url(&token, None)?,
             "https://203.0.113.10:8443/v1/join"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_rejects_invalid_signature_envelope_before_key_generation() -> anyhow::Result<()> {
+        let mut token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }])?;
+        token.signature = "A".repeat(64 * 1024);
+        let error = match join(JoinArgs {
+            token: serde_json::to_string(&token)?,
+            control_plane_url: None,
+            dry_run: true,
+        })
+        .await
+        {
+            Ok(_) => anyhow::bail!("invalid signature envelope should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("signature must be exactly 88 bytes"));
         Ok(())
     }
 

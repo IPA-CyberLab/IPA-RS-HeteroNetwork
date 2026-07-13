@@ -1342,6 +1342,7 @@ dependencies = [
 name = "ipars-types"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "ipnet",
  "serde",

@@ -537,7 +537,6 @@ where
         now: chrono::DateTime<Utc>,
     ) -> Result<RegisterNodeResponse, ControlPlaneError> {
         token
-            .claims
             .validate_shape()
             .map_err(|error| ControlPlaneError::TokenVerification(error.to_string()))?;
         if !token.claims.policy.allow_join {

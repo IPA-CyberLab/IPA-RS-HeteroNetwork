@@ -11817,9 +11817,8 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
     let token: SignedJoinToken =
         serde_json::from_str(&token).context("agent join token must be JSON signed token")?;
     token
-        .claims
         .validate_shape()
-        .context("agent join token claim validation failed")?;
+        .context("agent signed join token validation failed")?;
     Ok(Some(token))
 }
 
@@ -14909,9 +14908,8 @@ fn control_plane_base_urls(
     if override_url.is_none() {
         if let Some(token) = token {
             token
-                .claims
                 .validate_shape()
-                .context("agent join token claim validation failed")?;
+                .context("agent signed join token validation failed")?;
         }
     }
     let (base_urls, name) = if let Some(url) = override_url {
@@ -14987,9 +14985,8 @@ fn signal_base_urls(
     if override_url.is_none() {
         if let Some(token) = token {
             token
-                .claims
                 .validate_shape()
-                .context("agent join token claim validation failed")?;
+                .context("agent signed join token validation failed")?;
         }
     }
     let (base_urls, name) = if let Some(url) = override_url {
@@ -15035,9 +15032,8 @@ async fn agent_stun_servers(
     );
     if let Some(token) = token {
         token
-            .claims
             .validate_shape()
-            .context("agent join token claim validation failed")?;
+            .context("agent signed join token validation failed")?;
         for endpoint in token
             .claims
             .bootstrap_endpoints
@@ -15175,7 +15171,7 @@ mod tests {
                 policy: TokenPolicy::default(),
                 nonce: "nonce-a".to_string(),
             },
-            signature: "signature".to_string(),
+            signature: format!("{}==", "A".repeat(86)),
         }
     }
 
@@ -18047,6 +18043,26 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("nonce exceeds 255 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_join_token_rejects_invalid_signature_envelope() -> anyhow::Result<()> {
+        let mut token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://control.example:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+        token.signature = "A".repeat(4096);
+        let token = serde_json::to_string(&token)?;
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--join-token", token.as_str()])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match agent_join_token(&args) {
+            Ok(_) => anyhow::bail!("invalid signature envelope should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("signature must be exactly 88 bytes"));
         Ok(())
     }
 

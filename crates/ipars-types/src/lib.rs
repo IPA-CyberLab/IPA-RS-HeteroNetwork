@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
@@ -165,6 +167,8 @@ pub const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub const JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS: i64 = 5;
 pub const MAX_JOIN_TOKEN_VALIDITY_SECONDS: i64 =
     MAX_JOIN_TOKEN_TTL_SECONDS + JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS;
+pub const ED25519_SIGNATURE_BYTES: usize = 64;
+pub const ED25519_SIGNATURE_BASE64_BYTES: usize = 88;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1351,6 +1355,69 @@ fn join_token_ipv6_route_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv
 pub struct SignedJoinToken {
     pub claims: JoinTokenClaims,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedJoinTokenValidationError {
+    reason: String,
+}
+
+impl SignedJoinTokenValidationError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl Display for SignedJoinTokenValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "signed join token is invalid: {}", self.reason)
+    }
+}
+
+impl std::error::Error for SignedJoinTokenValidationError {}
+
+impl SignedJoinToken {
+    pub fn signature_bytes(
+        &self,
+    ) -> Result<[u8; ED25519_SIGNATURE_BYTES], SignedJoinTokenValidationError> {
+        if self.signature.len() != ED25519_SIGNATURE_BASE64_BYTES {
+            return Err(SignedJoinTokenValidationError::new(format!(
+                "signature must be exactly {ED25519_SIGNATURE_BASE64_BYTES} bytes of standard base64"
+            )));
+        }
+        let decoded = STANDARD.decode(&self.signature).map_err(|_| {
+            SignedJoinTokenValidationError::new("signature is not valid standard base64")
+        })?;
+        let signature: [u8; ED25519_SIGNATURE_BYTES] =
+            decoded.try_into().map_err(|decoded: Vec<u8>| {
+                SignedJoinTokenValidationError::new(format!(
+                    "signature decodes to {} bytes instead of {ED25519_SIGNATURE_BYTES}",
+                    decoded.len()
+                ))
+            })?;
+        if STANDARD.encode(signature) != self.signature {
+            return Err(SignedJoinTokenValidationError::new(
+                "signature is not canonical standard base64",
+            ));
+        }
+        Ok(signature)
+    }
+
+    pub fn validate_shape(&self) -> Result<(), SignedJoinTokenValidationError> {
+        self.signature_bytes()?;
+        self.claims.validate_shape().map_err(|error| {
+            SignedJoinTokenValidationError::new(format!(
+                "claim validation failed: {}",
+                error.reason()
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18094,6 +18161,45 @@ mod tests {
         assert!(claim_validation_error(&invalid)
             .reason()
             .contains("policy allowed route count 257 exceeds maximum 256"));
+    }
+
+    #[test]
+    fn signed_join_token_validation_requires_canonical_fixed_size_signature() {
+        let valid_signature = format!("{}==", "A".repeat(86));
+        let mut token = SignedJoinToken {
+            claims: valid_join_token_claims(),
+            signature: valid_signature.clone(),
+        };
+        assert!(token.validate_shape().is_ok());
+        assert_eq!(
+            token
+                .signature_bytes()
+                .unwrap_or_else(|error| panic!("valid signature shape failed: {error}")),
+            [0; ED25519_SIGNATURE_BYTES]
+        );
+
+        for invalid in [
+            String::new(),
+            "A".repeat(ED25519_SIGNATURE_BASE64_BYTES - 1),
+            "A".repeat(ED25519_SIGNATURE_BASE64_BYTES),
+            "!".repeat(ED25519_SIGNATURE_BASE64_BYTES),
+            format!("{}B==", "A".repeat(85)),
+            "A".repeat(ED25519_SIGNATURE_BASE64_BYTES + 1),
+        ] {
+            token.signature = invalid;
+            assert!(
+                token.validate_shape().is_err(),
+                "invalid signature envelope should be rejected"
+            );
+        }
+
+        token.signature = valid_signature;
+        token.claims.nonce = "bad nonce".to_string();
+        let error = match token.validate_shape() {
+            Ok(()) => panic!("invalid nested claims should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.reason().contains("claim validation failed"));
     }
 
     #[test]

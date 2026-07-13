@@ -10,6 +10,7 @@ use ipars_types::api::{
 };
 use ipars_types::{
     ClusterId, JoinTokenClaims, JoinTokenClaimsValidationError, NodeId, SignedJoinToken,
+    SignedJoinTokenValidationError,
 };
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -32,6 +33,8 @@ pub enum CryptoError {
     TokenSerialization(#[from] serde_json::Error),
     #[error(transparent)]
     InvalidJoinTokenClaims(#[from] JoinTokenClaimsValidationError),
+    #[error(transparent)]
+    InvalidSignedJoinToken(#[from] SignedJoinTokenValidationError),
     #[error("token is not valid at {0}")]
     TokenTime(DateTime<Utc>),
     #[error("token cluster mismatch: expected {expected}, got {actual}")]
@@ -242,6 +245,7 @@ pub fn verify_join_token(
     now: DateTime<Utc>,
     expected_cluster: &ClusterId,
 ) -> Result<(), CryptoError> {
+    let signature_bytes = token.signature_bytes()?;
     token.claims.validate_shape()?;
     if !token.claims.is_time_valid(now) {
         return Err(CryptoError::TokenTime(now));
@@ -256,9 +260,7 @@ pub fn verify_join_token(
     let key_bytes = decode_32(issuer_public_key_b64)?;
     let verifying_key =
         VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    let signature_bytes = STANDARD.decode(&token.signature)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_| CryptoError::InvalidSignature)?;
+    let signature = Signature::from_bytes(&signature_bytes);
     let payload = serde_json::to_vec(&token.claims)?;
     verifying_key
         .verify(&payload, &signature)
@@ -565,6 +567,39 @@ mod tests {
             verify_join_token(&invalid_token, &issuer.public_key_b64(), now, &cluster_id),
             Err(CryptoError::InvalidJoinTokenClaims(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn token_verification_rejects_invalid_signature_envelopes_before_decode(
+    ) -> Result<(), CryptoError> {
+        let issuer = IdentityKeyPair::generate();
+        let cluster_id = ClusterId::new();
+        let now = Utc::now();
+        let mut token = issuer.sign_join_token(JoinTokenClaims {
+            cluster_id: cluster_id.clone(),
+            bootstrap_endpoints: Vec::new(),
+            expires_at: now + Duration::hours(1),
+            not_before: now - Duration::seconds(5),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            issuer: issuer.node_id(),
+            key_id: KeyId::from_string("root"),
+            policy: TokenPolicy::default(),
+            nonce: "nonce-signature-envelope".to_string(),
+        })?;
+
+        for invalid in [
+            "short".to_string(),
+            "!".repeat(ipars_types::ED25519_SIGNATURE_BASE64_BYTES),
+            "A".repeat(64 * 1024),
+        ] {
+            token.signature = invalid;
+            assert!(matches!(
+                verify_join_token(&token, &issuer.public_key_b64(), now, &cluster_id),
+                Err(CryptoError::InvalidSignedJoinToken(_))
+            ));
+        }
         Ok(())
     }
 
