@@ -108,6 +108,13 @@ stun_http_port="$((base + 3))"
 relay_udp_port="$((base + 4))"
 relay_http_port="$((base + 5))"
 relay_agent_port="$((base + 6))"
+control_plane_operator_token_path="${state_dir}/control-plane-operator.token"
+control_plane_operator_token="init-spawn-smoke-control-plane-operator-token-20260713"
+
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+printf '%s' "$control_plane_operator_token" >"$control_plane_operator_token_path"
+chmod 600 "$control_plane_operator_token_path"
 
 "$ipars_bin" init \
   --public-endpoint "127.0.0.1:${relay_udp_port}" \
@@ -116,6 +123,7 @@ relay_agent_port="$((base + 6))"
   --daemon-binary "$iparsd_bin" \
   --daemon-state-dir "$state_dir" \
   --control-plane-listen "127.0.0.1:${control_plane_port}" \
+  --control-plane-operator-api-bearer-token-path "$control_plane_operator_token_path" \
   --signal-listen "127.0.0.1:${signal_port}" \
   --stun-listen "127.0.0.1:${stun_port}" \
   --stun-http-listen "127.0.0.1:${stun_http_port}" \
@@ -136,6 +144,43 @@ for port in "$control_plane_port" "$signal_port" "$stun_http_port" "$relay_http_
   curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${port}/healthz" >/dev/null
 done
 
+relay_status_path="${work_dir}/relay-status.json"
+relay_agent_status_path="${work_dir}/relay-agent-status.json"
+curl --fail --silent --show-error --max-time 5 \
+  "http://127.0.0.1:${relay_http_port}/v1/status" >"$relay_status_path"
+curl --fail --silent --show-error --max-time 5 \
+  "http://127.0.0.1:${relay_agent_port}/v1/status" >"$relay_agent_status_path"
+
+relay_node_id="$(jq -r '.relay_node' "$relay_status_path")"
+relay_agent_node_id="$(jq -r '.node_id' "$relay_agent_status_path")"
+state_node_id="$(jq -r '.node_id' "${state_dir}/relay-agent.json")"
+[[ "$relay_node_id" != "null" && "$relay_node_id" == "$relay_agent_node_id" && "$relay_node_id" == "$state_node_id" ]] || {
+  echo "Relay and relay-agent Node IDs did not match" >&2
+  exit 1
+}
+
+metrics_path="${work_dir}/control-plane-metrics.json"
+metrics_ready=0
+for _ in $(seq 1 "$ready_timeout"); do
+  if curl --fail --silent --show-error --max-time 5 \
+    -H "Authorization: Bearer ${control_plane_operator_token}" \
+    "http://127.0.0.1:${control_plane_port}/v1/metrics" >"$metrics_path" \
+    && jq -e '
+      .node_count == 1 and
+      .healthy_node_count == 1 and
+      .relay_candidate_count == 1
+    ' "$metrics_path" >/dev/null; then
+    metrics_ready=1
+    break
+  fi
+  sleep 1
+done
+[[ "$metrics_ready" == "1" ]] || {
+  echo "relay-agent did not become a healthy relay candidate" >&2
+  jq . "$metrics_path" >&2 2>/dev/null || true
+  exit 1
+}
+
 while IFS= read -r pid; do
   [[ "$pid" =~ ^[0-9]+$ ]] || { echo "invalid daemon PID in init output" >&2; exit 1; }
   kill -0 "$pid" 2>/dev/null || { echo "daemon PID ${pid} is not alive after readiness" >&2; exit 1; }
@@ -143,7 +188,7 @@ done < <(jq -r '.daemon_processes[].pid' "$output_path")
 
 [[ "$(stat -c '%a' "$state_dir")" == "700" ]] || { echo "daemon state directory is not owner-only" >&2; exit 1; }
 [[ "$(stat -c '%a' "${state_dir}/logs")" == "700" ]] || { echo "daemon log directory is not owner-only" >&2; exit 1; }
-for secret in relay-admission.token relay-agent.json relay-agent.join-token; do
+for secret in control-plane-operator.token relay-admission.token relay-agent.json relay-agent.join-token; do
   [[ "$(stat -c '%a' "${state_dir}/${secret}")" == "600" ]] || {
     echo "${secret} is not owner-only" >&2
     exit 1
@@ -157,4 +202,4 @@ if grep -Fq "$admission_token" "$output_path"; then
   exit 1
 fi
 
-echo "ipars init spawn smoke passed: five daemons became healthy and owner-only bootstrap state was created"
+echo "ipars init spawn smoke passed: relay-agent registered, heartbeat made it a relay candidate, and five daemons became healthy"
