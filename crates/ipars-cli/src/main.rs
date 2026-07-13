@@ -7,7 +7,7 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use anyhow::Context;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
-use ipars_agent::FileAgentStateStore;
+use ipars_agent::{AgentNodeState, FileAgentStateStore};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_stun::UdpStunProbe;
@@ -23,10 +23,10 @@ use ipars_types::api::{
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, validate_join_token_bootstrap_endpoints,
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
-    EndpointCandidateKind, JoinTokenClaims, KeyId, NatProbeObservation, NodeId, PathMetrics,
-    PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
-    MAX_JOIN_TOKEN_ALLOWED_ROUTES, MAX_JOIN_TOKEN_IDENTIFIER_BYTES, MAX_JOIN_TOKEN_TAGS,
-    MAX_JOIN_TOKEN_TTL_SECONDS,
+    EndpointCandidateKind, JoinTokenClaims, KeyId, NatProbeObservation, NodeId, NodeRecord,
+    PathMetrics, PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_ALLOWED_ROUTES,
+    MAX_JOIN_TOKEN_IDENTIFIER_BYTES, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -368,6 +368,8 @@ struct JoinArgs {
     token: String,
     #[arg(long)]
     control_plane_url: Option<String>,
+    #[arg(long, env = "IPARS_JOIN_STATE_PATH")]
+    state_path: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 }
@@ -1351,7 +1353,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     match command {
         Command::Init(args) => print_json(&init(*args)?)?,
-        Command::Join(args) => print_json(&join(args).await?)?,
+        Command::Join(args) => print_json(&join(args, agent_state_path.as_deref()).await?)?,
         Command::Status(args) => {
             match (args.agent_url.as_deref(), args.control_plane_url.as_deref()) {
                 (Some(agent_url), None) => print_json(
@@ -1912,7 +1914,10 @@ fn reject_multi_linked_log(path: &Path, metadata: &std::fs::Metadata) -> anyhow:
     Ok(())
 }
 
-async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
+async fn join(
+    args: JoinArgs,
+    global_agent_state_path: Option<&Path>,
+) -> anyhow::Result<JoinOutput> {
     let token: SignedJoinToken =
         serde_json::from_str(&args.token).context("join token must be JSON signed token")?;
     token
@@ -1920,6 +1925,15 @@ async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
         .context("signed join token validation failed")?;
     let identity = IdentityKeyPair::generate();
     let wireguard = WireGuardKeyPair::generate();
+    let state_path = args
+        .state_path
+        .as_deref()
+        .or(global_agent_state_path)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_join_state_path);
+    if !args.dry_run {
+        ensure_join_state_path_available(&state_path)?;
+    }
     let control_plane_urls = control_plane_join_urls(&token, args.control_plane_url.as_deref())?;
     let registration = RegisterNodeRequest {
         node_id: identity.node_id(),
@@ -1944,6 +1958,8 @@ async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
     } else {
         let (url, response) =
             post_join_request(&reqwest::Client::new(), &control_plane_urls, &join_request).await?;
+        validate_join_registration_response(&response.node, &identity, &wireguard, &token)?;
+        persist_joined_agent_state(&state_path, &identity, &wireguard, &response)?;
         (url, Some(response))
     };
 
@@ -1957,8 +1973,87 @@ async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
         wireguard_public_key: wireguard.public_key_b64,
         control_plane_url,
         registered: registration_response.is_some(),
+        state_path,
+        state_persisted: registration_response.is_some(),
         registration: registration_response,
     })
+}
+
+fn default_join_state_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(path).join("ipars/agent.json");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/state/ipars/agent.json");
+    }
+    PathBuf::from("/var/lib/ipars/agent.json")
+}
+
+fn ensure_join_state_path_available(path: &Path) -> anyhow::Result<()> {
+    let store = FileAgentStateStore::new(path);
+    match store.load() {
+        Ok(existing) => anyhow::bail!(
+            "join state path {} already contains node {}; choose a new --state-path",
+            path.display(),
+            existing.node_id
+        ),
+        Err(ipars_agent::AgentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "join state path {} is not available for a new node",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn validate_join_registration_response(
+    node: &NodeRecord,
+    identity: &IdentityKeyPair,
+    wireguard: &WireGuardKeyPair,
+    token: &SignedJoinToken,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        node.cluster_id == token.claims.cluster_id,
+        "control-plane join response cluster ID does not match the join token"
+    );
+    anyhow::ensure!(
+        node.node_id == identity.node_id(),
+        "control-plane join response node ID does not match the generated identity"
+    );
+    anyhow::ensure!(
+        node.identity_public_key == identity.public_key_b64(),
+        "control-plane join response identity public key does not match the generated identity"
+    );
+    anyhow::ensure!(
+        node.wireguard_public_key == wireguard.public_key_b64,
+        "control-plane join response WireGuard public key does not match the generated key"
+    );
+    Ok(())
+}
+
+fn persist_joined_agent_state(
+    path: &Path,
+    identity: &IdentityKeyPair,
+    wireguard: &WireGuardKeyPair,
+    response: &RegisterNodeResponse,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let state = AgentNodeState {
+        node_id: identity.node_id(),
+        identity_private_key_b64: identity.signing_key_b64(),
+        identity_public_key_b64: identity.public_key_b64(),
+        wireguard_private_key_b64: wireguard.private_key_b64.clone(),
+        wireguard_public_key_b64: wireguard.public_key_b64.clone(),
+        vpn_ip: Some(response.node.vpn_ip),
+        created_at: now,
+        updated_at: now,
+    };
+    FileAgentStateStore::new(path)
+        .save(&state)
+        .with_context(|| format!("failed to persist joined agent state at {}", path.display()))
 }
 
 async fn post_join_request(
@@ -5370,6 +5465,8 @@ struct JoinOutput {
     wireguard_public_key: String,
     control_plane_url: String,
     registered: bool,
+    state_path: PathBuf,
+    state_persisted: bool,
     registration: Option<RegisterNodeResponse>,
 }
 
@@ -9946,17 +10043,104 @@ mod tests {
             kind: BootstrapEndpointKind::ControlPlane,
         }])?;
         token.signature = "A".repeat(64 * 1024);
-        let error = match join(JoinArgs {
-            token: serde_json::to_string(&token)?,
-            control_plane_url: None,
-            dry_run: true,
-        })
+        let error = match join(
+            JoinArgs {
+                token: serde_json::to_string(&token)?,
+                control_plane_url: None,
+                state_path: None,
+                dry_run: true,
+            },
+            None,
+        )
         .await
         {
             Ok(_) => anyhow::bail!("invalid signature envelope should be rejected"),
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("signature must be exactly 88 bytes"));
+        Ok(())
+    }
+
+    #[test]
+    fn joined_state_persists_generated_credentials_and_vpn_ip() -> anyhow::Result<()> {
+        let identity = IdentityKeyPair::generate();
+        let wireguard = WireGuardKeyPair::generate();
+        let mut node = cli_test_node_record(identity.node_id());
+        node.identity_public_key = identity.public_key_b64();
+        node.wireguard_public_key = wireguard.public_key_b64.clone();
+        node.vpn_ip = ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)));
+        let state_dir = temp_path("join-state");
+        let state_path = state_dir.join("agent.json");
+
+        persist_joined_agent_state(
+            &state_path,
+            &identity,
+            &wireguard,
+            &RegisterNodeResponse {
+                node: node.clone(),
+                peer_map: PeerMap {
+                    cluster_id: node.cluster_id.clone(),
+                    peers: Vec::new(),
+                    generated_at: Utc::now(),
+                },
+                relay_map: ipars_types::api::RelayMap {
+                    cluster_id: node.cluster_id.clone(),
+                    relays: Vec::new(),
+                    generated_at: Utc::now(),
+                },
+                cluster_policy: ipars_types::ClusterPolicy::default(),
+            },
+        )?;
+
+        let state = FileAgentStateStore::new(&state_path).load()?;
+        assert_eq!(state.node_id, identity.node_id());
+        assert_eq!(state.identity_public_key_b64, identity.public_key_b64());
+        assert_eq!(state.wireguard_public_key_b64, wireguard.public_key_b64);
+        assert_eq!(state.vpn_ip, Some(node.vpn_ip));
+        assert_eq!(state.identity_key_pair()?.node_id(), identity.node_id());
+        assert_eq!(state.wireguard_private_key_b64, wireguard.private_key_b64);
+        std::fs::remove_dir_all(state_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn join_rejects_registration_identity_mismatch_before_state_persist() -> anyhow::Result<()> {
+        let identity = IdentityKeyPair::generate();
+        let wireguard = WireGuardKeyPair::generate();
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }])?;
+        let mut node = cli_test_node_record(identity.node_id());
+        node.identity_public_key = IdentityKeyPair::generate().public_key_b64();
+
+        let error = test_error(
+            validate_join_registration_response(&node, &identity, &wireguard, &token),
+            "mismatched registration identity should be rejected",
+        );
+        assert!(error
+            .to_string()
+            .contains("identity public key does not match"));
+        Ok(())
+    }
+
+    #[test]
+    fn join_does_not_overwrite_existing_state_path() -> anyhow::Result<()> {
+        let state_dir = temp_path("join-existing-state");
+        let state_path = state_dir.join("agent.json");
+        let state = AgentNodeState::generate(Utc::now());
+        FileAgentStateStore::new(&state_path).save(&state)?;
+
+        let error = test_error(
+            ensure_join_state_path_available(&state_path),
+            "existing join state should not be overwritten",
+        );
+        assert!(error.to_string().contains("already contains node"));
+        assert_eq!(
+            FileAgentStateStore::new(&state_path).load()?.node_id,
+            state.node_id
+        );
+        std::fs::remove_dir_all(state_dir)?;
         Ok(())
     }
 

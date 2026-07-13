@@ -76,6 +76,23 @@ iparsd agent \
   --apply-peer-map
 ```
 
+For one-shot CLI provisioning, persist the generated node credentials before
+starting the Agent daemon:
+
+```bash
+ipars join "$(cat ./join.token)" \
+  --state-path /var/lib/ipars/agent.json
+iparsd agent \
+  --state-path /var/lib/ipars/agent.json \
+  --control-plane-url https://203.0.113.10:8443 \
+  --apply-peer-map
+```
+
+`ipars join` never prints private keys. It rejects an existing state path
+instead of silently replacing another node identity; use a new state path for
+a new node. `--dry-run` validates the token and bootstrap selection but does
+not write state.
+
 The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/ipars/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
 
 Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
