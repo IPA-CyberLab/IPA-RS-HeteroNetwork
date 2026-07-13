@@ -536,6 +536,10 @@ where
         request: RegisterNodeRequest,
         now: chrono::DateTime<Utc>,
     ) -> Result<RegisterNodeResponse, ControlPlaneError> {
+        token
+            .claims
+            .validate_shape()
+            .map_err(|error| ControlPlaneError::TokenVerification(error.to_string()))?;
         if !token.claims.policy.allow_join {
             return Err(ControlPlaneError::JoinDenied);
         }
@@ -2453,7 +2457,7 @@ mod tests {
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
         EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics,
         PathRecord, PathScore, PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy,
-        TransportProtocol,
+        TransportProtocol, MAX_JOIN_TOKEN_IDENTIFIER_BYTES,
     };
 
     use super::*;
@@ -6020,6 +6024,35 @@ mod tests {
             response.node.vpn_ip.0,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_service_validates_claim_shape_before_issuer_lookup(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let mut token = issuer.sign_join_token(claims_for_issuer(
+            cluster_id.clone(),
+            issuer.node_id(),
+            key_id.clone(),
+            "join-service-invalid-shape",
+        ))?;
+        token.claims.issuer = NodeId::from_string("x".repeat(MAX_JOIN_TOKEN_IDENTIFIER_BYTES + 1));
+        let service = join_service(cluster_id, &issuer, key_id)?;
+
+        let error = match service
+            .join(token, registration_request("node-a"), Utc::now())
+            .await
+        {
+            Ok(_) => return Err("invalid token claim shape was accepted".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ControlPlaneError::TokenVerification(_)));
+        assert!(error
+            .to_string()
+            .contains("issuer node ID exceeds 255 bytes"));
         Ok(())
     }
 

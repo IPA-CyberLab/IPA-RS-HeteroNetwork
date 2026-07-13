@@ -16,10 +16,12 @@ Join tokens are Ed25519-signed claims containing the cluster ID, issuer node/key
 
 Implemented controls:
 
-- token TTL is capped at 30 days;
-- tags are bounded and path-safe;
+- token validity is positive and capped at the 30-day TTL plus the 5-second `not_before` clock-skew allowance used by the CLI;
+- cluster, issuer, key, role, nonce, claim-tag, and policy-tag identifiers are path-safe and capped at 255 bytes;
+- claim and policy tag sets are each capped at 64 entries;
 - bootstrap endpoints are typed and validated before signing and after parsing: at most 32 total, 8 per service kind, and 2048 bytes per URL, with duplicate, control-character, userinfo, query, fragment, scheme/kind mismatch, and unusable numeric-address rejection;
-- unsafe, duplicate, non-canonical, and overlapping route allowlists are rejected;
+- route allowlists are capped at 256 entries, and unsafe, duplicate, non-canonical, and overlapping CIDRs are rejected;
+- the signer, verifier, CLI, Agent, and Control Plane all apply the same claim-shape validator, with the Control Plane rejecting malformed claims before issuer lookup or token-ledger mutation;
 - relay permission is explicit;
 - control-plane token ledgers persist max-use and revocation state;
 - SQL token-use updates use compare-and-swap semantics so concurrent control-plane instances do not over-admit the same token.

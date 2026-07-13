@@ -11818,8 +11818,8 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
         serde_json::from_str(&token).context("agent join token must be JSON signed token")?;
     token
         .claims
-        .validate_bootstrap_endpoints()
-        .context("agent join token bootstrap validation failed")?;
+        .validate_shape()
+        .context("agent join token claim validation failed")?;
     Ok(Some(token))
 }
 
@@ -14910,8 +14910,8 @@ fn control_plane_base_urls(
         if let Some(token) = token {
             token
                 .claims
-                .validate_bootstrap_endpoints()
-                .context("agent join token bootstrap validation failed")?;
+                .validate_shape()
+                .context("agent join token claim validation failed")?;
         }
     }
     let (base_urls, name) = if let Some(url) = override_url {
@@ -14988,8 +14988,8 @@ fn signal_base_urls(
         if let Some(token) = token {
             token
                 .claims
-                .validate_bootstrap_endpoints()
-                .context("agent join token bootstrap validation failed")?;
+                .validate_shape()
+                .context("agent join token claim validation failed")?;
         }
     }
     let (base_urls, name) = if let Some(url) = override_url {
@@ -15036,8 +15036,8 @@ async fn agent_stun_servers(
     if let Some(token) = token {
         token
             .claims
-            .validate_bootstrap_endpoints()
-            .context("agent join token bootstrap validation failed")?;
+            .validate_shape()
+            .context("agent join token claim validation failed")?;
         for endpoint in token
             .claims
             .bootstrap_endpoints
@@ -15149,7 +15149,7 @@ mod tests {
     use ipars_types::{
         AclAction, BootstrapEndpoint, CandidateSource, EndpointCandidate, EndpointCandidateKind,
         JoinTokenClaims, PathScore, PeerPathKey, Role, Route, Tag, TokenPolicy, TransportProtocol,
-        VpnIp,
+        VpnIp, MAX_JOIN_TOKEN_IDENTIFIER_BYTES,
     };
 
     use super::*;
@@ -18027,6 +18027,26 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("endpoint count 9 exceeds maximum 8"));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_join_token_rejects_invalid_claim_shape() -> anyhow::Result<()> {
+        let mut token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://control.example:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
+        token.claims.nonce = "x".repeat(MAX_JOIN_TOKEN_IDENTIFIER_BYTES + 1);
+        let token = serde_json::to_string(&token)?;
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--join-token", token.as_str()])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match agent_join_token(&args) {
+            Ok(_) => anyhow::bail!("invalid token claim shape should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("nonce exceeds 255 bytes"));
         Ok(())
     }
 

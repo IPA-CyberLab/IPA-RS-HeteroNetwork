@@ -24,15 +24,13 @@ use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, validate_join_token_bootstrap_endpoints,
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
     EndpointCandidateKind, JoinTokenClaims, KeyId, NatProbeObservation, NodeId, PathMetrics,
-    PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
+    PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    MAX_JOIN_TOKEN_ALLOWED_ROUTES, MAX_JOIN_TOKEN_IDENTIFIER_BYTES, MAX_JOIN_TOKEN_TAGS,
+    MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-const MAX_TOKEN_IDENTIFIER_BYTES: usize = 255;
-const MAX_JOIN_TOKEN_TAGS: usize = 64;
-const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
-const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_ISSUER_PRIVATE_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
@@ -1919,8 +1917,8 @@ async fn join(args: JoinArgs) -> anyhow::Result<JoinOutput> {
         serde_json::from_str(&args.token).context("join token must be JSON signed token")?;
     token
         .claims
-        .validate_bootstrap_endpoints()
-        .context("join token bootstrap validation failed")?;
+        .validate_shape()
+        .context("join token claim validation failed")?;
     let identity = IdentityKeyPair::generate();
     let wireguard = WireGuardKeyPair::generate();
     let control_plane_urls = control_plane_join_urls(&token, args.control_plane_url.as_deref())?;
@@ -5036,8 +5034,8 @@ fn validate_token_identifier(value: &str, label: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{label} cannot be empty");
     }
-    if value.len() > MAX_TOKEN_IDENTIFIER_BYTES {
-        anyhow::bail!("{label} exceeds {MAX_TOKEN_IDENTIFIER_BYTES} bytes");
+    if value.len() > MAX_JOIN_TOKEN_IDENTIFIER_BYTES {
+        anyhow::bail!("{label} exceeds {MAX_JOIN_TOKEN_IDENTIFIER_BYTES} bytes");
     }
     if !value
         .bytes()
@@ -5239,7 +5237,7 @@ fn claims(
         cluster_id,
         bootstrap_endpoints,
         expires_at: now + ttl,
-        not_before: now - Duration::seconds(5),
+        not_before: now - Duration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
         role: Role::from_string(role),
         tags: tag_set,
         issuer: issuer.node_id,
@@ -5247,7 +5245,7 @@ fn claims(
         policy,
         nonce: format!("nonce-{}", now.timestamp_nanos_opt().unwrap_or_default()),
     };
-    claims.validate_bootstrap_endpoints()?;
+    claims.validate_shape()?;
     Ok(claims)
 }
 
@@ -10131,7 +10129,7 @@ mod tests {
         }
 
         let issuer = IdentityKeyPair::generate();
-        let oversized_identifier = "x".repeat(MAX_TOKEN_IDENTIFIER_BYTES + 1);
+        let oversized_identifier = "x".repeat(MAX_JOIN_TOKEN_IDENTIFIER_BYTES + 1);
         let too_many_tags = (0..=MAX_JOIN_TOKEN_TAGS)
             .map(|index| format!("tag-{index}"))
             .collect::<Vec<_>>();
@@ -10151,7 +10149,9 @@ mod tests {
                     issuer_key_id: oversized_identifier,
                     ..token_args(&issuer)
                 },
-                format!("--issuer-key-id exceeds {MAX_TOKEN_IDENTIFIER_BYTES} bytes"),
+                format!(
+                    "--issuer-key-id exceeds {MAX_JOIN_TOKEN_IDENTIFIER_BYTES} bytes"
+                ),
             ),
             (
                 TokenCreateArgs {

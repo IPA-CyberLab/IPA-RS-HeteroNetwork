@@ -44,7 +44,7 @@ ipars token revoke \
 
 The control plane accepts only fresh Ed25519-signed revocations from its configured issuer key ring. Keep overlapping old/new issuer public keys configured until tokens from the old key no longer need revocation.
 
-Join-token bootstrap lists are capped at 32 endpoints total and 8 per service kind. Each URL is capped at 2048 bytes and must be an absolute typed endpoint without userinfo, query, fragment, control characters, unusable numeric addresses, or normalized duplicates. Agents also cap the merged explicit and token-derived STUN set at 8 unique usable resolved socket addresses; publish multiple independent endpoints within these bounds for failover.
+Join-token cluster, issuer, key, role, nonce, claim-tag, and policy-tag identifiers are capped at 255 bytes and must use path-safe ASCII. Claim and policy tag sets are each capped at 64 entries. Policy route allowlists are capped at 256 safe canonical, unique, non-overlapping CIDRs. The validity window must be positive and cannot exceed the 30-day TTL plus the CLI's 5-second `not_before` skew allowance. Bootstrap lists are capped at 32 endpoints total and 8 per service kind; each URL is capped at 2048 bytes and must be an absolute typed endpoint without userinfo, query, fragment, control characters, unusable numeric addresses, or normalized duplicates. Agents also cap the merged explicit and token-derived STUN set at 8 unique usable resolved socket addresses; publish multiple independent endpoints within these bounds for failover.
 
 ## Join Nodes
 

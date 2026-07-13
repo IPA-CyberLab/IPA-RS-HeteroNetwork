@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -158,6 +158,13 @@ pub struct BootstrapEndpoint {
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS: usize = 32;
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND: usize = 8;
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES: usize = 2048;
+pub const MAX_JOIN_TOKEN_IDENTIFIER_BYTES: usize = 255;
+pub const MAX_JOIN_TOKEN_TAGS: usize = 64;
+pub const MAX_JOIN_TOKEN_ALLOWED_ROUTES: usize = 256;
+pub const MAX_JOIN_TOKEN_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+pub const JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS: i64 = 5;
+pub const MAX_JOIN_TOKEN_VALIDITY_SECONDS: i64 =
+    MAX_JOIN_TOKEN_TTL_SECONDS + JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,6 +214,31 @@ impl Display for JoinTokenBootstrapValidationError {
 }
 
 impl std::error::Error for JoinTokenBootstrapValidationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinTokenClaimsValidationError {
+    reason: String,
+}
+
+impl JoinTokenClaimsValidationError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl Display for JoinTokenClaimsValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "join token claims are invalid: {}", self.reason)
+    }
+}
+
+impl std::error::Error for JoinTokenClaimsValidationError {}
 
 pub fn validate_join_token_bootstrap_endpoints(
     endpoints: &[BootstrapEndpoint],
@@ -1115,6 +1147,204 @@ impl JoinTokenClaims {
     pub fn validate_bootstrap_endpoints(&self) -> Result<(), JoinTokenBootstrapValidationError> {
         validate_join_token_bootstrap_endpoints(&self.bootstrap_endpoints)
     }
+
+    pub fn validate_shape(&self) -> Result<(), JoinTokenClaimsValidationError> {
+        validate_join_token_claim_identifier(self.cluster_id.as_str(), "cluster ID")?;
+        validate_join_token_claim_identifier(self.issuer.as_str(), "issuer node ID")?;
+        validate_join_token_claim_identifier(self.key_id.as_str(), "issuer key ID")?;
+        validate_join_token_claim_identifier(self.role.as_str(), "role")?;
+        validate_join_token_claim_identifier(&self.nonce, "nonce")?;
+
+        validate_join_token_claim_tags(&self.tags, "tag")?;
+        validate_join_token_claim_tags(&self.policy.allowed_tags, "policy allowed tag")?;
+        validate_join_token_allowed_routes(&self.policy.allowed_routes)?;
+
+        if self.expires_at <= self.not_before {
+            return Err(JoinTokenClaimsValidationError::new(
+                "expires_at must be later than not_before",
+            ));
+        }
+        let validity = self.expires_at.signed_duration_since(self.not_before);
+        if validity > ChronoDuration::seconds(MAX_JOIN_TOKEN_VALIDITY_SECONDS) {
+            return Err(JoinTokenClaimsValidationError::new(format!(
+                "validity window exceeds {MAX_JOIN_TOKEN_VALIDITY_SECONDS} seconds"
+            )));
+        }
+
+        self.validate_bootstrap_endpoints().map_err(|error| {
+            JoinTokenClaimsValidationError::new(format!(
+                "bootstrap endpoint validation failed: {}",
+                error.reason()
+            ))
+        })
+    }
+}
+
+fn validate_join_token_claim_identifier(
+    value: &str,
+    label: &str,
+) -> Result<(), JoinTokenClaimsValidationError> {
+    if value.is_empty() {
+        return Err(JoinTokenClaimsValidationError::new(format!(
+            "{label} cannot be empty"
+        )));
+    }
+    if value.len() > MAX_JOIN_TOKEN_IDENTIFIER_BYTES {
+        return Err(JoinTokenClaimsValidationError::new(format!(
+            "{label} exceeds {MAX_JOIN_TOKEN_IDENTIFIER_BYTES} bytes"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(JoinTokenClaimsValidationError::new(format!(
+            "{label} must contain only ASCII letters, digits, '_', '.' or '-'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_join_token_claim_tags(
+    tags: &BTreeSet<Tag>,
+    label: &str,
+) -> Result<(), JoinTokenClaimsValidationError> {
+    if tags.len() > MAX_JOIN_TOKEN_TAGS {
+        return Err(JoinTokenClaimsValidationError::new(format!(
+            "{label} count {} exceeds maximum {MAX_JOIN_TOKEN_TAGS}",
+            tags.len()
+        )));
+    }
+    for tag in tags {
+        validate_join_token_claim_identifier(tag.as_str(), label)?;
+    }
+    Ok(())
+}
+
+fn validate_join_token_allowed_routes(
+    routes: &[IpNet],
+) -> Result<(), JoinTokenClaimsValidationError> {
+    if routes.len() > MAX_JOIN_TOKEN_ALLOWED_ROUTES {
+        return Err(JoinTokenClaimsValidationError::new(format!(
+            "policy allowed route count {} exceeds maximum {MAX_JOIN_TOKEN_ALLOWED_ROUTES}",
+            routes.len()
+        )));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut accepted = Vec::new();
+    for (index, route) in routes.iter().enumerate() {
+        if let Some(reason) = restricted_join_token_route_cidr_reason(route) {
+            return Err(JoinTokenClaimsValidationError::new(format!(
+                "policy allowed route {index} must not use {reason} CIDR {route}"
+            )));
+        }
+        let canonical = route.trunc();
+        if route != &canonical {
+            return Err(JoinTokenClaimsValidationError::new(format!(
+                "policy allowed route {index} must be canonical {canonical}, not {route}"
+            )));
+        }
+        if !seen.insert(canonical) {
+            return Err(JoinTokenClaimsValidationError::new(format!(
+                "policy allowed route {index} duplicates {canonical}"
+            )));
+        }
+        if let Some(overlap) = accepted
+            .iter()
+            .find(|existing| join_token_route_cidrs_overlap(existing, &canonical))
+        {
+            return Err(JoinTokenClaimsValidationError::new(format!(
+                "policy allowed route {canonical} overlaps {overlap}"
+            )));
+        }
+        accepted.push(canonical);
+    }
+    Ok(())
+}
+
+fn restricted_join_token_route_cidr_reason(cidr: &IpNet) -> Option<&'static str> {
+    if cidr.prefix_len() == 0 {
+        return Some("unrestricted");
+    }
+    match cidr {
+        IpNet::V4(network) => restricted_join_token_ipv4_route_cidr_reason(network),
+        IpNet::V6(network) => restricted_join_token_ipv6_route_cidr_reason(network),
+    }
+}
+
+fn restricted_join_token_ipv4_route_cidr_reason(network: &ipnet::Ipv4Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4),
+            "multicast",
+        ),
+        (
+            ipnet::Ipv4Net::new_assert(Ipv4Addr::new(255, 255, 255, 255), 32),
+            "broadcast",
+        ),
+    ];
+    restricted.iter().find_map(|(restricted, reason)| {
+        join_token_ipv4_route_cidrs_overlap(network, restricted).then_some(*reason)
+    })
+}
+
+fn restricted_join_token_ipv6_route_cidr_reason(network: &ipnet::Ipv6Net) -> Option<&'static str> {
+    let restricted = [
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::UNSPECIFIED, 128),
+            "unspecified",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::LOCALHOST, 128),
+            "loopback",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            "link-local",
+        ),
+        (
+            ipnet::Ipv6Net::new_assert(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+            "multicast",
+        ),
+    ];
+    restricted.iter().find_map(|(restricted, reason)| {
+        join_token_ipv6_route_cidrs_overlap(network, restricted).then_some(*reason)
+    })
+}
+
+fn join_token_route_cidrs_overlap(left: &IpNet, right: &IpNet) -> bool {
+    match (left, right) {
+        (IpNet::V4(left), IpNet::V4(right)) => join_token_ipv4_route_cidrs_overlap(left, right),
+        (IpNet::V6(left), IpNet::V6(right)) => join_token_ipv6_route_cidrs_overlap(left, right),
+        _ => false,
+    }
+}
+
+fn join_token_ipv4_route_cidrs_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
+}
+
+fn join_token_ipv6_route_cidrs_overlap(left: &ipnet::Ipv6Net, right: &ipnet::Ipv6Net) -> bool {
+    left.contains(&right.network())
+        || left.contains(&right.broadcast())
+        || right.contains(&left.network())
+        || right.contains(&left.broadcast())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17731,6 +17961,139 @@ mod tests {
                 "invalid bootstrap endpoint should be rejected"
             );
         }
+    }
+
+    fn valid_join_token_claims() -> JoinTokenClaims {
+        let now = Utc::now();
+        let tags = BTreeSet::from([Tag::from_string("edge")]);
+        JoinTokenClaims {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            bootstrap_endpoints: vec![BootstrapEndpoint {
+                url: "https://control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            }],
+            expires_at: now + ChronoDuration::seconds(MAX_JOIN_TOKEN_TTL_SECONDS),
+            not_before: now - ChronoDuration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
+            role: Role::edge(),
+            tags: tags.clone(),
+            issuer: NodeId::from_string("issuer-a"),
+            key_id: KeyId::from_string("root"),
+            policy: TokenPolicy {
+                allowed_tags: tags,
+                ..TokenPolicy::default()
+            },
+            nonce: "nonce-a".to_string(),
+        }
+    }
+
+    fn claim_validation_error(claims: &JoinTokenClaims) -> JoinTokenClaimsValidationError {
+        match claims.validate_shape() {
+            Ok(()) => panic!("invalid join token claims should be rejected"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn join_token_claim_validation_bounds_identifiers_tags_and_time() {
+        let valid = valid_join_token_claims();
+        assert!(valid.validate_shape().is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.nonce = "x".repeat(MAX_JOIN_TOKEN_IDENTIFIER_BYTES + 1);
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("nonce exceeds 255 bytes"));
+
+        invalid = valid.clone();
+        invalid.role = Role::from_string("edge role");
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("role must contain only ASCII"));
+
+        invalid = valid.clone();
+        invalid.tags = (0..=MAX_JOIN_TOKEN_TAGS)
+            .map(|index| Tag::from_string(format!("tag-{index}")))
+            .collect();
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("tag count 65 exceeds maximum 64"));
+
+        invalid = valid.clone();
+        invalid.policy.allowed_tags = (0..=MAX_JOIN_TOKEN_TAGS)
+            .map(|index| Tag::from_string(format!("allowed-{index}")))
+            .collect();
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("policy allowed tag count 65 exceeds maximum 64"));
+
+        invalid = valid.clone();
+        invalid.expires_at = invalid.not_before;
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("expires_at must be later than not_before"));
+
+        invalid = valid;
+        invalid.expires_at =
+            invalid.not_before + ChronoDuration::seconds(MAX_JOIN_TOKEN_VALIDITY_SECONDS + 1);
+        assert!(claim_validation_error(&invalid).reason().contains(&format!(
+            "validity window exceeds {MAX_JOIN_TOKEN_VALIDITY_SECONDS} seconds"
+        )));
+    }
+
+    #[test]
+    fn join_token_claim_validation_bounds_and_validates_allowed_routes() {
+        let valid = valid_join_token_claims();
+
+        let mut invalid = valid.clone();
+        invalid.policy.allowed_routes = vec!["0.0.0.0/0"
+            .parse()
+            .unwrap_or_else(|error| panic!("test CIDR should parse: {error}"))];
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("must not use unrestricted CIDR"));
+
+        invalid = valid.clone();
+        invalid.policy.allowed_routes = vec!["10.42.0.1/24"
+            .parse()
+            .unwrap_or_else(|error| panic!("test CIDR should parse: {error}"))];
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("must be canonical 10.42.0.0/24"));
+
+        let route = "10.42.0.0/16"
+            .parse()
+            .unwrap_or_else(|error| panic!("test CIDR should parse: {error}"));
+        invalid = valid.clone();
+        invalid.policy.allowed_routes = vec![route, route];
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("duplicates 10.42.0.0/16"));
+
+        invalid = valid.clone();
+        invalid.policy.allowed_routes = vec![
+            "10.42.0.0/16"
+                .parse()
+                .unwrap_or_else(|error| panic!("test CIDR should parse: {error}")),
+            "10.42.1.0/24"
+                .parse()
+                .unwrap_or_else(|error| panic!("test CIDR should parse: {error}")),
+        ];
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("10.42.1.0/24 overlaps 10.42.0.0/16"));
+
+        invalid = valid;
+        invalid.policy.allowed_routes = (0..=MAX_JOIN_TOKEN_ALLOWED_ROUTES)
+            .map(|index| {
+                IpNet::V4(Ipv4Net::new_assert(
+                    Ipv4Addr::from(u32::from(Ipv4Addr::new(10, 0, 0, 0)) + index as u32),
+                    32,
+                ))
+            })
+            .collect();
+        assert!(claim_validation_error(&invalid)
+            .reason()
+            .contains("policy allowed route count 257 exceeds maximum 256"));
     }
 
     #[test]
