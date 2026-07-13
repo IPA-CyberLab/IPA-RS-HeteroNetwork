@@ -101,7 +101,6 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
       --data-root="$tmp_dir/data" \
       --exec-root="$tmp_dir/exec" \
       --pidfile="$daemon_pid_file" \
-      --plugin-dir="$tmp_dir/plugins" \
       --storage-driver=fuse-overlayfs \
       --iptables=false \
       --bridge=none \
@@ -109,15 +108,23 @@ daemon_pid_file="$tmp_dir/dockerd.pid"
   fi
   exec rootlesskit \
     --net=slirp4netns \
+    --mtu=65520 \
+    --slirp4netns-sandbox=auto \
+    --slirp4netns-seccomp=auto \
+    --disable-host-loopback \
+    --port-driver=builtin \
     --copy-up=/etc \
     --copy-up=/run \
+    --propagation=rslave \
     --state-dir="$tmp_dir/rootlesskit" \
-    dockerd \
+    sh -ec '
+      rm -f /run/docker /run/containerd /run/xtables.lock
+      exec dockerd "$@"
+    ' sh \
       --host="$DOCKER_HOST" \
       --data-root="$tmp_dir/data" \
       --exec-root="$tmp_dir/exec" \
       --pidfile="$daemon_pid_file" \
-      --plugin-dir="$tmp_dir/plugins" \
       --storage-driver=fuse-overlayfs \
       --iptables=false \
       --bridge=none \
