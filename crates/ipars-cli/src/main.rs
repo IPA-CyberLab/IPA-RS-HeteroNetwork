@@ -367,6 +367,8 @@ struct InitArgs {
     relay_http_listen: SocketAddr,
     #[arg(long)]
     relay_admission_url: Option<String>,
+    #[arg(long, default_value = "127.0.0.1:9781")]
+    relay_agent_listen: SocketAddr,
 }
 
 #[derive(Debug, Args)]
@@ -1546,12 +1548,23 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         },
     )?;
     let token = identity.sign_join_token(claims)?;
+    let relay_agent = if args.spawn_daemons && args.allow_relay {
+        Some(prepare_init_relay_agent(
+            &args,
+            &identity,
+            &cluster_id,
+            &bootstrap_endpoints,
+        )?)
+    } else {
+        None
+    };
     let daemon_specs = init_daemon_specs(
         &args,
         &cluster_id,
         &identity.node_id(),
         &issuer_key_id,
         &issuer_public_key,
+        relay_agent.as_ref(),
     );
     let daemon_commands = daemon_specs
         .iter()
@@ -1567,6 +1580,16 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     } else {
         Vec::new()
     };
+
+    let mut services = vec![
+        "control-plane".to_string(),
+        "signal".to_string(),
+        "stun".to_string(),
+        "relay".to_string(),
+    ];
+    if relay_agent.is_some() {
+        services.push("relay-agent".to_string());
+    }
 
     Ok(InitOutput {
         cluster_id,
@@ -1584,12 +1607,7 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         wireguard_public_key: wireguard.public_key_b64,
         bootstrap_endpoints,
         join_token: token,
-        services: vec![
-            "control-plane".to_string(),
-            "signal".to_string(),
-            "stun".to_string(),
-            "relay".to_string(),
-        ],
+        services,
         daemon_state_dir: args.daemon_state_dir,
         daemon_commands,
         daemon_processes,
@@ -1605,6 +1623,7 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
     validate_listen_port_for_bootstrap(args.control_plane_listen, "--control-plane-listen")?;
     validate_listen_port_for_bootstrap(args.signal_listen, "--signal-listen")?;
     validate_listen_port_for_bootstrap(args.stun_listen, "--stun-listen")?;
+    validate_listen_port_for_bootstrap(args.relay_agent_listen, "--relay-agent-listen")?;
     anyhow::ensure!(
         args.daemon_ready_timeout_seconds > 0,
         "--daemon-ready-timeout-seconds must be greater than zero"
@@ -1662,6 +1681,7 @@ fn init_daemon_specs(
     node_id: &NodeId,
     issuer_key_id: &str,
     issuer_public_key: &str,
+    relay_agent: Option<&InitRelayAgentBootstrap>,
 ) -> Vec<InitDaemonSpec> {
     let log_dir = args.daemon_state_dir.join("logs");
     let control_plane_database_url = effective_control_plane_database_url(args);
@@ -1707,7 +1727,10 @@ fn init_daemon_specs(
         control_plane_args.push(path.display().to_string());
     }
 
-    vec![
+    let relay_node_id = relay_agent
+        .map(|agent| agent.node_id.clone())
+        .unwrap_or_else(|| node_id.clone());
+    let mut specs = vec![
         InitDaemonSpec {
             service: "control-plane",
             args: control_plane_args,
@@ -1737,7 +1760,7 @@ fn init_daemon_specs(
             args: vec![
                 "relay".to_string(),
                 "--relay-node-id".to_string(),
-                node_id.as_str().to_string(),
+                relay_node_id.as_str().to_string(),
                 "--udp-listen".to_string(),
                 args.relay_udp_listen.to_string(),
                 "--http-listen".to_string(),
@@ -1745,12 +1768,110 @@ fn init_daemon_specs(
                 "--public-endpoint".to_string(),
                 args.public_endpoint.to_string(),
                 "--admission-url".to_string(),
-                relay_admission_url,
+                relay_admission_url.clone(),
             ],
             log_path: log_dir.join("relay.log"),
             health_listen: local_health_listen(args.relay_http_listen),
         },
-    ]
+    ];
+    if let Some(relay_agent) = relay_agent {
+        specs.push(InitDaemonSpec {
+            service: "relay-agent",
+            args: vec![
+                "agent".to_string(),
+                "--listen".to_string(),
+                args.relay_agent_listen.to_string(),
+                "--state-path".to_string(),
+                relay_agent.state_path.display().to_string(),
+                "--join-token-path".to_string(),
+                relay_agent.join_token_path.display().to_string(),
+                "--runtime-backend".to_string(),
+                "dry-run".to_string(),
+                "--control-plane-url".to_string(),
+                local_http_url(args.control_plane_listen),
+                "--relay-public-endpoint".to_string(),
+                args.public_endpoint.to_string(),
+                "--relay-admission-url".to_string(),
+                relay_admission_url.clone(),
+                "--relay-status-url".to_string(),
+                local_http_url(args.relay_http_listen),
+                "--stun-bind".to_string(),
+                local_health_listen(args.relay_agent_listen).to_string(),
+            ],
+            log_path: log_dir.join("relay-agent.log"),
+            health_listen: local_health_listen(args.relay_agent_listen),
+        });
+    }
+    specs
+}
+
+#[derive(Debug, Clone)]
+struct InitRelayAgentBootstrap {
+    node_id: NodeId,
+    state_path: PathBuf,
+    join_token_path: PathBuf,
+}
+
+fn prepare_init_relay_agent(
+    args: &InitArgs,
+    issuer: &IdentityKeyPair,
+    cluster_id: &ClusterId,
+    bootstrap_endpoints: &[BootstrapEndpoint],
+) -> anyhow::Result<InitRelayAgentBootstrap> {
+    prepare_init_daemon_directory(&args.daemon_state_dir, "daemon state dir")?;
+    let state_path = args.daemon_state_dir.join("relay-agent.json");
+    ensure_join_state_path_available(&state_path)?;
+    let relay_identity = IdentityKeyPair::generate();
+    let relay_wireguard = WireGuardKeyPair::generate();
+    let now = Utc::now();
+    FileAgentStateStore::new(&state_path)
+        .save(&AgentNodeState {
+            node_id: relay_identity.node_id(),
+            identity_private_key_b64: relay_identity.signing_key_b64(),
+            identity_public_key_b64: relay_identity.public_key_b64(),
+            wireguard_private_key_b64: relay_wireguard.private_key_b64.clone(),
+            wireguard_public_key_b64: relay_wireguard.public_key_b64.clone(),
+            vpn_ip: None,
+            registered_node: None,
+            bootstrap_endpoints: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        })
+        .with_context(|| {
+            format!(
+                "failed to persist bootstrap relay agent state at {}",
+                state_path.display()
+            )
+        })?;
+
+    let relay_token = issuer.sign_join_token(claims(
+        cluster_id.clone(),
+        TokenIssuer {
+            node_id: issuer.node_id(),
+            key_id: KeyId::from_string(args.issuer_key_id.clone()),
+        },
+        "relay".to_string(),
+        Vec::new(),
+        args.token_ttl_seconds,
+        bootstrap_endpoints.to_vec(),
+        TokenPolicyInput {
+            allow_relay: true,
+            allowed_routes: Vec::new(),
+            max_token_uses: Some(1),
+        },
+    )?)?;
+    let join_token_path = args.daemon_state_dir.join("relay-agent.join-token");
+    write_init_secret_file(
+        &join_token_path,
+        &serde_json::to_vec(&relay_token)?,
+        "bootstrap relay agent join token",
+    )?;
+
+    Ok(InitRelayAgentBootstrap {
+        node_id: relay_identity.node_id(),
+        state_path,
+        join_token_path,
+    })
 }
 
 fn effective_control_plane_database_url(args: &InitArgs) -> String {
@@ -1775,27 +1896,46 @@ fn spawn_init_daemons(
 
     let mut processes = Vec::with_capacity(specs.len());
     let mut spawned: Vec<Child> = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let child = match spawn_init_daemon(binary, spec) {
-            Ok(child) => child,
-            Err(error) => {
-                for mut child in spawned {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                return Err(error);
-            }
-        };
-        processes.push(InitDaemonProcess {
-            service: spec.service.to_string(),
-            pid: child.id(),
-            command: spec.command(binary),
-            log_path: spec.log_path.clone(),
-        });
-        spawned.push(child);
+    let core_specs = specs
+        .iter()
+        .filter(|spec| spec.service != "relay-agent")
+        .cloned()
+        .collect::<Vec<_>>();
+    let relay_agent_specs = specs
+        .iter()
+        .filter(|spec| spec.service == "relay-agent")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if let Err(error) = spawn_init_daemon_group(binary, &core_specs, &mut processes, &mut spawned) {
+        for mut child in spawned {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(error);
+    }
+    if let Err(error) = wait_for_init_daemons(&mut spawned, &core_specs, ready_timeout_seconds) {
+        for mut child in spawned {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(error);
     }
 
-    if let Err(error) = wait_for_init_daemons(&mut spawned, specs, ready_timeout_seconds) {
+    if let Err(error) =
+        spawn_init_daemon_group(binary, &relay_agent_specs, &mut processes, &mut spawned)
+    {
+        for mut child in spawned {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(error);
+    }
+    if let Err(error) = wait_for_init_daemons(
+        &mut spawned[core_specs.len()..],
+        &relay_agent_specs,
+        ready_timeout_seconds,
+    ) {
         for mut child in spawned {
             let _ = child.kill();
             let _ = child.wait();
@@ -1804,6 +1944,25 @@ fn spawn_init_daemons(
     }
 
     Ok(processes)
+}
+
+fn spawn_init_daemon_group(
+    binary: &Path,
+    specs: &[InitDaemonSpec],
+    processes: &mut Vec<InitDaemonProcess>,
+    spawned: &mut Vec<Child>,
+) -> anyhow::Result<()> {
+    for spec in specs {
+        let child = spawn_init_daemon(binary, spec)?;
+        processes.push(InitDaemonProcess {
+            service: spec.service.to_string(),
+            pid: child.id(),
+            command: spec.command(binary),
+            log_path: spec.log_path.clone(),
+        });
+        spawned.push(child);
+    }
+    Ok(())
 }
 
 fn local_health_listen(listen: SocketAddr) -> SocketAddr {
@@ -1980,6 +2139,36 @@ fn open_init_daemon_log(path: &Path) -> anyhow::Result<std::fs::File> {
     }
     reject_multi_linked_log(path, &metadata)?;
     Ok(log)
+}
+
+fn write_init_secret_file(path: &Path, contents: &[u8], label: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        prepare_init_daemon_directory(parent, "daemon state dir")?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => anyhow::bail!("{label} {} already exists", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {label} {}", path.display()));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {label} {}", path.display()))?;
+    if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(error).with_context(|| format!("failed to write {label} {}", path.display()));
+    }
+    set_owner_only_open_file_permissions(&file, path, label)?;
+    Ok(())
 }
 
 fn init_daemon_log_open_options() -> std::fs::OpenOptions {
@@ -9825,6 +10014,7 @@ mod tests {
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
+            relay_agent_listen: SocketAddr::from(([127, 0, 0, 1], 9781)),
         }
     }
 
@@ -11038,6 +11228,7 @@ mod tests {
             relay_udp_listen: SocketAddr::from(([0, 0, 0, 0], 51820)),
             relay_http_listen: SocketAddr::from(([0, 0, 0, 0], 9580)),
             relay_admission_url: None,
+            relay_agent_listen: SocketAddr::from(([127, 0, 0, 1], 9781)),
         })?;
 
         assert_eq!(output.issuer_private_key_path, Some(key_path.clone()));
@@ -11150,6 +11341,7 @@ mod tests {
             relay_udp_listen: "0.0.0.0:15182".parse()?,
             relay_http_listen: "127.0.0.1:19580".parse()?,
             relay_admission_url: None,
+            relay_agent_listen: "127.0.0.1:19781".parse()?,
         })?;
 
         assert!(output.daemon_processes.is_empty());
@@ -11263,6 +11455,57 @@ mod tests {
 
         let _ = std::fs::remove_file(key_path);
         let _ = std::fs::remove_file(operator_token_path);
+        Ok(())
+    }
+
+    #[test]
+    fn init_allow_relay_builds_a_registered_relay_agent_spec() -> anyhow::Result<()> {
+        let mut args = valid_init_args();
+        args.allow_relay = true;
+        args.spawn_daemons = true;
+        args.daemon_state_dir = temp_path("relay-agent-bootstrap");
+        let issuer = IdentityKeyPair::generate();
+        let cluster_id = ClusterId::new();
+        let bootstrap_endpoints = bootstrap_from_public_endpoint(&args);
+        let relay_agent =
+            prepare_init_relay_agent(&args, &issuer, &cluster_id, &bootstrap_endpoints)?;
+        let specs = init_daemon_specs(
+            &args,
+            &cluster_id,
+            &issuer.node_id(),
+            "root",
+            &issuer.public_key_b64(),
+            Some(&relay_agent),
+        );
+
+        assert_eq!(specs.len(), 5);
+        let relay = specs
+            .iter()
+            .find(|spec| spec.service == "relay")
+            .context("expected relay daemon spec")?;
+        assert!(relay.args.windows(2).any(|values| {
+            values[0] == "--relay-node-id" && values[1] == relay_agent.node_id.as_str()
+        }));
+        let relay_agent_spec = specs
+            .iter()
+            .find(|spec| spec.service == "relay-agent")
+            .context("expected relay-agent daemon spec")?;
+        assert!(relay_agent_spec
+            .args
+            .contains(&relay_agent.state_path.display().to_string()));
+        assert!(relay_agent_spec
+            .args
+            .contains(&relay_agent.join_token_path.display().to_string()));
+
+        let state = FileAgentStateStore::new(&relay_agent.state_path).load()?;
+        assert_eq!(state.node_id, relay_agent.node_id);
+        let token: SignedJoinToken =
+            serde_json::from_slice(&std::fs::read(&relay_agent.join_token_path)?)?;
+        assert_eq!(token.claims.role, Role::from_string("relay"));
+        assert!(token.claims.policy.allow_relay);
+        assert_eq!(token.claims.policy.max_token_uses, Some(1));
+
+        let _ = std::fs::remove_dir_all(&args.daemon_state_dir);
         Ok(())
     }
 
