@@ -675,17 +675,19 @@ pub trait RouteManager: Send + Sync {
 }
 
 pub fn docker_route_plan(intent: DockerNetworkIntent) -> RoutePlan {
+    let mut container_cidrs = intent.container_cidrs;
+    container_cidrs.sort();
+    let advertised_by = NodeId::from_string(intent.container_namespace);
+
     RoutePlan {
         owner: RoutePlanOwner::Docker,
         interface: intent.overlay_interface,
-        routes: intent
-            .container_cidrs
+        routes: container_cidrs
             .into_iter()
-            .enumerate()
-            .map(|(index, cidr)| Route {
-                id: format!("docker-{index}"),
+            .map(|cidr| Route {
+                id: docker_route_id(&cidr),
                 cidr,
-                advertised_by: NodeId::from_string(intent.container_namespace.clone()),
+                advertised_by: advertised_by.clone(),
                 via: None,
                 metric: 100,
                 tags: Default::default(),
@@ -698,6 +700,37 @@ pub fn docker_route_plan(intent: DockerNetworkIntent) -> RoutePlan {
             to: None,
             fwmark: Some(0x6473),
         }],
+    }
+}
+
+fn docker_route_id(cidr: &IpNet) -> String {
+    match cidr {
+        IpNet::V4(network) => {
+            let octets = network.network().octets();
+            format!(
+                "docker-v4-{}-{}-{}-{}-{}",
+                octets[0],
+                octets[1],
+                octets[2],
+                octets[3],
+                network.prefix_len()
+            )
+        }
+        IpNet::V6(network) => {
+            let segments = network.network().segments();
+            format!(
+                "docker-v6-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{:x}-{}",
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                segments[4],
+                segments[5],
+                segments[6],
+                segments[7],
+                network.prefix_len()
+            )
+        }
     }
 }
 
@@ -4295,7 +4328,56 @@ mod tests {
 
         assert_eq!(plan.interface, "ipars0");
         assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].id, "docker-v4-172-18-0-0-16");
         assert_eq!(plan.policy_rules[0].table, 10_064);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_route_plan_uses_cidr_identity_and_deterministic_order(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let intent = |container_cidrs| DockerNetworkIntent {
+            container_namespace: "container-a".to_string(),
+            host_interface: "eth0".to_string(),
+            overlay_interface: "ipars0".to_string(),
+            container_cidrs,
+            expose_host_routes: true,
+        };
+        let first = checked_docker_route_plan(intent(vec![
+            "fd00:18::/64".parse()?,
+            "172.19.0.0/16".parse()?,
+            "172.18.0.0/16".parse()?,
+        ]))?;
+        let second = checked_docker_route_plan(intent(vec![
+            "172.18.0.0/16".parse()?,
+            "172.19.0.0/16".parse()?,
+            "fd00:18::/64".parse()?,
+        ]))?;
+
+        let route_keys = |plan: &RoutePlan| {
+            plan.routes
+                .iter()
+                .map(|route| (route.id.clone(), route.cidr.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(route_keys(&first), route_keys(&second));
+        assert_eq!(
+            route_keys(&first),
+            vec![
+                (
+                    "docker-v4-172-18-0-0-16".to_string(),
+                    "172.18.0.0/16".to_string(),
+                ),
+                (
+                    "docker-v4-172-19-0-0-16".to_string(),
+                    "172.19.0.0/16".to_string(),
+                ),
+                (
+                    "docker-v6-fd00-18-0-0-0-0-0-0-64".to_string(),
+                    "fd00:18::/64".to_string(),
+                ),
+            ]
+        );
         Ok(())
     }
 
