@@ -508,4 +508,13 @@ if ! assert_workload_http agent-b 172.30.251.2; then
   exit 1
 fi
 
+if ! assert_vpn_http workload-a "$agent_b_vpn_ip"; then
+  rootless_dataplane_diagnostics "workload-a could not reach the remote agent over the VPN"
+  exit 1
+fi
+if ! assert_vpn_http workload-b "$agent_a_vpn_ip"; then
+  rootless_dataplane_diagnostics "workload-b could not reach the remote agent over the VPN"
+  exit 1
+fi
+
 echo "Rootless Docker route-provider workload namespace smoke passed"
