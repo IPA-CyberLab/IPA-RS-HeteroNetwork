@@ -1557,7 +1557,7 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     } else {
         None
     };
-    let relay_agent = if args.spawn_daemons && args.allow_relay {
+    let relay_agent = if args.allow_relay {
         Some(prepare_init_relay_agent(
             &args,
             &identity,
@@ -11527,7 +11527,11 @@ mod tests {
         })?;
 
         assert!(output.daemon_processes.is_empty());
-        assert_eq!(output.daemon_commands.len(), 4);
+        assert_eq!(output.daemon_commands.len(), 5);
+        assert_eq!(
+            output.services.last().map(String::as_str),
+            Some("relay-agent")
+        );
         assert_eq!(
             output
                 .join_token
@@ -11647,6 +11651,26 @@ mod tests {
             .command
             .windows(2)
             .any(|values| values[0] == "--admission-bearer-token-path"
+                && values[1] == output_relay_admission_token_path.display().to_string()));
+
+        let relay_agent = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "relay-agent")
+            .context("expected manual relay-agent daemon command")?;
+        assert!(relay_agent.command.contains(&"agent".to_string()));
+        assert!(relay_agent
+            .command
+            .iter()
+            .any(|value| value.ends_with("relay-agent.json")));
+        assert!(relay_agent
+            .command
+            .iter()
+            .any(|value| value.ends_with("relay-agent.join-token")));
+        assert!(relay_agent
+            .command
+            .windows(2)
+            .any(|values| values[0] == "--relay-admission-bearer-token-path"
                 && values[1] == output_relay_admission_token_path.display().to_string()));
         let relay_admission_token =
             read_init_relay_admission_token(output_relay_admission_token_path)?;
