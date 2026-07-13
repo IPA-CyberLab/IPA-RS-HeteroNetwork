@@ -488,6 +488,53 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered rootless Compose config unexpectedly kept the TUN device mount"
     );
 
+    let rootless_dataplane_compose = ComposeProject {
+        repo_root: rootless_compose.repo_root.clone(),
+        project_name: format!("ipars-config-{}", unique_suffix()?),
+        compose_files: vec![
+            PathBuf::from("docker/compose.yaml"),
+            PathBuf::from("docker/compose.rootless.yaml"),
+            PathBuf::from("docker/compose.rootless-dataplane.yaml"),
+        ],
+        docker_socket: temp_dir.join("rootless-dataplane-docker.sock"),
+        extra_env: rootless_compose.extra_env.clone(),
+    };
+    let rendered = run_compose(&rootless_dataplane_compose, ["config"])?;
+    let rendered =
+        String::from_utf8(rendered.stdout).context("rootless dataplane config was not UTF-8")?;
+    assert_rendered_compose_env(
+        &rendered,
+        &[
+            ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
+            ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-boringtun"),
+            ("IPARS_AGENT_ROUTE_BACKEND", "command"),
+            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
+            ("IPARS_AGENT_DISABLE_PEER_PROBE", "false"),
+        ],
+    )?;
+    anyhow::ensure!(
+        rendered.contains("- NET_ADMIN"),
+        "rendered rootless dataplane Compose config did not grant NET_ADMIN"
+    );
+    anyhow::ensure!(
+        rendered.contains("source: /dev/net/tun") && rendered.contains("target: /dev/net/tun"),
+        "rendered rootless dataplane Compose config did not mount /dev/net/tun"
+    );
+    for forbidden in [
+        "IPARS_DOCKER_API_SOCKET:",
+        "IPARS_DOCKER_NETWORKS:",
+        "IPARS_DOCKER_CONTAINER_NAMESPACE:",
+        "IPARS_DOCKER_CONTAINER_CIDRS:",
+        "IPARS_AGENT_RELAY_FORWARDER_",
+        "target: /run/ipars/docker.sock",
+    ] {
+        anyhow::ensure!(
+            !rendered.contains(forbidden),
+            "rendered rootless dataplane Compose config retained forbidden setting {forbidden}\n{rendered}"
+        );
+    }
+
     let compose = ComposeProject {
         repo_root,
         project_name: format!("ipars-smoke-{}", unique_suffix()?),
