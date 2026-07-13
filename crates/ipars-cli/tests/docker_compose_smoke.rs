@@ -777,7 +777,9 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "control-plane",
             "control-plane-b",
             "signal",
+            "signal-b",
             "stun",
+            "stun-b",
         ],
     )?;
     let bootstrap_ip = compose_service_ipv4(&compose, "control-plane")?;
@@ -790,6 +792,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "--build",
             "agent",
             "agent-b",
+            "agent-failover",
             "workload-a",
             "workload-b",
             "workload-a-v6",
@@ -850,8 +853,19 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "dataplane Compose config did not render two production Agent backends\n{rendered}"
     );
     anyhow::ensure!(
+        rendered
+            .matches("IPARS_AGENT_RUNTIME_BACKEND: dry-run")
+            .count()
+            == 1,
+        "dataplane Compose config did not render one post-failover dry-run Agent backend\n{rendered}"
+    );
+    anyhow::ensure!(
         !rendered.contains("/dev/net/tun"),
         "dataplane Compose config unexpectedly mounted /dev/net/tun\n{rendered}"
+    );
+    anyhow::ensure!(
+        !rendered.contains("IPARS_AGENT_SIGNAL_URL"),
+        "dataplane Compose config unexpectedly pinned an Agent to one Signal service\n{rendered}"
     );
     anyhow::ensure!(
         rendered
@@ -888,7 +902,9 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "control-plane",
             "control-plane-b",
             "signal",
+            "signal-b",
             "stun",
+            "stun-b",
             "agent",
             "agent-b",
             "workload-a",
@@ -1015,7 +1031,9 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "postgres",
             "control-plane-b",
             "signal",
+            "signal-b",
             "stun",
+            "stun-b",
             "agent",
             "agent-b",
             "workload-a",
@@ -1029,6 +1047,18 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "agent",
         "http://control-plane-b:8443/healthz",
         "secondary control-plane health",
+    )?;
+    wait_for_compose_http(
+        &compose,
+        "agent",
+        "http://control-plane-b:9443/healthz",
+        "secondary signal health",
+    )?;
+    wait_for_compose_http(
+        &compose,
+        "agent",
+        "http://control-plane-b:3479/healthz",
+        "secondary STUN health",
     )?;
 
     replace_docker_bridge_network(
@@ -1051,6 +1081,58 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         workload_a_v6_ip,
         workload_b_v6_ip,
     )?;
+
+    run_compose_with_diagnostics(
+        &compose,
+        [
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "--wait",
+            "--wait-timeout",
+            "90",
+            "agent-failover",
+        ],
+    )?;
+    assert_compose_service_not_running(&compose, "control-plane")?;
+    assert_compose_services_running(&compose, &["control-plane-b", "agent-failover"])?;
+    let (failover_agent_id, failover_agent_vpn_ip) =
+        compose_dataplane_agent_status(&compose, "agent-failover")?;
+    anyhow::ensure!(
+        failover_agent_id != agent_id && failover_agent_id != agent_b_id,
+        "post-failover Agent unexpectedly reused an existing node ID {failover_agent_id}"
+    );
+    anyhow::ensure!(
+        failover_agent_vpn_ip != agent_vpn_ip && failover_agent_vpn_ip != agent_b_vpn_ip,
+        "post-failover Agent unexpectedly reused an existing VPN IP {failover_agent_vpn_ip}"
+    );
+    assert_compose_agent_peer_map(&compose, "agent-failover", 9780, &agent_id)?;
+    assert_compose_agent_peer_map(&compose, "agent-failover", 9780, &agent_b_id)?;
+    assert_compose_agent_peer_activity(&compose, "agent-failover", 9780, &agent_id)?;
+    assert_compose_agent_path(
+        &compose,
+        "agent-failover",
+        9780,
+        &failover_agent_id,
+        &agent_id,
+    )?;
+    wait_for_ipars_control_plane_query(
+        &compose,
+        "secondary control-plane peer map for post-failover Agent",
+        "agent-failover",
+        &[
+            "peers",
+            "--control-plane-url",
+            "http://control-plane-b:8443",
+            "--node-id",
+            &failover_agent_id,
+        ],
+        |value| {
+            ensure_peer_map_contains(value, &agent_id)?;
+            ensure_peer_map_contains(value, &agent_b_id)
+        },
+    )?;
     Ok(())
 }
 
@@ -1064,7 +1146,9 @@ fn generated_dataplane_join_token(
     let control_plane = format!("http://{bootstrap_ip}:8443");
     let control_plane_b = "http://control-plane-b:8443";
     let signal = format!("http://{bootstrap_ip}:9443");
+    let signal_b = "http://control-plane-b:9443";
     let stun = format!("udp://{bootstrap_ip}:3478");
+    let stun_b = "udp://control-plane-b:3478";
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipars"));
     command
         .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
@@ -1080,13 +1164,15 @@ fn generated_dataplane_join_token(
             "--unlimited-uses",
             "--allowed-route",
             "100.64.0.0/10",
-            "--signal-bootstrap",
-            &signal,
-            "--stun-bootstrap",
-            &stun,
         ]);
     for endpoint in [&control_plane, control_plane_b] {
         command.arg("--control-plane-bootstrap").arg(endpoint);
+    }
+    for endpoint in [&signal, signal_b] {
+        command.arg("--signal-bootstrap").arg(endpoint);
+    }
+    for endpoint in [&stun, stun_b] {
+        command.arg("--stun-bootstrap").arg(endpoint);
     }
     for route in allowed_routes {
         command.arg("--allowed-route").arg(route.to_string());
@@ -3134,6 +3220,7 @@ where
     let agent_state_path = match service {
         "agent" => "/var/lib/ipars/agent.json",
         "agent-b" => "/var/lib/ipars/agent-b.json",
+        "agent-failover" => "/var/lib/ipars/agent-failover.json",
         _ => anyhow::bail!("service {service} does not have an agent identity state path"),
     };
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -3309,7 +3396,7 @@ fn compose_exec_post_json(
 
 fn add_api_bearer_header(command: &mut Command, service: &str) {
     let token = match service {
-        "agent" | "agent-b" => Some(COMPOSE_AGENT_API_BEARER_TOKEN),
+        "agent" | "agent-b" | "agent-failover" => Some(COMPOSE_AGENT_API_BEARER_TOKEN),
         "control-plane" => Some(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
         "signal" => Some(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         "stun" => Some(COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN),

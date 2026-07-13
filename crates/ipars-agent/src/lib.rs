@@ -1409,7 +1409,10 @@ impl AgentRuntime {
         let observations = UdpStunProbe
             .observe_binding_many(local_bind, &stun_servers)
             .await?;
-        let filtering_observations = match stun_servers.first().copied() {
+        let filtering_observations = match observations
+            .first()
+            .map(|observation| observation.stun_server)
+        {
             Some(stun_server) => UdpStunProbe
                 .observe_filtering(local_bind, stun_server)
                 .await

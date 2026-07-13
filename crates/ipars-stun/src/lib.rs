@@ -72,8 +72,18 @@ impl UdpStunProbe {
         validate_stun_servers(stun_servers)?;
         let socket = UdpSocket::bind(local_bind).await?;
         let mut observations = Vec::with_capacity(stun_servers.len());
+        let mut first_error = None;
         for stun_server in stun_servers {
-            observations.push(observe_binding_with_socket(&socket, *stun_server).await?);
+            match observe_binding_with_socket(&socket, *stun_server).await {
+                Ok(observation) => observations.push(observation),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if observations.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                StunError::InvalidResponse("no STUN server returned an observation".to_string())
+            }));
         }
         Ok(observations)
     }
@@ -1320,6 +1330,28 @@ mod tests {
             observations[0].reflexive_addr,
             observations[1].reflexive_addr
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_probe_keeps_observations_when_an_earlier_server_is_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let unavailable = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let unavailable_addr = unavailable.local_addr()?;
+        let available = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let available_addr = available.local_addr()?;
+        let available_task = tokio::spawn(async move { available.serve_once().await });
+
+        let observations = UdpStunProbe
+            .observe_binding_many(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                &[unavailable_addr, available_addr],
+            )
+            .await?;
+        available_task.await??;
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].stun_server, available_addr);
         Ok(())
     }
 
