@@ -15,6 +15,7 @@ ipars-types = { path = "../ipars-types" }
 netlink-sys.workspace = true
 nix.workspace = true
 rtnetlink.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

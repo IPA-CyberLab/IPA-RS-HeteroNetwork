@@ -18,8 +18,9 @@ use ipars_crypto::{
 };
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_route_manager::{
-    warn_if_linux_netns_is_current, with_netlink_namespace, LinuxNetlinkSocket,
-    LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan,
+    validate_route_plan, warn_if_linux_netns_is_current, with_netlink_namespace,
+    LinuxNetlinkSocket, LinuxNetworkNamespace, ManagedMainTableRoute, RouteManager,
+    RouteManagerError, RoutePlan,
 };
 use ipars_stun::{StunError, StunProbe, UdpStunProbe};
 use ipars_types::api::{
@@ -4958,8 +4959,59 @@ where
             None => None,
         };
 
+        let local_route_cidrs = match &self.lazy_runtime {
+            Some(runtime) => runtime
+                .local_advertised_routes()
+                .await
+                .into_iter()
+                .map(|route| route.cidr)
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        let selected_advertised_routes =
+            select_peer_advertised_routes(&desired_peers, &local_route_cidrs);
+        let mut desired_peer_routes = BTreeMap::new();
+        let mut routes = Vec::new();
+        for peer in &desired_peers {
+            let peer_routes = peer_routes_for_record(
+                peer,
+                selected_advertised_routes
+                    .get(&peer.node_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?;
+            routes.extend(peer_routes.iter().cloned());
+            desired_peer_routes.insert(peer.node_id.clone(), peer_routes);
+        }
+        let desired_managed_routes = routes
+            .iter()
+            .map(|route| ManagedMainTableRoute::current(route.cidr, route.metric))
+            .collect::<BTreeSet<_>>();
+        let desired_route_plan = RoutePlan {
+            interface: self.interface.clone(),
+            routes,
+            policy_rules: Vec::new(),
+        };
+        validate_route_plan(&desired_route_plan)?;
+        let actual_managed_routes = self
+            .route_manager
+            .managed_main_table_routes(&self.interface)
+            .await?;
+
         let mut peers_removed = 0;
         let mut routes_removed = 0;
+        if let Some(actual_managed_routes) = &actual_managed_routes {
+            let stale_routes = actual_managed_routes
+                .difference(&desired_managed_routes)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !stale_routes.is_empty() {
+                self.route_manager
+                    .remove_managed_main_table_routes(&self.interface, &stale_routes)
+                    .await?;
+                routes_removed += stale_routes.len();
+            }
+        }
         let mut removed_public_keys = BTreeSet::new();
         for peer in peers_to_remove {
             let applied_public_key = self.applied_peers.read().await.get(&peer).cloned();
@@ -4973,7 +5025,7 @@ where
                 .get(&peer)
                 .cloned()
                 .unwrap_or_default();
-            if !routes_to_remove.is_empty() {
+            if actual_managed_routes.is_none() && !routes_to_remove.is_empty() {
                 self.route_manager
                     .remove_routes(RoutePlan {
                         interface: self.interface.clone(),
@@ -5009,30 +5061,19 @@ where
                 peers_removed += 1;
             }
         }
-        let local_route_cidrs = match &self.lazy_runtime {
-            Some(runtime) => runtime
-                .local_advertised_routes()
-                .await
-                .into_iter()
-                .map(|route| route.cidr)
-                .collect(),
-            None => BTreeSet::new(),
-        };
-        let selected_advertised_routes =
-            select_peer_advertised_routes(&desired_peers, &local_route_cidrs);
-
-        let mut routes = Vec::new();
-        let mut peer_routes = BTreeMap::new();
         let mut peers_applied = 0;
 
         for peer in desired_peers {
-            let desired_routes = peer_routes_for_record(
-                peer,
-                selected_advertised_routes
+            let desired_routes =
+                desired_peer_routes
                     .get(&peer.node_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            )?;
+                    .cloned()
+                    .ok_or_else(|| {
+                        AgentError::RoutePlanning(format!(
+                            "missing desired route plan for peer {}",
+                            peer.node_id
+                        ))
+                    })?;
             let allowed_ip = peer_overlay_cidr(&peer.vpn_ip);
             let mut allowed_ips = vec![allowed_ip];
             allowed_ips.extend(
@@ -5067,7 +5108,7 @@ where
                 .into_iter()
                 .filter(|route| !desired_routes.contains(route))
                 .collect::<Vec<_>>();
-            if !routes_to_remove.is_empty() {
+            if actual_managed_routes.is_none() && !routes_to_remove.is_empty() {
                 self.route_manager
                     .remove_routes(RoutePlan {
                         interface: self.interface.clone(),
@@ -5080,25 +5121,13 @@ where
                     applied.retain(|route| !routes_to_remove.contains(route));
                 }
             }
-
-            routes.extend(desired_routes.iter().cloned());
-            peer_routes.insert(peer.node_id.clone(), desired_routes);
         }
 
-        let routes_applied = routes.len();
+        let routes_applied = desired_route_plan.routes.len();
         if routes_applied > 0 {
-            self.route_manager
-                .apply_routes(RoutePlan {
-                    interface: self.interface.clone(),
-                    routes,
-                    policy_rules: Vec::new(),
-                })
-                .await?;
-            let mut applied_routes = self.applied_routes.write().await;
-            for (peer, routes) in peer_routes {
-                applied_routes.insert(peer, routes);
-            }
+            self.route_manager.apply_routes(desired_route_plan).await?;
         }
+        *self.applied_routes.write().await = desired_peer_routes;
 
         if let Some(runtime) = &self.lazy_runtime {
             runtime.record_peer_map_snapshot(peer_map).await;
@@ -6009,17 +6038,67 @@ mod tests {
     struct RecordingRouteManager {
         applied: tokio::sync::RwLock<Vec<RoutePlan>>,
         removed: tokio::sync::RwLock<Vec<RoutePlan>>,
+        managed_inventory: tokio::sync::RwLock<Option<BTreeSet<ManagedMainTableRoute>>>,
+        managed_removed: tokio::sync::RwLock<Vec<BTreeSet<ManagedMainTableRoute>>>,
+        fail_managed_inventory: bool,
+    }
+
+    impl RecordingRouteManager {
+        fn with_managed_inventory(routes: impl IntoIterator<Item = ManagedMainTableRoute>) -> Self {
+            Self {
+                managed_inventory: tokio::sync::RwLock::new(Some(routes.into_iter().collect())),
+                ..Self::default()
+            }
+        }
+
+        fn with_failed_managed_inventory() -> Self {
+            Self {
+                fail_managed_inventory: true,
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait]
     impl RouteManager for RecordingRouteManager {
         async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
+            if let Some(inventory) = self.managed_inventory.write().await.as_mut() {
+                inventory.extend(
+                    plan.routes
+                        .iter()
+                        .map(|route| ManagedMainTableRoute::current(route.cidr, route.metric)),
+                );
+            }
             self.applied.write().await.push(plan);
             Ok(())
         }
 
         async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
             self.removed.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn managed_main_table_routes(
+            &self,
+            _interface: &str,
+        ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
+            if self.fail_managed_inventory {
+                return Err(RouteManagerError::Backend(
+                    "injected managed route inventory failure".to_string(),
+                ));
+            }
+            Ok(self.managed_inventory.read().await.clone())
+        }
+
+        async fn remove_managed_main_table_routes(
+            &self,
+            _interface: &str,
+            routes: &BTreeSet<ManagedMainTableRoute>,
+        ) -> Result<(), RouteManagerError> {
+            if let Some(inventory) = self.managed_inventory.write().await.as_mut() {
+                inventory.retain(|route| !routes.contains(route));
+            }
+            self.managed_removed.write().await.push(routes.clone());
             Ok(())
         }
 
@@ -8447,6 +8526,85 @@ mod tests {
         assert_eq!(plan.routes[0].cidr, "100.64.0.2/32".parse()?);
         assert_eq!(plan.routes[0].metric, 10);
         assert_eq!(plan.routes[1].cidr, "10.10.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_removes_unknown_managed_route_after_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let desired = ManagedMainTableRoute::current("100.64.0.70/32".parse()?, 10);
+        let stale = ManagedMainTableRoute::current("10.70.0.0/16".parse()?, 50);
+        let route_manager = RecordingRouteManager::with_managed_inventory([desired, stale.clone()]);
+        let applier =
+            PeerMapApplier::new("ipars0", MemoryWireGuardBackend::default(), route_manager);
+        let peer_id = NodeId::from_string("peer-after-restart");
+
+        let summary = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_record(
+                    peer_id.clone(),
+                    "100.64.0.70".parse()?,
+                    "wg-peer-after-restart",
+                    Vec::new(),
+                    Vec::new(),
+                )],
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.routes_removed, 1);
+        assert_eq!(summary.routes_applied, 1);
+        assert_eq!(
+            applier
+                .route_manager
+                .managed_removed
+                .read()
+                .await
+                .as_slice(),
+            &[BTreeSet::from([stale])]
+        );
+        assert!(applier.wireguard.peers.read().await.contains_key(&peer_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_route_inventory_failure_prevents_dataplane_mutation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::with_failed_managed_inventory(),
+        );
+
+        let result = applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer_record(
+                    NodeId::from_string("peer-inventory-failure"),
+                    "100.64.0.71".parse()?,
+                    "wg-peer-inventory-failure",
+                    Vec::new(),
+                    Vec::new(),
+                )],
+                generated_at: Utc::now(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::RouteManager(RouteManagerError::Backend(message)))
+                if message.contains("injected managed route inventory failure")
+        ));
+        assert!(applier.wireguard.peers.read().await.is_empty());
+        assert!(applier.route_manager.applied.read().await.is_empty());
+        assert!(applier.route_manager.removed.read().await.is_empty());
+        assert!(applier
+            .route_manager
+            .managed_removed
+            .read()
+            .await
+            .is_empty());
         Ok(())
     }
 

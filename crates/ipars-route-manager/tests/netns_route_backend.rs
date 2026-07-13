@@ -6,8 +6,8 @@ use std::{fs, path::PathBuf};
 
 use ipars_route_manager::{
     DockerNetworkIntent, KubernetesUnderlayIntent, LinuxNetlinkRouteManager, LinuxNetworkNamespace,
-    LinuxRouteManager, NamespacedLinuxRouteCommandRunner, RouteManager, RoutePlan,
-    SystemRouteCommandRunner,
+    LinuxRouteManager, ManagedMainTableRoute, NamespacedLinuxRouteCommandRunner, RouteManager,
+    RoutePlan, SystemRouteCommandRunner,
 };
 use ipars_types::{NodeId, Route};
 
@@ -30,7 +30,7 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
 
     let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
     let manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
-        namespace,
+        namespace.clone(),
         SystemRouteCommandRunner,
     ));
     let plan = RoutePlan {
@@ -61,7 +61,24 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
     assert!(route_after_apply.contains("dev lo"));
     assert!(route_after_apply.contains("metric 77"));
 
-    manager.remove_routes(plan).await?;
+    let restarted_manager = LinuxRouteManager::new(NamespacedLinuxRouteCommandRunner::new(
+        namespace,
+        SystemRouteCommandRunner,
+    ));
+    let inventory = restarted_manager
+        .managed_main_table_routes("lo")
+        .await?
+        .ok_or("command route inventory unexpectedly unavailable")?;
+    assert_eq!(
+        inventory,
+        BTreeSet::from([ManagedMainTableRoute::current(
+            "198.51.100.0/24".parse()?,
+            77,
+        )])
+    );
+    restarted_manager
+        .remove_managed_main_table_routes("lo", &inventory)
+        .await?;
     let route_after_remove = command_output(
         "ip",
         [
@@ -260,7 +277,7 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
     )?;
 
     let namespace = LinuxNetworkNamespace::from_name(namespace_name.as_str())?;
-    let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace);
+    let manager = LinuxNetlinkRouteManager::new_in_namespace(namespace.clone());
     let plan = RoutePlan {
         interface: "lo".to_string(),
         routes: vec![Route {
@@ -289,7 +306,21 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
     assert!(route_after_apply.contains("dev lo"));
     assert!(route_after_apply.contains("metric 78"));
 
-    manager.remove_routes(plan).await?;
+    let restarted_manager = LinuxNetlinkRouteManager::new_in_namespace(namespace);
+    let inventory = restarted_manager
+        .managed_main_table_routes("lo")
+        .await?
+        .ok_or("netlink route inventory unexpectedly unavailable")?;
+    assert_eq!(
+        inventory,
+        BTreeSet::from([ManagedMainTableRoute::current(
+            "198.51.101.0/24".parse()?,
+            78,
+        )])
+    );
+    restarted_manager
+        .remove_managed_main_table_routes("lo", &inventory)
+        .await?;
     let route_after_remove = command_output(
         "ip",
         [

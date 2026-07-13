@@ -16,7 +16,7 @@ use ipnet::IpNet;
 use netlink_sys::{AsyncSocket, Socket, SocketAddr};
 use nix::sched::CloneFlags;
 use rtnetlink::packet_route::{
-    route::RouteMessage,
+    route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
     rule::{RuleAction, RuleAttribute, RuleMessage},
     AddressFamily,
 };
@@ -36,6 +36,11 @@ const MAX_LINUX_ROUTE_COMMAND_PROGRAM_BYTES: usize = 4096;
 const MAX_LINUX_ROUTE_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_ROUTE_COMMAND_ARG_BYTES: usize = 128 * 1024;
 const MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
+/// Numeric Linux route protocol reserved for routes owned by IPARS.
+pub const IPARS_MANAGED_ROUTE_PROTOCOL: u8 = 240;
+const LINUX_ROUTE_PROTOCOL_BOOT: u8 = 3;
+const LINUX_ROUTE_PROTOCOL_STATIC: u8 = 4;
+const LINUX_MAIN_ROUTE_TABLE: u32 = 254;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -60,6 +65,23 @@ pub struct RoutePlan {
     pub interface: String,
     pub routes: Vec<Route>,
     pub policy_rules: Vec<PolicyRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ManagedMainTableRoute {
+    pub cidr: IpNet,
+    pub metric: u32,
+    pub protocol: u8,
+}
+
+impl ManagedMainTableRoute {
+    pub fn current(cidr: IpNet, metric: u32) -> Self {
+        Self {
+            cidr,
+            metric,
+            protocol: IPARS_MANAGED_ROUTE_PROTOCOL,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +554,15 @@ pub struct KubernetesUnderlayIntent {
 pub trait RouteManager: Send + Sync {
     async fn apply_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError>;
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError>;
+    async fn managed_main_table_routes(
+        &self,
+        interface: &str,
+    ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError>;
+    async fn remove_managed_main_table_routes(
+        &self,
+        interface: &str,
+        routes: &BTreeSet<ManagedMainTableRoute>,
+    ) -> Result<(), RouteManagerError>;
     async fn apply_docker_intent(
         &self,
         intent: DockerNetworkIntent,
@@ -640,6 +671,44 @@ pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
             return Err(invalid_route_plan(format!(
                 "route plan must not reuse policy rule priority {}",
                 rule.priority
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_main_table_routes(
+    interface: &str,
+    routes: &BTreeSet<ManagedMainTableRoute>,
+) -> Result<(), RouteManagerError> {
+    validate_linux_interface_name(interface).map_err(invalid_route_plan)?;
+    for route in routes {
+        if route.metric == 0 {
+            return Err(invalid_route_plan(format!(
+                "managed route {} metric must be greater than zero",
+                route.cidr
+            )));
+        }
+        if !matches!(
+            route.protocol,
+            IPARS_MANAGED_ROUTE_PROTOCOL | LINUX_ROUTE_PROTOCOL_BOOT | LINUX_ROUTE_PROTOCOL_STATIC
+        ) {
+            return Err(invalid_route_plan(format!(
+                "managed route {} uses unsupported protocol {}",
+                route.cidr, route.protocol
+            )));
+        }
+        if let Some(reason) = restricted_route_cidr_reason(&route.cidr) {
+            return Err(invalid_route_plan(format!(
+                "managed route {} must not include {reason} CIDR",
+                route.cidr
+            )));
+        }
+        let canonical = route.cidr.trunc();
+        if route.cidr != canonical {
+            return Err(invalid_route_plan(format!(
+                "managed route {} must use canonical CIDR {canonical}",
+                route.cidr
             )));
         }
     }
@@ -1018,6 +1087,12 @@ impl LinuxRouteCommand {
 #[async_trait]
 pub trait LinuxRouteCommandRunner: Send + Sync {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError>;
+
+    async fn output(&self, _command: LinuxRouteCommand) -> Result<Vec<u8>, RouteManagerError> {
+        Err(RouteManagerError::Backend(
+            "linux route command runner does not support bounded stdout capture".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1027,6 +1102,15 @@ pub struct SystemRouteCommandRunner;
 impl LinuxRouteCommandRunner for SystemRouteCommandRunner {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
         run_system_route_command(
+            command,
+            DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT,
+            DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .await
+    }
+
+    async fn output(&self, command: LinuxRouteCommand) -> Result<Vec<u8>, RouteManagerError> {
+        run_system_route_command_stdout(
             command,
             DEFAULT_SYSTEM_ROUTE_COMMAND_TIMEOUT,
             DEFAULT_SYSTEM_ROUTE_COMMAND_OUTPUT_MAX_BYTES,
@@ -1065,6 +1149,10 @@ impl LinuxRouteCommandRunner for TimedSystemRouteCommandRunner {
     async fn run(&self, command: LinuxRouteCommand) -> Result<(), RouteManagerError> {
         run_system_route_command(command, self.timeout, self.output_max_bytes).await
     }
+
+    async fn output(&self, command: LinuxRouteCommand) -> Result<Vec<u8>, RouteManagerError> {
+        run_system_route_command_stdout(command, self.timeout, self.output_max_bytes).await
+    }
 }
 
 async fn run_system_route_command(
@@ -1085,6 +1173,31 @@ async fn run_system_route_command(
         "{command_label} failed: {}",
         command_stderr_message(&output.stderr)
     )))
+}
+
+async fn run_system_route_command_stdout(
+    command: LinuxRouteCommand,
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<Vec<u8>, RouteManagerError> {
+    validate_system_route_command_runtime_bounds(timeout, output_max_bytes)?;
+    validate_linux_route_command(&command)?;
+    let command_label = command_label(&command.program, &command.args);
+    let output =
+        run_route_command_output(command, timeout, output_max_bytes, &command_label).await?;
+    if !output.status.success() {
+        return Err(RouteManagerError::Backend(format!(
+            "{command_label} failed: {}",
+            command_stderr_message(&output.stderr)
+        )));
+    }
+    if output.stdout.truncated {
+        return Err(RouteManagerError::Backend(format!(
+            "{command_label} stdout exceeded {} bytes",
+            output.stdout.limit
+        )));
+    }
+    Ok(output.stdout.bytes)
 }
 
 fn validate_system_route_command_runtime_bounds(
@@ -1540,10 +1653,14 @@ async fn collect_bounded_route_command_output(
         }
     };
 
-    let _stdout = collect_route_command_output_task(stdout_task).await?;
+    let stdout = collect_route_command_output_task(stdout_task).await?;
     let stderr = collect_route_command_output_task(stderr_task).await?;
 
-    Ok(BoundedRouteCommandOutput { status, stderr })
+    Ok(BoundedRouteCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn configure_route_command_process_group(_command: &mut Command) {
@@ -1601,6 +1718,7 @@ async fn collect_route_command_output_task(
 #[derive(Debug)]
 struct BoundedRouteCommandOutput {
     status: ExitStatus,
+    stdout: LimitedRouteCommandOutput,
     stderr: LimitedRouteCommandOutput,
 }
 
@@ -1708,6 +1826,13 @@ where
         warn_if_linux_netns_is_current(&self.namespace, "route command runner");
         self.inner.run(command.in_namespace(&self.namespace)).await
     }
+
+    async fn output(&self, command: LinuxRouteCommand) -> Result<Vec<u8>, RouteManagerError> {
+        warn_if_linux_netns_is_current(&self.namespace, "route command runner");
+        self.inner
+            .output(command.in_namespace(&self.namespace))
+            .await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1768,16 +1893,56 @@ where
             route.cidr.to_string(),
             "dev".to_string(),
             plan.interface.clone(),
+            "protocol".to_string(),
+            IPARS_MANAGED_ROUTE_PROTOCOL.to_string(),
         ];
         if let Some(table) = table {
             args.push("table".to_string());
             args.push(table.to_string());
         }
-        if action == "replace" {
-            args.push("metric".to_string());
-            args.push(route.metric.to_string());
-        }
+        args.push("metric".to_string());
+        args.push(route.metric.to_string());
         LinuxRouteCommand::new("ip", args)
+    }
+
+    fn managed_route_inventory_command(interface: &str, ipv6: bool) -> LinuxRouteCommand {
+        LinuxRouteCommand::new(
+            "ip",
+            [
+                "-N".to_string(),
+                "-j".to_string(),
+                "-details".to_string(),
+                if ipv6 { "-6" } else { "-4" }.to_string(),
+                "route".to_string(),
+                "show".to_string(),
+                "table".to_string(),
+                LINUX_MAIN_ROUTE_TABLE.to_string(),
+                "dev".to_string(),
+                interface.to_string(),
+            ],
+        )
+    }
+
+    fn remove_managed_route_command(
+        interface: &str,
+        route: &ManagedMainTableRoute,
+    ) -> LinuxRouteCommand {
+        LinuxRouteCommand::new(
+            "ip",
+            [
+                "route".to_string(),
+                "del".to_string(),
+                route.cidr.to_string(),
+                "dev".to_string(),
+                interface.to_string(),
+                "protocol".to_string(),
+                route.protocol.to_string(),
+                "table".to_string(),
+                LINUX_MAIN_ROUTE_TABLE.to_string(),
+                "metric".to_string(),
+                route.metric.to_string(),
+            ],
+        )
     }
 
     fn policy_rule_command(action: &str, rule: &PolicyRule) -> LinuxRouteCommand {
@@ -1840,6 +2005,36 @@ where
         Ok(())
     }
 
+    async fn managed_main_table_routes(
+        &self,
+        interface: &str,
+    ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
+        validate_linux_interface_name(interface).map_err(invalid_route_plan)?;
+        let mut routes = BTreeSet::new();
+        for ipv6 in [false, true] {
+            let output = self
+                .runner
+                .output(Self::managed_route_inventory_command(interface, ipv6))
+                .await?;
+            routes.extend(parse_managed_main_table_routes(&output, interface)?);
+        }
+        Ok(Some(routes))
+    }
+
+    async fn remove_managed_main_table_routes(
+        &self,
+        interface: &str,
+        routes: &BTreeSet<ManagedMainTableRoute>,
+    ) -> Result<(), RouteManagerError> {
+        validate_managed_main_table_routes(interface, routes)?;
+        for route in routes {
+            self.runner
+                .run(Self::remove_managed_route_command(interface, route))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn apply_docker_intent(
         &self,
         intent: DockerNetworkIntent,
@@ -1857,6 +2052,168 @@ where
         self.apply_routes(plan.clone()).await?;
         Ok(plan)
     }
+}
+
+fn parse_managed_main_table_routes(
+    output: &[u8],
+    interface: &str,
+) -> Result<BTreeSet<ManagedMainTableRoute>, RouteManagerError> {
+    let rows = serde_json::from_slice::<Vec<serde_json::Value>>(output).map_err(|error| {
+        RouteManagerError::Backend(format!(
+            "failed to parse numeric JSON route inventory for interface `{interface}`: {error}"
+        ))
+    })?;
+    let mut routes = BTreeSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        let object = row.as_object().ok_or_else(|| {
+            RouteManagerError::Backend(format!(
+                "route inventory row {index} for interface `{interface}` must be a JSON object"
+            ))
+        })?;
+        let Some(protocol_value) = object.get("protocol") else {
+            continue;
+        };
+        let protocol = parse_numeric_json_u32(protocol_value, "protocol", index)?;
+        let protocol = u8::try_from(protocol).map_err(|_| {
+            RouteManagerError::Backend(format!("route inventory row {index} protocol exceeds u8"))
+        })?;
+        if !matches!(
+            protocol,
+            IPARS_MANAGED_ROUTE_PROTOCOL | LINUX_ROUTE_PROTOCOL_BOOT | LINUX_ROUTE_PROTOCOL_STATIC
+        ) {
+            continue;
+        }
+
+        match parse_managed_main_table_route_row(object, interface, index, protocol) {
+            Ok(Some(route)) => {
+                if !routes.insert(route.clone()) {
+                    return Err(RouteManagerError::Backend(format!(
+                        "route inventory repeats managed route {} metric {} protocol {}",
+                        route.cidr, route.metric, route.protocol
+                    )));
+                }
+            }
+            Ok(None) => {}
+            Err(error) if protocol != IPARS_MANAGED_ROUTE_PROTOCOL => {
+                tracing::debug!(
+                    %error,
+                    route_inventory_row = index,
+                    route_protocol = protocol,
+                    "ignored non-IPARS legacy route that does not match the managed route shape"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    validate_managed_main_table_routes(interface, &routes)?;
+    Ok(routes)
+}
+
+fn parse_managed_main_table_route_row(
+    object: &serde_json::Map<String, serde_json::Value>,
+    interface: &str,
+    index: usize,
+    protocol: u8,
+) -> Result<Option<ManagedMainTableRoute>, RouteManagerError> {
+    if let Some(value) = object.get("type") {
+        let kind = parse_numeric_json_u32(value, "type", index)?;
+        if kind != 1 {
+            return Err(RouteManagerError::Backend(format!(
+                "route inventory row {index} must be a unicast route, found type {kind}"
+            )));
+        }
+    }
+    if let Some(value) = object.get("table") {
+        let table = parse_numeric_json_u32(value, "table", index)?;
+        if table != LINUX_MAIN_ROUTE_TABLE {
+            return Err(RouteManagerError::Backend(format!(
+                "route inventory row {index} unexpectedly uses table {table}"
+            )));
+        }
+    }
+    if let Some(device) = object.get("dev").and_then(serde_json::Value::as_str) {
+        if device != interface {
+            return Err(RouteManagerError::Backend(format!(
+                "route inventory row {index} unexpectedly uses interface `{device}`"
+            )));
+        }
+    }
+    if ["gateway", "via", "multipath", "nexthops"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return Err(RouteManagerError::Backend(format!(
+            "route inventory row {index} is not a direct interface route"
+        )));
+    }
+
+    let destination = object
+        .get("dst")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            RouteManagerError::Backend(format!(
+                "route inventory row {index} is missing a string destination"
+            ))
+        })?;
+    if destination == "default" {
+        return Err(RouteManagerError::Backend(format!(
+            "route inventory row {index} must not be a default route"
+        )));
+    }
+    let cidr = parse_inventory_destination(destination).map_err(|error| {
+        RouteManagerError::Backend(format!(
+            "route inventory row {index} has invalid destination `{destination}`: {error}"
+        ))
+    })?;
+    let metric = object
+        .get("metric")
+        .ok_or_else(|| {
+            RouteManagerError::Backend(format!("route inventory row {index} is missing a metric"))
+        })
+        .and_then(|value| parse_numeric_json_u32(value, "metric", index))?;
+    if metric == 0 {
+        return Err(RouteManagerError::Backend(format!(
+            "route inventory row {index} metric must be greater than zero"
+        )));
+    }
+    Ok(Some(ManagedMainTableRoute {
+        cidr,
+        metric,
+        protocol,
+    }))
+}
+
+fn parse_numeric_json_u32(
+    value: &serde_json::Value,
+    field: &str,
+    index: usize,
+) -> Result<u32, RouteManagerError> {
+    if let Some(value) = value.as_u64() {
+        return u32::try_from(value).map_err(|_| {
+            RouteManagerError::Backend(format!(
+                "route inventory row {index} field `{field}` exceeds u32"
+            ))
+        });
+    }
+    if let Some(value) = value.as_str() {
+        return value.parse::<u32>().map_err(|error| {
+            RouteManagerError::Backend(format!(
+                "route inventory row {index} field `{field}` is not numeric: {error}"
+            ))
+        });
+    }
+    Err(RouteManagerError::Backend(format!(
+        "route inventory row {index} field `{field}` must be a numeric string or integer"
+    )))
+}
+
+fn parse_inventory_destination(value: &str) -> Result<IpNet, String> {
+    if value.contains('/') {
+        return value.parse::<IpNet>().map_err(|error| error.to_string());
+    }
+    let address = value.parse::<IpAddr>().map_err(|error| error.to_string())?;
+    let prefix = if address.is_ipv4() { 32 } else { 128 };
+    IpNet::new(address, prefix).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1950,6 +2307,72 @@ impl LinuxNetlinkRouteManager {
             })
     }
 
+    async fn delete_managed_main_table_route(
+        handle: &Handle,
+        route: &ManagedMainTableRoute,
+        interface_index: u32,
+    ) -> Result<(), RouteManagerError> {
+        let route_record = Route {
+            id: "managed-inventory-route".to_string(),
+            cidr: route.cidr,
+            advertised_by: NodeId::from_string("managed-route-inventory"),
+            via: None,
+            metric: route.metric,
+            tags: Default::default(),
+        };
+        handle
+            .route()
+            .del(netlink_route_message_with_protocol(
+                &route_record,
+                interface_index,
+                None,
+                route.protocol,
+            ))
+            .execute()
+            .await
+            .map_err(|error| {
+                RouteManagerError::Backend(format!(
+                    "failed to delete inventoried route {} through rtnetlink: {error}",
+                    route.cidr
+                ))
+            })
+    }
+
+    async fn query_managed_main_table_routes(
+        handle: &Handle,
+        interface_index: u32,
+    ) -> Result<BTreeSet<ManagedMainTableRoute>, RouteManagerError> {
+        let mut managed = BTreeSet::new();
+        let ipv4_request = RouteMessageBuilder::<Ipv4Addr>::new()
+            .protocol(RouteProtocol::Unspec)
+            .scope(RouteScope::Universe)
+            .kind(RouteType::Unspec)
+            .build();
+        let mut ipv4_routes = handle.route().get(ipv4_request).execute();
+        while let Some(message) = ipv4_routes.try_next().await.map_err(|error| {
+            RouteManagerError::Backend(format!(
+                "failed to query IPv4 route inventory through rtnetlink: {error}"
+            ))
+        })? {
+            insert_netlink_managed_route(&mut managed, &message, interface_index)?;
+        }
+
+        let ipv6_request = RouteMessageBuilder::<Ipv6Addr>::new()
+            .protocol(RouteProtocol::Unspec)
+            .scope(RouteScope::Universe)
+            .kind(RouteType::Unspec)
+            .build();
+        let mut ipv6_routes = handle.route().get(ipv6_request).execute();
+        while let Some(message) = ipv6_routes.try_next().await.map_err(|error| {
+            RouteManagerError::Backend(format!(
+                "failed to query IPv6 route inventory through rtnetlink: {error}"
+            ))
+        })? {
+            insert_netlink_managed_route(&mut managed, &message, interface_index)?;
+        }
+        Ok(managed)
+    }
+
     async fn add_rule(handle: &Handle, rule: &PolicyRule) -> Result<(), RouteManagerError> {
         let mut request = handle.rule().add();
         request
@@ -2011,6 +2434,32 @@ impl RouteManager for LinuxNetlinkRouteManager {
         Ok(())
     }
 
+    async fn managed_main_table_routes(
+        &self,
+        interface: &str,
+    ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
+        validate_linux_interface_name(interface).map_err(invalid_route_plan)?;
+        let handle = self.open_handle().await?;
+        let interface_index = Self::interface_index(&handle, interface).await?;
+        let routes = Self::query_managed_main_table_routes(&handle, interface_index).await?;
+        validate_managed_main_table_routes(interface, &routes)?;
+        Ok(Some(routes))
+    }
+
+    async fn remove_managed_main_table_routes(
+        &self,
+        interface: &str,
+        routes: &BTreeSet<ManagedMainTableRoute>,
+    ) -> Result<(), RouteManagerError> {
+        validate_managed_main_table_routes(interface, routes)?;
+        let handle = self.open_handle().await?;
+        let interface_index = Self::interface_index(&handle, interface).await?;
+        for route in routes {
+            Self::delete_managed_main_table_route(&handle, route, interface_index).await?;
+        }
+        Ok(())
+    }
+
     async fn apply_docker_intent(
         &self,
         intent: DockerNetworkIntent,
@@ -2030,12 +2479,124 @@ impl RouteManager for LinuxNetlinkRouteManager {
     }
 }
 
+fn insert_netlink_managed_route(
+    routes: &mut BTreeSet<ManagedMainTableRoute>,
+    message: &RouteMessage,
+    interface_index: u32,
+) -> Result<(), RouteManagerError> {
+    let protocol = u8::from(message.header.protocol);
+    if !matches!(
+        protocol,
+        IPARS_MANAGED_ROUTE_PROTOCOL | LINUX_ROUTE_PROTOCOL_BOOT | LINUX_ROUTE_PROTOCOL_STATIC
+    ) {
+        return Ok(());
+    }
+    let parsed = parse_netlink_managed_route(message, interface_index);
+    let route = match parsed {
+        Ok(Some(route)) => route,
+        Ok(None) => return Ok(()),
+        Err(error) if protocol != IPARS_MANAGED_ROUTE_PROTOCOL => {
+            tracing::debug!(
+                %error,
+                route_protocol = protocol,
+                "ignored non-IPARS legacy netlink route that does not match the managed route shape"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if !routes.insert(route.clone()) {
+        return Err(RouteManagerError::Backend(format!(
+            "netlink route inventory repeats managed route {} metric {} protocol {}",
+            route.cidr, route.metric, route.protocol
+        )));
+    }
+    Ok(())
+}
+
+fn parse_netlink_managed_route(
+    message: &RouteMessage,
+    interface_index: u32,
+) -> Result<Option<ManagedMainTableRoute>, RouteManagerError> {
+    let mut table = u32::from(message.header.table);
+    let mut output_interface = None;
+    let mut destination = None;
+    let mut metric = None;
+    let mut indirect = false;
+    for attribute in &message.attributes {
+        match attribute {
+            RouteAttribute::Table(value) => table = *value,
+            RouteAttribute::Oif(value) => output_interface = Some(*value),
+            RouteAttribute::Destination(value) => destination = Some(value),
+            RouteAttribute::Priority(value) => metric = Some(*value),
+            RouteAttribute::Gateway(_) | RouteAttribute::Via(_) | RouteAttribute::MultiPath(_) => {
+                indirect = true;
+            }
+            _ => {}
+        }
+    }
+    if table != LINUX_MAIN_ROUTE_TABLE || output_interface != Some(interface_index) {
+        return Ok(None);
+    }
+    if message.header.kind != RouteType::Unicast {
+        return Err(RouteManagerError::Backend(format!(
+            "managed netlink route must be unicast, found {:?}",
+            message.header.kind
+        )));
+    }
+    if indirect {
+        return Err(RouteManagerError::Backend(
+            "managed netlink route must be a direct interface route".to_string(),
+        ));
+    }
+    let destination = destination.ok_or_else(|| {
+        RouteManagerError::Backend("managed netlink route is missing a destination".to_string())
+    })?;
+    let address = match destination {
+        RouteAddress::Inet(address) => IpAddr::V4(*address),
+        RouteAddress::Inet6(address) => IpAddr::V6(*address),
+        _ => {
+            return Err(RouteManagerError::Backend(
+                "managed netlink route uses a non-IP destination".to_string(),
+            ));
+        }
+    };
+    let cidr = IpNet::new(address, message.header.destination_prefix_length).map_err(|error| {
+        RouteManagerError::Backend(format!(
+            "managed netlink route has an invalid destination prefix: {error}"
+        ))
+    })?;
+    let metric = metric.ok_or_else(|| {
+        RouteManagerError::Backend("managed netlink route is missing a metric".to_string())
+    })?;
+    if metric == 0 {
+        return Err(RouteManagerError::Backend(
+            "managed netlink route metric must be greater than zero".to_string(),
+        ));
+    }
+    Ok(Some(ManagedMainTableRoute {
+        cidr,
+        metric,
+        protocol: u8::from(message.header.protocol),
+    }))
+}
+
 fn netlink_route_message(route: &Route, interface_index: u32, table: Option<u32>) -> RouteMessage {
+    netlink_route_message_with_protocol(route, interface_index, table, IPARS_MANAGED_ROUTE_PROTOCOL)
+}
+
+fn netlink_route_message_with_protocol(
+    route: &Route,
+    interface_index: u32,
+    table: Option<u32>,
+    protocol: u8,
+) -> RouteMessage {
     match route.cidr {
         IpNet::V4(network) => {
             let mut builder = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
                 .destination_prefix(network.addr(), network.prefix_len())
                 .output_interface(interface_index)
+                .protocol(RouteProtocol::Other(protocol))
                 .priority(route.metric);
             if let Some(table) = table {
                 builder = builder.table_id(table);
@@ -2046,6 +2607,7 @@ fn netlink_route_message(route: &Route, interface_index: u32, table: Option<u32>
             let mut builder = RouteMessageBuilder::<std::net::Ipv6Addr>::new()
                 .destination_prefix(network.addr(), network.prefix_len())
                 .output_interface(interface_index)
+                .protocol(RouteProtocol::Other(protocol))
                 .priority(route.metric);
             if let Some(table) = table {
                 builder = builder.table_id(table);
@@ -2117,6 +2679,22 @@ impl RouteManager for DryRunLinuxRouteManager {
     async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
         validate_route_plan(&plan)?;
         Ok(())
+    }
+
+    async fn managed_main_table_routes(
+        &self,
+        interface: &str,
+    ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
+        validate_linux_interface_name(interface).map_err(invalid_route_plan)?;
+        Ok(None)
+    }
+
+    async fn remove_managed_main_table_routes(
+        &self,
+        interface: &str,
+        routes: &BTreeSet<ManagedMainTableRoute>,
+    ) -> Result<(), RouteManagerError> {
+        validate_managed_main_table_routes(interface, routes)
     }
 
     async fn apply_docker_intent(
@@ -3329,6 +3907,46 @@ mod tests {
     }
 
     #[test]
+    fn command_route_inventory_parses_current_and_legacy_direct_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let output = br#"[
+            {"type":"1","dst":"100.64.0.2","protocol":"240","scope":"0","metric":10},
+            {"type":"1","dst":"10.42.0.0/16","protocol":"3","scope":"253","metric":50},
+            {"type":"1","dst":"default","gateway":"192.0.2.1","protocol":"3","scope":"0"},
+            {"type":"1","dst":"100.64.0.0/10","protocol":"2","scope":"253"}
+        ]"#;
+
+        assert_eq!(
+            parse_managed_main_table_routes(output, "ipars0")?,
+            BTreeSet::from([
+                ManagedMainTableRoute::current("100.64.0.2/32".parse()?, 10),
+                ManagedMainTableRoute {
+                    cidr: "10.42.0.0/16".parse()?,
+                    metric: 50,
+                    protocol: LINUX_ROUTE_PROTOCOL_BOOT,
+                },
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_route_inventory_rejects_malformed_current_protocol_route() {
+        let error = match parse_managed_main_table_routes(
+            br#"[{"type":"1","dst":"100.64.0.2","protocol":"240"}]"#,
+            "ipars0",
+        ) {
+            Ok(routes) => panic!("malformed current route unexpectedly parsed: {routes:?}"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RouteManagerError::Backend(message) if message.contains("missing a metric")
+        ));
+    }
+
+    #[test]
     fn linux_netlink_route_message_sets_destination_interface_table_and_metric(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let route = Route {
@@ -3344,6 +3962,10 @@ mod tests {
 
         assert_eq!(message.header.address_family, AddressFamily::Inet);
         assert_eq!(message.header.destination_prefix_length, 16);
+        assert_eq!(
+            message.header.protocol,
+            RouteProtocol::Other(IPARS_MANAGED_ROUTE_PROTOCOL)
+        );
         assert!(message
             .attributes
             .contains(&RouteAttribute::Destination(RouteAddress::Inet(
@@ -3352,6 +3974,26 @@ mod tests {
         assert!(message.attributes.contains(&RouteAttribute::Oif(7)));
         assert!(message.attributes.contains(&RouteAttribute::Table(10_064)));
         assert!(message.attributes.contains(&RouteAttribute::Priority(100)));
+        Ok(())
+    }
+
+    #[test]
+    fn netlink_route_inventory_extracts_current_managed_route(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let route = Route {
+            id: "route-a".to_string(),
+            cidr: "100.64.0.2/32".parse()?,
+            advertised_by: NodeId::from_string("peer-a"),
+            via: None,
+            metric: 10,
+            tags: Default::default(),
+        };
+        let message = netlink_route_message(&route, 7, None);
+
+        assert_eq!(
+            parse_netlink_managed_route(&message, 7)?,
+            Some(ManagedMainTableRoute::current(route.cidr, route.metric))
+        );
         Ok(())
     }
 
@@ -3426,6 +4068,8 @@ mod tests {
                         "10.42.0.0/16",
                         "dev",
                         "ipars0",
+                        "protocol",
+                        "240",
                         "table",
                         "10064",
                         "metric",
@@ -3485,8 +4129,12 @@ mod tests {
                         "10.42.0.0/16",
                         "dev",
                         "ipars0",
+                        "protocol",
+                        "240",
                         "table",
                         "10064",
+                        "metric",
+                        "100",
                     ],
                 ),
             ]
@@ -3513,6 +4161,8 @@ mod tests {
                         "10.42.0.0/16",
                         "dev",
                         "ipars0",
+                        "protocol",
+                        "240",
                         "table",
                         "10064",
                         "metric",
@@ -3582,6 +4232,8 @@ mod tests {
                         "172.18.0.0/16",
                         "dev",
                         "ipars0",
+                        "protocol",
+                        "240",
                         "table",
                         "10064",
                         "metric",

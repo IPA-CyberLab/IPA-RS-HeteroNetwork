@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use ipars_crypto::WireGuardKeyPair;
+use ipars_route_manager::IPARS_MANAGED_ROUTE_PROTOCOL;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde_json::Value;
 
@@ -1133,6 +1134,12 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         agent_vpn_ip,
         agent_b_vpn_ip,
     )?;
+    assert_compose_reconciles_unknown_managed_route(
+        &compose,
+        "agent",
+        agent_vpn_ip,
+        agent_b_vpn_ip,
+    )?;
     let agent_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent", workload_a_cidr)?;
     let agent_b_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent-b", workload_b_cidr)?;
     let workload_a_ip = compose_service_ipv4_in_subnet(&compose, "workload-a", workload_a_cidr)?;
@@ -2209,6 +2216,70 @@ fn assert_compose_reconciles_unknown_wireguard_peer(
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "Docker Agent {service} did not remove an unknown WireGuard peer after authoritative peer-map reconciliation\nlast probe:\n{last_output}\n{}",
+                compose_diagnostics(compose)
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    wait_for_compose_wireguard_path(compose, service, local_vpn_ip, remote_vpn_ip)
+}
+
+fn assert_compose_reconciles_unknown_managed_route(
+    compose: &ComposeProject,
+    service: &str,
+    local_vpn_ip: IpAddr,
+    remote_vpn_ip: IpAddr,
+) -> Result<()> {
+    let stale_cidr = "192.0.2.253/32";
+    let stale_destination = "192.0.2.253";
+    let managed_protocol = IPARS_MANAGED_ROUTE_PROTOCOL.to_string();
+    run_compose_with_diagnostics(
+        compose,
+        [
+            "exec",
+            "-T",
+            service,
+            "ip",
+            "route",
+            "replace",
+            stale_cidr,
+            "dev",
+            "ipars0",
+            "protocol",
+            managed_protocol.as_str(),
+            "metric",
+            "77",
+        ],
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut command = compose_command(compose);
+        command.args([
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-ec",
+            "! ip -N route show table 254 dev ipars0 protocol \"$1\" | grep -F -- \"$2\" >/dev/null",
+            "sh",
+            managed_protocol.as_str(),
+            stale_destination,
+        ]);
+        let last_output = match command.output() {
+            Ok(output) if output.status.success() => break,
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("failed to inspect managed routes: {error}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "Docker Agent {service} did not remove an unknown managed route after authoritative peer-map reconciliation\nlast probe:\n{last_output}\n{}",
                 compose_diagnostics(compose)
             );
         }

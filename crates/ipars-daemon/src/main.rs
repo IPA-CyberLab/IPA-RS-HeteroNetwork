@@ -43,6 +43,8 @@ use ipars_relay::{
     encode_relay_datagram, RelayAdmissionRateLimit, RelayService, RelaySessionId, UdpRelay,
 };
 use ipars_relay_http::{router as relay_router, RelayHttpState};
+#[cfg(test)]
+use ipars_route_manager::ManagedMainTableRoute;
 use ipars_route_manager::{
     checked_docker_route_plan, checked_kubernetes_route_plan, kubernetes_route_plan,
     DockerNetworkIntent, DryRunLinuxRouteManager, KubernetesUnderlayIntent,
@@ -15479,6 +15481,21 @@ mod tests {
 
         async fn remove_routes(&self, plan: RoutePlan) -> Result<(), RouteManagerError> {
             self.removed.write().await.push(plan);
+            Ok(())
+        }
+
+        async fn managed_main_table_routes(
+            &self,
+            _interface: &str,
+        ) -> Result<Option<BTreeSet<ManagedMainTableRoute>>, RouteManagerError> {
+            Ok(None)
+        }
+
+        async fn remove_managed_main_table_routes(
+            &self,
+            _interface: &str,
+            _routes: &BTreeSet<ManagedMainTableRoute>,
+        ) -> Result<(), RouteManagerError> {
             Ok(())
         }
 
