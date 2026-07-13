@@ -19,12 +19,10 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    #[error("base64 decoding failed")]
-    Base64(#[from] base64::DecodeError),
-    #[error("ed25519 key material is invalid")]
-    InvalidEd25519Key,
-    #[error("wireguard public key material is invalid")]
-    InvalidWireGuardKey,
+    #[error("ed25519 key material is invalid: {0}")]
+    InvalidEd25519Key(&'static str),
+    #[error("wireguard key material is invalid: {0}")]
+    InvalidWireGuardKey(&'static str),
     #[error("ed25519 signature is invalid")]
     InvalidSignature,
     #[error(transparent)]
@@ -47,6 +45,8 @@ pub enum CryptoError {
 }
 
 const NODE_API_REQUEST_NONCE_BYTES: usize = 24;
+pub const KEY_MATERIAL_BYTES: usize = 32;
+pub const KEY_MATERIAL_BASE64_BYTES: usize = 44;
 
 #[derive(Clone)]
 pub struct IdentityKeyPair {
@@ -67,7 +67,11 @@ impl IdentityKeyPair {
     }
 
     pub fn from_signing_key_b64(value: &str) -> Result<Self, CryptoError> {
-        Ok(Self::from_signing_bytes(decode_32(value)?))
+        let key = Self::from_signing_bytes(decode_ed25519_key_b64(value)?);
+        if key.verifying_key().is_weak() {
+            return Err(CryptoError::InvalidEd25519Key("derived public key is weak"));
+        }
+        Ok(key)
     }
 
     pub fn signing_key_b64(&self) -> String {
@@ -239,6 +243,15 @@ impl WireGuardKeyPair {
             public_key_b64: encode_bytes(public.as_bytes()),
         }
     }
+
+    pub fn from_private_key_b64(value: &str) -> Result<Self, CryptoError> {
+        let secret = StaticSecret::from(decode_wireguard_private_key_b64(value)?);
+        let public = X25519PublicKey::from(&secret);
+        Ok(Self {
+            private_key_b64: encode_bytes(&secret.to_bytes()),
+            public_key_b64: encode_bytes(public.as_bytes()),
+        })
+    }
 }
 
 pub fn verify_join_token(
@@ -259,9 +272,7 @@ pub fn verify_join_token(
         });
     }
 
-    let key_bytes = decode_32(issuer_public_key_b64)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
+    let verifying_key = verifying_key_from_b64(issuer_public_key_b64)?;
     let signature = Signature::from_bytes(&signature_bytes);
     let payload = serde_json::to_vec(&token.claims)?;
     verifying_key
@@ -331,9 +342,7 @@ fn verify_ed25519_payload(
     signature_bytes: [u8; ipars_types::ED25519_SIGNATURE_BYTES],
     public_key_b64: &str,
 ) -> Result<(), CryptoError> {
-    let key_bytes = decode_32(public_key_b64)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
+    let verifying_key = verifying_key_from_b64(public_key_b64)?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
         .verify(payload, &signature)
@@ -420,24 +429,16 @@ pub fn validate_node_api_request_nonce(value: &str) -> Result<(), CryptoError> {
 }
 
 pub fn validate_identity_public_key_b64(value: &str) -> Result<(), CryptoError> {
-    let key_bytes = decode_32(value)?;
-    VerifyingKey::from_bytes(&key_bytes)
-        .map(|_| ())
-        .map_err(|_| CryptoError::InvalidEd25519Key)
+    verifying_key_from_b64(value).map(|_| ())
 }
 
 pub fn validate_wireguard_public_key_b64(value: &str) -> Result<(), CryptoError> {
-    let bytes = STANDARD.decode(value)?;
-    if bytes.len() != 32 {
-        return Err(CryptoError::InvalidWireGuardKey);
-    }
-    Ok(())
+    decode_wireguard_public_key_b64(value).map(|_| ())
 }
 
 pub fn node_id_from_public_key_b64(value: &str) -> Result<NodeId, CryptoError> {
-    let key_bytes = decode_32(value)?;
-    VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidEd25519Key)?;
-    Ok(node_id_from_public_key(&key_bytes))
+    let verifying_key = verifying_key_from_b64(value)?;
+    Ok(node_id_from_public_key(verifying_key.as_bytes()))
 }
 
 pub fn node_id_from_public_key(public_key: &[u8]) -> NodeId {
@@ -449,12 +450,57 @@ pub fn encode_bytes(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }
 
-fn decode_32(value: &str) -> Result<[u8; 32], CryptoError> {
-    let bytes = STANDARD.decode(value)?;
-    bytes
-        .as_slice()
+pub fn decode_wireguard_private_key_b64(
+    value: &str,
+) -> Result<[u8; KEY_MATERIAL_BYTES], CryptoError> {
+    decode_canonical_key_material(value).map_err(CryptoError::InvalidWireGuardKey)
+}
+
+pub fn decode_wireguard_public_key_b64(
+    value: &str,
+) -> Result<[u8; KEY_MATERIAL_BYTES], CryptoError> {
+    let bytes = decode_canonical_key_material(value).map_err(CryptoError::InvalidWireGuardKey)?;
+    let probe_secret = StaticSecret::from([0x42; KEY_MATERIAL_BYTES]);
+    let public_key = X25519PublicKey::from(bytes);
+    if probe_secret
+        .diffie_hellman(&public_key)
+        .as_bytes()
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(CryptoError::InvalidWireGuardKey("public key has low order"));
+    }
+    Ok(bytes)
+}
+
+fn decode_ed25519_key_b64(value: &str) -> Result<[u8; KEY_MATERIAL_BYTES], CryptoError> {
+    decode_canonical_key_material(value).map_err(CryptoError::InvalidEd25519Key)
+}
+
+fn verifying_key_from_b64(value: &str) -> Result<VerifyingKey, CryptoError> {
+    let key_bytes = decode_ed25519_key_b64(value)?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|_| CryptoError::InvalidEd25519Key("bytes do not encode a valid public key"))?;
+    if verifying_key.is_weak() {
+        return Err(CryptoError::InvalidEd25519Key("public key is weak"));
+    }
+    Ok(verifying_key)
+}
+
+fn decode_canonical_key_material(value: &str) -> Result<[u8; KEY_MATERIAL_BYTES], &'static str> {
+    if value.len() != KEY_MATERIAL_BASE64_BYTES {
+        return Err("must be exactly 44 bytes of standard base64");
+    }
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|_| "is not valid standard base64")?;
+    let key: [u8; KEY_MATERIAL_BYTES] = decoded
         .try_into()
-        .map_err(|_| CryptoError::InvalidEd25519Key)
+        .map_err(|_| "must decode to exactly 32 bytes")?;
+    if STANDARD.encode(key) != value {
+        return Err("is not canonical standard base64");
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -593,17 +639,31 @@ mod tests {
     fn wireguard_keys_are_distinct() -> Result<(), CryptoError> {
         let first = WireGuardKeyPair::generate();
         let second = WireGuardKeyPair::generate();
+        let restored = WireGuardKeyPair::from_private_key_b64(&first.private_key_b64)?;
 
         assert_ne!(first.private_key_b64, second.private_key_b64);
         assert_ne!(first.public_key_b64, second.public_key_b64);
+        assert_eq!(restored, first);
+        assert_eq!(
+            encode_bytes(&decode_wireguard_private_key_b64(&first.private_key_b64)?),
+            first.private_key_b64
+        );
         validate_wireguard_public_key_b64(&first.public_key_b64)?;
+        for invalid in [
+            "not-valid-base64".to_string(),
+            encode_bytes(&[1, 2, 3]),
+            "A".repeat(KEY_MATERIAL_BASE64_BYTES),
+            format!("{}B=", "A".repeat(42)),
+            "A".repeat(64 * 1024),
+        ] {
+            assert!(matches!(
+                validate_wireguard_public_key_b64(&invalid),
+                Err(CryptoError::InvalidWireGuardKey(_))
+            ));
+        }
         assert!(matches!(
-            validate_wireguard_public_key_b64("not-valid-base64"),
-            Err(CryptoError::Base64(_))
-        ));
-        assert!(matches!(
-            validate_wireguard_public_key_b64(&encode_bytes(&[1, 2, 3])),
-            Err(CryptoError::InvalidWireGuardKey)
+            validate_wireguard_public_key_b64(&format!("{}=", "A".repeat(43))),
+            Err(CryptoError::InvalidWireGuardKey("public key has low order"))
         ));
         Ok(())
     }
@@ -620,10 +680,19 @@ mod tests {
             node_id_from_public_key_b64(&key.public_key_b64())?,
             key.node_id()
         );
-        assert!(matches!(
-            validate_identity_public_key_b64("not-valid-base64"),
-            Err(CryptoError::Base64(_))
-        ));
+        for invalid in [
+            "not-valid-base64".to_string(),
+            encode_bytes(&[1, 2, 3]),
+            "A".repeat(KEY_MATERIAL_BASE64_BYTES),
+            format!("{}B=", "A".repeat(42)),
+            "A".repeat(64 * 1024),
+            format!("{}=", "A".repeat(43)),
+        ] {
+            assert!(matches!(
+                validate_identity_public_key_b64(&invalid),
+                Err(CryptoError::InvalidEd25519Key(_))
+            ));
+        }
         Ok(())
     }
 

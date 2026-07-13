@@ -37,6 +37,10 @@ The CLI signs the cluster ID, nonce, issuer node/key IDs, and current timestamp 
 
 ## Key Rotation
 
+Identity and WireGuard key material uses canonical standard Base64 encoding of exactly 32 bytes, which is 44 encoded bytes including padding. Oversized, malformed, non-canonical, and wrong-length keys are rejected before key construction. Ed25519 public keys flagged as weak are rejected, as are low-order X25519/WireGuard public keys that cannot contribute to a shared secret. Control Plane startup validates the primary and every overlapping trusted issuer public key before binding the service; node registration, request authentication, WireGuard rotation, and Agent command/netlink backends apply the same key boundaries.
+
+Persisted Agent state is accepted only when the identity private key derives the stored identity public key and node ID, the WireGuard private key derives the stored WireGuard public key, and `updated_at` is not before `created_at`. File load, save, and runtime replacement all reject inconsistent state. Treat such rejection as state corruption or an invalid manual edit; restore a consistent owner-only state backup or deliberately re-enroll the node rather than copying individual key fields.
+
 Issuer signing key rotation is overlap-based. Start control-plane instances with repeated trusted issuer public keys:
 
 ```bash

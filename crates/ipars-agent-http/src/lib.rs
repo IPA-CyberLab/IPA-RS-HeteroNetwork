@@ -214,7 +214,7 @@ async fn rotate_wireguard_key(
     let mut next_state = plan.next_state;
     next_state.updated_at = control_plane_response.rotated_at;
     state_store.save(&next_state)?;
-    state.runtime.replace_state(next_state.clone());
+    state.runtime.replace_state(next_state.clone())?;
 
     Ok(Json(AgentWireGuardKeyRotationResponse {
         node_id: next_state.node_id,
@@ -1537,6 +1537,7 @@ impl IntoResponse for ApiError {
             | AgentError::HolePunch(_)
             | AgentError::RelaySession(_)
             | AgentError::InsecureStatePath(_)
+            | AgentError::InvalidState(_)
             | AgentError::WireGuard(_)
             | AgentError::PeerProbe(_) => StatusCode::SERVICE_UNAVAILABLE,
             AgentError::PathProbeRejected(_) | AgentError::PathStateRejected(_) => {

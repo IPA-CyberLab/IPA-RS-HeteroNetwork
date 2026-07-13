@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 genetlink.workspace = true

@@ -10,10 +10,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
-use ipars_crypto::{CryptoError, IdentityKeyPair, WireGuardKeyPair};
+use ipars_crypto::{
+    decode_wireguard_private_key_b64, decode_wireguard_public_key_b64, encode_bytes, CryptoError,
+    IdentityKeyPair, WireGuardKeyPair,
+};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_route_manager::{
     warn_if_linux_netns_is_current, with_netlink_namespace, LinuxNetlinkSocket,
@@ -84,6 +86,8 @@ pub enum AgentError {
     Json(#[from] serde_json::Error),
     #[error("insecure agent state path: {0}")]
     InsecureStatePath(String),
+    #[error("agent state is invalid: {0}")]
+    InvalidState(String),
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
     #[error("stun probe error: {0}")]
@@ -142,9 +146,43 @@ impl AgentNodeState {
     }
 
     pub fn identity_key_pair(&self) -> Result<IdentityKeyPair, AgentError> {
-        Ok(IdentityKeyPair::from_signing_key_b64(
-            &self.identity_private_key_b64,
-        )?)
+        let identity = IdentityKeyPair::from_signing_key_b64(&self.identity_private_key_b64)
+            .map_err(|error| {
+                AgentError::InvalidState(format!("identity private key is invalid: {error}"))
+            })?;
+        if identity.public_key_b64() != self.identity_public_key_b64 {
+            return Err(AgentError::InvalidState(
+                "identity public key does not match identity private key".to_string(),
+            ));
+        }
+        if identity.node_id() != self.node_id {
+            return Err(AgentError::InvalidState(format!(
+                "node ID {} does not match identity key-derived node ID {}",
+                self.node_id,
+                identity.node_id()
+            )));
+        }
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<(), AgentError> {
+        self.identity_key_pair()?;
+        let wireguard = WireGuardKeyPair::from_private_key_b64(&self.wireguard_private_key_b64)
+            .map_err(|error| {
+                AgentError::InvalidState(format!("WireGuard private key is invalid: {error}"))
+            })?;
+        if wireguard.public_key_b64 != self.wireguard_public_key_b64 {
+            return Err(AgentError::InvalidState(
+                "WireGuard public key does not match WireGuard private key".to_string(),
+            ));
+        }
+        if self.updated_at < self.created_at {
+            return Err(AgentError::InvalidState(format!(
+                "updated_at {} is before created_at {}",
+                self.updated_at, self.created_at
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -173,10 +211,13 @@ impl FileAgentStateStore {
     pub fn load(&self) -> Result<AgentNodeState, AgentError> {
         ensure_private_agent_state_parent(&self.path)?;
         let bytes = read_private_agent_state_file(&self.path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let state: AgentNodeState = serde_json::from_slice(&bytes)?;
+        state.validate()?;
+        Ok(state)
     }
 
     pub fn save(&self, state: &AgentNodeState) -> Result<(), AgentError> {
+        state.validate()?;
         prepare_private_agent_state_parent(&self.path)?;
         let bytes = serde_json::to_vec_pretty(state)?;
         write_private_agent_state_file(&self.path, &bytes)?;
@@ -1279,11 +1320,13 @@ impl AgentRuntime {
         }
     }
 
-    pub fn replace_state(&self, state: AgentNodeState) {
+    pub fn replace_state(&self, state: AgentNodeState) -> Result<(), AgentError> {
+        state.validate()?;
         match self.state.write() {
             Ok(mut current) => *current = state,
             Err(poisoned) => *poisoned.into_inner() = state,
         }
+        Ok(())
     }
 
     pub async fn record_userspace_wireguard_process_status(
@@ -2900,15 +2943,8 @@ fn wireguard_handshake_timestamp(
 }
 
 fn validate_wireguard_public_key(value: &str) -> Result<(), AgentError> {
-    let decoded = BASE64_STANDARD.decode(value).map_err(|error| {
-        AgentError::WireGuard(format!("invalid WireGuard public key base64: {error}"))
-    })?;
-    if decoded.len() != 32 {
-        return Err(AgentError::WireGuard(format!(
-            "WireGuard public key decoded to {} bytes, expected 32",
-            decoded.len()
-        )));
-    }
+    decode_wireguard_public_key_b64(value)
+        .map_err(|error| AgentError::WireGuard(format!("invalid WireGuard public key: {error}")))?;
     Ok(())
 }
 
@@ -4091,15 +4127,9 @@ fn wireguard_private_key_command(
 
 fn validated_wireguard_private_key(value: &str) -> Result<Vec<u8>, AgentError> {
     let trimmed = value.trim();
-    let decoded = BASE64_STANDARD.decode(trimmed).map_err(|error| {
-        AgentError::WireGuard(format!("invalid WireGuard private key base64: {error}"))
+    decode_wireguard_private_key_b64(trimmed).map_err(|error| {
+        AgentError::WireGuard(format!("invalid WireGuard private key: {error}"))
     })?;
-    if decoded.len() != 32 {
-        return Err(AgentError::WireGuard(format!(
-            "WireGuard private key decoded to {} bytes, expected 32",
-            decoded.len()
-        )));
-    }
     Ok(trimmed.as_bytes().to_vec())
 }
 
@@ -4400,30 +4430,14 @@ fn wireguard_namespace_suffix(namespace: Option<&LinuxNetworkNamespace>) -> Stri
 
 #[cfg(target_os = "linux")]
 fn parse_wireguard_public_key(value: &str) -> Result<[u8; 32], AgentError> {
-    let decoded = BASE64_STANDARD.decode(value.trim()).map_err(|error| {
-        AgentError::WireGuard(format!("invalid WireGuard public key base64: {error}"))
-    })?;
-    decoded.try_into().map_err(|decoded: Vec<u8>| {
-        AgentError::WireGuard(format!(
-            "WireGuard public key decoded to {} bytes, expected 32",
-            decoded.len()
-        ))
-    })
+    decode_wireguard_public_key_b64(value)
+        .map_err(|error| AgentError::WireGuard(format!("invalid WireGuard public key: {error}")))
 }
 
 #[cfg(target_os = "linux")]
 fn parse_wireguard_private_key(value: &str) -> Result<[u8; 32], AgentError> {
-    let decoded = BASE64_STANDARD
-        .decode(validated_wireguard_private_key(value)?)
-        .map_err(|error| {
-            AgentError::WireGuard(format!("invalid WireGuard private key base64: {error}"))
-        })?;
-    decoded.try_into().map_err(|decoded: Vec<u8>| {
-        AgentError::WireGuard(format!(
-            "WireGuard private key decoded to {} bytes, expected 32",
-            decoded.len()
-        ))
-    })
+    decode_wireguard_private_key_b64(value.trim())
+        .map_err(|error| AgentError::WireGuard(format!("invalid WireGuard private key: {error}")))
 }
 
 #[cfg(target_os = "linux")]
@@ -4605,7 +4619,8 @@ fn wireguard_netlink_peer_telemetry(
             "WireGuard netlink telemetry peer did not include a public key".to_string(),
         )
     })?;
-    let public_key_b64 = BASE64_STANDARD.encode(public_key);
+    let public_key_b64 = encode_bytes(&public_key);
+    validate_wireguard_public_key(&public_key_b64)?;
     let mut telemetry = WireGuardPeerTelemetry::new(public_key_b64);
     for attribute in peer.iter() {
         match attribute {
@@ -7697,8 +7712,11 @@ mod tests {
     async fn peer_map_application_refreshes_rotated_local_private_key() -> Result<(), AgentError> {
         let first_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let second_private_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let first_keypair = WireGuardKeyPair::from_private_key_b64(first_private_key)?;
+        let second_keypair = WireGuardKeyPair::from_private_key_b64(second_private_key)?;
         let mut state = AgentNodeState::generate(Utc::now());
         state.wireguard_private_key_b64 = first_private_key.to_string();
+        state.wireguard_public_key_b64 = first_keypair.public_key_b64;
         let runtime = Arc::new(AgentRuntime::new(state.clone(), ClusterPolicy::default()));
         let runner = RecordingRunner::default();
         let applier = PeerMapApplier::new(
@@ -7715,7 +7733,8 @@ mod tests {
 
         applier.apply_peer_map(peer_map.clone()).await?;
         state.wireguard_private_key_b64 = second_private_key.to_string();
-        runtime.replace_state(state);
+        state.wireguard_public_key_b64 = second_keypair.public_key_b64;
+        runtime.replace_state(state)?;
         applier.apply_peer_map(peer_map).await?;
 
         assert_eq!(
@@ -7733,8 +7752,8 @@ mod tests {
     #[test]
     fn command_wireguard_telemetry_parser_aggregates_bounded_field_outputs(
     ) -> Result<(), AgentError> {
-        let first_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        let second_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let first_key = encode_bytes(&[7; 32]);
+        let second_key = encode_bytes(&[9; 32]);
         let handshakes = format!("{first_key}\t1710000000\n{second_key}\t0\n");
         let transfers = format!("{first_key}\t120\t340\n{second_key}\t0\t0\n");
         let endpoints = format!("{first_key}\t203.0.113.10:51820\n{second_key}\t(none)\n");
@@ -7747,9 +7766,9 @@ mod tests {
 
         assert_eq!(telemetry.len(), 2);
         assert_eq!(
-            telemetry.get(first_key),
+            telemetry.get(&first_key),
             Some(&WireGuardPeerTelemetry {
-                public_key_b64: first_key.to_string(),
+                public_key_b64: first_key,
                 endpoint: Some("203.0.113.10:51820".to_string()),
                 latest_handshake_at: DateTime::<Utc>::from_timestamp(1_710_000_000, 0),
                 rx_bytes: 120,
@@ -7757,9 +7776,9 @@ mod tests {
             })
         );
         assert_eq!(
-            telemetry.get(second_key),
+            telemetry.get(&second_key),
             Some(&WireGuardPeerTelemetry {
-                public_key_b64: second_key.to_string(),
+                public_key_b64: second_key,
                 endpoint: None,
                 latest_handshake_at: None,
                 rx_bytes: 0,
@@ -7771,7 +7790,7 @@ mod tests {
 
     #[test]
     fn command_wireguard_telemetry_parser_rejects_malformed_or_untrusted_rows() {
-        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let key = encode_bytes(&[7; 32]);
         let malformed =
             parse_wireguard_command_telemetry(format!("{key} 1710000000\n").as_bytes(), b"", b"");
         assert!(matches!(
@@ -7784,15 +7803,24 @@ mod tests {
         assert!(matches!(
             invalid_key,
             Err(AgentError::WireGuard(message))
-                if message.contains("invalid WireGuard public key base64")
+                if message.contains("invalid WireGuard public key")
+        ));
+
+        let low_order_key = format!("{}=", "A".repeat(43));
+        let low_order =
+            parse_wireguard_command_telemetry(format!("{low_order_key}\t0\n").as_bytes(), b"", b"");
+        assert!(matches!(
+            low_order,
+            Err(AgentError::WireGuard(message)) if message.contains("public key has low order")
         ));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_wireguard_telemetry_parser_reads_handshake_and_transfer() -> Result<(), AgentError> {
+        let public_key = [7; 32];
         let peer = WireguardPeer(vec![
-            WireguardPeerAttribute::PublicKey([0; 32]),
+            WireguardPeerAttribute::PublicKey(public_key),
             WireguardPeerAttribute::Endpoint(SocketAddr::from(([203, 0, 113, 10], 51_820))),
             WireguardPeerAttribute::LastHandshake(netlink_packet_wireguard::WireguardTimeSpec {
                 seconds: 1_710_000_000,
@@ -7807,7 +7835,7 @@ mod tests {
         assert_eq!(
             telemetry,
             WireGuardPeerTelemetry {
-                public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                public_key_b64: encode_bytes(&public_key),
                 endpoint: Some("203.0.113.10:51820".to_string()),
                 latest_handshake_at: DateTime::<Utc>::from_timestamp(1_710_000_000, 123_000_000,),
                 rx_bytes: 120,
@@ -7843,11 +7871,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_wireguard_backend_builds_netlink_peer_config() -> Result<(), AgentError> {
-        let public_key =
-            parse_wireguard_public_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")?;
+        let public_key_bytes = [7; 32];
+        let public_key_b64 = encode_bytes(&public_key_bytes);
+        let public_key = parse_wireguard_public_key(&public_key_b64)?;
         let config = WireGuardPeerConfig {
             peer: NodeId::from_string("node-a"),
-            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            public_key: public_key_b64,
             endpoint: Some("203.0.113.10:51820".to_string()),
             allowed_ips: vec!["100.64.0.2/32".to_string(), "fd00::2/128".to_string()],
             persistent_keepalive_seconds: Some(25),
@@ -7855,8 +7884,10 @@ mod tests {
 
         let peer = netlink_peer_config(&config, public_key)?;
 
-        assert_eq!(public_key, [0; 32]);
-        assert!(peer.0.contains(&WireguardPeerAttribute::PublicKey([0; 32])));
+        assert_eq!(public_key, public_key_bytes);
+        assert!(peer
+            .0
+            .contains(&WireguardPeerAttribute::PublicKey(public_key_bytes)));
         assert!(peer.0.contains(&WireguardPeerAttribute::Flags(
             WireguardPeerFlags::ReplaceAllowedIps
         )));
@@ -10515,6 +10546,99 @@ mod tests {
             let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_node_state_rejects_inconsistent_key_material_and_timestamps() {
+        let now = Utc::now();
+        let state = AgentNodeState::generate(now);
+        let other = AgentNodeState::generate(now);
+        assert!(state.validate().is_ok());
+
+        let mut cases = Vec::new();
+
+        let mut invalid = state.clone();
+        invalid.identity_private_key_b64 = "A".repeat(64 * 1024);
+        cases.push((invalid, "identity private key is invalid"));
+
+        let mut invalid = state.clone();
+        invalid.identity_public_key_b64 = other.identity_public_key_b64.clone();
+        cases.push((
+            invalid,
+            "identity public key does not match identity private key",
+        ));
+
+        let mut invalid = state.clone();
+        invalid.node_id = other.node_id;
+        cases.push((invalid, "does not match identity key-derived node ID"));
+
+        let mut invalid = state.clone();
+        invalid.wireguard_private_key_b64 = "not-a-key".to_string();
+        cases.push((invalid, "WireGuard private key is invalid"));
+
+        let mut invalid = state.clone();
+        invalid.wireguard_public_key_b64 = other.wireguard_public_key_b64;
+        cases.push((
+            invalid,
+            "WireGuard public key does not match WireGuard private key",
+        ));
+
+        let mut invalid = state;
+        invalid.updated_at = invalid.created_at - chrono::Duration::seconds(1);
+        cases.push((invalid, "updated_at"));
+
+        for (invalid, expected) in cases {
+            let error = match invalid.validate() {
+                Ok(()) => panic!("inconsistent agent state should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_state_store_rejects_inconsistent_keys_on_load_and_save() -> Result<(), AgentError> {
+        let now = Utc::now();
+        let mut state = AgentNodeState::generate(now);
+        state.identity_public_key_b64 = AgentNodeState::generate(now).identity_public_key_b64;
+        let dir = temp_state_dir("state-inconsistent-keys");
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let load_path = dir.join("load.json");
+        std::fs::write(&load_path, serde_json::to_vec_pretty(&state)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&load_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        let load_error = match FileAgentStateStore::new(&load_path).load() {
+            Ok(_) => panic!("inconsistent state file should be rejected"),
+            Err(error) => error,
+        };
+        assert!(load_error
+            .to_string()
+            .contains("identity public key does not match identity private key"));
+
+        let save_path = dir.join("save.json");
+        let save_error = match FileAgentStateStore::new(&save_path).save(&state) {
+            Ok(()) => panic!("inconsistent state should not be saved"),
+            Err(error) => error,
+        };
+        assert!(save_error
+            .to_string()
+            .contains("identity public key does not match identity private key"));
+        assert!(!save_path.exists());
+
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }

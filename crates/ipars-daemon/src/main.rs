@@ -37,7 +37,7 @@ use ipars_control_plane::{
 use ipars_control_plane_http::{router, ControlPlaneHttpState};
 #[cfg(test)]
 use ipars_crypto::verify_signal_node_upsert_signature;
-use ipars_crypto::IdentityKeyPair;
+use ipars_crypto::{validate_identity_public_key_b64, IdentityKeyPair};
 use ipars_relay::{
     encode_relay_datagram, RelayAdmissionRateLimit, RelayService, RelaySessionId, UdpRelay,
 };
@@ -3957,6 +3957,16 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
         validate_api_bearer_token(token, "--operator-api-bearer-token")?;
     }
+    validate_identity_public_key_b64(&args.issuer_public_key)
+        .context("--issuer-public-key must be a canonical non-weak Ed25519 public key")?;
+    for trusted in &args.trusted_issuer_keys {
+        validate_identity_public_key_b64(&trusted.public_key).with_context(|| {
+            format!(
+                "--trusted-issuer-key public key for issuer {} key {} must be a canonical non-weak Ed25519 public key",
+                trusted.issuer_node_id, trusted.key_id
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -7204,7 +7214,7 @@ async fn run_agent(
             store
                 .save(&persisted_state)
                 .context("failed to persist registered agent VPN IP")?;
-            runtime.replace_state(persisted_state);
+            runtime.replace_state(persisted_state)?;
         }
     }
     let control_plane_bases = agent_control_plane_base_urls(
@@ -16302,6 +16312,7 @@ mod tests {
     #[test]
     fn control_plane_operator_api_auth_accepts_inline_and_file_sources() -> anyhow::Result<()> {
         let token = "control-plane-operator-secret-with-32-bytes";
+        let issuer_public_key = IdentityKeyPair::generate().public_key_b64();
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -16312,7 +16323,7 @@ mod tests {
             "--issuer-key-id",
             "root",
             "--issuer-public-key",
-            "pub-a",
+            issuer_public_key.as_str(),
             "--operator-api-bearer-token",
             token,
         ])?;
@@ -16341,7 +16352,7 @@ mod tests {
             "--issuer-key-id",
             "root",
             "--issuer-public-key",
-            "pub-a",
+            issuer_public_key.as_str(),
             "--operator-api-bearer-token-path",
             &path.display().to_string(),
         ])?;
@@ -16451,7 +16462,80 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_runtime_rejects_invalid_issuer_public_keys() -> anyhow::Result<()> {
+        let valid_key = IdentityKeyPair::generate().public_key_b64();
+        let weak_key = format!("{}=", "A".repeat(43));
+        let oversized_key = "A".repeat(64 * 1024);
+        let cases = [
+            (
+                vec![
+                    "iparsd",
+                    "control-plane",
+                    "--cluster-id",
+                    "cluster-a",
+                    "--issuer-node-id",
+                    "issuer-a",
+                    "--issuer-key-id",
+                    "root",
+                    "--issuer-public-key",
+                    oversized_key.as_str(),
+                ],
+                "--issuer-public-key must be a canonical non-weak Ed25519 public key",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "control-plane",
+                    "--cluster-id",
+                    "cluster-a",
+                    "--issuer-node-id",
+                    "issuer-a",
+                    "--issuer-key-id",
+                    "root",
+                    "--issuer-public-key",
+                    weak_key.as_str(),
+                ],
+                "--issuer-public-key must be a canonical non-weak Ed25519 public key",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "control-plane",
+                    "--cluster-id",
+                    "cluster-a",
+                    "--issuer-node-id",
+                    "issuer-a",
+                    "--issuer-key-id",
+                    "root",
+                    "--issuer-public-key",
+                    valid_key.as_str(),
+                    "--trusted-issuer-key",
+                    "issuer-b,next,not-a-key",
+                ],
+                "--trusted-issuer-key public key for issuer issuer-b key next",
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(argv)?;
+            let Command::ControlPlane(args) = cli.command else {
+                anyhow::bail!("expected control-plane command");
+            };
+            let error = match validate_control_plane_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("invalid issuer public key should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected {expected}, got {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn control_plane_args_accept_acl_rules() -> anyhow::Result<()> {
+        let issuer_public_key = IdentityKeyPair::generate().public_key_b64();
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -16462,7 +16546,7 @@ mod tests {
             "--issuer-key-id",
             "root",
             "--issuer-public-key",
-            "pub-a",
+            issuer_public_key.as_str(),
             "--relay-health-ttl-seconds",
             "45",
             "--endpoint-candidate-ttl-seconds",

@@ -48,6 +48,8 @@ Join-token signatures must be canonical standard Base64 encoding of exactly one 
 
 The same 88-byte canonical signature envelope applies to heartbeat, WireGuard key rotation, node removal, token revocation, direct Control Plane node queries, and Signal upsert/path/hole-punch requests. A malformed or oversized envelope is rejected as an input-shape error rather than retried as an authentication failure; inspect the service response and correct the producer or transport encoding before retrying.
 
+All Ed25519 identity/issuer and WireGuard private/public keys must be canonical standard Base64 encoding of exactly 32 bytes, or 44 encoded bytes including padding. Control Plane startup rejects malformed, oversized, non-canonical, wrong-length, or weak primary/trusted issuer public keys. Registration and rotation reject weak Ed25519 or low-order WireGuard public keys. Agent state load/save verifies both private-to-public derivations, the identity-derived node ID, and timestamp order; an inconsistent state file is not repaired automatically because choosing one conflicting key as authoritative could silently change node identity or data-plane credentials. Restore the complete state from backup or remove it and perform an intentional fresh join.
+
 ## Join Nodes
 
 Before placing credentials or starting the service, validate the intended host runtime with the same data-plane flags:
