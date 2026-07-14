@@ -27386,6 +27386,150 @@ exec sleep 60
         Ok(())
     }
 
+    async fn serve_mock_remote_docker_engine(
+        listener: tokio::net::TcpListener,
+        expected_path: String,
+        bodies: Vec<String>,
+    ) -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        for body in bodies {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await?;
+                anyhow::ensure!(
+                    read > 0,
+                    "remote Docker API client closed before sending request headers"
+                );
+                request.extend_from_slice(&buffer[..read]);
+                anyhow::ensure!(
+                    request.len() <= 16 * 1024,
+                    "remote Docker API request headers exceeded the test bound"
+                );
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            anyhow::ensure!(
+                request_text.starts_with(&format!("GET {expected_path} ")),
+                "unexpected remote Docker API request line: {request_text}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn docker_api_discovery_supports_multiple_remote_engines_and_churn() -> anyhow::Result<()>
+    {
+        let listener_a = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address_a = listener_a.local_addr()?;
+        let listener_b = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address_b = listener_b.local_addr()?;
+        let server_a = tokio::spawn(serve_mock_remote_docker_engine(
+            listener_a,
+            "/engine/v1.43/networks".to_string(),
+            vec![
+                r#"[{"Id":"engine-a-id","Name":"engine_a_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.31.10.0/24"}]}}]"#.to_string(),
+                r#"[{"Id":"engine-a-id","Name":"engine_a_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.31.12.0/24"}]}}]"#.to_string(),
+            ],
+        ));
+        let server_b = tokio::spawn(serve_mock_remote_docker_engine(
+            listener_b,
+            "/v1.43/networks".to_string(),
+            vec![
+                r#"[{"Id":"engine-b-id","Name":"engine_b_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.31.20.0/24"}]}}]"#.to_string(),
+                r#"[{"Id":"engine-b-id","Name":"engine_b_default","Driver":"bridge","IPAM":{"Config":[{"Subnet":"172.31.22.0/24"}]}}]"#.to_string(),
+            ],
+        ));
+
+        let make_discovery = |url: String,
+                              container_namespace: &str,
+                              network: &str|
+         -> anyhow::Result<DockerApiNetworkDiscovery> {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                "--apply-docker-routes",
+                "--docker-discover-networks",
+                "--docker-api-url",
+                url.as_str(),
+                "--docker-network",
+                network,
+                "--docker-container-namespace",
+                container_namespace,
+                "--docker-host-interface",
+                "eth1",
+            ])?;
+            let Command::Agent(args) = cli.command else {
+                anyhow::bail!("expected agent command");
+            };
+            validate_agent_runtime_config(&args)?;
+            anyhow::ensure!(
+                !runtime_preflight_needs(&args).docker_api_socket,
+                "remote Docker API discovery unexpectedly required a local socket"
+            );
+            preflight_agent_runtime_with_path(
+                &args,
+                Some(OsStr::new(SANITIZED_RUNTIME_COMMAND_PATH)),
+            )?;
+            DockerApiNetworkDiscovery::new(&args)
+        };
+
+        let discovery_a = make_discovery(
+            format!("http://{address_a}/engine/"),
+            "docker-host-a",
+            "engine_a_default",
+        )?;
+        let discovery_b = make_discovery(
+            format!("http://{address_b}"),
+            "docker-host-b",
+            "engine_b_default",
+        )?;
+
+        let (first_a, first_b) =
+            tokio::join!(discovery_a.discover_intent(), discovery_b.discover_intent());
+        let first_a = first_a?;
+        let first_b = first_b?;
+        assert_eq!(first_a.container_namespace, "docker-host-a");
+        assert_eq!(first_b.container_namespace, "docker-host-b");
+        assert_eq!(first_a.host_interface, "eth1");
+        assert_eq!(first_b.host_interface, "eth1");
+        assert_eq!(first_a.container_cidrs, vec!["172.31.10.0/24".parse()?]);
+        assert_eq!(first_b.container_cidrs, vec!["172.31.20.0/24".parse()?]);
+
+        let (second_a, second_b) =
+            tokio::join!(discovery_a.discover_intent(), discovery_b.discover_intent());
+        let second_a = second_a?;
+        let second_b = second_b?;
+        assert_eq!(second_a.container_cidrs, vec!["172.31.12.0/24".parse()?]);
+        assert_eq!(second_b.container_cidrs, vec!["172.31.22.0/24".parse()?]);
+        assert_ne!(first_a.container_cidrs, second_a.container_cidrs);
+        assert_ne!(first_b.container_cidrs, second_b.container_cidrs);
+        anyhow::ensure!(
+            !ip_cidrs_overlap(&second_a.container_cidrs[0], &second_b.container_cidrs[0]),
+            "independent remote Docker Engine route intents unexpectedly overlap"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), server_a)
+            .await
+            .context("timed out waiting for remote Docker Engine A churn requests")???;
+        tokio::time::timeout(Duration::from_secs(5), server_b)
+            .await
+            .context("timed out waiting for remote Docker Engine B churn requests")???;
+        Ok(())
+    }
+
     #[test]
     fn docker_api_remote_url_requires_tls_and_rejects_unsafe_parts() -> anyhow::Result<()> {
         let plaintext_remote = match validate_docker_api_url("http://docker.example:2375") {
