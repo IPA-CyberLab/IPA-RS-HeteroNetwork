@@ -11559,6 +11559,9 @@ async fn heartbeat_request(
     relay_capability: Option<RelayCapability>,
     routes: Option<Vec<Route>>,
 ) -> anyhow::Result<HeartbeatRequest> {
+    runtime
+        .refresh_candidate_observations(chrono::Utc::now())
+        .await;
     let status = runtime.status().await;
     let path_state = runtime.path_state().await;
     let health = agent_health_from_status(&status, "agent heartbeat");
@@ -11709,6 +11712,9 @@ async fn signal_node_upsert_request(
     mut node: NodeRecord,
     relay_capability: Option<RelayCapability>,
 ) -> anyhow::Result<SignalNodeUpsertRequest> {
+    runtime
+        .refresh_candidate_observations(chrono::Utc::now())
+        .await;
     let status = runtime.status().await;
     let health = agent_health_from_status(&status, "agent signal registration");
     node.endpoint_candidates = status.candidates;
@@ -12043,6 +12049,9 @@ async fn negotiate_signal_paths(
     hole_puncher: &UdpHolePuncher,
     options: &SignalPathNegotiationOptions,
 ) -> anyhow::Result<()> {
+    runtime
+        .refresh_candidate_observations(chrono::Utc::now())
+        .await;
     let status = runtime.status().await;
     let identity = runtime
         .state()
@@ -30805,6 +30814,19 @@ exec sleep 60
         };
         runtime.upsert_path_state(path.clone()).await?;
 
+        let stale_observed_at = Utc::now() - chrono::Duration::seconds(300);
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: node_id.clone(),
+                kind: ipars_types::EndpointCandidateKind::StunReflexive,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+                observed_at: stale_observed_at,
+                priority: 80,
+                cost: 20,
+                source: ipars_types::CandidateSource::StunProbe,
+            }])
+            .await;
+
         let identity = runtime.state().identity_key_pair()?;
         let advertised_route = Route {
             id: "route-a".to_string(),
@@ -30825,7 +30847,8 @@ exec sleep 60
         assert_eq!(request.node_id, node_id);
         assert_eq!(request.health.state, HealthState::Healthy);
         assert!(request.node_signature.is_some());
-        assert!(request.candidates.is_empty());
+        assert_eq!(request.candidates.len(), 1);
+        assert!(request.candidates[0].observed_at > stale_observed_at);
         assert!(request.relay_capability.is_none());
         assert_eq!(request.routes, Some(vec![advertised_route]));
         assert_eq!(request.path_state, vec![path]);

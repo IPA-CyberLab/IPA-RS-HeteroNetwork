@@ -1471,6 +1471,17 @@ impl AgentRuntime {
         *self.candidates.write().await = candidates;
     }
 
+    /// Refresh the lease timestamp for locally observed candidates while the
+    /// active WireGuard endpoint keeps the mapping alive.
+    pub async fn refresh_candidate_observations(&self, observed_at: DateTime<Utc>) {
+        let mut candidates = self.candidates.write().await;
+        for candidate in candidates.iter_mut() {
+            if candidate.source == CandidateSource::StunProbe {
+                candidate.observed_at = observed_at;
+            }
+        }
+    }
+
     pub async fn probe_stun(
         &self,
         local_bind: std::net::SocketAddr,
@@ -11920,6 +11931,44 @@ mod tests {
         let status = runtime.status().await;
         assert_eq!(status.candidate_count, 1);
         assert_eq!(status.candidates, vec![candidate]);
+    }
+
+    #[tokio::test]
+    async fn runtime_refreshes_stun_candidate_observation_leases() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id.clone();
+        let old_observed_at = Utc::now() - ChronoDuration::seconds(300);
+        let refreshed_at = Utc::now();
+        let stun_candidate = EndpointCandidate {
+            node_id: node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
+            observed_at: old_observed_at,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        };
+        let interface_candidate = EndpointCandidate {
+            node_id,
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([10, 0, 0, 10], 51820)),
+            observed_at: old_observed_at,
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::InterfaceScan,
+        };
+        runtime
+            .replace_candidates(vec![stun_candidate, interface_candidate.clone()])
+            .await;
+
+        runtime.refresh_candidate_observations(refreshed_at).await;
+
+        let candidates = runtime.status().await.candidates;
+        assert_eq!(candidates[0].observed_at, refreshed_at);
+        assert_eq!(candidates[1], interface_candidate);
     }
 
     #[tokio::test]
