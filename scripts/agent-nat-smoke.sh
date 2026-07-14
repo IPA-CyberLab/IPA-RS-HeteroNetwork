@@ -477,49 +477,73 @@ ping_overlay_once() {
   ip netns exec "$namespace" ping -I ipars0 -c 1 -W 2 "$target" >/dev/null 2>&1
 }
 
+ping_overlay_a_status=1
+ping_overlay_b_status=1
+
 ping_overlay_pair_once() {
-  local pid_a pid_b success=0
+  local pid_a pid_b
   ping_overlay_once "$agent_a" "$vpn_b" &
   pid_a="$!"
   ping_overlay_once "$agent_b" "$vpn_a" &
   pid_b="$!"
-  if ! wait "$pid_a"; then
-    success=1
+  if wait "$pid_a"; then
+    ping_overlay_a_status=0
+  else
+    ping_overlay_a_status=1
   fi
-  if ! wait "$pid_b"; then
-    success=1
+  if wait "$pid_b"; then
+    ping_overlay_b_status=0
+  else
+    ping_overlay_b_status=1
   fi
-  return "$success"
+  [[ "$ping_overlay_a_status" == "0" && "$ping_overlay_b_status" == "0" ]]
 }
 
 wait_for_direct_dataplane() {
   local peer_a="$1"
   local peer_b="$2"
   local consecutive_successes=0
+  local iterations=0
+  local direct_state_failures=0
+  local metrics_gate_failures=0
+  local ping_pair_failures=0
+  local post_ping_gate_failures=0
+  local successful_ping_pairs=0
   for _ in $(seq 1 90); do
-    local state_a state_b metrics_a metrics_b
+    iterations=$((iterations + 1))
+    local state_a="" state_b="" metrics_a="" metrics_b=""
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
-    if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
-      && metrics_a="$(agent_metrics "$agent_a" 2>/dev/null)" \
-      && metrics_b="$(agent_metrics "$agent_b" 2>/dev/null)" \
-      && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
-      && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null \
-      && ping_overlay_pair_once; then
-      state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
-      state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
+    if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]]; then
       metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
       metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
-      if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
-        && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
+      if jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
         && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null; then
-        consecutive_successes=$((consecutive_successes + 1))
-        if [[ "$consecutive_successes" -ge 3 ]]; then
-          return 0
+        if ping_overlay_pair_once; then
+          successful_ping_pairs=$((successful_ping_pairs + 1))
+          state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
+          state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
+          metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
+          metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
+          if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
+            && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
+            && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null; then
+            consecutive_successes=$((consecutive_successes + 1))
+            if [[ "$consecutive_successes" -ge 3 ]]; then
+              return 0
+            fi
+            continue
+          fi
+          post_ping_gate_failures=$((post_ping_gate_failures + 1))
+        else
+          ping_pair_failures=$((ping_pair_failures + 1))
         fi
-        continue
+      else
+        metrics_gate_failures=$((metrics_gate_failures + 1))
+        ping_overlay_pair_once || true
       fi
     else
+      direct_state_failures=$((direct_state_failures + 1))
       # Keep revalidation probes supplied with encrypted traffic while the path is pending.
       ping_overlay_pair_once || true
     fi
@@ -527,6 +551,7 @@ wait_for_direct_dataplane() {
     sleep 1
   done
   echo "direct path state did not sustain bidirectional overlay traffic" >&2
+  echo "direct dataplane wait diagnostics: iterations=${iterations} direct_state_failures=${direct_state_failures} metrics_gate_failures=${metrics_gate_failures} ping_pair_failures=${ping_pair_failures} post_ping_gate_failures=${post_ping_gate_failures} successful_ping_pairs=${successful_ping_pairs} last_ping_a_status=${ping_overlay_a_status} last_ping_b_status=${ping_overlay_b_status}" >&2
   echo "--- agent A paths ---" >&2
   agent_paths "$agent_a" | jq . >&2 || true
   echo "--- agent B paths ---" >&2
