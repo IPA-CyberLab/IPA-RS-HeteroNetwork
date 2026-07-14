@@ -166,6 +166,7 @@ const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_RELAY_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+const RELAY_NODE_ID_STATE_WAIT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -502,8 +503,18 @@ struct StunArgs {
 
 #[derive(Debug, Args, Clone)]
 struct RelayArgs {
-    #[arg(long, env = "IPARS_RELAY_NODE_ID")]
-    relay_node_id: String,
+    #[arg(
+        long,
+        env = "IPARS_RELAY_NODE_ID",
+        conflicts_with = "relay_node_id_path"
+    )]
+    relay_node_id: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_RELAY_NODE_ID_PATH",
+        conflicts_with = "relay_node_id"
+    )]
+    relay_node_id_path: Option<PathBuf>,
     #[arg(long, env = "IPARS_RELAY_UDP_LISTEN", default_value = "0.0.0.0:51820")]
     udp_listen: SocketAddr,
     #[arg(long, env = "IPARS_RELAY_HTTP_LISTEN", default_value = "0.0.0.0:9580")]
@@ -7102,6 +7113,7 @@ async fn run_relay(
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
     validate_relay_config(&args)?;
+    let relay_node_id = relay_node_id(&args).await?;
     let admission_bearer_token = relay_admission_bearer_token(&args)?;
     let operator_api_bearer_token = relay_operator_api_bearer_token(&args)?;
     let udp_relay = UdpRelay::bind(args.udp_listen).await?;
@@ -7127,7 +7139,7 @@ async fn run_relay(
     let max_sessions_per_node =
         (args.max_sessions_per_node > 0).then_some(args.max_sessions_per_node);
     let service = Arc::new(RelayService::with_session_ttl_admission_controls(
-        NodeId::from_string(args.relay_node_id),
+        relay_node_id,
         RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(public_endpoint),
@@ -7166,7 +7178,17 @@ async fn run_relay(
 }
 
 fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
-    validate_daemon_identifier(&args.relay_node_id, "--relay-node-id")?;
+    match (&args.relay_node_id, &args.relay_node_id_path) {
+        (Some(node_id), None) => validate_daemon_identifier(node_id, "--relay-node-id")?,
+        (None, Some(path)) if path.as_os_str().is_empty() => {
+            anyhow::bail!("--relay-node-id-path must not be empty")
+        }
+        (None, Some(_)) => {}
+        (None, None) => anyhow::bail!("one of --relay-node-id or --relay-node-id-path is required"),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--relay-node-id and --relay-node-id-path cannot be used together")
+        }
+    }
     let public_endpoint = args
         .public_endpoint
         .context("--public-endpoint is required for relay advertisement")?;
@@ -7204,6 +7226,35 @@ fn validate_relay_config(args: &RelayArgs) -> anyhow::Result<()> {
         validate_api_bearer_token(token, "--operator-api-bearer-token")?;
     }
     Ok(())
+}
+
+async fn relay_node_id(args: &RelayArgs) -> anyhow::Result<NodeId> {
+    if let Some(node_id) = args.relay_node_id.as_deref() {
+        return Ok(NodeId::from_string(node_id));
+    }
+
+    let path = args
+        .relay_node_id_path
+        .as_deref()
+        .context("one of --relay-node-id or --relay-node-id-path is required")?;
+    let store = FileAgentStateStore::new(path);
+    let deadline = Instant::now() + Duration::from_secs(RELAY_NODE_ID_STATE_WAIT_SECONDS);
+    loop {
+        match store.load() {
+            Ok(state) => return Ok(state.node_id),
+            Err(AgentError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "failed to load relay node identity from {}: {error}",
+                    path.display()
+                )
+            }
+        }
+    }
 }
 
 fn relay_operator_api_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<String>> {
@@ -13037,7 +13088,7 @@ fn relay_session_state_from_admission(
     relay_endpoint: SocketAddr,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<RelaySessionState> {
-    validate_relay_admission_response(peer, request, &response, now)?;
+    validate_relay_admission_response(peer, relay, request, &response, now)?;
     let (admitted_local_addr, admitted_peer_addr) = if response.left == peer.node_id {
         (response.right_addr, response.left_addr)
     } else {
@@ -13057,10 +13108,18 @@ fn relay_session_state_from_admission(
 
 fn validate_relay_admission_response(
     peer: &NodeRecord,
+    relay: &NodeRecord,
     request: &RelayAdmissionRequest,
     response: &RelayAdmissionResponse,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
+    if response.relay_node != relay.node_id {
+        anyhow::bail!(
+            "relay admission response relay mismatch: expected {}, got {}",
+            relay.node_id,
+            response.relay_node
+        );
+    }
     if response.left != request.left || response.right != request.right {
         anyhow::bail!(
             "relay admission response node pair mismatch: expected {} -> {}, got {} -> {}",
@@ -18920,7 +18979,7 @@ mod tests {
         };
         let now = Utc::now();
         let response = RelayAdmissionResponse {
-            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            relay_node: relay.node_id.clone(),
             session_id: "node-a:node-b".to_string(),
             session_token: "relay-secret".to_string(),
             expires_at: now + ChronoDuration::seconds(300),
@@ -18929,6 +18988,13 @@ mod tests {
             left_addr: request.left_addr,
             right_addr: request.right_addr,
         };
+
+        let mut mismatched_response = response.clone();
+        mismatched_response.relay_node = NodeId::from_string("relay-daemon-local-name");
+        let error =
+            validate_relay_admission_response(&peer, &relay, &request, &mismatched_response, now)
+                .expect_err("relay identity mismatch must be rejected");
+        assert!(error.to_string().contains("relay mismatch"));
 
         let session = relay_session_state_from_admission(
             &peer,
@@ -18966,7 +19032,7 @@ mod tests {
             right_addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
         };
         let response = RelayAdmissionResponse {
-            relay_node: NodeId::from_string("relay-daemon-local-name"),
+            relay_node: relay.node_id.clone(),
             session_id: "node-a:node-z".to_string(),
             session_token: "relay-secret".to_string(),
             expires_at: now + ChronoDuration::seconds(300),
@@ -28568,6 +28634,38 @@ exec sleep 60
         }
 
         Err(anyhow::anyhow!("expected relay command"))
+    }
+
+    #[tokio::test]
+    async fn relay_node_id_path_uses_agent_state_identity() -> anyhow::Result<()> {
+        let directory = unique_test_dir("relay-node-id-state")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let state_path = directory.join("agent.json");
+        let state_store = FileAgentStateStore::new(&state_path);
+        let state = state_store.load_or_create(Utc::now())?;
+        let state_path_arg = state_path.display().to_string();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "relay",
+            "--relay-node-id-path",
+            state_path_arg.as_str(),
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--admission-url",
+            "http://relay-a:9580",
+        ])?;
+
+        let Command::Relay(args) = cli.command else {
+            anyhow::bail!("expected relay command");
+        };
+        validate_relay_config(&args)?;
+        assert_eq!(relay_node_id(&args).await?, state.node_id);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]

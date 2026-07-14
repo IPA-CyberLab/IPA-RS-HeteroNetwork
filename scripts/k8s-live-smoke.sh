@@ -232,6 +232,7 @@ wait_for_agent_api_service() {
 wait_for_relay_service() {
   local pod="$1"
   local service_name="$2"
+  local expected_relay_node="$3"
   local service_json=""
   local endpoints_json=""
   local cluster_ip=""
@@ -260,15 +261,19 @@ wait_for_relay_service() {
       node_status="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
         curl --noproxy '*' --fail --silent --show-error --max-time 5 \
           "http://${relay_node_ip}:${relay_http_node_port}/v1/status" 2>/dev/null || true)"
-      if jq -e '.health == "healthy" and .capability.e2e_only == true' >/dev/null 2>&1 <<<"$cluster_status" \
-        && jq -e '.health == "healthy" and .capability.e2e_only == true' >/dev/null 2>&1 <<<"$node_status"; then
+      if jq -e --arg expected "$expected_relay_node" \
+        '.health == "healthy" and .capability.e2e_only == true and .relay_node == $expected' \
+        >/dev/null 2>&1 <<<"$cluster_status" \
+        && jq -e --arg expected "$expected_relay_node" \
+          '.health == "healthy" and .capability.e2e_only == true and .relay_node == $expected' \
+          >/dev/null 2>&1 <<<"$node_status"; then
         echo "Kubernetes relay Service ${service_name} exposed healthy UDP/TCP relay endpoints through ClusterIP ${cluster_ip} and NodePort ${relay_udp_node_port}/${relay_http_node_port}"
         return 0
       fi
     fi
     sleep 2
   done
-  echo "Kubernetes relay Service ${service_name} did not expose a healthy relay endpoint" >&2
+  echo "Kubernetes relay Service ${service_name} did not expose a healthy relay endpoint with identity ${expected_relay_node}" >&2
   echo "Service:\n${service_json}" >&2
   echo "Endpoints:\n${endpoints_json}" >&2
   echo "ClusterIP status:\n${cluster_status:-<empty>}" >&2
@@ -696,7 +701,7 @@ for pod in "${agent_pods[@]}"; do
   node_ids+=("$node_id")
   vpn_ips+=("$vpn_ip")
 done
-wait_for_relay_service "${agent_pods[0]}" "$relay_service_name"
+wait_for_relay_service "${agent_pods[0]}" "$relay_service_name" "${node_ids[0]}"
 
 "$kubectl_bin" -n "$namespace" apply -f - <<EOF
 apiVersion: v1

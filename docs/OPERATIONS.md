@@ -360,9 +360,12 @@ When relay advertisement and relay Service exposure are enabled, the DaemonSet
 starts an `iparsd relay` sidecar in the same Pod. Its UDP target defaults to
 `51830` so it does not collide with the Agent's `51820` WireGuard/STUN listener;
 the relay Service exposes the advertised UDP port `51820` and HTTP port `9580`.
-The sidecar exposes `/healthz` for startup, readiness, and liveness checks. Use a
-different relay target if the Agent listener is customized, and keep the Service's
-external endpoint aligned with the value passed to `--relay-public-endpoint`.
+The sidecar reads the Agent Node ID from the shared `agent.json` state file and
+waits for that file before serving, so relay admission responses use the same
+identity that the Agent advertises. It exposes `/healthz` for startup, readiness,
+and liveness checks. Use a different relay target if the Agent listener is
+customized, and keep the Service's external endpoint aligned with the value
+passed to `--relay-public-endpoint`.
 
 `ipars k8s install` can override either side with
 `--agent-wireguard-listen-port` or `--agent-stun-bind`; the omitted value is

@@ -431,6 +431,7 @@ template_ok relay-service \
   --set agent.relayService.type=ClusterIP
 
 assert_rendered_contains relay-service "- name: relay"
+assert_rendered_contains relay-service "--relay-node-id-path"
 assert_rendered_contains relay-service "IPARS_RELAY_PUBLIC_ENDPOINT"
 assert_rendered_contains relay-service "containerPort: 51830"
 assert_rendered_contains relay-service "targetPort: 51830"

@@ -1361,11 +1361,9 @@ spec:
             - /usr/local/bin/iparsd
           args:
             - relay
+            - --relay-node-id-path
+            - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
           env:
-            - name: IPARS_RELAY_NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
             - name: IPARS_RELAY_UDP_LISTEN
               value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.udpTargetPort) | quote }}
             - name: IPARS_RELAY_HTTP_LISTEN
@@ -1444,6 +1442,9 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 1
             failureThreshold: 30
+          volumeMounts:
+            - name: agent-state
+              mountPath: {{ $agentStateMountPath | quote }}
         {{- end }}
       volumes:
         - name: agent-state
