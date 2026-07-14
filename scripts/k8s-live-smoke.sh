@@ -834,6 +834,8 @@ spec:
             - signal
             - --listen
             - 0.0.0.0:9443
+            - --control-plane-url
+            - http://${bootstrap_name}.${namespace}.svc:8443
           env:
             - name: IPARS_SIGNAL_DISABLE_IPV6_DIRECT
               value: "true"
