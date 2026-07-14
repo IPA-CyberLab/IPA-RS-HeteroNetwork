@@ -254,6 +254,7 @@ wait_for_relay_service() {
   local expected_endpoint_ip="${4:-}"
   local service_json=""
   local endpoints_json=""
+  local endpoint_slices_json=""
   local cluster_ip=""
   local cluster_status=""
   local node_status=""
@@ -263,6 +264,8 @@ wait_for_relay_service() {
     service_json="$($kubectl_bin -n "$namespace" get service "$service_name" -o json 2>/dev/null || true)"
     cluster_ip="$(jq -r '.spec.clusterIP // empty' <<<"$service_json" 2>/dev/null || true)"
     endpoints_json="$($kubectl_bin -n "$namespace" get endpoints "$service_name" -o json 2>/dev/null || true)"
+    endpoint_slices_json="$($kubectl_bin -n "$namespace" get endpointslice \
+      -l "kubernetes.io/service-name=${service_name}" -o json 2>/dev/null || true)"
     if [[ "$cluster_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
       && jq -e --argjson udp "$relay_udp_node_port" --argjson http "$relay_http_node_port" '
         .spec.type == "NodePort"
@@ -275,6 +278,24 @@ wait_for_relay_service() {
         and ([.subsets[]?.ports[]? | select(.name == "relay-udp" and .protocol == "UDP" and .port == 51830)] | length) >= 1
         and ([.subsets[]?.ports[]? | select(.name == "relay-http" and .protocol == "TCP" and .port == 9580)] | length) >= 1
       ' >/dev/null 2>&1 <<<"$endpoints_json"; then
+      if [[ -n "$expected_endpoint_ip" ]] \
+        && ! jq -e --arg expected "$expected_endpoint_ip" '
+          ([.subsets[]?.addresses[]?.ip] | unique) == [$expected]
+          and ([.subsets[]?.ports[]? | select(.name == "relay-udp" and .protocol == "UDP" and .port == 51830)] | length) == 1
+          and ([.subsets[]?.ports[]? | select(.name == "relay-http" and .protocol == "TCP" and .port == 9580)] | length) == 1
+        ' >/dev/null 2>&1 <<<"$endpoints_json"; then
+        sleep 2
+        continue
+      fi
+      if [[ -n "$expected_endpoint_ip" ]] \
+        && ! jq -e --arg expected "$expected_endpoint_ip" '
+          ([.items[]?.endpoints[]?
+            | select((.conditions.ready // true) == true)
+            | .addresses[]?] | unique) == [$expected]
+        ' >/dev/null 2>&1 <<<"$endpoint_slices_json"; then
+        sleep 2
+        continue
+      fi
       cluster_status="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
         curl --noproxy '*' --fail --silent --show-error --max-time 5 \
           "http://${cluster_ip}:9580/v1/status" 2>/dev/null || true)"
@@ -297,6 +318,7 @@ wait_for_relay_service() {
   echo "Kubernetes relay Service ${service_name} did not expose a healthy relay endpoint with identity ${expected_relay_node}" >&2
   echo "Service:\n${service_json}" >&2
   echo "Endpoints:\n${endpoints_json}" >&2
+  echo "EndpointSlices:\n${endpoint_slices_json}" >&2
   echo "ClusterIP status:\n${cluster_status:-<empty>}" >&2
   echo "NodePort status:\n${node_status:-<empty>}" >&2
   return 1
@@ -641,7 +663,13 @@ relay_admission_token_secret_file="$tmp_dir/relay-admission-token.secret"
 "$kubectl_bin" version --request-timeout=15s >/dev/null
 "$kubectl_bin" get nodes --no-headers | grep -q .
 "$helm_bin" version --short >/dev/null
-relay_node_ip="$($kubectl_bin get nodes -o jsonpath='{range .items[0].status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' | awk 'NF { print; exit }')"
+relay_node_ip="$($kubectl_bin get nodes \
+  -l 'node-role.kubernetes.io/control-plane' \
+  -o jsonpath='{range .items[0].status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
+  | awk 'NF { print; exit }')"
+if [[ -z "$relay_node_ip" ]]; then
+  relay_node_ip="$($kubectl_bin get nodes -o jsonpath='{range .items[0].status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' | awk 'NF { print; exit }')"
+fi
 if [[ ! "$relay_node_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   echo "kind live smoke requires an IPv4 node InternalIP for the relay NodePort, got ${relay_node_ip:-<empty>}" >&2
   exit 1
