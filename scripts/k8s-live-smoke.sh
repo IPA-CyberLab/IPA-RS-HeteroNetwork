@@ -405,7 +405,7 @@ wait_for_relay_fallback_path() {
         http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
     if jq -e --arg peer "$peer_id" '
       any(.paths[]?; .key.remote == $peer
-        and .selected_state == "relay"
+        and .selected_state == "RELAY"
         and (.relay_node | type == "string"))
     ' >/dev/null 2>&1 <<<"$paths_json" \
       && jq -e --arg peer "$peer_id" '
@@ -481,9 +481,9 @@ wait_for_direct_path_promotion() {
         http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
     if jq -e --arg peer "$peer_id" '
       any(.paths[]?; .key.remote == $peer
-        and (.selected_state == "direct_public"
-          or .selected_state == "direct_ipv6"
-          or .selected_state == "direct_nat_traversal")
+        and (.selected_state == "DIRECT_PUBLIC"
+          or .selected_state == "DIRECT_IPV6"
+          or .selected_state == "DIRECT_NAT_TRAVERSAL")
         and .relay_node == null)
     ' >/dev/null 2>&1 <<<"$paths_json" \
       && jq -e --arg peer "$peer_id" '
