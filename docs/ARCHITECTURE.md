@@ -173,7 +173,7 @@ Public nodes are relay candidates only when policy, health, and capacity permit 
 - abuse/rate-limit status
 - health status
 
-When a relay admission URL fronts a shared Service, the HTTP response identifies the relay instance that actually admitted the session. Agents accept that identity only when it is present in the current signed relay candidate set, and use that candidate's advertised UDP endpoint for the forwarder; an unknown response identity remains an admission failure.
+When a relay admission URL fronts a shared Service, the HTTP response identifies the relay instance that actually admitted the session. Agents accept that identity only when it is present in the current signed relay advertisements, including the local or peer relay advertisement when the endpoint is shared with a path participant, and use that advertisement's UDP endpoint for the forwarder; an unknown response identity remains an admission failure.
 
 Relay traffic is opaque WireGuard-encrypted UDP payload. Relays route by an outer relay frame containing session metadata and an expiring bearer credential, enforce bounded session metadata and payload sizes before forwarding, enforce per-session throughput windows, strip the relay frame before forwarding, and never receive keys that can decrypt tenant payload. Oversized relay frames are counted separately in dataplane drop-reason metrics.
 
