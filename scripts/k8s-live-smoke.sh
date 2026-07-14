@@ -439,6 +439,7 @@ fi
 trap cleanup EXIT
 umask 077
 tmp_dir="$(mktemp -d)"
+relay_admission_token_file="$tmp_dir/relay-admission.token"
 
 "$kubectl_bin" version --request-timeout=15s >/dev/null
 "$kubectl_bin" get nodes --no-headers | grep -q .
@@ -498,6 +499,8 @@ run_ipars init \
   --token-ttl-seconds "$timeout_seconds" \
   --default-role kubernetes-node \
   --allow-relay \
+  --relay-admission-bearer-token-path "$relay_admission_token_file" \
+  --daemon-state-dir "$tmp_dir/bootstrap" \
   --allowed-route "$service_cidr" \
   --unlimited-uses >"$init_output"
 
@@ -515,6 +518,7 @@ printf '%s' "$control_plane_operator_api_token" >"$control_plane_operator_api_to
   --from-file=token="$token_file" \
   --from-file=agent-api-token="$agent_api_token_file" \
   --from-file=control-plane-operator-api-token="$control_plane_operator_api_token_file" \
+  --from-file=relay-admission-token="$relay_admission_token_file" \
   --dry-run=client -o yaml | "$kubectl_bin" -n "$namespace" apply -f - >/dev/null
 
 image_ref="${image_repository}:${image_tag}"
@@ -631,6 +635,8 @@ agent_api_service_name="${chart_fullname}-agent"
   --set agent.peerMap.pollIntervalSeconds=2 \
   --set serviceExposure.routeIntervalSeconds=2 \
   --set agent.relayAdvertisement.enabled=true \
+  --set-string "agent.relayAdmissionBearerTokenSecret.name=${token_secret}" \
+  --set-string 'agent.relayAdmissionBearerTokenSecret.key=relay-admission-token' \
   --set-string "agent.relayAdvertisement.publicEndpoint=${relay_public_endpoint}" \
   --set-string "agent.relayAdvertisement.admissionUrl=${relay_admission_url}" \
   --set-string "agent.relayAdvertisement.statusUrl=${relay_status_url}" \
