@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_bin="${CARGO:-cargo}"
 docker_bin="${DOCKER:-docker}"
 dockerd_bin="${DOCKERD:-dockerd}"
+containerd_bin="${CONTAINERD:-containerd}"
 suffix="$$-$(date +%s%N)"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-docker-multi-engine.XXXXXX")"
 engine_a_port="$((25000 + ($$ % 1000)))"
@@ -13,10 +14,22 @@ engine_a_data="$tmp_dir/data-a"
 engine_b_data="$tmp_dir/data-b"
 engine_a_exec="$tmp_dir/exec-a"
 engine_b_exec="$tmp_dir/exec-b"
+engine_a_containerd_root="$tmp_dir/containerd-root-a"
+engine_b_containerd_root="$tmp_dir/containerd-root-b"
+engine_a_containerd_state="$tmp_dir/containerd-state-a"
+engine_b_containerd_state="$tmp_dir/containerd-state-b"
 engine_a_pidfile="$tmp_dir/dockerd-a.pid"
 engine_b_pidfile="$tmp_dir/dockerd-b.pid"
 engine_a_containerd="$tmp_dir/containerd-a.sock"
 engine_b_containerd="$tmp_dir/containerd-b.sock"
+engine_a_containerd_pidfile="$tmp_dir/containerd-a.pid"
+engine_b_containerd_pidfile="$tmp_dir/containerd-b.pid"
+engine_a_containerd_pid=""
+engine_b_containerd_pid=""
+engine_a_containerd_launcher_pid=""
+engine_b_containerd_launcher_pid=""
+engine_a_containerd_log="$tmp_dir/containerd-a.log"
+engine_b_containerd_log="$tmp_dir/containerd-b.log"
 engine_a_log="$tmp_dir/dockerd-a.log"
 engine_b_log="$tmp_dir/dockerd-b.log"
 test_log="$tmp_dir/test.log"
@@ -47,6 +60,18 @@ cleanup() {
   if [[ -f "$engine_b_pidfile" ]]; then
     run_root kill "$(run_root cat "$engine_b_pidfile")" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$engine_a_containerd_pid" ]]; then
+    run_root kill "$engine_a_containerd_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$engine_b_containerd_pid" ]]; then
+    run_root kill "$engine_b_containerd_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$engine_a_containerd_launcher_pid" ]]; then
+    kill "$engine_a_containerd_launcher_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$engine_b_containerd_launcher_pid" ]]; then
+    kill "$engine_b_containerd_launcher_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${test_pid:-}" ]]; then
     kill "$test_pid" >/dev/null 2>&1 || true
   fi
@@ -64,7 +89,28 @@ require_command() {
 
 require_command "$docker_bin"
 require_command "$dockerd_bin"
+require_command "$containerd_bin"
 require_command curl
+
+wait_for_containerd() {
+  local socket_path="$1"
+  local pid="$2"
+  local log_path="$3"
+  for _ in $(seq 1 60); do
+    if [[ -S "$socket_path" ]]; then
+      return 0
+    fi
+    if ! run_root kill -0 "$pid" >/dev/null 2>&1; then
+      echo "containerd for ${socket_path} exited before becoming ready" >&2
+      cat "$log_path" >&2 || true
+      exit 1
+    fi
+    sleep 1
+  done
+  echo "containerd socket ${socket_path} did not become ready" >&2
+  cat "$log_path" >&2 || true
+  exit 1
+}
 
 start_engine() {
   local name="$1"
@@ -73,8 +119,45 @@ start_engine() {
   local exec_root="$4"
   local pidfile="$5"
   local containerd_socket="$6"
-  local log_path="$7"
-  run_root mkdir -p "$data_root" "$exec_root"
+  local containerd_pidfile="$7"
+  local containerd_root="$8"
+  local containerd_state="$9"
+  local containerd_log_path="${10}"
+  local log_path="${11}"
+  run_root mkdir -p "$data_root" "$exec_root" "$containerd_root" "$containerd_state"
+  run_root sh -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' \
+    ipars-containerd "$containerd_pidfile" "$containerd_bin" \
+    --config=/dev/null \
+    --address="$containerd_socket" \
+    --root="$containerd_root" \
+    --state="$containerd_state" \
+    --log-level=error \
+    >"$containerd_log_path" 2>&1 &
+  local containerd_launcher_pid=$!
+  if [[ "$name" == "a" ]]; then
+    engine_a_containerd_launcher_pid="$containerd_launcher_pid"
+  else
+    engine_b_containerd_launcher_pid="$containerd_launcher_pid"
+  fi
+  local containerd_pid=""
+  for _ in $(seq 1 30); do
+    if [[ -f "$containerd_pidfile" ]]; then
+      containerd_pid="$(run_root cat "$containerd_pidfile")"
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$containerd_pid" ]]; then
+    echo "containerd for ${containerd_socket} did not publish its pid" >&2
+    cat "$containerd_log_path" >&2 || true
+    exit 1
+  fi
+  if [[ "$name" == "a" ]]; then
+    engine_a_containerd_pid="$containerd_pid"
+  else
+    engine_b_containerd_pid="$containerd_pid"
+  fi
+  wait_for_containerd "$containerd_socket" "$containerd_pid" "$containerd_log_path"
   run_root "$dockerd_bin" \
     --host="tcp://127.0.0.1:${port}" \
     --tls=false \
@@ -116,8 +199,8 @@ docker_engine() {
     "$docker_bin" --host "tcp://127.0.0.1:${port}" "$@"
 }
 
-start_engine a "$engine_a_port" "$engine_a_data" "$engine_a_exec" "$engine_a_pidfile" "$engine_a_containerd" "$engine_a_log"
-start_engine b "$engine_b_port" "$engine_b_data" "$engine_b_exec" "$engine_b_pidfile" "$engine_b_containerd" "$engine_b_log"
+start_engine a "$engine_a_port" "$engine_a_data" "$engine_a_exec" "$engine_a_pidfile" "$engine_a_containerd" "$engine_a_containerd_pidfile" "$engine_a_containerd_root" "$engine_a_containerd_state" "$engine_a_containerd_log" "$engine_a_log"
+start_engine b "$engine_b_port" "$engine_b_data" "$engine_b_exec" "$engine_b_pidfile" "$engine_b_containerd" "$engine_b_containerd_pidfile" "$engine_b_containerd_root" "$engine_b_containerd_state" "$engine_b_containerd_log" "$engine_b_log"
 wait_for_engine "$engine_a_port" "$engine_a_log"
 wait_for_engine "$engine_b_port" "$engine_b_log"
 
