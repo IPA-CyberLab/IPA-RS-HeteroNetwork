@@ -17,6 +17,7 @@ suffix="$$-$(date +%s%N)"
 namespace="${IPARS_K8S_SMOKE_NAMESPACE:-ipars-live-${suffix}}"
 release="${IPARS_K8S_SMOKE_RELEASE:-ipars-live-${suffix}}"
 bootstrap_name="ipars-bootstrap"
+signal_name="ipars-signal"
 token_secret="ipars-live-join"
 agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
@@ -74,7 +75,7 @@ dump_diagnostics() {
     "$kubectl_bin" -n "$namespace" describe daemonset "$chart_fullname" 2>&1 || true
   fi
   "$kubectl_bin" -n "$namespace" logs "deployment/${bootstrap_name}" -c control-plane --tail=200 2>&1 || true
-  "$kubectl_bin" -n "$namespace" logs "deployment/${bootstrap_name}" -c signal --tail=200 2>&1 || true
+  "$kubectl_bin" -n "$namespace" logs "deployment/${signal_name}" -c signal --tail=200 2>&1 || true
   "$kubectl_bin" -n "$namespace" logs "deployment/${bootstrap_name}" -c stun --tail=200 2>&1 || true
   local pod
   while IFS= read -r pod; do
@@ -145,15 +146,31 @@ wait_for_bootstrap_health() {
     if [[ -n "$pod" ]] \
       && "$kubectl_bin" -n "$namespace" exec "$pod" -c control-plane -- \
         curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8443/healthz >/dev/null \
-      && "$kubectl_bin" -n "$namespace" exec "$pod" -c signal -- \
-        curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9443/healthz >/dev/null \
       && "$kubectl_bin" -n "$namespace" exec "$pod" -c stun -- \
         curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3479/healthz >/dev/null; then
       return 0
     fi
     sleep 2
   done
-  echo "bootstrap control-plane, signal, and STUN services did not become healthy" >&2
+  echo "bootstrap control-plane and STUN services did not become healthy" >&2
+  return 1
+}
+
+wait_for_signal_health() {
+  local pod=""
+  local attempt
+  for attempt in $(seq 1 60); do
+    pod="$($kubectl_bin -n "$namespace" get pods \
+      -l app.kubernetes.io/component=ipars-signal \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [[ -n "$pod" ]] \
+      && "$kubectl_bin" -n "$namespace" exec "$pod" -c signal -- \
+        curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9443/healthz >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "signal service did not become healthy" >&2
   return 1
 }
 
@@ -655,13 +672,25 @@ spec:
     - name: control-plane
       port: 8443
       targetPort: control-plane
-    - name: signal
-      port: 9443
-      targetPort: signal
     - name: stun
       protocol: UDP
       port: 3478
       targetPort: stun
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${signal_name}
+  labels:
+    app.kubernetes.io/component: ipars-signal
+    ipars.io/live-smoke-bootstrap: "true"
+spec:
+  selector:
+    app.kubernetes.io/component: ipars-signal
+  ports:
+    - name: signal
+      port: 9443
+      targetPort: signal
 EOF
 
 bootstrap_cluster_ip="$("$kubectl_bin" -n "$namespace" get service "$bootstrap_name" -o jsonpath='{.spec.clusterIP}')"
@@ -755,21 +784,6 @@ spec:
               mountPath: /run/secrets/control-plane/operator-api-token
               subPath: operator-api-token
               readOnly: true
-        - name: signal
-          image: ${image_ref_json}
-          command: ["/usr/local/bin/iparsd"]
-          args:
-            - signal
-            - --listen
-            - 0.0.0.0:9443
-          env:
-            - name: IPARS_SIGNAL_DISABLE_IPV6_DIRECT
-              value: "true"
-            - name: IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL
-              value: "true"
-          ports:
-            - name: signal
-              containerPort: 9443
         - name: stun
           image: ${image_ref_json}
           command: ["/usr/local/bin/iparsd"]
@@ -795,13 +809,48 @@ spec:
             items:
               - key: control-plane-operator-api-token
                 path: operator-api-token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${signal_name}
+  labels:
+    app.kubernetes.io/component: ipars-signal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: ipars-signal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: ipars-signal
+    spec:
+      containers:
+        - name: signal
+          image: ${image_ref_json}
+          command: ["/usr/local/bin/iparsd"]
+          args:
+            - signal
+            - --listen
+            - 0.0.0.0:9443
+          env:
+            - name: IPARS_SIGNAL_DISABLE_IPV6_DIRECT
+              value: "true"
+            - name: IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL
+              value: "true"
+          ports:
+            - name: signal
+              containerPort: 9443
 EOF
 
 "$kubectl_bin" -n "$namespace" rollout status "deployment/${bootstrap_name}" --timeout="${timeout_seconds}s"
+"$kubectl_bin" -n "$namespace" rollout status "deployment/${signal_name}" --timeout="${timeout_seconds}s"
 wait_for_bootstrap_health
+wait_for_signal_health
 
 control_plane_url="http://${bootstrap_name}.${namespace}.svc:8443"
-signal_url="http://${bootstrap_name}.${namespace}.svc:9443"
+signal_url="http://${signal_name}.${namespace}.svc:9443"
 agent_state_path="/var/lib/ipars-live/${release}"
 agent_api_service_name="${chart_fullname}-agent"
 "$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \
@@ -1074,12 +1123,12 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
     "${node_ids[$relay_remote_index]}"
   wait_for_relay_dataplane
 
-  "$kubectl_bin" -n "$namespace" set env "deployment/$bootstrap_name" \
+  "$kubectl_bin" -n "$namespace" set env "deployment/$signal_name" \
     --containers=signal \
     IPARS_SIGNAL_DISABLE_IPV6_DIRECT=false \
     IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL=false
-  "$kubectl_bin" -n "$namespace" rollout status "deployment/$bootstrap_name" --timeout="$timeout_seconds"s
-  wait_for_bootstrap_health
+  "$kubectl_bin" -n "$namespace" rollout status "deployment/$signal_name" --timeout="$timeout_seconds"s
+  wait_for_signal_health
   wait_for_wireguard_path \
     "${agent_pods[$relay_local_index]}" \
     "${vpn_ips[$relay_local_index]}" \
