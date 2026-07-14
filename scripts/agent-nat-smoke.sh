@@ -415,6 +415,56 @@ ping_overlay() {
   return 1
 }
 
+ping_overlay_once() {
+  local namespace="$1"
+  local target="$2"
+  ip netns exec "$namespace" ping -I ipars0 -c 1 -W 1 "$target" >/dev/null 2>&1
+}
+
+wait_for_direct_dataplane() {
+  local peer_a="$1"
+  local peer_b="$2"
+  local consecutive_successes=0
+  for _ in $(seq 1 90); do
+    local state_a state_b metrics_a metrics_b
+    state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
+    state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
+    if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
+      && metrics_a="$(agent_metrics "$agent_a" 2>/dev/null)" \
+      && metrics_b="$(agent_metrics "$agent_b" 2>/dev/null)" \
+      && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
+      && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null \
+      && ping_overlay_once "$agent_a" "$vpn_b" \
+      && ping_overlay_once "$agent_b" "$vpn_a"; then
+      state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
+      state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
+      metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
+      metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
+      if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
+        && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
+        && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null; then
+        consecutive_successes=$((consecutive_successes + 1))
+        if [[ "$consecutive_successes" -ge 3 ]]; then
+          return 0
+        fi
+        continue
+      fi
+    fi
+    consecutive_successes=0
+    sleep 1
+  done
+  echo "direct path state did not sustain bidirectional overlay traffic" >&2
+  echo "--- agent A paths ---" >&2
+  agent_paths "$agent_a" | jq . >&2 || true
+  echo "--- agent B paths ---" >&2
+  agent_paths "$agent_b" | jq . >&2 || true
+  echo "--- agent A metrics ---" >&2
+  agent_metrics "$agent_a" | jq . >&2 || true
+  echo "--- agent B metrics ---" >&2
+  agent_metrics "$agent_b" | jq . >&2 || true
+  return 1
+}
+
 pin_agent_peer() {
   local namespace="$1"
   local peer="$2"
@@ -740,8 +790,7 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" 
   if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
     sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
   fi
-  ping_overlay "$agent_a" "$vpn_b"
-  ping_overlay "$agent_b" "$vpn_a"
+  wait_for_direct_dataplane "$node_a" "$node_b"
   ip netns exec "$agent_a" wg show ipars0 endpoints | grep -F -- "${nat_b_public_ip}:51820" >/dev/null
   ip netns exec "$agent_b" wg show ipars0 endpoints | grep -F -- "${nat_a_public_ip}:51820" >/dev/null
   if [[ "$nat_profile" == "one-sided" ]]; then
