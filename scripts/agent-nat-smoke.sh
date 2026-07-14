@@ -267,11 +267,11 @@ create_agent_nat_pair() {
       -j SNAT --to-source "$public_ip" --random-fully
   elif [[ -n "$snat_port" ]]; then
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
-      -s "${agent_ip}/32" -o "$public_if" -p tcp \
-      -j SNAT --to-source "$public_ip"
+      -s "${agent_ip}/32" -o "$public_if" -p udp --sport 51820 \
+      -j SNAT --to-source "${public_ip}:${snat_port}-${snat_port}"
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
-      -s "${agent_ip}/32" -o "$public_if" -p udp \
-      -j SNAT --to-source "${public_ip}:${snat_port}"
+      -s "${agent_ip}/32" -o "$public_if" \
+      -j SNAT --to-source "$public_ip"
   else
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
       -s "${agent_ip}/32" -o "$public_if" -j SNAT --to-source "$public_ip"
