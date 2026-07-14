@@ -645,6 +645,9 @@ wait_for_direct_path() {
   local expected_state_a="${3:-DIRECT_NAT_TRAVERSAL}"
   local expected_state_b="${4:-DIRECT_NAT_TRAVERSAL}"
   for _ in $(seq 1 120); do
+    # A pending direct probe needs encrypted traffic to produce inbound WireGuard evidence.
+    ping_overlay_once "$agent_a" "$vpn_b" || true
+    ping_overlay_once "$agent_b" "$vpn_a" || true
     local state_a state_b metrics_a metrics_b
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
