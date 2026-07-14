@@ -11,6 +11,17 @@ init_error="${work_dir}/init.stderr"
 join_token_path="${work_dir}/agent.join-token"
 control_plane_operator_token_path="${state_dir}/control-plane-operator.token"
 control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
+nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
+
+case "$nat_profile" in
+  endpoint-independent|symmetric)
+    ;;
+  *)
+    echo "unsupported IPARS_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
+    echo "expected endpoint-independent or symmetric" >&2
+    exit 1
+    ;;
+esac
 
 suffix="$$"
 bridge="ipbn${suffix}"
@@ -199,6 +210,7 @@ create_agent_nat_pair() {
   local public_if="$7"
   local agent_if="$8"
   local private_if="$9"
+  local profile="${10}"
 
   ip link add "$root_public_if" type veth peer name "$public_if"
   ip link set "$root_public_if" master "$bridge"
@@ -228,8 +240,17 @@ create_agent_nat_pair() {
   ip netns exec "$agent_namespace" sysctl -qw net.ipv4.conf.default.rp_filter=0
 
   ip netns exec "$nat_namespace" iptables -P FORWARD ACCEPT
-  ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
-    -s "${agent_ip}/32" -o "$public_if" -j SNAT --to-source "$public_ip"
+  if [[ "$profile" == "symmetric" ]]; then
+    ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
+      -s "${agent_ip}/32" -o "$public_if" -p tcp \
+      -j SNAT --to-source "$public_ip"
+    ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
+      -s "${agent_ip}/32" -o "$public_if" -p udp \
+      -j SNAT --to-source "$public_ip" --random-fully
+  else
+    ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
+      -s "${agent_ip}/32" -o "$public_if" -j SNAT --to-source "$public_ip"
+  fi
 }
 
 block_direct_peer() {
@@ -391,12 +412,17 @@ wait_agent_ready() {
     local metrics
     if status="$(agent_status "$namespace" 2>/dev/null)" \
       && metrics="$(agent_metrics "$namespace" 2>/dev/null)" \
-      && jq -e '
+      && jq -e --arg profile "$nat_profile" '
         .vpn_ip != null and
         .candidate_count >= 2 and
         .nat_classification != null and
-        .nat_classification.mapping_behavior == "endpoint_independent" and
-        .nat_classification.filtering_behavior == "endpoint_independent"
+        (if $profile == "symmetric" then
+          .nat_classification.mapping_behavior == "address_and_port_dependent" and
+          .nat_classification.strategy == "relay_preferred"
+        else
+          .nat_classification.mapping_behavior == "endpoint_independent" and
+          .nat_classification.filtering_behavior == "endpoint_independent"
+        end)
       ' <<<"$status" >/dev/null \
       && jq -e '.peer_map_synced == true and .peer_map_peer_count >= 2' <<<"$metrics" >/dev/null; then
       printf '%s\n' "$status" >"${log_path}.status.json"
@@ -540,10 +566,12 @@ ip link set "$bridge" up
 
 create_agent_nat_pair \
   "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
-  "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if"
+  "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
+  "$nat_profile"
 create_agent_nat_pair \
   "$nat_b" "$agent_b" "$nat_b_public_ip" "$nat_b_agent_ip" "$nat_b_gateway" \
-  "$nat_b_root_public_if" "$nat_b_public_if" "$nat_b_agent_if" "$nat_b_private_if"
+  "$nat_b_root_public_if" "$nat_b_public_if" "$nat_b_agent_if" "$nat_b_private_if" \
+  "$nat_profile"
 
 block_direct_peer \
   "$nat_a" "$nat_a_public_if" "$nat_b_public_ip" "$nat_a_agent_ip" \
@@ -589,8 +617,10 @@ for port in "$control_plane_port" "$signal_port" "$stun_http_port" "$relay_http_
 done
 
 signal_pid="$(jq -r '.daemon_processes[] | select(.service == "signal") | .pid' "$init_output")"
-stop_signal
-start_signal disabled "${state_dir}/logs/signal-disabled.log"
+if [[ "$nat_profile" == "endpoint-independent" ]]; then
+  stop_signal
+  start_signal disabled "${state_dir}/logs/signal-disabled.log"
+fi
 
 start_agent "$agent_a" "$nat_a_agent_ip" "${work_dir}/agent-a.json" "${work_dir}/agent-a.log"
 start_agent "$agent_b" "$nat_b_agent_ip" "${work_dir}/agent-b.json" "${work_dir}/agent-b.log"
@@ -621,22 +651,29 @@ for metrics_path in "${work_dir}/relay-a.metrics.json" "${work_dir}/relay-b.metr
   jq -e '([.relay_forwarders[]?.outbound_payload_bytes] | add // 0) > 0' "$metrics_path" >/dev/null
 done
 
-stop_signal
-start_signal enabled "${state_dir}/logs/signal-enabled.log"
-unblock_direct_peer "$nat_a" direct_rule_a
-unblock_direct_peer "$nat_a" direct_input_rule_a
-unblock_direct_peer "$nat_b" direct_rule_b
-unblock_direct_peer "$nat_b" direct_input_rule_b
-if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}" != "0" ]]; then
-  sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS}"
+if [[ "$nat_profile" == "endpoint-independent" ]]; then
+  stop_signal
+  start_signal enabled "${state_dir}/logs/signal-enabled.log"
+  unblock_direct_peer "$nat_a" direct_rule_a
+  unblock_direct_peer "$nat_a" direct_input_rule_a
+  unblock_direct_peer "$nat_b" direct_rule_b
+  unblock_direct_peer "$nat_b" direct_input_rule_b
+  if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}" != "0" ]]; then
+    sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS}"
+  fi
+  wait_for_direct_path "$node_a" "$node_b"
+  if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
+    sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
+  fi
+  ip netns exec "$agent_a" ping -I ipars0 -c 3 -W 2 "$vpn_b"
+  ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
+  ip netns exec "$agent_a" wg show ipars0 endpoints | grep -F -- "${nat_b_public_ip}:51820" >/dev/null
+  ip netns exec "$agent_b" wg show ipars0 endpoints | grep -F -- "${nat_a_public_ip}:51820" >/dev/null
+  echo "agent NAT smoke passed: endpoint-independent SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+else
+  sleep 5
+  wait_for_relay_path "$node_a" "$node_b"
+  ip netns exec "$agent_a" ping -I ipars0 -c 3 -W 2 "$vpn_b"
+  ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
+  echo "agent NAT smoke passed: symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
 fi
-wait_for_direct_path "$node_a" "$node_b"
-if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
-  sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
-fi
-ip netns exec "$agent_a" ping -I ipars0 -c 3 -W 2 "$vpn_b"
-ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
-ip netns exec "$agent_a" wg show ipars0 endpoints | grep -F -- "${nat_b_public_ip}:51820" >/dev/null
-ip netns exec "$agent_b" wg show ipars0 endpoints | grep -F -- "${nat_a_public_ip}:51820" >/dev/null
-
-echo "agent NAT smoke passed: real Agents joined through SNAT, used encrypted relay fallback, and promoted to direct NAT traversal"
