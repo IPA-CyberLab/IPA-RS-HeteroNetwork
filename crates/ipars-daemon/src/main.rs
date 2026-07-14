@@ -11969,7 +11969,9 @@ fn direct_path_probe_confirmed(
     };
     let skew = chrono::Duration::seconds(DIRECT_PATH_HANDSHAKE_CLOCK_SKEW_SECONDS);
     let fresh_handshake = telemetry.latest_handshake_at.is_some_and(|handshake| {
-        handshake >= endpoint_observed_at
+        // Command-backed WireGuard telemetry has whole-second timestamps. Allow the
+        // observation timestamp to land just after a valid handshake response.
+        handshake >= endpoint_observed_at - skew
             && handshake <= now + skew
             && handshake <= pending.expires_at + skew
     });
@@ -31542,6 +31544,41 @@ exec sleep 60
             .await
             .is_none());
         assert_eq!(runtime.metrics().await.direct_path_probe_confirmed_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_path_verification_allows_second_precision_handshake_timestamp() -> anyhow::Result<()>
+    {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let pending = PendingDirectPathProbe {
+            selected_state: PathState::DirectPublic,
+            selected_candidate: candidate.clone(),
+            started_at: now,
+            expires_at: now + ChronoDuration::seconds(120),
+            endpoint_observed_at: Some(now + ChronoDuration::milliseconds(500)),
+            baseline_rx_bytes: Some(100),
+            baseline_tx_bytes: Some(200),
+        };
+        let telemetry = WireGuardPeerTelemetry {
+            public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            endpoint: Some(candidate.addr.to_string()),
+            latest_handshake_at: Some(now),
+            rx_bytes: 100,
+            tx_bytes: 200,
+        };
+
+        assert!(direct_path_probe_confirmed(
+            &pending,
+            &candidate,
+            Some(&telemetry),
+            now + ChronoDuration::seconds(1),
+            true,
+        ));
         Ok(())
     }
 
