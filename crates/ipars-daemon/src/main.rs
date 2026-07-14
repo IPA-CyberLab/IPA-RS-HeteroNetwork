@@ -18991,9 +18991,16 @@ mod tests {
 
         let mut mismatched_response = response.clone();
         mismatched_response.relay_node = NodeId::from_string("relay-daemon-local-name");
-        let error =
-            validate_relay_admission_response(&peer, &relay, &request, &mismatched_response, now)
-                .expect_err("relay identity mismatch must be rejected");
+        let error = match validate_relay_admission_response(
+            &peer,
+            &relay,
+            &request,
+            &mismatched_response,
+            now,
+        ) {
+            Ok(()) => anyhow::bail!("relay identity mismatch must be rejected"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("relay mismatch"));
 
         let session = relay_session_state_from_admission(
