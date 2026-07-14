@@ -210,7 +210,7 @@ agent:
     httpAppProtocol: http
     publishNotReadyAddresses: false
     udpPort: 51820
-    udpTargetPort: 51820
+    udpTargetPort: 51830
     httpPort: 9580
     httpTargetPort: 9580
     udpNodePort: 0

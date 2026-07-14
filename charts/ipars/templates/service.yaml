@@ -24,6 +24,9 @@
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayService.publishNotReadyAddresses" "value" .Values.agent.relayService.publishNotReadyAddresses) -}}
 {{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- $relayServiceActive := and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled -}}
+{{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
+{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.wireguardListenPort" "value" $agentWireguardListenPortValue "max" 65535) -}}
+{{- $agentWireguardListenPort := int $agentWireguardListenPortValue -}}
 {{- $agentApiPortValue := printf "%v" .Values.agent.apiService.port -}}
 {{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.port" "value" $agentApiPortValue "max" 65535) -}}
 {{- $agentApiPort := int $agentApiPortValue -}}
@@ -102,7 +105,7 @@
 {{- end -}}
 {{- end -}}
 {{- if not $relayServiceActive -}}
-{{- if or (ne .Values.agent.relayService.type "LoadBalancer") (ne $relayUdpPort 51820) (ne $relayUdpTargetPort 51820) (ne $relayHttpPort 9580) (ne $relayHttpTargetPort 9580) (ne .Values.agent.relayService.udpAppProtocol "ipars.io/relay-udp") (ne .Values.agent.relayService.httpAppProtocol "http") (ne $relayClusterIP "") $relayClusterIPs (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0) (ne $relayLoadBalancerClass "") (ne $relayLoadBalancerIP "") $relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0) (not $relayAllocateLoadBalancerNodePorts) (ne $relayIpFamilyPolicy "") $relayIpFamilies (ne .Values.agent.relayService.internalTrafficPolicy "") (ne .Values.agent.relayService.trafficDistribution "") (ne .Values.agent.relayService.sessionAffinity "") (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.externalTrafficPolicy "Local") .Values.agent.relayService.publishNotReadyAddresses .Values.agent.relayService.annotations .Values.agent.relayService.exposureAcknowledged .Values.agent.relayService.allowUnrestrictedLoadBalancer .Values.agent.relayService.allowClusterExternalTrafficPolicy -}}
+{{- if or (ne .Values.agent.relayService.type "LoadBalancer") (ne $relayUdpPort 51820) (ne $relayUdpTargetPort 51830) (ne $relayHttpPort 9580) (ne $relayHttpTargetPort 9580) (ne .Values.agent.relayService.udpAppProtocol "ipars.io/relay-udp") (ne .Values.agent.relayService.httpAppProtocol "http") (ne $relayClusterIP "") $relayClusterIPs (ne $relayUdpNodePort 0) (ne $relayHttpNodePort 0) (ne $relayLoadBalancerClass "") (ne $relayLoadBalancerIP "") $relayExternalIPs $relayLoadBalancerSourceRanges (ne $relayHealthCheckNodePort 0) (not $relayAllocateLoadBalancerNodePorts) (ne $relayIpFamilyPolicy "") $relayIpFamilies (ne .Values.agent.relayService.internalTrafficPolicy "") (ne .Values.agent.relayService.trafficDistribution "") (ne .Values.agent.relayService.sessionAffinity "") (ne $relaySessionAffinityTimeoutSeconds 0) (ne .Values.agent.relayService.externalTrafficPolicy "Local") .Values.agent.relayService.publishNotReadyAddresses .Values.agent.relayService.annotations .Values.agent.relayService.exposureAcknowledged .Values.agent.relayService.allowUnrestrictedLoadBalancer .Values.agent.relayService.allowClusterExternalTrafficPolicy -}}
 {{- fail "agent.relayService exposure-specific values require agent.relayService.enabled=true and agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
 {{- end -}}
@@ -273,6 +276,12 @@
 {{- end -}}
 {{- if and $relayServiceActive (or (lt $relayHttpTargetPort 1) (gt $relayHttpTargetPort 65535)) -}}
 {{- fail "agent.relayService.httpTargetPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $relayServiceActive (eq $relayUdpTargetPort $agentWireguardListenPort) -}}
+{{- fail "agent.relayService.udpTargetPort must differ from agent.wireguardListenPort because the relay sidecar shares the agent Pod network namespace" -}}
+{{- end -}}
+{{- if and $relayServiceActive (eq $relayHttpTargetPort $agentApiTargetPort) -}}
+{{- fail "agent.relayService.httpTargetPort must differ from agent.apiService.targetPort because the relay sidecar shares the agent Pod network namespace" -}}
 {{- end -}}
 {{- if and $relayServiceActive (ne $relayClusterIP "") -}}
 {{- include "ipars.validateUsableServiceIPAddress" (dict "path" "agent.relayService.clusterIP" "value" $relayClusterIP) -}}

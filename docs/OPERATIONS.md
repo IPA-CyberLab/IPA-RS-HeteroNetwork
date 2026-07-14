@@ -356,6 +356,14 @@ Its production defaults set `agent.wireguardListenPort: 51820` and
 `agent.stunBind: "0.0.0.0:51820"`. Helm rejects zero ports and mismatched values
 before rendering the DaemonSet.
 
+When relay advertisement and relay Service exposure are enabled, the DaemonSet
+starts an `iparsd relay` sidecar in the same Pod. Its UDP target defaults to
+`51830` so it does not collide with the Agent's `51820` WireGuard/STUN listener;
+the relay Service exposes the advertised UDP port `51820` and HTTP port `9580`.
+The sidecar exposes `/healthz` for startup, readiness, and liveness checks. Use a
+different relay target if the Agent listener is customized, and keep the Service's
+external endpoint aligned with the value passed to `--relay-public-endpoint`.
+
 `ipars k8s install` can override either side with
 `--agent-wireguard-listen-port` or `--agent-stun-bind`; the omitted value is
 derived from the supplied port, while conflicting explicit values are rejected
@@ -403,7 +411,9 @@ For a live Kubernetes cluster integration gate, provide an image that the cluste
 pull and run the disposable-namespace smoke. It verifies Helm's DaemonSet against real
 control-plane, signal, and STUN services, signed token registration, namespace-scoped
 Service discovery RBAC, agent peer-map synchronization, control-plane health metrics,
-and, by default, a cross-agent WireGuard handshake plus encrypted HTTP traffic:
+relay sidecar health and relay UDP/HTTP Service reachability through ClusterIP and
+NodePort, relay-candidate publication, and, by default, a cross-agent WireGuard
+handshake plus encrypted HTTP traffic:
 
 ```bash
 IPARS_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/ipars \

@@ -87,6 +87,9 @@ const DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT: u16 = 51_821;
 const DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT: u16 = 51_822;
 const DEFAULT_K8S_AGENT_WIREGUARD_LISTEN_PORT: u16 = 51_820;
+const DEFAULT_K8S_AGENT_API_TARGET_PORT: u16 = 9_780;
+const DEFAULT_K8S_RELAY_UDP_TARGET_PORT: u16 = 51_830;
+const DEFAULT_K8S_RELAY_HTTP_TARGET_PORT: u16 = 9_580;
 const DEFAULT_K8S_AGENT_PEER_PROBE_PORT: u16 = 51_821;
 const DEFAULT_AGENT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_AGENT_PEER_PROBE_SAMPLE_COUNT: u16 = 5;
@@ -10144,6 +10147,36 @@ fn validate_k8s_service_exposure(args: &K8sInstallArgs) -> anyhow::Result<()> {
     {
         anyhow::bail!("--relay-udp-node-port and --relay-http-node-port must be different");
     }
+    if args.expose_relay {
+        let agent_wireguard_listen_port = args
+            .agent_wireguard_listen_port
+            .or_else(|| {
+                args.agent_stun_bind
+                    .as_deref()
+                    .and_then(|bind| bind.parse::<SocketAddr>().ok())
+                    .map(|bind| bind.port())
+            })
+            .unwrap_or(DEFAULT_K8S_AGENT_WIREGUARD_LISTEN_PORT);
+        let relay_udp_target_port = args
+            .relay_udp_target_port
+            .unwrap_or(DEFAULT_K8S_RELAY_UDP_TARGET_PORT);
+        if relay_udp_target_port == agent_wireguard_listen_port {
+            anyhow::bail!(
+                "--relay-udp-target-port must differ from the Agent WireGuard/STUN listener port because the relay sidecar shares the Agent Pod network namespace"
+            );
+        }
+        let agent_api_target_port = args
+            .agent_api_target_port
+            .unwrap_or(DEFAULT_K8S_AGENT_API_TARGET_PORT);
+        let relay_http_target_port = args
+            .relay_http_target_port
+            .unwrap_or(DEFAULT_K8S_RELAY_HTTP_TARGET_PORT);
+        if relay_http_target_port == agent_api_target_port {
+            anyhow::bail!(
+                "--relay-http-target-port must differ from the Agent API listener port because the relay sidecar shares the Agent Pod network namespace"
+            );
+        }
+    }
     if args.agent_api_load_balancer_class.is_some() && args.agent_api_service_type != "LoadBalancer"
     {
         anyhow::bail!("--agent-api-load-balancer-class only applies to LoadBalancer services");
@@ -15794,7 +15827,7 @@ fi
             relay_cluster_ip: Some("2001:db8::41".parse()?),
             relay_secondary_cluster_ip: Some("10.96.0.41".parse()?),
             relay_udp_port: Some(51821),
-            relay_udp_target_port: Some(51820),
+            relay_udp_target_port: Some(51830),
             relay_http_port: Some(9581),
             relay_http_target_port: Some(9580),
             relay_udp_node_port: Some(31820),
@@ -15915,7 +15948,7 @@ fi
             plan.commands[2].contains("--set-string 'agent.relayService.clusterIPs[1]=10.96.0.41'")
         );
         assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
-        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51820"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51830"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpTargetPort=9580"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
@@ -17721,7 +17754,7 @@ fi
         assert!(service_template.contains("(ne .Values.agent.apiService.appProtocol \"http\")"));
         assert!(service_template.contains("(ne .Values.agent.relayService.type \"LoadBalancer\")"));
         assert!(service_template.contains("(ne $relayUdpPort 51820)"));
-        assert!(service_template.contains("(ne $relayUdpTargetPort 51820)"));
+        assert!(service_template.contains("(ne $relayUdpTargetPort 51830)"));
         assert!(service_template.contains("(ne $relayHttpPort 9580)"));
         assert!(service_template.contains("(ne $relayHttpTargetPort 9580)"));
         assert!(service_template
@@ -19934,7 +19967,7 @@ fi
             "--relay-udp-port",
             "51821",
             "--relay-udp-target-port",
-            "51820",
+            "51830",
             "--relay-http-port",
             "9581",
             "--relay-http-target-port",
@@ -20273,7 +20306,7 @@ fi
             assert!(args.expose_relay);
             assert_eq!(args.relay_service_type, "LoadBalancer");
             assert_eq!(args.relay_udp_port, Some(51821));
-            assert_eq!(args.relay_udp_target_port, Some(51820));
+            assert_eq!(args.relay_udp_target_port, Some(51830));
             assert_eq!(args.relay_http_port, Some(9581));
             assert_eq!(args.relay_http_target_port, Some(9580));
             assert_eq!(args.relay_udp_node_port, Some(31820));
@@ -20772,6 +20805,40 @@ fi
         assert!(error.contains(
             "--relay-udp-node-port must not reuse Kubernetes NodePort 31080 already assigned to --agent-api-node-port"
         ));
+
+        let mut udp_listener_collision = base_k8s_install_args();
+        udp_listener_collision.expose_relay = true;
+        udp_listener_collision.allow_public_service_exposure = true;
+        udp_listener_collision.allow_unrestricted_load_balancer = true;
+        udp_listener_collision.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        udp_listener_collision.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        udp_listener_collision.relay_udp_target_port = Some(51820);
+        let error = match k8s_install_plan(udp_listener_collision) {
+            Ok(_) => panic!("relay UDP target port must not collide with the Agent listener"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-udp-target-port must differ"),
+            "unexpected UDP collision error: {error}"
+        );
+
+        let mut http_listener_collision = base_k8s_install_args();
+        http_listener_collision.expose_agent_api = true;
+        http_listener_collision.agent_api_target_port = Some(9790);
+        http_listener_collision.expose_relay = true;
+        http_listener_collision.allow_public_service_exposure = true;
+        http_listener_collision.allow_unrestricted_load_balancer = true;
+        http_listener_collision.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
+        http_listener_collision.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
+        http_listener_collision.relay_http_target_port = Some(9790);
+        let error = match k8s_install_plan(http_listener_collision) {
+            Ok(_) => panic!("relay HTTP target port must not collide with the Agent API listener"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("--relay-http-target-port must differ"),
+            "unexpected HTTP collision error: {error}"
+        );
 
         Ok(())
     }
@@ -21519,7 +21586,7 @@ fi
         valid.expose_relay = true;
         valid.relay_service_type = "ClusterIP".to_string();
         valid.relay_udp_port = Some(51821);
-        valid.relay_udp_target_port = Some(51820);
+        valid.relay_udp_target_port = Some(51830);
         valid.relay_http_port = Some(9581);
         valid.relay_http_target_port = Some(9580);
         valid.relay_network_policy_cidrs = vec!["203.0.113.0/24".parse()?];
@@ -21538,7 +21605,7 @@ fi
         assert!(plan.commands[2]
             .contains("--set-string 'networkPolicy.relay.allowedCidrs[0]=203.0.113.0/24'"));
         assert!(plan.commands[2].contains("--set agent.relayService.udpPort=51821"));
-        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51820"));
+        assert!(plan.commands[2].contains("--set agent.relayService.udpTargetPort=51830"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpPort=9581"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpTargetPort=9580"));
         assert!(plan

@@ -430,6 +430,12 @@ template_ok relay-service \
   --set agent.relayService.enabled=true \
   --set agent.relayService.type=ClusterIP
 
+assert_rendered_contains relay-service "- name: relay"
+assert_rendered_contains relay-service "IPARS_RELAY_PUBLIC_ENDPOINT"
+assert_rendered_contains relay-service "containerPort: 51830"
+assert_rendered_contains relay-service "targetPort: 51830"
+assert_rendered_contains relay-service "readOnlyRootFilesystem: true"
+
 template_fails relay-advertisement-loopback-public-endpoint \
   "agent.relayAdvertisement.publicEndpoint host value \"127.0.0.1\" must not be a loopback address" \
   --set agent.relayAdvertisement.enabled=true \
@@ -643,6 +649,24 @@ template_ok relay-forwarder-netns \
 template_fails relay-service-without-advertisement \
   "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true" \
   --set agent.relayService.enabled=true
+
+template_fails relay-sidecar-wireguard-port-collision \
+  "agent.relayService.udpTargetPort must differ from agent.wireguardListenPort" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=ClusterIP \
+  --set agent.relayService.udpTargetPort=51820
+
+template_fails relay-sidecar-agent-api-port-collision \
+  "agent.relayService.httpTargetPort must differ from agent.apiService.targetPort" \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string agent.relayAdvertisement.publicEndpoint=203.0.113.10:51820 \
+  --set-string agent.relayAdvertisement.admissionUrl=http://relay.example.com:9580 \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=ClusterIP \
+  --set agent.relayService.httpTargetPort=9780
 
 template_fails agent-api-nodeport-without-exposure-ack \
   "agent.apiService external exposure requires agent.apiService.exposureAcknowledged=true" \

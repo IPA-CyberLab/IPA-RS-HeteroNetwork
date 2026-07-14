@@ -1353,6 +1353,98 @@ spec:
               mountPath: /var/run/netns
               readOnly: true
             {{- end }}
+        {{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled }}
+        - name: relay
+          image: "{{ $imageRepository }}:{{ $imageTag }}"
+          imagePullPolicy: {{ $imagePullPolicy }}
+          command:
+            - /usr/local/bin/iparsd
+          args:
+            - relay
+          env:
+            - name: IPARS_RELAY_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: IPARS_RELAY_UDP_LISTEN
+              value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.udpTargetPort) | quote }}
+            - name: IPARS_RELAY_HTTP_LISTEN
+              value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.httpTargetPort) | quote }}
+            - name: IPARS_RELAY_PUBLIC_ENDPOINT
+              value: {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}
+            - name: IPARS_RELAY_ADMISSION_URL
+              value: {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}
+            - name: IPARS_RELAY_MAX_SESSIONS
+              value: {{ .Values.agent.relayAdvertisement.maxSessions | quote }}
+            - name: IPARS_RELAY_MAX_MBPS
+              value: {{ .Values.agent.relayAdvertisement.maxMbps | quote }}
+            {{- if and $relayAdmissionBearerTokenSecretName $relayAdmissionBearerTokenSecretKey }}
+            - name: IPARS_RELAY_ADMISSION_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $relayAdmissionBearerTokenSecretName | quote }}
+                  key: {{ $relayAdmissionBearerTokenSecretKey | quote }}
+            {{- end }}
+          ports:
+            - name: relay-udp
+              containerPort: {{ int .Values.agent.relayService.udpTargetPort }}
+              protocol: UDP
+            - name: relay-http
+              containerPort: {{ int .Values.agent.relayService.httpTargetPort }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          {{- if or .Values.agent.resources.requests.cpu .Values.agent.resources.requests.memory .Values.agent.resources.limits.cpu .Values.agent.resources.limits.memory }}
+          resources:
+            {{- if or .Values.agent.resources.requests.cpu .Values.agent.resources.requests.memory }}
+            requests:
+              {{- if .Values.agent.resources.requests.cpu }}
+              cpu: {{ .Values.agent.resources.requests.cpu | quote }}
+              {{- end }}
+              {{- if .Values.agent.resources.requests.memory }}
+              memory: {{ .Values.agent.resources.requests.memory | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if or .Values.agent.resources.limits.cpu .Values.agent.resources.limits.memory }}
+            limits:
+              {{- if .Values.agent.resources.limits.cpu }}
+              cpu: {{ .Values.agent.resources.limits.cpu | quote }}
+              {{- end }}
+              {{- if .Values.agent.resources.limits.memory }}
+              memory: {{ .Values.agent.resources.limits.memory | quote }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: relay-http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: relay-http
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: relay-http
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 30
+        {{- end }}
       volumes:
         - name: agent-state
           hostPath:

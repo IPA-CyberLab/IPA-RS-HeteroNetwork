@@ -22,9 +22,16 @@ agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
 service_route_name="ipars-route-target"
 service_route_port="18080"
+relay_udp_node_port="${IPARS_K8S_SMOKE_RELAY_UDP_NODE_PORT:-31820}"
+relay_http_node_port="${IPARS_K8S_SMOKE_RELAY_HTTP_NODE_PORT:-31958}"
 service_cidr="${IPARS_K8S_SMOKE_SERVICE_CIDR:-10.96.0.0/12}"
 stale_kubernetes_route_cidr="198.18.0.0/15"
 chart_fullname=""
+relay_service_name=""
+relay_node_ip=""
+relay_public_endpoint=""
+relay_admission_url=""
+relay_status_url=""
 tmp_dir=""
 namespace_created=0
 helm_installed=0
@@ -222,6 +229,53 @@ wait_for_agent_api_service() {
   return 1
 }
 
+wait_for_relay_service() {
+  local pod="$1"
+  local service_name="$2"
+  local service_json=""
+  local endpoints_json=""
+  local cluster_ip=""
+  local cluster_status=""
+  local node_status=""
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    service_json="$($kubectl_bin -n "$namespace" get service "$service_name" -o json 2>/dev/null || true)"
+    cluster_ip="$(jq -r '.spec.clusterIP // empty' <<<"$service_json" 2>/dev/null || true)"
+    endpoints_json="$($kubectl_bin -n "$namespace" get endpoints "$service_name" -o json 2>/dev/null || true)"
+    if [[ "$cluster_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+      && jq -e --argjson udp "$relay_udp_node_port" --argjson http "$relay_http_node_port" '
+        .spec.type == "NodePort"
+        and ([.spec.ports[]? | select(.name == "relay-udp" and .protocol == "UDP" and .port == 51820 and .targetPort == 51830 and .nodePort == $udp)] | length) == 1
+        and ([.spec.ports[]? | select(.name == "relay-http" and .protocol == "TCP" and .port == 9580 and .targetPort == 9580 and .nodePort == $http)] | length) == 1
+      ' >/dev/null 2>&1 <<<"$service_json" \
+      && jq -e '
+        ([.subsets[]?.addresses[]?.ip] | length) >= 1
+        and ([.subsets[]?.ports[]? | select(.name == "relay-udp" and .protocol == "UDP" and .port == 51830)] | length) >= 1
+        and ([.subsets[]?.ports[]? | select(.name == "relay-http" and .protocol == "TCP" and .port == 9580)] | length) >= 1
+      ' >/dev/null 2>&1 <<<"$endpoints_json"; then
+      cluster_status="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
+        curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+          "http://${cluster_ip}:9580/v1/status" 2>/dev/null || true)"
+      node_status="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
+        curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+          "http://${relay_node_ip}:${relay_http_node_port}/v1/status" 2>/dev/null || true)"
+      if jq -e '.health == "healthy" and .capability.e2e_only == true' >/dev/null 2>&1 <<<"$cluster_status" \
+        && jq -e '.health == "healthy" and .capability.e2e_only == true' >/dev/null 2>&1 <<<"$node_status"; then
+        echo "Kubernetes relay Service ${service_name} exposed healthy UDP/TCP relay endpoints through ClusterIP ${cluster_ip} and NodePort ${relay_udp_node_port}/${relay_http_node_port}"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  echo "Kubernetes relay Service ${service_name} did not expose a healthy relay endpoint" >&2
+  echo "Service:\n${service_json}" >&2
+  echo "Endpoints:\n${endpoints_json}" >&2
+  echo "ClusterIP status:\n${cluster_status:-<empty>}" >&2
+  echo "NodePort status:\n${node_status:-<empty>}" >&2
+  return 1
+}
+
 activate_agent_peer() {
   local pod="$1"
   local peer_id="$2"
@@ -287,6 +341,28 @@ wait_for_control_plane_metrics() {
   return 1
 }
 
+wait_for_control_plane_relay_candidates() {
+  local minimum_nodes="$1"
+  local metrics_json=""
+  local attempt
+  for attempt in $(seq 1 60); do
+    metrics_json="$($kubectl_bin -n "$namespace" exec "deployment/${bootstrap_name}" -c control-plane -- \
+      /usr/local/bin/ipars \
+        --control-plane-operator-api-bearer-token-path /run/secrets/control-plane/operator-api-token \
+        status --control-plane-url http://127.0.0.1:8443 2>/dev/null || true)"
+    if jq -e --argjson minimum "$minimum_nodes" \
+      '.metrics.relay_candidate_count >= $minimum' \
+      >/dev/null 2>&1 <<<"$metrics_json"; then
+      echo "control-plane reports ${minimum_nodes} healthy Kubernetes relay candidate(s)"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "control-plane did not report every Kubernetes relay sidecar as a healthy relay candidate" >&2
+  echo "Control-plane status:\n${metrics_json:-<empty>}" >&2
+  return 1
+}
+
 if [[ -z "$image_repository" || -z "$image_tag" ]]; then
   echo "set IPARS_K8S_SMOKE_IMAGE_REPOSITORY and IPARS_K8S_SMOKE_IMAGE_TAG to an image reachable by the target cluster" >&2
   exit 1
@@ -319,6 +395,18 @@ if [[ "$keep_resources" != "0" && "$keep_resources" != "1" ]]; then
   echo "IPARS_K8S_SMOKE_KEEP_RESOURCES must be 0 or 1" >&2
   exit 1
 fi
+if [[ ! "$relay_udp_node_port" =~ ^[0-9]+$ || "$relay_udp_node_port" -lt 30000 || "$relay_udp_node_port" -gt 32767 ]]; then
+  echo "IPARS_K8S_SMOKE_RELAY_UDP_NODE_PORT must be between 30000 and 32767" >&2
+  exit 1
+fi
+if [[ ! "$relay_http_node_port" =~ ^[0-9]+$ || "$relay_http_node_port" -lt 30000 || "$relay_http_node_port" -gt 32767 ]]; then
+  echo "IPARS_K8S_SMOKE_RELAY_HTTP_NODE_PORT must be between 30000 and 32767" >&2
+  exit 1
+fi
+if [[ "$relay_udp_node_port" == "$relay_http_node_port" ]]; then
+  echo "IPARS_K8S_SMOKE_RELAY_UDP_NODE_PORT and IPARS_K8S_SMOKE_RELAY_HTTP_NODE_PORT must differ" >&2
+  exit 1
+fi
 
 if [[ "$agent_host_network" == "true" ]]; then
   agent_dns_policy="ClusterFirstWithHostNet"
@@ -335,6 +423,7 @@ else
   chart_fullname="${chart_fullname:0:53}"
   chart_fullname="${chart_fullname%-}"
 fi
+relay_service_name="${chart_fullname}-relay"
 require_command "$kubectl_bin"
 require_command "$helm_bin"
 require_command jq
@@ -354,6 +443,14 @@ tmp_dir="$(mktemp -d)"
 "$kubectl_bin" version --request-timeout=15s >/dev/null
 "$kubectl_bin" get nodes --no-headers | grep -q .
 "$helm_bin" version --short >/dev/null
+relay_node_ip="$($kubectl_bin get nodes -o jsonpath='{range .items[0].status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' | awk 'NF { print; exit }')"
+if [[ ! "$relay_node_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo "kind live smoke requires an IPv4 node InternalIP for the relay NodePort, got ${relay_node_ip:-<empty>}" >&2
+  exit 1
+fi
+relay_public_endpoint="${relay_node_ip}:${relay_udp_node_port}"
+relay_admission_url="http://${relay_node_ip}:${relay_http_node_port}"
+relay_status_url="$relay_admission_url"
 
 if "$kubectl_bin" get namespace "$namespace" >/dev/null 2>&1; then
   echo "refusing to reuse existing namespace ${namespace}" >&2
@@ -532,6 +629,17 @@ agent_api_service_name="${chart_fullname}-agent"
   --set agent.apiService.targetPort=9780 \
   --set agent.peerMap.pollIntervalSeconds=2 \
   --set serviceExposure.routeIntervalSeconds=2 \
+  --set agent.relayAdvertisement.enabled=true \
+  --set-string "agent.relayAdvertisement.publicEndpoint=${relay_public_endpoint}" \
+  --set-string "agent.relayAdvertisement.admissionUrl=${relay_admission_url}" \
+  --set-string "agent.relayAdvertisement.statusUrl=${relay_status_url}" \
+  --set agent.relayService.enabled=true \
+  --set agent.relayService.type=NodePort \
+  --set agent.relayService.exposureAcknowledged=true \
+  --set agent.relayService.udpNodePort="${relay_udp_node_port}" \
+  --set agent.relayService.httpNodePort="${relay_http_node_port}" \
+  --set agent.relayService.udpTargetPort=51830 \
+  --set agent.relayService.httpTargetPort=9580 \
   --set-string 'agent.tolerations[0].operator=Exists' \
   --set "agent.hostNetwork=${agent_host_network}" \
   --set-string "agent.dnsPolicy=${agent_dns_policy}" \
@@ -579,6 +687,7 @@ for pod in "${agent_pods[@]}"; do
   node_ids+=("$node_id")
   vpn_ips+=("$vpn_ip")
 done
+wait_for_relay_service "${agent_pods[0]}" "$relay_service_name"
 
 "$kubectl_bin" -n "$namespace" apply -f - <<EOF
 apiVersion: v1
@@ -623,6 +732,7 @@ done
 route_provider_node_id="${node_ids[0]}"
 "$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \
   --namespace "$namespace" \
+  --reuse-values \
   --wait \
   --timeout "${timeout_seconds}s" \
   --set-string "image.repository=${image_repository}" \
@@ -694,6 +804,7 @@ for pod in "${agent_pods[@]}"; do
 done
 
 wait_for_control_plane_metrics "$desired_agents"
+wait_for_control_plane_relay_candidates "$desired_agents"
 wait_for_agent_api_service "${agent_pods[0]}" "$agent_api_service_name"
 
 for index in "${!node_ids[@]}"; do

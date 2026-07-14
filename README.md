@@ -91,7 +91,7 @@ The runner preflights `docker`, Docker daemon reachability, and the `docker comp
 IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 cargo test -p ipars-cli --test docker_compose_smoke -- --nocapture
 ```
 
-Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders default, Service exposure, Service traffic policy/distribution/affinity, node affinity, pod affinity/anti-affinity, scheduler/runtime class, topology spread, NetworkPolicy, route-disabled, namespace-scoped Service discovery RBAC, relay-forwarder namespace, and expected-failure chart configurations. The kind Kubernetes live smoke additionally verifies Service/API routes through the selected route provider, identity-preserving DaemonSet rollout, and removal of an injected stale protocol-240 peer-map route from the consumer after authoritative Service discovery reconciliation:
+Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders default, Service exposure, Service traffic policy/distribution/affinity, node affinity, pod affinity/anti-affinity, scheduler/runtime class, topology spread, NetworkPolicy, route-disabled, namespace-scoped Service discovery RBAC, colocated relay sidecar, relay-forwarder namespace, and expected-failure chart configurations. The kind Kubernetes live smoke additionally verifies Service/API routes through the selected route provider, identity-preserving DaemonSet rollout, the relay Service and sidecar status path, and removal of an injected stale protocol-240 peer-map route from the consumer after authoritative Service discovery reconciliation:
 
 ```bash
 scripts/helm-smoke.sh
@@ -99,10 +99,12 @@ scripts/helm-smoke.sh
 
 Run the live Kubernetes integration smoke against a cluster where the IPARS image is
 already pullable. It creates a disposable namespace, starts control-plane, signal, and
-STUN services, installs the Helm DaemonSet with a signed join token, and verifies agent
-registration, Service discovery RBAC, peer-map synchronization, control-plane metrics,
-and, with the default `linux-command` backend, a real cross-agent WireGuard handshake
-and encrypted HTTP request before deleting the namespace:
+STUN services, installs the Helm DaemonSet with a signed join token and a colocated
+`iparsd relay` sidecar, and verifies agent registration, Service discovery RBAC,
+peer-map synchronization, control-plane metrics, the relay UDP/HTTP Service through
+ClusterIP and NodePort, healthy relay status, and relay-candidate publication. With
+the default `linux-command` backend it also requires a real cross-agent WireGuard
+handshake and encrypted HTTP request before deleting the namespace:
 
 ```bash
 IPARS_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/ipars \
