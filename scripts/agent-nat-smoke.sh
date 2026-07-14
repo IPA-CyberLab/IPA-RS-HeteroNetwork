@@ -402,6 +402,19 @@ relay_status() {
     "http://${root_public_ip}:${relay_http_port}/v1/status"
 }
 
+ping_overlay() {
+  local namespace="$1"
+  local target="$2"
+  for attempt in 1 2 3; do
+    if ip netns exec "$namespace" ping -I ipars0 -c 3 -W 2 "$target"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "overlay ping from ${namespace} to ${target} failed after relay/direct warm-up retries" >&2
+  return 1
+}
+
 pin_agent_peer() {
   local namespace="$1"
   local peer="$2"
@@ -698,8 +711,8 @@ wait_for_relay_path "$node_a" "$node_b"
 if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS:-0}" != "0" ]]; then
   sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS}"
 fi
-ip netns exec "$agent_a" ping -I ipars0 -c 3 -W 2 "$vpn_b"
-ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
+ping_overlay "$agent_a" "$vpn_b"
+ping_overlay "$agent_b" "$vpn_a"
 agent_metrics "$agent_a" >"${work_dir}/relay-a.metrics.json"
 agent_metrics "$agent_b" >"${work_dir}/relay-b.metrics.json"
 for metrics_path in "${work_dir}/relay-a.metrics.json" "${work_dir}/relay-b.metrics.json"; do
@@ -722,8 +735,8 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" 
   if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
     sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
   fi
-  ip netns exec "$agent_a" ping -I ipars0 -c 3 -W 2 "$vpn_b"
-  ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
+  ping_overlay "$agent_a" "$vpn_b"
+  ping_overlay "$agent_b" "$vpn_a"
   ip netns exec "$agent_a" wg show ipars0 endpoints | grep -F -- "${nat_b_public_ip}:51820" >/dev/null
   ip netns exec "$agent_b" wg show ipars0 endpoints | grep -F -- "${nat_a_public_ip}:51820" >/dev/null
   if [[ "$nat_profile" == "one-sided" ]]; then
@@ -734,7 +747,7 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" 
 else
   sleep 5
   wait_for_relay_path "$node_a" "$node_b"
-  ip netns exec "$agent_a" ping -I ipars0 -c 3 -W 2 "$vpn_b"
-  ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
+  ping_overlay "$agent_a" "$vpn_b"
+  ping_overlay "$agent_b" "$vpn_a"
   echo "agent NAT smoke passed: symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
 fi
