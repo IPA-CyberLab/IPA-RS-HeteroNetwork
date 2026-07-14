@@ -12501,6 +12501,21 @@ async fn retain_path_during_direct_probe(
             }
             return (current, StableSignalPathSelection::CurrentRelay);
         }
+        if current.selected_state.is_direct() {
+            current.updated_at = now;
+            if !current
+                .score
+                .reasons
+                .iter()
+                .any(|reason| reason == "direct_path_probe_pending")
+            {
+                current
+                    .score
+                    .reasons
+                    .push("direct_path_probe_pending".to_string());
+            }
+            return (current, StableSignalPathSelection::CurrentDirect);
+        }
     }
     direct_path_failure_record(direct, relay_candidates, "direct_path_probe_pending", now)
 }
@@ -12520,6 +12535,7 @@ fn direct_path_failure_record(
 enum StableSignalPathSelection {
     Candidate,
     CurrentRelay,
+    CurrentDirect,
 }
 
 async fn stable_signal_path_record(
@@ -31670,6 +31686,52 @@ exec sleep 60
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.direct_path_probe_confirmed_count, 1);
         assert_eq!(metrics.direct_path_probe_timeout_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_probe_retains_current_direct_path_until_probe_finishes(
+    ) -> Result<(), AgentError> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("peer-a");
+        let current_candidate = candidate("peer-a", EndpointCandidateKind::StunReflexive, 10);
+        let mut probe_candidate = current_candidate.clone();
+        probe_candidate.addr = SocketAddr::from(([203, 0, 113, 11], 51820));
+        let current = PathRecord {
+            key: PeerPathKey::new(local.clone(), peer.clone()),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(current_candidate),
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                0,
+            ),
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+        runtime.upsert_path_state(current.clone()).await?;
+        let probe = PathRecord {
+            selected_candidate: Some(probe_candidate),
+            ..current.clone()
+        };
+
+        let (retained, selection) =
+            retain_path_during_direct_probe(&runtime, &probe, &[], Utc::now()).await;
+
+        assert_eq!(selection, StableSignalPathSelection::CurrentDirect);
+        assert_eq!(retained.selected_state, PathState::DirectNatTraversal);
+        assert_eq!(retained.selected_candidate, current.selected_candidate);
+        assert!(retained
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_path_probe_pending"));
         Ok(())
     }
 
