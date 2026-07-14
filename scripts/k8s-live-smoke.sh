@@ -788,20 +788,20 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
       exit 1
     fi
 
-    "$kubectl_bin" -n "$namespace" exec "$provider_pod" -c agent -- \
+    "$kubectl_bin" -n "$namespace" exec "$consumer_pod" -c agent -- \
       sh -ec '
-        ip -4 route replace "$1" dev ipars0 scope global table 10064 protocol 242 metric 100
+        ip -4 route replace "$1" dev ipars0 scope global protocol 240 metric 50
       ' sh "$stale_kubernetes_route_cidr"
     for attempt in $(seq 1 90); do
-      stale_routes="$($kubectl_bin -n "$namespace" exec "$provider_pod" -c agent -- \
-        ip -4 route show table 10064 protocol 242 2>/dev/null || true)"
+      stale_routes="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
+        ip -4 route show table main protocol 240 2>/dev/null || true)"
       if ! grep -Fq -- "$stale_kubernetes_route_cidr" <<<"$stale_routes"; then
-        echo "route provider ${route_provider_node_id} removed stale Kubernetes managed route ${stale_kubernetes_route_cidr}"
+        echo "consumer removed stale Kubernetes peer-map route ${stale_kubernetes_route_cidr}"
         break
       fi
       if [[ "$attempt" == 90 ]]; then
-        echo "route provider ${route_provider_node_id} retained stale Kubernetes managed route ${stale_kubernetes_route_cidr}" >&2
-        echo "managed Kubernetes routes:\n${stale_routes}" >&2
+        echo "consumer retained stale Kubernetes peer-map route ${stale_kubernetes_route_cidr}" >&2
+        echo "managed peer-map routes:\n${stale_routes}" >&2
         exit 1
       fi
       sleep 2
