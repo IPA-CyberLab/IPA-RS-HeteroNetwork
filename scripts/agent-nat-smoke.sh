@@ -302,15 +302,16 @@ block_direct_peer() {
   local public_if="$2"
   local peer_public_ip="$3"
   local agent_ip="$4"
-  local -n forward_rule_ref="$5"
-  local -n input_rule_ref="$6"
+  local public_port="${5:-51820}"
+  local -n forward_rule_ref="$6"
+  local -n input_rule_ref="$7"
   forward_rule_ref=(
     -I FORWARD 1
     -i "$public_if"
     -s "$peer_public_ip"
     -d "$agent_ip"
     -p udp
-    --dport 51820
+    --dport "$public_port"
     -j DROP
   )
   input_rule_ref=(
@@ -318,7 +319,7 @@ block_direct_peer() {
     -i "$public_if"
     -s "$peer_public_ip"
     -p udp
-    --dport 51820
+    --dport "$public_port"
     -j DROP
   )
   ip netns exec "$nat_namespace" iptables "${forward_rule_ref[@]}"
@@ -717,11 +718,11 @@ fi
 
 block_direct_peer \
   "$nat_a" "$nat_a_public_if" "$nat_b_public_ip" "$nat_a_agent_ip" \
-  direct_rule_a direct_input_rule_a
+  "$nat_a_expected_public_port" direct_rule_a direct_input_rule_a
 if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
   block_direct_peer \
     "$nat_b" "$nat_b_public_if" "$nat_a_public_ip" "$nat_b_agent_ip" \
-    direct_rule_b direct_input_rule_b
+    "$nat_b_expected_public_port" direct_rule_b direct_input_rule_b
 fi
 
 echo "starting public bootstrap services on ${root_public_ip}"
