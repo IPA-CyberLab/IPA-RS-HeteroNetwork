@@ -7721,7 +7721,7 @@ struct ManagedUserspaceWireGuardProcess {
     pid: Option<u32>,
     runtime: Arc<AgentRuntime>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ManagedUserspaceWireGuardProcess {
@@ -7736,21 +7736,34 @@ impl ManagedUserspaceWireGuardProcess {
             }
         }
 
-        if let Err(error) = self.task.await {
-            tracing::warn!(
-                command = %self.label,
-                pid = ?self.pid,
-                %error,
-                "userspace WireGuard process monitor task failed"
-            );
-            self.runtime
-                .record_userspace_wireguard_process_status(
-                    AgentManagedProcessState::Failed,
-                    self.pid,
-                    None,
-                    Some(error.to_string()),
-                )
-                .await;
+        if let Some(task) = self.task.take() {
+            if let Err(error) = task.await {
+                tracing::warn!(
+                    command = %self.label,
+                    pid = ?self.pid,
+                    %error,
+                    "userspace WireGuard process monitor task failed"
+                );
+                self.runtime
+                    .record_userspace_wireguard_process_status(
+                        AgentManagedProcessState::Failed,
+                        self.pid,
+                        None,
+                        Some(error.to_string()),
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+impl Drop for ManagedUserspaceWireGuardProcess {
+    fn drop(&mut self) {
+        // Startup can fail after the process is ready but before the HTTP
+        // server owns the normal shutdown path. Notify the monitor here so
+        // those early-return paths still terminate the child process group.
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
     }
 }
@@ -7829,7 +7842,7 @@ async fn start_userspace_wireguard_process(
         pid,
         runtime,
         shutdown: Some(shutdown),
-        task,
+        task: Some(task),
     }))
 }
 
@@ -23919,6 +23932,67 @@ exec sleep 60
         assert_eq!(status.state, AgentManagedProcessState::Stopped);
         assert_eq!(status.pid, Some(pid));
         assert!(status.exit_status.is_some());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_managed_userspace_wireguard_process_stops_child_process() -> anyhow::Result<()>
+    {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "iparsd-userspace-wg-drop-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir(&temp_dir)?;
+        let pid_path = temp_dir.join("child.pid");
+        let pid_arg = pid_path.display().to_string();
+        let shell_script = r#"printf '%s\n' "$$" > "$1"; exec sleep 60"#;
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(shell_script)
+            .arg("ipars-drop")
+            .arg(&pid_arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start drop cleanup test child")?;
+        let pid = wait_for_pid_file(&pid_path, Duration::from_secs(2)).await?;
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let task = tokio::spawn(monitor_userspace_wireguard_process(
+            child,
+            "drop-test".to_string(),
+            Some(pid),
+            runtime.clone(),
+            shutdown_rx,
+            Duration::from_secs(1),
+        ));
+
+        let managed = ManagedUserspaceWireGuardProcess {
+            label: "drop-test".to_string(),
+            pid: Some(pid),
+            runtime: runtime.clone(),
+            shutdown: Some(shutdown),
+            task: Some(task),
+        };
+        drop(managed);
+
+        assert!(
+            wait_for_process_absent(pid, Duration::from_secs(2)).await,
+            "userspace WireGuard child process {pid} was left running after manager drop"
+        );
+        let status = runtime
+            .userspace_wireguard_process_status()
+            .await
+            .context("missing userspace WireGuard process status after manager drop")?;
+        assert_eq!(status.state, AgentManagedProcessState::Stopped);
+        assert_eq!(status.pid, Some(pid));
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }

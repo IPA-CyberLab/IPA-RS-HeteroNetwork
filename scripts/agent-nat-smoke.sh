@@ -14,11 +14,11 @@ control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
 
 case "$nat_profile" in
-  endpoint-independent|symmetric|one-sided)
+  endpoint-independent|symmetric|one-sided|one-sided-symmetric)
     ;;
   *)
     echo "unsupported IPARS_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
-    echo "expected endpoint-independent, symmetric, or one-sided" >&2
+    echo "expected endpoint-independent, symmetric, one-sided, or one-sided-symmetric" >&2
     exit 1
     ;;
 esac
@@ -436,7 +436,8 @@ wait_agent_ready() {
   local namespace="$1"
   local log_path="$2"
   local public_agent=0
-  if [[ "$nat_profile" == "one-sided" && "$namespace" == "$agent_b" ]]; then
+  if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]] \
+    && [[ "$namespace" == "$agent_b" ]]; then
     public_agent=1
   fi
   for _ in $(seq 1 90); do
@@ -452,11 +453,11 @@ wait_agent_ready() {
         .vpn_ip != null and
         .candidate_count >= 2 and
         .nat_classification != null and
-        (if $profile == "symmetric" then
+        (if $public_agent == "1" then
+          .nat_classification.mapping_behavior == "no_nat"
+        elif $profile == "symmetric" or $profile == "one-sided-symmetric" then
           .nat_classification.mapping_behavior == "address_and_port_dependent" and
           .nat_classification.strategy == "relay_preferred"
-        elif $public_agent == "1" then
-          .nat_classification.mapping_behavior == "no_nat"
         else
           .nat_classification.mapping_behavior == "endpoint_independent" and
           .nat_classification.filtering_behavior == "endpoint_independent"
@@ -609,7 +610,7 @@ public_ports=(
 )
 
 ip netns add "$nat_a"
-if [[ "$nat_profile" != "one-sided" ]]; then
+if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
   ip netns add "$nat_b"
 fi
 ip netns add "$agent_a"
@@ -618,11 +619,15 @@ ip link add "$bridge" type bridge
 ip addr add "${root_public_ip}/24" dev "$bridge"
 ip link set "$bridge" up
 
-if [[ "$nat_profile" == "one-sided" ]]; then
+if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]]; then
+  nat_a_profile="$nat_profile"
+  if [[ "$nat_profile" == "one-sided-symmetric" ]]; then
+    nat_a_profile="symmetric"
+  fi
   create_agent_nat_pair \
     "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
     "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
-    endpoint-independent
+    "$nat_a_profile"
   create_public_agent "$agent_b" "$nat_b_public_ip" "$nat_b_root_public_if" "$nat_b_public_if"
 else
   create_agent_nat_pair \
@@ -638,7 +643,7 @@ fi
 block_direct_peer \
   "$nat_a" "$nat_a_public_if" "$nat_b_public_ip" "$nat_a_agent_ip" \
   direct_rule_a direct_input_rule_a
-if [[ "$nat_profile" != "one-sided" ]]; then
+if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
   block_direct_peer \
     "$nat_b" "$nat_b_public_if" "$nat_a_public_ip" "$nat_b_agent_ip" \
     direct_rule_b direct_input_rule_b
@@ -687,7 +692,7 @@ if [[ "$nat_profile" != "symmetric" ]]; then
 fi
 
 agent_b_bind_ip="$nat_b_agent_ip"
-if [[ "$nat_profile" == "one-sided" ]]; then
+if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]]; then
   agent_b_bind_ip="$nat_b_public_ip"
 fi
 start_agent "$agent_a" "$nat_a_agent_ip" "${work_dir}/agent-a.json" "${work_dir}/agent-a.log"
@@ -724,7 +729,7 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" 
   start_signal enabled "${state_dir}/logs/signal-enabled.log"
   unblock_direct_peer "$nat_a" direct_rule_a
   unblock_direct_peer "$nat_a" direct_input_rule_a
-  if [[ "$nat_profile" != "one-sided" ]]; then
+  if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
     unblock_direct_peer "$nat_b" direct_rule_b
     unblock_direct_peer "$nat_b" direct_input_rule_b
   fi
@@ -749,5 +754,9 @@ else
   wait_for_relay_path "$node_a" "$node_b"
   ping_overlay "$agent_a" "$vpn_b"
   ping_overlay "$agent_b" "$vpn_a"
-  echo "agent NAT smoke passed: symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
+  if [[ "$nat_profile" == "one-sided-symmetric" ]]; then
+    echo "agent NAT smoke passed: one-sided public-peer symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
+  else
+    echo "agent NAT smoke passed: symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
+  fi
 fi
