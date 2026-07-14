@@ -153,6 +153,11 @@ jobs:
           CARGO: cargo
         run: scripts/docker-smoke.sh
 
+      - name: Run multi-Docker-Engine discovery and churn suite
+        env:
+          CARGO: cargo
+        run: scripts/docker-multi-engine-smoke.sh
+
   rootless-docker-smoke:
     name: Rootless Docker BoringTun smoke
     runs-on: ubuntu-24.04

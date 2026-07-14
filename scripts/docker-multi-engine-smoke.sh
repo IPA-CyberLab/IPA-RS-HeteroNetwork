@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cargo_bin="${CARGO:-cargo}"
+docker_bin="${DOCKER:-docker}"
+dockerd_bin="${DOCKERD:-dockerd}"
+suffix="$$-$(date +%s%N)"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-docker-multi-engine.XXXXXX")"
+engine_a_port="$((25000 + ($$ % 1000)))"
+engine_b_port="$((engine_a_port + 1))"
+engine_a_data="$tmp_dir/data-a"
+engine_b_data="$tmp_dir/data-b"
+engine_a_exec="$tmp_dir/exec-a"
+engine_b_exec="$tmp_dir/exec-b"
+engine_a_pidfile="$tmp_dir/dockerd-a.pid"
+engine_b_pidfile="$tmp_dir/dockerd-b.pid"
+engine_a_containerd="$tmp_dir/containerd-a.sock"
+engine_b_containerd="$tmp_dir/containerd-b.sock"
+engine_a_log="$tmp_dir/dockerd-a.log"
+engine_b_log="$tmp_dir/dockerd-b.log"
+test_log="$tmp_dir/test.log"
+test_exit="$tmp_dir/test.exit"
+ready_file="$tmp_dir/ready"
+release_file="$tmp_dir/release"
+engine_a_network="ipars-engine-a-${suffix}"
+engine_b_network="ipars-engine-b-${suffix}"
+
+if (( EUID == 0 )); then
+  root_prefix=()
+elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  root_prefix=(sudo -n)
+else
+  echo "running two Docker daemons requires root or passwordless sudo" >&2
+  exit 1
+fi
+
+run_root() {
+  "${root_prefix[@]}" "$@"
+}
+
+cleanup() {
+  set +e
+  if [[ -f "$engine_a_pidfile" ]]; then
+    run_root kill "$(run_root cat "$engine_a_pidfile")" >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$engine_b_pidfile" ]]; then
+    run_root kill "$(run_root cat "$engine_b_pidfile")" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${test_pid:-}" ]]; then
+    kill "$test_pid" >/dev/null 2>&1 || true
+  fi
+  run_root rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+require_command() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    echo "required command '$name' is not available in PATH" >&2
+    exit 1
+  fi
+}
+
+require_command "$docker_bin"
+require_command "$dockerd_bin"
+require_command curl
+
+start_engine() {
+  local name="$1"
+  local port="$2"
+  local data_root="$3"
+  local exec_root="$4"
+  local pidfile="$5"
+  local containerd_socket="$6"
+  local log_path="$7"
+  run_root mkdir -p "$data_root" "$exec_root"
+  run_root "$dockerd_bin" \
+    --host="tcp://127.0.0.1:${port}" \
+    --tls=false \
+    --data-root="$data_root" \
+    --exec-root="$exec_root" \
+    --pidfile="$pidfile" \
+    --containerd="$containerd_socket" \
+    --containerd-namespace="ipars-${name}-${suffix}" \
+    --containerd-plugins-namespace="ipars-${name}-plugins-${suffix}" \
+    --storage-driver=vfs \
+    --bridge=none \
+    --iptables=false \
+    --ip6tables=false \
+    --ip-forward=false \
+    --ip-masq=false \
+    --userland-proxy=false \
+    --log-level=error \
+    >"$log_path" 2>&1 &
+}
+
+wait_for_engine() {
+  local port="$1"
+  local log_path="$2"
+  for _ in $(seq 1 90); do
+    if curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:${port}/_ping" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Docker Engine on port ${port} did not become ready" >&2
+  cat "$log_path" >&2 || true
+  exit 1
+}
+
+docker_engine() {
+  local port="$1"
+  shift
+  env -u DOCKER_HOST -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
+    "$docker_bin" --host "tcp://127.0.0.1:${port}" "$@"
+}
+
+start_engine a "$engine_a_port" "$engine_a_data" "$engine_a_exec" "$engine_a_pidfile" "$engine_a_containerd" "$engine_a_log"
+start_engine b "$engine_b_port" "$engine_b_data" "$engine_b_exec" "$engine_b_pidfile" "$engine_b_containerd" "$engine_b_log"
+wait_for_engine "$engine_a_port" "$engine_a_log"
+wait_for_engine "$engine_b_port" "$engine_b_log"
+
+docker_engine "$engine_a_port" network create --driver bridge --subnet 172.31.10.0/24 "$engine_a_network" >/dev/null
+docker_engine "$engine_b_port" network create --driver bridge --subnet 172.31.20.0/24 "$engine_b_network" >/dev/null
+
+cd "$repo_root"
+(
+  set +e
+  env \
+    IPARS_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE=1 \
+    IPARS_DOCKER_MULTI_ENGINE_URL_A="http://127.0.0.1:${engine_a_port}" \
+    IPARS_DOCKER_MULTI_ENGINE_URL_B="http://127.0.0.1:${engine_b_port}" \
+    IPARS_DOCKER_MULTI_ENGINE_NETWORK_A="$engine_a_network" \
+    IPARS_DOCKER_MULTI_ENGINE_NETWORK_B="$engine_b_network" \
+    IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_A=172.31.10.0/24 \
+    IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_B=172.31.20.0/24 \
+    IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_A=172.31.12.0/24 \
+    IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_B=172.31.22.0/24 \
+    IPARS_DOCKER_MULTI_ENGINE_READY_FILE="$ready_file" \
+    IPARS_DOCKER_MULTI_ENGINE_RELEASE_FILE="$release_file" \
+    "$cargo_bin" test --locked -p ipars-daemon --all-features \
+      docker_api_discovery_supports_multiple_real_docker_engines_and_churn -- --nocapture \
+      >"$test_log" 2>&1
+  status=$?
+  printf '%s\n' "$status" >"$test_exit"
+  exit "$status"
+) &
+test_pid=$!
+
+for _ in $(seq 1 90); do
+  if [[ -f "$ready_file" ]]; then
+    break
+  fi
+  if [[ -f "$test_exit" ]]; then
+    cat "$test_log" >&2
+    exit "$(cat "$test_exit")"
+  fi
+  sleep 1
+done
+if [[ ! -f "$ready_file" ]]; then
+  echo "real Docker Engine discovery test did not reach its churn barrier" >&2
+  cat "$test_log" >&2 || true
+  exit 1
+fi
+
+docker_engine "$engine_a_port" network rm "$engine_a_network" >/dev/null
+docker_engine "$engine_b_port" network rm "$engine_b_network" >/dev/null
+docker_engine "$engine_a_port" network create --driver bridge --subnet 172.31.12.0/24 "$engine_a_network" >/dev/null
+docker_engine "$engine_b_port" network create --driver bridge --subnet 172.31.22.0/24 "$engine_b_network" >/dev/null
+touch "$release_file"
+
+if ! wait "$test_pid"; then
+  cat "$test_log" >&2
+  exit 1
+fi
+cat "$test_log"
+echo "real multi-Docker-Engine discovery and churn smoke passed"

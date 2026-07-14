@@ -27530,6 +27530,113 @@ exec sleep 60
         Ok(())
     }
 
+    #[tokio::test]
+    async fn docker_api_discovery_supports_multiple_real_docker_engines_and_churn(
+    ) -> anyhow::Result<()> {
+        if std::env::var("IPARS_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            eprintln!(
+                "skipping real multi-Docker-Engine discovery smoke; set IPARS_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE=1 to run it"
+            );
+            return Ok(());
+        }
+
+        let required_env = |name: &str| {
+            std::env::var(name).with_context(|| {
+                format!("real multi-Docker-Engine discovery smoke requires {name}")
+            })
+        };
+        let api_url_a = required_env("IPARS_DOCKER_MULTI_ENGINE_URL_A")?;
+        let api_url_b = required_env("IPARS_DOCKER_MULTI_ENGINE_URL_B")?;
+        let network_a = required_env("IPARS_DOCKER_MULTI_ENGINE_NETWORK_A")?;
+        let network_b = required_env("IPARS_DOCKER_MULTI_ENGINE_NETWORK_B")?;
+        let first_cidr_a = required_env("IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_A")?;
+        let first_cidr_b = required_env("IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_B")?;
+        let second_cidr_a = required_env("IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_A")?;
+        let second_cidr_b = required_env("IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_B")?;
+        let ready_path = PathBuf::from(required_env("IPARS_DOCKER_MULTI_ENGINE_READY_FILE")?);
+        let release_path = PathBuf::from(required_env("IPARS_DOCKER_MULTI_ENGINE_RELEASE_FILE")?);
+
+        let make_discovery = |url: &str,
+                              container_namespace: &str,
+                              network: &str|
+         -> anyhow::Result<DockerApiNetworkDiscovery> {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--runtime-backend",
+                "dry-run",
+                "--apply-docker-routes",
+                "--docker-discover-networks",
+                "--docker-api-url",
+                url,
+                "--docker-network",
+                network,
+                "--docker-container-namespace",
+                container_namespace,
+                "--docker-host-interface",
+                "eth1",
+            ])?;
+            let Command::Agent(args) = cli.command else {
+                anyhow::bail!("expected agent command");
+            };
+            validate_agent_runtime_config(&args)?;
+            anyhow::ensure!(
+                !runtime_preflight_needs(&args).docker_api_socket,
+                "remote Docker API discovery unexpectedly required a local socket"
+            );
+            preflight_agent_runtime_with_path(
+                &args,
+                Some(OsStr::new(SANITIZED_RUNTIME_COMMAND_PATH)),
+            )?;
+            DockerApiNetworkDiscovery::new(&args)
+        };
+
+        let discovery_a = make_discovery(&api_url_a, "real-docker-host-a", &network_a)?;
+        let discovery_b = make_discovery(&api_url_b, "real-docker-host-b", &network_b)?;
+        let (first_a, first_b) =
+            tokio::join!(discovery_a.discover_intent(), discovery_b.discover_intent());
+        let first_a = first_a?;
+        let first_b = first_b?;
+        assert_eq!(first_a.container_namespace, "real-docker-host-a");
+        assert_eq!(first_b.container_namespace, "real-docker-host-b");
+        assert_eq!(first_a.host_interface, "eth1");
+        assert_eq!(first_b.host_interface, "eth1");
+        assert_eq!(first_a.container_cidrs, vec![first_cidr_a.parse()?]);
+        assert_eq!(first_b.container_cidrs, vec![first_cidr_b.parse()?]);
+
+        std::fs::write(&ready_path, b"first-discovery-complete\n")?;
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if release_path.is_file() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for real Docker Engine network churn")?;
+
+        let (second_a, second_b) =
+            tokio::join!(discovery_a.discover_intent(), discovery_b.discover_intent());
+        let second_a = second_a?;
+        let second_b = second_b?;
+        assert_eq!(second_a.container_cidrs, vec![second_cidr_a.parse()?]);
+        assert_eq!(second_b.container_cidrs, vec![second_cidr_b.parse()?]);
+        assert_ne!(first_a.container_cidrs, second_a.container_cidrs);
+        assert_ne!(first_b.container_cidrs, second_b.container_cidrs);
+        anyhow::ensure!(
+            !ip_cidrs_overlap(&second_a.container_cidrs[0], &second_b.container_cidrs[0]),
+            "independent real Docker Engine route intents unexpectedly overlap"
+        );
+        let _ = std::fs::remove_file(ready_path);
+        let _ = std::fs::remove_file(release_path);
+        Ok(())
+    }
+
     #[test]
     fn docker_api_remote_url_requires_tls_and_rejects_unsafe_parts() -> anyhow::Result<()> {
         let plaintext_remote = match validate_docker_api_url("http://docker.example:2375") {
