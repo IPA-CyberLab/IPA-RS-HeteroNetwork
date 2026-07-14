@@ -440,6 +440,7 @@ trap cleanup EXIT
 umask 077
 tmp_dir="$(mktemp -d)"
 relay_admission_token_file="$tmp_dir/relay-admission.token"
+relay_admission_token_secret_file="$tmp_dir/relay-admission-token.secret"
 
 "$kubectl_bin" version --request-timeout=15s >/dev/null
 "$kubectl_bin" get nodes --no-headers | grep -q .
@@ -511,6 +512,7 @@ token_file="$tmp_dir/join-token.json"
 agent_api_token_file="$tmp_dir/agent-api.token"
 control_plane_operator_api_token_file="$tmp_dir/control-plane-operator-api.token"
 jq -ce '.join_token' "$init_output" >"$token_file"
+tr -d '\r\n' <"$relay_admission_token_file" >"$relay_admission_token_secret_file"
 printf '%s' "$agent_api_token" >"$agent_api_token_file"
 printf '%s' "$control_plane_operator_api_token" >"$control_plane_operator_api_token_file"
 
@@ -518,7 +520,7 @@ printf '%s' "$control_plane_operator_api_token" >"$control_plane_operator_api_to
   --from-file=token="$token_file" \
   --from-file=agent-api-token="$agent_api_token_file" \
   --from-file=control-plane-operator-api-token="$control_plane_operator_api_token_file" \
-  --from-file=relay-admission-token="$relay_admission_token_file" \
+  --from-file=relay-admission-token="$relay_admission_token_secret_file" \
   --dry-run=client -o yaml | "$kubectl_bin" -n "$namespace" apply -f - >/dev/null
 
 image_ref="${image_repository}:${image_tag}"
