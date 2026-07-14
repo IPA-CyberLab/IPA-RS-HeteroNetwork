@@ -13012,6 +13012,7 @@ impl fmt::Display for AgentRelayAdmissionError {
 
 impl std::error::Error for AgentRelayAdmissionError {}
 
+#[cfg(test)]
 async fn admit_relay_session(
     client: &reqwest::Client,
     status: &ipars_types::api::AgentStatusResponse,
@@ -13019,10 +13020,27 @@ async fn admit_relay_session(
     relay: &NodeRecord,
     relay_admission_bearer_token: Option<&str>,
 ) -> Result<RelaySessionState, AgentRelayAdmissionError> {
+    admit_relay_session_with_candidates(
+        client,
+        status,
+        peer,
+        relay,
+        std::slice::from_ref(relay),
+        relay_admission_bearer_token,
+    )
+    .await
+}
+
+async fn admit_relay_session_with_candidates(
+    client: &reqwest::Client,
+    status: &ipars_types::api::AgentStatusResponse,
+    peer: &NodeRecord,
+    relay: &NodeRecord,
+    relay_candidates: &[NodeRecord],
+    relay_admission_bearer_token: Option<&str>,
+) -> Result<RelaySessionState, AgentRelayAdmissionError> {
     let request = relay_admission_request(status, peer)
         .ok_or(AgentRelayAdmissionError::NoEndpointCandidate)?;
-    let relay_endpoint =
-        relay_public_endpoint(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
     let admission_url =
         relay_admission_url(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
     let mut request_builder = client.post(admission_url).json(&request);
@@ -13035,7 +13053,7 @@ async fn admit_relay_session(
         .map_err(|error| AgentRelayAdmissionError::Unavailable(anyhow::Error::new(error)))?
         .error_for_status()
         .map_err(|error| AgentRelayAdmissionError::Rejected(anyhow::Error::new(error)))?;
-    let response = read_bounded_agent_json_response(
+    let response: RelayAdmissionResponse = read_bounded_agent_json_response(
         response,
         MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES,
         "relay admission",
@@ -13043,9 +13061,20 @@ async fn admit_relay_session(
     .await
     .map_err(AgentRelayAdmissionError::InvalidResponse)?;
 
+    let admitted_relay = relay_candidates
+        .iter()
+        .find(|candidate| candidate.node_id == response.relay_node)
+        .ok_or_else(|| {
+            AgentRelayAdmissionError::InvalidResponse(anyhow::anyhow!(
+                "relay admission response identified unknown relay {}",
+                response.relay_node
+            ))
+        })?;
+    let relay_endpoint = relay_public_endpoint(admitted_relay)
+        .map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
     relay_session_state_from_admission(
         peer,
-        relay,
+        admitted_relay,
         &request,
         response,
         relay_endpoint,
@@ -13065,7 +13094,16 @@ async fn admit_relay_session_from_candidates(
     let mut errors = Vec::new();
     for relay in relays {
         runtime.record_relay_admission_attempt();
-        match admit_relay_session(client, status, peer, relay, relay_admission_bearer_token).await {
+        match admit_relay_session_with_candidates(
+            client,
+            status,
+            peer,
+            relay,
+            relays,
+            relay_admission_bearer_token,
+        )
+        .await
+        {
             Ok(session) => {
                 runtime.record_relay_admission_success();
                 return Ok(session);
@@ -29924,6 +29962,87 @@ exec sleep 60
         );
         bad_task.abort();
         good_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_admission_accepts_known_identity_from_shared_endpoint() -> anyhow::Result<()> {
+        async fn relay_admission_success(
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            let session_id = RelaySessionId::new(&request.left, &request.right)
+                .as_str()
+                .to_string();
+            axum::Json(RelayAdmissionResponse {
+                relay_node: NodeId::from_string("relay-good"),
+                session_id,
+                session_token: "token-good".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+        )
+        .await?;
+        let mut relay_alias = node_record("relay-alias");
+        relay_alias.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(relay_base.clone()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let mut relay_good = node_record("relay-good");
+        relay_good.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+
+        let status = agent_status(
+            "local",
+            vec![candidate("local", EndpointCandidateKind::StunReflexive, 10)],
+        );
+        let mut peer = node_record("peer-a");
+        let mut peer_candidate = candidate("peer-a", EndpointCandidateKind::StunReflexive, 10);
+        peer_candidate.addr = SocketAddr::from(([203, 0, 113, 20], 51820));
+        peer.endpoint_candidates = vec![peer_candidate];
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        let session = admit_relay_session_from_candidates(
+            &reqwest::Client::new(),
+            &runtime,
+            &status,
+            &peer,
+            &[relay_alias, relay_good],
+            None,
+        )
+        .await?;
+
+        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        assert_eq!(
+            session.relay_endpoint,
+            SocketAddr::from(([203, 0, 113, 32], 51820))
+        );
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(metrics.relay_admission_success_count, 1);
+        assert_eq!(metrics.relay_admission_failure_count, 0);
+        relay_task.abort();
         Ok(())
     }
 
