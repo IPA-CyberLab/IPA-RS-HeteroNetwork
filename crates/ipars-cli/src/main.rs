@@ -6165,6 +6165,18 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
 
 fn rootless_workload_network_preflight_command(args: &DockerInstallArgs, network: &str) -> String {
     if let Some(url) = args.docker_api_url.as_deref() {
+        let local_docker_command = if let Some(socket) = args.docker_api_socket.as_ref() {
+            format!(
+                "docker --host {}",
+                shell_word(&format!("unix://{}", socket.display()))
+            )
+        } else {
+            "docker".to_string()
+        };
+        let local_network = shell_word(network);
+        let local_preflight = format!(
+            "{local_docker_command} network inspect {local_network} >/dev/null 2>&1 || {{ echo \"rootless workload network {local_network} was not found on the Compose Docker Engine\" >&2; exit 1; }}"
+        );
         let ca_certificate = args
             .docker_api_ca_cert_path
             .as_ref()
@@ -6178,7 +6190,7 @@ fn rootless_workload_network_preflight_command(args: &DockerInstallArgs, network
             .map(|_| " --cacert \"$docker_api_ca_cert\"")
             .unwrap_or_default();
         return format!(
-            "docker_api_url={}; docker_network={}{}; curl --fail --silent --show-error --connect-timeout {} --max-time {}{} \"$docker_api_url/{}/networks/$docker_network\" >/dev/null || {{ echo \"rootless workload network $docker_network was not found on the remote Docker Engine\" >&2; exit 1; }}",
+            "{local_preflight}; docker_api_url={}; docker_network={}{}; curl --fail --silent --show-error --connect-timeout {} --max-time {}{} \"$docker_api_url/{}/networks/$docker_network\" >/dev/null || {{ echo \"rootless workload network $docker_network was not found on the remote Docker Engine\" >&2; exit 1; }}",
             shell_word(url.trim_end_matches('/')),
             shell_word(network),
             ca_assignment,
@@ -15562,6 +15574,8 @@ fi
 
         assert!(plan.commands[1].contains("curl --fail --silent --show-error"));
         assert!(plan.commands[1].contains("\"$docker_api_url/v1.43/networks/$docker_network\""));
+        assert!(plan.commands[1].contains("docker network inspect edge_workload"));
+        assert!(plan.commands[1].contains("Compose Docker Engine"));
         assert!(!plan.commands[1].contains("docker --host"));
         assert!(plan
             .prerequisites
@@ -15576,6 +15590,7 @@ fi
         let command = rootless_workload_network_preflight_command(&args, "edge_workload");
         assert!(command.contains("--cacert \"$docker_api_ca_cert\""));
         assert!(command.contains("docker_api_ca_cert=/etc/docker/ca.pem"));
+        assert!(command.contains("docker network inspect edge_workload"));
         assert!(command.contains("\"$docker_api_url/v1.43/networks/$docker_network\""));
         assert!(!command.contains("docker --host"));
         Ok(())
