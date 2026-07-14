@@ -234,6 +234,7 @@ wait_for_relay_service() {
   local pod="$1"
   local service_name="$2"
   local expected_relay_node="$3"
+  local expected_endpoint_ip="${4:-}"
   local service_json=""
   local endpoints_json=""
   local cluster_ip=""
@@ -251,8 +252,9 @@ wait_for_relay_service() {
         and ([.spec.ports[]? | select(.name == "relay-udp" and .protocol == "UDP" and .port == 51820 and .targetPort == 51830 and .nodePort == $udp)] | length) == 1
         and ([.spec.ports[]? | select(.name == "relay-http" and .protocol == "TCP" and .port == 9580 and .targetPort == 9580 and .nodePort == $http)] | length) == 1
       ' >/dev/null 2>&1 <<<"$service_json" \
-      && jq -e '
+      && jq -e --arg expected_endpoint "$expected_endpoint_ip" '
         ([.subsets[]?.addresses[]?.ip] | length) >= 1
+        and ($expected_endpoint == "" or (([.subsets[]?.addresses[]?.ip] | index($expected_endpoint)) != null))
         and ([.subsets[]?.ports[]? | select(.name == "relay-udp" and .protocol == "UDP" and .port == 51830)] | length) >= 1
         and ([.subsets[]?.ports[]? | select(.name == "relay-http" and .protocol == "TCP" and .port == 9580)] | length) >= 1
       ' >/dev/null 2>&1 <<<"$endpoints_json"; then
@@ -281,6 +283,31 @@ wait_for_relay_service() {
   echo "ClusterIP status:\n${cluster_status:-<empty>}" >&2
   echo "NodePort status:\n${node_status:-<empty>}" >&2
   return 1
+}
+
+pin_relay_service_to_pod() {
+  local pod="$1"
+  local pod_name_label=""
+  local pod_instance_label=""
+  local pod_ip=""
+  local selector_patch=""
+
+  pod_name_label="$($kubectl_bin -n "$namespace" get pod "$pod" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}')"
+  pod_instance_label="$($kubectl_bin -n "$namespace" get pod "$pod" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/instance}')"
+  pod_ip="$($kubectl_bin -n "$namespace" get pod "$pod" -o jsonpath='{.status.podIP}')"
+  if [[ -z "$pod_name_label" || -z "$pod_instance_label" || ! "$pod_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "relay endpoint pod ${pod} did not expose the expected labels and Pod IP" >&2
+    return 1
+  fi
+
+  "$kubectl_bin" -n "$namespace" label pod "$pod" ipars.io/live-smoke-relay=true --overwrite >/dev/null
+  selector_patch="$(jq -cn \
+    --arg name "$pod_name_label" \
+    --arg instance "$pod_instance_label" \
+    '{spec:{selector:{"app.kubernetes.io/name":$name,"app.kubernetes.io/instance":$instance,"ipars.io/live-smoke-relay":"true"}}}')"
+  "$kubectl_bin" -n "$namespace" patch service "$relay_service_name" \
+    --type=merge -p "$selector_patch" >/dev/null
+  echo "Kubernetes relay Service ${relay_service_name} pinned to Agent pod ${pod} (${pod_ip})"
 }
 
 activate_agent_peer() {
@@ -942,6 +969,15 @@ for index in "${!node_ids[@]}"; do
   vpn_ips[$index]="${vpn_ip_by_node[$node_id]}"
 done
 
+relay_pod="${agent_pods[$relay_candidate_index]}"
+pin_relay_service_to_pod "$relay_pod"
+relay_pod_ip="$($kubectl_bin -n "$namespace" get pod "$relay_pod" -o jsonpath='{.status.podIP}')"
+wait_for_relay_service \
+  "${agent_pods[0]}" \
+  "$relay_service_name" \
+  "${node_ids[$relay_candidate_index]}" \
+  "$relay_pod_ip"
+
 for pod in "${agent_pods[@]}"; do
   ipv4_forwarding="$($kubectl_bin -n "$namespace" exec "pod/${pod}" -c agent -- \
     cat /proc/sys/net/ipv4/ip_forward)"
@@ -961,7 +997,11 @@ for index in "${!node_ids[@]}"; do
   peer_map_json="$("$kubectl_bin" -n "$namespace" exec "pod/${pod}" -c agent -- \
     /usr/local/bin/ipars --agent-state-path /var/lib/ipars/agent.json peers \
       --control-plane-url "$control_plane_url" --node-id "$node_id")"
-  jq -e --arg cluster_id "$cluster_id" '.cluster_id == $cluster_id and (.peers | type == "array")' \
+  jq -e --arg cluster_id "$cluster_id" '
+    .cluster_id == $cluster_id
+    and (.peers | type == "array" and length >= 2)
+    and all(.peers[]?; (.endpoint_candidates | type == "array" and length > 0))
+  ' \
     >/dev/null <<<"$peer_map_json"
 done
 
