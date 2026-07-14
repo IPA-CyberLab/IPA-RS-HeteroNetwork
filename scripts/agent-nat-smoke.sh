@@ -38,6 +38,9 @@ case "$nat_profile" in
     nat_b_expected_public_port=50102
     nat_b_snat_port="$nat_b_expected_public_port"
     ;;
+  one-sided-port-preserving)
+    nat_a_snat_port=51820
+    ;;
 esac
 
 suffix="$$"
@@ -141,6 +144,20 @@ dump_failure() {
     echo "--- init output ---" >&2
     jq . "$init_output" >&2 2>/dev/null || cat "$init_output" >&2
   fi
+  for namespace in "$agent_a" "$agent_b"; do
+    if ip netns list | awk '{print $1}' | grep -Fx -- "$namespace" >/dev/null 2>&1; then
+      echo "--- ${namespace} status ---" >&2
+      agent_status "$namespace" | jq . >&2 || true
+      echo "--- ${namespace} metrics ---" >&2
+      agent_metrics "$namespace" | jq . >&2 || true
+      echo "--- ${namespace} paths ---" >&2
+      agent_paths "$namespace" | jq . >&2 || true
+      echo "--- ${namespace} peers ---" >&2
+      agent_peers "$namespace" | jq . >&2 || true
+      echo "--- ${namespace} WireGuard endpoints ---" >&2
+      ip netns exec "$namespace" wg show ipars0 endpoints >&2 || true
+    fi
+  done
   for log in "${work_dir}"/agent-*.log "${state_dir}"/logs/*.log; do
     [[ -f "$log" ]] || continue
     echo "--- ${log} ---" >&2
@@ -160,6 +177,10 @@ cleanup() {
   trap - EXIT
   set +e
 
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    dump_failure
+  fi
+
   kill_pid "$agent_a_pid"
   kill_pid "$agent_b_pid"
   kill_pid "$signal_pid"
@@ -178,9 +199,6 @@ cleanup() {
   done
   ip link del "$bridge" >/dev/null 2>&1 || true
 
-  if [[ "$cleanup_status" -ne 0 ]]; then
-    dump_failure
-  fi
   rm -rf "$work_dir"
   exit "$cleanup_status"
 }
