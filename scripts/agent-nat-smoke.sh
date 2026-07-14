@@ -14,12 +14,29 @@ control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
 
 case "$nat_profile" in
-  endpoint-independent|symmetric|one-sided|one-sided-symmetric)
+  endpoint-independent|fixed-port|mixed-port|symmetric|one-sided|one-sided-symmetric)
     ;;
   *)
     echo "unsupported IPARS_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
-    echo "expected endpoint-independent, symmetric, one-sided, or one-sided-symmetric" >&2
+    echo "expected endpoint-independent, fixed-port, mixed-port, symmetric, one-sided, or one-sided-symmetric" >&2
     exit 1
+    ;;
+esac
+
+nat_a_expected_public_port=51820
+nat_b_expected_public_port=51820
+nat_a_snat_port=""
+nat_b_snat_port=""
+case "$nat_profile" in
+  fixed-port)
+    nat_a_expected_public_port=50101
+    nat_b_expected_public_port=50102
+    nat_a_snat_port="$nat_a_expected_public_port"
+    nat_b_snat_port="$nat_b_expected_public_port"
+    ;;
+  mixed-port)
+    nat_b_expected_public_port=50102
+    nat_b_snat_port="$nat_b_expected_public_port"
     ;;
 esac
 
@@ -211,6 +228,7 @@ create_agent_nat_pair() {
   local agent_if="$8"
   local private_if="$9"
   local profile="${10}"
+  local snat_port="${11:-}"
 
   ip link add "$root_public_if" type veth peer name "$public_if"
   ip link set "$root_public_if" master "$bridge"
@@ -247,6 +265,13 @@ create_agent_nat_pair() {
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
       -s "${agent_ip}/32" -o "$public_if" -p udp \
       -j SNAT --to-source "$public_ip" --random-fully
+  elif [[ -n "$snat_port" ]]; then
+    ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
+      -s "${agent_ip}/32" -o "$public_if" -p tcp \
+      -j SNAT --to-source "$public_ip"
+    ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
+      -s "${agent_ip}/32" -o "$public_if" -p udp \
+      -j SNAT --to-source "${public_ip}:${snat_port}"
   else
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
       -s "${agent_ip}/32" -o "$public_if" -j SNAT --to-source "$public_ip"
@@ -677,17 +702,17 @@ if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]
   create_agent_nat_pair \
     "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
     "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
-    "$nat_a_profile"
+    "$nat_a_profile" "$nat_a_snat_port"
   create_public_agent "$agent_b" "$nat_b_public_ip" "$nat_b_root_public_if" "$nat_b_public_if"
 else
   create_agent_nat_pair \
     "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
     "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
-    "$nat_profile"
+    "$nat_profile" "$nat_a_snat_port"
   create_agent_nat_pair \
     "$nat_b" "$agent_b" "$nat_b_public_ip" "$nat_b_agent_ip" "$nat_b_gateway" \
     "$nat_b_root_public_if" "$nat_b_public_if" "$nat_b_agent_if" "$nat_b_private_if" \
-    "$nat_profile"
+    "$nat_profile" "$nat_b_snat_port"
 fi
 
 block_direct_peer \
@@ -774,7 +799,8 @@ for metrics_path in "${work_dir}/relay-a.metrics.json" "${work_dir}/relay-b.metr
   jq -e '([.relay_forwarders[]?.outbound_payload_bytes] | add // 0) > 0' "$metrics_path" >/dev/null
 done
 
-if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" ]]; then
+if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port" \
+  || "$nat_profile" == "mixed-port" || "$nat_profile" == "one-sided" ]]; then
   stop_signal
   start_signal enabled "${state_dir}/logs/signal-enabled.log"
   unblock_direct_peer "$nat_a" direct_rule_a
@@ -791,13 +817,24 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" 
     sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
   fi
   wait_for_direct_dataplane "$node_a" "$node_b"
-  ip netns exec "$agent_a" wg show ipars0 endpoints | grep -F -- "${nat_b_public_ip}:51820" >/dev/null
-  ip netns exec "$agent_b" wg show ipars0 endpoints | grep -F -- "${nat_a_public_ip}:51820" >/dev/null
-  if [[ "$nat_profile" == "one-sided" ]]; then
-    echo "agent NAT smoke passed: one-sided public-peer NAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
-  else
-    echo "agent NAT smoke passed: endpoint-independent SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
-  fi
+  ip netns exec "$agent_a" wg show ipars0 endpoints \
+    | grep -F -- "${nat_b_public_ip}:${nat_b_expected_public_port}" >/dev/null
+  ip netns exec "$agent_b" wg show ipars0 endpoints \
+    | grep -F -- "${nat_a_public_ip}:${nat_a_expected_public_port}" >/dev/null
+  case "$nat_profile" in
+    one-sided)
+      echo "agent NAT smoke passed: one-sided public-peer NAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+      ;;
+    fixed-port)
+      echo "agent NAT smoke passed: fixed-port SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+      ;;
+    mixed-port)
+      echo "agent NAT smoke passed: mixed-port SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+      ;;
+    *)
+      echo "agent NAT smoke passed: endpoint-independent SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+      ;;
+  esac
 else
   sleep 5
   wait_for_relay_path "$node_a" "$node_b"

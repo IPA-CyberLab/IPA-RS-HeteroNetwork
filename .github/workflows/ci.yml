@@ -123,7 +123,7 @@ jobs:
             IPARS_AGENT_NAT_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
             IPARS_NETNS_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
             IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH="$PWD/target/ebpf/ipars-packet-flow.bpf.o" \
-            bash -c 'scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided-symmetric scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=symmetric scripts/agent-nat-smoke.sh && scripts/netns-smoke.sh'
+            bash -c 'scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=fixed-port scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=mixed-port scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided-symmetric scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=symmetric scripts/agent-nat-smoke.sh && scripts/netns-smoke.sh'
 
   docker-compose-smoke:
     name: Docker Compose smoke
