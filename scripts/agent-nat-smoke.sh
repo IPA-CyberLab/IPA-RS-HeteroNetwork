@@ -14,11 +14,11 @@ control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
 
 case "$nat_profile" in
-  endpoint-independent|fixed-port|mixed-port|symmetric|one-sided|one-sided-symmetric)
+  endpoint-independent|fixed-port|mixed-port|symmetric|asymmetric|one-sided|one-sided-port-preserving|one-sided-symmetric)
     ;;
   *)
     echo "unsupported IPARS_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
-    echo "expected endpoint-independent, fixed-port, mixed-port, symmetric, one-sided, or one-sided-symmetric" >&2
+    echo "expected endpoint-independent, fixed-port, mixed-port, symmetric, asymmetric, one-sided, one-sided-port-preserving, or one-sided-symmetric" >&2
     exit 1
     ;;
 esac
@@ -326,6 +326,12 @@ block_direct_peer() {
   ip netns exec "$nat_namespace" iptables "${input_rule_ref[@]}"
 }
 
+is_one_sided_profile() {
+  [[ "$nat_profile" == "one-sided" \
+    || "$nat_profile" == "one-sided-port-preserving" \
+    || "$nat_profile" == "one-sided-symmetric" ]]
+}
+
 unblock_direct_peer() {
   local nat_namespace="$1"
   local -n rule_ref="$2"
@@ -512,9 +518,12 @@ wait_agent_ready() {
   local namespace="$1"
   local log_path="$2"
   local public_agent=0
-  if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]] \
-    && [[ "$namespace" == "$agent_b" ]]; then
+  local symmetric_agent=0
+  if is_one_sided_profile && [[ "$namespace" == "$agent_b" ]]; then
     public_agent=1
+  fi
+  if [[ "$nat_profile" == "asymmetric" && "$namespace" == "$agent_a" ]]; then
+    symmetric_agent=1
   fi
   for _ in $(seq 1 90); do
     if ! kill -0 "$(if [[ "$namespace" == "$agent_a" ]]; then echo "$agent_a_pid"; else echo "$agent_b_pid"; fi)" 2>/dev/null; then
@@ -525,13 +534,13 @@ wait_agent_ready() {
     local metrics
     if status="$(agent_status "$namespace" 2>/dev/null)" \
       && metrics="$(agent_metrics "$namespace" 2>/dev/null)" \
-      && jq -e --arg profile "$nat_profile" --arg public_agent "$public_agent" '
+      && jq -e --arg profile "$nat_profile" --arg public_agent "$public_agent" --arg symmetric_agent "$symmetric_agent" '
         .vpn_ip != null and
         .candidate_count >= 2 and
         .nat_classification != null and
         (if $public_agent == "1" then
           .nat_classification.mapping_behavior == "no_nat"
-        elif $profile == "symmetric" or $profile == "one-sided-symmetric" then
+        elif $profile == "symmetric" or $profile == "one-sided-symmetric" or ($profile == "asymmetric" and $symmetric_agent == "1") then
           .nat_classification.mapping_behavior == "address_and_port_dependent" and
           .nat_classification.strategy == "relay_preferred"
         else
@@ -686,7 +695,7 @@ public_ports=(
 )
 
 ip netns add "$nat_a"
-if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
+if ! is_one_sided_profile; then
   ip netns add "$nat_b"
 fi
 ip netns add "$agent_a"
@@ -695,7 +704,7 @@ ip link add "$bridge" type bridge
 ip addr add "${root_public_ip}/24" dev "$bridge"
 ip link set "$bridge" up
 
-if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]]; then
+if is_one_sided_profile; then
   nat_a_profile="$nat_profile"
   if [[ "$nat_profile" == "one-sided-symmetric" ]]; then
     nat_a_profile="symmetric"
@@ -706,20 +715,26 @@ if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]
     "$nat_a_profile" "$nat_a_snat_port"
   create_public_agent "$agent_b" "$nat_b_public_ip" "$nat_b_root_public_if" "$nat_b_public_if"
 else
+  nat_a_profile="$nat_profile"
+  nat_b_profile="$nat_profile"
+  if [[ "$nat_profile" == "asymmetric" ]]; then
+    nat_a_profile="symmetric"
+    nat_b_profile="endpoint-independent"
+  fi
   create_agent_nat_pair \
     "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
     "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
-    "$nat_profile" "$nat_a_snat_port"
+    "$nat_a_profile" "$nat_a_snat_port"
   create_agent_nat_pair \
     "$nat_b" "$agent_b" "$nat_b_public_ip" "$nat_b_agent_ip" "$nat_b_gateway" \
     "$nat_b_root_public_if" "$nat_b_public_if" "$nat_b_agent_if" "$nat_b_private_if" \
-    "$nat_profile" "$nat_b_snat_port"
+    "$nat_b_profile" "$nat_b_snat_port"
 fi
 
 block_direct_peer \
   "$nat_a" "$nat_a_public_if" "$nat_b_public_ip" "$nat_a_agent_ip" \
   "$nat_a_expected_public_port" direct_rule_a direct_input_rule_a
-if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
+if ! is_one_sided_profile; then
   block_direct_peer \
     "$nat_b" "$nat_b_public_if" "$nat_a_public_ip" "$nat_b_agent_ip" \
     "$nat_b_expected_public_port" direct_rule_b direct_input_rule_b
@@ -768,7 +783,7 @@ if [[ "$nat_profile" != "symmetric" ]]; then
 fi
 
 agent_b_bind_ip="$nat_b_agent_ip"
-if [[ "$nat_profile" == "one-sided" || "$nat_profile" == "one-sided-symmetric" ]]; then
+if is_one_sided_profile; then
   agent_b_bind_ip="$nat_b_public_ip"
 fi
 start_agent "$agent_a" "$nat_a_agent_ip" "${work_dir}/agent-a.json" "${work_dir}/agent-a.log"
@@ -801,12 +816,13 @@ for metrics_path in "${work_dir}/relay-a.metrics.json" "${work_dir}/relay-b.metr
 done
 
 if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port" \
-  || "$nat_profile" == "mixed-port" || "$nat_profile" == "one-sided" ]]; then
+  || "$nat_profile" == "mixed-port" || "$nat_profile" == "one-sided" \
+  || "$nat_profile" == "one-sided-port-preserving" ]]; then
   stop_signal
   start_signal enabled "${state_dir}/logs/signal-enabled.log"
   unblock_direct_peer "$nat_a" direct_rule_a
   unblock_direct_peer "$nat_a" direct_input_rule_a
-  if [[ "$nat_profile" != "one-sided" && "$nat_profile" != "one-sided-symmetric" ]]; then
+  if ! is_one_sided_profile; then
     unblock_direct_peer "$nat_b" direct_rule_b
     unblock_direct_peer "$nat_b" direct_input_rule_b
   fi
@@ -826,6 +842,9 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port"
     one-sided)
       echo "agent NAT smoke passed: one-sided public-peer NAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
       ;;
+    one-sided-port-preserving)
+      echo "agent NAT smoke passed: one-sided port-preserving public-peer NAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+      ;;
     fixed-port)
       echo "agent NAT smoke passed: fixed-port SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
       ;;
@@ -843,6 +862,8 @@ else
   ping_overlay "$agent_b" "$vpn_a"
   if [[ "$nat_profile" == "one-sided-symmetric" ]]; then
     echo "agent NAT smoke passed: one-sided public-peer symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
+  elif [[ "$nat_profile" == "asymmetric" ]]; then
+    echo "agent NAT smoke passed: asymmetric SNAT Agents classified the symmetric side as address-and-port-dependent NAT and stayed on encrypted relay fallback"
   else
     echo "agent NAT smoke passed: symmetric SNAT Agents classified address-and-port-dependent NAT and stayed on encrypted relay fallback"
   fi
