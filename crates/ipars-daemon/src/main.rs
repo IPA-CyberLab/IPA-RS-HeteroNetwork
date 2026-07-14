@@ -116,7 +116,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -7720,8 +7720,11 @@ async fn start_userspace_wireguard_process(
         return Ok(None);
     };
     let label = runtime_command_label(&command.program, &command.args);
-    let mut child = spawn_userspace_wireguard_process(&command)
-        .with_context(|| format!("failed to start userspace WireGuard process `{label}`"))?;
+    let (mut child, output_tasks) = spawn_userspace_wireguard_process_with_output(
+        &command,
+        runtime_command_output_max_bytes(args),
+    )
+    .with_context(|| format!("failed to start userspace WireGuard process `{label}`"))?;
     let pid = child.id();
     runtime
         .record_userspace_wireguard_process_status(
@@ -7743,27 +7746,32 @@ async fn start_userspace_wireguard_process(
         let status =
             cleanup_unready_userspace_wireguard_process(child, label.clone(), shutdown_timeout)
                 .await;
+        let message = userspace_wireguard_error_message(
+            message,
+            collect_userspace_wireguard_output(output_tasks, shutdown_timeout).await,
+        );
         runtime
             .record_userspace_wireguard_process_status(
                 AgentManagedProcessState::Failed,
                 pid,
                 status.map(|status| status.to_string()),
-                Some(message),
+                Some(message.clone()),
             )
             .await;
-        return Err(error);
+        return Err(anyhow::anyhow!(message));
     }
     runtime
         .record_userspace_wireguard_process_status(AgentManagedProcessState::Ready, pid, None, None)
         .await;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(monitor_userspace_wireguard_process(
+    let task = tokio::spawn(monitor_userspace_wireguard_process_with_output(
         child,
         label.clone(),
         pid,
         runtime.clone(),
         shutdown_rx,
         shutdown_timeout,
+        Some(output_tasks),
     ));
     Ok(Some(ManagedUserspaceWireGuardProcess {
         label,
@@ -7774,9 +7782,42 @@ async fn start_userspace_wireguard_process(
     }))
 }
 
+#[derive(Debug)]
+struct UserspaceWireGuardOutputTasks {
+    stdout: tokio::task::JoinHandle<std::io::Result<LimitedUserspaceWireGuardOutput>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<LimitedUserspaceWireGuardOutput>>,
+}
+
+#[derive(Debug)]
+struct LimitedUserspaceWireGuardOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    limit: usize,
+}
+
+#[cfg(test)]
 fn spawn_userspace_wireguard_process(
     command: &LinuxCommand,
 ) -> anyhow::Result<tokio::process::Child> {
+    let (child, _) = spawn_userspace_wireguard_process_inner(command, None)?;
+    Ok(child)
+}
+
+fn spawn_userspace_wireguard_process_with_output(
+    command: &LinuxCommand,
+    output_max_bytes: usize,
+) -> anyhow::Result<(tokio::process::Child, UserspaceWireGuardOutputTasks)> {
+    let (child, output_tasks) =
+        spawn_userspace_wireguard_process_inner(command, Some(output_max_bytes))?;
+    let output_tasks =
+        output_tasks.context("userspace WireGuard output capture was not initialized")?;
+    Ok((child, output_tasks))
+}
+
+fn spawn_userspace_wireguard_process_inner(
+    command: &LinuxCommand,
+    output_max_bytes: Option<usize>,
+) -> anyhow::Result<(tokio::process::Child, Option<UserspaceWireGuardOutputTasks>)> {
     let command = resolve_userspace_wireguard_spawn_command(command)?;
     for attempt in 0..=USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRIES {
         let mut child_command = tokio::process::Command::new(&command.program);
@@ -7787,13 +7828,43 @@ fn spawn_userspace_wireguard_process(
             .env("LANG", SANITIZED_RUNTIME_COMMAND_LOCALE)
             .env("LC_ALL", SANITIZED_RUNTIME_COMMAND_LOCALE)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(if output_max_bytes.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stderr(if output_max_bytes.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .kill_on_drop(true);
         configure_userspace_wireguard_process_group(&mut child_command);
 
         match child_command.spawn() {
-            Ok(child) => return Ok(child),
+            Ok(mut child) => {
+                let output_tasks = if let Some(limit) = output_max_bytes {
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .context("userspace WireGuard stdout pipe was not available")?;
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .context("userspace WireGuard stderr pipe was not available")?;
+                    Some(UserspaceWireGuardOutputTasks {
+                        stdout: tokio::spawn(read_limited_userspace_wireguard_output(
+                            stdout, limit,
+                        )),
+                        stderr: tokio::spawn(read_limited_userspace_wireguard_output(
+                            stderr, limit,
+                        )),
+                    })
+                } else {
+                    None
+                };
+                return Ok((child, output_tasks));
+            }
             Err(error)
                 if userspace_wireguard_spawn_error_is_retryable(&error)
                     && attempt < USERSPACE_WIREGUARD_EXECUTABLE_BUSY_RETRIES =>
@@ -7806,6 +7877,42 @@ fn spawn_userspace_wireguard_process(
         }
     }
     unreachable!("bounded userspace WireGuard spawn retry must return or fail")
+}
+
+async fn read_limited_userspace_wireguard_output<R>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<LimitedUserspaceWireGuardOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(4096));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = limit.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let keep = read.min(remaining);
+            bytes.extend_from_slice(&chunk[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+
+    Ok(LimitedUserspaceWireGuardOutput {
+        bytes,
+        truncated,
+        limit,
+    })
 }
 
 fn userspace_wireguard_spawn_error_is_retryable(error: &std::io::Error) -> bool {
@@ -7907,17 +8014,46 @@ async fn cleanup_unready_userspace_wireguard_process(
     stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await
 }
 
+#[cfg(test)]
 async fn monitor_userspace_wireguard_process(
+    child: tokio::process::Child,
+    label: String,
+    pid: Option<u32>,
+    runtime: Arc<AgentRuntime>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    shutdown_timeout: Duration,
+) {
+    monitor_userspace_wireguard_process_with_output(
+        child,
+        label,
+        pid,
+        runtime,
+        shutdown,
+        shutdown_timeout,
+        None,
+    )
+    .await;
+}
+
+async fn monitor_userspace_wireguard_process_with_output(
     mut child: tokio::process::Child,
     label: String,
     pid: Option<u32>,
     runtime: Arc<AgentRuntime>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     shutdown_timeout: Duration,
+    output_tasks: Option<UserspaceWireGuardOutputTasks>,
 ) {
+    let mut output_tasks = output_tasks;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let output = match output_tasks.take() {
+                    Some(output_tasks) => {
+                        collect_userspace_wireguard_output(output_tasks, shutdown_timeout).await
+                    }
+                    None => None,
+                };
                 tracing::warn!(
                     command = %label,
                     pid = ?pid,
@@ -7929,7 +8065,8 @@ async fn monitor_userspace_wireguard_process(
                         AgentManagedProcessState::Exited,
                         pid,
                         Some(status.to_string()),
-                        None,
+                        output
+                            .map(|output| format!("userspace WireGuard process output: {output}")),
                     )
                     .await;
                 return;
@@ -7957,6 +8094,12 @@ async fn monitor_userspace_wireguard_process(
                     .await;
                 let status = stop_userspace_wireguard_child(&mut child, &label, shutdown_timeout).await;
                 let stopped = status.is_some();
+                let output = match output_tasks.take() {
+                    Some(output_tasks) => {
+                        collect_userspace_wireguard_output(output_tasks, shutdown_timeout).await
+                    }
+                    None => None,
+                };
                 runtime
                     .record_userspace_wireguard_process_status(
                         if stopped {
@@ -7967,9 +8110,14 @@ async fn monitor_userspace_wireguard_process(
                         pid,
                         status.map(|status| status.to_string()),
                         if stopped {
-                            None
+                            output.map(|output| {
+                                format!("userspace WireGuard process output: {output}")
+                            })
                         } else {
-                            Some("failed to stop userspace WireGuard process cleanly".to_string())
+                            Some(userspace_wireguard_error_message(
+                                "failed to stop userspace WireGuard process cleanly".to_string(),
+                                output,
+                            ))
                         },
                     )
                     .await;
@@ -7977,6 +8125,82 @@ async fn monitor_userspace_wireguard_process(
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
+    }
+}
+
+async fn collect_userspace_wireguard_output(
+    output_tasks: UserspaceWireGuardOutputTasks,
+    timeout: Duration,
+) -> Option<String> {
+    let stdout =
+        collect_userspace_wireguard_output_stream("stdout", output_tasks.stdout, timeout).await;
+    let stderr =
+        collect_userspace_wireguard_output_stream("stderr", output_tasks.stderr, timeout).await;
+    let details = [stdout, stderr]
+        .into_iter()
+        .filter(|detail| !detail.is_empty())
+        .collect::<Vec<_>>();
+    (!details.is_empty()).then(|| details.join("; "))
+}
+
+async fn collect_userspace_wireguard_output_stream(
+    stream_name: &'static str,
+    mut task: tokio::task::JoinHandle<std::io::Result<LimitedUserspaceWireGuardOutput>>,
+    timeout: Duration,
+) -> String {
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(Ok(output))) => format_userspace_wireguard_output(stream_name, output),
+        Ok(Ok(Err(error))) => format!("{stream_name} capture failed: {error}"),
+        Ok(Err(error)) => format!("{stream_name} capture task failed: {error}"),
+        Err(_) => {
+            task.abort();
+            format!(
+                "{stream_name} capture timed out after {}",
+                userspace_wireguard_timeout_label(timeout)
+            )
+        }
+    }
+}
+
+fn userspace_wireguard_timeout_label(timeout: Duration) -> String {
+    if timeout.as_millis() < 1000 {
+        format!("{}ms", timeout.as_millis())
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+fn format_userspace_wireguard_output(
+    stream_name: &str,
+    output: LimitedUserspaceWireGuardOutput,
+) -> String {
+    if output.bytes.is_empty() && !output.truncated {
+        return String::new();
+    }
+
+    let max_escaped_chars = output.limit.saturating_mul(4).max(1);
+    let text = String::from_utf8_lossy(&output.bytes)
+        .chars()
+        .flat_map(char::escape_default)
+        .take(max_escaped_chars)
+        .collect::<String>();
+    let text = if text.is_empty() {
+        "<empty>".to_string()
+    } else {
+        text
+    };
+    let suffix = if output.truncated {
+        format!(" (truncated after {} bytes)", output.limit)
+    } else {
+        String::new()
+    };
+    format!("{stream_name}={text}{suffix}")
+}
+
+fn userspace_wireguard_error_message(base: String, output: Option<String>) -> String {
+    match output {
+        Some(output) => format!("{base}; userspace WireGuard process output: {output}"),
+        None => base,
     }
 }
 
@@ -23313,7 +23537,7 @@ exec sleep 60
         let pid_path = temp_dir.join("child.pid");
         let command_path = temp_dir.join("userspace-wg-start-failure");
         let pid_arg = pid_path.display().to_string();
-        let shell_script = "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\nexec sleep 60\n";
+        let shell_script = "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\nprintf 'userspace stdout diagnostic\\n'\nprintf 'userspace stderr diagnostic\\n' >&2\nexec sleep 60\n";
         write_trusted_test_executable(&command_path, shell_script)?;
         let cli = Cli::try_parse_from(vec![
             "iparsd".to_string(),
@@ -23355,6 +23579,18 @@ exec sleep 60
                 error.to_string().contains("last readiness check failed"),
                 "readiness error should include the last failed check: {error}"
             );
+            assert!(
+                error
+                    .to_string()
+                    .contains("stdout=userspace stdout diagnostic\\n"),
+                "readiness error should include bounded stdout: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("stderr=userspace stderr diagnostic\\n"),
+                "readiness error should include bounded stderr: {error}"
+            );
             let pid = std::fs::read_to_string(&pid_path)?
                 .trim()
                 .parse::<u32>()
@@ -23385,6 +23621,27 @@ exec sleep 60
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Err(anyhow::anyhow!("expected agent command"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn userspace_wireguard_process_output_is_bounded_and_drained() -> anyhow::Result<()> {
+        let temp_dir = unique_trusted_test_dir("userspace-wg-output")?;
+        let command_path = temp_dir.join("userspace-wg-output");
+        let shell_script = "#!/bin/sh\nprintf '0123456789abcdefEXTRA'\nprintf 'stderr-0123456789abcdefEXTRA' >&2\nexit 7\n";
+        write_trusted_test_executable(&command_path, shell_script)?;
+        let command = LinuxCommand::new(command_path.display().to_string(), Vec::<String>::new());
+        let (mut child, output_tasks) =
+            spawn_userspace_wireguard_process_with_output(&command, 16)?;
+        let status = child.wait().await?;
+        assert_eq!(status.code(), Some(7));
+        let output = collect_userspace_wireguard_output(output_tasks, Duration::from_secs(1))
+            .await
+            .context("missing userspace WireGuard output")?;
+        assert!(output.contains("stdout=0123456789abcdef (truncated after 16 bytes)"));
+        assert!(output.contains("stderr=stderr-012345678 (truncated after 16 bytes)"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
