@@ -267,6 +267,11 @@ plan omits the socket bind and accepts an optional bounded PEM trust bundle via
 `--docker-api-ca-cert-path`, mounted read-only inside the Agent. For example,
 when the external workload network is the route provider:
 
+The remote rootless workload-network preflight requires host `curl` and queries
+the Engine API before Compose startup. When a CA path is supplied, the command
+passes it as `curl --cacert`; it does not depend on Docker CLI certificate
+directory conventions.
+
 ```bash
 ipars docker install \
   --rootless \

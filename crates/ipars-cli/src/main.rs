@@ -74,6 +74,8 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_STUN_ALTERNATE_LISTEN: &str = "0.0.0.0:3480";
 const DEFAULT_DOCKER_HOST_INTERFACE: &str = "docker0";
 const DEFAULT_DOCKER_ROUTE_INTERVAL_SECONDS: u64 = 60;
+// Keep the install-time remote-network probe aligned with iparsd's default.
+const DEFAULT_DOCKER_API_VERSION: &str = "v1.43";
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -6031,6 +6033,12 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         prerequisites
             .push("Docker API access from the agent for bridge-network IPAM discovery".to_string());
     }
+    if args.rootless_workload_network.is_some() && args.docker_api_url.is_some() {
+        prerequisites.push(
+            "curl on the install host for the rootless remote Docker API workload-network preflight"
+                .to_string(),
+        );
+    }
     if args.relay_forwarder_bind.is_some() {
         prerequisites.push(
             "A reachable local WireGuard UDP endpoint for relay forwarder proxying".to_string(),
@@ -6156,9 +6164,31 @@ fn docker_install_compose_files(args: &DockerInstallArgs) -> Vec<String> {
 }
 
 fn rootless_workload_network_preflight_command(args: &DockerInstallArgs, network: &str) -> String {
-    let docker_command = if let Some(url) = args.docker_api_url.as_deref() {
-        format!("docker --host {}", shell_word(url))
-    } else if let Some(socket) = args.docker_api_socket.as_ref() {
+    if let Some(url) = args.docker_api_url.as_deref() {
+        let ca_certificate = args
+            .docker_api_ca_cert_path
+            .as_ref()
+            .map(|path| shell_word(&path.display().to_string()));
+        let ca_assignment = ca_certificate
+            .as_deref()
+            .map(|path| format!("; docker_api_ca_cert={path}"))
+            .unwrap_or_default();
+        let ca_option = ca_certificate
+            .as_ref()
+            .map(|_| " --cacert \"$docker_api_ca_cert\"")
+            .unwrap_or_default();
+        return format!(
+            "docker_api_url={}; docker_network={}{}; curl --fail --silent --show-error --connect-timeout {} --max-time {}{} \"$docker_api_url/{}/networks/$docker_network\" >/dev/null || {{ echo \"rootless workload network $docker_network was not found on the remote Docker Engine\" >&2; exit 1; }}",
+            shell_word(url.trim_end_matches('/')),
+            shell_word(network),
+            ca_assignment,
+            args.agent_http_connect_timeout_seconds,
+            args.agent_http_request_timeout_seconds,
+            ca_option,
+            DEFAULT_DOCKER_API_VERSION,
+        );
+    }
+    let docker_command = if let Some(socket) = args.docker_api_socket.as_ref() {
         format!(
             "docker --host {}",
             shell_word(&format!("unix://{}", socket.display()))
@@ -15516,6 +15546,38 @@ fi
         assert!(userspace_command
             .to_string()
             .contains("--rootless does not support --userspace-wireguard-command"));
+        Ok(())
+    }
+
+    #[test]
+    fn docker_install_plan_uses_remote_api_for_rootless_network_preflight() -> anyhow::Result<()> {
+        let plan = docker_install_plan(DockerInstallArgs {
+            rootless: true,
+            rootless_workload_network: Some("edge_workload".to_string()),
+            docker_discover_networks: true,
+            docker_networks: vec!["edge_default".to_string()],
+            docker_api_url: Some("https://docker.example:2376/engine".to_string()),
+            ..docker_install_test_args()
+        })?;
+
+        assert!(plan.commands[1].contains("curl --fail --silent --show-error"));
+        assert!(plan.commands[1].contains("\"$docker_api_url/v1.43/networks/$docker_network\""));
+        assert!(!plan.commands[1].contains("docker --host"));
+        assert!(plan
+            .prerequisites
+            .iter()
+            .any(|prerequisite| prerequisite.contains("curl on the install host")));
+
+        let mut args = docker_install_test_args();
+        args.rootless = true;
+        args.rootless_workload_network = Some("edge_workload".to_string());
+        args.docker_api_url = Some("https://docker.example:2376/engine".to_string());
+        args.docker_api_ca_cert_path = Some(PathBuf::from("/etc/docker/ca.pem"));
+        let command = rootless_workload_network_preflight_command(&args, "edge_workload");
+        assert!(command.contains("--cacert \"$docker_api_ca_cert\""));
+        assert!(command.contains("docker_api_ca_cert=/etc/docker/ca.pem"));
+        assert!(command.contains("\"$docker_api_url/v1.43/networks/$docker_network\""));
+        assert!(!command.contains("docker --host"));
         Ok(())
     }
 
