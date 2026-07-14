@@ -474,7 +474,22 @@ ping_overlay() {
 ping_overlay_once() {
   local namespace="$1"
   local target="$2"
-  ip netns exec "$namespace" ping -I ipars0 -c 1 -W 1 "$target" >/dev/null 2>&1
+  ip netns exec "$namespace" ping -I ipars0 -c 1 -W 2 "$target" >/dev/null 2>&1
+}
+
+ping_overlay_pair_once() {
+  local pid_a pid_b success=0
+  ping_overlay_once "$agent_a" "$vpn_b" &
+  pid_a="$!"
+  ping_overlay_once "$agent_b" "$vpn_a" &
+  pid_b="$!"
+  if ! wait "$pid_a"; then
+    success=1
+  fi
+  if ! wait "$pid_b"; then
+    success=1
+  fi
+  return "$success"
 }
 
 wait_for_direct_dataplane() {
@@ -482,9 +497,6 @@ wait_for_direct_dataplane() {
   local peer_b="$2"
   local consecutive_successes=0
   for _ in $(seq 1 90); do
-    # Keep revalidation probes supplied with encrypted traffic while the path is pending.
-    ping_overlay_once "$agent_a" "$vpn_b" || true
-    ping_overlay_once "$agent_b" "$vpn_a" || true
     local state_a state_b metrics_a metrics_b
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
@@ -493,8 +505,7 @@ wait_for_direct_dataplane() {
       && metrics_b="$(agent_metrics "$agent_b" 2>/dev/null)" \
       && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
       && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null \
-      && ping_overlay_once "$agent_a" "$vpn_b" \
-      && ping_overlay_once "$agent_b" "$vpn_a"; then
+      && ping_overlay_pair_once; then
       state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
       state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
       metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
@@ -508,6 +519,9 @@ wait_for_direct_dataplane() {
         fi
         continue
       fi
+    else
+      # Keep revalidation probes supplied with encrypted traffic while the path is pending.
+      ping_overlay_pair_once || true
     fi
     consecutive_successes=0
     sleep 1
@@ -649,8 +663,7 @@ wait_for_direct_path() {
   local expected_state_b="${4:-DIRECT_NAT_TRAVERSAL}"
   for _ in $(seq 1 120); do
     # A pending direct probe needs encrypted traffic to produce inbound WireGuard evidence.
-    ping_overlay_once "$agent_a" "$vpn_b" || true
-    ping_overlay_once "$agent_b" "$vpn_a" || true
+    ping_overlay_pair_once || true
     local state_a state_b metrics_a metrics_b
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
