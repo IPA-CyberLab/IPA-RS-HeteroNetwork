@@ -497,6 +497,7 @@ run_ipars init \
   --issuer-key-id live-smoke \
   --token-ttl-seconds "$timeout_seconds" \
   --default-role kubernetes-node \
+  --allow-relay \
   --allowed-route "$service_cidr" \
   --unlimited-uses >"$init_output"
 
