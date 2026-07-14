@@ -482,6 +482,9 @@ wait_for_direct_dataplane() {
   local peer_b="$2"
   local consecutive_successes=0
   for _ in $(seq 1 90); do
+    # Keep revalidation probes supplied with encrypted traffic while the path is pending.
+    ping_overlay_once "$agent_a" "$vpn_b" || true
+    ping_overlay_once "$agent_b" "$vpn_a" || true
     local state_a state_b metrics_a metrics_b
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
