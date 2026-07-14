@@ -23,6 +23,7 @@ control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffi
 service_route_name="ipars-route-target"
 service_route_port="18080"
 service_cidr="${IPARS_K8S_SMOKE_SERVICE_CIDR:-10.96.0.0/12}"
+stale_kubernetes_route_cidr="198.18.0.0/15"
 chart_fullname=""
 tmp_dir=""
 namespace_created=0
@@ -530,6 +531,7 @@ agent_api_service_name="${chart_fullname}-agent"
   --set agent.apiService.port=9780 \
   --set agent.apiService.targetPort=9780 \
   --set agent.peerMap.pollIntervalSeconds=2 \
+  --set serviceExposure.routeIntervalSeconds=2 \
   --set-string 'agent.tolerations[0].operator=Exists' \
   --set "agent.hostNetwork=${agent_host_network}" \
   --set-string "agent.dnsPolicy=${agent_dns_policy}" \
@@ -634,6 +636,7 @@ route_provider_node_id="${node_ids[0]}"
   --set agent.apiService.port=9780 \
   --set agent.apiService.targetPort=9780 \
   --set agent.peerMap.pollIntervalSeconds=2 \
+  --set serviceExposure.routeIntervalSeconds=2 \
   --set agent.routeProvider=false \
   --set-string 'agent.tolerations[0].operator=Exists' \
   --set "agent.hostNetwork=${agent_host_network}" \
@@ -784,6 +787,25 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
       echo "route provider ${route_provider_node_id} routed its local Kubernetes Service through ipars0" >&2
       exit 1
     fi
+
+    "$kubectl_bin" -n "$namespace" exec "$provider_pod" -c agent -- \
+      sh -ec '
+        ip -4 route replace "$1" dev ipars0 table 10064 protocol 242
+      ' sh "$stale_kubernetes_route_cidr"
+    for attempt in $(seq 1 90); do
+      stale_routes="$($kubectl_bin -n "$namespace" exec "$provider_pod" -c agent -- \
+        ip -4 route show table 10064 protocol 242 2>/dev/null || true)"
+      if ! grep -Fq -- "$stale_kubernetes_route_cidr" <<<"$stale_routes"; then
+        echo "route provider ${route_provider_node_id} removed stale Kubernetes managed route ${stale_kubernetes_route_cidr}"
+        break
+      fi
+      if [[ "$attempt" == 90 ]]; then
+        echo "route provider ${route_provider_node_id} retained stale Kubernetes managed route ${stale_kubernetes_route_cidr}" >&2
+        echo "managed Kubernetes routes:\n${stale_routes}" >&2
+        exit 1
+      fi
+      sleep 2
+    done
   fi
 fi
 

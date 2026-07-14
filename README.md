@@ -91,7 +91,7 @@ The runner preflights `docker`, Docker daemon reachability, and the `docker comp
 IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 cargo test -p ipars-cli --test docker_compose_smoke -- --nocapture
 ```
 
-Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders default, Service exposure, Service traffic policy/distribution/affinity, node affinity, pod affinity/anti-affinity, scheduler/runtime class, topology spread, NetworkPolicy, route-disabled, namespace-scoped Service discovery RBAC, relay-forwarder namespace, and expected-failure chart configurations:
+Helm chart smoke coverage uses Docker to run a pinned Helm CLI image and renders default, Service exposure, Service traffic policy/distribution/affinity, node affinity, pod affinity/anti-affinity, scheduler/runtime class, topology spread, NetworkPolicy, route-disabled, namespace-scoped Service discovery RBAC, relay-forwarder namespace, and expected-failure chart configurations. The kind Kubernetes live smoke additionally verifies Service/API routes through the selected route provider, identity-preserving DaemonSet rollout, and removal of an injected stale protocol-242 route after authoritative Service discovery reconciliation:
 
 ```bash
 scripts/helm-smoke.sh
