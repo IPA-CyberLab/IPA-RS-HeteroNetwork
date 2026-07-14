@@ -790,7 +790,7 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
 
     "$kubectl_bin" -n "$namespace" exec "$provider_pod" -c agent -- \
       sh -ec '
-        ip -4 route replace "$1" dev ipars0 table 10064 protocol 242
+        ip -4 route replace "$1" dev ipars0 scope global table 10064 protocol 242 metric 100
       ' sh "$stale_kubernetes_route_cidr"
     for attempt in $(seq 1 90); do
       stale_routes="$($kubectl_bin -n "$namespace" exec "$provider_pod" -c agent -- \
