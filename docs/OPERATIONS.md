@@ -282,25 +282,50 @@ ipars docker install \
   --docker-network ipars_workload
 ```
 
-The API filter is matched by Docker network name or ID. A workload service in the supplied Compose
-manifest must use the agent namespace and must not declare `networks`:
+The API filter is matched by Docker network name or ID. To attach arbitrary
+services from an existing Compose application, first render the complete
+rootless configuration and generate an override for each service that should
+share an Agent namespace:
 
-```yaml
-services:
-  workload:
-    network_mode: service:agent
+```bash
+docker compose -p edge \
+  -f docker/compose.yaml \
+  -f docker/compose.rootless.yaml \
+  -f docker/compose.rootless-dataplane.yaml \
+  -f docker/compose.rootless-route-provider.yaml \
+  config --format json >"$XDG_RUNTIME_DIR/edge.compose.json"
+
+scripts/rootless-compose-attach.sh \
+  --config-json "$XDG_RUNTIME_DIR/edge.compose.json" \
+  --agent-service agent \
+  --workload-service api \
+  --workload-service worker \
+  --output "$XDG_RUNTIME_DIR/edge.workloads.yaml"
+
+docker compose -p edge \
+  -f docker/compose.yaml \
+  -f docker/compose.rootless.yaml \
+  -f docker/compose.rootless-dataplane.yaml \
+  -f docker/compose.rootless-route-provider.yaml \
+  -f "$XDG_RUNTIME_DIR/edge.workloads.yaml" \
+  up -d
 ```
 
-Use `IPARS_ROOTLESS_AGENT_HTTP_PORT` and the `IPARS_ROOTLESS_STUN_*_PORT`
-variables when published ports need to move. Workloads sharing this namespace
-must avoid the published agent/STUN ports. The overlay's numeric relay/STUN
-defaults are suitable for the bundled Compose network; set
-`IPARS_AGENT_RELAY_PUBLIC_ENDPOINT` or `IPARS_ROOTLESS_STUN_SERVER` when using
-a different endpoint. This is an explicit one-agent/one-workload-namespace
-contract; arbitrary rootless Compose services that retain independent
-namespaces or require automatic multi-network attachment remain unsupported.
-Use the explicit `dry-run` runtime when only management/control-plane
-validation is needed.
+The generator sets `network_mode: service:agent`, clears the workload
+`networks` declaration, preserves the existing Agent health dependency, and
+moves explicit TCP/UDP published ports to the Agent. This keeps rootlesskit's
+host port forwarder at the namespace boundary, so host-to-workload service
+requests continue to work after the workload joins the Agent namespace. It
+rejects missing published ports, duplicate target ports, and duplicate
+published ports. Use a separate generated override for a workload attached to
+each different Agent. The generated override must be passed after all rootless
+route-provider overlays.
+
+This is service-level host-to-container return-path support through published
+ports; it is not an arbitrary unprivileged L3 route from the outer host into a
+slirp4netns network. Workloads that require raw host-to-container IP routing
+still need a privileged route-provider boundary. Use the explicit `dry-run`
+runtime when only management/control-plane validation is needed.
 
 Run the repeatable Compose smoke with:
 

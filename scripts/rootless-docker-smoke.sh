@@ -15,6 +15,7 @@ daemon_pid=""
 daemon_pid_file=""
 project_name="ipars-rootless-${suffix}"
 override_path=""
+rootless_attach_overrides=()
 e2e_started=0
 
 require_command() {
@@ -45,6 +46,9 @@ cleanup() {
       compose_files+=( -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml" )
       compose_files+=( -f "$repo_root/docker/compose.rootless-discovery-e2e.yaml" )
       compose_files+=( -f "$repo_root/docker/compose.rootless-docker-discovery.yaml" )
+      for attach_override in "${rootless_attach_overrides[@]}"; do
+        compose_files+=( -f "$attach_override" )
+      done
     else
       compose_files+=( -f "$override_path" )
     fi
@@ -306,18 +310,43 @@ workload_network_b="${project_name}_workload-b"
 export IPARS_DOCKER_API_SOCKET_HOST="$docker_socket"
 export IPARS_ROOTLESS_DOCKER_NETWORK_A="$workload_network_a"
 export IPARS_ROOTLESS_DOCKER_NETWORK_B="$workload_network_b"
+workload_a_http_port="${IPARS_ROOTLESS_WORKLOAD_A_HTTP_PORT:-18080}"
+workload_b_http_port="${IPARS_ROOTLESS_WORKLOAD_B_HTTP_PORT:-18081}"
+for workload_http_port in "$workload_a_http_port" "$workload_b_http_port"; do
+  if [[ ! "$workload_http_port" =~ ^[0-9]+$ || "$workload_http_port" -lt 1 || "$workload_http_port" -gt 65535 ]]; then
+    echo "rootless workload HTTP ports must be integers between 1 and 65535" >&2
+    exit 1
+  fi
+done
+if [[ "$workload_a_http_port" == "$workload_b_http_port" ]]; then
+  echo "rootless workload HTTP ports must be distinct across Agent namespaces" >&2
+  exit 1
+fi
+export IPARS_ROOTLESS_WORKLOAD_A_HTTP_PORT="$workload_a_http_port"
+export IPARS_ROOTLESS_WORKLOAD_B_HTTP_PORT="$workload_b_http_port"
 
 rootless_e2e_compose() {
+  local compose_files=(
+    -f "$repo_root/docker/compose.yaml"
+    -f "$repo_root/docker/compose.rootless.yaml"
+    -f "$repo_root/docker/compose.rootless-dataplane.yaml"
+    -f "$repo_root/docker/compose.rootless-e2e.yaml"
+    -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml"
+    -f "$repo_root/docker/compose.rootless-discovery-e2e.yaml"
+    -f "$repo_root/docker/compose.rootless-docker-discovery.yaml"
+  )
+  for attach_override in "${rootless_attach_overrides[@]}"; do
+    compose_files+=( -f "$attach_override" )
+  done
   DOCKER_HOST="unix://${docker_socket}" "$docker_bin" compose \
-    -p "$project_name" \
-    -f "$repo_root/docker/compose.yaml" \
-    -f "$repo_root/docker/compose.rootless.yaml" \
-    -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
-    -f "$repo_root/docker/compose.rootless-e2e.yaml" \
-    -f "$repo_root/docker/compose.rootless-route-provider-e2e.yaml" \
-    -f "$repo_root/docker/compose.rootless-discovery-e2e.yaml" \
-    -f "$repo_root/docker/compose.rootless-docker-discovery.yaml" \
-    "$@"
+    -p "$project_name" "${compose_files[@]}" "$@"
+}
+
+rootless_host_workload_diagnostics() {
+  local reason="$1"
+  echo "rootless host-to-workload diagnostics (${reason}):" >&2
+  rootless_e2e_compose ps >&2 || true
+  rootless_e2e_compose logs --no-color --tail=160 agent agent-b workload-a workload-b >&2 || true
 }
 
 if ! rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-config.json"; then
@@ -342,12 +371,69 @@ if ! jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_netw
     "$tmp_dir/rootless-e2e-config.json" >&2 || true
   exit 1
 fi
+
+rootless_attach_overrides=(
+  "$tmp_dir/rootless-workload-a-attach.yaml"
+  "$tmp_dir/rootless-workload-b-attach.yaml"
+)
+if ! "$repo_root/scripts/rootless-compose-attach.sh" \
+  --config-json "$tmp_dir/rootless-e2e-config.json" \
+  --agent-service agent \
+  --workload-service workload-a \
+  --output "${rootless_attach_overrides[0]}"; then
+  echo "rootless workload-a namespace attachment generation failed" >&2
+  exit 1
+fi
+if ! "$repo_root/scripts/rootless-compose-attach.sh" \
+  --config-json "$tmp_dir/rootless-e2e-config.json" \
+  --agent-service agent-b \
+  --workload-service workload-b \
+  --output "${rootless_attach_overrides[1]}"; then
+  echo "rootless workload-b namespace attachment generation failed" >&2
+  exit 1
+fi
+if ! rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-attached-config.json"; then
+  echo "rootless attached Compose config rendering failed" >&2
+  rootless_e2e_compose config >&2 || true
+  exit 1
+fi
+if ! jq -e --arg port_a "$workload_a_http_port" --arg port_b "$workload_b_http_port" '
+  .services["workload-a"].network_mode == "service:agent"
+  and .services["workload-b"].network_mode == "service:agent-b"
+  and .services["workload-a"].ports == null
+  and .services["workload-b"].ports == null
+  and any(.services.agent.ports[]; (.target == 8080 and (.published | tostring) == $port_a))
+  and any(.services["agent-b"].ports[]; (.target == 8080 and (.published | tostring) == $port_b))
+' "$tmp_dir/rootless-e2e-attached-config.json" >/dev/null; then
+  echo "rootless workload namespace attachment contract mismatch" >&2
+  jq '{agent: .services.agent, agent_b: .services["agent-b"], workload_a: .services["workload-a"], workload_b: .services["workload-b"]}' \
+    "$tmp_dir/rootless-e2e-attached-config.json" >&2 || true
+  exit 1
+fi
 e2e_started=1
 if ! rootless_e2e_compose up -d --build --wait --wait-timeout 300; then
   rootless_e2e_compose ps >&2 || true
   rootless_e2e_compose logs --no-color --tail=160 control-plane signal stun agent agent-b workload-a workload-b >&2 || true
   exit 1
 fi
+
+for workload_http_port in "$workload_a_http_port" "$workload_b_http_port"; do
+  host_workload_ready=0
+  for _ in $(seq 1 60); do
+    if curl --noproxy "*" --fail --silent --show-error --max-time 3 \
+      "http://127.0.0.1:${workload_http_port}/healthz" >/dev/null 2>&1; then
+      host_workload_ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$host_workload_ready" -ne 1 ]]; then
+    echo "rootless host-to-workload published port ${workload_http_port} did not become reachable" >&2
+    rootless_host_workload_diagnostics "published port failed"
+    exit 1
+  fi
+done
+echo "rootless host-to-workload published ports ${workload_a_http_port},${workload_b_http_port} are reachable"
 
 agent_get() {
   local service="$1"

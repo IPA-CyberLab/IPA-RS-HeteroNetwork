@@ -6093,8 +6093,8 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         if args.agent_runtime_backend == "linux-command" {
             notes.push("If the rootless engine cannot pass /dev/net/tun or grant user-namespace CAP_NET_ADMIN, startup fails during the agent WireGuard preflight instead of falling back to dry-run".to_string());
             if let Some(network) = args.rootless_workload_network.as_deref() {
-                notes.push(format!("The rootless route-provider overlay attaches agent to the existing external Docker network `{network}` and applies Docker CIDR routes inside the agent/workload shared network namespace; workload services must use `network_mode: service:agent` and must not declare their own networks"));
-                notes.push("The rootless shared-network route-provider contract is explicit and does not mutate Docker networks or use iptables; use one workload namespace per agent and expose additional workloads through that namespace".to_string());
+                notes.push(format!("The rootless route-provider overlay attaches agent to the existing external Docker network `{network}` and applies Docker CIDR routes inside the agent/workload shared network namespace; use scripts/rootless-compose-attach.sh to generate `network_mode: service:agent` overrides for selected workload services"));
+                notes.push("The rootless shared-network route-provider contract is explicit and does not mutate Docker networks or use iptables; the attachment helper clears workload network declarations, preserves Agent health dependencies, and moves explicit TCP/UDP published ports to the Agent so rootlesskit can forward host service traffic".to_string());
             } else {
                 notes.push("The rootless BoringTun mode keeps Docker route/discovery disabled by default; pass --rootless-workload-network together with Docker CIDR/discovery settings to enable the explicit shared-network route-provider overlay".to_string());
             }

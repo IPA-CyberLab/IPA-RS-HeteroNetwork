@@ -205,6 +205,14 @@ The Compose bundle runs PostgreSQL, control plane, signal, relay, STUN, and an a
 
 Rootless Docker install plans place `docker/compose.rootless.yaml` after the base Compose file. The default `linux-command` plan adds `docker/compose.rootless-dataplane.yaml`, which requests only user-namespace-scoped `CAP_NET_ADMIN` and `/dev/net/tun` and selects the in-process BoringTun backend; the daemon preflight checks the TUN substrate before reading join credentials or mutating state. Passing `--agent-runtime-backend dry-run` omits that dataplane overlay and keeps the rootless stack non-mutating. Without `--rootless-workload-network`, Docker route/discovery and relay-forwarder settings remain rejected. With that explicit shared namespace boundary, explicit CIDRs or Docker API discovery are supported; discovery adds `docker/compose.rootless-docker-discovery.yaml`, uses `$XDG_RUNTIME_DIR/docker.sock` by default through a read-only non-creating mount, and reconciles same-network subnet changes without Docker network mutation or iptables. Workloads must use `network_mode: service:agent`; arbitrary rootless Compose network lifecycle and host-to-container return-path integration remain outside this contract.
 
+The rootless Compose attachment helper is the operational bridge for selected
+workload services that do not already use the shared namespace profile. It
+generates the required `network_mode: service:<agent>` and `!reset` network
+override, preserves the Agent health dependency, and moves explicit TCP/UDP
+published ports to the Agent so rootlesskit can forward host service traffic
+into the shared namespace. It intentionally does not promise arbitrary outer
+host L3 routing or dynamic route-provider lifecycle across rootless engines.
+
 Control Plane, Signal, STUN, and Relay HTTP observation routes use distinct file-backed operator credentials in the Compose bundle; the Agent join token and management credential remain separate again. A further Relay admission secret is mounted into Relay and Agent through their separate path variables without entering either environment. STUN's secret controls only HTTP metrics and does not alter the public UDP listener, while Relay capability status and admission retain their protocol-specific boundaries.
 
 ## Runtime Backends
@@ -365,7 +373,7 @@ Required integration scenarios:
 - 10-node topology: mixed public, NAT, Docker, and route-provider nodes.
 - NAT matrix: full cone, restricted cone, port-restricted, symmetric, and double NAT where reproducible with network namespaces.
 - Relay fallback: forced direct-path failure and automatic direct promotion after recovery.
-- Docker Compose: host/container/remote reachability.
+- Docker Compose: host/container/remote reachability, including generated rootless shared-namespace workload attachment and host access through published TCP/UDP ports.
 - Kubernetes: DaemonSet agent route publication and node-underlay reachability.
 
 ## Scale Plan

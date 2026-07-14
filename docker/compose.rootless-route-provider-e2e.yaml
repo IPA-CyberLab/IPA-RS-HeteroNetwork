@@ -81,7 +81,11 @@ services:
       - 0.0.0.0:3478
       - --http-listen
       - 0.0.0.0:8080
-    network_mode: service:agent
+    networks: !override
+      workload-a:
+        ipv4_address: 172.30.251.3
+    ports:
+      - "${IPARS_ROOTLESS_WORKLOAD_A_HTTP_PORT:-18080}:8080/tcp"
     depends_on:
       agent:
         condition: service_healthy
@@ -104,7 +108,11 @@ services:
       - 0.0.0.0:3478
       - --http-listen
       - 0.0.0.0:8080
-    network_mode: service:agent-b
+    networks: !override
+      workload-b:
+        ipv4_address: 172.30.252.3
+    ports:
+      - "${IPARS_ROOTLESS_WORKLOAD_B_HTTP_PORT:-18081}:8080/tcp"
     depends_on:
       agent-b:
         condition: service_healthy
