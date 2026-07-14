@@ -12573,6 +12573,7 @@ async fn remove_relay_session_for_peer(
     selected_state: Option<PathState>,
     message: &'static str,
 ) {
+    let _endpoint_update_guard = runtime.wireguard_endpoint_update_guard().await;
     let removed = runtime.remove_relay_session(peer).await;
     if let Some(session) = removed {
         if let Some(supervisor) = relay_forwarder_supervisor {

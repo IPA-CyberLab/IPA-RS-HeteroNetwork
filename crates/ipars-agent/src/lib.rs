@@ -544,6 +544,7 @@ pub struct AgentRuntime {
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
     local_advertised_routes: tokio::sync::RwLock<Vec<Route>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
+    wireguard_endpoint_update: tokio::sync::Mutex<()>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
     path_quality_observations: tokio::sync::RwLock<BTreeMap<NodeId, PathQualityObservation>>,
@@ -1219,6 +1220,7 @@ impl AgentRuntime {
             nat_classification: tokio::sync::RwLock::new(None),
             local_advertised_routes: tokio::sync::RwLock::new(Vec::new()),
             latest_peer_map: tokio::sync::RwLock::new(None),
+            wireguard_endpoint_update: tokio::sync::Mutex::new(()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
             path_quality_observations: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -1762,6 +1764,10 @@ impl AgentRuntime {
             .cloned()
     }
 
+    pub async fn wireguard_endpoint_update_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.wireguard_endpoint_update.lock().await
+    }
+
     pub async fn peer_quality_probe_targets(&self) -> Vec<PeerQualityProbeTarget> {
         let Ok(peer_map) = self.peer_map_snapshot().await else {
             return Vec::new();
@@ -1987,6 +1993,7 @@ impl AgentRuntime {
     }
 
     pub async fn upsert_path_state(&self, record: PathRecord) -> Result<(), AgentError> {
+        let _endpoint_update_guard = self.wireguard_endpoint_update_guard().await;
         let local_node = self.state().node_id;
         validate_path_record(&record, &local_node)?;
         let remote = record.key.remote.clone();
@@ -5258,6 +5265,11 @@ where
         let mut peers_applied = 0;
 
         for peer in desired_peers {
+            let _endpoint_update_guard = if let Some(runtime) = self.lazy_runtime.as_ref() {
+                Some(runtime.wireguard_endpoint_update_guard().await)
+            } else {
+                None
+            };
             let desired_routes =
                 desired_peer_routes
                     .get(&peer.node_id)
