@@ -31690,6 +31690,71 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn direct_path_verification_rejects_outbound_only_transfer_growth() -> anyhow::Result<()>
+    {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let runtime = AgentRuntime::new(AgentNodeState::generate(now), ClusterPolicy::default());
+        let public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = DirectPathVerificationConfig {
+            required: true,
+            probe_timeout: Duration::from_secs(120),
+            handshake_max_age: Duration::from_secs(180),
+        };
+        let selected_candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let direct = PathRecord {
+            key: PeerPathKey::new(runtime.state().node_id, NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(selected_candidate.clone()),
+            relay_node: None,
+            score: PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0),
+            updated_at: now,
+            pinned: false,
+        };
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: selected_candidate.clone(),
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(120),
+                endpoint_observed_at: Some(now),
+                baseline_rx_bytes: Some(100),
+                baseline_tx_bytes: Some(200),
+            })
+            .await?;
+        let telemetry = BTreeMap::from([(
+            public_key.to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: public_key.to_string(),
+                endpoint: Some(selected_candidate.addr.to_string()),
+                latest_handshake_at: None,
+                rx_bytes: 100,
+                tx_bytes: 201,
+            },
+        )]);
+
+        let decision = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&telemetry),
+            public_key,
+            now + ChronoDuration::seconds(30),
+            config,
+        )
+        .await?;
+
+        assert_eq!(decision, DirectPathVerificationDecision::Pending);
+        assert!(runtime
+            .pending_direct_path_probe(&direct.key.remote)
+            .await
+            .is_some());
+        assert_eq!(runtime.metrics().await.direct_path_probe_confirmed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_probe_retains_current_direct_path_until_probe_finishes(
     ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(

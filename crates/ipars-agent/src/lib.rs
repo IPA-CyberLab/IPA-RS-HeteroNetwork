@@ -2769,11 +2769,9 @@ impl PendingDirectPathProbe {
     }
 
     pub fn transfer_increased(&self, telemetry: &WireGuardPeerTelemetry) -> bool {
+        // Outbound bytes only prove local handshake attempts; inbound bytes prove reachability.
         self.baseline_rx_bytes
             .is_some_and(|baseline| telemetry.rx_bytes > baseline)
-            || self
-                .baseline_tx_bytes
-                .is_some_and(|baseline| telemetry.tx_bytes > baseline)
     }
 }
 

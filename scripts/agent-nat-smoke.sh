@@ -156,6 +156,12 @@ dump_failure() {
       agent_peers "$namespace" | jq . >&2 || true
       echo "--- ${namespace} WireGuard endpoints ---" >&2
       ip netns exec "$namespace" wg show ipars0 endpoints >&2 || true
+      echo "--- ${namespace} WireGuard allowed IPs ---" >&2
+      ip netns exec "$namespace" wg show ipars0 allowed-ips >&2 || true
+      echo "--- ${namespace} WireGuard transfer ---" >&2
+      ip netns exec "$namespace" wg show ipars0 transfer >&2 || true
+      echo "--- ${namespace} WireGuard latest handshakes ---" >&2
+      ip netns exec "$namespace" wg show ipars0 latest-handshakes >&2 || true
     fi
   done
   for log in "${work_dir}"/agent-*.log "${state_dir}"/logs/*.log; do
