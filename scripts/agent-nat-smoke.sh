@@ -14,11 +14,11 @@ control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
 
 case "$nat_profile" in
-  endpoint-independent|symmetric)
+  endpoint-independent|symmetric|one-sided)
     ;;
   *)
     echo "unsupported IPARS_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
-    echo "expected endpoint-independent or symmetric" >&2
+    echo "expected endpoint-independent, symmetric, or one-sided" >&2
     exit 1
     ;;
 esac
@@ -253,6 +253,25 @@ create_agent_nat_pair() {
   fi
 }
 
+create_public_agent() {
+  local agent_namespace="$1"
+  local public_ip="$2"
+  local root_public_if="$3"
+  local public_if="$4"
+
+  ip link add "$root_public_if" type veth peer name "$public_if"
+  ip link set "$root_public_if" master "$bridge"
+  ip link set "$root_public_if" up
+  ip link set "$public_if" netns "$agent_namespace"
+
+  ip -n "$agent_namespace" link set lo up
+  ip -n "$agent_namespace" link set "$public_if" up
+  ip -n "$agent_namespace" addr add "${public_ip}/24" dev "$public_if"
+  ip -n "$agent_namespace" route replace default via "$root_public_ip" dev "$public_if"
+  ip netns exec "$agent_namespace" sysctl -qw net.ipv4.conf.all.rp_filter=0
+  ip netns exec "$agent_namespace" sysctl -qw net.ipv4.conf.default.rp_filter=0
+}
+
 block_direct_peer() {
   local nat_namespace="$1"
   local public_if="$2"
@@ -403,6 +422,10 @@ path_state() {
 wait_agent_ready() {
   local namespace="$1"
   local log_path="$2"
+  local public_agent=0
+  if [[ "$nat_profile" == "one-sided" && "$namespace" == "$agent_b" ]]; then
+    public_agent=1
+  fi
   for _ in $(seq 1 90); do
     if ! kill -0 "$(if [[ "$namespace" == "$agent_a" ]]; then echo "$agent_a_pid"; else echo "$agent_b_pid"; fi)" 2>/dev/null; then
       echo "agent in ${namespace} exited before readiness" >&2
@@ -412,13 +435,15 @@ wait_agent_ready() {
     local metrics
     if status="$(agent_status "$namespace" 2>/dev/null)" \
       && metrics="$(agent_metrics "$namespace" 2>/dev/null)" \
-      && jq -e --arg profile "$nat_profile" '
+      && jq -e --arg profile "$nat_profile" --arg public_agent "$public_agent" '
         .vpn_ip != null and
         .candidate_count >= 2 and
         .nat_classification != null and
         (if $profile == "symmetric" then
           .nat_classification.mapping_behavior == "address_and_port_dependent" and
           .nat_classification.strategy == "relay_preferred"
+        elif $public_agent == "1" then
+          .nat_classification.mapping_behavior == "no_nat"
         else
           .nat_classification.mapping_behavior == "endpoint_independent" and
           .nat_classification.filtering_behavior == "endpoint_independent"
@@ -494,11 +519,13 @@ wait_for_relay_path() {
 wait_for_direct_path() {
   local peer_a="$1"
   local peer_b="$2"
+  local expected_state_a="${3:-DIRECT_NAT_TRAVERSAL}"
+  local expected_state_b="${4:-DIRECT_NAT_TRAVERSAL}"
   for _ in $(seq 1 120); do
     local state_a state_b metrics_a metrics_b
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
-    if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
+    if [[ "$state_a" == "$expected_state_a" && "$state_b" == "$expected_state_b" ]] \
       && metrics_a="$(agent_metrics "$agent_a" 2>/dev/null)" \
       && metrics_b="$(agent_metrics "$agent_b" 2>/dev/null)" \
       && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
@@ -509,7 +536,19 @@ wait_for_direct_path() {
     fi
     sleep 1
   done
-  echo "both agents did not promote the direct NAT traversal path" >&2
+  echo "agents did not promote the expected direct paths (${expected_state_a}/${expected_state_b})" >&2
+  echo "--- agent A status ---" >&2
+  agent_status "$agent_a" | jq . >&2 || true
+  echo "--- agent B status ---" >&2
+  agent_status "$agent_b" | jq . >&2 || true
+  echo "--- agent A paths ---" >&2
+  agent_paths "$agent_a" | jq . >&2 || true
+  echo "--- agent B paths ---" >&2
+  agent_paths "$agent_b" | jq . >&2 || true
+  echo "--- agent A metrics ---" >&2
+  agent_metrics "$agent_a" | jq . >&2 || true
+  echo "--- agent B metrics ---" >&2
+  agent_metrics "$agent_b" | jq . >&2 || true
   return 1
 }
 
@@ -557,28 +596,40 @@ public_ports=(
 )
 
 ip netns add "$nat_a"
-ip netns add "$nat_b"
+if [[ "$nat_profile" != "one-sided" ]]; then
+  ip netns add "$nat_b"
+fi
 ip netns add "$agent_a"
 ip netns add "$agent_b"
 ip link add "$bridge" type bridge
 ip addr add "${root_public_ip}/24" dev "$bridge"
 ip link set "$bridge" up
 
-create_agent_nat_pair \
-  "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
-  "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
-  "$nat_profile"
-create_agent_nat_pair \
-  "$nat_b" "$agent_b" "$nat_b_public_ip" "$nat_b_agent_ip" "$nat_b_gateway" \
-  "$nat_b_root_public_if" "$nat_b_public_if" "$nat_b_agent_if" "$nat_b_private_if" \
-  "$nat_profile"
+if [[ "$nat_profile" == "one-sided" ]]; then
+  create_agent_nat_pair \
+    "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
+    "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
+    endpoint-independent
+  create_public_agent "$agent_b" "$nat_b_public_ip" "$nat_b_root_public_if" "$nat_b_public_if"
+else
+  create_agent_nat_pair \
+    "$nat_a" "$agent_a" "$nat_a_public_ip" "$nat_a_agent_ip" "$nat_a_gateway" \
+    "$nat_a_root_public_if" "$nat_a_public_if" "$nat_a_agent_if" "$nat_a_private_if" \
+    "$nat_profile"
+  create_agent_nat_pair \
+    "$nat_b" "$agent_b" "$nat_b_public_ip" "$nat_b_agent_ip" "$nat_b_gateway" \
+    "$nat_b_root_public_if" "$nat_b_public_if" "$nat_b_agent_if" "$nat_b_private_if" \
+    "$nat_profile"
+fi
 
 block_direct_peer \
   "$nat_a" "$nat_a_public_if" "$nat_b_public_ip" "$nat_a_agent_ip" \
   direct_rule_a direct_input_rule_a
-block_direct_peer \
-  "$nat_b" "$nat_b_public_if" "$nat_a_public_ip" "$nat_b_agent_ip" \
-  direct_rule_b direct_input_rule_b
+if [[ "$nat_profile" != "one-sided" ]]; then
+  block_direct_peer \
+    "$nat_b" "$nat_b_public_if" "$nat_a_public_ip" "$nat_b_agent_ip" \
+    direct_rule_b direct_input_rule_b
+fi
 
 echo "starting public bootstrap services on ${root_public_ip}"
 if ! "$ipars_bin" init \
@@ -617,13 +668,17 @@ for port in "$control_plane_port" "$signal_port" "$stun_http_port" "$relay_http_
 done
 
 signal_pid="$(jq -r '.daemon_processes[] | select(.service == "signal") | .pid' "$init_output")"
-if [[ "$nat_profile" == "endpoint-independent" ]]; then
+if [[ "$nat_profile" != "symmetric" ]]; then
   stop_signal
   start_signal disabled "${state_dir}/logs/signal-disabled.log"
 fi
 
+agent_b_bind_ip="$nat_b_agent_ip"
+if [[ "$nat_profile" == "one-sided" ]]; then
+  agent_b_bind_ip="$nat_b_public_ip"
+fi
 start_agent "$agent_a" "$nat_a_agent_ip" "${work_dir}/agent-a.json" "${work_dir}/agent-a.log"
-start_agent "$agent_b" "$nat_b_agent_ip" "${work_dir}/agent-b.json" "${work_dir}/agent-b.log"
+start_agent "$agent_b" "$agent_b_bind_ip" "${work_dir}/agent-b.json" "${work_dir}/agent-b.log"
 wait_agent_health "$agent_a"
 wait_agent_health "$agent_b"
 wait_agent_ready "$agent_a" "${work_dir}/agent-a.log"
@@ -651,13 +706,15 @@ for metrics_path in "${work_dir}/relay-a.metrics.json" "${work_dir}/relay-b.metr
   jq -e '([.relay_forwarders[]?.outbound_payload_bytes] | add // 0) > 0' "$metrics_path" >/dev/null
 done
 
-if [[ "$nat_profile" == "endpoint-independent" ]]; then
+if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "one-sided" ]]; then
   stop_signal
   start_signal enabled "${state_dir}/logs/signal-enabled.log"
   unblock_direct_peer "$nat_a" direct_rule_a
   unblock_direct_peer "$nat_a" direct_input_rule_a
-  unblock_direct_peer "$nat_b" direct_rule_b
-  unblock_direct_peer "$nat_b" direct_input_rule_b
+  if [[ "$nat_profile" != "one-sided" ]]; then
+    unblock_direct_peer "$nat_b" direct_rule_b
+    unblock_direct_peer "$nat_b" direct_input_rule_b
+  fi
   if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}" != "0" ]]; then
     sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS}"
   fi
@@ -669,7 +726,11 @@ if [[ "$nat_profile" == "endpoint-independent" ]]; then
   ip netns exec "$agent_b" ping -I ipars0 -c 3 -W 2 "$vpn_a"
   ip netns exec "$agent_a" wg show ipars0 endpoints | grep -F -- "${nat_b_public_ip}:51820" >/dev/null
   ip netns exec "$agent_b" wg show ipars0 endpoints | grep -F -- "${nat_a_public_ip}:51820" >/dev/null
-  echo "agent NAT smoke passed: endpoint-independent SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+  if [[ "$nat_profile" == "one-sided" ]]; then
+    echo "agent NAT smoke passed: one-sided public-peer NAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+  else
+    echo "agent NAT smoke passed: endpoint-independent SNAT Agents used encrypted relay fallback and promoted to direct NAT traversal"
+  fi
 else
   sleep 5
   wait_for_relay_path "$node_a" "$node_b"
