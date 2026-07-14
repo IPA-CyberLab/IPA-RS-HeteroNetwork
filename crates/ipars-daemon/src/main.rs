@@ -11823,6 +11823,7 @@ struct SignalPathNegotiationOptions {
 enum DirectPathVerificationDecision {
     Disabled,
     Confirmed(&'static str),
+    RetainCurrent(&'static str),
     Start(PendingDirectPathProbe),
     Pending,
     Expired,
@@ -11909,18 +11910,27 @@ async fn direct_path_verification_decision(
             .await;
     }
 
-    let current_direct_matches = runtime
-        .path_record_for_peer(&direct.key.remote)
-        .await
-        .is_some_and(|current| {
-            direct_path_record_targets(&current, direct.selected_state, candidate)
-        });
+    let current_path = runtime.path_record_for_peer(&direct.key.remote).await;
+    let current_direct_matches = current_path.as_ref().is_some_and(|current| {
+        direct_path_record_targets(current, direct.selected_state, candidate)
+    });
     if current_direct_matches
         && direct_path_telemetry_is_recent(candidate, telemetry, now, config.handshake_max_age)
     {
         return Ok(DirectPathVerificationDecision::Confirmed(
             "recent_wireguard_handshake",
         ));
+    }
+    if let Some(current) = current_path
+        .as_ref()
+        .filter(|current| current.selected_state.is_direct())
+        .and_then(|current| current.selected_candidate.as_ref())
+    {
+        if direct_path_telemetry_is_recent(current, telemetry, now, config.handshake_max_age) {
+            return Ok(DirectPathVerificationDecision::RetainCurrent(
+                "recent_wireguard_handshake",
+            ));
+        }
     }
 
     let timeout = chrono::Duration::from_std(config.probe_timeout).map_err(|error| {
@@ -12176,6 +12186,17 @@ async fn negotiate_signal_paths(
                         state = ?record.selected_state,
                         evidence,
                         "verified direct WireGuard path"
+                    );
+                }
+                DirectPathVerificationDecision::RetainCurrent(evidence) => {
+                    if let Some(current) = runtime.path_record_for_peer(&peer.node_id).await {
+                        record = current;
+                    }
+                    tracing::debug!(
+                        peer = %record.key.remote,
+                        state = ?record.selected_state,
+                        evidence,
+                        "retained existing direct WireGuard path while signal candidate changed"
                     );
                 }
                 DirectPathVerificationDecision::Start(probe) => {
@@ -31505,6 +31526,65 @@ exec sleep 60
             .await
             .is_none());
         assert_eq!(runtime.metrics().await.direct_path_probe_confirmed_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_path_verification_retains_healthy_current_candidate_when_signal_changes(
+    ) -> anyhow::Result<()> {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let runtime = AgentRuntime::new(AgentNodeState::generate(now), ClusterPolicy::default());
+        let public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = DirectPathVerificationConfig {
+            required: true,
+            probe_timeout: Duration::from_secs(120),
+            handshake_max_age: Duration::from_secs(180),
+        };
+        let current_candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let mut signal_candidate = current_candidate.clone();
+        signal_candidate.addr = SocketAddr::from(([203, 0, 113, 11], 51820));
+        let current = PathRecord {
+            key: PeerPathKey::new(runtime.state().node_id, NodeId::from_string("peer-a")),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(current_candidate.clone()),
+            relay_node: None,
+            score: PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0),
+            updated_at: now,
+            pinned: false,
+        };
+        runtime.upsert_path_state(current.clone()).await?;
+        let telemetry = BTreeMap::from([(
+            public_key.to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: public_key.to_string(),
+                endpoint: Some(current_candidate.addr.to_string()),
+                latest_handshake_at: Some(now - ChronoDuration::seconds(1)),
+                rx_bytes: 10,
+                tx_bytes: 20,
+            },
+        )]);
+        let signal_record = PathRecord {
+            selected_candidate: Some(signal_candidate),
+            ..current
+        };
+
+        let decision = direct_path_verification_decision(
+            &runtime,
+            &signal_record,
+            Some(&telemetry),
+            public_key,
+            now,
+            config,
+        )
+        .await?;
+
+        assert_eq!(
+            decision,
+            DirectPathVerificationDecision::RetainCurrent("recent_wireguard_handshake")
+        );
         Ok(())
     }
 
