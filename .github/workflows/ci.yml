@@ -75,8 +75,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
+            curl \
             iproute2 \
             iptables \
+            iputils-ping \
+            jq \
             kmod \
             procps \
             wireguard-tools
@@ -97,7 +100,7 @@ jobs:
           fi
 
       - name: Build daemon
-        run: cargo build --locked -p ipars-daemon
+        run: cargo build --locked -p ipars-cli -p ipars-daemon
 
       - name: Build packet-flow eBPF object
         run: |
@@ -116,9 +119,11 @@ jobs:
             CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
+            IPARS_AGENT_NAT_SMOKE_IPARS_BIN="$PWD/target/debug/ipars" \
+            IPARS_AGENT_NAT_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
             IPARS_NETNS_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
             IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH="$PWD/target/ebpf/ipars-packet-flow.bpf.o" \
-            scripts/netns-smoke.sh
+            bash -c 'scripts/agent-nat-smoke.sh && scripts/netns-smoke.sh'
 
   docker-compose-smoke:
     name: Docker Compose smoke
