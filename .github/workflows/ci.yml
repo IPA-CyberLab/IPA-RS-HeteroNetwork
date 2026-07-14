@@ -337,7 +337,7 @@ jobs:
 
           printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
 
-      - name: Run two-node Kubernetes integration suite
+      - name: Run three-node Kubernetes relay integration suite
         env:
           CARGO: cargo
           IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND: linux-command

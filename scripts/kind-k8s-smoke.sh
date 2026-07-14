@@ -121,6 +121,7 @@ kubeadmConfigPatches:
 nodes:
   - role: control-plane
   - role: worker
+  - role: worker
 EOF
 
 cluster_requested=1

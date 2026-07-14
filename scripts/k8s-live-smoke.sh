@@ -28,6 +28,7 @@ service_cidr="${IPARS_K8S_SMOKE_SERVICE_CIDR:-10.96.0.0/12}"
 stale_kubernetes_route_cidr="198.18.0.0/15"
 chart_fullname=""
 relay_service_name=""
+relay_cluster_ip=""
 relay_node_ip=""
 relay_public_endpoint=""
 relay_admission_url=""
@@ -261,12 +262,13 @@ wait_for_relay_service() {
       node_status="$($kubectl_bin -n "$namespace" exec "$pod" -c agent -- \
         curl --noproxy '*' --fail --silent --show-error --max-time 5 \
           "http://${relay_node_ip}:${relay_http_node_port}/v1/status" 2>/dev/null || true)"
-      if jq -e --arg expected "$expected_relay_node" \
-        '.health == "healthy" and .capability.e2e_only == true and .relay_node == $expected' \
+      if jq -e \
+        '.health == "healthy" and .capability.e2e_only == true' \
         >/dev/null 2>&1 <<<"$cluster_status" \
         && jq -e --arg expected "$expected_relay_node" \
           '.health == "healthy" and .capability.e2e_only == true and .relay_node == $expected' \
           >/dev/null 2>&1 <<<"$node_status"; then
+        relay_cluster_ip="$cluster_ip"
         echo "Kubernetes relay Service ${service_name} exposed healthy UDP/TCP relay endpoints through ClusterIP ${cluster_ip} and NodePort ${relay_udp_node_port}/${relay_http_node_port}"
         return 0
       fi
@@ -323,6 +325,112 @@ wait_for_wireguard_path() {
     sleep 2
   done
   echo "agent pod ${pod} did not establish a WireGuard path to ${remote_vpn_ip}" >&2
+  return 1
+}
+
+wait_for_relay_fallback_path() {
+  local pod="$1"
+  local peer_id="$2"
+  local paths_json=""
+  local metrics_json=""
+  local attempt
+  local relay_target="$relay_cluster_ip"
+  [[ -n "$relay_target" ]] || relay_target="the Kubernetes relay Service"
+  for attempt in $(seq 1 90); do
+    paths_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer $agent_api_token" \
+        http://127.0.0.1:9780/v1/paths 2>/dev/null || true)"
+    metrics_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer $agent_api_token" \
+        http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
+    if jq -e --arg peer "$peer_id" '
+      any(.paths[]?; .key.remote == $peer
+        and .selected_state == "relay"
+        and (.relay_node | type == "string"))
+    ' >/dev/null 2>&1 <<<"$paths_json" \
+      && jq -e --arg peer "$peer_id" '
+        .relay_session_count >= 1
+        and .relay_forwarder_count >= 1
+        and any(.relay_forwarders[]?; .peer == $peer
+          and .outbound_packets > 0
+          and .inbound_packets > 0)
+      ' >/dev/null 2>&1 <<<"$metrics_json"; then
+      echo "agent pod $pod established an encrypted relay fallback path to $peer_id through $relay_target"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "agent pod $pod did not expose an active relay fallback path to $peer_id" >&2
+  echo "Paths:\n$paths_json" >&2
+  echo "Metrics:\n$metrics_json" >&2
+  return 1
+}
+
+wait_for_relay_dataplane() {
+  local relay_status=""
+  local relay_pod
+  local attempt
+  for attempt in $(seq 1 90); do
+    while IFS= read -r relay_pod; do
+      [[ -n "$relay_pod" ]] || continue
+      relay_status="$("$kubectl_bin" -n "$namespace" exec "$relay_pod" -c agent -- \
+        curl --fail --silent --show-error --max-time 5 \
+          http://127.0.0.1:9580/v1/status 2>/dev/null || true)"
+      if jq -e '
+        .health == "healthy"
+        and .capability.e2e_only == true
+        and .dataplane.datagrams_received >= 1
+        and .dataplane.datagrams_forwarded >= 1
+        and .dataplane.payload_bytes_forwarded > 0
+      ' >/dev/null 2>&1 <<<"$relay_status"; then
+        echo "Kubernetes relay sidecar forwarded opaque UDP datagrams through the relay Service"
+        return 0
+      fi
+    done < <("$kubectl_bin" -n "$namespace" get pods \
+      -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=$release" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+    sleep 2
+  done
+  echo "no Kubernetes relay sidecar reported forwarded UDP datagrams" >&2
+  echo "Relay status:\n$relay_status" >&2
+  return 1
+}
+
+wait_for_direct_path_promotion() {
+  local pod="$1"
+  local peer_id="$2"
+  local paths_json=""
+  local metrics_json=""
+  local attempt
+  for attempt in $(seq 1 120); do
+    paths_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer $agent_api_token" \
+        http://127.0.0.1:9780/v1/paths 2>/dev/null || true)"
+    metrics_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer $agent_api_token" \
+        http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
+    if jq -e --arg peer "$peer_id" '
+      any(.paths[]?; .key.remote == $peer
+        and (.selected_state == "direct_public"
+          or .selected_state == "direct_ipv6"
+          or .selected_state == "direct_nat_traversal")
+        and .relay_node == null)
+    ' >/dev/null 2>&1 <<<"$paths_json" \
+      && jq -e --arg peer "$peer_id" '
+        (any(.relay_forwarders[]?; .peer == $peer) | not)
+      ' >/dev/null 2>&1 <<<"$metrics_json"; then
+      echo "agent pod $pod promoted $peer_id from relay fallback to a direct path"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "agent pod $pod did not promote $peer_id from relay fallback to a direct path" >&2
+  echo "Paths:\n$paths_json" >&2
+  echo "Metrics:\n$metrics_json" >&2
   return 1
 }
 
@@ -588,6 +696,11 @@ spec:
             - signal
             - --listen
             - 0.0.0.0:9443
+          env:
+            - name: IPARS_SIGNAL_DISABLE_IPV6_DIRECT
+              value: "true"
+            - name: IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL
+              value: "true"
           ports:
             - name: signal
               containerPort: 9443
@@ -641,6 +754,9 @@ agent_api_service_name="${chart_fullname}-agent"
   --set agent.apiService.targetPort=9780 \
   --set agent.peerMap.pollIntervalSeconds=2 \
   --set serviceExposure.routeIntervalSeconds=2 \
+  --set agent.relayForwarder.enabled=true \
+  --set-string agent.relayForwarder.bind=127.0.0.1:0 \
+  --set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820 \
   --set agent.relayAdvertisement.enabled=true \
   --set-string "agent.relayAdmissionBearerTokenSecret.name=${token_secret}" \
   --set-string 'agent.relayAdmissionBearerTokenSecret.key=relay-admission-token' \
@@ -690,6 +806,10 @@ if [[ "$agent_runtime_backend" == "linux-command" && "$desired_agents" -lt 2 ]];
   echo "linux-command live smoke requires at least two scheduled agent pods" >&2
   exit 1
 fi
+if [[ "$agent_runtime_backend" == "linux-command" && "$desired_agents" -ne 3 ]]; then
+  echo "linux-command relay fallback live smoke requires exactly three scheduled agent pods" >&2
+  exit 1
+fi
 
 node_ids=()
 vpn_ips=()
@@ -701,7 +821,21 @@ for pod in "${agent_pods[@]}"; do
   node_ids+=("$node_id")
   vpn_ips+=("$vpn_ip")
 done
-wait_for_relay_service "${agent_pods[0]}" "$relay_service_name" "${node_ids[0]}"
+relay_candidate_index=""
+for index in "${!agent_pods[@]}"; do
+  pod_node_name="$("$kubectl_bin" -n "$namespace" get pod "${agent_pods[$index]}" -o jsonpath='{.spec.nodeName}')"
+  pod_node_ip="$("$kubectl_bin" get node "$pod_node_name" \
+    -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' | awk 'NF { print; exit }')"
+  if [[ "$pod_node_ip" == "$relay_node_ip" ]]; then
+    relay_candidate_index="$index"
+    break
+  fi
+done
+if [[ -z "$relay_candidate_index" ]]; then
+  echo "could not map the advertised relay NodePort node IP to an Agent pod" >&2
+  exit 1
+fi
+wait_for_relay_service "${agent_pods[0]}" "$relay_service_name" "${node_ids[$relay_candidate_index]}"
 
 "$kubectl_bin" -n "$namespace" apply -f - <<EOF
 apiVersion: v1
@@ -840,6 +974,47 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
       activate_agent_peer "${agent_pods[$local_index]}" "${node_ids[$remote_index]}"
     done
   done
+
+  # The fixed NodePort relay endpoint is exposed on the first kind node; keep
+  # that node as the sole relay candidate for the selected three-agent pair.
+  relay_local_index=""
+  relay_remote_index=""
+  for index in "${!node_ids[@]}"; do
+    if [[ "$index" == "$relay_candidate_index" ]]; then
+      continue
+    fi
+    if [[ -z "$relay_local_index" ]]; then
+      relay_local_index="$index"
+    else
+      relay_remote_index="$index"
+    fi
+  done
+  if [[ -z "$relay_local_index" || -z "$relay_remote_index" ]]; then
+    echo "could not select two non-relay Agent peers for the Kubernetes relay gate" >&2
+    exit 1
+  fi
+  wait_for_wireguard_path \
+    "${agent_pods[$relay_local_index]}" \
+    "${vpn_ips[$relay_local_index]}" \
+    "${vpn_ips[$relay_remote_index]}"
+  wait_for_relay_fallback_path \
+    "${agent_pods[$relay_local_index]}" \
+    "${node_ids[$relay_remote_index]}"
+  wait_for_relay_dataplane
+
+  "$kubectl_bin" -n "$namespace" set env "deployment/$bootstrap_name" \
+    --containers=signal \
+    IPARS_SIGNAL_DISABLE_IPV6_DIRECT=false \
+    IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL=false
+  "$kubectl_bin" -n "$namespace" rollout status "deployment/$bootstrap_name" --timeout="$timeout_seconds"s
+  wait_for_bootstrap_health
+  wait_for_wireguard_path \
+    "${agent_pods[$relay_local_index]}" \
+    "${vpn_ips[$relay_local_index]}" \
+    "${vpn_ips[$relay_remote_index]}"
+  wait_for_direct_path_promotion \
+    "${agent_pods[$relay_local_index]}" \
+    "${node_ids[$relay_remote_index]}"
 
   for local_index in "${!node_ids[@]}"; do
     remote_index=$(( (local_index + 1) % ${#node_ids[@]} ))

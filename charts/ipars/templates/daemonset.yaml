@@ -225,7 +225,7 @@
 {{- if not .Values.agent.relayForwarder.wireguardEndpoint -}}
 {{- fail "agent.relayForwarder.wireguardEndpoint is required when agent.relayForwarder.bind is set" -}}
 {{- end -}}
-{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.relayForwarder.bind" "value" .Values.agent.relayForwarder.bind) -}}
+{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.relayForwarder.bind" "value" .Values.agent.relayForwarder.bind "allowPortZero" true) -}}
 {{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.wireguardEndpoint" "value" .Values.agent.relayForwarder.wireguardEndpoint) -}}
 {{- if and .Values.agent.relayForwarder.netns (or (gt (len .Values.agent.relayForwarder.netns) 64) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.relayForwarder.netns))) -}}
 {{- fail "agent.relayForwarder.netns must be a Linux network namespace name of 1-64 ASCII letters, digits, '.', '_' or '-'" -}}

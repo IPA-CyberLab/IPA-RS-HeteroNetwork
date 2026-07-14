@@ -4630,8 +4630,7 @@ fn parse_kubernetes_stun_endpoint(value: &str) -> Result<String, String> {
 }
 
 fn parse_kubernetes_agent_stun_bind(value: &str) -> Result<String, String> {
-    validate_relay_forwarder_bind_arg(value, "agent STUN bind")
-        .map_err(|error| error.to_string())?;
+    validate_non_ephemeral_bind_arg(value, "agent STUN bind").map_err(|error| error.to_string())?;
     Ok(value.to_string())
 }
 
@@ -8511,7 +8510,7 @@ fn validate_k8s_agent_wireguard_endpoint_config(args: &K8sInstallArgs) -> anyhow
     let Some(stun_bind) = args.agent_stun_bind.as_deref() else {
         return Ok(());
     };
-    validate_relay_forwarder_bind_arg(stun_bind, "--agent-stun-bind")?;
+    validate_non_ephemeral_bind_arg(stun_bind, "--agent-stun-bind")?;
     let stun_bind = stun_bind.parse::<SocketAddr>().with_context(|| {
         "--agent-stun-bind must be an IPv4 host:port or [IPv6]:port bind socket address"
     })?;
@@ -8796,10 +8795,18 @@ fn validate_k8s_relay_advertised_public_endpoint_arg(
 }
 
 fn validate_relay_forwarder_bind_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    validate_bind_arg(value, flag, true)
+}
+
+fn validate_non_ephemeral_bind_arg(value: &str, flag: &str) -> anyhow::Result<()> {
+    validate_bind_arg(value, flag, false)
+}
+
+fn validate_bind_arg(value: &str, flag: &str, allow_port_zero: bool) -> anyhow::Result<()> {
     let endpoint = value.parse::<SocketAddr>().with_context(|| {
         format!("{flag} must be an IPv4 host:port or [IPv6]:port bind socket address")
     })?;
-    if endpoint.port() == 0 {
+    if endpoint.port() == 0 && !allow_port_zero {
         anyhow::bail!("{flag} must use a nonzero port");
     }
     if endpoint.ip().is_multicast() {
@@ -17071,6 +17078,16 @@ fi
         assert!(helm.contains("--set-string agent.relayForwarder.endpoint=127.0.0.1:45182"));
         assert!(!helm.contains("agent.relayForwarder.bind"));
         assert!(!helm.contains("agent.relayForwarder.maxSessions"));
+
+        let mut ephemeral_bind = base_k8s_install_args();
+        ephemeral_bind.relay_forwarder_bind = Some("127.0.0.1:0".to_string());
+        ephemeral_bind.relay_forwarder_wireguard_endpoint = Some("127.0.0.1:51820".to_string());
+        let plan = k8s_install_plan(ephemeral_bind)?;
+        let helm = &plan.commands[2];
+        assert!(helm.contains("--set-string agent.relayForwarder.bind=127.0.0.1:0"));
+        assert!(
+            helm.contains("--set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820")
+        );
 
         let mut invalid_endpoint = base_k8s_install_args();
         invalid_endpoint.relay_forwarder_endpoint = Some("0.0.0.0:45182".to_string());

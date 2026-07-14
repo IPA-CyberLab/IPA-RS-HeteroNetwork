@@ -25680,6 +25680,56 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn relay_forwarder_supervisor_allocates_unique_ephemeral_ports_per_peer(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 2,
+            restart_backoff: Duration::ZERO,
+            crash_policy: test_crash_policy(),
+        });
+        let session =
+            |peer: &str, session_id: &str, local_port: u16, peer_port: u16| RelaySessionState {
+                peer: NodeId::from_string(peer),
+                relay_node: NodeId::from_string("relay-ephemeral"),
+                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], local_port)),
+                admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], peer_port)),
+                session_id: session_id.to_string(),
+                session_token: format!("token-{session_id}"),
+                expires_at: Utc::now() + ChronoDuration::minutes(5),
+            };
+
+        let first = supervisor
+            .upsert(
+                &runtime,
+                session("peer-ephemeral-a", "session-a", 41_001, 41_002),
+            )
+            .await?;
+        let second = supervisor
+            .upsert(
+                &runtime,
+                session("peer-ephemeral-b", "session-b", 41_003, 41_004),
+            )
+            .await?;
+
+        assert_ne!(first.port(), 0);
+        assert_ne!(second.port(), 0);
+        assert_ne!(first, second);
+        assert_eq!(runtime.relay_forwarder_endpoints().await.len(), 2);
+
+        supervisor.shutdown_all(&runtime).await;
+        assert!(runtime.relay_forwarder_endpoints().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn relay_forwarder_supervisor_reaps_dead_tasks_and_backs_off() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),

@@ -486,6 +486,7 @@
 {{- define "ipars.validateBindSocketAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
+{{- $allowPortZero := default false .allowPortZero -}}
 {{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
 {{- $ipv4Socket := regexMatch (printf "^%s\\.%s\\.%s\\.%s:[0-9]+$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $value -}}
 {{- $ipv6Socket := regexMatch "^\\[[0-9A-Fa-f:.]+\\]:[0-9]+$" $value -}}
@@ -493,8 +494,12 @@
 {{- fail (printf "%s value %q must be an IPv4 host:port or [IPv6]:port bind socket address" $path $value) -}}
 {{- end -}}
 {{- $port := int (regexFind "[0-9]+$" $value) -}}
-{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- if or (and (not $allowPortZero) (lt $port 1)) (gt $port 65535) -}}
+{{- if $allowPortZero -}}
+{{- fail (printf "%s port must be between 0 and 65535" $path) -}}
+{{- else -}}
 {{- fail (printf "%s port must be between 1 and 65535" $path) -}}
+{{- end -}}
 {{- end -}}
 {{- if $ipv4Socket -}}
 {{- $host := regexFind "^[^:]+" $value -}}

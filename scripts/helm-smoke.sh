@@ -647,6 +647,15 @@ template_ok relay-forwarder-netns \
   --set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820 \
   --set-string agent.relayForwarder.netns=relay-fw
 
+template_ok relay-forwarder-ephemeral-bind \
+  --set agent.relayForwarder.enabled=true \
+  --set-string agent.relayForwarder.bind=127.0.0.1:0 \
+  --set-string agent.relayForwarder.wireguardEndpoint=127.0.0.1:51820
+
+assert_rendered_contains relay-forwarder-ephemeral-bind "- --relay-forwarder-bind"
+assert_rendered_contains relay-forwarder-ephemeral-bind '- "127.0.0.1:0"'
+assert_rendered_contains relay-forwarder-ephemeral-bind '- "127.0.0.1:51820"'
+
 template_fails relay-service-without-advertisement \
   "agent.relayService.enabled=true requires agent.relayAdvertisement.enabled=true" \
   --set agent.relayService.enabled=true
