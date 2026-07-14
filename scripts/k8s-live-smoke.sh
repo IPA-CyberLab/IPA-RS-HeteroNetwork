@@ -324,6 +324,35 @@ activate_agent_peer() {
   jq -e --arg peer "$peer_id" '.peer == $peer and .pinned == true' >/dev/null <<<"$response"
 }
 
+wait_for_agent_peer_map() {
+  local pod="$1"
+  local peer_map_json=""
+  local attempt
+  for attempt in $(seq 1 60); do
+    peer_map_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      curl --fail --silent --show-error --max-time 5 \
+        -H "Authorization: Bearer $agent_api_token" \
+        http://127.0.0.1:9780/v1/peers 2>/dev/null || true)"
+    if jq -e --arg cluster_id "$cluster_id" '
+      .cluster_id == $cluster_id
+      and (.peers | type == "array" and length >= 2)
+      and all(.peers[]?;
+        (.endpoint_candidates | type == "array" and length > 0)
+        and any(.endpoint_candidates[]?;
+          .kind != "relay"
+          and (.addr | type == "string" and test("[0-9]+$"))
+        )
+      )
+    ' >/dev/null 2>&1 <<<"$peer_map_json"; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "agent pod ${pod} did not publish fresh usable endpoint candidates for every peer" >&2
+  printf 'Peer map:\n%s\n' "$peer_map_json" >&2
+  return 1
+}
+
 wait_for_wireguard_path() {
   local pod="$1"
   local local_vpn_ip="$2"
@@ -360,6 +389,8 @@ wait_for_relay_fallback_path() {
   local peer_id="$2"
   local paths_json=""
   local metrics_json=""
+  local status_json=""
+  local peer_map_json=""
   local attempt
   local relay_target="$relay_cluster_ip"
   [[ -n "$relay_target" ]] || relay_target="the Kubernetes relay Service"
@@ -390,8 +421,16 @@ wait_for_relay_fallback_path() {
     sleep 2
   done
   echo "agent pod $pod did not expose an active relay fallback path to $peer_id" >&2
-  echo "Paths:\n$paths_json" >&2
-  echo "Metrics:\n$metrics_json" >&2
+  status_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+    curl --fail --silent --show-error --max-time 5 \
+      -H "Authorization: Bearer $agent_api_token" \
+      http://127.0.0.1:9780/v1/status 2>/dev/null || true)"
+  peer_map_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+    curl --fail --silent --show-error --max-time 5 \
+      -H "Authorization: Bearer $agent_api_token" \
+      http://127.0.0.1:9780/v1/peers 2>/dev/null || true)"
+  printf 'Paths:\n%s\nMetrics:\n%s\nStatus:\n%s\nPeer map:\n%s\n' \
+    "$paths_json" "$metrics_json" "$status_json" "$peer_map_json" >&2
   return 1
 }
 
@@ -991,18 +1030,8 @@ wait_for_control_plane_metrics "$desired_agents"
 wait_for_control_plane_relay_candidates "$desired_agents"
 wait_for_agent_api_service "${agent_pods[0]}" "$agent_api_service_name"
 
-for index in "${!node_ids[@]}"; do
-  node_id="${node_ids[$index]}"
-  pod="${agent_pods[$index]}"
-  peer_map_json="$("$kubectl_bin" -n "$namespace" exec "pod/${pod}" -c agent -- \
-    /usr/local/bin/ipars --agent-state-path /var/lib/ipars/agent.json peers \
-      --control-plane-url "$control_plane_url" --node-id "$node_id")"
-  jq -e --arg cluster_id "$cluster_id" '
-    .cluster_id == $cluster_id
-    and (.peers | type == "array" and length >= 2)
-    and all(.peers[]?; (.endpoint_candidates | type == "array" and length > 0))
-  ' \
-    >/dev/null <<<"$peer_map_json"
+for pod in "${agent_pods[@]}"; do
+  wait_for_agent_peer_map "$pod"
 done
 
 if [[ "$agent_runtime_backend" == "linux-command" ]]; then
@@ -1033,6 +1062,9 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
     echo "could not select two non-relay Agent peers for the Kubernetes relay gate" >&2
     exit 1
   fi
+  activate_agent_peer \
+    "${agent_pods[$relay_local_index]}" \
+    "${node_ids[$relay_remote_index]}"
   wait_for_wireguard_path \
     "${agent_pods[$relay_local_index]}" \
     "${vpn_ips[$relay_local_index]}" \
@@ -1055,6 +1087,17 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
   wait_for_direct_path_promotion \
     "${agent_pods[$relay_local_index]}" \
     "${node_ids[$relay_remote_index]}"
+
+  for local_index in "${!node_ids[@]}"; do
+    for remote_index in "${!node_ids[@]}"; do
+      if [[ "$local_index" == "$remote_index" \
+        || ("$local_index" == "$relay_local_index" \
+          && "$remote_index" == "$relay_remote_index") ]]; then
+        continue
+      fi
+      activate_agent_peer "${agent_pods[$local_index]}" "${node_ids[$remote_index]}"
+    done
+  done
 
   for local_index in "${!node_ids[@]}"; do
     remote_index=$(( (local_index + 1) % ${#node_ids[@]} ))
