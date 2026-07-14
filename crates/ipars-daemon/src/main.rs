@@ -13120,6 +13120,21 @@ async fn admit_relay_session_from_candidates(
         .await
         {
             Ok(session) => {
+                if session.relay_node == status.node_id || session.relay_node == peer.node_id {
+                    let error = AgentRelayAdmissionError::InvalidResponse(anyhow::anyhow!(
+                        "relay admission response used endpoint {} as relay",
+                        session.relay_node
+                    ));
+                    runtime.record_relay_admission_failure_reason(error.reason());
+                    errors.push(format!("{}: {error:#}", relay.node_id));
+                    tracing::warn!(
+                        relay = %relay.node_id,
+                        peer = %peer.node_id,
+                        %error,
+                        "relay admission candidate resolved to a path endpoint; trying next relay"
+                    );
+                    continue;
+                }
                 runtime.record_relay_admission_success();
                 return Ok(session);
             }
@@ -30062,7 +30077,7 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn relay_admission_accepts_peer_identity_from_shared_endpoint() -> anyhow::Result<()> {
+    async fn relay_admission_rejects_peer_identity_from_shared_endpoint() -> anyhow::Result<()> {
         async fn relay_admission_success(
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
@@ -30117,7 +30132,7 @@ exec sleep 60
             ClusterPolicy::default(),
         );
 
-        let session = admit_relay_session_from_candidates(
+        let error = match admit_relay_session_from_candidates(
             &reqwest::Client::new(),
             &runtime,
             &status,
@@ -30125,17 +30140,21 @@ exec sleep 60
             &[relay_alias],
             None,
         )
-        .await?;
-
-        assert_eq!(session.relay_node, NodeId::from_string("peer-a"));
-        assert_eq!(
-            session.relay_endpoint,
-            SocketAddr::from(([203, 0, 113, 32], 51820))
-        );
+        .await
+        {
+            Ok(_) => anyhow::bail!("an endpoint identity must not be used as a relay"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("used endpoint peer-a as relay"));
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.relay_admission_attempt_count, 1);
-        assert_eq!(metrics.relay_admission_success_count, 1);
-        assert_eq!(metrics.relay_admission_failure_count, 0);
+        assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(metrics.relay_admission_failure_count, 1);
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::InvalidResponse,
+            1,
+        );
         relay_task.abort();
         Ok(())
     }
