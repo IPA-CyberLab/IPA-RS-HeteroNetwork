@@ -1096,6 +1096,46 @@ wait_for_relay_service \
   "${node_ids[$relay_candidate_index]}" \
   "$relay_pod_ip"
 
+# Agents may have established pooled HTTP/UDP paths while the relay Service
+# still selected every sidecar. Restart only the non-relay Pods after pinning
+# the Service so their first relay admission uses the selected relay identity.
+for index in "${!node_ids[@]}"; do
+  if [[ "$index" == "$relay_candidate_index" ]]; then
+    continue
+  fi
+  old_pod="${agent_pods[$index]}"
+  pod_node="$($kubectl_bin -n "$namespace" get pod "$old_pod" -o jsonpath='{.spec.nodeName}')"
+  "$kubectl_bin" -n "$namespace" delete pod "$old_pod" --wait=true --timeout="${timeout_seconds}s" >/dev/null
+  replacement_pod=""
+  for attempt in $(seq 1 90); do
+    while IFS= read -r candidate_pod; do
+      [[ -n "$candidate_pod" && "$candidate_pod" != "$old_pod" ]] || continue
+      if "$kubectl_bin" -n "$namespace" wait --for=condition=Ready "pod/${candidate_pod}" \
+        --timeout=5s >/dev/null 2>&1; then
+        replacement_pod="$candidate_pod"
+        break 2
+      fi
+    done < <("$kubectl_bin" -n "$namespace" get pods \
+      -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
+      --field-selector "spec.nodeName=${pod_node}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+    sleep 2
+  done
+  if [[ -z "$replacement_pod" ]]; then
+    echo "replacement Agent pod for ${old_pod} did not become Ready on node ${pod_node}" >&2
+    exit 1
+  fi
+  status_json="$(wait_for_agent_runtime "$replacement_pod")"
+  replacement_node_id="$(jq -er '.node_id | strings' <<<"$status_json")"
+  replacement_vpn_ip="$(jq -er '.vpn_ip | strings' <<<"$status_json")"
+  if [[ "$replacement_node_id" != "${node_ids[$index]}" ]]; then
+    echo "replacement Agent pod ${replacement_pod} changed identity from ${node_ids[$index]} to ${replacement_node_id}" >&2
+    exit 1
+  fi
+  agent_pods[$index]="$replacement_pod"
+  vpn_ips[$index]="$replacement_vpn_ip"
+done
+
 for pod in "${agent_pods[@]}"; do
   ipv4_forwarding="$($kubectl_bin -n "$namespace" exec "pod/${pod}" -c agent -- \
     cat /proc/sys/net/ipv4/ip_forward)"
