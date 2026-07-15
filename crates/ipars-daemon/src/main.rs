@@ -31708,7 +31708,7 @@ exec sleep 60
         runtime
             .upsert_pending_direct_path_probe(PendingDirectPathProbe {
                 selected_state: PathState::DirectPublic,
-                selected_candidate,
+                selected_candidate: selected_candidate.clone(),
                 started_at: now - ChronoDuration::seconds(121),
                 expires_at: now - ChronoDuration::seconds(1),
                 endpoint_observed_at: Some(now - ChronoDuration::seconds(30)),
@@ -31720,7 +31720,7 @@ exec sleep 60
             public_key.to_string(),
             WireGuardPeerTelemetry {
                 public_key_b64: public_key.to_string(),
-                endpoint: Some(direct.selected_candidate.as_ref().unwrap().addr.to_string()),
+                endpoint: Some(selected_candidate.addr.to_string()),
                 latest_handshake_at: None,
                 rx_bytes: 102,
                 tx_bytes: 200,
@@ -31743,7 +31743,7 @@ exec sleep 60
         runtime
             .upsert_pending_direct_path_probe(PendingDirectPathProbe {
                 selected_state: PathState::DirectPublic,
-                selected_candidate: direct.selected_candidate.clone().unwrap(),
+                selected_candidate,
                 started_at: now - ChronoDuration::seconds(121),
                 expires_at: now - ChronoDuration::seconds(1),
                 endpoint_observed_at: None,
