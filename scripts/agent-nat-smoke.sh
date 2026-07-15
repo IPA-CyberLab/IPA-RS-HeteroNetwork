@@ -467,7 +467,7 @@ relay_status() {
 ping_overlay() {
   local namespace="$1"
   local target="$2"
-  for attempt in 1 2 3; do
+  for attempt in $(seq 1 10); do
     if ip netns exec "$namespace" ping -I ipars0 -c 3 -W 2 "$target"; then
       return 0
     fi
