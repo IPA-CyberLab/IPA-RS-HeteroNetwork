@@ -171,6 +171,7 @@ const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
+const DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
@@ -7517,7 +7518,13 @@ async fn run_agent(
         .map(|(local_vpn_ip, namespace, config)| {
             let direct_config = PeerProbeConfig {
                 sample_count: 1,
-                response_timeout: config.response_timeout.min(Duration::from_millis(250)),
+                // A direct WireGuard endpoint may need several seconds for the
+                // first encrypted handshake after the relay forwarder is
+                // suspended. Keep the probe bounded, but do not let the
+                // ordinary quality-probe timeout expire before that handshake.
+                response_timeout: config
+                    .response_timeout
+                    .max(DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT),
                 sample_interval: Duration::ZERO,
                 ..*config
             };
@@ -11939,6 +11946,12 @@ async fn direct_path_verification_decision_with_data_plane_probe(
             }
             if let Some(telemetry) = telemetry {
                 if !direct_path_endpoint_matches(candidate, telemetry) {
+                    tracing::debug!(
+                        peer = %direct.key.remote,
+                        candidate_endpoint = %candidate.addr,
+                        observed_endpoint = ?telemetry.endpoint,
+                        "direct path telemetry endpoint does not match selected candidate"
+                    );
                     if pending.endpoint_observed_at.take().is_some() {
                         pending.baseline_rx_bytes = None;
                         pending.baseline_tx_bytes = None;
@@ -11949,6 +11962,11 @@ async fn direct_path_verification_decision_with_data_plane_probe(
                     return Ok(DirectPathVerificationDecision::Pending);
                 }
                 if pending.endpoint_observed_at.is_none() {
+                    tracing::debug!(
+                        peer = %direct.key.remote,
+                        endpoint = %candidate.addr,
+                        "observed selected direct WireGuard endpoint"
+                    );
                     pending.endpoint_observed_at = Some(now);
                     pending.baseline_rx_bytes = Some(telemetry.rx_bytes);
                     pending.baseline_tx_bytes = Some(telemetry.tx_bytes);
@@ -12075,7 +12093,16 @@ async fn direct_path_overlay_probe_confirmed(
         return false;
     }
     match data_plane_probe.measure(peer_vpn_ip).await {
-        Ok(measurement) => measurement.successful_sample_count() > 0,
+        Ok(measurement) => {
+            let successful_samples = measurement.successful_sample_count();
+            tracing::debug!(
+                peer = %peer,
+                successful_samples,
+                sample_count = measurement.sample_count(),
+                "completed direct WireGuard overlay probe"
+            );
+            successful_samples > 0
+        }
         Err(error) => {
             tracing::debug!(
                 %error,
@@ -12458,7 +12485,16 @@ async fn negotiate_signal_paths(
             .pending_direct_path_probe(&peer.node_id)
             .await
             .is_some_and(|probe| probe.is_active_at(chrono::Utc::now()));
-        if record.selected_state == PathState::Relay && direct_path_probe_active {
+        // Keep relay traffic available until WireGuard has observed the selected
+        // direct endpoint. This primes endpoint-independent and fixed-port NAT
+        // mappings before the relay is removed from the verification path.
+        let direct_path_probe_ready_to_suspend = runtime
+            .pending_direct_path_probe(&peer.node_id)
+            .await
+            .is_some_and(|probe| {
+                probe.is_active_at(chrono::Utc::now()) && probe.endpoint_observed_at.is_some()
+            });
+        if record.selected_state == PathState::Relay && direct_path_probe_ready_to_suspend {
             suspend_relay_forwarder_for_direct_probe(
                 runtime,
                 options.relay_forwarder_supervisor.as_ref(),
