@@ -12,6 +12,7 @@ join_token_path="${work_dir}/agent.join-token"
 control_plane_operator_token_path="${state_dir}/control-plane-operator.token"
 control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
+direct_probe_timeout_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PROBE_TIMEOUT_SECONDS:-20}"
 
 case "$nat_profile" in
   endpoint-independent|fixed-port|mixed-port|symmetric|asymmetric|one-sided|one-sided-port-preserving|one-sided-symmetric)
@@ -419,7 +420,7 @@ start_agent() {
     --heartbeat-interval-seconds 2 \
     --signal-registration-interval-seconds 2 \
     --signal-path-interval-seconds 2 \
-    --direct-path-probe-timeout-seconds 8 \
+    --direct-path-probe-timeout-seconds "$direct_probe_timeout_seconds" \
     --direct-handshake-max-age-seconds 30 \
     --relay-session-renew-before-seconds 5 \
     --hole-punch-attempts 8 \
