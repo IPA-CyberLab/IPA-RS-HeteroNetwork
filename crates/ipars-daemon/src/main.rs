@@ -12217,6 +12217,43 @@ fn direct_path_probe_has_handshake_evidence(
         })
 }
 
+async fn set_direct_path_relay_forwarding(
+    runtime: &AgentRuntime,
+    supervisor: Option<&Arc<RelayForwarderSupervisor>>,
+    peer: &NodeId,
+    forwarding_enabled: bool,
+) -> bool {
+    let Some(supervisor) = supervisor else {
+        return false;
+    };
+    if !supervisor
+        .set_forwarding_enabled(peer, forwarding_enabled)
+        .await
+    {
+        return false;
+    }
+
+    if let Some(mut pending) = runtime.pending_direct_path_probe(peer).await {
+        let suspended = !forwarding_enabled;
+        if pending.relay_forwarder_suspended != suspended {
+            pending.relay_forwarder_suspended = suspended;
+            if let Err(error) = runtime.upsert_pending_direct_path_probe(pending).await {
+                tracing::warn!(
+                    %error,
+                    peer = %peer,
+                    "failed to persist relay forwarding state for direct path probe"
+                );
+            }
+        }
+    }
+    tracing::debug!(
+        peer = %peer,
+        forwarding_enabled,
+        "updated relay forwarder payload forwarding for direct path probe"
+    );
+    true
+}
+
 fn direct_path_endpoint_matches(
     candidate: &EndpointCandidate,
     telemetry: &WireGuardPeerTelemetry,
@@ -12387,6 +12424,26 @@ async fn negotiate_signal_paths(
             && path_selection == StableSignalPathSelection::Candidate
         {
             let now = chrono::Utc::now();
+            let pending_direct_path_probe = runtime.pending_direct_path_probe(&peer.node_id).await;
+            let overlay_probe_pending = options.direct_path_data_plane_probe.is_some()
+                && pending_direct_path_probe.as_ref().is_some_and(|pending| {
+                    pending.is_active_at(now)
+                        && pending.endpoint_observed_at.is_some()
+                        && record.selected_candidate.as_ref().is_some_and(|candidate| {
+                            pending.targets(record.selected_state, candidate)
+                        })
+                });
+            let relay_forwarding_paused_for_overlay_probe = if overlay_probe_pending {
+                set_direct_path_relay_forwarding(
+                    runtime,
+                    options.relay_forwarder_supervisor.as_ref(),
+                    &peer.node_id,
+                    false,
+                )
+                .await
+            } else {
+                false
+            };
             let relay_forwarder_metrics = runtime
                 .relay_forwarder_metrics_for_peer(&peer.node_id)
                 .await;
@@ -12404,6 +12461,17 @@ async fn negotiate_signal_paths(
                 },
             )
             .await?;
+            if relay_forwarding_paused_for_overlay_probe
+                && !matches!(&decision, DirectPathVerificationDecision::Confirmed(_))
+            {
+                set_direct_path_relay_forwarding(
+                    runtime,
+                    options.relay_forwarder_supervisor.as_ref(),
+                    &peer.node_id,
+                    true,
+                )
+                .await;
+            }
             match decision {
                 DirectPathVerificationDecision::Disabled => {
                     if let Err(error) = prepare_direct_nat_traversal(
@@ -12537,11 +12605,12 @@ async fn negotiate_signal_paths(
         let direct_path_probe_active = pending_direct_path_probe
             .as_ref()
             .is_some_and(|probe| probe.is_active_at(direct_path_probe_now));
-        // WireGuard telemetry reports the configured endpoint before it proves
-        // that a handshake can traverse the direct path. Keep relay fallback
-        // available until a newer handshake is observed for this candidate.
-        let direct_path_probe_has_handshake =
-            pending_direct_path_probe.as_ref().is_some_and(|probe| {
+        let overlay_probe_required = options.direct_path_data_plane_probe.is_some();
+        // Without an overlay probe, a newer handshake is usable only after the
+        // relay forwarder has been suspended. Overlay probes suspend forwarding
+        // around their own measurement below, so telemetry alone is not enough.
+        let pause_relay_forwarding = !overlay_probe_required
+            && pending_direct_path_probe.as_ref().is_some_and(|probe| {
                 probe.is_active_at(direct_path_probe_now)
                     && direct_path_probe_has_handshake_evidence(
                         probe,
@@ -12550,33 +12619,17 @@ async fn negotiate_signal_paths(
                             .and_then(|snapshot| snapshot.get(&peer.wireguard_public_key)),
                     )
             });
-        let pause_relay_forwarding = direct_path_probe_has_handshake;
-        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
-            let forwarding_enabled = !pause_relay_forwarding;
-            if supervisor
-                .set_forwarding_enabled(&peer.node_id, forwarding_enabled)
-                .await
-            {
-                if let Some(mut pending) = pending_direct_path_probe {
-                    let suspended = !forwarding_enabled;
-                    if pending.relay_forwarder_suspended != suspended {
-                        pending.relay_forwarder_suspended = suspended;
-                        if let Err(error) = runtime.upsert_pending_direct_path_probe(pending).await
-                        {
-                            tracing::warn!(
-                                %error,
-                                peer = %peer.node_id,
-                                "failed to persist relay forwarding state for direct path probe"
-                            );
-                        }
-                    }
-                }
-                tracing::debug!(
-                    peer = %peer.node_id,
-                    forwarding_enabled,
-                    "updated relay forwarder payload forwarding for direct path probe"
-                );
-            }
+        let keep_direct_relay_disabled = overlay_probe_required
+            && record.selected_state.is_direct()
+            && !direct_path_probe_active;
+        if !keep_direct_relay_disabled {
+            set_direct_path_relay_forwarding(
+                runtime,
+                options.relay_forwarder_supervisor.as_ref(),
+                &peer.node_id,
+                !pause_relay_forwarding,
+            )
+            .await;
         }
         if record.selected_state == PathState::Relay {
             match relay_candidates.first() {

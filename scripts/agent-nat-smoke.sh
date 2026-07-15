@@ -423,6 +423,8 @@ start_agent() {
   local agent_ip="$2"
   local state_path="$3"
   local log_path="$4"
+  # Allow the first direct data packet to trigger a WireGuard handshake
+  # before declaring the overlay probe unsuccessful.
   ip netns exec "$namespace" "$iparsd_bin" agent \
     --listen 127.0.0.1:9780 \
     --state-path "$state_path" \
@@ -450,9 +452,9 @@ start_agent() {
     --hole-punch-interval-millis 100 \
     --http-connect-timeout-seconds 3 \
     --http-request-timeout-seconds 5 \
-    --peer-probe-sample-count 1 \
-    --peer-probe-response-timeout-millis 250 \
-    --peer-probe-sample-interval-millis 0 \
+    --peer-probe-sample-count 3 \
+    --peer-probe-response-timeout-millis 500 \
+    --peer-probe-sample-interval-millis 100 \
     >"$log_path" 2>&1 &
   local pid=$!
   agent_pids+=("$pid")
