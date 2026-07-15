@@ -545,6 +545,7 @@ pub struct AgentRuntime {
     nat_classification: tokio::sync::RwLock<Option<NatClassification>>,
     local_advertised_routes: tokio::sync::RwLock<Vec<Route>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
+    peer_map_sync_notify: Arc<tokio::sync::Notify>,
     wireguard_endpoint_update: tokio::sync::Mutex<()>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
@@ -1254,6 +1255,7 @@ impl AgentRuntime {
             nat_classification: tokio::sync::RwLock::new(None),
             local_advertised_routes: tokio::sync::RwLock::new(Vec::new()),
             latest_peer_map: tokio::sync::RwLock::new(None),
+            peer_map_sync_notify: Arc::new(tokio::sync::Notify::new()),
             wireguard_endpoint_update: tokio::sync::Mutex::new(()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -1802,6 +1804,14 @@ impl AgentRuntime {
         self.wireguard_endpoint_update.lock().await
     }
 
+    pub fn peer_map_sync_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.peer_map_sync_notify.clone()
+    }
+
+    fn request_peer_map_sync(&self) {
+        self.peer_map_sync_notify.notify_one();
+    }
+
     pub async fn peer_quality_probe_targets(&self) -> Vec<PeerQualityProbeTarget> {
         let Ok(peer_map) = self.peer_map_snapshot().await else {
             return Vec::new();
@@ -1975,6 +1985,7 @@ impl AgentRuntime {
             .write()
             .await
             .insert(peer, probe);
+        self.request_peer_map_sync();
         Ok(())
     }
 
@@ -1982,7 +1993,11 @@ impl AgentRuntime {
         &self,
         peer: &NodeId,
     ) -> Option<PendingDirectPathProbe> {
-        self.pending_direct_path_probes.write().await.remove(peer)
+        let removed = self.pending_direct_path_probes.write().await.remove(peer);
+        if removed.is_some() {
+            self.request_peer_map_sync();
+        }
+        removed
     }
 
     pub fn record_direct_path_probe_started(&self) {

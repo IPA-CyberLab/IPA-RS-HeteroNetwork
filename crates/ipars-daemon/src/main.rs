@@ -10943,9 +10943,10 @@ where
     );
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds);
     let interface = args.wireguard_interface.clone();
+    let peer_map_sync_notify = runtime.peer_map_sync_notifier();
     Ok(PeerMapSyncHandle {
         task: tokio::spawn(async move {
-            run_peer_map_sync_loop(sync, interval, interface).await;
+            run_peer_map_sync_loop(sync, interval, interface, peer_map_sync_notify).await;
         }),
         telemetry_source: None,
     })
@@ -12158,6 +12159,33 @@ async fn direct_path_overlay_probe_confirmed(
     }
 }
 
+async fn wait_for_direct_wireguard_endpoint(
+    telemetry_source: Option<&Arc<dyn WireGuardPeerTelemetrySource>>,
+    peer_public_key: &str,
+    candidate: &EndpointCandidate,
+    timeout: Duration,
+) -> bool {
+    let Some(telemetry_source) = telemetry_source else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if telemetry_source
+            .snapshot()
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.get(peer_public_key).cloned())
+            .is_some_and(|telemetry| direct_path_endpoint_matches(candidate, &telemetry))
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn direct_path_probe_confirmed(
     pending: &PendingDirectPathProbe,
     candidate: &EndpointCandidate,
@@ -12527,6 +12555,18 @@ async fn negotiate_signal_paths(
                     );
                 }
                 DirectPathVerificationDecision::Start(probe) => {
+                    runtime.upsert_pending_direct_path_probe(probe).await?;
+                    runtime.record_direct_path_probe_started();
+                    // Publish the pending endpoint before hole punching so the
+                    // peer-map sync can switch WireGuard away from the relay
+                    // while the direct traversal setup is still running.
+                    set_direct_path_relay_forwarding(
+                        runtime,
+                        options.relay_forwarder_supervisor.as_ref(),
+                        &peer.node_id,
+                        false,
+                    )
+                    .await;
                     if let Err(error) = prepare_direct_nat_traversal(
                         client,
                         &signal_url,
@@ -12542,6 +12582,16 @@ async fn negotiate_signal_paths(
                             peer = %verification_record.key.remote,
                             "failed to prepare direct NAT traversal path"
                         );
+                        runtime
+                            .remove_pending_direct_path_probe(&peer.node_id)
+                            .await;
+                        set_direct_path_relay_forwarding(
+                            runtime,
+                            options.relay_forwarder_supervisor.as_ref(),
+                            &peer.node_id,
+                            true,
+                        )
+                        .await;
                         (record, path_selection) = direct_path_failure_record(
                             &verification_record,
                             &relay_candidates,
@@ -12549,8 +12599,30 @@ async fn negotiate_signal_paths(
                             now,
                         );
                     } else {
-                        runtime.upsert_pending_direct_path_probe(probe).await?;
-                        runtime.record_direct_path_probe_started();
+                        if let Some(candidate) = verification_record.selected_candidate.as_ref() {
+                            wait_for_direct_wireguard_endpoint(
+                                options.wireguard_peer_telemetry_source.as_ref(),
+                                &peer.wireguard_public_key,
+                                candidate,
+                                options
+                                    .direct_path_probe_timeout
+                                    .min(Duration::from_secs(5)),
+                            )
+                            .await;
+                        }
+                        if let Some(data_plane_probe) =
+                            options.direct_path_data_plane_probe.as_ref()
+                        {
+                            let measurement = data_plane_probe.measure(peer.vpn_ip).await;
+                            tracing::debug!(
+                                peer = %verification_record.key.remote,
+                                successful_samples = measurement
+                                    .as_ref()
+                                    .map(|measurement| measurement.successful_sample_count())
+                                    .unwrap_or_default(),
+                                "primed direct WireGuard data plane after hole punch"
+                            );
+                        }
                         tracing::info!(
                             peer = %verification_record.key.remote,
                             state = ?verification_record.selected_state,
@@ -14039,6 +14111,7 @@ async fn run_peer_map_sync_loop<S, A>(
     sync: PeerMapSync<S, A>,
     interval: Duration,
     interface: String,
+    peer_map_sync_notify: Arc<tokio::sync::Notify>,
 ) where
     S: PeerMapSource + 'static,
     A: PeerMapSink + 'static,
@@ -14059,7 +14132,10 @@ async fn run_peer_map_sync_loop<S, A>(
                 "failed to apply control-plane peer map; will retry"
             ),
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = peer_map_sync_notify.notified() => {}
+        }
     }
 }
 

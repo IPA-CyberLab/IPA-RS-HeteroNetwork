@@ -274,6 +274,7 @@ create_agent_nat_pair() {
   local private_if="$9"
   local profile="${10}"
   local snat_port="${11:-}"
+  local public_port="${snat_port:-51820}"
 
   ip link add "$root_public_if" type veth peer name "$public_if"
   ip link set "$root_public_if" master "$bridge"
@@ -323,6 +324,14 @@ create_agent_nat_pair() {
       -j SNAT --to-source "${public_ip}:51820-51820"
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
       -s "${agent_ip}/32" -o "$public_if" -j SNAT --to-source "$public_ip"
+  fi
+
+  if [[ "$profile" != "symmetric" ]]; then
+    # Model the inbound mapping that endpoint-independent and port-preserving
+    # NATs expose for the agent's WireGuard port.
+    ip netns exec "$nat_namespace" iptables -t nat -A PREROUTING \
+      -d "$public_ip" -p udp --dport "$public_port" \
+      -j DNAT --to-destination "${agent_ip}:51820"
   fi
 }
 
