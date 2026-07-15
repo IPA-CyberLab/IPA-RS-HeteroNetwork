@@ -11887,6 +11887,7 @@ async fn direct_path_verification_decision(
                     if pending.endpoint_observed_at.take().is_some() {
                         pending.baseline_rx_bytes = None;
                         pending.baseline_tx_bytes = None;
+                        pending.baseline_latest_handshake_at = None;
                         pending.baseline_relay_inbound_payload_bytes = None;
                         runtime.upsert_pending_direct_path_probe(pending).await?;
                     }
@@ -11896,6 +11897,7 @@ async fn direct_path_verification_decision(
                     pending.endpoint_observed_at = Some(now);
                     pending.baseline_rx_bytes = Some(telemetry.rx_bytes);
                     pending.baseline_tx_bytes = Some(telemetry.tx_bytes);
+                    pending.baseline_latest_handshake_at = telemetry.latest_handshake_at;
                     pending.baseline_relay_inbound_payload_bytes =
                         relay_forwarder_metrics.map(|metrics| metrics.inbound_payload_bytes);
                     runtime.upsert_pending_direct_path_probe(pending).await?;
@@ -11968,7 +11970,9 @@ async fn direct_path_verification_decision(
             endpoint_observed_at: None,
             baseline_rx_bytes: None,
             baseline_tx_bytes: None,
+            baseline_latest_handshake_at: None,
             baseline_relay_inbound_payload_bytes: None,
+            relay_forwarder_suspended: false,
         },
     ))
 }
@@ -11992,7 +11996,8 @@ fn direct_path_probe_confirmed(
     // socket while the selected direct endpoint is being probed. Only receive
     // bytes beyond the forwarder's inbound payload growth prove direct traffic.
     if !pending.transfer_increased(telemetry) {
-        return false;
+        return pending.relay_forwarder_suspended
+            && direct_path_probe_handshake_advanced(pending, telemetry);
     }
     let Some(baseline_relay_inbound_payload_bytes) = pending.baseline_relay_inbound_payload_bytes
     else {
@@ -12008,6 +12013,20 @@ fn direct_path_probe_confirmed(
     let relay_inbound_delta =
         relay_inbound_payload_bytes.saturating_sub(baseline_relay_inbound_payload_bytes);
     wireguard_rx_delta > relay_inbound_delta
+}
+
+fn direct_path_probe_handshake_advanced(
+    pending: &PendingDirectPathProbe,
+    telemetry: &WireGuardPeerTelemetry,
+) -> bool {
+    match (
+        pending.baseline_latest_handshake_at,
+        telemetry.latest_handshake_at,
+    ) {
+        (None, Some(_)) => true,
+        (Some(baseline), Some(current)) => current > baseline,
+        _ => false,
+    }
 }
 
 fn direct_path_endpoint_matches(
@@ -12705,6 +12724,16 @@ async fn suspend_relay_forwarder_for_direct_probe(
         supervisor.remove(runtime, peer).await;
     } else {
         runtime.remove_relay_forwarder_endpoint(peer).await;
+    }
+    if let Some(mut pending) = runtime.pending_direct_path_probe(peer).await {
+        pending.relay_forwarder_suspended = true;
+        if let Err(error) = runtime.upsert_pending_direct_path_probe(pending).await {
+            tracing::warn!(
+                %error,
+                peer = %peer,
+                "failed to retain direct probe state after suspending relay forwarder"
+            );
+        }
     }
     tracing::debug!(
         peer = %peer,
@@ -31661,7 +31690,9 @@ exec sleep 60
             endpoint_observed_at: Some(now + ChronoDuration::milliseconds(500)),
             baseline_rx_bytes: Some(100),
             baseline_tx_bytes: Some(200),
+            baseline_latest_handshake_at: None,
             baseline_relay_inbound_payload_bytes: None,
+            relay_forwarder_suspended: false,
         };
         let telemetry = WireGuardPeerTelemetry {
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
@@ -31695,7 +31726,9 @@ exec sleep 60
             endpoint_observed_at: Some(now),
             baseline_rx_bytes: Some(100),
             baseline_tx_bytes: Some(200),
+            baseline_latest_handshake_at: None,
             baseline_relay_inbound_payload_bytes: Some(1_000),
+            relay_forwarder_suspended: false,
         };
         let forwarder = RelayForwarderStats::new(
             NodeId::from_string("peer-a"),
@@ -31727,6 +31760,51 @@ exec sleep 60
             &candidate,
             Some(&direct_telemetry),
             Some(&forwarder.snapshot()),
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_path_verification_accepts_handshake_after_relay_forwarder_suspension(
+    ) -> anyhow::Result<()> {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let pending = PendingDirectPathProbe {
+            selected_state: PathState::DirectPublic,
+            selected_candidate: candidate.clone(),
+            started_at: now,
+            expires_at: now + ChronoDuration::seconds(120),
+            endpoint_observed_at: Some(now),
+            baseline_rx_bytes: Some(100),
+            baseline_tx_bytes: Some(200),
+            baseline_latest_handshake_at: Some(now),
+            baseline_relay_inbound_payload_bytes: Some(1_000),
+            relay_forwarder_suspended: true,
+        };
+        let telemetry = WireGuardPeerTelemetry {
+            public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            endpoint: Some(candidate.addr.to_string()),
+            latest_handshake_at: Some(now + ChronoDuration::seconds(1)),
+            rx_bytes: 100,
+            tx_bytes: 200,
+        };
+        assert!(direct_path_probe_confirmed(
+            &pending,
+            &candidate,
+            Some(&telemetry),
+            None,
+        ));
+
+        let mut unsuspended = pending;
+        unsuspended.relay_forwarder_suspended = false;
+        assert!(!direct_path_probe_confirmed(
+            &unsuspended,
+            &candidate,
+            Some(&telemetry),
+            None,
         ));
         Ok(())
     }
@@ -31824,7 +31902,9 @@ exec sleep 60
                 endpoint_observed_at: Some(now),
                 baseline_rx_bytes: Some(100),
                 baseline_tx_bytes: Some(200),
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         let telemetry = BTreeMap::from([(
@@ -31862,7 +31942,9 @@ exec sleep 60
                 endpoint_observed_at: Some(now - ChronoDuration::seconds(30)),
                 baseline_rx_bytes: Some(101),
                 baseline_tx_bytes: Some(200),
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         let transfer_telemetry = BTreeMap::from([(
@@ -31899,7 +31981,9 @@ exec sleep 60
                 endpoint_observed_at: None,
                 baseline_rx_bytes: Some(102),
                 baseline_tx_bytes: Some(200),
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         let expired = direct_path_verification_decision(
@@ -31950,7 +32034,9 @@ exec sleep 60
                 endpoint_observed_at: Some(now),
                 baseline_rx_bytes: Some(100),
                 baseline_tx_bytes: Some(200),
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         let telemetry = BTreeMap::from([(

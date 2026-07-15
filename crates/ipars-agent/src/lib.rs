@@ -2766,7 +2766,9 @@ pub struct PendingDirectPathProbe {
     pub endpoint_observed_at: Option<DateTime<Utc>>,
     pub baseline_rx_bytes: Option<u64>,
     pub baseline_tx_bytes: Option<u64>,
+    pub baseline_latest_handshake_at: Option<DateTime<Utc>>,
     pub baseline_relay_inbound_payload_bytes: Option<u64>,
+    pub relay_forwarder_suspended: bool,
 }
 
 impl PendingDirectPathProbe {
@@ -9503,7 +9505,9 @@ mod tests {
                 endpoint_observed_at: None,
                 baseline_rx_bytes: Some(10),
                 baseline_tx_bytes: Some(20),
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         let applier = PeerMapApplier::new(
@@ -9564,7 +9568,9 @@ mod tests {
                 endpoint_observed_at: None,
                 baseline_rx_bytes: Some(10),
                 baseline_tx_bytes: Some(20),
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         applier.apply_peer_map(peer_map).await?;
@@ -9668,7 +9674,9 @@ mod tests {
                 endpoint_observed_at: None,
                 baseline_rx_bytes: None,
                 baseline_tx_bytes: None,
+                baseline_latest_handshake_at: None,
                 baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
             })
             .await?;
         runtime
