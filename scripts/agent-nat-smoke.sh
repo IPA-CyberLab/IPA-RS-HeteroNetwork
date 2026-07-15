@@ -13,6 +13,12 @@ control_plane_operator_token_path="${state_dir}/control-plane-operator.token"
 control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
 direct_probe_timeout_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PROBE_TIMEOUT_SECONDS:-20}"
+relay_warmup_attempts="${IPARS_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS:-30}"
+
+[[ "$relay_warmup_attempts" =~ ^[1-9][0-9]*$ ]] || {
+  echo "IPARS_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS must be a positive integer" >&2
+  exit 1
+}
 
 case "$nat_profile" in
   endpoint-independent|fixed-port|mixed-port|symmetric|asymmetric|one-sided|one-sided-port-preserving|one-sided-symmetric)
@@ -467,13 +473,24 @@ relay_status() {
 ping_overlay() {
   local namespace="$1"
   local target="$2"
-  for attempt in $(seq 1 10); do
+  for attempt in $(seq 1 "$relay_warmup_attempts"); do
     if ip netns exec "$namespace" ping -I ipars0 -c 3 -W 2 "$target"; then
       return 0
     fi
     sleep 1
   done
   echo "overlay ping from ${namespace} to ${target} failed after relay/direct warm-up retries" >&2
+  return 1
+}
+
+ping_overlay_pair() {
+  for _ in $(seq 1 "$relay_warmup_attempts"); do
+    if ping_overlay_pair_once; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "bidirectional overlay warm-up failed after relay retries" >&2
   return 1
 }
 
@@ -881,6 +898,7 @@ wait_for_relay_path "$node_a" "$node_b"
 if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS:-0}" != "0" ]]; then
   sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS}"
 fi
+ping_overlay_pair
 ping_overlay "$agent_a" "$vpn_b"
 ping_overlay "$agent_b" "$vpn_a"
 agent_metrics "$agent_a" >"${work_dir}/relay-a.metrics.json"

@@ -16,7 +16,7 @@ use ipars_crypto::{
     decode_wireguard_private_key_b64, decode_wireguard_public_key_b64, encode_bytes, CryptoError,
     IdentityKeyPair, WireGuardKeyPair,
 };
-use ipars_relay::encode_relay_datagram_with_route;
+use ipars_relay::{encode_relay_datagram_with_route, encode_relay_endpoint_announcement};
 use ipars_route_manager::{
     desired_managed_route_inventory, validate_route_plan, warn_if_linux_netns_is_current,
     with_netlink_namespace, LinuxNetlinkSocket, LinuxNetworkNamespace, RouteManager,
@@ -1030,6 +1030,28 @@ impl UdpRelayFrameForwarder {
         .map_err(|error| AgentError::RelaySession(error.to_string()))
     }
 
+    pub fn encode_endpoint_announcement(&self) -> Result<Vec<u8>, AgentError> {
+        self.ensure_session_active()?;
+        let local = relay_session_local_node(&self.session.session_id, &self.session.peer)?;
+        encode_relay_endpoint_announcement(
+            &self.session.session_id,
+            &self.session.session_token,
+            &local,
+            &self.session.peer,
+        )
+        .map_err(|error| AgentError::RelaySession(error.to_string()))
+    }
+
+    pub async fn send_endpoint_announcement(
+        &self,
+        socket: &tokio::net::UdpSocket,
+    ) -> Result<usize, AgentError> {
+        let datagram = self.encode_endpoint_announcement()?;
+        Ok(socket
+            .send_to(&datagram, self.session.relay_endpoint)
+            .await?)
+    }
+
     pub async fn send_to_relay(
         &self,
         socket: &tokio::net::UdpSocket,
@@ -1112,6 +1134,7 @@ impl UdpRelayFrameForwarder {
         socket: tokio::net::UdpSocket,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), AgentError> {
+        self.send_endpoint_announcement(&socket).await?;
         let mut buffer = vec![0_u8; 65_535];
         loop {
             tokio::select! {

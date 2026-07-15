@@ -108,10 +108,12 @@ struct RelayDatagram {
     source: Option<NodeId>,
     destination: Option<NodeId>,
     ciphertext_payload: Vec<u8>,
+    endpoint_announcement: bool,
 }
 
 const RELAY_FRAME_MAGIC: &[u8] = b"IPARS-RLY1";
 const RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
+const RELAY_FRAME_MAGIC_V3: &[u8] = b"IPARS-RLY3";
 const MAX_RELAY_SESSION_ID_BYTES: usize = 4096;
 const MAX_RELAY_SESSION_TOKEN_BYTES: usize = 256;
 const MAX_RELAY_NODE_ID_BYTES: usize = 128;
@@ -189,6 +191,48 @@ pub fn encode_relay_datagram_with_route(
     datagram.extend_from_slice(source.as_str().as_bytes());
     datagram.extend_from_slice(destination.as_str().as_bytes());
     datagram.extend_from_slice(ciphertext_payload);
+    Ok(datagram)
+}
+
+/// Encode an authenticated endpoint announcement without forwarding payload.
+///
+/// Relay forwarders bind an ephemeral UDP port, which may differ from the
+/// endpoint advertised during registration. The relay learns that port from
+/// the source address of this frame before normal WireGuard traffic starts.
+pub fn encode_relay_endpoint_announcement(
+    session_id: &str,
+    session_token: &str,
+    source: &NodeId,
+    destination: &NodeId,
+) -> Result<Vec<u8>, RelayError> {
+    if session_id.is_empty()
+        || session_token.is_empty()
+        || source.as_str().is_empty()
+        || destination.as_str().is_empty()
+    {
+        return Err(RelayError::MalformedFrame);
+    }
+    validate_relay_frame_sizes_allow_empty(session_id.len(), session_token.len(), 0)?;
+    validate_relay_frame_node_id(source.as_str())?;
+    validate_relay_frame_node_id(destination.as_str())?;
+
+    let mut datagram = Vec::with_capacity(
+        RELAY_FRAME_MAGIC_V3.len()
+            + 8
+            + session_id.len()
+            + session_token.len()
+            + source.as_str().len()
+            + destination.as_str().len(),
+    );
+    datagram.extend_from_slice(RELAY_FRAME_MAGIC_V3);
+    datagram.extend_from_slice(&(session_id.len() as u16).to_be_bytes());
+    datagram.extend_from_slice(&(session_token.len() as u16).to_be_bytes());
+    datagram.extend_from_slice(&(source.as_str().len() as u16).to_be_bytes());
+    datagram.extend_from_slice(&(destination.as_str().len() as u16).to_be_bytes());
+    datagram.extend_from_slice(session_id.as_bytes());
+    datagram.extend_from_slice(session_token.as_bytes());
+    datagram.extend_from_slice(source.as_str().as_bytes());
+    datagram.extend_from_slice(destination.as_str().as_bytes());
     Ok(datagram)
 }
 
@@ -375,9 +419,11 @@ impl RelayTable {
         self.dataplane.record_received(datagram.len());
         let result = self.forward_datagram_for_addr_at_inner(source_addr, datagram, now);
         match result {
-            Ok((target, payload)) => {
-                self.dataplane.record_forwarded(payload.len());
-                Ok((target, payload))
+            Ok(forward) => {
+                if forward.should_forward {
+                    self.dataplane.record_forwarded(forward.payload.len());
+                }
+                Ok((forward.target, forward.payload))
             }
             Err(error) => {
                 self.dataplane
@@ -392,7 +438,7 @@ impl RelayTable {
         source_addr: SocketAddr,
         datagram: &[u8],
         now: DateTime<Utc>,
-    ) -> Result<(SocketAddr, Vec<u8>), RelayError> {
+    ) -> Result<RelayDatagramForward, RelayError> {
         let datagram = decode_relay_datagram(datagram)?;
         self.remove_expired_session(&datagram.session_id, now)?;
         let session = self
@@ -423,7 +469,11 @@ impl RelayTable {
         session.bytes_forwarded = session
             .bytes_forwarded
             .saturating_add(datagram.ciphertext_payload.len() as u64);
-        Ok((target, datagram.ciphertext_payload))
+        Ok(RelayDatagramForward {
+            target,
+            payload: datagram.ciphertext_payload,
+            should_forward: !datagram.endpoint_announcement,
+        })
     }
 
     pub fn purge_expired(&mut self, now: DateTime<Utc>) -> usize {
@@ -474,6 +524,13 @@ impl RelayTable {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RelayDatagramForward {
+    target: SocketAddr,
+    payload: Vec<u8>,
+    should_forward: bool,
 }
 
 impl RelaySession {
@@ -624,7 +681,37 @@ fn validate_relay_frame_sizes(
     session_token_len: usize,
     ciphertext_payload_len: usize,
 ) -> Result<(), RelayError> {
-    if session_id_len == 0 || session_token_len == 0 || ciphertext_payload_len == 0 {
+    validate_relay_frame_sizes_with_options(
+        session_id_len,
+        session_token_len,
+        ciphertext_payload_len,
+        false,
+    )
+}
+
+fn validate_relay_frame_sizes_allow_empty(
+    session_id_len: usize,
+    session_token_len: usize,
+    ciphertext_payload_len: usize,
+) -> Result<(), RelayError> {
+    validate_relay_frame_sizes_with_options(
+        session_id_len,
+        session_token_len,
+        ciphertext_payload_len,
+        true,
+    )
+}
+
+fn validate_relay_frame_sizes_with_options(
+    session_id_len: usize,
+    session_token_len: usize,
+    ciphertext_payload_len: usize,
+    allow_empty_payload: bool,
+) -> Result<(), RelayError> {
+    if session_id_len == 0
+        || session_token_len == 0
+        || (!allow_empty_payload && ciphertext_payload_len == 0)
+    {
         return Err(RelayError::MalformedFrame);
     }
     if session_id_len > MAX_RELAY_SESSION_ID_BYTES
@@ -666,6 +753,9 @@ fn relay_session_token_matches(expected: &str, provided: &str) -> bool {
 }
 
 fn decode_relay_datagram(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
+    if datagram.starts_with(RELAY_FRAME_MAGIC_V3) {
+        return decode_relay_datagram_v3(datagram);
+    }
     if datagram.starts_with(RELAY_FRAME_MAGIC_V2) {
         return decode_relay_datagram_v2(datagram);
     }
@@ -712,16 +802,29 @@ fn decode_relay_datagram_v1(datagram: &[u8]) -> Result<RelayDatagram, RelayError
         source: None,
         destination: None,
         ciphertext_payload: datagram[payload_start..].to_vec(),
+        endpoint_announcement: false,
     })
 }
 
 fn decode_relay_datagram_v2(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
-    let fixed_header_len = RELAY_FRAME_MAGIC_V2.len() + 8;
-    if datagram.len() <= fixed_header_len || !datagram.starts_with(RELAY_FRAME_MAGIC_V2) {
+    decode_relay_datagram_v2_with_options(datagram, RELAY_FRAME_MAGIC_V2, false)
+}
+
+fn decode_relay_datagram_v3(datagram: &[u8]) -> Result<RelayDatagram, RelayError> {
+    decode_relay_datagram_v2_with_options(datagram, RELAY_FRAME_MAGIC_V3, true)
+}
+
+fn decode_relay_datagram_v2_with_options(
+    datagram: &[u8],
+    magic: &[u8],
+    endpoint_announcement: bool,
+) -> Result<RelayDatagram, RelayError> {
+    let fixed_header_len = magic.len() + 8;
+    if datagram.len() < fixed_header_len || !datagram.starts_with(magic) {
         return Err(RelayError::MalformedFrame);
     }
 
-    let session_len_offset = RELAY_FRAME_MAGIC_V2.len();
+    let session_len_offset = magic.len();
     let token_len_offset = session_len_offset + 2;
     let source_len_offset = token_len_offset + 2;
     let destination_len_offset = source_len_offset + 2;
@@ -746,17 +849,26 @@ fn decode_relay_datagram_v2(datagram: &[u8]) -> Result<RelayDatagram, RelayError
     if session_len == 0 || token_len == 0 || source_len == 0 || destination_len == 0 {
         return Err(RelayError::MalformedFrame);
     }
-    validate_relay_frame_sizes(
-        session_len,
-        token_len,
-        datagram.len().saturating_sub(payload_start),
-    )?;
+    if endpoint_announcement {
+        validate_relay_frame_sizes_allow_empty(
+            session_len,
+            token_len,
+            datagram.len().saturating_sub(payload_start),
+        )?;
+    } else {
+        validate_relay_frame_sizes(
+            session_len,
+            token_len,
+            datagram.len().saturating_sub(payload_start),
+        )?;
+    }
     validate_relay_node_id_size(source_len)?;
     validate_relay_node_id_size(destination_len)?;
     if token_start > datagram.len()
         || source_start > datagram.len()
         || destination_start > datagram.len()
-        || payload_start >= datagram.len()
+        || payload_start > datagram.len()
+        || (!endpoint_announcement && payload_start == datagram.len())
     {
         return Err(RelayError::MalformedFrame);
     }
@@ -778,6 +890,7 @@ fn decode_relay_datagram_v2(datagram: &[u8]) -> Result<RelayDatagram, RelayError
         source: Some(NodeId::from_string(source)),
         destination: Some(NodeId::from_string(destination)),
         ciphertext_payload: datagram[payload_start..].to_vec(),
+        endpoint_announcement,
     })
 }
 
@@ -1033,7 +1146,9 @@ impl UdpRelay {
                     let (len, peer) = packet?;
                     let target = table.write().await.forward_datagram_for_addr(peer, &buffer[..len]);
                     if let Ok((target, payload)) = target {
-                        self.socket.send_to(&payload, target).await?;
+                        if !payload.is_empty() {
+                            self.socket.send_to(&payload, target).await?;
+                        }
                     }
                 }
             }
@@ -1554,6 +1669,68 @@ mod tests {
         let (target, payload) = table.forward_datagram_for_addr(learned_left_addr, &second_left)?;
         assert_eq!(target, learned_right_addr);
         assert_eq!(payload, b"left-second");
+        Ok(())
+    }
+
+    #[test]
+    fn relay_endpoint_announcements_learn_forwarder_addresses_without_forwarding_payload(
+    ) -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let admitted_left_addr = SocketAddr::from(([198, 51, 100, 10], 40000));
+        let admitted_right_addr = SocketAddr::from(([198, 51, 100, 20], 40000));
+        let learned_left_addr = SocketAddr::from(([198, 51, 100, 10], 41000));
+        let learned_right_addr = SocketAddr::from(([198, 51, 100, 20], 42000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            admitted_left_addr,
+            admitted_right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let left_announcement = encode_relay_endpoint_announcement(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_left_addr, &left_announcement)?;
+        assert_eq!(target, admitted_right_addr);
+        assert!(payload.is_empty());
+
+        let right_announcement = encode_relay_endpoint_announcement(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &right,
+            &left,
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_right_addr, &right_announcement)?;
+        assert_eq!(target, learned_left_addr);
+        assert!(payload.is_empty());
+
+        let left_payload = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+            b"left-after-announcement",
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_left_addr, &left_payload)?;
+        assert_eq!(target, learned_right_addr);
+        assert_eq!(payload, b"left-after-announcement");
+        let metrics = table.dataplane_metrics();
+        assert_eq!(
+            metrics.payload_bytes_forwarded,
+            b"left-after-announcement".len() as u64
+        );
+        assert_eq!(metrics.datagrams_forwarded, 1);
         Ok(())
     }
 
