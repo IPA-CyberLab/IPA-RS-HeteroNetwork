@@ -73,6 +73,7 @@ const MAX_LINUX_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
 const MAX_LINUX_COMMAND_STDIN_BYTES: usize = 64 * 1024;
 const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
+const DIRECT_PATH_PROBE_KEEPALIVE_SECONDS: u16 = 1;
 
 mod peer_probe;
 
@@ -2132,6 +2133,17 @@ impl AgentRuntime {
             .copied()
     }
 
+    pub async fn relay_forwarder_metrics_for_peer(
+        &self,
+        peer: &NodeId,
+    ) -> Option<AgentRelayForwarderMetrics> {
+        self.relay_forwarder_metrics
+            .read()
+            .await
+            .get(peer)
+            .map(|metrics| metrics.snapshot())
+    }
+
     pub async fn remove_relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
         self.relay_forwarder_metrics.write().await.remove(peer);
         self.relay_forwarder_endpoints.write().await.remove(peer)
@@ -2754,6 +2766,7 @@ pub struct PendingDirectPathProbe {
     pub endpoint_observed_at: Option<DateTime<Utc>>,
     pub baseline_rx_bytes: Option<u64>,
     pub baseline_tx_bytes: Option<u64>,
+    pub baseline_relay_inbound_payload_bytes: Option<u64>,
 }
 
 impl PendingDirectPathProbe {
@@ -4839,6 +4852,14 @@ pub trait PeerMapSink: Send + Sync {
 #[async_trait]
 pub trait PeerEndpointResolver: Send + Sync + std::fmt::Debug {
     async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError>;
+
+    async fn persistent_keepalive_seconds_for_peer(
+        &self,
+        _peer: &NodeRecord,
+        endpoint: Option<&str>,
+    ) -> Result<Option<u16>, AgentError> {
+        Ok(endpoint.map(|_| 25))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4931,6 +4952,23 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
                 .and_then(|candidate| wireguard_endpoint_for_candidate(candidate, &peer.node_id))
                 .or_else(|| preferred_endpoint(peer))),
         }
+    }
+
+    async fn persistent_keepalive_seconds_for_peer(
+        &self,
+        peer: &NodeRecord,
+        endpoint: Option<&str>,
+    ) -> Result<Option<u16>, AgentError> {
+        if endpoint.is_some()
+            && self
+                .runtime
+                .pending_direct_path_probe(&peer.node_id)
+                .await
+                .is_some_and(|probe| probe.is_active_at(Utc::now()))
+        {
+            return Ok(Some(DIRECT_PATH_PROBE_KEEPALIVE_SECONDS));
+        }
+        Ok(endpoint.map(|_| 25))
     }
 }
 
@@ -5287,13 +5325,17 @@ where
                     .map(|route| route.cidr.to_string()),
             );
             let endpoint = self.endpoint_resolver.endpoint_for_peer(peer).await?;
+            let persistent_keepalive_seconds = self
+                .endpoint_resolver
+                .persistent_keepalive_seconds_for_peer(peer, endpoint.as_deref())
+                .await?;
             self.wireguard
                 .upsert_peer(WireGuardPeerConfig {
                     peer: peer.node_id.clone(),
                     public_key: peer.wireguard_public_key.clone(),
                     endpoint: endpoint.clone(),
                     allowed_ips,
-                    persistent_keepalive_seconds: endpoint.map(|_| 25),
+                    persistent_keepalive_seconds,
                 })
                 .await?;
             self.applied_peers
@@ -9461,6 +9503,7 @@ mod tests {
                 endpoint_observed_at: None,
                 baseline_rx_bytes: Some(10),
                 baseline_tx_bytes: Some(20),
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
         let applier = PeerMapApplier::new(
@@ -9493,6 +9536,16 @@ mod tests {
                 .and_then(|config| config.endpoint.as_deref()),
             Some("203.0.113.10:51820")
         );
+        assert_eq!(
+            applier
+                .wireguard
+                .peers
+                .read()
+                .await
+                .get(&peer_id)
+                .and_then(|config| config.persistent_keepalive_seconds),
+            Some(1)
+        );
 
         runtime
             .upsert_pending_direct_path_probe(PendingDirectPathProbe {
@@ -9511,6 +9564,7 @@ mod tests {
                 endpoint_observed_at: None,
                 baseline_rx_bytes: Some(10),
                 baseline_tx_bytes: Some(20),
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
         applier.apply_peer_map(peer_map).await?;
@@ -9523,6 +9577,16 @@ mod tests {
                 .get(&peer_id)
                 .and_then(|config| config.endpoint.as_deref()),
             Some("127.0.0.1:52000")
+        );
+        assert_eq!(
+            applier
+                .wireguard
+                .peers
+                .read()
+                .await
+                .get(&peer_id)
+                .and_then(|config| config.persistent_keepalive_seconds),
+            Some(25)
         );
         Ok(())
     }
@@ -9604,6 +9668,7 @@ mod tests {
                 endpoint_observed_at: None,
                 baseline_rx_bytes: None,
                 baseline_tx_bytes: None,
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
         runtime

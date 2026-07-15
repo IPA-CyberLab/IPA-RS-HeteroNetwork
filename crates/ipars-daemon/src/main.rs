@@ -11844,6 +11844,7 @@ async fn direct_path_verification_decision(
     peer_public_key: &str,
     now: chrono::DateTime<chrono::Utc>,
     config: DirectPathVerificationConfig,
+    relay_forwarder_metrics: Option<&AgentRelayForwarderMetrics>,
 ) -> Result<DirectPathVerificationDecision, AgentError> {
     if !config.required {
         return Ok(DirectPathVerificationDecision::Disabled);
@@ -11858,7 +11859,14 @@ async fn direct_path_verification_decision(
     if let Some(mut pending) = runtime.pending_direct_path_probe(&direct.key.remote).await {
         if pending.targets(direct.selected_state, candidate) {
             let active = pending.is_active_at(now);
-            if !active && direct_path_probe_confirmed(&pending, candidate, telemetry) {
+            if !active
+                && direct_path_probe_confirmed(
+                    &pending,
+                    candidate,
+                    telemetry,
+                    relay_forwarder_metrics,
+                )
+            {
                 runtime
                     .remove_pending_direct_path_probe(&direct.key.remote)
                     .await;
@@ -11879,6 +11887,7 @@ async fn direct_path_verification_decision(
                     if pending.endpoint_observed_at.take().is_some() {
                         pending.baseline_rx_bytes = None;
                         pending.baseline_tx_bytes = None;
+                        pending.baseline_relay_inbound_payload_bytes = None;
                         runtime.upsert_pending_direct_path_probe(pending).await?;
                     }
                     return Ok(DirectPathVerificationDecision::Pending);
@@ -11887,10 +11896,25 @@ async fn direct_path_verification_decision(
                     pending.endpoint_observed_at = Some(now);
                     pending.baseline_rx_bytes = Some(telemetry.rx_bytes);
                     pending.baseline_tx_bytes = Some(telemetry.tx_bytes);
+                    pending.baseline_relay_inbound_payload_bytes =
+                        relay_forwarder_metrics.map(|metrics| metrics.inbound_payload_bytes);
                     runtime.upsert_pending_direct_path_probe(pending).await?;
                     return Ok(DirectPathVerificationDecision::Pending);
                 }
-                if direct_path_probe_confirmed(&pending, candidate, Some(telemetry)) {
+                if pending.baseline_relay_inbound_payload_bytes.is_none() {
+                    if let Some(metrics) = relay_forwarder_metrics {
+                        pending.baseline_relay_inbound_payload_bytes =
+                            Some(metrics.inbound_payload_bytes);
+                        runtime.upsert_pending_direct_path_probe(pending).await?;
+                        return Ok(DirectPathVerificationDecision::Pending);
+                    }
+                }
+                if direct_path_probe_confirmed(
+                    &pending,
+                    candidate,
+                    Some(telemetry),
+                    relay_forwarder_metrics,
+                ) {
                     runtime
                         .remove_pending_direct_path_probe(&direct.key.remote)
                         .await;
@@ -11944,6 +11968,7 @@ async fn direct_path_verification_decision(
             endpoint_observed_at: None,
             baseline_rx_bytes: None,
             baseline_tx_bytes: None,
+            baseline_relay_inbound_payload_bytes: None,
         },
     ))
 }
@@ -11952,6 +11977,7 @@ fn direct_path_probe_confirmed(
     pending: &PendingDirectPathProbe,
     candidate: &EndpointCandidate,
     telemetry: Option<&WireGuardPeerTelemetry>,
+    relay_forwarder_metrics: Option<&AgentRelayForwarderMetrics>,
 ) -> bool {
     let Some(telemetry) = telemetry else {
         return false;
@@ -11962,10 +11988,26 @@ fn direct_path_probe_confirmed(
     if pending.endpoint_observed_at.is_none() {
         return false;
     }
-    // A handshake can be produced by a relay forwarder while the selected direct
-    // endpoint is being probed. Inbound transfer growth after the endpoint was
-    // observed proves that encrypted payloads came back through that endpoint.
-    pending.transfer_increased(telemetry)
+    // A relay forwarder can inject encrypted payloads into the same WireGuard
+    // socket while the selected direct endpoint is being probed. Only receive
+    // bytes beyond the forwarder's inbound payload growth prove direct traffic.
+    if !pending.transfer_increased(telemetry) {
+        return false;
+    }
+    let Some(baseline_relay_inbound_payload_bytes) = pending.baseline_relay_inbound_payload_bytes
+    else {
+        return true;
+    };
+    let relay_inbound_payload_bytes = relay_forwarder_metrics
+        .map(|metrics| metrics.inbound_payload_bytes)
+        .unwrap_or(baseline_relay_inbound_payload_bytes);
+    let wireguard_rx_delta = pending
+        .baseline_rx_bytes
+        .map(|baseline| telemetry.rx_bytes.saturating_sub(baseline))
+        .unwrap_or_default();
+    let relay_inbound_delta =
+        relay_inbound_payload_bytes.saturating_sub(baseline_relay_inbound_payload_bytes);
+    wireguard_rx_delta > relay_inbound_delta
 }
 
 fn direct_path_endpoint_matches(
@@ -12138,6 +12180,9 @@ async fn negotiate_signal_paths(
             && path_selection == StableSignalPathSelection::Candidate
         {
             let now = chrono::Utc::now();
+            let relay_forwarder_metrics = runtime
+                .relay_forwarder_metrics_for_peer(&peer.node_id)
+                .await;
             let decision = direct_path_verification_decision(
                 runtime,
                 &record,
@@ -12145,6 +12190,7 @@ async fn negotiate_signal_paths(
                 &peer.wireguard_public_key,
                 now,
                 direct_path_verification,
+                relay_forwarder_metrics.as_ref(),
             )
             .await?;
             match decision {
@@ -31472,6 +31518,7 @@ exec sleep 60
             public_key,
             now,
             config,
+            None,
         )
         .await?;
         let DirectPathVerificationDecision::Start(probe) = decision else {
@@ -31499,6 +31546,7 @@ exec sleep 60
             public_key,
             now + ChronoDuration::seconds(3),
             config,
+            None,
         )
         .await?;
         assert_eq!(activated, DirectPathVerificationDecision::Pending);
@@ -31522,6 +31570,7 @@ exec sleep 60
             public_key,
             now + ChronoDuration::seconds(5),
             config,
+            None,
         )
         .await?;
         assert_eq!(handshake_only, DirectPathVerificationDecision::Pending);
@@ -31537,6 +31586,7 @@ exec sleep 60
             public_key,
             now + ChronoDuration::seconds(6),
             config,
+            None,
         )
         .await?;
 
@@ -31568,6 +31618,7 @@ exec sleep 60
             endpoint_observed_at: Some(now + ChronoDuration::milliseconds(500)),
             baseline_rx_bytes: Some(100),
             baseline_tx_bytes: Some(200),
+            baseline_relay_inbound_payload_bytes: None,
         };
         let telemetry = WireGuardPeerTelemetry {
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
@@ -31581,6 +31632,58 @@ exec sleep 60
             &pending,
             &candidate,
             Some(&telemetry),
+            None,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_path_verification_rejects_relay_only_transfer_growth() -> anyhow::Result<()> {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let candidate = candidate("peer-a", EndpointCandidateKind::PublicUdp, 10);
+        let pending = PendingDirectPathProbe {
+            selected_state: PathState::DirectPublic,
+            selected_candidate: candidate.clone(),
+            started_at: now,
+            expires_at: now + ChronoDuration::seconds(120),
+            endpoint_observed_at: Some(now),
+            baseline_rx_bytes: Some(100),
+            baseline_tx_bytes: Some(200),
+            baseline_relay_inbound_payload_bytes: Some(1_000),
+        };
+        let forwarder = RelayForwarderStats::new(
+            NodeId::from_string("peer-a"),
+            NodeId::from_string("relay-a"),
+            SocketAddr::from(([198, 51, 100, 30], 51_820)),
+            SocketAddr::from(([10, 0, 0, 2], 40_000)),
+        );
+        forwarder.record_inbound(1_200);
+        let relay_only_telemetry = WireGuardPeerTelemetry {
+            public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            endpoint: Some(candidate.addr.to_string()),
+            latest_handshake_at: None,
+            rx_bytes: 300,
+            tx_bytes: 200,
+        };
+        assert!(!direct_path_probe_confirmed(
+            &pending,
+            &candidate,
+            Some(&relay_only_telemetry),
+            Some(&forwarder.snapshot()),
+        ));
+
+        let direct_telemetry = WireGuardPeerTelemetry {
+            rx_bytes: 301,
+            ..relay_only_telemetry
+        };
+        assert!(direct_path_probe_confirmed(
+            &pending,
+            &candidate,
+            Some(&direct_telemetry),
+            Some(&forwarder.snapshot()),
         ));
         Ok(())
     }
@@ -31634,6 +31737,7 @@ exec sleep 60
             public_key,
             now,
             config,
+            None,
         )
         .await?;
 
@@ -31677,6 +31781,7 @@ exec sleep 60
                 endpoint_observed_at: Some(now),
                 baseline_rx_bytes: Some(100),
                 baseline_tx_bytes: Some(200),
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
         let telemetry = BTreeMap::from([(
@@ -31697,6 +31802,7 @@ exec sleep 60
             public_key,
             now + ChronoDuration::seconds(30),
             config,
+            None,
         )
         .await?;
         assert_eq!(
@@ -31713,6 +31819,7 @@ exec sleep 60
                 endpoint_observed_at: Some(now - ChronoDuration::seconds(30)),
                 baseline_rx_bytes: Some(101),
                 baseline_tx_bytes: Some(200),
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
         let transfer_telemetry = BTreeMap::from([(
@@ -31732,6 +31839,7 @@ exec sleep 60
             public_key,
             now,
             config,
+            None,
         )
         .await?;
         assert_eq!(
@@ -31748,11 +31856,13 @@ exec sleep 60
                 endpoint_observed_at: None,
                 baseline_rx_bytes: Some(102),
                 baseline_tx_bytes: Some(200),
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
-        let expired =
-            direct_path_verification_decision(&runtime, &direct, None, public_key, now, config)
-                .await?;
+        let expired = direct_path_verification_decision(
+            &runtime, &direct, None, public_key, now, config, None,
+        )
+        .await?;
         assert_eq!(expired, DirectPathVerificationDecision::Expired);
         assert!(runtime
             .pending_direct_path_probe(&direct.key.remote)
@@ -31797,6 +31907,7 @@ exec sleep 60
                 endpoint_observed_at: Some(now),
                 baseline_rx_bytes: Some(100),
                 baseline_tx_bytes: Some(200),
+                baseline_relay_inbound_payload_bytes: None,
             })
             .await?;
         let telemetry = BTreeMap::from([(
@@ -31817,6 +31928,7 @@ exec sleep 60
             public_key,
             now + ChronoDuration::seconds(30),
             config,
+            None,
         )
         .await?;
 
