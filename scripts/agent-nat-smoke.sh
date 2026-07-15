@@ -299,6 +299,9 @@ create_agent_nat_pair() {
       -j SNAT --to-source "$public_ip"
   else
     ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
+      -s "${agent_ip}/32" -o "$public_if" -p udp --sport 51820 \
+      -j SNAT --to-source "${public_ip}:51820-51820"
+    ip netns exec "$nat_namespace" iptables -t nat -A POSTROUTING \
       -s "${agent_ip}/32" -o "$public_if" -j SNAT --to-source "$public_ip"
   fi
 }
