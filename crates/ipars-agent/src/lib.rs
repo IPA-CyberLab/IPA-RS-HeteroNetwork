@@ -2152,6 +2152,7 @@ impl AgentRuntime {
                 relay_forwarder_endpoints.remove(&session.peer);
                 relay_forwarder_metrics.remove(&session.peer);
             }
+            self.request_peer_map_sync();
         }
         expired
     }
@@ -2163,10 +2164,15 @@ impl AgentRuntime {
     }
 
     pub async fn upsert_relay_forwarder_endpoint(&self, peer: NodeId, endpoint: SocketAddr) {
-        self.relay_forwarder_endpoints
+        let endpoint_changed = self
+            .relay_forwarder_endpoints
             .write()
             .await
-            .insert(peer, endpoint);
+            .insert(peer, endpoint)
+            != Some(endpoint);
+        if endpoint_changed {
+            self.request_peer_map_sync();
+        }
     }
 
     pub async fn register_relay_forwarder_metrics(&self, metrics: Arc<RelayForwarderStats>) {
@@ -2197,7 +2203,11 @@ impl AgentRuntime {
 
     pub async fn remove_relay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
         self.relay_forwarder_metrics.write().await.remove(peer);
-        self.relay_forwarder_endpoints.write().await.remove(peer)
+        let removed = self.relay_forwarder_endpoints.write().await.remove(peer);
+        if removed.is_some() {
+            self.request_peer_map_sync();
+        }
+        removed
     }
 
     pub async fn relay_forwarder_endpoints(&self) -> BTreeMap<NodeId, SocketAddr> {
