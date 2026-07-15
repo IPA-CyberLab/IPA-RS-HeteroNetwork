@@ -11858,14 +11858,18 @@ async fn direct_path_verification_decision(
     if let Some(mut pending) = runtime.pending_direct_path_probe(&direct.key.remote).await {
         if pending.targets(direct.selected_state, candidate) {
             let active = pending.is_active_at(now);
-            if !active && direct_path_probe_confirmed(&pending, candidate, telemetry, now, false) {
+            if !active && direct_path_probe_confirmed(&pending, candidate, telemetry, now, true) {
+                let evidence =
+                    if telemetry.is_some_and(|telemetry| pending.transfer_increased(telemetry)) {
+                        "wireguard_transfer"
+                    } else {
+                        "wireguard_handshake"
+                    };
                 runtime
                     .remove_pending_direct_path_probe(&direct.key.remote)
                     .await;
                 runtime.record_direct_path_probe_confirmed();
-                return Ok(DirectPathVerificationDecision::Confirmed(
-                    "wireguard_handshake",
-                ));
+                return Ok(DirectPathVerificationDecision::Confirmed(evidence));
             }
             if !active {
                 runtime
@@ -31707,8 +31711,43 @@ exec sleep 60
                 selected_candidate,
                 started_at: now - ChronoDuration::seconds(121),
                 expires_at: now - ChronoDuration::seconds(1),
-                endpoint_observed_at: None,
+                endpoint_observed_at: Some(now - ChronoDuration::seconds(30)),
                 baseline_rx_bytes: Some(101),
+                baseline_tx_bytes: Some(200),
+            })
+            .await?;
+        let transfer_telemetry = BTreeMap::from([(
+            public_key.to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: public_key.to_string(),
+                endpoint: Some(direct.selected_candidate.as_ref().unwrap().addr.to_string()),
+                latest_handshake_at: None,
+                rx_bytes: 102,
+                tx_bytes: 200,
+            },
+        )]);
+        let confirmed_at_expiry = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&transfer_telemetry),
+            public_key,
+            now,
+            config,
+        )
+        .await?;
+        assert_eq!(
+            confirmed_at_expiry,
+            DirectPathVerificationDecision::Confirmed("wireguard_transfer")
+        );
+
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: direct.selected_candidate.clone().unwrap(),
+                started_at: now - ChronoDuration::seconds(121),
+                expires_at: now - ChronoDuration::seconds(1),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: Some(102),
                 baseline_tx_bytes: Some(200),
             })
             .await?;
@@ -31721,7 +31760,7 @@ exec sleep 60
             .await
             .is_none());
         let metrics = runtime.metrics().await;
-        assert_eq!(metrics.direct_path_probe_confirmed_count, 1);
+        assert_eq!(metrics.direct_path_probe_confirmed_count, 2);
         assert_eq!(metrics.direct_path_probe_timeout_count, 1);
         Ok(())
     }
