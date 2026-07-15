@@ -1981,11 +1981,18 @@ impl AgentRuntime {
             "pending direct path probe",
         )
         .map_err(AgentError::PathProbeRejected)?;
-        self.pending_direct_path_probes
-            .write()
-            .await
-            .insert(peer, probe);
-        self.request_peer_map_sync();
+        let endpoint_changed = {
+            let mut pending_probes = self.pending_direct_path_probes.write().await;
+            let endpoint_changed = pending_probes.get(&peer).is_none_or(|current| {
+                current.selected_state != probe.selected_state
+                    || current.selected_candidate != probe.selected_candidate
+            });
+            pending_probes.insert(peer, probe);
+            endpoint_changed
+        };
+        if endpoint_changed {
+            self.request_peer_map_sync();
+        }
         Ok(())
     }
 
@@ -1993,11 +2000,7 @@ impl AgentRuntime {
         &self,
         peer: &NodeId,
     ) -> Option<PendingDirectPathProbe> {
-        let removed = self.pending_direct_path_probes.write().await.remove(peer);
-        if removed.is_some() {
-            self.request_peer_map_sync();
-        }
-        removed
+        self.pending_direct_path_probes.write().await.remove(peer)
     }
 
     pub fn record_direct_path_probe_started(&self) {
