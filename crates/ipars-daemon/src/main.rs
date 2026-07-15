@@ -7494,7 +7494,7 @@ async fn run_agent(
     if let Some(handle) = peer_map_handle {
         background_tasks.push(handle.task);
     }
-    if args.apply_peer_map
+    let peer_probe_runtime = if args.apply_peer_map
         && args.runtime_backend == AgentRuntimeBackend::LinuxCommand
         && !args.disable_peer_probe
     {
@@ -7508,6 +7508,23 @@ async fn run_agent(
             .map(LinuxNetworkNamespace::from_name)
             .transpose()?;
         let config = agent_peer_probe_config(&args);
+        Some((local_vpn_ip, namespace, config))
+    } else {
+        None
+    };
+    let direct_path_data_plane_probe = peer_probe_runtime
+        .as_ref()
+        .map(|(local_vpn_ip, namespace, config)| {
+            let direct_config = PeerProbeConfig {
+                sample_count: 1,
+                response_timeout: config.response_timeout.min(Duration::from_millis(250)),
+                sample_interval: Duration::ZERO,
+                ..*config
+            };
+            UdpPeerProbe::new(*local_vpn_ip, namespace.clone(), direct_config)
+        })
+        .transpose()?;
+    if let Some((local_vpn_ip, namespace, config)) = peer_probe_runtime {
         background_tasks.push(start_peer_probe_responder(
             runtime.clone(),
             local_vpn_ip,
@@ -7682,6 +7699,7 @@ async fn run_agent(
                         args.relay_session_renew_before_seconds,
                     ),
                     wireguard_peer_telemetry_source: wireguard_peer_telemetry_source.clone(),
+                    direct_path_data_plane_probe,
                     direct_path_probe_timeout: Duration::from_secs(
                         args.direct_path_probe_timeout_seconds,
                     ),
@@ -11813,6 +11831,7 @@ struct SignalPathNegotiationOptions {
     relay_admission_bearer_token: Option<String>,
     relay_session_renew_before: Duration,
     wireguard_peer_telemetry_source: Option<Arc<dyn WireGuardPeerTelemetrySource>>,
+    direct_path_data_plane_probe: Option<UdpPeerProbe>,
     direct_path_probe_timeout: Duration,
     direct_handshake_max_age: Duration,
     peer_probe_observation_max_age: Duration,
@@ -11837,6 +11856,14 @@ struct DirectPathVerificationConfig {
     handshake_max_age: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct DirectPathVerificationEvidence<'a> {
+    relay_forwarder_metrics: Option<&'a AgentRelayForwarderMetrics>,
+    data_plane_probe: Option<&'a UdpPeerProbe>,
+    peer_vpn_ip: Option<VpnIp>,
+}
+
+#[cfg(test)]
 async fn direct_path_verification_decision(
     runtime: &AgentRuntime,
     direct: &PathRecord,
@@ -11846,9 +11873,36 @@ async fn direct_path_verification_decision(
     config: DirectPathVerificationConfig,
     relay_forwarder_metrics: Option<&AgentRelayForwarderMetrics>,
 ) -> Result<DirectPathVerificationDecision, AgentError> {
+    direct_path_verification_decision_with_data_plane_probe(
+        runtime,
+        direct,
+        telemetry_snapshot,
+        peer_public_key,
+        now,
+        config,
+        DirectPathVerificationEvidence {
+            relay_forwarder_metrics,
+            data_plane_probe: None,
+            peer_vpn_ip: None,
+        },
+    )
+    .await
+}
+
+async fn direct_path_verification_decision_with_data_plane_probe(
+    runtime: &AgentRuntime,
+    direct: &PathRecord,
+    telemetry_snapshot: Option<&BTreeMap<String, WireGuardPeerTelemetry>>,
+    peer_public_key: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    config: DirectPathVerificationConfig,
+    evidence: DirectPathVerificationEvidence<'_>,
+) -> Result<DirectPathVerificationDecision, AgentError> {
     if !config.required {
         return Ok(DirectPathVerificationDecision::Disabled);
     }
+    let overlay_probe_required =
+        evidence.data_plane_probe.is_some() && evidence.peer_vpn_ip.is_some();
     let Some(candidate) = direct.selected_candidate.as_ref() else {
         runtime
             .remove_pending_direct_path_probe(&direct.key.remote)
@@ -11860,11 +11914,12 @@ async fn direct_path_verification_decision(
         if pending.targets(direct.selected_state, candidate) {
             let active = pending.is_active_at(now);
             if !active
+                && !overlay_probe_required
                 && direct_path_probe_confirmed(
                     &pending,
                     candidate,
                     telemetry,
-                    relay_forwarder_metrics,
+                    evidence.relay_forwarder_metrics,
                 )
             {
                 runtime
@@ -11898,24 +11953,46 @@ async fn direct_path_verification_decision(
                     pending.baseline_rx_bytes = Some(telemetry.rx_bytes);
                     pending.baseline_tx_bytes = Some(telemetry.tx_bytes);
                     pending.baseline_latest_handshake_at = telemetry.latest_handshake_at;
-                    pending.baseline_relay_inbound_payload_bytes =
-                        relay_forwarder_metrics.map(|metrics| metrics.inbound_payload_bytes);
+                    pending.baseline_relay_inbound_payload_bytes = evidence
+                        .relay_forwarder_metrics
+                        .map(|metrics| metrics.inbound_payload_bytes);
                     runtime.upsert_pending_direct_path_probe(pending).await?;
                     return Ok(DirectPathVerificationDecision::Pending);
                 }
                 if pending.baseline_relay_inbound_payload_bytes.is_none() {
-                    if let Some(metrics) = relay_forwarder_metrics {
+                    if let Some(metrics) = evidence.relay_forwarder_metrics {
                         pending.baseline_relay_inbound_payload_bytes =
                             Some(metrics.inbound_payload_bytes);
                         runtime.upsert_pending_direct_path_probe(pending).await?;
                         return Ok(DirectPathVerificationDecision::Pending);
                     }
                 }
+                if overlay_probe_required {
+                    if direct_path_overlay_probe_confirmed(
+                        runtime,
+                        &direct.key.remote,
+                        &pending,
+                        evidence.relay_forwarder_metrics,
+                        evidence.data_plane_probe,
+                        evidence.peer_vpn_ip,
+                    )
+                    .await
+                    {
+                        runtime
+                            .remove_pending_direct_path_probe(&direct.key.remote)
+                            .await;
+                        runtime.record_direct_path_probe_confirmed();
+                        return Ok(DirectPathVerificationDecision::Confirmed(
+                            "wireguard_overlay_probe",
+                        ));
+                    }
+                    return Ok(DirectPathVerificationDecision::Pending);
+                }
                 if direct_path_probe_confirmed(
                     &pending,
                     candidate,
                     Some(telemetry),
-                    relay_forwarder_metrics,
+                    evidence.relay_forwarder_metrics,
                 ) {
                     runtime
                         .remove_pending_direct_path_probe(&direct.key.remote)
@@ -11975,6 +12052,39 @@ async fn direct_path_verification_decision(
             relay_forwarder_suspended: false,
         },
     ))
+}
+
+async fn direct_path_overlay_probe_confirmed(
+    runtime: &AgentRuntime,
+    peer: &NodeId,
+    pending: &PendingDirectPathProbe,
+    relay_forwarder_metrics: Option<&AgentRelayForwarderMetrics>,
+    data_plane_probe: Option<&UdpPeerProbe>,
+    peer_vpn_ip: Option<VpnIp>,
+) -> bool {
+    let Some(data_plane_probe) = data_plane_probe else {
+        return false;
+    };
+    let Some(peer_vpn_ip) = peer_vpn_ip else {
+        return false;
+    };
+    if !pending.relay_forwarder_suspended
+        && (relay_forwarder_metrics.is_some()
+            || runtime.relay_forwarder_endpoint(peer).await.is_some())
+    {
+        return false;
+    }
+    match data_plane_probe.measure(peer_vpn_ip).await {
+        Ok(measurement) => measurement.successful_sample_count() > 0,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                peer = %peer,
+                "direct path overlay probe did not receive a response"
+            );
+            false
+        }
+    }
 }
 
 fn direct_path_probe_confirmed(
@@ -12202,14 +12312,18 @@ async fn negotiate_signal_paths(
             let relay_forwarder_metrics = runtime
                 .relay_forwarder_metrics_for_peer(&peer.node_id)
                 .await;
-            let decision = direct_path_verification_decision(
+            let decision = direct_path_verification_decision_with_data_plane_probe(
                 runtime,
                 &record,
                 telemetry_snapshot.as_ref(),
                 &peer.wireguard_public_key,
                 now,
                 direct_path_verification,
-                relay_forwarder_metrics.as_ref(),
+                DirectPathVerificationEvidence {
+                    relay_forwarder_metrics: relay_forwarder_metrics.as_ref(),
+                    data_plane_probe: options.direct_path_data_plane_probe.as_ref(),
+                    peer_vpn_ip: Some(peer.vpn_ip),
+                },
             )
             .await?;
             match decision {
@@ -16208,7 +16322,7 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
@@ -30586,6 +30700,7 @@ exec sleep 60
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
                 wireguard_peer_telemetry_source: None,
+                direct_path_data_plane_probe: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
                 peer_probe_observation_max_age: Duration::from_secs(120),
@@ -30700,6 +30815,7 @@ exec sleep 60
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
                 wireguard_peer_telemetry_source: None,
+                direct_path_data_plane_probe: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
                 peer_probe_observation_max_age: Duration::from_secs(120),
@@ -30826,6 +30942,7 @@ exec sleep 60
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(120),
                 wireguard_peer_telemetry_source: None,
+                direct_path_data_plane_probe: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
                 peer_probe_observation_max_age: Duration::from_secs(120),
@@ -30948,6 +31065,7 @@ exec sleep 60
             relay_admission_bearer_token: None,
             relay_session_renew_before: Duration::from_secs(30),
             wireguard_peer_telemetry_source: Some(Arc::new(EmptyWireGuardPeerTelemetrySource)),
+            direct_path_data_plane_probe: None,
             direct_path_probe_timeout: Duration::from_millis(1),
             direct_handshake_max_age: Duration::from_secs(180),
             peer_probe_observation_max_age: Duration::from_secs(120),
@@ -31117,6 +31235,7 @@ exec sleep 60
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
                 wireguard_peer_telemetry_source: None,
+                direct_path_data_plane_probe: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
                 peer_probe_observation_max_age: Duration::from_secs(120),
@@ -31216,6 +31335,7 @@ exec sleep 60
                 relay_admission_bearer_token: None,
                 relay_session_renew_before: Duration::from_secs(30),
                 wireguard_peer_telemetry_source: None,
+                direct_path_data_plane_probe: None,
                 direct_path_probe_timeout: Duration::from_secs(120),
                 direct_handshake_max_age: Duration::from_secs(180),
                 peer_probe_observation_max_age: Duration::from_secs(120),
@@ -31806,6 +31926,114 @@ exec sleep 60
             Some(&telemetry),
             None,
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_path_verification_requires_and_accepts_overlay_probe_response(
+    ) -> anyhow::Result<()> {
+        let now = Utc
+            .timestamp_opt(1_710_000_000, 0)
+            .single()
+            .context("time")?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(now),
+            ClusterPolicy::default(),
+        ));
+        let peer_node_id = NodeId::from_string("peer-a");
+        let mut peer = node_record("peer-a");
+        peer.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+        runtime
+            .record_peer_map_snapshot(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                generated_at: now,
+            })
+            .await;
+
+        let reservation = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = reservation.local_addr()?.port();
+        drop(reservation);
+        let probe_config = PeerProbeConfig {
+            port,
+            sample_count: 1,
+            response_timeout: Duration::from_millis(250),
+            sample_interval: Duration::ZERO,
+            max_requests_per_second_per_peer: 100,
+        };
+        let responder = UdpPeerProbeResponder::bind(
+            VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None,
+            probe_config,
+        )?;
+        let responder_task = tokio::spawn(responder.run(runtime.clone()));
+        let probe = UdpPeerProbe::new(
+            VpnIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+            None,
+            probe_config,
+        )?;
+        let candidate = candidate(peer_node_id.as_str(), EndpointCandidateKind::PublicUdp, 10);
+        let direct = PathRecord {
+            key: PeerPathKey::new(runtime.state().node_id, peer_node_id.clone()),
+            selected_state: PathState::DirectPublic,
+            selected_candidate: Some(candidate.clone()),
+            relay_node: None,
+            score: PathScore::calculate(PathState::DirectPublic, &PathMetrics::default(), true, 0),
+            updated_at: now,
+            pinned: false,
+        };
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: candidate.clone(),
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(120),
+                endpoint_observed_at: Some(now),
+                baseline_rx_bytes: Some(100),
+                baseline_tx_bytes: Some(200),
+                baseline_latest_handshake_at: None,
+                baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: true,
+            })
+            .await?;
+        let telemetry = BTreeMap::from([(
+            "wg-peer-a".to_string(),
+            WireGuardPeerTelemetry {
+                public_key_b64: "wg-peer-a".to_string(),
+                endpoint: Some(candidate.addr.to_string()),
+                latest_handshake_at: None,
+                rx_bytes: 100,
+                tx_bytes: 200,
+            },
+        )]);
+        let decision = direct_path_verification_decision_with_data_plane_probe(
+            &runtime,
+            &direct,
+            Some(&telemetry),
+            "wg-peer-a",
+            now + ChronoDuration::seconds(1),
+            DirectPathVerificationConfig {
+                required: true,
+                probe_timeout: Duration::from_secs(120),
+                handshake_max_age: Duration::from_secs(180),
+            },
+            DirectPathVerificationEvidence {
+                relay_forwarder_metrics: None,
+                data_plane_probe: Some(&probe),
+                peer_vpn_ip: Some(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            },
+        )
+        .await?;
+
+        responder_task.abort();
+        assert_eq!(
+            decision,
+            DirectPathVerificationDecision::Confirmed("wireguard_overlay_probe")
+        );
+        assert!(runtime
+            .pending_direct_path_probe(&peer_node_id)
+            .await
+            .is_none());
         Ok(())
     }
 

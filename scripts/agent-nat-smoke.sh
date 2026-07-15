@@ -430,7 +430,9 @@ start_agent() {
     --hole-punch-interval-millis 100 \
     --http-connect-timeout-seconds 3 \
     --http-request-timeout-seconds 5 \
-    --disable-peer-probe \
+    --peer-probe-sample-count 1 \
+    --peer-probe-response-timeout-millis 250 \
+    --peer-probe-sample-interval-millis 0 \
     >"$log_path" 2>&1 &
   local pid=$!
   agent_pids+=("$pid")
