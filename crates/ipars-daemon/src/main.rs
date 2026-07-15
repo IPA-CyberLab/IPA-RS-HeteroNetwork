@@ -7518,7 +7518,11 @@ async fn run_agent(
         .as_ref()
         .map(|(local_vpn_ip, namespace, config)| {
             let direct_config = PeerProbeConfig {
-                sample_count: 1,
+                // The first encrypted packet may only establish the direct
+                // WireGuard handshake. Retry within the same verification
+                // window so that packet loss during that transition does not
+                // reject an otherwise usable path.
+                sample_count: config.sample_count.clamp(2, 3),
                 // A direct WireGuard endpoint may need several seconds for the
                 // first encrypted handshake after the relay forwarder is
                 // suspended. Keep the probe bounded, but do not let the
@@ -12418,38 +12422,51 @@ async fn negotiate_signal_paths(
             chrono::Utc::now(),
             &status.candidates,
         );
+        let direct_candidate_record = candidate_record.clone();
         let (mut record, mut path_selection) =
             stable_signal_path_record(runtime, candidate_record).await;
-        if record.selected_state.is_direct()
+        let current_relay_retained = record.selected_state == PathState::Relay
+            && path_selection == StableSignalPathSelection::CurrentRelay;
+        let verification_record = if current_relay_retained
+            && direct_candidate_record.selected_state.is_direct()
+            && direct_candidate_record.selected_candidate.is_some()
+        {
+            Some(direct_candidate_record)
+        } else if record.selected_state.is_direct()
             && path_selection == StableSignalPathSelection::Candidate
         {
+            Some(record.clone())
+        } else {
+            None
+        };
+        if let Some(verification_record) = verification_record {
             let now = chrono::Utc::now();
             let pending_direct_path_probe = runtime.pending_direct_path_probe(&peer.node_id).await;
             let overlay_probe_pending = options.direct_path_data_plane_probe.is_some()
                 && pending_direct_path_probe.as_ref().is_some_and(|pending| {
                     pending.is_active_at(now)
                         && pending.endpoint_observed_at.is_some()
-                        && record.selected_candidate.as_ref().is_some_and(|candidate| {
-                            pending.targets(record.selected_state, candidate)
-                        })
+                        && verification_record.selected_candidate.as_ref().is_some_and(
+                            |candidate| {
+                                pending.targets(verification_record.selected_state, candidate)
+                            },
+                        )
                 });
-            let relay_forwarding_paused_for_overlay_probe = if overlay_probe_pending {
+            if overlay_probe_pending {
                 set_direct_path_relay_forwarding(
                     runtime,
                     options.relay_forwarder_supervisor.as_ref(),
                     &peer.node_id,
                     false,
                 )
-                .await
-            } else {
-                false
-            };
+                .await;
+            }
             let relay_forwarder_metrics = runtime
                 .relay_forwarder_metrics_for_peer(&peer.node_id)
                 .await;
             let decision = direct_path_verification_decision_with_data_plane_probe(
                 runtime,
-                &record,
+                &verification_record,
                 telemetry_snapshot.as_ref(),
                 &peer.wireguard_public_key,
                 now,
@@ -12461,46 +12478,39 @@ async fn negotiate_signal_paths(
                 },
             )
             .await?;
-            if relay_forwarding_paused_for_overlay_probe
-                && !matches!(&decision, DirectPathVerificationDecision::Confirmed(_))
-            {
-                set_direct_path_relay_forwarding(
-                    runtime,
-                    options.relay_forwarder_supervisor.as_ref(),
-                    &peer.node_id,
-                    true,
-                )
-                .await;
-            }
             match decision {
                 DirectPathVerificationDecision::Disabled => {
-                    if let Err(error) = prepare_direct_nat_traversal(
-                        client,
-                        &signal_url,
-                        &status.node_id,
-                        &identity,
-                        &record,
-                        hole_puncher,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            peer = %record.key.remote,
-                            "failed to prepare direct NAT traversal path"
-                        );
-                        (record, path_selection) = direct_path_failure_record(
-                            &record,
-                            &relay_candidates,
-                            "direct_nat_traversal_failed",
-                            now,
-                        );
+                    if !current_relay_retained {
+                        if let Err(error) = prepare_direct_nat_traversal(
+                            client,
+                            &signal_url,
+                            &status.node_id,
+                            &identity,
+                            &verification_record,
+                            hole_puncher,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                peer = %verification_record.key.remote,
+                                "failed to prepare direct NAT traversal path"
+                            );
+                            (record, path_selection) = direct_path_failure_record(
+                                &verification_record,
+                                &relay_candidates,
+                                "direct_nat_traversal_failed",
+                                now,
+                            );
+                        }
                     }
                 }
                 DirectPathVerificationDecision::Confirmed(evidence) => {
+                    record = verification_record.clone();
+                    path_selection = StableSignalPathSelection::Candidate;
                     tracing::info!(
-                        peer = %record.key.remote,
-                        state = ?record.selected_state,
+                        peer = %verification_record.key.remote,
+                        state = ?verification_record.selected_state,
                         evidence,
                         "verified direct WireGuard path"
                     );
@@ -12510,7 +12520,7 @@ async fn negotiate_signal_paths(
                         record = current;
                     }
                     tracing::debug!(
-                        peer = %record.key.remote,
+                        peer = %verification_record.key.remote,
                         state = ?record.selected_state,
                         evidence,
                         "retained existing direct WireGuard path while signal candidate changed"
@@ -12522,18 +12532,18 @@ async fn negotiate_signal_paths(
                         &signal_url,
                         &status.node_id,
                         &identity,
-                        &record,
+                        &verification_record,
                         hole_puncher,
                     )
                     .await
                     {
                         tracing::warn!(
                             %error,
-                            peer = %record.key.remote,
+                            peer = %verification_record.key.remote,
                             "failed to prepare direct NAT traversal path"
                         );
                         (record, path_selection) = direct_path_failure_record(
-                            &record,
+                            &verification_record,
                             &relay_candidates,
                             "direct_nat_traversal_failed",
                             now,
@@ -12542,14 +12552,14 @@ async fn negotiate_signal_paths(
                         runtime.upsert_pending_direct_path_probe(probe).await?;
                         runtime.record_direct_path_probe_started();
                         tracing::info!(
-                            peer = %record.key.remote,
-                            state = ?record.selected_state,
+                            peer = %verification_record.key.remote,
+                            state = ?verification_record.selected_state,
                             timeout_seconds = options.direct_path_probe_timeout.as_secs(),
                             "started direct WireGuard path verification"
                         );
                         (record, path_selection) = retain_path_during_direct_probe(
                             runtime,
-                            &record,
+                            &verification_record,
                             &relay_candidates,
                             now,
                         )
@@ -12557,18 +12567,22 @@ async fn negotiate_signal_paths(
                     }
                 }
                 DirectPathVerificationDecision::Pending => {
-                    (record, path_selection) =
-                        retain_path_during_direct_probe(runtime, &record, &relay_candidates, now)
-                            .await;
+                    (record, path_selection) = retain_path_during_direct_probe(
+                        runtime,
+                        &verification_record,
+                        &relay_candidates,
+                        now,
+                    )
+                    .await;
                 }
                 DirectPathVerificationDecision::Expired => {
                     tracing::warn!(
-                        peer = %record.key.remote,
-                        state = ?record.selected_state,
+                        peer = %verification_record.key.remote,
+                        state = ?verification_record.selected_state,
                         "direct WireGuard path verification expired"
                     );
                     (record, path_selection) = direct_path_failure_record(
-                        &record,
+                        &verification_record,
                         &relay_candidates,
                         "direct_path_probe_timeout",
                         now,
@@ -12576,12 +12590,12 @@ async fn negotiate_signal_paths(
                 }
                 DirectPathVerificationDecision::MissingCandidate => {
                     tracing::warn!(
-                        peer = %record.key.remote,
-                        state = ?record.selected_state,
+                        peer = %verification_record.key.remote,
+                        state = ?verification_record.selected_state,
                         "signal selected a direct path without a usable candidate"
                     );
                     (record, path_selection) = direct_path_failure_record(
-                        &record,
+                        &verification_record,
                         &relay_candidates,
                         "direct_candidate_missing",
                         now,
@@ -12607,10 +12621,15 @@ async fn negotiate_signal_paths(
             .is_some_and(|probe| probe.is_active_at(direct_path_probe_now));
         let overlay_probe_required = options.direct_path_data_plane_probe.is_some();
         // Without an overlay probe, a newer handshake is usable only after the
-        // relay forwarder has been suspended. Overlay probes suspend forwarding
-        // around their own measurement below, so telemetry alone is not enough.
-        let pause_relay_forwarding = !overlay_probe_required
-            && pending_direct_path_probe.as_ref().is_some_and(|probe| {
+        // relay forwarder has been suspended. With an overlay probe, preserve
+        // the suspension after the direct endpoint is observed until the
+        // probe confirms or expires, so relay traffic cannot reset the probe.
+        let pause_relay_forwarding = if overlay_probe_required {
+            pending_direct_path_probe.as_ref().is_some_and(|probe| {
+                probe.is_active_at(direct_path_probe_now) && probe.relay_forwarder_suspended
+            })
+        } else {
+            pending_direct_path_probe.as_ref().is_some_and(|probe| {
                 probe.is_active_at(direct_path_probe_now)
                     && direct_path_probe_has_handshake_evidence(
                         probe,
@@ -12618,19 +12637,15 @@ async fn negotiate_signal_paths(
                             .as_ref()
                             .and_then(|snapshot| snapshot.get(&peer.wireguard_public_key)),
                     )
-            });
-        let keep_direct_relay_disabled = overlay_probe_required
-            && record.selected_state.is_direct()
-            && !direct_path_probe_active;
-        if !keep_direct_relay_disabled {
-            set_direct_path_relay_forwarding(
-                runtime,
-                options.relay_forwarder_supervisor.as_ref(),
-                &peer.node_id,
-                !pause_relay_forwarding,
-            )
-            .await;
-        }
+            })
+        };
+        set_direct_path_relay_forwarding(
+            runtime,
+            options.relay_forwarder_supervisor.as_ref(),
+            &peer.node_id,
+            !pause_relay_forwarding,
+        )
+        .await;
         if record.selected_state == PathState::Relay {
             match relay_candidates.first() {
                 Some(preferred_relay) => {
