@@ -12206,6 +12206,17 @@ fn direct_path_probe_handshake_advanced(
     }
 }
 
+fn direct_path_probe_has_handshake_evidence(
+    pending: &PendingDirectPathProbe,
+    telemetry: Option<&WireGuardPeerTelemetry>,
+) -> bool {
+    pending.endpoint_observed_at.is_some()
+        && telemetry.is_some_and(|telemetry| {
+            direct_path_endpoint_matches(&pending.selected_candidate, telemetry)
+                && direct_path_probe_handshake_advanced(pending, telemetry)
+        })
+}
+
 fn direct_path_endpoint_matches(
     candidate: &EndpointCandidate,
     telemetry: &WireGuardPeerTelemetry,
@@ -12526,9 +12537,20 @@ async fn negotiate_signal_paths(
         let direct_path_probe_active = pending_direct_path_probe
             .as_ref()
             .is_some_and(|probe| probe.is_active_at(direct_path_probe_now));
-        let pause_relay_forwarding = pending_direct_path_probe.as_ref().is_some_and(|probe| {
-            probe.is_active_at(direct_path_probe_now) && probe.endpoint_observed_at.is_some()
-        });
+        // WireGuard telemetry reports the configured endpoint before it proves
+        // that a handshake can traverse the direct path. Keep relay fallback
+        // available until a newer handshake is observed for this candidate.
+        let direct_path_probe_has_handshake =
+            pending_direct_path_probe.as_ref().is_some_and(|probe| {
+                probe.is_active_at(direct_path_probe_now)
+                    && direct_path_probe_has_handshake_evidence(
+                        probe,
+                        telemetry_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.get(&peer.wireguard_public_key)),
+                    )
+            });
+        let pause_relay_forwarding = direct_path_probe_has_handshake;
         if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
             let forwarding_enabled = !pause_relay_forwarding;
             if supervisor
@@ -31976,6 +31998,17 @@ exec sleep 60
             rx_bytes: 100,
             tx_bytes: 200,
         };
+        assert!(direct_path_probe_has_handshake_evidence(
+            &pending,
+            Some(&telemetry)
+        ));
+        let mut handshake_before_probe = pending.clone();
+        handshake_before_probe.baseline_latest_handshake_at =
+            Some(now + ChronoDuration::seconds(2));
+        assert!(!direct_path_probe_has_handshake_evidence(
+            &handshake_before_probe,
+            Some(&telemetry)
+        ));
         assert!(direct_path_probe_confirmed(
             &pending,
             &candidate,

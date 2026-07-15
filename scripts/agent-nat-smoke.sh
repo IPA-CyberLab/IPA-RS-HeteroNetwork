@@ -69,8 +69,11 @@ agent_a="ipars-agent-a-${suffix}"
 agent_b="ipars-agent-b-${suffix}"
 
 root_public_ip="198.18.100.1"
-nat_a_public_ip="198.18.100.2"
-nat_b_public_ip="198.18.100.3"
+# Keep each invocation on a separate public tuple so conntrack state from a
+# previous namespace teardown cannot be reused by the next profile.
+nat_public_octet_base=$((20 + (suffix % 100) * 2))
+nat_a_public_ip="198.18.100.${nat_public_octet_base}"
+nat_b_public_ip="198.18.100.$((nat_public_octet_base + 1))"
 nat_a_gateway="10.250.0.1"
 nat_a_agent_ip="10.250.0.2"
 nat_b_gateway="10.251.0.1"
