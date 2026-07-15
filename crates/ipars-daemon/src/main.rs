@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11108,9 +11109,11 @@ impl RelayForwarderSupervisor {
             session.relay_endpoint,
             local_endpoint,
         ));
+        let forwarding_enabled = Arc::new(AtomicBool::new(true));
         let forwarder =
             UdpRelayFrameForwarder::new(session.clone(), self.config.wireguard_endpoint)
-                .with_metrics(metrics.clone());
+                .with_metrics(metrics.clone())
+                .with_forwarding_enabled(forwarding_enabled.clone());
         let task = tokio::spawn(forwarder.serve(socket, shutdown_rx));
         self.handles.lock().await.insert(
             session.peer.clone(),
@@ -11119,6 +11122,7 @@ impl RelayForwarderSupervisor {
                 relay_endpoint: session.relay_endpoint,
                 local_endpoint,
                 shutdown_tx,
+                forwarding_enabled,
                 task,
             },
         );
@@ -11135,6 +11139,15 @@ impl RelayForwarderSupervisor {
             "started relay forwarder"
         );
         Ok(local_endpoint)
+    }
+
+    async fn set_forwarding_enabled(&self, peer: &NodeId, enabled: bool) -> bool {
+        let handles = self.handles.lock().await;
+        let Some(handle) = handles.get(peer) else {
+            return false;
+        };
+        handle.forwarding_enabled.store(enabled, Ordering::Relaxed);
+        true
     }
 
     async fn reap_finished(&self, runtime: &AgentRuntime) -> usize {
@@ -11391,6 +11404,7 @@ struct RelayForwarderTask {
     relay_endpoint: SocketAddr,
     local_endpoint: SocketAddr,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    forwarding_enabled: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<Result<(), AgentError>>,
 }
 
@@ -11990,6 +12004,7 @@ async fn direct_path_verification_decision_with_data_plane_probe(
                         runtime,
                         &direct.key.remote,
                         &pending,
+                        telemetry,
                         evidence.relay_forwarder_metrics,
                         evidence.data_plane_probe,
                         evidence.peer_vpn_ip,
@@ -12076,6 +12091,7 @@ async fn direct_path_overlay_probe_confirmed(
     runtime: &AgentRuntime,
     peer: &NodeId,
     pending: &PendingDirectPathProbe,
+    telemetry: &WireGuardPeerTelemetry,
     relay_forwarder_metrics: Option<&AgentRelayForwarderMetrics>,
     data_plane_probe: Option<&UdpPeerProbe>,
     peer_vpn_ip: Option<VpnIp>,
@@ -12086,22 +12102,46 @@ async fn direct_path_overlay_probe_confirmed(
     let Some(peer_vpn_ip) = peer_vpn_ip else {
         return false;
     };
-    if !pending.relay_forwarder_suspended
-        && (relay_forwarder_metrics.is_some()
-            || runtime.relay_forwarder_endpoint(peer).await.is_some())
-    {
-        return false;
-    }
+    let relay_metrics_before = runtime
+        .relay_forwarder_metrics_for_peer(peer)
+        .await
+        .or_else(|| relay_forwarder_metrics.cloned());
     match data_plane_probe.measure(peer_vpn_ip).await {
         Ok(measurement) => {
             let successful_samples = measurement.successful_sample_count();
+            let relay_metrics_after = runtime.relay_forwarder_metrics_for_peer(peer).await;
+            let (relay_inbound_delta, relay_outbound_delta) =
+                match (relay_metrics_before.as_ref(), relay_metrics_after.as_ref()) {
+                    (Some(before), Some(after)) => (
+                        Some(
+                            after
+                                .inbound_payload_bytes
+                                .saturating_sub(before.inbound_payload_bytes),
+                        ),
+                        Some(
+                            after
+                                .outbound_payload_bytes
+                                .saturating_sub(before.outbound_payload_bytes),
+                        ),
+                    ),
+                    _ => (None, None),
+                };
+            let relay_payload_increased = relay_inbound_delta.is_some_and(|delta| delta > 0)
+                || relay_outbound_delta.is_some_and(|delta| delta > 0);
+            let wireguard_rx_delta = pending
+                .baseline_rx_bytes
+                .map(|baseline| telemetry.rx_bytes.saturating_sub(baseline));
             tracing::debug!(
                 peer = %peer,
                 successful_samples,
                 sample_count = measurement.sample_count(),
+                relay_payload_increased,
+                wireguard_rx_delta = ?wireguard_rx_delta,
+                relay_inbound_delta = ?relay_inbound_delta,
+                relay_outbound_delta = ?relay_outbound_delta,
                 "completed direct WireGuard overlay probe"
             );
-            successful_samples > 0
+            successful_samples > 0 && !relay_payload_increased
         }
         Err(error) => {
             tracing::debug!(
@@ -12481,26 +12521,40 @@ async fn negotiate_signal_paths(
                 record.relay_node = Some(preferred_relay.node_id.clone());
             }
         }
-        let direct_path_probe_active = runtime
-            .pending_direct_path_probe(&peer.node_id)
-            .await
-            .is_some_and(|probe| probe.is_active_at(chrono::Utc::now()));
-        // Keep relay traffic available until WireGuard has observed the selected
-        // direct endpoint. This primes endpoint-independent and fixed-port NAT
-        // mappings before the relay is removed from the verification path.
-        let direct_path_probe_ready_to_suspend = runtime
-            .pending_direct_path_probe(&peer.node_id)
-            .await
-            .is_some_and(|probe| {
-                probe.is_active_at(chrono::Utc::now()) && probe.endpoint_observed_at.is_some()
-            });
-        if record.selected_state == PathState::Relay && direct_path_probe_ready_to_suspend {
-            suspend_relay_forwarder_for_direct_probe(
-                runtime,
-                options.relay_forwarder_supervisor.as_ref(),
-                &peer.node_id,
-            )
-            .await;
+        let pending_direct_path_probe = runtime.pending_direct_path_probe(&peer.node_id).await;
+        let direct_path_probe_now = chrono::Utc::now();
+        let direct_path_probe_active = pending_direct_path_probe
+            .as_ref()
+            .is_some_and(|probe| probe.is_active_at(direct_path_probe_now));
+        let pause_relay_forwarding = pending_direct_path_probe.as_ref().is_some_and(|probe| {
+            probe.is_active_at(direct_path_probe_now) && probe.endpoint_observed_at.is_some()
+        });
+        if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
+            let forwarding_enabled = !pause_relay_forwarding;
+            if supervisor
+                .set_forwarding_enabled(&peer.node_id, forwarding_enabled)
+                .await
+            {
+                if let Some(mut pending) = pending_direct_path_probe {
+                    let suspended = !forwarding_enabled;
+                    if pending.relay_forwarder_suspended != suspended {
+                        pending.relay_forwarder_suspended = suspended;
+                        if let Err(error) = runtime.upsert_pending_direct_path_probe(pending).await
+                        {
+                            tracing::warn!(
+                                %error,
+                                peer = %peer.node_id,
+                                "failed to persist relay forwarding state for direct path probe"
+                            );
+                        }
+                    }
+                }
+                tracing::debug!(
+                    peer = %peer.node_id,
+                    forwarding_enabled,
+                    "updated relay forwarder payload forwarding for direct path probe"
+                );
+            }
         }
         if record.selected_state == PathState::Relay {
             match relay_candidates.first() {
@@ -12668,7 +12722,7 @@ async fn negotiate_signal_paths(
                     }
                 }
             }
-        } else {
+        } else if !direct_path_probe_active {
             remove_relay_session_for_peer(
                 runtime,
                 options.relay_forwarder_supervisor.as_ref(),
@@ -12862,33 +12916,6 @@ async fn remove_relay_session_for_peer(
     } else {
         runtime.remove_relay_forwarder_endpoint(peer).await;
     }
-}
-
-async fn suspend_relay_forwarder_for_direct_probe(
-    runtime: &AgentRuntime,
-    relay_forwarder_supervisor: Option<&Arc<RelayForwarderSupervisor>>,
-    peer: &NodeId,
-) {
-    let _endpoint_update_guard = runtime.wireguard_endpoint_update_guard().await;
-    if let Some(supervisor) = relay_forwarder_supervisor {
-        supervisor.remove(runtime, peer).await;
-    } else {
-        runtime.remove_relay_forwarder_endpoint(peer).await;
-    }
-    if let Some(mut pending) = runtime.pending_direct_path_probe(peer).await {
-        pending.relay_forwarder_suspended = true;
-        if let Err(error) = runtime.upsert_pending_direct_path_probe(pending).await {
-            tracing::warn!(
-                %error,
-                peer = %peer,
-                "failed to retain direct probe state after suspending relay forwarder"
-            );
-        }
-    }
-    tracing::debug!(
-        peer = %peer,
-        "suspended relay forwarder while verifying direct WireGuard path"
-    );
 }
 
 fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>> {
@@ -18715,6 +18742,7 @@ mod tests {
                 relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
                 local_endpoint,
                 shutdown_tx,
+                forwarding_enabled: Arc::new(AtomicBool::new(true)),
                 task,
             },
         );
@@ -26210,6 +26238,7 @@ exec sleep 60
                 relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
                 local_endpoint,
                 shutdown_tx,
+                forwarding_enabled: Arc::new(AtomicBool::new(true)),
                 task,
             },
         );

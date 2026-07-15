@@ -5,7 +5,7 @@ use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -993,6 +993,7 @@ pub struct UdpRelayFrameForwarder {
     session: RelaySessionState,
     wireguard_endpoint: SocketAddr,
     metrics: Option<Arc<RelayForwarderStats>>,
+    forwarding_enabled: Arc<AtomicBool>,
 }
 
 impl UdpRelayFrameForwarder {
@@ -1001,11 +1002,17 @@ impl UdpRelayFrameForwarder {
             session,
             wireguard_endpoint,
             metrics: None,
+            forwarding_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn with_metrics(mut self, metrics: Arc<RelayForwarderStats>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_forwarding_enabled(mut self, forwarding_enabled: Arc<AtomicBool>) -> Self {
+        self.forwarding_enabled = forwarding_enabled;
         self
     }
 
@@ -1154,6 +1161,9 @@ impl UdpRelayFrameForwarder {
                         }
                         Err(error) => return Err(error.into()),
                     };
+                    if !self.forwarding_enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     if peer == self.session.relay_endpoint {
                         self.forward_to_wireguard(&socket, &buffer[..len]).await?;
                     } else if wireguard_sender_matches_configured(self.wireguard_endpoint, peer) {
@@ -7994,10 +8004,10 @@ mod tests {
         let relay_task = tokio::spawn(relay.serve(service.table(), relay_shutdown_rx));
         let forwarder_task = tokio::spawn(forwarder.serve(forwarder_socket, forwarder_shutdown_rx));
 
+        let mut buffer = [0_u8; 128];
         wireguard_socket
             .send_to(b"not-wireguard", forwarder_addr)
             .await?;
-        let mut buffer = [0_u8; 128];
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(100),
             peer_socket.recv_from(&mut buffer)

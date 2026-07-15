@@ -12,11 +12,22 @@ join_token_path="${work_dir}/agent.join-token"
 control_plane_operator_token_path="${state_dir}/control-plane-operator.token"
 control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
 nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
-direct_probe_timeout_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PROBE_TIMEOUT_SECONDS:-20}"
+direct_probe_timeout_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PROBE_TIMEOUT_SECONDS:-30}"
 relay_warmup_attempts="${IPARS_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS:-30}"
+pause_before_direct_seconds="${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}"
+direct_path_ping_interval_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PING_INTERVAL_SECONDS:-1}"
+direct_path_priming_attempts="${IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PRIMING_ATTEMPTS:-5}"
 
 [[ "$relay_warmup_attempts" =~ ^[1-9][0-9]*$ ]] || {
   echo "IPARS_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS must be a positive integer" >&2
+  exit 1
+}
+[[ "$direct_path_ping_interval_seconds" =~ ^[1-9][0-9]*$ ]] || {
+  echo "IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PING_INTERVAL_SECONDS must be a positive integer" >&2
+  exit 1
+}
+[[ "$direct_path_priming_attempts" =~ ^[1-9][0-9]*$ ]] || {
+  echo "IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PRIMING_ATTEMPTS must be a positive integer" >&2
   exit 1
 }
 
@@ -709,9 +720,13 @@ wait_for_direct_path() {
   local peer_b="$2"
   local expected_state_a="${3:-DIRECT_NAT_TRAVERSAL}"
   local expected_state_b="${4:-DIRECT_NAT_TRAVERSAL}"
-  for _ in $(seq 1 120); do
-    # A pending direct probe needs encrypted traffic to produce inbound WireGuard evidence.
-    ping_overlay_pair_once || true
+  for iteration in $(seq 1 120); do
+    # Keep priming WireGuard while leaving most direct-probe measurement
+    # windows free of unrelated relay payloads.
+    if (( iteration <= direct_path_priming_attempts \
+      || iteration % direct_path_ping_interval_seconds == 0 )); then
+      ping_overlay_pair_once || true
+    fi
     local state_a state_b metrics_a metrics_b
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
@@ -918,8 +933,8 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port"
     unblock_direct_peer "$nat_b" direct_rule_b
     unblock_direct_peer "$nat_b" direct_input_rule_b
   fi
-  if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}" != "0" ]]; then
-    sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS}"
+  if [[ "$pause_before_direct_seconds" != "0" ]]; then
+    sleep "$pause_before_direct_seconds"
   fi
   wait_for_direct_path "$node_a" "$node_b"
   if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
