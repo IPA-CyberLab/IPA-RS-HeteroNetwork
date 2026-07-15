@@ -11858,18 +11858,14 @@ async fn direct_path_verification_decision(
     if let Some(mut pending) = runtime.pending_direct_path_probe(&direct.key.remote).await {
         if pending.targets(direct.selected_state, candidate) {
             let active = pending.is_active_at(now);
-            if !active && direct_path_probe_confirmed(&pending, candidate, telemetry, now, true) {
-                let evidence =
-                    if telemetry.is_some_and(|telemetry| pending.transfer_increased(telemetry)) {
-                        "wireguard_transfer"
-                    } else {
-                        "wireguard_handshake"
-                    };
+            if !active && direct_path_probe_confirmed(&pending, candidate, telemetry) {
                 runtime
                     .remove_pending_direct_path_probe(&direct.key.remote)
                     .await;
                 runtime.record_direct_path_probe_confirmed();
-                return Ok(DirectPathVerificationDecision::Confirmed(evidence));
+                return Ok(DirectPathVerificationDecision::Confirmed(
+                    "wireguard_transfer",
+                ));
             }
             if !active {
                 runtime
@@ -11894,17 +11890,14 @@ async fn direct_path_verification_decision(
                     runtime.upsert_pending_direct_path_probe(pending).await?;
                     return Ok(DirectPathVerificationDecision::Pending);
                 }
-                if direct_path_probe_confirmed(&pending, candidate, Some(telemetry), now, true) {
+                if direct_path_probe_confirmed(&pending, candidate, Some(telemetry)) {
                     runtime
                         .remove_pending_direct_path_probe(&direct.key.remote)
                         .await;
                     runtime.record_direct_path_probe_confirmed();
-                    let evidence = if pending.transfer_increased(telemetry) {
-                        "wireguard_transfer"
-                    } else {
-                        "wireguard_handshake"
-                    };
-                    return Ok(DirectPathVerificationDecision::Confirmed(evidence));
+                    return Ok(DirectPathVerificationDecision::Confirmed(
+                        "wireguard_transfer",
+                    ));
                 }
             }
             return Ok(DirectPathVerificationDecision::Pending);
@@ -11959,8 +11952,6 @@ fn direct_path_probe_confirmed(
     pending: &PendingDirectPathProbe,
     candidate: &EndpointCandidate,
     telemetry: Option<&WireGuardPeerTelemetry>,
-    now: chrono::DateTime<chrono::Utc>,
-    active: bool,
 ) -> bool {
     let Some(telemetry) = telemetry else {
         return false;
@@ -11968,18 +11959,13 @@ fn direct_path_probe_confirmed(
     if !direct_path_endpoint_matches(candidate, telemetry) {
         return false;
     }
-    let Some(endpoint_observed_at) = pending.endpoint_observed_at else {
+    if pending.endpoint_observed_at.is_none() {
         return false;
-    };
-    let skew = chrono::Duration::seconds(DIRECT_PATH_HANDSHAKE_CLOCK_SKEW_SECONDS);
-    let fresh_handshake = telemetry.latest_handshake_at.is_some_and(|handshake| {
-        // Command-backed WireGuard telemetry has whole-second timestamps. Allow the
-        // observation timestamp to land just after a valid handshake response.
-        handshake >= endpoint_observed_at - skew
-            && handshake <= now + skew
-            && handshake <= pending.expires_at + skew
-    });
-    fresh_handshake || (active && pending.transfer_increased(telemetry))
+    }
+    // A handshake can be produced by a relay forwarder while the selected direct
+    // endpoint is being probed. Inbound transfer growth after the endpoint was
+    // observed proves that encrypted payloads came back through that endpoint.
+    pending.transfer_increased(telemetry)
 }
 
 fn direct_path_endpoint_matches(
@@ -31529,7 +31515,7 @@ exec sleep 60
             .context("peer telemetry")?
             .latest_handshake_at = Some(now + ChronoDuration::seconds(4));
 
-        let confirmed = direct_path_verification_decision(
+        let handshake_only = direct_path_verification_decision(
             &runtime,
             &direct,
             Some(&telemetry),
@@ -31538,10 +31524,25 @@ exec sleep 60
             config,
         )
         .await?;
+        assert_eq!(handshake_only, DirectPathVerificationDecision::Pending);
+
+        telemetry
+            .get_mut(public_key)
+            .context("peer telemetry")?
+            .rx_bytes = 1;
+        let confirmed = direct_path_verification_decision(
+            &runtime,
+            &direct,
+            Some(&telemetry),
+            public_key,
+            now + ChronoDuration::seconds(6),
+            config,
+        )
+        .await?;
 
         assert_eq!(
             confirmed,
-            DirectPathVerificationDecision::Confirmed("wireguard_handshake")
+            DirectPathVerificationDecision::Confirmed("wireguard_transfer")
         );
         assert!(runtime
             .pending_direct_path_probe(&direct.key.remote)
@@ -31552,8 +31553,8 @@ exec sleep 60
     }
 
     #[test]
-    fn direct_path_verification_allows_second_precision_handshake_timestamp() -> anyhow::Result<()>
-    {
+    fn direct_path_verification_accepts_transfer_with_second_precision_handshake(
+    ) -> anyhow::Result<()> {
         let now = Utc
             .timestamp_opt(1_710_000_000, 0)
             .single()
@@ -31572,7 +31573,7 @@ exec sleep 60
             public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
             endpoint: Some(candidate.addr.to_string()),
             latest_handshake_at: Some(now),
-            rx_bytes: 100,
+            rx_bytes: 101,
             tx_bytes: 200,
         };
 
@@ -31580,8 +31581,6 @@ exec sleep 60
             &pending,
             &candidate,
             Some(&telemetry),
-            now + ChronoDuration::seconds(1),
-            true,
         ));
         Ok(())
     }
