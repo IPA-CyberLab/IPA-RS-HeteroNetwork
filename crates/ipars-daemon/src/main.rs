@@ -37,7 +37,7 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
-use ipars_control_plane_http::{router, ControlPlaneHttpState};
+use ipars_control_plane_http::{router, ControlPlaneHttpState, WebAuthProvider, WebUiAuthConfig};
 #[cfg(test)]
 use ipars_crypto::verify_signal_node_upsert_signature;
 use ipars_crypto::{validate_identity_public_key_b64, IdentityKeyPair};
@@ -367,6 +367,31 @@ struct ControlPlaneArgs {
     operator_api_bearer_token: Option<String>,
     #[arg(long, env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")]
     operator_api_bearer_token_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "IPARS_WEB_UI_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    web_ui_enabled: bool,
+    #[arg(long, env = "IPARS_WEB_AUTH_PROVIDER", default_value = "keycloak")]
+    web_auth_provider: String,
+    #[arg(
+        long,
+        env = "IPARS_WEB_OIDC_ISSUER_URL",
+        default_value = "http://localhost:8080/realms/ipars"
+    )]
+    web_oidc_issuer_url: String,
+    #[arg(long, env = "IPARS_WEB_OIDC_CLIENT_ID", default_value = "ipars-web")]
+    web_oidc_client_id: String,
+    #[arg(long, env = "IPARS_WEB_OIDC_AUTH_BASE_URL")]
+    web_oidc_auth_base_url: Option<String>,
+    #[arg(
+        long,
+        env = "IPARS_WEB_OIDC_SCOPES",
+        default_value = "openid profile email"
+    )]
+    web_oidc_scopes: String,
     #[arg(long, env = "IPARS_CLUSTER_ID")]
     cluster_id: String,
     #[arg(long, env = "IPARS_VPN_POOL", default_value = "100.64.0.0/10")]
@@ -4041,6 +4066,24 @@ where
 {
     validate_control_plane_runtime_config(&args)?;
     let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
+    let web_ui_auth = if args.web_ui_enabled {
+        let provider = WebAuthProvider::parse(&args.web_auth_provider)
+            .map_err(anyhow::Error::msg)
+            .context("--web-auth-provider")?;
+        Some(
+            WebUiAuthConfig::new(
+                provider,
+                args.web_oidc_issuer_url.clone(),
+                args.web_oidc_client_id.clone(),
+                args.web_oidc_auth_base_url.clone(),
+                args.web_oidc_scopes.clone(),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("web UI OIDC configuration")?,
+        )
+    } else {
+        None
+    };
     let mut config =
         ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
     config.cluster_policy.relay_health_ttl_seconds = args.relay_health_ttl_seconds;
@@ -4076,6 +4119,9 @@ where
     let mut http_state = ControlPlaneHttpState::new(plane, join_service);
     if let Some(token) = operator_api_bearer_token {
         http_state = http_state.require_operator_api_bearer_token(token);
+    }
+    if let Some(auth) = web_ui_auth {
+        http_state = http_state.enable_web_ui(auth);
     }
     let result = serve_router(args.listen, router(http_state)).await;
     if let Some(task) = otel_metrics_task {

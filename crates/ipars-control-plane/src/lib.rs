@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -65,6 +65,10 @@ pub enum ControlPlaneError {
     NodeRegistrationRejected { node_id: NodeId, reason: String },
     #[error("node not found: {0}")]
     NodeNotFound(NodeId),
+    #[error("path not found: {local} -> {remote}")]
+    PathNotFound { local: NodeId, remote: NodeId },
+    #[error("cluster policy rejected: {0}")]
+    InvalidClusterPolicy(String),
     #[error("no available VPN IP in pool")]
     VpnPoolExhausted,
     #[error("route {0} is not permitted by token policy")]
@@ -688,9 +692,11 @@ where
 pub struct ControlPlane<S> {
     config: ControlPlaneConfig,
     store: Arc<S>,
+    cluster_policy: StdRwLock<ClusterPolicy>,
     allocator: RwLock<VpnAllocator>,
     accepted_node_query_nonces: Mutex<BTreeMap<(NodeId, String), chrono::DateTime<Utc>>>,
     operation_metrics: ControlPlaneOperationMetrics,
+    admin_path_pins: RwLock<BTreeMap<(NodeId, NodeId), bool>>,
 }
 
 #[derive(Debug, Default)]
@@ -747,10 +753,13 @@ where
     S: ControlPlaneStore,
 {
     pub fn new(config: ControlPlaneConfig, store: Arc<S>) -> Self {
+        let cluster_policy = config.cluster_policy.clone();
         Self {
             allocator: RwLock::new(VpnAllocator::new(config.vpn_pool)),
             accepted_node_query_nonces: Mutex::new(BTreeMap::new()),
             operation_metrics: ControlPlaneOperationMetrics::default(),
+            cluster_policy: StdRwLock::new(cluster_policy),
+            admin_path_pins: RwLock::new(BTreeMap::new()),
             config,
             store,
         }
@@ -758,6 +767,126 @@ where
 
     pub fn config(&self) -> &ControlPlaneConfig {
         &self.config
+    }
+
+    pub fn cluster_policy(&self) -> Result<ClusterPolicy, ControlPlaneError> {
+        self.cluster_policy
+            .read()
+            .map(|policy| policy.clone())
+            .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))
+    }
+
+    pub fn set_cluster_policy(
+        &self,
+        policy: ClusterPolicy,
+    ) -> Result<ClusterPolicy, ControlPlaneError> {
+        validate_cluster_policy(&policy)?;
+        let mut current = self
+            .cluster_policy
+            .write()
+            .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))?;
+        *current = policy.clone();
+        Ok(policy)
+    }
+
+    fn policy_snapshot(&self) -> Result<ClusterPolicy, ControlPlaneError> {
+        self.cluster_policy()
+    }
+
+    pub async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+        self.store.list_nodes().await
+    }
+
+    pub async fn health_for_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<NodeHealth>, ControlPlaneError> {
+        self.store.get_health(node_id).await
+    }
+
+    pub async fn list_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        let nodes = self.store.list_nodes().await?;
+        let mut paths = Vec::new();
+        for node in nodes {
+            for path in self.store.list_paths_for(&node.node_id).await? {
+                if !paths
+                    .iter()
+                    .any(|current: &PathRecord| current.key == path.key)
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        self.apply_admin_path_pins(&mut paths).await;
+        Ok(paths)
+    }
+
+    pub async fn admin_remove_node(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RemoveNodeResponse, ControlPlaneError> {
+        let result = self.store.remove_node(node_id).await?;
+        self.admin_path_pins
+            .write()
+            .await
+            .retain(|(local, remote), _| local != node_id && remote != node_id);
+        *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
+        self.operation_metrics.record_node_removal(true);
+        Ok(RemoveNodeResponse {
+            node: result.node,
+            removed_path_count: result.removed_path_count,
+            removed_health: result.removed_health,
+            removed_at: Utc::now(),
+        })
+    }
+
+    pub async fn set_admin_path_pin(
+        &self,
+        local: NodeId,
+        remote: NodeId,
+        pinned: bool,
+    ) -> Result<PathRecord, ControlPlaneError> {
+        self.store
+            .get_node(&local)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(local.clone()))?;
+        self.store
+            .get_node(&remote)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(remote.clone()))?;
+        let mut path = self
+            .store
+            .list_paths_for(&local)
+            .await?
+            .into_iter()
+            .find(|path| path.key.local == local && path.key.remote == remote)
+            .ok_or_else(|| ControlPlaneError::PathNotFound {
+                local: local.clone(),
+                remote: remote.clone(),
+            })?;
+        if pinned {
+            self.admin_path_pins
+                .write()
+                .await
+                .insert((local.clone(), remote.clone()), true);
+        } else {
+            self.admin_path_pins
+                .write()
+                .await
+                .remove(&(local.clone(), remote.clone()));
+        }
+        path.pinned = pinned;
+        self.store.upsert_path(path.clone()).await?;
+        Ok(path)
+    }
+
+    async fn apply_admin_path_pins(&self, paths: &mut [PathRecord]) {
+        let pins = self.admin_path_pins.read().await;
+        for path in paths {
+            if let Some(pinned) = pins.get(&(path.key.local.clone(), path.key.remote.clone())) {
+                path.pinned = *pinned;
+            }
+        }
     }
 
     pub async fn register_with_claims(
@@ -804,14 +933,16 @@ where
     ) -> Result<RegisterNodeResponse, ControlPlaneError> {
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
-        let peer_map = self.filtered_peer_map_for_node(&node, &peers, now);
-        let relay_map = self.filtered_relay_map_for_node(&node, &peers, &health_by_node, now);
+        let policy = self.policy_snapshot()?;
+        let peer_map = self.filtered_peer_map_for_node(&node, &peers, &policy, now);
+        let relay_map =
+            self.filtered_relay_map_for_node(&node, &peers, &health_by_node, &policy, now);
 
         Ok(RegisterNodeResponse {
             node,
             peer_map,
             relay_map,
-            cluster_policy: self.config.cluster_policy.clone(),
+            cluster_policy: policy,
         })
     }
 
@@ -957,7 +1088,8 @@ where
             .into_iter()
             .collect::<Vec<_>>();
 
-        Ok(self.filtered_peer_map_for_node(&source, &peers, Utc::now()))
+        let policy = self.policy_snapshot()?;
+        Ok(self.filtered_peer_map_for_node(&source, &peers, &policy, Utc::now()))
     }
 
     pub async fn remove_node(
@@ -1038,6 +1170,8 @@ where
             .iter()
             .map(|peer| (peer.node_id.clone(), peer))
             .collect::<BTreeMap<_, _>>();
+        let policy = self.policy_snapshot()?;
+        let pins = self.admin_path_pins.read().await.clone();
         let now = Utc::now();
         let mut stale_path_count = 0;
         let paths = self
@@ -1045,7 +1179,10 @@ where
             .list_paths_for(node_id)
             .await?
             .into_iter()
-            .filter_map(|path| {
+            .filter_map(|mut path| {
+                if let Some(pinned) = pins.get(&(path.key.local.clone(), path.key.remote.clone())) {
+                    path.pinned = *pinned;
+                }
                 let peer_id = if path.key.local == source.node_id {
                     &path.key.remote
                 } else if path.key.remote == source.node_id {
@@ -1053,17 +1190,13 @@ where
                 } else {
                     return None;
                 };
-                let visible = peers_by_id.get(peer_id).is_some_and(|peer| {
-                    acl_filter_peer(&source, peer, &self.config.cluster_policy).is_some()
-                });
+                let visible = peers_by_id
+                    .get(peer_id)
+                    .is_some_and(|peer| acl_filter_peer(&source, peer, &policy).is_some());
                 if !visible {
                     return None;
                 }
-                if path_is_fresh(
-                    &path,
-                    now,
-                    self.config.cluster_policy.path_state_ttl_seconds,
-                ) {
+                if path_is_fresh(&path, now, policy.path_state_ttl_seconds) {
                     Some(path)
                 } else {
                     stale_path_count += 1;
@@ -1077,7 +1210,7 @@ where
             node_id: node_id.clone(),
             paths,
             stale_path_count,
-            path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
+            path_state_ttl_seconds: policy.path_state_ttl_seconds,
             generated_at: now,
         })
     }
@@ -1153,6 +1286,14 @@ where
                 )?;
             }
         }
+        {
+            let pins = self.admin_path_pins.read().await;
+            for path in &mut request.path_state {
+                if let Some(pinned) = pins.get(&(path.key.local.clone(), path.key.remote.clone())) {
+                    path.pinned = *pinned;
+                }
+            }
+        }
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
         }
@@ -1222,9 +1363,15 @@ where
             .await?;
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
-        let peer_map = self.filtered_peer_map_for_node(&updated_node, &peers, rotated_at);
-        let relay_map =
-            self.filtered_relay_map_for_node(&updated_node, &peers, &health_by_node, rotated_at);
+        let policy = self.policy_snapshot()?;
+        let peer_map = self.filtered_peer_map_for_node(&updated_node, &peers, &policy, rotated_at);
+        let relay_map = self.filtered_relay_map_for_node(
+            &updated_node,
+            &peers,
+            &health_by_node,
+            &policy,
+            rotated_at,
+        );
 
         Ok(RotateWireGuardKeyResponse {
             node: updated_node,
@@ -1300,6 +1447,7 @@ where
         previous_health: Option<&NodeHealth>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
+        let policy = self.policy_snapshot()?;
         validate_node_health_shape(
             &request.health,
             now,
@@ -1480,7 +1628,7 @@ where
                 if !endpoint_candidate_is_fresh(
                     candidate,
                     now,
-                    self.config.cluster_policy.endpoint_candidate_ttl_seconds,
+                    policy.endpoint_candidate_ttl_seconds,
                 ) {
                     return Err(ControlPlaneError::NodeUpdateRejected {
                         node_id: request.node_id.clone(),
@@ -1601,6 +1749,7 @@ where
         reporter: &NodeRecord,
         nodes: &[NodeRecord],
     ) -> Result<(), ControlPlaneError> {
+        let policy = self.policy_snapshot()?;
         let nodes_by_id = nodes
             .iter()
             .map(|node| (node.node_id.clone(), node))
@@ -1615,7 +1764,7 @@ where
                     ),
                 });
             };
-            if acl_filter_peer(reporter, remote, &self.config.cluster_policy).is_none() {
+            if acl_filter_peer(reporter, remote, &policy).is_none() {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!(
@@ -1636,6 +1785,7 @@ where
         health_by_node: &BTreeMap<NodeId, NodeHealth>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
+        let policy = self.policy_snapshot()?;
         let nodes_by_id = nodes
             .iter()
             .map(|node| (node.node_id.clone(), node))
@@ -1653,18 +1803,13 @@ where
                     reason: format!("relay node {relay_node} is not registered"),
                 });
             };
-            if !relay_candidate_allowed(
-                relay,
-                health_by_node.get(relay_node),
-                now,
-                &self.config.cluster_policy,
-            ) {
+            if !relay_candidate_allowed(relay, health_by_node.get(relay_node), now, &policy) {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!("relay node {relay_node} is not an eligible relay candidate"),
                 });
             }
-            if acl_filter_peer(reporter, relay, &self.config.cluster_policy).is_none() {
+            if acl_filter_peer(reporter, relay, &policy).is_none() {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!("relay node {relay_node} is not visible to reporting node"),
@@ -1677,6 +1822,7 @@ where
     pub async fn metrics(&self) -> Result<ControlPlaneMetricsResponse, ControlPlaneError> {
         let nodes = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&nodes).await?;
+        let policy = self.policy_snapshot()?;
         let mut healthy_node_count = 0;
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
@@ -1684,23 +1830,14 @@ where
         let relay_candidate_count = nodes
             .iter()
             .filter(|node| {
-                relay_candidate_allowed(
-                    node,
-                    health_by_node.get(&node.node_id),
-                    now,
-                    &self.config.cluster_policy,
-                )
+                relay_candidate_allowed(node, health_by_node.get(&node.node_id), now, &policy)
             })
             .count();
         let stale_endpoint_candidate_count = nodes
             .iter()
             .flat_map(|node| &node.endpoint_candidates)
             .filter(|candidate| {
-                !endpoint_candidate_is_fresh(
-                    candidate,
-                    now,
-                    self.config.cluster_policy.endpoint_candidate_ttl_seconds,
-                )
+                !endpoint_candidate_is_fresh(candidate, now, policy.endpoint_candidate_ttl_seconds)
             })
             .count();
         let vpn_pool_total_count = vpn_pool_usable_host_count(self.config.vpn_pool);
@@ -1710,7 +1847,7 @@ where
             .count() as u64;
         let vpn_pool_available_count =
             vpn_pool_total_count.saturating_sub(vpn_pool_allocated_count);
-        let peer_map_metrics = peer_map_visibility_metrics(&nodes, &self.config.cluster_policy);
+        let peer_map_metrics = peer_map_visibility_metrics(&nodes, &policy);
         let operation_metrics = self.operation_metrics.snapshot();
 
         let mut paths = BTreeMap::<(NodeId, NodeId), PathRecord>::new();
@@ -1730,7 +1867,7 @@ where
         let mut stale_path_count = 0;
         let mut path_state_counts = BTreeMap::<PathState, usize>::new();
         for path in paths.values() {
-            if !path_is_fresh(path, now, self.config.cluster_policy.path_state_ttl_seconds) {
+            if !path_is_fresh(path, now, policy.path_state_ttl_seconds) {
                 stale_path_count += 1;
                 continue;
             }
@@ -1776,11 +1913,8 @@ where
                     count: *path_state_counts.get(&state).unwrap_or(&0),
                 })
                 .collect(),
-            endpoint_candidate_ttl_seconds: self
-                .config
-                .cluster_policy
-                .endpoint_candidate_ttl_seconds,
-            path_state_ttl_seconds: self.config.cluster_policy.path_state_ttl_seconds,
+            endpoint_candidate_ttl_seconds: policy.endpoint_candidate_ttl_seconds,
+            path_state_ttl_seconds: policy.path_state_ttl_seconds,
             generated_at: now,
         })
     }
@@ -1802,6 +1936,7 @@ where
         &self,
         source: &NodeRecord,
         peers: &[NodeRecord],
+        policy: &ClusterPolicy,
         generated_at: chrono::DateTime<Utc>,
     ) -> PeerMap {
         PeerMap {
@@ -1809,14 +1944,8 @@ where
             peers: peers
                 .iter()
                 .filter(|peer| peer.node_id != source.node_id)
-                .filter_map(|peer| acl_filter_peer(source, peer, &self.config.cluster_policy))
-                .map(|peer| {
-                    filter_served_endpoint_candidates(
-                        peer,
-                        generated_at,
-                        &self.config.cluster_policy,
-                    )
-                })
+                .filter_map(|peer| acl_filter_peer(source, peer, policy))
+                .map(|peer| filter_served_endpoint_candidates(peer, generated_at, policy))
                 .collect(),
             generated_at,
         }
@@ -1827,6 +1956,7 @@ where
         source: &NodeRecord,
         peers: &[NodeRecord],
         health_by_node: &BTreeMap<NodeId, NodeHealth>,
+        policy: &ClusterPolicy,
         generated_at: chrono::DateTime<Utc>,
     ) -> RelayMap {
         RelayMap {
@@ -1838,27 +1968,90 @@ where
                         peer,
                         health_by_node.get(&peer.node_id),
                         generated_at,
-                        &self.config.cluster_policy,
+                        policy,
                     )
                 })
                 .filter_map(|peer| {
                     if peer.node_id == source.node_id {
                         Some(peer.clone())
                     } else {
-                        acl_filter_peer(source, peer, &self.config.cluster_policy)
+                        acl_filter_peer(source, peer, policy)
                     }
                 })
-                .map(|peer| {
-                    filter_served_endpoint_candidates(
-                        peer,
-                        generated_at,
-                        &self.config.cluster_policy,
-                    )
-                })
+                .map(|peer| filter_served_endpoint_candidates(peer, generated_at, policy))
                 .collect(),
             generated_at,
         }
     }
+}
+
+fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
+    for (name, value) in [
+        ("idle_timeout_seconds", policy.idle_timeout_seconds),
+        ("relay_health_ttl_seconds", policy.relay_health_ttl_seconds),
+        (
+            "endpoint_candidate_ttl_seconds",
+            policy.endpoint_candidate_ttl_seconds,
+        ),
+        ("path_state_ttl_seconds", policy.path_state_ttl_seconds),
+        (
+            "path_quality_observation_ttl_seconds",
+            policy.path_quality_observation_ttl_seconds,
+        ),
+        (
+            "nat_classification_ttl_seconds",
+            policy.nat_classification_ttl_seconds,
+        ),
+    ] {
+        if value == 0 {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "{name} must be greater than zero"
+            )));
+        }
+    }
+    if policy.nat_classification_min_confidence_percent > 100 {
+        return Err(ControlPlaneError::InvalidClusterPolicy(
+            "nat_classification_min_confidence_percent must be at most 100".to_string(),
+        ));
+    }
+    if policy.acl_rules.len() > 256 {
+        return Err(ControlPlaneError::InvalidClusterPolicy(
+            "acl_rules must contain at most 256 rules".to_string(),
+        ));
+    }
+
+    let mut rule_ids = BTreeSet::new();
+    for rule in &policy.acl_rules {
+        if rule.id.is_empty() || rule.id.len() > 128 {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "ACL rule IDs must be 1 to 128 bytes: {:?}",
+                rule.id
+            )));
+        }
+        if rule
+            .id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "ACL rule ID {:?} contains whitespace or control characters",
+                rule.id
+            )));
+        }
+        if !rule_ids.insert(&rule.id) {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "ACL rule ID {:?} is duplicated",
+                rule.id
+            )));
+        }
+        if rule.routes.len() > 256 {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "ACL rule {:?} contains more than 256 routes",
+                rule.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default)]

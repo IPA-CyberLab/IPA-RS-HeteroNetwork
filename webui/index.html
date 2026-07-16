@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>IPARS Control</title>
+    <link rel="stylesheet" href="/ui/styles.css">
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">IP</span>
+          <span>
+            <strong>IPARS Control</strong>
+            <small id="cluster-name">Control plane</small>
+          </span>
+        </div>
+        <div class="topbar-actions">
+          <span id="connection-state" class="connection-state offline">Offline</span>
+          <span id="refresh-time" class="refresh-time">Not connected</span>
+          <button id="auth-button" class="button button-quiet" type="button">Sign in</button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="sidebar" aria-label="Primary navigation">
+          <div class="nav-label">Manage</div>
+          <button class="nav-button active" type="button" data-view="overview">
+            <span class="nav-icon">◉</span><span>Overview</span>
+          </button>
+          <button class="nav-button" type="button" data-view="nodes">
+            <span class="nav-icon">▦</span><span>Devices</span>
+          </button>
+          <button class="nav-button" type="button" data-view="paths">
+            <span class="nav-icon">⇄</span><span>Connections</span>
+          </button>
+          <button class="nav-button" type="button" data-view="routes">
+            <span class="nav-icon">⌁</span><span>Routes</span>
+          </button>
+          <button class="nav-button" type="button" data-view="acl">
+            <span class="nav-icon">⊞</span><span>Access control</span>
+          </button>
+          <div class="sidebar-footer">
+            <span class="status-dot"></span>
+            <span>Control plane API</span>
+          </div>
+        </aside>
+
+        <main class="content">
+          <section id="auth-panel" class="auth-panel">
+            <div class="auth-panel-inner">
+              <span class="eyebrow">IPARS MANAGEMENT</span>
+              <h1 id="auth-title">Sign in to manage this network</h1>
+              <p id="auth-copy">Authenticate with the configured identity provider to view nodes, paths, routes, and access policy.</p>
+              <button id="oidc-login" class="button button-primary" type="button">Sign in with SSO</button>
+              <form id="token-form" class="token-form" hidden>
+                <label for="operator-token">Operator API bearer token</label>
+                <div class="token-row">
+                  <input id="operator-token" type="password" autocomplete="off" placeholder="Paste token">
+                  <button class="button button-primary" type="submit">Connect</button>
+                </div>
+              </form>
+              <p id="auth-error" class="form-error" role="alert"></p>
+            </div>
+          </section>
+
+          <section id="dashboard" hidden>
+            <div class="page-heading">
+              <div>
+                <span class="eyebrow">NETWORK ADMINISTRATION</span>
+                <h1 id="view-title">Overview</h1>
+                <p id="view-subtitle">Live state from the IPARS control plane.</p>
+              </div>
+              <button id="refresh-button" class="button button-quiet" type="button">Refresh</button>
+            </div>
+            <div id="status-message" class="status-message" role="status"></div>
+            <div id="view-content"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <script src="/ui/app.js"></script>
+  </body>
+</html>

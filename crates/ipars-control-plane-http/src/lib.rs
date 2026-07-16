@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -18,8 +19,14 @@ use ipars_types::api::{
     RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
-use ipars_types::{NodeId, PathState, TokenLedgerMetrics};
-use serde::Serialize;
+use ipars_types::{
+    ClusterPolicy, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, TokenLedgerMetrics,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::time::timeout;
+use url::Url;
 
 const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
 
@@ -33,6 +40,7 @@ pub struct ControlPlaneHttpState<S, L> {
     plane: Arc<ControlPlane<S>>,
     join_service: Arc<ControlPlaneJoinService<S, L>>,
     operator_api_bearer_token: Option<Arc<str>>,
+    web_ui_auth: Option<Arc<WebUiAuthConfig>>,
 }
 
 impl<S, L> Clone for ControlPlaneHttpState<S, L> {
@@ -41,6 +49,7 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
             plane: self.plane.clone(),
             join_service: self.join_service.clone(),
             operator_api_bearer_token: self.operator_api_bearer_token.clone(),
+            web_ui_auth: self.web_ui_auth.clone(),
         }
     }
 }
@@ -54,11 +63,17 @@ impl<S, L> ControlPlaneHttpState<S, L> {
             plane,
             join_service,
             operator_api_bearer_token: None,
+            web_ui_auth: None,
         }
     }
 
     pub fn require_operator_api_bearer_token(mut self, token: String) -> Self {
         self.operator_api_bearer_token = Some(Arc::from(token));
+        self
+    }
+
+    pub fn enable_web_ui(mut self, auth: WebUiAuthConfig) -> Self {
+        self.web_ui_auth = Some(Arc::new(auth));
         self
     }
 }
@@ -85,6 +100,32 @@ where
         )
         .route("/v1/tokens/revoke", post(revoke_token::<S, L>));
 
+    let management_auth = Arc::new(ManagementAuth {
+        operator_api_bearer_token: state.operator_api_bearer_token.clone(),
+        web_ui_auth: state.web_ui_auth.clone(),
+        client: Client::new(),
+    });
+    let admin = Router::new()
+        .route("/v1/admin/overview", get(admin_overview::<S, L>))
+        .route("/v1/admin/nodes", get(admin_nodes::<S, L>))
+        .route("/v1/admin/paths", get(admin_paths::<S, L>))
+        .route(
+            "/v1/admin/policy",
+            get(admin_policy::<S, L>).put(update_admin_policy::<S, L>),
+        )
+        .route(
+            "/v1/admin/nodes/{node_id}",
+            delete(admin_remove_node::<S, L>),
+        )
+        .route(
+            "/v1/admin/paths/{local_node_id}/{remote_node_id}/pin",
+            post(admin_pin_path::<S, L>),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            management_auth,
+            require_management_auth,
+        ));
+
     let app = if let Some(token) = state.operator_api_bearer_token.clone() {
         let operator = Router::new()
             .route("/metrics", get(prometheus_metrics::<S, L>))
@@ -94,11 +135,424 @@ where
                 token,
                 require_operator_api_bearer,
             ));
-        protocol.merge(operator)
+        protocol.merge(operator).merge(admin)
     } else {
-        protocol
+        protocol.merge(admin)
     };
-    app.with_state(state)
+    app.route("/ui", get(ui_index))
+        .route("/ui/", get(ui_index))
+        .route("/ui/app.js", get(ui_app))
+        .route("/ui/styles.css", get(ui_styles))
+        .route("/ui/config", get(ui_config::<S, L>))
+        .with_state(state)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebAuthProvider {
+    Keycloak,
+    Cognito,
+}
+
+impl WebAuthProvider {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "keycloak" => Ok(Self::Keycloak),
+            "cognito" => Ok(Self::Cognito),
+            other => Err(format!(
+                "unsupported web auth provider {other:?}; expected keycloak or cognito"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Keycloak => "keycloak",
+            Self::Cognito => "cognito",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebUiAuthConfig {
+    provider: WebAuthProvider,
+    issuer_url: String,
+    client_id: String,
+    scopes: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    userinfo_endpoint: String,
+    logout_endpoint: String,
+}
+
+impl WebUiAuthConfig {
+    pub fn new(
+        provider: WebAuthProvider,
+        issuer_url: String,
+        client_id: String,
+        auth_base_url: Option<String>,
+        scopes: String,
+    ) -> Result<Self, String> {
+        let issuer_url = validate_web_auth_base_url(issuer_url, "issuer URL")?;
+        let auth_base_url = match auth_base_url {
+            Some(value) => validate_web_auth_base_url(value, "OIDC auth base URL")?,
+            None => issuer_url.clone(),
+        };
+        let client_id = client_id.trim().to_string();
+        if client_id.is_empty() || client_id.len() > 256 || client_id.chars().any(char::is_control)
+        {
+            return Err("OIDC client ID must be 1 to 256 non-control characters".to_string());
+        }
+        let scopes = scopes.trim().to_string();
+        if scopes.is_empty() || scopes.chars().any(char::is_control) {
+            return Err(
+                "OIDC scopes must be non-empty and contain no control characters".to_string(),
+            );
+        }
+        let (authorization_suffix, token_suffix, userinfo_suffix, logout_suffix) = match provider {
+            WebAuthProvider::Keycloak => (
+                "/protocol/openid-connect/auth",
+                "/protocol/openid-connect/token",
+                "/protocol/openid-connect/userinfo",
+                "/protocol/openid-connect/logout",
+            ),
+            WebAuthProvider::Cognito => (
+                "/oauth2/authorize",
+                "/oauth2/token",
+                "/oauth2/userInfo",
+                "/logout",
+            ),
+        };
+        Ok(Self {
+            provider,
+            issuer_url: issuer_url.clone(),
+            client_id,
+            scopes,
+            authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
+            token_endpoint: endpoint_url(&auth_base_url, token_suffix),
+            userinfo_endpoint: endpoint_url(&auth_base_url, userinfo_suffix),
+            logout_endpoint: endpoint_url(&auth_base_url, logout_suffix),
+        })
+    }
+
+    pub async fn validate_access_token(&self, client: &Client, token: &str) -> bool {
+        if token.is_empty() || token.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES * 16 {
+            return false;
+        }
+        let response = match timeout(
+            Duration::from_secs(5),
+            client
+                .get(&self.userinfo_endpoint)
+                .bearer_auth(token)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            _ => return false,
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        match response.json::<Value>().await {
+            Ok(claims) => claims
+                .get("sub")
+                .and_then(Value::as_str)
+                .is_some_and(|subject| !subject.is_empty()),
+            Err(_) => false,
+        }
+    }
+
+    fn public_config(&self) -> WebUiPublicConfig {
+        WebUiPublicConfig {
+            enabled: true,
+            auth_enabled: true,
+            operator_token_enabled: false,
+            provider: Some(self.provider.as_str().to_string()),
+            issuer_url: Some(self.issuer_url.clone()),
+            client_id: Some(self.client_id.clone()),
+            scopes: Some(self.scopes.clone()),
+            authorization_endpoint: Some(self.authorization_endpoint.clone()),
+            token_endpoint: Some(self.token_endpoint.clone()),
+            logout_endpoint: Some(self.logout_endpoint.clone()),
+        }
+    }
+}
+
+fn validate_web_auth_base_url(value: String, name: &str) -> Result<String, String> {
+    let value = value.trim().trim_end_matches('/').to_string();
+    let parsed = Url::parse(&value).map_err(|error| format!("{name} is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!(
+            "{name} must be an http(s) URL with a host and no credentials, query, or fragment"
+        ));
+    }
+    Ok(value)
+}
+
+fn endpoint_url(base: &str, suffix: &str) -> String {
+    format!("{base}{suffix}")
+}
+
+#[derive(Debug, Serialize)]
+struct WebUiPublicConfig {
+    enabled: bool,
+    auth_enabled: bool,
+    operator_token_enabled: bool,
+    provider: Option<String>,
+    issuer_url: Option<String>,
+    client_id: Option<String>,
+    scopes: Option<String>,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    logout_endpoint: Option<String>,
+}
+
+#[derive(Clone)]
+struct ManagementAuth {
+    operator_api_bearer_token: Option<Arc<str>>,
+    web_ui_auth: Option<Arc<WebUiAuthConfig>>,
+    client: Client,
+}
+
+async fn require_management_auth(
+    State(auth): State<Arc<ManagementAuth>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = bearer_token_from_headers(request.headers());
+    let operator_authenticated = auth
+        .operator_api_bearer_token
+        .as_deref()
+        .zip(provided)
+        .is_some_and(|(expected, provided)| operator_api_token_matches(expected, provided));
+    let oidc_authenticated = if operator_authenticated {
+        false
+    } else if let (Some(oidc), Some(token)) = (auth.web_ui_auth.as_deref(), provided) {
+        oidc.validate_access_token(&auth.client, token).await
+    } else {
+        false
+    };
+    if !operator_authenticated && !oidc_authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "management API authentication was rejected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn ui_index() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../../webui/index.html"),
+    )
+}
+
+async fn ui_app() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../../webui/app.js"),
+    )
+}
+
+async fn ui_styles() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../../../webui/styles.css"),
+    )
+}
+
+async fn ui_config<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Json<WebUiPublicConfig>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let mut config = state
+        .web_ui_auth
+        .as_deref()
+        .map(WebUiAuthConfig::public_config)
+        .unwrap_or_else(|| WebUiPublicConfig {
+            enabled: state.operator_api_bearer_token.is_some(),
+            auth_enabled: false,
+            operator_token_enabled: state.operator_api_bearer_token.is_some(),
+            provider: None,
+            issuer_url: None,
+            client_id: None,
+            scopes: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            logout_endpoint: None,
+        });
+    config.operator_token_enabled = state.operator_api_bearer_token.is_some();
+    Json(config)
+}
+
+#[derive(Debug, Serialize)]
+struct AdminNodeResponse {
+    node: NodeRecord,
+    health: Option<NodeHealth>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminOverviewResponse {
+    cluster_id: ipars_types::ClusterId,
+    vpn_pool: ipnet::Ipv4Net,
+    cluster_policy: ClusterPolicy,
+    metrics: ControlPlaneMetricsResponse,
+    nodes: Vec<AdminNodeResponse>,
+    paths: Vec<PathRecord>,
+    generated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminPolicyRequest {
+    cluster_policy: ClusterPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminPathPinRequest {
+    pinned: bool,
+}
+
+async fn admin_node_snapshot<S>(
+    plane: &ControlPlane<S>,
+) -> Result<Vec<AdminNodeResponse>, ControlPlaneError>
+where
+    S: ControlPlaneStore,
+{
+    let nodes = plane.list_nodes().await?;
+    let mut snapshot = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        snapshot.push(AdminNodeResponse {
+            health: plane.health_for_node(&node.node_id).await?,
+            node,
+        });
+    }
+    Ok(snapshot)
+}
+
+async fn admin_overview<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<AdminOverviewResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let generated_at = Utc::now();
+    let config = state.plane.config();
+    Ok(Json(AdminOverviewResponse {
+        cluster_id: config.cluster_id.clone(),
+        vpn_pool: config.vpn_pool,
+        cluster_policy: state.plane.cluster_policy()?,
+        metrics: control_plane_metrics(&state).await?,
+        nodes: admin_node_snapshot(&state.plane).await?,
+        paths: state.plane.list_paths().await?,
+        generated_at,
+    }))
+}
+
+async fn admin_nodes<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<Vec<AdminNodeResponse>>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(admin_node_snapshot(&state.plane).await?))
+}
+
+async fn admin_paths<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<Vec<PathRecord>>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.list_paths().await?))
+}
+
+async fn admin_policy<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<ControlPlanePolicyResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let config = state.plane.config();
+    Ok(Json(ControlPlanePolicyResponse {
+        cluster_id: config.cluster_id.clone(),
+        vpn_pool: config.vpn_pool,
+        cluster_policy: state.plane.cluster_policy()?,
+        generated_at: Utc::now(),
+    }))
+}
+
+async fn update_admin_policy<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<AdminPolicyRequest>,
+) -> Result<Json<ControlPlanePolicyResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let cluster_policy = state.plane.set_cluster_policy(request.cluster_policy)?;
+    let config = state.plane.config();
+    Ok(Json(ControlPlanePolicyResponse {
+        cluster_id: config.cluster_id.clone(),
+        vpn_pool: config.vpn_pool,
+        cluster_policy,
+        generated_at: Utc::now(),
+    }))
+}
+
+async fn admin_remove_node<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path(node_id): Path<String>,
+) -> Result<Json<RemoveNodeResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(
+        state
+            .plane
+            .admin_remove_node(&NodeId::from_string(node_id))
+            .await?,
+    ))
+}
+
+async fn admin_pin_path<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path((local_node_id, remote_node_id)): Path<(String, String)>,
+    Json(request): Json<AdminPathPinRequest>,
+) -> Result<Json<PathRecord>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(
+        state
+            .plane
+            .set_admin_path_pin(
+                NodeId::from_string(local_node_id),
+                NodeId::from_string(remote_node_id),
+                request.pinned,
+            )
+            .await?,
+    ))
 }
 
 async fn require_operator_api_bearer(
@@ -168,18 +622,18 @@ where
 
 async fn policy<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
-) -> Json<ControlPlanePolicyResponse>
+) -> Result<Json<ControlPlanePolicyResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
     let config = state.plane.config();
-    Json(ControlPlanePolicyResponse {
+    Ok(Json(ControlPlanePolicyResponse {
         cluster_id: config.cluster_id.clone(),
         vpn_pool: config.vpn_pool,
-        cluster_policy: config.cluster_policy.clone(),
+        cluster_policy: state.plane.cluster_policy()?,
         generated_at: Utc::now(),
-    })
+    }))
 }
 
 async fn prometheus_metrics<S, L>(
@@ -748,6 +1202,8 @@ impl IntoResponse for ApiError {
             ControlPlaneError::NodeUpdateRejected { .. }
             | ControlPlaneError::NodeRegistrationRejected { .. } => StatusCode::FORBIDDEN,
             ControlPlaneError::NodeNotFound(_) => StatusCode::NOT_FOUND,
+            ControlPlaneError::PathNotFound { .. } => StatusCode::NOT_FOUND,
+            ControlPlaneError::InvalidClusterPolicy(_) => StatusCode::BAD_REQUEST,
             ControlPlaneError::VpnPoolExhausted | ControlPlaneError::Store(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -795,6 +1251,52 @@ mod tests {
     const OPERATOR_API_BEARER_TOKEN: &str = "control-plane-test-operator-token-32-bytes";
 
     use super::*;
+
+    #[test]
+    fn web_auth_config_derives_keycloak_and_cognito_endpoints() {
+        let keycloak = match WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "http://localhost:8080/realms/ipars".to_string(),
+            "ipars-web".to_string(),
+            None,
+            "openid profile email".to_string(),
+        ) {
+            Ok(config) => config,
+            Err(error) => panic!("keycloak config should be valid: {error}"),
+        };
+        let keycloak_config = keycloak.public_config();
+        assert_eq!(
+            keycloak_config.authorization_endpoint.as_deref(),
+            Some("http://localhost:8080/realms/ipars/protocol/openid-connect/auth")
+        );
+        let cognito = match WebUiAuthConfig::new(
+            WebAuthProvider::Cognito,
+            "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example".to_string(),
+            "ipars-web".to_string(),
+            Some("https://login.example.com".to_string()),
+            "openid".to_string(),
+        ) {
+            Ok(config) => config,
+            Err(error) => panic!("cognito config should be valid: {error}"),
+        };
+        let cognito_config = cognito.public_config();
+        assert_eq!(
+            cognito_config.authorization_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/authorize")
+        );
+        assert_eq!(
+            cognito_config.token_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/token")
+        );
+        assert!(WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "ftp://localhost/realm".to_string(),
+            "ipars-web".to_string(),
+            None,
+            "openid".to_string(),
+        )
+        .is_err());
+    }
 
     fn claims(cluster_id: ClusterId, issuer: NodeId, key_id: KeyId) -> JoinTokenClaims {
         let now = Utc::now();
@@ -1160,6 +1662,63 @@ mod tests {
         assert!(!policy.cluster_policy.allow_relay_fallback);
         assert_eq!(policy.cluster_policy.acl_rules.len(), 1);
         assert_eq!(policy.cluster_policy.acl_rules[0].id, "allow-edge");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/overview")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/overview")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let overview: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(overview["cluster_policy"]["allow_relay_fallback"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert!(String::from_utf8(body.to_vec())?.contains("IPARS Control"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/config")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let ui_config: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(ui_config["enabled"], true);
+        assert_eq!(ui_config["operator_token_enabled"], true);
 
         let request_body = JoinNodeRequest {
             token: issuer.sign_join_token(claims(

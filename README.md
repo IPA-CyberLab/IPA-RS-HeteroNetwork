@@ -60,6 +60,46 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SECURITY.md](docs/SECURI
 cargo test --locked --workspace
 ```
 
+## Web Management UI
+
+The control-plane daemon serves an operations UI at `/ui/`. It shows registered
+devices, health, selected paths, relay/candidate state, advertised routes, and
+the active ACL policy. The admin endpoints behind the UI are authenticated;
+node removal, path pinning, and policy updates are available from the browser.
+The UI is embedded in the Rust binary and does not require a Node.js build.
+
+OIDC is enabled by default with Keycloak:
+
+```bash
+IPARS_WEB_AUTH_PROVIDER=keycloak
+IPARS_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/ipars
+IPARS_WEB_OIDC_CLIENT_ID=ipars-web
+iparsd control-plane
+```
+
+Register `https://control-plane.example.com/ui/` as the public client redirect
+URI and enable Authorization Code with PKCE. The Keycloak client must allow the
+control-plane origin as a Web Origin. The default development issuer is
+`http://localhost:8080/realms/ipars`.
+
+To use Amazon Cognito, keep the issuer URL for token validation and set the
+hosted UI domain separately:
+
+```bash
+IPARS_WEB_AUTH_PROVIDER=cognito
+IPARS_WEB_OIDC_ISSUER_URL=https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example
+IPARS_WEB_OIDC_AUTH_BASE_URL=https://ipars.auth.us-east-1.amazoncognito.com
+IPARS_WEB_OIDC_CLIENT_ID=exampleclient
+iparsd control-plane
+```
+
+The Cognito app client must allow the same `/ui/` callback URL and use a
+public-client PKCE flow. `IPARS_WEB_UI_ENABLED=false` disables OIDC setup and
+the UI; an existing `IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN` or its
+file-backed variant can also be entered in the UI as an operator-token
+fallback. The OIDC access token is checked server-side through the configured
+provider userinfo endpoint before any `/v1/admin/*` request is handled.
+
 Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`:
 
 ```bash
