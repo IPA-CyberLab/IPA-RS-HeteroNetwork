@@ -1,6 +1,43 @@
 (function () {
   "use strict";
 
+  var ICONS = {
+    "layout-dashboard": '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+    server: '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+    network: '<rect width="6" height="6" x="3" y="3" rx="1"/><rect width="6" height="6" x="15" y="15" rx="1"/><path d="M9 6h3a3 3 0 0 1 3 3v6"/><path d="M15 18h-3a3 3 0 0 1-3-3V9"/>',
+    route: '<circle cx="6" cy="19" r="3"/><path d="M9 19h2a4 4 0 0 0 4-4V9a4 4 0 0 1 4-4h0"/><path d="m17 2 3 3-3 3"/>',
+    "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
+    "chevron-right": '<path d="m9 18 6-6-6-6"/>',
+    menu: '<line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/>',
+    "panel-left": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
+    "log-in": '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+    "log-out": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+    "refresh-cw": '<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>',
+    search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    filter: '<polygon points="22 3 2 3 10 12.5 10 19 14 21 14 12.5 22 3"/>',
+    "arrow-up-right": '<path d="M7 7h10v10"/><path d="M7 17 17 7"/>',
+    "arrow-down-right": '<path d="M7 7h10v10"/><path d="m7 7 10 10"/>',
+    "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m8 12 2.5 2.5L16 9"/>',
+    "circle-alert": '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
+    "alert-triangle": '<path d="m21.7 18-8.4-14a1.5 1.5 0 0 0-2.6 0L2.3 18A1.5 1.5 0 0 0 3.6 20h16.8a1.5 1.5 0 0 0 1.3-2Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+    x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+    pin: '<path d="M12 17v5"/><path d="M9 3h6l1 7 3 3H5l3-3z"/>',
+    "pin-off": '<path d="m2 2 20 20"/><path d="M9 3h6l1 7 2.4 2.4"/><path d="M5 13h14"/><path d="M12 17v5"/>',
+    "trash-2": '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/>',
+    plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+    save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>',
+    copy: '<rect width="13" height="13" x="9" y="9" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>',
+    activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    sliders: '<line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/>',
+    eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
+    "more-horizontal": '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+    wifi: '<path d="M5 13a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M12 20h.01"/>',
+    "route-off": '<path d="m2 2 20 20"/><path d="M9 3h4a3 3 0 0 1 3 3v1"/><path d="M15 15v1a3 3 0 0 1-3 3H9"/><path d="M5 13h6"/><path d="M19 13h3"/>',
+    "check-check": '<path d="m1 12 4 4L15 6"/><path d="m9 12 4 4L23 6"/>',
+    "external-link": '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>'
+  };
+
   var state = {
     config: null,
     overview: null,
@@ -9,11 +46,35 @@
       || "",
     activeView: "overview",
     selectedNodeId: null,
-    loading: false
+    loading: false,
+    sidebarCollapsed: localStorage.getItem("ipars_sidebar_collapsed") === "true",
+    mobileNavOpen: false,
+    filters: {
+      nodes: "",
+      nodeHealth: "all",
+      paths: "",
+      pathState: "all",
+      routes: "",
+      acl: ""
+    }
   };
 
   function $(id) {
     return document.getElementById(id);
+  }
+
+  function icon(name, size) {
+    var content = ICONS[name] || ICONS.activity;
+    var dimension = size || 16;
+    return '<svg aria-hidden="true" width="' + dimension + '" height="' + dimension
+      + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + content + "</svg>";
+  }
+
+  function decorateIcons(root) {
+    (root || document).querySelectorAll("[data-icon]").forEach(function (node) {
+      node.innerHTML = icon(node.dataset.icon);
+    });
   }
 
   function escapeHtml(value) {
@@ -27,48 +88,64 @@
 
   function shortId(value) {
     var text = String(value || "");
-    return text.length > 16 ? text.slice(0, 8) + "..." + text.slice(-6) : text || "-";
+    return text.length > 18 ? text.slice(0, 9) + "..." + text.slice(-5) : text || "-";
+  }
+
+  function initials(value) {
+    var text = String(value || "IP").replace(/[^a-zA-Z0-9]/g, "");
+    return (text.slice(0, 2) || "IP").toUpperCase();
   }
 
   function formatTime(value) {
     if (!value) return "-";
     var date = new Date(value);
-    return isNaN(date.getTime()) ? "-" : date.toLocaleString();
+    return isNaN(date.getTime()) ? "-" : date.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
   }
 
   function age(value) {
     if (!value) return "-";
-    var seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
+    var timestamp = new Date(value).getTime();
+    if (isNaN(timestamp)) return "-";
+    var seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
     if (seconds < 60) return seconds + "s ago";
     if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
-    return Math.floor(seconds / 3600) + "h ago";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago";
+    return Math.floor(seconds / 86400) + "d ago";
+  }
+
+  function pretty(value) {
+    return String(value || "unknown")
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, function (letter) { return letter.toUpperCase(); });
+  }
+
+  function statusClass(value) {
+    var text = String(value || "unknown").toLowerCase();
+    if (text.indexOf("unreachable") !== -1 || text === "offline" || text === "denied") return "unreachable";
+    if (text.indexOf("relay") !== -1) return "relay";
+    if (text.indexOf("degraded") !== -1 || text.indexOf("stale") !== -1) return "degraded";
+    if (text.indexOf("pinned") !== -1) return "pinned";
+    if (text.indexOf("direct") !== -1 || text.indexOf("connected") !== -1) return "direct";
+    if (text.indexOf("healthy") !== -1 || text === "online") return "healthy";
+    if (text.indexOf("nat") !== -1 || text.indexOf("ipv6") !== -1) return "info";
+    return "unknown";
+  }
+
+  function statusPill(value, label) {
+    return '<span class="status-pill ' + statusClass(value) + '">' + escapeHtml(label || pretty(value)) + "</span>";
   }
 
   function listTags(tags) {
     var values = Array.isArray(tags) ? tags : Object.keys(tags || {});
-    if (!values.length) return "<span class='muted'>None</span>";
-    return "<span class='tag-list'>" + values.map(function (tag) {
-      return "<span class='tag'>" + escapeHtml(tag) + "</span>";
+    if (!values.length) return '<span class="faint">None</span>';
+    return '<span class="tag-list">' + values.map(function (tag) {
+      return '<span class="tag">' + escapeHtml(tag) + "</span>";
     }).join("") + "</span>";
-  }
-
-  function stateClass(value) {
-    var text = String(value || "").toLowerCase();
-    if (text.indexOf("healthy") !== -1) return "healthy";
-    if (text.indexOf("degraded") !== -1) return "degraded";
-    if (text.indexOf("unhealthy") !== -1) return "unhealthy";
-    if (text.indexOf("relay") !== -1) return "relay";
-    if (text.indexOf("nat") !== -1) return "nat";
-    if (text.indexOf("ipv6") !== -1) return "ipv6";
-    if (text.indexOf("unreachable") !== -1) return "unreachable";
-    if (text.indexOf("direct") !== -1) return "direct";
-    return "unknown";
-  }
-
-  function statusPill(value) {
-    var text = String(value || "unknown").replace(/_/g, " ");
-    return "<span class='status-pill " + stateClass(value) + "'>"
-      + escapeHtml(text) + "</span>";
   }
 
   function setStatus(message, error) {
@@ -77,37 +154,44 @@
     node.classList.toggle("error", Boolean(error));
   }
 
-  function setConnection(online) {
-    var node = $("connection-state");
-    node.textContent = online ? "Connected" : "Offline";
-    node.className = "connection-state " + (online ? "online" : "offline");
+  function toast(message, type) {
+    var node = document.createElement("div");
+    node.className = "toast " + (type || "success");
+    node.innerHTML = icon(type === "error" ? "circle-alert" : "circle-check") + "<span>" + escapeHtml(message) + "</span>";
+    $("toast-root").appendChild(node);
+    setTimeout(function () { node.remove(); }, 3600);
   }
 
-  async function api(path, options) {
+  function setConnection(online) {
+    var node = $("connection-state");
+    node.className = "connection-state " + (online ? "online" : "offline");
+    node.innerHTML = '<span class="status-dot"></span><span>' + (online ? "Connected" : "Offline") + "</span>";
+  }
+
+  function api(path, options) {
     var request = options || {};
     var headers = new Headers(request.headers || {});
     headers.set("Accept", "application/json");
     if (state.token) headers.set("Authorization", "Bearer " + state.token);
-    if (request.body && !headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json");
-    }
-    var response = await fetch(path, Object.assign({}, request, { headers: headers }));
-    if (response.status === 401) {
-      clearSession();
-      showAuth("Your session expired. Sign in again.");
-      throw new Error("authentication required");
-    }
-    if (!response.ok) {
-      var message = response.status + " " + response.statusText;
-      try {
-        var body = await response.json();
-        if (body.error) message = body.error;
-      } catch (_) {
-        // Keep the HTTP status when the server did not return JSON.
+    if (request.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    return fetch(path, Object.assign({}, request, { headers: headers })).then(async function (response) {
+      if (response.status === 401) {
+        clearSession();
+        showAuth("Your session expired. Sign in again.");
+        throw new Error("authentication required");
       }
-      throw new Error(message);
-    }
-    return response.json();
+      if (!response.ok) {
+        var message = response.status + " " + response.statusText;
+        try {
+          var body = await response.json();
+          if (body.error) message = body.error;
+        } catch (_) {
+          // Keep the HTTP status when the server did not return JSON.
+        }
+        throw new Error(message);
+      }
+      return response.json();
+    });
   }
 
   function clearSession() {
@@ -120,13 +204,15 @@
     $("auth-panel").hidden = false;
     $("dashboard").hidden = true;
     $("auth-error").textContent = message || "";
-    $("auth-button").textContent = "Sign in";
+    $("auth-button").innerHTML = '<span class="account-avatar">A</span><span class="account-label">Sign in</span>';
+    setConnection(false);
+    closeMobileNav();
   }
 
   function showDashboard() {
     $("auth-panel").hidden = true;
     $("dashboard").hidden = false;
-    $("auth-button").textContent = "Sign out";
+    $("auth-button").innerHTML = '<span class="account-avatar">A</span><span class="account-label">Sign out</span>';
   }
 
   function randomBytes(length) {
@@ -141,39 +227,41 @@
     return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
   }
 
-  async function pkceChallenge(verifier) {
-    var digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-    return base64Url(new Uint8Array(digest));
-  }
-
-  async function startLogin() {
-    if (!state.config || !state.config.authorization_endpoint) return;
-    var verifier = base64Url(randomBytes(32));
-    var challenge = await pkceChallenge(verifier);
-    var loginState = base64Url(randomBytes(24));
-    sessionStorage.setItem("ipars_pkce_verifier", verifier);
-    sessionStorage.setItem("ipars_login_state", loginState);
-    var params = new URLSearchParams({
-      response_type: "code",
-      client_id: state.config.client_id,
-      redirect_uri: location.origin + "/ui/",
-      scope: state.config.scopes || "openid profile email",
-      state: loginState,
-      code_challenge: challenge,
-      code_challenge_method: "S256"
+  function pkceChallenge(verifier) {
+    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)).then(function (digest) {
+      return base64Url(new Uint8Array(digest));
     });
-    location.assign(state.config.authorization_endpoint + "?" + params.toString());
   }
 
-  async function exchangeCode() {
+  function startLogin() {
+    if (!state.config || !state.config.authorization_endpoint) return Promise.resolve();
+    var verifier = base64Url(randomBytes(32));
+    return pkceChallenge(verifier).then(function (challenge) {
+      var loginState = base64Url(randomBytes(24));
+      sessionStorage.setItem("ipars_pkce_verifier", verifier);
+      sessionStorage.setItem("ipars_login_state", loginState);
+      var params = new URLSearchParams({
+        response_type: "code",
+        client_id: state.config.client_id,
+        redirect_uri: location.origin + "/ui/",
+        scope: state.config.scopes || "openid profile email",
+        state: loginState,
+        code_challenge: challenge,
+        code_challenge_method: "S256"
+      });
+      location.assign(state.config.authorization_endpoint + "?" + params.toString());
+    });
+  }
+
+  function exchangeCode() {
     var query = new URLSearchParams(location.search);
     var code = query.get("code");
-    if (!code) return false;
+    if (!code) return Promise.resolve(false);
     if (query.get("state") !== sessionStorage.getItem("ipars_login_state")) {
-      throw new Error("OIDC state validation failed");
+      return Promise.reject(new Error("OIDC state validation failed"));
     }
     var verifier = sessionStorage.getItem("ipars_pkce_verifier");
-    if (!verifier) throw new Error("OIDC verifier is missing");
+    if (!verifier) return Promise.reject(new Error("OIDC verifier is missing"));
     var body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: state.config.client_id,
@@ -181,246 +269,285 @@
       redirect_uri: location.origin + "/ui/",
       code_verifier: verifier
     });
-    var response = await fetch(state.config.token_endpoint, {
+    return fetch(state.config.token_endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body
+    }).then(function (response) {
+      if (!response.ok) throw new Error("OIDC token exchange failed (" + response.status + ")");
+      return response.json();
+    }).then(function (tokens) {
+      if (!tokens.access_token) throw new Error("OIDC response did not include an access token");
+      state.token = tokens.access_token;
+      sessionStorage.setItem("ipars_access_token", state.token);
+      sessionStorage.removeItem("ipars_pkce_verifier");
+      sessionStorage.removeItem("ipars_login_state");
+      history.replaceState({}, document.title, location.origin + "/ui/");
+      return true;
     });
-    if (!response.ok) throw new Error("OIDC token exchange failed (" + response.status + ")");
-    var tokens = await response.json();
-    if (!tokens.access_token) throw new Error("OIDC response did not include an access token");
-    state.token = tokens.access_token;
-    sessionStorage.setItem("ipars_access_token", state.token);
-    sessionStorage.removeItem("ipars_pkce_verifier");
-    sessionStorage.removeItem("ipars_login_state");
-    history.replaceState({}, document.title, location.origin + "/ui/");
-    return true;
   }
 
-  async function loadConfig() {
-    var response = await fetch("/ui/config", { headers: { Accept: "application/json" } });
-    if (!response.ok) throw new Error("Unable to load UI configuration (" + response.status + ")");
-    state.config = await response.json();
-    $("oidc-login").hidden = !state.config.auth_enabled;
-    $("token-form").hidden = !state.config.operator_token_enabled;
-    if (state.config.provider) {
-      $("oidc-login").textContent = "Sign in with " + state.config.provider;
-    }
-    if (!state.config.enabled) {
-      $("auth-title").textContent = "Web UI is not configured";
-      $("auth-copy").textContent = "Enable the web UI and configure an operator bearer token or OIDC provider on the control-plane daemon.";
-    }
+  function loadConfig() {
+    return fetch("/ui/config", { headers: { Accept: "application/json" } }).then(function (response) {
+      if (!response.ok) throw new Error("Unable to load UI configuration (" + response.status + ")");
+      return response.json();
+    }).then(function (config) {
+      state.config = config;
+      $("oidc-login").hidden = !config.auth_enabled;
+      $("token-form").hidden = !config.operator_token_enabled;
+      if (config.provider) {
+        $("oidc-login").querySelector("span:last-child").textContent = "Sign in with " + pretty(config.provider);
+      }
+      if (!config.enabled) {
+        $("auth-title").textContent = "Web UI is not configured";
+        $("auth-copy").textContent = "Enable the web UI and configure an operator token or OIDC provider on the daemon.";
+      }
+    });
   }
 
-  async function loadOverview() {
-    if (!state.token) return;
+  function updateNavigationCounts() {
+    if (!state.overview) return;
+    var metrics = state.overview.metrics || {};
+    $("nav-node-count").textContent = metrics.node_count == null ? "-" : metrics.node_count;
+    $("nav-path-count").textContent = metrics.path_count == null ? "-" : metrics.path_count;
+    $("nav-rule-count").textContent = (state.overview.cluster_policy.acl_rules || []).length;
+  }
+
+  function loadOverview() {
+    if (!state.token || state.loading) return Promise.resolve();
     state.loading = true;
-    try {
-      state.overview = await api("/v1/admin/overview");
+    return api("/v1/admin/overview").then(function (overview) {
+      state.overview = overview;
       showDashboard();
       setConnection(true);
-      $("cluster-name").textContent = state.overview.cluster_id;
-      $("refresh-time").textContent = "Updated " + formatTime(state.overview.generated_at);
+      $("cluster-name").textContent = overview.cluster_id;
+      $("sidebar-cluster").textContent = overview.cluster_id;
+      $("refresh-time").textContent = "Updated " + formatTime(overview.generated_at);
+      updateNavigationCounts();
       renderView();
-    } catch (error) {
+    }).catch(function (error) {
       if (error.message !== "authentication required") setStatus(error.message, true);
-    } finally {
+    }).finally(function () {
       state.loading = false;
-    }
+    });
   }
 
-  function metricCard(label, value, note) {
-    return "<div class='metric-card'><div class='metric-label'>" + escapeHtml(label)
-      + "</div><div class='metric-value'>" + escapeHtml(value)
-      + "</div><div class='metric-note'>" + escapeHtml(note) + "</div></div>";
+  function metricCard(label, value, note, iconName, trend, trendClass) {
+    return '<article class="metric-card"><div class="metric-heading"><span>' + escapeHtml(label)
+      + '</span><span class="metric-icon">' + icon(iconName) + '</span></div><div class="metric-value">'
+      + escapeHtml(value) + '</div><div class="metric-note">' + escapeHtml(note)
+      + (trend ? '<span class="metric-trend ' + (trendClass || "") + '">' + trend + '</span>' : "")
+      + "</div></article>";
+  }
+
+  function nodeTableRows(entries, limit) {
+    var rows = (limit ? entries.slice(0, limit) : entries).map(function (entry) {
+      var node = entry.node;
+      var health = entry.health || {};
+      var label = shortId(node.node_id);
+      return '<tr class="' + (state.selectedNodeId === node.node_id ? "selected" : "") + '"><td><button class="primary-link" data-node-id="'
+        + escapeHtml(node.node_id) + '" type="button"><span class="table-primary"><span class="peer-avatar">'
+        + escapeHtml(initials(node.node_id)) + '</span><span><strong>' + escapeHtml(label)
+        + '</strong><small title="' + escapeHtml(node.node_id) + '">' + escapeHtml(node.node_id) + '</small></span></span></button></td><td class="mono">'
+        + escapeHtml(node.vpn_ip) + '</td><td>' + statusPill(health.state || "unknown") + '</td><td><span class="role-badge">'
+        + escapeHtml(node.role || "member") + '</span></td><td>' + listTags(node.tags) + '</td><td>'
+        + escapeHtml(node.relay_capability ? "Available" : "No") + '</td><td class="faint">' + escapeHtml(age(health.last_seen_at || node.registered_at)) + '</td><td><button class="detail-link" data-node-id="'
+        + escapeHtml(node.node_id) + '" type="button" aria-label="Open device details" title="Open device details">'
+        + icon("arrow-up-right") + "</button></td></tr>";
+    }).join("");
+    return rows || '<tr><td colspan="8"><div class="filter-empty"><strong>No devices found</strong><span>Try changing the search or status filter.</span></div></td></tr>';
+  }
+
+  function emptyState(title, message, iconName) {
+    return '<div class="empty-state-card">' + icon(iconName || "server") + '<strong>' + escapeHtml(title) + '</strong><p>' + escapeHtml(message) + "</p></div>";
   }
 
   function renderOverview() {
-    var metrics = state.overview.metrics;
-    var policy = state.overview.cluster_policy;
-    var paths = state.overview.paths || [];
+    var overview = state.overview;
+    var metrics = overview.metrics || {};
+    var policy = overview.cluster_policy || {};
+    var paths = overview.paths || [];
+    var nodes = overview.nodes || [];
+    var routeCount = nodes.reduce(function (total, entry) { return total + (entry.node.routes || []).length; }, 0);
     var counts = {};
-    paths.forEach(function (path) {
-      counts[path.selected_state] = (counts[path.selected_state] || 0) + 1;
+    paths.forEach(function (path) { counts[path.selected_state] = (counts[path.selected_state] || 0) + 1; });
+    var totalStates = paths.length || 1;
+    var stateRows = ["direct_public", "direct_ipv6", "direct_nat_traversal", "relay", "unreachable"].map(function (name) {
+      var count = counts[name] || 0;
+      var rowClass = name === "unreachable" ? "bad" : name === "relay" ? "warn" : "";
+      return '<div class="state-row ' + rowClass + '"><span class="state-name">' + escapeHtml(pretty(name))
+        + '</span><span class="state-bar"><span style="width:' + Math.max(count ? 3 : 0, Math.round((count / totalStates) * 100))
+        + '%"></span></span><span class="state-count">' + count + '</span></div>';
+    }).join("");
+    var recent = nodes.slice().sort(function (a, b) {
+      return new Date(b.health && b.health.last_seen_at || 0) - new Date(a.health && a.health.last_seen_at || 0);
     });
-    var totalStates = Object.values(counts).reduce(function (sum, value) {
-      return sum + value;
-    }, 0) || 1;
-    var stateRows = ["direct_public", "direct_ipv6", "direct_nat_traversal", "relay", "unreachable"]
-      .map(function (name) {
-        var count = counts[name] || 0;
-        var className = name === "unreachable" ? "bad" : name === "relay" ? "warn" : "";
-        return "<div class='state-row " + className + "'><span class='state-name'>"
-          + escapeHtml(name.replace(/_/g, " ")) + "</span><span class='state-bar'><span style='width:"
-          + Math.round((count / totalStates) * 100) + "%'></span></span><span class='state-count'>"
-          + count + "</span></div>";
-      }).join("");
-    var recentNodes = (state.overview.nodes || []).slice(0, 6);
-    var nodeRows = recentNodes.length ? recentNodes.map(function (entry) {
-      return "<tr><td class='primary-cell mono'>" + escapeHtml(shortId(entry.node.node_id))
-        + "</td><td>" + escapeHtml(entry.node.vpn_ip) + "</td><td>"
-        + escapeHtml(entry.node.role) + "</td><td>"
-        + statusPill(entry.health ? entry.health.state : "unknown") + "</td></tr>";
-    }).join("") : "<tr><td colspan='4' class='empty-state'>No devices registered.</td></tr>";
-    return "<div class='metric-grid'>"
-      + metricCard("Registered devices", metrics.node_count, metrics.healthy_node_count + " healthy")
-      + metricCard("Active paths", metrics.path_count, metrics.stale_path_count + " stale")
-      + metricCard("Relay candidates", metrics.relay_candidate_count, "Eligible relay nodes")
-      + metricCard("VPN addresses free", metrics.vpn_pool_available_count, metrics.vpn_pool_allocated_count + " allocated")
-      + "</div><div class='overview-grid'>"
-      + "<section class='section-panel'><div class='section-header'><div><h2>Path state</h2><p>Fresh path telemetry in the control plane.</p></div></div><div class='section-body'><div class='state-list'>"
-      + stateRows + "</div></div></section>"
-      + "<section class='section-panel'><div class='section-header'><div><h2>Policy posture</h2><p>Current runtime policy.</p></div></div><div class='section-body'><div class='checkbox-row'>"
-      + "<span class='status-pill " + (policy.allow_ipv6_direct ? "healthy" : "unhealthy") + "'>"
-      + (policy.allow_ipv6_direct ? "IPv6 direct on" : "IPv6 direct off") + "</span>"
-      + "<span class='status-pill " + (policy.allow_nat_traversal ? "healthy" : "unhealthy") + "'>"
-      + (policy.allow_nat_traversal ? "NAT traversal on" : "NAT traversal off") + "</span>"
-      + "<span class='status-pill " + (policy.allow_relay_fallback ? "healthy" : "unhealthy") + "'>"
-      + (policy.allow_relay_fallback ? "Relay fallback on" : "Relay fallback off") + "</span>"
-      + "</div><p class='muted' style='margin:18px 0 0'>Endpoint TTL "
-      + escapeHtml(policy.endpoint_candidate_ttl_seconds) + "s · Path TTL "
-      + escapeHtml(policy.path_state_ttl_seconds) + "s</p></div></section></div>"
-      + "<section class='section-panel'><div class='section-header'><div><h2>Devices</h2><p>Most recently registered nodes.</p></div><button class='button button-quiet button-small' data-navigate='nodes' type='button'>View all</button></div><div class='table-wrap'><table><thead><tr><th>Node</th><th>VPN IP</th><th>Role</th><th>Health</th></tr></thead><tbody>"
-      + nodeRows + "</tbody></table></div></section>";
+    var staleClass = metrics.stale_path_count ? "warn" : "";
+    var recentContent = recent.length
+      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
+      : emptyState("No devices registered", "Connect a device to see it here.", "server");
+    return '<div class="metric-grid">'
+      + metricCard("Devices", metrics.node_count || 0, (metrics.healthy_node_count || 0) + " healthy", "server", icon("circle-check") + (metrics.healthy_node_count || 0), "")
+      + metricCard("Connections", metrics.path_count || 0, (metrics.stale_path_count || 0) + " stale", "network", icon(metrics.stale_path_count ? "circle-alert" : "activity") + (metrics.stale_path_count || 0), staleClass)
+      + metricCard("Advertised routes", routeCount, "Across registered devices", "route", "", "")
+      + metricCard("Access rules", (policy.acl_rules || []).length, policy.allow_relay_fallback ? "Relay fallback enabled" : "Relay fallback disabled", "shield-check", "", "")
+      + '</div><div class="overview-grid"><section class="section-panel"><div class="section-header"><div><h2>Connection health</h2><p>Selected path distribution</p></div><span class="status-pill info">' + paths.length + ' paths</span></div><div class="section-body"><div class="state-list">'
+      + stateRows + '</div></div></section><section class="section-panel"><div class="section-header"><div><h2>Policy posture</h2><p>Runtime settings</p></div><button class="button button-secondary button-small" data-navigate="acl" type="button">Edit policy</button></div><div class="section-body"><div class="policy-summary">'
+      + '<div class="policy-summary-row"><span>IPv6 direct</span>' + statusPill(policy.allow_ipv6_direct ? "healthy" : "unreachable", policy.allow_ipv6_direct ? "Enabled" : "Disabled") + '</div>'
+      + '<div class="policy-summary-row"><span>NAT traversal</span>' + statusPill(policy.allow_nat_traversal ? "healthy" : "unreachable", policy.allow_nat_traversal ? "Enabled" : "Disabled") + '</div>'
+      + '<div class="policy-summary-row"><span>Relay fallback</span>' + statusPill(policy.allow_relay_fallback ? "healthy" : "unreachable", policy.allow_relay_fallback ? "Enabled" : "Disabled") + '</div>'
+      + '<div class="policy-summary-row"><span>Path state TTL</span><span class="policy-summary-value">' + escapeHtml(policy.path_state_ttl_seconds) + " seconds</span></div>"
+      + '</div></div></section></div><section class="section-panel"><div class="section-header"><div><h2>Recently seen devices</h2><p>Latest control-plane observations</p></div><button class="button button-secondary button-small" data-navigate="nodes" type="button">View all</button></div>'
+      + recentContent + "</section>";
+  }
+
+  function filteredNodes() {
+    var query = state.filters.nodes.toLowerCase();
+    var healthFilter = state.filters.nodeHealth;
+    return (state.overview.nodes || []).filter(function (entry) {
+      var node = entry.node;
+      var health = entry.health || {};
+      var haystack = [node.node_id, node.vpn_ip, node.role, (node.tags || []).join(" ")].join(" ").toLowerCase();
+      return (!query || haystack.indexOf(query) !== -1) && (healthFilter === "all" || statusClass(health.state) === healthFilter);
+    });
+  }
+
+  function tableToolbar(filterKey, placeholder, selectId, options, count) {
+    var select = selectId ? '<select id="' + selectId + '" class="select-field" data-filter="' + selectId + '">' + options.map(function (option) {
+      return '<option value="' + escapeHtml(option.value) + '" ' + (state.filters[selectId] === option.value ? "selected" : "") + '>' + escapeHtml(option.label) + "</option>";
+    }).join("") + "</select>" : "";
+    return '<div class="toolbar"><div class="toolbar-group"><label class="search-field"><span data-icon="search"></span><input type="search" data-filter="' + filterKey + '" value="' + escapeHtml(state.filters[filterKey]) + '" placeholder="' + escapeHtml(placeholder) + '" aria-label="' + escapeHtml(placeholder) + '"></label>' + select + '</div><span class="result-count">' + count + " results</span></div>";
   }
 
   function renderNodes() {
-    var entries = state.overview.nodes || [];
-    var selected = entries.find(function (entry) {
-      return entry.node.node_id === state.selectedNodeId;
+    var entries = filteredNodes();
+    var options = [
+      { value: "all", label: "All statuses" },
+      { value: "healthy", label: "Healthy" },
+      { value: "degraded", label: "Degraded" },
+      { value: "unreachable", label: "Unreachable" }
+    ];
+    var tableBody = entries.length
+      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(entries) + "</tbody></table></div>"
+      : emptyState("No devices found", "Try changing the search or status filter.", "server");
+    var table = '<section class="section-panel">' + tableToolbar("nodes", "Search devices", "nodeHealth", options, entries.length) + tableBody + "</section>";
+    return table;
+  }
+
+  function filteredPaths() {
+    var query = state.filters.paths.toLowerCase();
+    var pathFilter = state.filters.pathState;
+    return (state.overview.paths || []).filter(function (path) {
+      var haystack = [path.key.local, path.key.remote, path.selected_state, path.selected_candidate && path.selected_candidate.addr, path.relay_node].join(" ").toLowerCase();
+      return (!query || haystack.indexOf(query) !== -1) && (pathFilter === "all" || statusClass(path.selected_state) === pathFilter);
     });
-    var rows = entries.length ? entries.map(function (entry) {
-      var node = entry.node;
-      var health = entry.health;
-      return "<tr><td class='primary-cell'><button class='link-button mono' data-node-id='"
-        + escapeHtml(node.node_id) + "' type='button'>" + escapeHtml(shortId(node.node_id))
-        + "</button></td><td class='mono'>" + escapeHtml(node.vpn_ip) + "</td><td>"
-        + escapeHtml(node.role) + "</td><td>" + statusPill(health ? health.state : "unknown")
-        + "</td><td>" + listTags(node.tags) + "</td><td>"
-        + escapeHtml(node.relay_capability ? "Available" : "No") + "</td><td>"
-        + escapeHtml(formatTime(node.registered_at)) + "</td></tr>";
-    }).join("") : "<tr><td colspan='7' class='empty-state'>No devices registered.</td></tr>";
-    var detail = selected
-      ? "<aside class='detail-panel'><span class='eyebrow'>DEVICE DETAILS</span><h2 class='mono' style='margin-top:10px'>"
-        + escapeHtml(shortId(selected.node.node_id)) + "</h2><dl>"
-        + "<dt>Node ID</dt><dd class='mono'>" + escapeHtml(selected.node.node_id) + "</dd>"
-        + "<dt>VPN address</dt><dd class='mono'>" + escapeHtml(selected.node.vpn_ip) + "</dd>"
-        + "<dt>Role</dt><dd>" + escapeHtml(selected.node.role) + "</dd>"
-        + "<dt>Health</dt><dd>" + statusPill(selected.health ? selected.health.state : "unknown") + "</dd>"
-        + "<dt>Last seen</dt><dd>" + escapeHtml(selected.health ? formatTime(selected.health.last_seen_at) : "Never") + "</dd>"
-        + "<dt>Routes</dt><dd>" + selected.node.routes.length + "</dd>"
-        + "<dt class='detail-tags'>Tags</dt><dd class='detail-tags'>" + listTags(selected.node.tags) + "</dd>"
-        + "</dl><button class='button button-danger' data-remove-node='" + escapeHtml(selected.node.node_id) + "' type='button'>Remove device</button></aside>"
-      : "<aside class='detail-panel'><span class='eyebrow'>DEVICE DETAILS</span><p class='muted' style='margin-top:14px'>Select a device to inspect it.</p></aside>";
-    return "<div class='detail-layout'><section class='section-panel'><div class='section-header'><div><h2>Registered devices</h2><p>"
-      + entries.length + " device" + (entries.length === 1 ? "" : "s")
-      + " in this cluster.</p></div></div><div class='table-wrap'><table><thead><tr><th>Node</th><th>VPN IP</th><th>Role</th><th>Health</th><th>Tags</th><th>Relay</th><th>Registered</th></tr></thead><tbody>"
-      + rows + "</tbody></table></div></section>" + detail + "</div>";
   }
 
   function renderPaths() {
-    var paths = state.overview.paths || [];
-    var rows = paths.length ? paths.map(function (path) {
-      var label = path.key.local + "::" + path.key.remote;
-      return "<tr><td class='primary-cell mono'>" + escapeHtml(shortId(path.key.local))
-        + "</td><td class='mono'>" + escapeHtml(shortId(path.key.remote)) + "</td><td>"
-        + statusPill(path.selected_state) + "</td><td class='mono'>"
-        + escapeHtml(path.selected_candidate ? path.selected_candidate.addr : "-") + "</td><td class='mono'>"
-        + escapeHtml(path.relay_node ? shortId(path.relay_node) : "-") + "</td><td>"
-        + escapeHtml(path.score.value) + "</td><td>" + escapeHtml(age(path.updated_at))
-        + "</td><td><button class='pin-button " + (path.pinned ? "active" : "")
-        + "' data-pin-path='" + escapeHtml(label) + "' data-pinned='" + path.pinned
-        + "' type='button'>" + (path.pinned ? "Pinned" : "Pin") + "</button></td></tr>";
-    }).join("") : "<tr><td colspan='8' class='empty-state'>No path telemetry is available.</td></tr>";
-    return "<section class='section-panel'><div class='section-header'><div><h2>Connections</h2><p>Selected path, endpoint, relay, and score from node telemetry.</p></div></div><div class='table-wrap'><table><thead><tr><th>Local</th><th>Remote</th><th>State</th><th>Candidate</th><th>Relay</th><th>Score</th><th>Updated</th><th>Control</th></tr></thead><tbody>"
-      + rows + "</tbody></table></div></section>";
+    var paths = filteredPaths();
+    var options = [
+      { value: "all", label: "All states" },
+      { value: "direct", label: "Direct" },
+      { value: "relay", label: "Relay" },
+      { value: "degraded", label: "Degraded" },
+      { value: "unreachable", label: "Unreachable" }
+    ];
+    var rows = paths.map(function (path) {
+      var local = path.key.local;
+      var remote = path.key.remote;
+      var candidate = path.selected_candidate && path.selected_candidate.addr;
+      var score = path.score && path.score.value;
+      return '<tr><td><span class="table-primary"><span class="peer-avatar cyan">' + escapeHtml(initials(local)) + '</span><span><strong class="mono">' + escapeHtml(shortId(local)) + '</strong><small title="' + escapeHtml(local) + '">' + escapeHtml(local) + '</small></span></span></td><td><span class="table-primary"><span class="peer-avatar">' + escapeHtml(initials(remote)) + '</span><span><strong class="mono">' + escapeHtml(shortId(remote)) + '</strong><small title="' + escapeHtml(remote) + '">' + escapeHtml(remote) + '</small></span></span></td><td>' + statusPill(path.selected_state) + '</td><td class="mono">' + escapeHtml(candidate || "-") + '</td><td class="mono">' + escapeHtml(path.relay_node ? shortId(path.relay_node) : "-") + '</td><td class="mono">' + escapeHtml(score == null ? "-" : score) + '</td><td class="faint">' + escapeHtml(age(path.updated_at)) + '</td><td><button class="pin-button ' + (path.pinned ? "active" : "") + '" data-pin-local="' + escapeHtml(local) + '" data-pin-remote="' + escapeHtml(remote) + '" data-pinned="' + path.pinned + '" type="button">' + icon(path.pinned ? "pin-off" : "pin") + '<span>' + (path.pinned ? "Unpin" : "Pin") + '</span></button></td></tr>';
+    }).join("");
+    var tableBody = paths.length
+      ? '<div class="table-wrap"><table><thead><tr><th>Local device</th><th>Remote device</th><th>State</th><th>Endpoint</th><th>Relay</th><th>Score</th><th>Updated</th><th>Control</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+      : emptyState("No connections found", "Try changing the search or state filter.", "network");
+    return '<section class="section-panel"><div class="section-header"><div><h2>Connections</h2><p>Selected endpoint, relay, score, and operator pin state</p></div></div>'
+      + tableToolbar("paths", "Search by node or endpoint", "pathState", options, paths.length)
+      + tableBody + "</section>";
+  }
+
+  function allRoutes() {
+    var routes = [];
+    (state.overview.nodes || []).forEach(function (entry) {
+      (entry.node.routes || []).forEach(function (route) { routes.push({ node: entry.node, route: route }); });
+    });
+    return routes;
   }
 
   function renderRoutes() {
-    var routes = [];
-    (state.overview.nodes || []).forEach(function (entry) {
-      (entry.node.routes || []).forEach(function (route) {
-        routes.push({ node: entry.node, route: route });
-      });
+    var query = state.filters.routes.toLowerCase();
+    var routes = allRoutes().filter(function (item) {
+      return !query || [item.route.id, item.route.cidr, item.node.node_id, item.node.role, (item.node.tags || []).join(" ")].join(" ").toLowerCase().indexOf(query) !== -1;
     });
-    var rows = routes.length ? routes.map(function (item) {
-      return "<tr><td class='primary-cell mono'>" + escapeHtml(item.route.id || "-")
-        + "</td><td class='mono'>" + escapeHtml(item.route.cidr || "-") + "</td><td class='mono'>"
-        + escapeHtml(shortId(item.node.node_id)) + "</td><td>" + escapeHtml(item.node.role)
-        + "</td><td>" + listTags(item.node.tags) + "</td></tr>";
-    }).join("") : "<tr><td colspan='5' class='empty-state'>No advertised routes.</td></tr>";
-    return "<section class='section-panel'><div class='section-header'><div><h2>Advertised routes</h2><p>Routes currently owned by registered devices.</p></div></div><div class='table-wrap'><table><thead><tr><th>Route</th><th>Network</th><th>Advertised by</th><th>Role</th><th>Tags</th></tr></thead><tbody>"
-      + rows + "</tbody></table></div></section>";
+    var rows = routes.map(function (item) {
+      return '<tr><td class="mono route-id">' + escapeHtml(item.route.id || "-") + '</td><td class="route-network">' + escapeHtml(item.route.cidr || "-") + '</td><td><button class="primary-link" data-node-id="' + escapeHtml(item.node.node_id) + '" type="button"><span class="route-owner">' + escapeHtml(shortId(item.node.node_id)) + '</span></button></td><td><span class="role-badge">' + escapeHtml(item.node.role || "member") + '</span></td><td>' + listTags(item.node.tags) + '</td><td><span class="status-pill info">Advertised</span></td></tr>';
+    }).join("");
+    var tableBody = routes.length
+      ? '<div class="table-wrap"><table><thead><tr><th>Route ID</th><th>Network</th><th>Advertised by</th><th>Role</th><th>Tags</th><th>Status</th></tr></thead><tbody>' + rows + "</tbody></table></div>"
+      : emptyState("No routes found", "Registered devices have not advertised a matching route.", "route");
+    return '<section class="section-panel"><div class="section-header"><div><h2>Network routes</h2><p>Networks advertised by registered devices</p></div><span class="status-pill info">' + routes.length + " routes</span></div>"
+      + tableToolbar("routes", "Search routes or owners", null, [], routes.length)
+      + tableBody + "</section>";
   }
 
   function csvValues(value) {
-    return String(value || "").split(",").map(function (item) {
-      return item.trim();
-    }).filter(Boolean);
+    return String(value || "").split(",").map(function (item) { return item.trim(); }).filter(Boolean);
   }
 
   function ruleField(index, field, value, label, wide) {
-    return "<div class='form-field " + (wide ? "wide" : "") + "'><label for='rule-"
-      + index + "-" + field + "'>" + label + "</label><input id='rule-" + index + "-"
-      + field + "' data-rule-index='" + index + "' data-rule-field='" + field + "' value='"
-      + escapeHtml((value || []).join(", ")) + "' placeholder='Comma separated'></div>";
+    return '<div class="form-field ' + (wide ? "wide" : "") + '"><label for="rule-' + index + '-' + field + '">' + label + '</label><input id="rule-' + index + '-' + field + '" data-rule-index="' + index + '" data-rule-field="' + field + '" value="' + escapeHtml((value || []).join(", ")) + '" placeholder="Comma separated"></div>';
+  }
+
+  function renderRule(rule, index) {
+    var protocols = ["any", "tcp", "udp", "icmp", "icmpv6", "sctp"];
+    var protocolOptions = protocols.map(function (protocol) {
+      return '<option value="' + protocol + '" ' + (rule.protocol === protocol ? "selected" : "") + '>' + protocol.toUpperCase() + "</option>";
+    }).join("");
+    return '<article class="rule-editor"><div class="rule-heading"><div class="rule-title"><span class="rule-number">' + (index + 1) + '</span><strong>' + escapeHtml(rule.id || "Unnamed rule") + '</strong><span class="status-pill ' + (rule.action === "deny" ? "denied" : "healthy") + '">' + escapeHtml(rule.action || "allow") + '</span></div><div class="rule-actions"><button class="icon-text-button danger" data-delete-rule="' + index + '" type="button">' + icon("trash-2") + '<span>Delete</span></button></div></div><div class="form-grid">'
+      + '<div class="form-field"><label for="rule-' + index + '-id">Rule ID</label><input id="rule-' + index + '-id" data-rule-index="' + index + '" data-rule-field="id" value="' + escapeHtml(rule.id || "") + '"></div>'
+      + '<div class="form-field"><label for="rule-' + index + '-action">Action</label><select id="rule-' + index + '-action" data-rule-index="' + index + '" data-rule-field="action"><option value="allow" ' + (rule.action === "allow" ? "selected" : "") + '>Allow</option><option value="deny" ' + (rule.action === "deny" ? "selected" : "") + '>Deny</option></select></div>'
+      + '<div class="form-field"><label for="rule-' + index + '-protocol">Protocol</label><select id="rule-' + index + '-protocol" data-rule-index="' + index + '" data-rule-field="protocol">' + protocolOptions + "</select></div>"
+      + ruleField(index, "from_roles", rule.from_roles, "From roles", false)
+      + ruleField(index, "from_tags", rule.from_tags, "From tags", false)
+      + ruleField(index, "to_roles", rule.to_roles, "To roles", false)
+      + ruleField(index, "to_tags", rule.to_tags, "To tags", false)
+      + ruleField(index, "routes", rule.routes, "Routes (CIDR)", true)
+      + "</div></article>";
   }
 
   function renderAcl() {
-    var policy = state.overview.cluster_policy;
+    var policy = state.overview.cluster_policy || {};
     var rules = policy.acl_rules || [];
-    var ruleEditors = rules.map(function (rule, index) {
-      var protocols = ["any", "tcp", "udp", "icmp", "icmpv6", "sctp"];
-      var protocolOptions = protocols.map(function (protocol) {
-        return "<option value='" + protocol + "' " + (rule.protocol === protocol ? "selected" : "")
-          + ">" + protocol + "</option>";
-      }).join("");
-      return "<div class='section-body' style='border-top:1px solid var(--border)'><div class='form-grid'>"
-        + "<div class='form-field'><label for='rule-" + index + "-id'>Rule ID</label><input id='rule-"
-        + index + "-id' data-rule-index='" + index + "' data-rule-field='id' value='"
-        + escapeHtml(rule.id) + "'></div>"
-        + "<div class='form-field'><label for='rule-" + index + "-action'>Action</label><select id='rule-"
-        + index + "-action' data-rule-index='" + index + "' data-rule-field='action'><option value='allow' "
-        + (rule.action === "allow" ? "selected" : "") + ">Allow</option><option value='deny' "
-        + (rule.action === "deny" ? "selected" : "") + ">Deny</option></select></div>"
-        + "<div class='form-field'><label for='rule-" + index + "-protocol'>Protocol</label><select id='rule-"
-        + index + "-protocol' data-rule-index='" + index + "' data-rule-field='protocol'>"
-        + protocolOptions + "</select></div>"
-        + ruleField(index, "from_roles", rule.from_roles, "From roles", false)
-        + ruleField(index, "from_tags", rule.from_tags, "From tags", false)
-        + ruleField(index, "to_roles", rule.to_roles, "To roles", false)
-        + ruleField(index, "to_tags", rule.to_tags, "To tags", false)
-        + ruleField(index, "routes", rule.routes, "Routes (CIDR)", true)
-        + "<div class='form-field' style='align-self:end'><button class='button button-danger button-small' data-delete-rule='"
-        + index + "' type='button'>Delete rule</button></div></div></div>";
-    }).join("");
-    return "<section class='section-panel'><div class='section-header'><div><h2>Access control policy</h2><p>Changes apply to newly generated peer maps and path validation.</p></div><button class='button button-primary button-small' id='save-policy' type='button'>Save policy</button></div><div class='section-body'><div class='checkbox-row'>"
-      + "<label class='checkbox-label'><input type='checkbox' data-policy-boolean='allow_ipv6_direct' "
-      + (policy.allow_ipv6_direct ? "checked" : "") + "> IPv6 direct</label>"
-      + "<label class='checkbox-label'><input type='checkbox' data-policy-boolean='allow_nat_traversal' "
-      + (policy.allow_nat_traversal ? "checked" : "") + "> NAT traversal</label>"
-      + "<label class='checkbox-label'><input type='checkbox' data-policy-boolean='allow_relay_fallback' "
-      + (policy.allow_relay_fallback ? "checked" : "") + "> Relay fallback</label></div>"
-      + "<div class='form-grid' style='margin-top:17px'><div class='form-field'><label for='idle-timeout'>Idle timeout (seconds)</label><input id='idle-timeout' type='number' min='1' value='"
-      + escapeHtml(policy.idle_timeout_seconds) + "'></div><div class='form-field'><label for='endpoint-ttl'>Endpoint TTL (seconds)</label><input id='endpoint-ttl' type='number' min='1' value='"
-      + escapeHtml(policy.endpoint_candidate_ttl_seconds) + "'></div><div class='form-field'><label for='path-ttl'>Path TTL (seconds)</label><input id='path-ttl' type='number' min='1' value='"
-      + escapeHtml(policy.path_state_ttl_seconds) + "'></div></div></div></section>"
-      + "<section class='section-panel'><div class='section-header'><div><h2>ACL rules</h2><p>Each rule can match roles, tags, routes, and protocol.</p></div><button class='button button-quiet button-small' id='add-rule' type='button'>Add rule</button></div>"
-      + (ruleEditors || "<div class='empty-state'>No explicit ACL rules. Add one to override the default posture.</div>")
-      + "</section>";
+    var filteredRules = rules.filter(function (rule) {
+      var query = state.filters.acl.toLowerCase();
+      return !query || [rule.id, rule.action, rule.protocol, (rule.from_roles || []).join(" "), (rule.from_tags || []).join(" "), (rule.to_roles || []).join(" "), (rule.to_tags || []).join(" "), (rule.routes || []).join(" ")].join(" ").toLowerCase().indexOf(query) !== -1;
+    });
+    var ruleMarkup = filteredRules.map(function (rule) { return renderRule(rule, rules.indexOf(rule)); }).join("");
+    if (!ruleMarkup) ruleMarkup = '<div class="empty-state-card">' + icon("shield-check") + '<strong>No matching access rules</strong><p>Use Add rule to define a new policy entry.</p></div>';
+    return '<div class="access-layout"><section class="section-panel policy-controls"><div class="section-header"><div><h2>Policy settings</h2><p>Runtime connectivity posture</p></div><span class="status-pill info">' + rules.length + ' rules</span></div><div class="section-body"><div class="toggle-list">'
+      + toggleRow("allow_ipv6_direct", "IPv6 direct", "Permit direct IPv6 candidates", policy.allow_ipv6_direct)
+      + toggleRow("allow_nat_traversal", "NAT traversal", "Use endpoint discovery and traversal", policy.allow_nat_traversal)
+      + toggleRow("allow_relay_fallback", "Relay fallback", "Use relay when direct paths fail", policy.allow_relay_fallback)
+      + '</div><div class="policy-numbers"><div class="form-field"><label for="idle-timeout">Idle timeout (seconds)</label><input id="idle-timeout" type="number" min="1" value="' + escapeHtml(policy.idle_timeout_seconds) + '"></div><div class="form-field"><label for="endpoint-ttl">Endpoint TTL (seconds)</label><input id="endpoint-ttl" type="number" min="1" value="' + escapeHtml(policy.endpoint_candidate_ttl_seconds) + '"></div><div class="form-field"><label for="path-ttl">Path TTL (seconds)</label><input id="path-ttl" type="number" min="1" value="' + escapeHtml(policy.path_state_ttl_seconds) + '"></div></div><div class="form-actions"><button class="button button-primary" id="save-policy" type="button">' + icon("save") + '<span>Save policy</span></button></div></div></section><section class="section-panel"><div class="section-header"><div><h2>Access rules</h2><p>Match identities, tags, routes, and protocol</p></div><div class="section-header-actions"><label class="search-field"><span data-icon="search"></span><input type="search" data-filter="acl" value="' + escapeHtml(state.filters.acl) + '" placeholder="Filter rules" aria-label="Filter access rules"></label><button class="button button-secondary button-small" id="add-rule" type="button">' + icon("plus") + '<span>Add rule</span></button></div></div><div class="rule-list">' + ruleMarkup + "</div></section></div>";
+  }
+
+  function toggleRow(field, label, description, checked) {
+    return '<label class="toggle-row"><span class="toggle-copy"><strong>' + label + '</strong><small>' + description + '</small></span><span><input class="switch-input" type="checkbox" data-policy-boolean="' + field + '" ' + (checked ? "checked" : "") + '><span class="switch"></span></span></label>';
   }
 
   function renderView() {
     if (!state.overview) return;
     var metadata = {
-      overview: ["Overview", "Live state from the IPARS control plane."],
-      nodes: ["Devices", "Registered nodes, health, identity, and relay capability."],
-      paths: ["Connections", "Selected path telemetry and operator pin state."],
-      routes: ["Routes", "Advertised network routes and their owners."],
-      acl: ["Access control", "Runtime connectivity policy and ACL rules."]
+      overview: ["Overview", "Network health at a glance."],
+      nodes: ["Devices", "Registered nodes and their current health."],
+      paths: ["Connections", "Selected paths and operator controls."],
+      routes: ["Network routes", "Advertised networks and their owners."],
+      acl: ["Access control", "Runtime connectivity policy and rules."]
     }[state.activeView];
     $("view-title").textContent = metadata[0];
     $("view-subtitle").textContent = metadata[1];
+    $("breadcrumb-current").textContent = metadata[0];
     $("view-content").innerHTML = {
       overview: renderOverview,
       nodes: renderNodes,
@@ -430,6 +557,54 @@
     }[state.activeView]();
     document.querySelectorAll(".nav-button").forEach(function (button) {
       button.classList.toggle("active", button.dataset.view === state.activeView);
+    });
+    decorateIcons($("view-content"));
+  }
+
+  function findNode(nodeId) {
+    return (state.overview.nodes || []).find(function (entry) { return entry.node.node_id === nodeId; });
+  }
+
+  function openNodeDrawer(nodeId) {
+    var entry = findNode(nodeId);
+    if (!entry) return;
+    var node = entry.node;
+    var health = entry.health || {};
+    var paths = (state.overview.paths || []).filter(function (path) { return path.key.local === nodeId || path.key.remote === nodeId; });
+    var routes = node.routes || [];
+    state.selectedNodeId = nodeId;
+    $("drawer-root").innerHTML = '<div class="drawer-backdrop" data-close-drawer></div><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><header class="drawer-header"><div><h2 id="drawer-title">Device details</h2><span class="drawer-subtitle">Registered node</span></div><button class="drawer-close" data-close-drawer type="button" aria-label="Close device details" title="Close">' + icon("x") + '</button></header><div class="drawer-body"><div class="drawer-identity"><span class="peer-avatar">' + escapeHtml(initials(node.node_id)) + '</span><div><strong>' + escapeHtml(shortId(node.node_id)) + '</strong><small>' + escapeHtml(node.node_id) + '</small></div></div><div class="drawer-section" style="border-top:0;margin-top:0;padding-top:0"><span class="status-pill ' + statusClass(health.state) + '">' + escapeHtml(pretty(health.state || "unknown")) + '</span></div><dl class="detail-list"><dt>VPN address</dt><dd class="mono">' + escapeHtml(node.vpn_ip) + '</dd><dt>Role</dt><dd>' + escapeHtml(node.role || "member") + '</dd><dt>Last seen</dt><dd>' + escapeHtml(formatTime(health.last_seen_at)) + '</dd><dt>Registered</dt><dd>' + escapeHtml(formatTime(node.registered_at)) + '</dd><dt>Relay capability</dt><dd>' + escapeHtml(node.relay_capability ? "Available" : "No") + '</dd><dt>Connections</dt><dd>' + paths.length + '</dd></dl><div class="drawer-section"><h3>Tags</h3>' + listTags(node.tags) + '</div><div class="drawer-section"><h3>Advertised routes</h3>' + (routes.length ? '<div class="chip-list">' + routes.map(function (route) { return '<span class="tag mono">' + escapeHtml(route.cidr) + '</span>'; }).join("") + '</div>' : '<span class="faint">None</span>') + '</div><div class="drawer-actions"><button class="button button-danger" data-remove-node="' + escapeHtml(node.node_id) + '" type="button">' + icon("trash-2") + '<span>Remove device</span></button></div></div></aside>';
+    decorateIcons($("drawer-root"));
+  }
+
+  function closeDrawer() {
+    state.selectedNodeId = null;
+    $("drawer-root").innerHTML = "";
+    if (state.overview) renderView();
+  }
+
+  function removeNode(nodeId) {
+    if (!window.confirm("Remove device " + shortId(nodeId) + " from this cluster?")) return;
+    return api("/v1/admin/nodes/" + encodeURIComponent(nodeId), { method: "DELETE" }).then(function () {
+      closeDrawer();
+      toast("Device removed.");
+      return loadOverview();
+    }).catch(function (error) {
+      setStatus(error.message, true);
+      toast(error.message, "error");
+    });
+  }
+
+  function pinPath(local, remote, pinned) {
+    return api("/v1/admin/paths/" + encodeURIComponent(local) + "/" + encodeURIComponent(remote) + "/pin", {
+      method: "POST",
+      body: JSON.stringify({ pinned: pinned })
+    }).then(function () {
+      toast(pinned ? "Path pinned." : "Path unpinned.");
+      return loadOverview();
+    }).catch(function (error) {
+      setStatus(error.message, true);
+      toast(error.message, "error");
     });
   }
 
@@ -448,51 +623,26 @@
     var field = input.dataset.ruleField;
     var rule = state.overview.cluster_policy.acl_rules[index];
     if (!rule) return;
-    rule[field] = ["from_roles", "from_tags", "to_roles", "to_tags", "routes"].indexOf(field) !== -1
-      ? csvValues(input.value) : input.value;
+    rule[field] = ["from_roles", "from_tags", "to_roles", "to_tags", "routes"].indexOf(field) !== -1 ? csvValues(input.value) : input.value;
   }
 
-  async function savePolicy() {
+  function savePolicy() {
     updatePolicyFromForm();
+    var button = $("save-policy");
+    if (button) button.disabled = true;
     setStatus("Saving policy...");
-    try {
-      var response = await api("/v1/admin/policy", {
-        method: "PUT",
-        body: JSON.stringify({ cluster_policy: state.overview.cluster_policy })
-      });
+    return api("/v1/admin/policy", { method: "PUT", body: JSON.stringify({ cluster_policy: state.overview.cluster_policy }) }).then(function (response) {
       state.overview.cluster_policy = response.cluster_policy;
-      setStatus("Policy saved.");
+      setStatus("");
+      toast("Policy saved.");
       renderView();
-    } catch (error) {
+      updateNavigationCounts();
+    }).catch(function (error) {
       setStatus(error.message, true);
-    }
-  }
-
-  async function removeNode(nodeId) {
-    if (!confirm("Remove device " + shortId(nodeId) + " from this cluster?")) return;
-    try {
-      await api("/v1/admin/nodes/" + encodeURIComponent(nodeId), { method: "DELETE" });
-      state.selectedNodeId = null;
-      setStatus("Device removed.");
-      await loadOverview();
-    } catch (error) {
-      setStatus(error.message, true);
-    }
-  }
-
-  async function pinPath(label, pinned) {
-    var parts = label.split("::");
-    try {
-      await api("/v1/admin/paths/" + encodeURIComponent(parts[0]) + "/"
-        + encodeURIComponent(parts[1]) + "/pin", {
-          method: "POST",
-          body: JSON.stringify({ pinned: pinned })
-        });
-      setStatus(pinned ? "Path pinned." : "Path unpinned.");
-      await loadOverview();
-    } catch (error) {
-      setStatus(error.message, true);
-    }
+      toast(error.message, "error");
+    }).finally(function () {
+      if (button) button.disabled = false;
+    });
   }
 
   function addRule() {
@@ -506,13 +656,14 @@
       protocol: "any",
       action: "allow"
     });
-    setStatus("Rule added locally. Save policy to apply it.");
+    state.filters.acl = "";
+    toast("Rule added locally.");
     renderView();
   }
 
   function deleteRule(index) {
     state.overview.cluster_policy.acl_rules.splice(index, 1);
-    setStatus("Rule deleted locally. Save policy to apply the change.");
+    toast("Rule deleted locally. Save policy to apply it.");
     renderView();
   }
 
@@ -522,20 +673,60 @@
     clearSession();
     if (logoutEndpoint && state.config.client_id) {
       var params = new URLSearchParams({ client_id: state.config.client_id });
-      if (provider === "cognito") params.set("logout_uri", location.origin + "/ui/");
-      else params.set("post_logout_redirect_uri", location.origin + "/ui/");
+      params.set(provider === "cognito" ? "logout_uri" : "post_logout_redirect_uri", location.origin + "/ui/");
       location.assign(logoutEndpoint + "?" + params.toString());
       return;
     }
     showAuth("");
-    setConnection(false);
+  }
+
+  function closeMobileNav() {
+    state.mobileNavOpen = false;
+    $("sidebar").classList.remove("mobile-open");
+    $("mobile-backdrop").hidden = true;
+  }
+
+  function toggleMobileNav() {
+    state.mobileNavOpen = !state.mobileNavOpen;
+    $("sidebar").classList.toggle("mobile-open", state.mobileNavOpen);
+    $("mobile-backdrop").hidden = !state.mobileNavOpen;
+  }
+
+  function toggleSidebar() {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    document.documentElement.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+    localStorage.setItem("ipars_sidebar_collapsed", state.sidebarCollapsed);
+    $("sidebar-toggle").setAttribute("aria-label", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
+    $("sidebar-toggle").setAttribute("title", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
+  }
+
+  function handleFilterInput(input) {
+    var key = input.dataset.filter;
+    if (!key || !(key in state.filters)) return;
+    var cursor = input.selectionStart;
+    state.filters[key] = input.value;
+    renderView();
+    var replacement = document.querySelector('[data-filter="' + key + '"]');
+    if (replacement) {
+      replacement.focus();
+      try { replacement.setSelectionRange(cursor, cursor); } catch (_) { /* Search inputs may not expose a selection. */ }
+    }
   }
 
   document.addEventListener("input", function (event) {
+    if (event.target.matches("[data-filter]")) {
+      handleFilterInput(event.target);
+      return;
+    }
     if (event.target.matches("[data-rule-index][data-rule-field]")) updateRuleField(event.target);
   });
 
   document.addEventListener("change", function (event) {
+    if (event.target.matches("[data-filter]")) {
+      state.filters[event.target.dataset.filter] = event.target.value;
+      renderView();
+      return;
+    }
     if (event.target.matches("[data-rule-index][data-rule-field]")) updateRuleField(event.target);
   });
 
@@ -543,6 +734,7 @@
     var nav = event.target.closest("[data-view]");
     if (nav) {
       state.activeView = nav.dataset.view;
+      closeMobileNav();
       renderView();
       return;
     }
@@ -554,8 +746,11 @@
     }
     var node = event.target.closest("[data-node-id]");
     if (node) {
-      state.selectedNodeId = node.dataset.nodeId;
-      renderView();
+      openNodeDrawer(node.dataset.nodeId);
+      return;
+    }
+    if (event.target.closest("[data-close-drawer]")) {
+      closeDrawer();
       return;
     }
     var remove = event.target.closest("[data-remove-node]");
@@ -563,9 +758,9 @@
       removeNode(remove.dataset.removeNode);
       return;
     }
-    var pin = event.target.closest("[data-pin-path]");
+    var pin = event.target.closest("[data-pin-local]");
     if (pin) {
-      pinPath(pin.dataset.pinPath, pin.dataset.pinned !== "true");
+      pinPath(pin.dataset.pinLocal, pin.dataset.pinRemote, pin.dataset.pinned !== "true");
       return;
     }
     var deleteButton = event.target.closest("[data-delete-rule]");
@@ -573,22 +768,39 @@
       deleteRule(Number(deleteButton.dataset.deleteRule));
       return;
     }
-    if (event.target.closest("#refresh-button")) loadOverview();
-    if (event.target.closest("#save-policy")) savePolicy();
-    if (event.target.closest("#add-rule")) addRule();
+    if (event.target.closest("#refresh-button") || event.target.closest("#refresh-button-top")) {
+      loadOverview();
+      return;
+    }
+    if (event.target.closest("#save-policy")) {
+      savePolicy();
+      return;
+    }
+    if (event.target.closest("#add-rule")) {
+      addRule();
+      return;
+    }
+    if (event.target.closest("#mobile-menu")) {
+      toggleMobileNav();
+      return;
+    }
+    if (event.target.closest("#sidebar-toggle")) {
+      toggleSidebar();
+      return;
+    }
   });
 
   $("oidc-login").addEventListener("click", function () {
     startLogin().catch(function (error) { $("auth-error").textContent = error.message; });
   });
 
-  $("token-form").addEventListener("submit", async function (event) {
+  $("token-form").addEventListener("submit", function (event) {
     event.preventDefault();
     var token = $("operator-token").value.trim();
     if (!token) return;
     state.token = token;
     sessionStorage.setItem("ipars_operator_token", token);
-    await loadOverview();
+    loadOverview();
   });
 
   $("auth-button").addEventListener("click", function () {
@@ -596,23 +808,24 @@
     else showAuth("");
   });
 
-  async function bootstrap() {
-    try {
-      await loadConfig();
-      var exchanged = await exchangeCode();
-      if (!state.token && !exchanged) {
-        showAuth("");
-        return;
-      }
-      await loadOverview();
-    } catch (error) {
-      showAuth(error.message);
-      setConnection(false);
-    }
-  }
+  document.documentElement.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  decorateIcons(document);
+  $("sidebar-toggle").setAttribute("aria-label", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
+  $("sidebar-toggle").setAttribute("title", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
 
   setInterval(function () {
     if (state.token && !state.loading) loadOverview();
   }, 10000);
-  bootstrap();
+
+  loadConfig().then(function () {
+    return exchangeCode();
+  }).then(function (exchanged) {
+    if (!state.token && !exchanged) {
+      showAuth("");
+      return;
+    }
+    return loadOverview();
+  }).catch(function (error) {
+    showAuth(error.message);
+  });
 })();

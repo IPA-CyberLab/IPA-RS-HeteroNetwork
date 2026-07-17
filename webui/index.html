@@ -4,82 +4,102 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#181a1d">
     <title>IPARS Control</title>
     <link rel="stylesheet" href="/ui/styles.css">
   </head>
   <body>
     <div id="app" class="app-shell">
       <header class="topbar">
-        <div class="brand">
-          <span class="brand-mark">IP</span>
-          <span>
-            <strong>IPARS Control</strong>
-            <small id="cluster-name">Control plane</small>
-          </span>
+        <div class="topbar-left">
+          <button id="mobile-menu" class="icon-button mobile-only" type="button" aria-label="Open navigation" title="Open navigation"><span data-icon="menu"></span></button>
+          <a class="brand" href="/ui/" aria-label="IPARS Control home">
+            <span class="brand-mark">IP</span>
+            <span class="brand-copy">
+              <strong>IPARS</strong>
+              <small>Control plane</small>
+            </span>
+          </a>
+          <button id="sidebar-toggle" class="icon-button desktop-only" type="button" aria-label="Collapse navigation" title="Collapse navigation"><span data-icon="panel-left"></span></button>
+        </div>
+        <div class="topbar-context">
+          <span class="context-label">Cluster</span>
+          <span id="cluster-name" class="context-value">Not connected</span>
         </div>
         <div class="topbar-actions">
-          <span id="connection-state" class="connection-state offline">Offline</span>
+          <span id="connection-state" class="connection-state offline"><span class="status-dot"></span><span>Offline</span></span>
           <span id="refresh-time" class="refresh-time">Not connected</span>
-          <button id="auth-button" class="button button-quiet" type="button">Sign in</button>
+          <button id="refresh-button-top" class="icon-button desktop-only" type="button" aria-label="Refresh data" title="Refresh data"></button>
+          <button id="auth-button" class="account-button" type="button"><span class="account-avatar">A</span><span class="account-label">Sign in</span></button>
         </div>
       </header>
 
-      <div class="workspace">
-        <aside class="sidebar" aria-label="Primary navigation">
-          <div class="nav-label">Manage</div>
-          <button class="nav-button active" type="button" data-view="overview">
-            <span class="nav-icon">◉</span><span>Overview</span>
-          </button>
-          <button class="nav-button" type="button" data-view="nodes">
-            <span class="nav-icon">▦</span><span>Devices</span>
-          </button>
-          <button class="nav-button" type="button" data-view="paths">
-            <span class="nav-icon">⇄</span><span>Connections</span>
-          </button>
-          <button class="nav-button" type="button" data-view="routes">
-            <span class="nav-icon">⌁</span><span>Routes</span>
-          </button>
-          <button class="nav-button" type="button" data-view="acl">
-            <span class="nav-icon">⊞</span><span>Access control</span>
-          </button>
+      <div class="app-frame">
+        <div id="mobile-backdrop" class="mobile-backdrop" hidden></div>
+        <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
+          <div class="sidebar-scroll">
+            <div class="nav-group">
+              <div class="nav-group-label">Network</div>
+              <button class="nav-button active" type="button" data-view="overview">
+                <span class="nav-icon" data-icon="layout-dashboard"></span><span class="nav-text">Overview</span>
+              </button>
+              <button class="nav-button" type="button" data-view="nodes">
+                <span class="nav-icon" data-icon="server"></span><span class="nav-text">Devices</span><span id="nav-node-count" class="nav-count">-</span>
+              </button>
+              <button class="nav-button" type="button" data-view="paths">
+                <span class="nav-icon" data-icon="network"></span><span class="nav-text">Connections</span><span id="nav-path-count" class="nav-count">-</span>
+              </button>
+              <button class="nav-button" type="button" data-view="routes">
+                <span class="nav-icon" data-icon="route"></span><span class="nav-text">Network routes</span>
+              </button>
+            </div>
+            <div class="nav-group">
+              <div class="nav-group-label">Security</div>
+              <button class="nav-button" type="button" data-view="acl">
+                <span class="nav-icon" data-icon="shield-check"></span><span class="nav-text">Access control</span><span id="nav-rule-count" class="nav-count">-</span>
+              </button>
+            </div>
+          </div>
           <div class="sidebar-footer">
-            <span class="status-dot"></span>
-            <span>Control plane API</span>
+            <div class="sidebar-health"><span class="status-dot online-dot"></span><span><strong>API online</strong><small id="sidebar-cluster">Control plane</small></span></div>
+            <span class="sidebar-version">v1</span>
           </div>
         </aside>
 
-        <main class="content">
+        <main class="main-area">
           <section id="auth-panel" class="auth-panel">
             <div class="auth-panel-inner">
-              <span class="eyebrow">IPARS MANAGEMENT</span>
-              <h1 id="auth-title">Sign in to manage this network</h1>
-              <p id="auth-copy">Authenticate with the configured identity provider to view nodes, paths, routes, and access policy.</p>
-              <button id="oidc-login" class="button button-primary" type="button">Sign in with SSO</button>
+              <div class="auth-logo"><span class="brand-mark">IP</span></div>
+              <span class="eyebrow">IPARS CONTROL PLANE</span>
+              <h1 id="auth-title">Sign in to your network</h1>
+              <p id="auth-copy">Use the configured identity provider to continue.</p>
+              <button id="oidc-login" class="button button-primary button-wide" type="button"><span data-icon="log-in"></span><span>Sign in with SSO</span></button>
               <form id="token-form" class="token-form" hidden>
-                <label for="operator-token">Operator API bearer token</label>
-                <div class="token-row">
-                  <input id="operator-token" type="password" autocomplete="off" placeholder="Paste token">
-                  <button class="button button-primary" type="submit">Connect</button>
+                <div class="form-field">
+                  <label for="operator-token">Operator token</label>
+                  <div class="token-row"><input id="operator-token" type="password" autocomplete="off" placeholder="Paste a bearer token"><button class="button button-secondary" type="submit">Connect</button></div>
                 </div>
               </form>
               <p id="auth-error" class="form-error" role="alert"></p>
+              <div class="auth-meta"><span class="status-dot"></span><span>Session protected by the control plane</span></div>
             </div>
           </section>
 
           <section id="dashboard" hidden>
-            <div class="page-heading">
-              <div>
-                <span class="eyebrow">NETWORK ADMINISTRATION</span>
-                <h1 id="view-title">Overview</h1>
-                <p id="view-subtitle">Live state from the IPARS control plane.</p>
+            <div class="content-inner">
+              <div class="breadcrumbs"><span>IPARS</span><span class="breadcrumb-separator" data-icon="chevron-right"></span><strong id="breadcrumb-current">Overview</strong></div>
+              <div class="page-heading">
+                <div><h1 id="view-title">Overview</h1><p id="view-subtitle">Network health at a glance.</p></div>
+                <div class="page-actions"><span class="live-label"><span class="status-dot"></span>Live</span><button id="refresh-button" class="button button-secondary" type="button"><span data-icon="refresh-cw"></span><span>Refresh</span></button></div>
               </div>
-              <button id="refresh-button" class="button button-quiet" type="button">Refresh</button>
+              <div id="status-message" class="status-message" role="status" aria-live="polite"></div>
+              <div id="view-content"></div>
             </div>
-            <div id="status-message" class="status-message" role="status"></div>
-            <div id="view-content"></div>
           </section>
         </main>
       </div>
+      <div id="drawer-root"></div>
+      <div id="toast-root" class="toast-root" aria-live="polite"></div>
     </div>
     <script src="/ui/app.js"></script>
   </body>
