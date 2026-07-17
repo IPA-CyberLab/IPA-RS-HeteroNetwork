@@ -235,6 +235,10 @@
 
   function startLogin() {
     if (!state.config || !state.config.authorization_endpoint) return Promise.resolve();
+    if (state.config.login_endpoint) {
+      location.assign(state.config.login_endpoint);
+      return Promise.resolve();
+    }
     var verifier = base64Url(randomBytes(32));
     return pkceChallenge(verifier).then(function (challenge) {
       var loginState = base64Url(randomBytes(24));
