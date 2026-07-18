@@ -40,7 +40,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         .join("../..")
         .canonicalize()
         .context("failed to resolve repository root")?;
-    let temp_dir = create_temp_dir_in(&repo_root.join("target"), "ipars-compose-smoke")?;
+    let temp_dir = create_temp_dir_in(&repo_root.join("target"), "heteronetwork-compose-smoke")?;
     let _temp_guard = TempDirGuard {
         path: temp_dir.clone(),
     };
@@ -95,7 +95,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     let docker_socket = temp_dir.join("docker.sock");
     let base_compose = ComposeProject {
         repo_root: repo_root.clone(),
-        project_name: format!("ipars-config-{}", unique_suffix()?),
+        project_name: format!("heteronetwork-config-{}", unique_suffix()?),
         compose_files: vec![PathBuf::from("docker/compose.yaml")],
         docker_socket: docker_socket.clone(),
         extra_env: Vec::new(),
@@ -108,7 +108,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered base Compose config unexpectedly included the Docker API socket bind"
     );
     anyhow::ensure!(
-        !rendered.contains("target: /run/ipars/docker.sock"),
+        !rendered.contains("target: /run/heteronetwork/docker.sock"),
         "rendered base Compose config unexpectedly mounted the Docker API socket in the agent container"
     );
     anyhow::ensure!(
@@ -117,39 +117,40 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     );
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH")
-            && rendered.contains("/run/secrets/ipars-agent-api-bearer-token"),
+            && rendered.contains("/run/secrets/heteronetwork-agent-api-bearer-token"),
         "rendered base Compose config did not mount the agent API Bearer secret"
     );
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")
-            && rendered.contains("/run/secrets/ipars-control-plane-operator-api-bearer-token"),
+            && rendered
+                .contains("/run/secrets/heteronetwork-control-plane-operator-api-bearer-token"),
         "rendered base Compose config did not mount the control-plane operator API Bearer secret"
     );
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")
-            && rendered.contains("/run/secrets/ipars-signal-operator-api-bearer-token"),
+            && rendered.contains("/run/secrets/heteronetwork-signal-operator-api-bearer-token"),
         "rendered base Compose config did not mount the signal operator API Bearer secret"
     );
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_PATH")
-            && rendered.contains("/run/secrets/ipars-stun-operator-api-bearer-token"),
+            && rendered.contains("/run/secrets/heteronetwork-stun-operator-api-bearer-token"),
         "rendered base Compose config did not mount the STUN operator API Bearer secret"
     );
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")
-            && rendered.contains("/run/secrets/ipars-relay-operator-api-bearer-token"),
+            && rendered.contains("/run/secrets/heteronetwork-relay-operator-api-bearer-token"),
         "rendered base Compose config did not mount the relay operator API Bearer secret"
     );
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")
             && rendered.contains("HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
-            && rendered.contains("/run/secrets/ipars-relay-admission-bearer-token"),
+            && rendered.contains("/run/secrets/heteronetwork-relay-admission-bearer-token"),
         "rendered base Compose config did not share the file-backed relay admission Bearer secret"
     );
 
     let rootful_discovery_compose = ComposeProject {
         repo_root: repo_root.clone(),
-        project_name: format!("ipars-config-{}", unique_suffix()?),
+        project_name: format!("heteronetwork-config-{}", unique_suffix()?),
         compose_files: vec![
             PathBuf::from("docker/compose.yaml"),
             PathBuf::from("docker/compose.docker-discovery.yaml"),
@@ -194,7 +195,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ),
             (
                 "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
-                "ipars0,--foreground".to_string(),
+                "heteronetwork0,--foreground".to_string(),
             ),
             (
                 "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
@@ -269,7 +270,10 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ("HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
             ("HETERONETWORK_AGENT_RUNTIME_BACKEND", "linux-command"),
             ("HETERONETWORK_DOCKER_DISCOVER_NETWORKS", "true"),
-            ("HETERONETWORK_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
+            (
+                "HETERONETWORK_DOCKER_API_SOCKET",
+                "/run/heteronetwork/docker.sock",
+            ),
             ("HETERONETWORK_DOCKER_NETWORKS", "edge_default,edge_apps"),
             ("HETERONETWORK_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
             ("HETERONETWORK_DOCKER_HOST_INTERFACE", "br-edge"),
@@ -282,7 +286,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ),
             (
                 "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS",
-                "ipars0,--foreground",
+                "heteronetwork0,--foreground",
             ),
             (
                 "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
@@ -329,7 +333,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         ],
     )?;
     anyhow::ensure!(
-        rendered.contains("target: /run/ipars/docker.sock"),
+        rendered.contains("target: /run/heteronetwork/docker.sock"),
         "rendered Docker discovery Compose config did not mount the Docker API socket"
     );
     anyhow::ensure!(
@@ -356,7 +360,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
 
     let rootless_compose = ComposeProject {
         repo_root: repo_root.clone(),
-        project_name: format!("ipars-config-{}", unique_suffix()?),
+        project_name: format!("heteronetwork-config-{}", unique_suffix()?),
         compose_files: vec![
             PathBuf::from("docker/compose.yaml"),
             PathBuf::from("docker/compose.rootless.yaml"),
@@ -389,7 +393,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ),
             (
                 "HETERONETWORK_DOCKER_API_SOCKET".to_string(),
-                "/run/ipars/docker.sock".to_string(),
+                "/run/heteronetwork/docker.sock".to_string(),
             ),
             (
                 "HETERONETWORK_DOCKER_NETWORKS".to_string(),
@@ -425,7 +429,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ),
             (
                 "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
-                "ipars0".to_string(),
+                "heteronetwork0".to_string(),
             ),
             (
                 "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
@@ -502,7 +506,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS:",
         "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS:",
         "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS:",
-        "target: /run/ipars/docker.sock",
+        "target: /run/heteronetwork/docker.sock",
     ] {
         anyhow::ensure!(
             !rendered.contains(forbidden),
@@ -520,7 +524,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
 
     let rootless_dataplane_compose = ComposeProject {
         repo_root: rootless_compose.repo_root.clone(),
-        project_name: format!("ipars-config-{}", unique_suffix()?),
+        project_name: format!("heteronetwork-config-{}", unique_suffix()?),
         compose_files: vec![
             PathBuf::from("docker/compose.yaml"),
             PathBuf::from("docker/compose.rootless.yaml"),
@@ -560,7 +564,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE:",
         "HETERONETWORK_DOCKER_CONTAINER_CIDRS:",
         "HETERONETWORK_AGENT_RELAY_FORWARDER_",
-        "target: /run/ipars/docker.sock",
+        "target: /run/heteronetwork/docker.sock",
     ] {
         anyhow::ensure!(
             !rendered.contains(forbidden),
@@ -570,7 +574,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
 
     let compose = ComposeProject {
         repo_root,
-        project_name: format!("ipars-smoke-{}", unique_suffix()?),
+        project_name: format!("heteronetwork-smoke-{}", unique_suffix()?),
         compose_files: vec![PathBuf::from("docker/compose.yaml"), override_path],
         docker_socket: temp_dir.join("unused-docker.sock"),
         extra_env: Vec::new(),
@@ -919,7 +923,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         .context("init output missing join_token")?
         .to_string();
     let suffix = unique_suffix()?;
-    let project_name = format!("ipars-dataplane-{suffix}");
+    let project_name = format!("heteronetwork-dataplane-{suffix}");
     let (workload_a_v6_cidr, workload_b_v6_cidr) = dataplane_ipv6_cidrs(&project_name)?;
     let docker_socket = docker_engine_socket_path()?;
     let route_a_network = format!("{project_name}-route-a");
@@ -1144,7 +1148,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             .matches("HETERONETWORK_DOCKER_DISCOVER_NETWORKS: \"true\"")
             .count()
             == 2
-            && rendered.matches("target: /run/ipars/docker.sock").count() == 2
+            && rendered.matches("target: /run/heteronetwork/docker.sock").count() == 2
             && rendered.matches("read_only: true").count() >= 2,
         "dataplane Compose config did not render two read-only Docker API discovery mounts\n{rendered}"
     );
@@ -1470,11 +1474,11 @@ fn generated_dataplane_join_token(
 
 fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
     let relay_admission_token_path = std::env::temp_dir().join(format!(
-        "ipars-compose-init-relay-admission-{}.token",
+        "heteronetwork-compose-init-relay-admission-{}.token",
         unique_suffix()?
     ));
     let relay_state_dir = std::env::temp_dir().join(format!(
-        "ipars-compose-init-relay-state-{}",
+        "heteronetwork-compose-init-relay-state-{}",
         unique_suffix()?
     ));
     let output = Command::new(env!("CARGO_BIN_EXE_ipars"))
@@ -1562,7 +1566,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - --issuer-public-key
       - {issuer_public_key}
     environment: !override
-      HETERONETWORK_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
+      HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@postgres:5432/heteronetwork
       HETERONETWORK_ROLE: control-plane
       HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: {control_plane_operator_api_bearer_token}
     secrets: !reset []
@@ -1614,7 +1618,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
     devices: !reset []
     secrets: !reset []
     volumes: !reset
-      - agent-data:/var/lib/ipars
+      - agent-data:/var/lib/heteronetwork
     environment: !override
       HETERONETWORK_ROLE: agent
       HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
@@ -1636,7 +1640,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - --listen
       - 0.0.0.0:{agent_port}
       - --state-path
-      - /var/lib/ipars/agent.json
+      - /var/lib/heteronetwork/agent.json
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
@@ -1661,7 +1665,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - /usr/local/bin/iparsd
     network_mode: host
     volumes:
-      - agent-b-data:/var/lib/ipars
+      - agent-b-data:/var/lib/heteronetwork
     environment:
       HETERONETWORK_ROLE: agent
       HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
@@ -1677,7 +1681,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - --listen
       - 0.0.0.0:{agent_b_port}
       - --state-path
-      - /var/lib/ipars/agent-b.json
+      - /var/lib/heteronetwork/agent-b.json
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
@@ -2248,7 +2252,7 @@ wg show "$interface" latest-handshakes | awk '$2 > 0 { found = 1 } END { exit !f
             "-ec",
             script,
             "sh",
-            "ipars0",
+            "heteronetwork0",
             &local_cidr,
             &remote_cidr,
             &remote_vpn_ip.to_string(),
@@ -2289,7 +2293,7 @@ fn assert_compose_reconciles_unknown_wireguard_peer(
             service,
             "wg",
             "set",
-            "ipars0",
+            "heteronetwork0",
             "peer",
             stale_public_key.as_str(),
             "allowed-ips",
@@ -2306,7 +2310,7 @@ fn assert_compose_reconciles_unknown_wireguard_peer(
             service,
             "sh",
             "-ec",
-            "! wg show ipars0 peers | grep -F -x -- \"$1\" >/dev/null",
+            "! wg show heteronetwork0 peers | grep -F -x -- \"$1\" >/dev/null",
             "sh",
             stale_public_key.as_str(),
         ]);
@@ -2352,7 +2356,7 @@ fn assert_compose_reconciles_unknown_managed_route(
             "replace",
             stale_cidr,
             "dev",
-            "ipars0",
+            "heteronetwork0",
             "protocol",
             managed_protocol.as_str(),
             "metric",
@@ -2369,7 +2373,7 @@ fn assert_compose_reconciles_unknown_managed_route(
             service,
             "sh",
             "-ec",
-            "! ip -N route show table 254 dev ipars0 protocol \"$1\" | grep -F -- \"$2\" >/dev/null",
+            "! ip -N route show table 254 dev heteronetwork0 protocol \"$1\" | grep -F -- \"$2\" >/dev/null",
             "sh",
             managed_protocol.as_str(),
             stale_destination,
@@ -2427,7 +2431,7 @@ ip route get "$remote_ip" | grep -F -- "dev $interface" >/dev/null
             "-ec",
             script,
             "sh",
-            "ipars0",
+            "heteronetwork0",
             &remote_cidr.to_string(),
             &remote_workload_ip.to_string(),
         ]);
@@ -2443,7 +2447,7 @@ ip route get "$remote_ip" | grep -F -- "dev $interface" >/dev/null
         };
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "Docker Agent {service} did not route advertised CIDR {remote_cidr} through ipars0\nlast probe:\n{last_output}\n{}",
+                "Docker Agent {service} did not route advertised CIDR {remote_cidr} through heteronetwork0\nlast probe:\n{last_output}\n{}",
                 compose_diagnostics(compose)
             );
         }
@@ -2495,7 +2499,7 @@ fi
             "-ec",
             script,
             "sh",
-            "ipars0",
+            "heteronetwork0",
             &stale_cidr.to_string(),
             &replacement_cidr.to_string(),
             &replacement_ip.to_string(),
@@ -2616,7 +2620,7 @@ fn assert_compose_wireguard_transfer(compose: &ComposeProject, service: &str) ->
         service,
         "sh",
         "-ec",
-        "wg show ipars0 transfer | awk '$2 > 0 && $3 > 0 { found = 1 } END { exit !found }'",
+        "wg show heteronetwork0 transfer | awk '$2 > 0 && $3 > 0 { found = 1 } END { exit !found }'",
     ]);
     let output = command
         .output()
@@ -3642,9 +3646,9 @@ where
     F: FnMut(&Value) -> Result<()>,
 {
     let agent_state_path = match service {
-        "agent" => "/var/lib/ipars/agent.json",
-        "agent-b" => "/var/lib/ipars/agent-b.json",
-        "agent-failover" => "/var/lib/ipars/agent-failover.json",
+        "agent" => "/var/lib/heteronetwork/agent.json",
+        "agent-b" => "/var/lib/heteronetwork/agent-b.json",
+        "agent-failover" => "/var/lib/heteronetwork/agent-failover.json",
         _ => anyhow::bail!("service {service} does not have an agent identity state path"),
     };
     let deadline = Instant::now() + Duration::from_secs(20);
