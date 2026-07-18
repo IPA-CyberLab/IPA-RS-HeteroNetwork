@@ -480,20 +480,15 @@ pub enum NatTraversalStrategy {
 ///
 /// `DoubleNat` is a conservative heuristic for a private local address with
 /// address-dependent mappings observed from multiple reflexive endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NatConnectivityState {
+    #[default]
     Unknown,
     Public,
     Nat,
     DoubleNat,
     RelayOnly,
-}
-
-impl Default for NatConnectivityState {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl NatTraversalStrategy {
