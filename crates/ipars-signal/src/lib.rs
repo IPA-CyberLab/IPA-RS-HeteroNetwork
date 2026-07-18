@@ -1670,6 +1670,14 @@ fn nat_classification_allows_hole_punch(
 ) -> bool {
     match classification {
         None => true,
+        // An insufficient-data result is explicitly non-authoritative. Keep
+        // trying the advertised reflexive candidate and let path probing or
+        // relay fallback establish whether it works.
+        Some(classification)
+            if classification.strategy == NatTraversalStrategy::InsufficientData =>
+        {
+            true
+        }
         Some(classification)
             if !nat_classification_meets_confidence(classification, min_confidence_percent) =>
         {
@@ -3544,6 +3552,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_attempts_direct_traversal_when_nat_data_is_insufficient(
+    ) -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry
+            .upsert_node_with_nat(source.clone(), Some(insufficient_data_nat()))
+            .await?;
+        registry.upsert_node(target.clone()).await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: Some(insufficient_data_nat()),
+                desired_routes: Vec::new(),
+            })
+            .await?;
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+
+        let plan = registry
+            .hole_punch_plan(source.node_id, target.node_id)
+            .await?;
+        assert!(plan.source_reflexive.is_some());
+        assert!(plan.target_reflexive.is_some());
+        let metrics = registry.metrics().await;
+        assert_eq!(metrics.hole_punch_nat_suppressed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_ignores_stale_nat_classification_for_hole_punch_plan(
     ) -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy {
@@ -3958,6 +3998,21 @@ mod tests {
             strategy: NatTraversalStrategy::RelayPreferred,
             connectivity_state: NatConnectivityState::RelayOnly,
             confidence: 0.9,
+            assessed_at: Utc::now(),
+        }
+    }
+
+    fn insufficient_data_nat() -> NatClassification {
+        NatClassification {
+            local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            mapping_behavior: NatMappingBehavior::Unknown,
+            filtering_behavior: ipars_types::NatFilteringBehavior::Unknown,
+            observed_endpoint: None,
+            observations: Vec::new(),
+            filtering_observations: Vec::new(),
+            strategy: NatTraversalStrategy::InsufficientData,
+            connectivity_state: NatConnectivityState::Unknown,
+            confidence: 0.25,
             assessed_at: Utc::now(),
         }
     }
