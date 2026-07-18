@@ -4531,9 +4531,16 @@ fn control_plane_node_enrollment_config(
     if !args.node_enrollment_enabled {
         return Ok(None);
     }
-    let key_path = node_enrollment_issuer_private_key_path(args)
+    let key_source = node_enrollment_issuer_private_key_path(args)
         .context("node enrollment issuer private key path or systemd credential is required")?;
-    let key = read_bounded_bearer_token_file(&key_path, "node enrollment issuer private key")?;
+    let key = match &key_source {
+        NodeEnrollmentIssuerKeySource::File(path) => {
+            read_bounded_bearer_token_file(path, "node enrollment issuer private key")?
+        }
+        NodeEnrollmentIssuerKeySource::SystemdCredential(path) => {
+            read_systemd_credential_file(path, "node enrollment issuer private key")?
+        }
+    };
     let issuer = IdentityKeyPair::from_signing_key_b64(&key)
         .context("node enrollment issuer private key is not a canonical Ed25519 signing key")?;
     let issuer_node_id = issuer.node_id();
@@ -4576,14 +4583,24 @@ fn control_plane_node_enrollment_config(
     .context("node enrollment configuration")
 }
 
-fn node_enrollment_issuer_private_key_path(args: &ControlPlaneArgs) -> Option<PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NodeEnrollmentIssuerKeySource {
+    File(PathBuf),
+    SystemdCredential(PathBuf),
+}
+
+fn node_enrollment_issuer_private_key_path(
+    args: &ControlPlaneArgs,
+) -> Option<NodeEnrollmentIssuerKeySource> {
     args.node_enrollment_issuer_private_key_path
         .clone()
+        .map(NodeEnrollmentIssuerKeySource::File)
         .or_else(|| {
             std::env::var_os("CREDENTIALS_DIRECTORY")
                 .filter(|directory| !directory.is_empty())
                 .map(PathBuf::from)
                 .map(|directory| directory.join(NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID))
+                .map(NodeEnrollmentIssuerKeySource::SystemdCredential)
         })
 }
 
@@ -13718,6 +13735,24 @@ fn read_api_bearer_token_file(path: &Path, api_label: &str) -> anyhow::Result<St
 }
 
 fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<String> {
+    read_bounded_secret_file(path, label, SecretFilePermissionPolicy::OwnerOnly)
+}
+
+fn read_systemd_credential_file(path: &Path, label: &str) -> anyhow::Result<String> {
+    read_bounded_secret_file(path, label, SecretFilePermissionPolicy::SystemdCredential)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretFilePermissionPolicy {
+    OwnerOnly,
+    SystemdCredential,
+}
+
+fn read_bounded_secret_file(
+    path: &Path,
+    label: &str,
+    permission_policy: SecretFilePermissionPolicy,
+) -> anyhow::Result<String> {
     let path_metadata = std::fs::symlink_metadata(path).with_context(|| {
         format!(
             "failed to inspect {label} bearer token path {}",
@@ -13736,7 +13771,13 @@ fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<St
             path.display()
         );
     }
-    validate_open_bearer_token_file_metadata(path, label, &path_metadata, &path_metadata)?;
+    validate_open_bearer_token_file_metadata(
+        path,
+        label,
+        &path_metadata,
+        &path_metadata,
+        permission_policy,
+    )?;
 
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -13763,7 +13804,13 @@ fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<St
             path.display()
         );
     }
-    validate_open_bearer_token_file_metadata(path, label, &path_metadata, &metadata)?;
+    validate_open_bearer_token_file_metadata(
+        path,
+        label,
+        &path_metadata,
+        &metadata,
+        permission_policy,
+    )?;
     if metadata.len() > MAX_API_BEARER_TOKEN_FILE_BYTES {
         anyhow::bail!(
             "{label} bearer token file {} exceeds maximum size of {} bytes",
@@ -13793,7 +13840,13 @@ fn read_bounded_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<St
             path.display()
         )
     })?;
-    validate_open_bearer_token_file_metadata(path, label, &metadata, &final_metadata)?;
+    validate_open_bearer_token_file_metadata(
+        path,
+        label,
+        &metadata,
+        &final_metadata,
+        permission_policy,
+    )?;
     Ok(token.trim().to_string())
 }
 
@@ -13802,6 +13855,7 @@ fn validate_open_bearer_token_file_metadata(
     label: &str,
     expected: &std::fs::Metadata,
     opened: &std::fs::Metadata,
+    permission_policy: SecretFilePermissionPolicy,
 ) -> anyhow::Result<()> {
     if !opened.is_file() {
         anyhow::bail!(
@@ -13824,22 +13878,41 @@ fn validate_open_bearer_token_file_metadata(
             path.display()
         );
         let mode = opened.permissions().mode() & 0o777;
-        anyhow::ensure!(
-            mode & 0o400 != 0,
-            "{label} bearer token file {} must be owner-readable",
-            path.display()
-        );
-        anyhow::ensure!(
-            mode & 0o077 == 0,
-            "{label} bearer token file {} permissions are {mode:o}; expected owner-only access",
-            path.display()
-        );
+        match permission_policy {
+            SecretFilePermissionPolicy::OwnerOnly => {
+                anyhow::ensure!(
+                    mode & 0o400 != 0,
+                    "{label} bearer token file {} must be owner-readable",
+                    path.display()
+                );
+                anyhow::ensure!(
+                    mode & 0o077 == 0,
+                    "{label} bearer token file {} permissions are {mode:o}; expected owner-only access",
+                    path.display()
+                );
+            }
+            SecretFilePermissionPolicy::SystemdCredential => {
+                anyhow::ensure!(
+                    systemd_credential_permissions_are_secure(mode, opened.uid(), opened.gid()),
+                    "{label} systemd credential {} permissions/ownership are {mode:o} {}:{}; expected 440 root:root",
+                    path.display(),
+                    opened.uid(),
+                    opened.gid()
+                );
+            }
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = expected;
+        let _ = permission_policy;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn systemd_credential_permissions_are_secure(mode: u32, uid: u32, gid: u32) -> bool {
+    mode == 0o440 && uid == 0 && gid == 0
 }
 
 fn raw_agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
@@ -26724,6 +26797,13 @@ exec sleep 60
         );
         assert!(error.to_string().contains("expected owner-only access"));
 
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o440))?;
+        let error = test_error(
+            read_bounded_bearer_token_file(&path, "test"),
+            "systemd-style permissions on an explicit token should fail",
+        );
+        assert!(error.to_string().contains("expected owner-only access"));
+
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))?;
         let error = test_error(
             read_bounded_bearer_token_file(&path, "test"),
@@ -26755,6 +26835,16 @@ exec sleep 60
         assert!(error.to_string().contains("must resolve to a regular file"));
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_credential_permissions_require_root_owned_read_only_group_access() {
+        assert!(systemd_credential_permissions_are_secure(0o440, 0, 0));
+        assert!(!systemd_credential_permissions_are_secure(0o440, 1000, 0));
+        assert!(!systemd_credential_permissions_are_secure(0o440, 0, 1000));
+        assert!(!systemd_credential_permissions_are_secure(0o640, 0, 0));
+        assert!(!systemd_credential_permissions_are_secure(0o444, 0, 0));
     }
 
     #[test]
