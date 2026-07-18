@@ -11,6 +11,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 ipars-control-plane = { path = "../ipars-control-plane" }
+ipars-crypto = { path = "../ipars-crypto" }
 ipars-types = { path = "../ipars-types" }
 ipnet.workspace = true
 reqwest.workspace = true
@@ -18,11 +19,11 @@ rand_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tokio-util.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-ipars-crypto = { path = "../ipars-crypto" }
 tower = { workspace = true, features = ["util"] }
 
 [lints]

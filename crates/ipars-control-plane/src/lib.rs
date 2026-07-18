@@ -24,10 +24,11 @@ use ipars_types::{
     validate_join_token_bootstrap_endpoints, AclAction, AclRule, BootstrapEndpoint,
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
     JoinTokenClaims, KeyId, NatClassification, NatTraversalStrategy, NodeHealth, NodeId,
-    NodeRecord, PathRecord, PathState, RelayCapability, Route, ServiceDirectory, ServiceInstance,
-    SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome,
-    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    NodeRecord, PathRecord, PathState, RelayCapability, Role, Route, ServiceDirectory,
+    ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord,
+    TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -47,6 +48,12 @@ const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
 const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
 const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
+pub const MAX_NODE_ENROLLMENT_TOKEN_USES: u32 = 1_000;
+pub const NODE_ENROLLMENT_ALLOWED_ROLES: [&str; 3] = ["edge", "worker", "gateway"];
+
+pub fn node_enrollment_role_is_allowed(role: &Role) -> bool {
+    NODE_ENROLLMENT_ALLOWED_ROLES.contains(&role.as_str())
+}
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -618,6 +625,28 @@ where
             .await
     }
 
+    pub async fn validate_issued_token(
+        &self,
+        claims: &JoinTokenClaims,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        let requested = TokenLedgerRecord::from_claims(claims, now);
+        let stored = self
+            .ledger
+            .get_token(&claims.cluster_id, &claims.nonce)
+            .await?
+            .ok_or_else(|| ControlPlaneError::TokenNotFound(claims.nonce.clone()))?;
+        ensure_token_definition_matches(&stored, &requested)?;
+        let status = stored.status(now);
+        if status != TokenStatus::Active {
+            return Err(ControlPlaneError::TokenRejected {
+                nonce: claims.nonce.clone(),
+                status,
+            });
+        }
+        Ok(stored)
+    }
+
     pub async fn revoke_token(
         &self,
         revocation: TokenRevocationRecord,
@@ -647,21 +676,116 @@ pub fn ensure_token_definition_matches(
     )))
 }
 
+#[derive(Debug, Clone)]
+enum IssuerKeyPolicy {
+    Unrestricted,
+    NodeEnrollment { max_ttl_seconds: i64 },
+}
+
+#[derive(Debug, Clone)]
+struct TrustedIssuerKey {
+    public_key_b64: String,
+    policy: IssuerKeyPolicy,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IssuerKeyRing {
-    keys: BTreeMap<(NodeId, KeyId), String>,
+    keys: BTreeMap<(NodeId, KeyId), TrustedIssuerKey>,
 }
 
 impl IssuerKeyRing {
     pub fn insert(&mut self, issuer: NodeId, key_id: KeyId, public_key_b64: String) {
-        self.keys.insert((issuer, key_id), public_key_b64);
+        self.keys.insert(
+            (issuer, key_id),
+            TrustedIssuerKey {
+                public_key_b64,
+                policy: IssuerKeyPolicy::Unrestricted,
+            },
+        );
     }
 
-    pub fn get(&self, issuer: &NodeId, key_id: &KeyId) -> Option<&str> {
-        self.keys
-            .get(&(issuer.clone(), key_id.clone()))
-            .map(String::as_str)
+    pub fn insert_node_enrollment_key(
+        &mut self,
+        issuer: NodeId,
+        key_id: KeyId,
+        public_key_b64: String,
+        max_ttl_seconds: i64,
+    ) {
+        self.keys.insert(
+            (issuer, key_id),
+            TrustedIssuerKey {
+                public_key_b64,
+                policy: IssuerKeyPolicy::NodeEnrollment { max_ttl_seconds },
+            },
+        );
     }
+
+    fn get(&self, issuer: &NodeId, key_id: &KeyId) -> Option<&TrustedIssuerKey> {
+        self.keys.get(&(issuer.clone(), key_id.clone()))
+    }
+}
+
+fn validate_issuer_key_policy(
+    claims: &JoinTokenClaims,
+    policy: &IssuerKeyPolicy,
+) -> Result<(), ControlPlaneError> {
+    let IssuerKeyPolicy::NodeEnrollment { max_ttl_seconds } = policy else {
+        return Ok(());
+    };
+    let reject = |reason: &str| {
+        ControlPlaneError::TokenVerification(format!(
+            "node enrollment issuer policy rejected token: {reason}"
+        ))
+    };
+    if *max_ttl_seconds <= 0
+        || claims.expires_at.signed_duration_since(claims.not_before)
+            > chrono::Duration::seconds(
+                max_ttl_seconds.saturating_add(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
+            )
+    {
+        return Err(reject("validity exceeds the configured maximum"));
+    }
+    if !node_enrollment_role_is_allowed(&claims.role) {
+        return Err(reject("role is not allowed"));
+    }
+    if claims.tags != claims.policy.allowed_tags {
+        return Err(reject("claim tags and allowed tags must match"));
+    }
+    if !claims.policy.allowed_routes.is_empty() {
+        return Err(reject("route authorization is not allowed"));
+    }
+    if !claims
+        .policy
+        .max_token_uses
+        .is_some_and(|uses| (1..=MAX_NODE_ENROLLMENT_TOKEN_USES).contains(&uses))
+    {
+        return Err(reject("token uses must be finite and bounded"));
+    }
+    for kind in [
+        BootstrapEndpointKind::ControlPlane,
+        BootstrapEndpointKind::Signal,
+        BootstrapEndpointKind::Stun,
+    ] {
+        if join_token_endpoint_count(claims, kind) < 2 {
+            return Err(reject("HA bootstrap endpoints are required"));
+        }
+    }
+    if claims.policy.allow_relay
+        && join_token_endpoint_count(claims, BootstrapEndpointKind::Relay) < 2
+    {
+        return Err(reject("two relay bootstrap endpoints are required"));
+    }
+    Ok(())
+}
+
+fn join_token_endpoint_count(claims: &JoinTokenClaims, kind: BootstrapEndpointKind) -> usize {
+    claims
+        .bootstrap_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == kind)
+        .filter_map(|endpoint| canonical_bootstrap_endpoint_url(&endpoint.url))
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 #[derive(Debug)]
@@ -688,12 +812,11 @@ where
         }
     }
 
-    pub async fn join(
+    pub fn validate_join_token(
         &self,
-        token: SignedJoinToken,
-        request: RegisterNodeRequest,
+        token: &SignedJoinToken,
         now: chrono::DateTime<Utc>,
-    ) -> Result<RegisterNodeResponse, ControlPlaneError> {
+    ) -> Result<(), ControlPlaneError> {
         token
             .validate_shape()
             .map_err(|error| ControlPlaneError::TokenVerification(error.to_string()))?;
@@ -701,7 +824,7 @@ where
             return Err(ControlPlaneError::JoinDenied);
         }
 
-        let issuer_public_key = self
+        let issuer_key = self
             .issuer_keys
             .get(&token.claims.issuer, &token.claims.key_id)
             .ok_or_else(|| ControlPlaneError::IssuerKeyNotFound {
@@ -709,11 +832,44 @@ where
                 key_id: token.claims.key_id.clone(),
             })?;
         verify_join_token(
-            &token,
-            issuer_public_key,
+            token,
+            &issuer_key.public_key_b64,
             now,
             &self.plane.config.cluster_id,
         )?;
+        validate_issuer_key_policy(&token.claims, &issuer_key.policy)?;
+        Ok(())
+    }
+
+    pub async fn issue_join_token(
+        &self,
+        token: &SignedJoinToken,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        self.validate_join_token(token, created_at)?;
+        self.admission
+            .issue_from_claims(&token.claims, created_at)
+            .await
+    }
+
+    pub async fn validate_issued_join_token(
+        &self,
+        token: &SignedJoinToken,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<TokenLedgerRecord, ControlPlaneError> {
+        self.validate_join_token(token, now)?;
+        self.admission
+            .validate_issued_token(&token.claims, now)
+            .await
+    }
+
+    pub async fn join(
+        &self,
+        token: SignedJoinToken,
+        request: RegisterNodeRequest,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RegisterNodeResponse, ControlPlaneError> {
+        self.validate_join_token(&token, now)?;
         self.admission.admit_join(&token.claims, now).await?;
         self.plane.register_with_claims(token.claims, request).await
     }
@@ -736,12 +892,17 @@ where
                 issuer: request.issuer.clone(),
                 key_id: request.key_id.clone(),
             })?;
+        if !matches!(issuer_public_key.policy, IssuerKeyPolicy::Unrestricted) {
+            return Err(ControlPlaneError::TokenVerification(
+                "issuer key is not authorized for token revocation".to_string(),
+            ));
+        }
         let signature = request.issuer_signature.as_ref().ok_or_else(|| {
             ControlPlaneError::TokenVerification(
                 "token revocation issuer signature is required".to_string(),
             )
         })?;
-        verify_token_revocation_signature(request, issuer_public_key)?;
+        verify_token_revocation_signature(request, &issuer_public_key.public_key_b64)?;
         if !timestamp_within_skew(
             signature.signed_at,
             revoked_at,
@@ -3206,6 +3367,60 @@ mod tests {
         claims.key_id = key_id;
         claims.nonce = nonce.to_string();
         claims
+    }
+
+    fn node_enrollment_claims(
+        cluster_id: ClusterId,
+        issuer: NodeId,
+        key_id: KeyId,
+        nonce: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> JoinTokenClaims {
+        let mut tags = BTreeSet::new();
+        tags.insert(Tag::from_string("edge"));
+        JoinTokenClaims {
+            cluster_id,
+            bootstrap_endpoints: vec![
+                BootstrapEndpoint {
+                    url: "https://203.0.113.10:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.11:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.10:9443".to_string(),
+                    kind: BootstrapEndpointKind::Signal,
+                },
+                BootstrapEndpoint {
+                    url: "https://203.0.113.11:9443".to_string(),
+                    kind: BootstrapEndpointKind::Signal,
+                },
+                BootstrapEndpoint {
+                    url: "udp://203.0.113.10:3478".to_string(),
+                    kind: BootstrapEndpointKind::Stun,
+                },
+                BootstrapEndpoint {
+                    url: "udp://203.0.113.11:3478".to_string(),
+                    kind: BootstrapEndpointKind::Stun,
+                },
+            ],
+            expires_at: now + Duration::hours(1),
+            not_before: now - Duration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
+            role: Role::edge(),
+            tags: tags.clone(),
+            issuer,
+            key_id,
+            policy: TokenPolicy {
+                allow_join: true,
+                allow_relay: false,
+                allowed_routes: Vec::new(),
+                allowed_tags: tags,
+                max_token_uses: Some(10),
+            },
+            nonce: nonce.to_string(),
+        }
     }
 
     fn registration_request(node_id: &str) -> RegisterNodeRequest {
@@ -7218,6 +7433,95 @@ mod tests {
 
         assert_eq!(old_response.node.node_id, node_id("node-old"));
         assert_eq!(next_response.node.node_id, node_id("node-next"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_enrollment_issuer_key_is_limited_to_bounded_node_join_tokens(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("web-enrollment");
+        let cluster_id = ClusterId::new();
+        let now = Utc::now();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = Arc::new(ControlPlane::new(
+            config,
+            Arc::new(InMemoryStore::default()),
+        ));
+        let mut key_ring = IssuerKeyRing::default();
+        key_ring.insert_node_enrollment_key(
+            issuer.node_id(),
+            key_id.clone(),
+            issuer.public_key_b64(),
+            3_600,
+        );
+        let service =
+            ControlPlaneJoinService::new(plane, Arc::new(InMemoryTokenLedger::default()), key_ring);
+        let valid_claims = node_enrollment_claims(
+            cluster_id,
+            issuer.node_id(),
+            key_id.clone(),
+            "valid-enrollment",
+            now,
+        );
+        service.validate_join_token(&issuer.sign_join_token(valid_claims.clone())?, now)?;
+
+        let rejected_reason =
+            |claims: JoinTokenClaims| -> Result<String, Box<dyn std::error::Error>> {
+                let token = issuer.sign_join_token(claims)?;
+                let error = match service.validate_join_token(&token, now) {
+                    Ok(()) => return Err("restricted enrollment claims were accepted".into()),
+                    Err(error) => error,
+                };
+                Ok(error.to_string())
+            };
+
+        let mut elevated_role = valid_claims.clone();
+        elevated_role.role = Role::control_plane();
+        assert!(rejected_reason(elevated_role)?.contains("role is not allowed"));
+
+        let mut unlimited = valid_claims.clone();
+        unlimited.policy.max_token_uses = None;
+        assert!(rejected_reason(unlimited)?.contains("token uses must be finite and bounded"));
+
+        let mut route_authority = valid_claims.clone();
+        route_authority.policy.allowed_routes = vec!["10.42.0.0/16".parse()?];
+        assert!(rejected_reason(route_authority)?.contains("route authorization is not allowed"));
+
+        let mut no_ha = valid_claims.clone();
+        no_ha.bootstrap_endpoints.remove(1);
+        assert!(rejected_reason(no_ha)?.contains("HA bootstrap endpoints are required"));
+
+        let mut excessive_ttl = valid_claims.clone();
+        excessive_ttl.expires_at = now + Duration::hours(2);
+        assert!(rejected_reason(excessive_ttl)?.contains("validity exceeds the configured maximum"));
+
+        let mut mismatched_tags = valid_claims.clone();
+        mismatched_tags
+            .policy
+            .allowed_tags
+            .insert(Tag::from_string("privileged"));
+        assert!(
+            rejected_reason(mismatched_tags)?.contains("claim tags and allowed tags must match")
+        );
+
+        let revocation = signed_token_revocation(
+            &issuer,
+            valid_claims.cluster_id,
+            "root-issued-token",
+            key_id,
+            now,
+        )?;
+        let revocation_error = match service.revoke_token(&revocation, now).await {
+            Ok(_) => return Err("enrollment issuer performed token revocation".into()),
+            Err(error) => error,
+        };
+        assert!(revocation_error
+            .to_string()
+            .contains("not authorized for token revocation"));
         Ok(())
     }
 

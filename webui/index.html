@@ -1,37 +1,40 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#ffffff">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%23ed1164'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='Arial' font-size='10' font-weight='700' fill='white'%3EHN%3C/text%3E%3C/svg%3E">
     <title>HeteroNetwork</title>
+    <script src="/ui/theme.js"></script>
     <link rel="stylesheet" href="/ui/styles.css">
   </head>
   <body>
     <div id="app" class="app-shell">
       <header class="topbar" role="banner">
         <div class="topbar-left">
-          <button id="mobile-menu" class="icon-button mobile-only" type="button" aria-label="Open navigation" title="Open navigation"><span data-icon="menu"></span></button>
+          <button id="mobile-menu" class="icon-button mobile-only" type="button" aria-label="Open navigation" title="Open navigation" data-i18n-aria="Open navigation" data-i18n-title="Open navigation"><span data-icon="menu"></span></button>
           <a class="brand" href="/ui/" aria-label="HeteroNetwork home">
             <span class="brand-mark">HN</span>
             <span class="brand-copy">
               <strong>HeteroNetwork</strong>
-              <small>Network control</small>
+              <small data-i18n="Network control">Network control</small>
             </span>
           </a>
           <button id="sidebar-toggle" class="icon-button desktop-only" type="button" aria-label="Collapse navigation" title="Collapse navigation"><span data-icon="panel-left"></span></button>
         </div>
         <div class="topbar-context">
-          <span class="context-label">Cluster</span>
-          <span id="cluster-name" class="context-value">Not connected</span>
+          <span class="context-label" data-i18n="Cluster">Cluster</span>
+          <span id="cluster-name" class="context-value" data-i18n="Not connected">Not connected</span>
         </div>
         <div class="topbar-actions">
-          <span id="connection-state" class="connection-state offline"><span class="status-dot"></span><span>Offline</span></span>
-          <span id="refresh-time" class="refresh-time">Not connected</span>
+          <span id="connection-state" class="connection-state offline"><span class="status-dot"></span><span data-i18n="Offline">Offline</span></span>
+          <span id="refresh-time" class="refresh-time" data-i18n="Not connected">Not connected</span>
           <button id="refresh-button-top" class="icon-button desktop-only" type="button" aria-label="Refresh data" title="Refresh data"><span data-icon="refresh-cw"></span></button>
-          <button id="auth-button" class="account-button" type="button"><span class="account-avatar">A</span><span class="account-label">Sign in</span></button>
+          <label class="locale-control" title="Language" data-i18n-title="Language"><span class="sr-only" data-i18n="Language">Language</span><select id="locale-select" aria-label="Language" data-i18n-aria="Language"><option value="en">EN</option><option value="ja">日本語</option></select></label>
+          <button id="theme-toggle" class="icon-button" type="button" aria-label="Switch to dark mode" title="Switch to dark mode"><span data-icon="moon"></span></button>
+          <button id="auth-button" class="account-button" type="button"><span class="account-avatar">A</span><span class="account-label" data-i18n="Sign in">Sign in</span></button>
         </div>
       </header>
 
@@ -40,32 +43,35 @@
         <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
           <div class="sidebar-scroll">
             <div class="nav-group">
-              <div class="nav-group-label">Network</div>
+              <div class="nav-group-label" data-i18n="Network">Network</div>
               <button class="nav-button active" type="button" data-view="overview">
-                <span class="nav-icon" data-icon="layout-dashboard"></span><span class="nav-text">Overview</span>
+                <span class="nav-icon" data-icon="layout-dashboard"></span><span class="nav-text" data-i18n="Overview">Overview</span>
               </button>
               <button class="nav-button" type="button" data-view="nodes">
-                <span class="nav-icon" data-icon="server"></span><span class="nav-text">Devices</span><span id="nav-node-count" class="nav-count">-</span>
+                <span class="nav-icon" data-icon="server"></span><span class="nav-text" data-i18n="Devices">Devices</span><span id="nav-node-count" class="nav-count">-</span>
+              </button>
+              <button id="enrollment-nav" class="nav-button" type="button" data-view="enrollment" hidden>
+                <span class="nav-icon" data-icon="plus"></span><span class="nav-text" data-i18n="Add device">Add device</span>
               </button>
               <button class="nav-button" type="button" data-view="services">
-                <span class="nav-icon" data-icon="check-check"></span><span class="nav-text">Public nodes</span><span id="nav-service-count" class="nav-count">-</span>
+                <span class="nav-icon" data-icon="check-check"></span><span class="nav-text" data-i18n="Public nodes">Public nodes</span><span id="nav-service-count" class="nav-count">-</span>
               </button>
               <button class="nav-button" type="button" data-view="paths">
-                <span class="nav-icon" data-icon="network"></span><span class="nav-text">Connections</span><span id="nav-path-count" class="nav-count">-</span>
+                <span class="nav-icon" data-icon="network"></span><span class="nav-text" data-i18n="Connections">Connections</span><span id="nav-path-count" class="nav-count">-</span>
               </button>
               <button class="nav-button" type="button" data-view="routes">
-                <span class="nav-icon" data-icon="route"></span><span class="nav-text">Network routes</span>
+                <span class="nav-icon" data-icon="route"></span><span class="nav-text" data-i18n="Network routes">Network routes</span>
               </button>
             </div>
             <div class="nav-group">
-              <div class="nav-group-label">Security</div>
+              <div class="nav-group-label" data-i18n="Security">Security</div>
               <button class="nav-button" type="button" data-view="acl">
-                <span class="nav-icon" data-icon="shield-check"></span><span class="nav-text">Access control</span><span id="nav-rule-count" class="nav-count">-</span>
+                <span class="nav-icon" data-icon="shield-check"></span><span class="nav-text" data-i18n="Access control">Access control</span><span id="nav-rule-count" class="nav-count">-</span>
               </button>
             </div>
           </div>
           <div class="sidebar-footer">
-            <div class="sidebar-health"><span class="status-dot online-dot"></span><span><strong>API online</strong><small id="sidebar-cluster">Control plane</small></span></div>
+            <div class="sidebar-health"><span class="status-dot online-dot"></span><span><strong data-i18n="API online">API online</strong><small id="sidebar-cluster" data-i18n="Control plane">Control plane</small></span></div>
             <span class="sidebar-version">v1</span>
           </div>
         </aside>
@@ -75,26 +81,26 @@
             <div class="auth-panel-inner">
               <div class="auth-logo"><span class="brand-mark">HN</span></div>
               <span class="eyebrow">HETERONETWORK CONSOLE</span>
-              <h1 id="auth-title">Sign in to your network</h1>
-              <p id="auth-copy">Use the configured identity provider to continue.</p>
-              <button id="oidc-login" class="button button-primary button-wide" type="button"><span data-icon="log-in"></span><span>Sign in with SSO</span></button>
+              <h1 id="auth-title" data-i18n="Sign in to your network">Sign in to your network</h1>
+              <p id="auth-copy" data-i18n="Use the configured identity provider to continue.">Use the configured identity provider to continue.</p>
+              <button id="oidc-login" class="button button-primary button-wide" type="button"><span data-icon="log-in"></span><span data-i18n="Sign in with SSO">Sign in with SSO</span></button>
               <form id="token-form" class="token-form" hidden>
                 <div class="form-field">
-                  <label for="operator-token">Operator token</label>
-                  <div class="token-row"><input id="operator-token" type="password" autocomplete="off" placeholder="Paste a bearer token"><button class="button button-secondary" type="submit">Connect</button></div>
+                  <label for="operator-token" data-i18n="Operator token">Operator token</label>
+                  <div class="token-row"><input id="operator-token" type="password" autocomplete="off" placeholder="Paste a bearer token" data-i18n-placeholder="Paste a bearer token"><button class="button button-secondary" type="submit" data-i18n="Connect">Connect</button></div>
                 </div>
               </form>
               <p id="auth-error" class="form-error" role="alert"></p>
-              <div class="auth-meta"><span class="status-dot"></span><span>Session protected by the control plane</span></div>
+              <div class="auth-meta"><span class="status-dot"></span><span data-i18n="Session protected by the control plane">Session protected by the control plane</span></div>
             </div>
           </section>
 
           <section id="dashboard" hidden>
             <div class="content-inner">
-              <div class="breadcrumbs"><span>HeteroNetwork</span><span class="breadcrumb-separator" data-icon="chevron-right"></span><strong id="breadcrumb-current">Overview</strong></div>
+              <div class="breadcrumbs"><span>HeteroNetwork</span><span class="breadcrumb-separator" data-icon="chevron-right"></span><strong id="breadcrumb-current" data-i18n="Overview">Overview</strong></div>
               <div class="page-heading">
-                <div><h1 id="view-title">Overview</h1><p id="view-subtitle">Network health at a glance.</p></div>
-                <div class="page-actions"><span class="live-label"><span class="status-dot"></span>Live</span><button id="refresh-button" class="button button-secondary" type="button"><span data-icon="refresh-cw"></span><span>Refresh</span></button></div>
+                <div><h1 id="view-title" data-i18n="Overview">Overview</h1><p id="view-subtitle" data-i18n="Network health at a glance.">Network health at a glance.</p></div>
+                <div class="page-actions"><span class="live-label"><span class="status-dot"></span><span data-i18n="Live">Live</span></span><button id="refresh-button" class="button button-secondary" type="button"><span data-icon="refresh-cw"></span><span data-i18n="Refresh">Refresh</span></button></div>
               </div>
               <div id="status-message" class="status-message" role="status" aria-live="polite"></div>
               <div id="view-content"></div>

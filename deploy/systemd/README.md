@@ -30,6 +30,7 @@ quorum.
 ```sh
 sudo useradd --system --home /var/lib/ipars --create-home --shell /usr/sbin/nologin ipars
 sudo install -d -o root -g ipars -m 0750 /etc/ipars
+sudo install -d -o root -g root -m 0700 /etc/credstore
 sudo install -d -o root -g root -m 0755 /opt/ipars/bin
 sudo install -o root -g root -m 0755 target/release/iparsd /opt/ipars/bin/iparsd
 sudo install -o root -g ipars -m 0640 deploy/systemd/public-node.env.example /etc/ipars/public-node.env
@@ -40,7 +41,21 @@ Replace every example value in `/etc/ipars/public-node.env`. Store independent,
 random 32-byte-or-longer printable tokens in the five referenced token files,
 owned by `ipars:ipars` with mode `0400`. The daemon intentionally rejects
 group/world-readable credential files. The issuer private key is not installed
-on public nodes; only its public key belongs in this environment file.
+on public nodes; only its public key belongs in this environment file. When the
+Web UI **Add device** workflow is enabled, generate a separate Ed25519 enrollment
+signing key and install the same key as
+`/etc/credstore/node-enrollment-issuer.key` on every Control Plane replica with
+ownership `root:root` and mode `0400`. The Control Plane unit imports it with
+systemd `LoadCredential=` into that service's read-only credential namespace;
+Signal, STUN, and Relay do not receive it even though the packaged services use
+the same Unix account. Do not set the direct private-key path variable in the
+shared environment file, and never reuse the offline root issuer key. Startup
+rejects key reuse and issuer/key ID collisions. Tokens from this online key are
+verifier-constrained to `edge`, `worker`, or
+`gateway` joins, matching claim/policy tags, no route authority, finite use
+counts, the configured TTL ceiling, and at least two active Control Plane,
+Signal, and STUN endpoints. Relay-enabled tokens also require two Relay
+endpoints.
 Set `HETERONETWORK_WEB_PUBLIC_URL` to that node's externally used origin. The daemon
 then keeps PKCE verifier/state server-side for the callback, including on lab
 HTTP IP addresses where browser WebCrypto is not available.
@@ -71,3 +86,11 @@ After one lease TTL, the surviving node reports one instance and
 the data plane; control, Signal, STUN, and new joins fail over to the surviving
 directory entries. Restart the stopped target and wait for HA readiness to
 return to `1`.
+
+The authenticated **Add device** view issues a token into the shared PostgreSQL
+ledger before returning a Linux install command. The command downloads the
+pinned `iparsd` artifact through token-authenticated, non-cacheable endpoints,
+verifies its SHA-256 digest, performs a one-time enrollment, removes the token,
+and starts the persistent systemd Agent from owner-only state. Issuance is
+disabled unless the service directory contains the required distinct active HA
+endpoints.

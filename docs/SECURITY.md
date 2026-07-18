@@ -27,6 +27,31 @@ Implemented controls:
 - control-plane token ledgers persist max-use and revocation state;
 - SQL token-use updates use compare-and-swap semantics so concurrent control-plane instances do not over-admit the same token.
 
+The optional Web UI enrollment path uses a dedicated online Ed25519 signer, not
+the offline root issuer. The trusted-key entry carries an enforced enrollment
+policy: only `edge`, `worker`, and `gateway` roles; identical claim and policy
+tags; no route authorization; a finite maximum of 1,000 uses; the configured TTL
+ceiling; and two distinct Control Plane, Signal, and STUN endpoints. Relay
+permission additionally requires two distinct Relay endpoints. These checks run
+after signature verification at every token boundary, so possession of the
+enrollment signer cannot mint a control-plane, route-authorizing, unlimited, or
+degraded-bootstrap token. The key is also rejected at the cluster-wide token
+revocation boundary.
+Control Plane startup rejects both public-key reuse with any unrestricted
+trusted issuer and an enrollment issuer/key ID that collides with an existing
+trusted entry. The packaged systemd unit obtains the enrollment signer through
+`LoadCredential=` from a root-only credential store; sibling Signal, STUN, and
+Relay services do not receive the service-scoped read-only copy.
+
+Enrollment issuance is an authenticated `/v1/admin/*` operation and inserts the
+signed definition into the shared token ledger before returning it. Installer
+and binary routes require the same signed token and confirm that the ledger
+record remains active, unexpired, unrevoked, and unexhausted. Responses are
+non-cacheable; the binary is pinned at startup by regular-file identity, size,
+and SHA-256, and is revalidated before each download. The generated installer
+keeps the token in an owner-only temporary file, removes it after one-time
+enrollment, and never embeds it in the persistent service unit.
+
 Revoke a token with:
 
 ```bash
@@ -155,6 +180,7 @@ Implemented controls:
 
 - Terminate TLS at a reverse proxy, load balancer, or Kubernetes Ingress before exposing control-plane, signal, relay admission, or agent APIs outside a private deployment network.
 - Store issuer private keys outside the control-plane process where possible; pass only issuer public keys to redundant control-plane instances.
+- If Web UI enrollment is enabled, use a separate enrollment signer on the Control Plane replicas; with the packaged systemd unit, keep its source root-only in `/etc/credstore` and let `LoadCredential=` expose it only to Control Plane. Never reuse the offline root issuer key, and rotate this online key as an independently scoped credential.
 - When using `ipars init --spawn-daemons`, spawned bootstrap services receive a cleared environment with only a fixed system `PATH` and `C` locale so issuer-key environment variables are not propagated.
 - Prefer file-backed join tokens through `--join-token-path` or Kubernetes Secrets over command-line token arguments.
 - Keep Agent API Bearer tokens owner-only, separate from join tokens, and pass them through `--api-bearer-token-path`, Compose secrets, or a distinct Kubernetes Secret key.

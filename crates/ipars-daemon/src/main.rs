@@ -36,7 +36,9 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
-use ipars_control_plane_http::{router, ControlPlaneHttpState, WebAuthProvider, WebUiAuthConfig};
+use ipars_control_plane_http::{
+    router, ControlPlaneHttpState, NodeEnrollmentConfig, WebAuthProvider, WebUiAuthConfig,
+};
 #[cfg(test)]
 use ipars_crypto::verify_signal_node_upsert_signature;
 use ipars_crypto::{validate_identity_public_key_b64, IdentityKeyPair};
@@ -194,6 +196,7 @@ const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
+const NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID: &str = "node-enrollment-issuer.key";
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
@@ -396,6 +399,29 @@ struct ControlPlaneArgs {
     web_oidc_client_id: String,
     #[arg(long, env = "HETERONETWORK_WEB_PUBLIC_URL")]
     web_public_url: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_NODE_ENROLLMENT_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    node_enrollment_enabled: bool,
+    #[arg(long, env = "HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH")]
+    node_enrollment_issuer_private_key_path: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID",
+        default_value = "web-enrollment"
+    )]
+    node_enrollment_issuer_key_id: String,
+    #[arg(
+        long,
+        env = "HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS",
+        default_value_t = 7 * 24 * 60 * 60
+    )]
+    node_enrollment_max_ttl_seconds: u64,
+    #[arg(long, env = "HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH")]
+    node_enrollment_binary_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
     web_oidc_auth_base_url: Option<String>,
     #[arg(
@@ -740,6 +766,8 @@ struct AgentArgs {
     join_token: Option<String>,
     #[arg(long, env = "HETERONETWORK_AGENT_JOIN_TOKEN_PATH")]
     join_token_path: Option<PathBuf>,
+    #[arg(long, env = "HETERONETWORK_AGENT_ENROLL_ONLY", default_value_t = false)]
+    enroll_only: bool,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT",
@@ -1753,6 +1781,12 @@ fn preflight_agent_runtime_with_path_and_checks(
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     validate_agent_api_auth_config(args)?;
+    if args.enroll_only {
+        anyhow::ensure!(
+            args.join_token.is_some() || args.join_token_path.is_some(),
+            "--enroll-only requires --join-token or --join-token-path"
+        );
+    }
     validate_bounded_u64(
         args.http_connect_timeout_seconds,
         "--http-connect-timeout-seconds",
@@ -4226,6 +4260,7 @@ where
     validate_control_plane_runtime_config(&args)?;
     let service_lease = control_plane_service_lease_config(&args)?;
     let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
+    let node_enrollment = control_plane_node_enrollment_config(&args)?;
     let web_ui_auth = if args.web_ui_enabled {
         let provider = WebAuthProvider::parse(&args.web_auth_provider)
             .map_err(anyhow::Error::msg)
@@ -4282,6 +4317,14 @@ where
             trusted.public_key,
         );
     }
+    if let Some(enrollment) = node_enrollment.as_ref() {
+        key_ring.insert_node_enrollment_key(
+            enrollment.issuer_node_id(),
+            enrollment.issuer_key_id(),
+            enrollment.issuer_public_key_b64(),
+            enrollment.max_ttl_seconds() as i64,
+        );
+    }
     let join_service = Arc::new(ControlPlaneJoinService::new(
         plane.clone(),
         token_ledger,
@@ -4300,6 +4343,9 @@ where
     }
     if let Some(auth) = web_ui_auth {
         http_state = http_state.enable_web_ui(auth);
+    }
+    if let Some(enrollment) = node_enrollment {
+        http_state = http_state.enable_node_enrollment(enrollment);
     }
     let result = serve_router(args.listen, router(http_state)).await;
     if let Some(task) = service_lease_task {
@@ -4406,6 +4452,10 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
     validate_daemon_identifier(&args.cluster_id, "--cluster-id")?;
     validate_daemon_identifier(&args.issuer_node_id, "--issuer-node-id")?;
     validate_daemon_identifier(&args.issuer_key_id, "--issuer-key-id")?;
+    validate_daemon_identifier(
+        &args.node_enrollment_issuer_key_id,
+        "--node-enrollment-issuer-key-id",
+    )?;
     for trusted in &args.trusted_issuer_keys {
         validate_daemon_identifier(
             &trusted.issuer_node_id,
@@ -4442,6 +4492,26 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
         validate_api_bearer_token(token, "--operator-api-bearer-token")?;
     }
+    if args.node_enrollment_enabled {
+        anyhow::ensure!(
+            args.web_ui_enabled,
+            "--node-enrollment-enabled requires --web-ui-enabled=true"
+        );
+        anyhow::ensure!(
+            args.web_public_url.is_some(),
+            "--node-enrollment-enabled requires --web-public-url"
+        );
+        anyhow::ensure!(
+            node_enrollment_issuer_private_key_path(args).is_some(),
+            "--node-enrollment-enabled requires --node-enrollment-issuer-private-key-path or a systemd node-enrollment-issuer.key credential"
+        );
+    } else {
+        anyhow::ensure!(
+            args.node_enrollment_issuer_private_key_path.is_none()
+                && args.node_enrollment_binary_path.is_none(),
+            "node enrollment key or binary options require --node-enrollment-enabled=true"
+        );
+    }
     validate_identity_public_key_b64(&args.issuer_public_key)
         .context("--issuer-public-key must be a canonical non-weak Ed25519 public key")?;
     for trusted in &args.trusted_issuer_keys {
@@ -4453,6 +4523,68 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
         })?;
     }
     Ok(())
+}
+
+fn control_plane_node_enrollment_config(
+    args: &ControlPlaneArgs,
+) -> anyhow::Result<Option<NodeEnrollmentConfig>> {
+    if !args.node_enrollment_enabled {
+        return Ok(None);
+    }
+    let key_path = node_enrollment_issuer_private_key_path(args)
+        .context("node enrollment issuer private key path or systemd credential is required")?;
+    let key = read_bounded_bearer_token_file(&key_path, "node enrollment issuer private key")?;
+    let issuer = IdentityKeyPair::from_signing_key_b64(&key)
+        .context("node enrollment issuer private key is not a canonical Ed25519 signing key")?;
+    let issuer_node_id = issuer.node_id();
+    let issuer_public_key = issuer.public_key_b64();
+    anyhow::ensure!(
+        issuer_public_key != args.issuer_public_key
+            && args
+                .trusted_issuer_keys
+                .iter()
+                .all(|trusted| trusted.public_key != issuer_public_key),
+        "node enrollment issuer must not reuse an unrestricted trusted issuer key"
+    );
+    anyhow::ensure!(
+        !(args.issuer_node_id == issuer_node_id.as_str()
+            && args.issuer_key_id == args.node_enrollment_issuer_key_id)
+            && args.trusted_issuer_keys.iter().all(|trusted| {
+                trusted.issuer_node_id != issuer_node_id.as_str()
+                    || trusted.key_id != args.node_enrollment_issuer_key_id
+            }),
+        "node enrollment issuer/key ID conflicts with an unrestricted trusted issuer entry"
+    );
+    let public_url = args
+        .web_public_url
+        .clone()
+        .context("node enrollment public URL is required")?;
+    let binary_path = match args.node_enrollment_binary_path.clone() {
+        Some(path) => path,
+        None => std::env::current_exe()
+            .context("failed to locate the current executable for node enrollment")?,
+    };
+    NodeEnrollmentConfig::new(
+        issuer,
+        args.node_enrollment_issuer_key_id.clone(),
+        public_url,
+        binary_path,
+        args.node_enrollment_max_ttl_seconds,
+    )
+    .map(Some)
+    .map_err(anyhow::Error::msg)
+    .context("node enrollment configuration")
+}
+
+fn node_enrollment_issuer_private_key_path(args: &ControlPlaneArgs) -> Option<PathBuf> {
+    args.node_enrollment_issuer_private_key_path
+        .clone()
+        .or_else(|| {
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .filter(|directory| !directory.is_empty())
+                .map(PathBuf::from)
+                .map(|directory| directory.join(NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID))
+        })
 }
 
 fn control_plane_operator_api_bearer_token(
@@ -7805,6 +7937,17 @@ async fn run_agent(
                 .context("failed to persist registered agent registration state")?;
             runtime.replace_state(persisted_state)?;
         }
+    }
+    if args.enroll_only {
+        anyhow::ensure!(
+            join_token.is_some() && registered_node.is_some(),
+            "--enroll-only requires a join token and a completed node registration"
+        );
+        tracing::info!(
+            node_id = %runtime.state().node_id,
+            "agent enrollment completed; exiting before background services start"
+        );
+        return Ok(());
     }
     let control_plane_bases = agent_control_plane_base_urls_with_persisted(
         join_token.as_ref(),
@@ -18349,6 +18492,132 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_node_enrollment_loads_private_signer_and_pinned_binary() -> anyhow::Result<()>
+    {
+        let root_public_key = IdentityKeyPair::generate().public_key_b64();
+        let enrollment_issuer = IdentityKeyPair::generate();
+        let directory = unique_test_dir("node-enrollment-config")?;
+        let key_path = directory.join("enrollment.key");
+        let binary_path = directory.join("iparsd");
+        write_private_test_secret(&key_path, enrollment_issuer.signing_key_b64())?;
+        std::fs::write(&binary_path, b"test-linux-amd64-binary")?;
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            root_public_key.as_str(),
+            "--web-public-url",
+            "http://100.64.0.10:8443",
+            "--node-enrollment-enabled",
+            "true",
+            "--node-enrollment-issuer-private-key-path",
+            key_path.to_str().context("test key path must be UTF-8")?,
+            "--node-enrollment-binary-path",
+            binary_path
+                .to_str()
+                .context("test binary path must be UTF-8")?,
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        validate_control_plane_runtime_config(&args)?;
+        let enrollment = control_plane_node_enrollment_config(&args)?
+            .context("node enrollment config should be enabled")?;
+        assert_eq!(enrollment.issuer_node_id(), enrollment_issuer.node_id());
+        assert_eq!(enrollment.issuer_key_id().as_str(), "web-enrollment");
+        assert_eq!(
+            enrollment.issuer_public_key_b64(),
+            enrollment_issuer.public_key_b64()
+        );
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_node_enrollment_rejects_root_key_reuse_and_key_id_collision(
+    ) -> anyhow::Result<()> {
+        let enrollment_issuer = IdentityKeyPair::generate();
+        let directory = unique_test_dir("node-enrollment-key-separation")?;
+        let key_path = directory.join("enrollment.key");
+        let binary_path = directory.join("iparsd");
+        write_private_test_secret(&key_path, enrollment_issuer.signing_key_b64())?;
+        std::fs::write(&binary_path, b"test-linux-amd64-binary")?;
+        let key_path = key_path.to_str().context("test key path must be UTF-8")?;
+        let binary_path = binary_path
+            .to_str()
+            .context("test binary path must be UTF-8")?;
+
+        let reused_key = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            enrollment_issuer.public_key_b64().as_str(),
+            "--web-public-url",
+            "http://100.64.0.10:8443",
+            "--node-enrollment-enabled",
+            "true",
+            "--node-enrollment-issuer-private-key-path",
+            key_path,
+            "--node-enrollment-binary-path",
+            binary_path,
+        ])?;
+        let Command::ControlPlane(reused_key) = reused_key.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        let reuse_error = match control_plane_node_enrollment_config(&reused_key) {
+            Ok(_) => anyhow::bail!("root issuer key was reused for node enrollment"),
+            Err(error) => error,
+        };
+        assert!(reuse_error.to_string().contains("must not reuse"));
+
+        let root_issuer = IdentityKeyPair::generate();
+        let enrollment_node_id = enrollment_issuer.node_id().to_string();
+        let colliding_id = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            enrollment_node_id.as_str(),
+            "--issuer-key-id",
+            "web-enrollment",
+            "--issuer-public-key",
+            root_issuer.public_key_b64().as_str(),
+            "--web-public-url",
+            "http://100.64.0.10:8443",
+            "--node-enrollment-enabled",
+            "true",
+            "--node-enrollment-issuer-private-key-path",
+            key_path,
+            "--node-enrollment-binary-path",
+            binary_path,
+        ])?;
+        let Command::ControlPlane(colliding_id) = colliding_id.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        let collision_error = match control_plane_node_enrollment_config(&colliding_id) {
+            Ok(_) => anyhow::bail!("enrollment issuer/key ID collision was accepted"),
+            Err(error) => error,
+        };
+        assert!(collision_error.to_string().contains("conflicts"));
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn trusted_issuer_key_parser_rejects_incomplete_values() {
         assert!(parse_trusted_issuer_key("issuer,key").is_err());
         assert!(parse_trusted_issuer_key("issuer,,pub").is_err());
@@ -20144,6 +20413,35 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_enroll_only_requires_a_join_token_source() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--enroll-only"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = match validate_agent_runtime_config(&args) {
+            Ok(()) => anyhow::bail!("enrollment without a token source was accepted"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--enroll-only requires --join-token or --join-token-path"));
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--enroll-only",
+            "--join-token-path",
+            "/run/heteronetwork/join-token.json",
+        ])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert!(args.enroll_only);
+        validate_agent_runtime_config(&args)?;
+        Ok(())
     }
 
     #[test]
