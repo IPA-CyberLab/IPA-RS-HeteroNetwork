@@ -93,8 +93,8 @@
   }
 
   function initials(value) {
-    var text = String(value || "IP").replace(/[^a-zA-Z0-9]/g, "");
-    return (text.slice(0, 2) || "IP").toUpperCase();
+    var text = String(value || "HN").replace(/[^a-zA-Z0-9]/g, "");
+    return (text.slice(0, 2) || "HN").toUpperCase();
   }
 
   function formatTime(value) {
@@ -127,6 +127,100 @@
 
   function normalizePathState(value) {
     return String(value || "unknown").toLowerCase();
+  }
+
+  function natProfile(entry) {
+    var node = entry && entry.node || {};
+    var health = entry && entry.health || {};
+    return entry && (entry.nat_classification || entry.natClassification)
+      || node.nat_classification
+      || node.natClassification
+      || health.nat_classification
+      || health.natClassification
+      || {};
+  }
+
+  function connectivityInfo(entry) {
+    var node = entry && entry.node || {};
+    var profile = natProfile(entry);
+    var connectivity = entry && (entry.connectivity || entry.connectivity_state || entry.connectivityState)
+      || node.connectivity
+      || node.connectivity_state
+      || node.connectivityState
+      || profile.connectivity
+      || {};
+    if (typeof connectivity !== "object") connectivity = { state: connectivity };
+    var explicit = String(connectivity.state || connectivity.kind || connectivity.mode
+      || connectivity.classification || entry && (entry.nat_state || entry.natState) || "").toLowerCase();
+    var mapping = String(profile.mapping_behavior || profile.mapping || profile.nat_type || "").toLowerCase();
+    var strategy = String(profile.strategy || "").toLowerCase();
+    var hasDoubleNat = Boolean(connectivity.double_nat || connectivity.doubleNat || profile.double_nat || profile.doubleNat)
+      || explicit.indexOf("double") !== -1 || mapping.indexOf("double") !== -1;
+    var relayOnly = Boolean(connectivity.relay_only || connectivity.relayOnly || profile.relay_only || profile.relayOnly)
+      || explicit.indexOf("relay_only") !== -1 || explicit.indexOf("relay-only") !== -1;
+    var publicNode = explicit.indexOf("public") !== -1 || explicit.indexOf("no_nat") !== -1
+      || explicit.indexOf("no-nat") !== -1 || mapping === "no_nat" || mapping === "nonat"
+      || mapping === "no-nat";
+    var natNode = explicit.indexOf("nat") !== -1 || mapping.indexOf("dependent") !== -1
+      || mapping.indexOf("nat") !== -1;
+    var candidates = Array.isArray(node.endpoint_candidates) ? node.endpoint_candidates : [];
+    var hasPublicCandidate = candidates.some(function (candidate) {
+      var kind = String(candidate && candidate.kind || "").toLowerCase();
+      return kind.indexOf("public") !== -1 || kind.indexOf("stun_reflexive") !== -1;
+    });
+    var state = hasDoubleNat ? "double_nat" : relayOnly ? "relay_only" : publicNode || (!natNode && hasPublicCandidate) ? "public" : natNode ? "nat" : "unknown";
+    var labels = {
+      public: "Public",
+      nat: "NAT",
+      double_nat: "Double NAT",
+      relay_only: "Relay only",
+      unknown: "Not detected"
+    };
+    var details = {
+      public: "Direct public endpoint",
+      nat: strategy === "relay_preferred" ? "NAT, relay preferred" : "NAT traversal available",
+      double_nat: "Multiple NAT layers detected",
+      relay_only: "Direct traversal unavailable",
+      unknown: "Waiting for STUN report"
+    };
+    var observed = profile.observed_endpoint || profile.public_endpoint || connectivity.observed_endpoint || connectivity.public_endpoint;
+    var confidence = Number(profile.confidence);
+    return {
+      state: state,
+      label: labels[state],
+      detail: details[state],
+      profile: profile,
+      observed: observed || "",
+      strategy: strategy,
+      confidence: isFinite(confidence) ? Math.round(confidence * 100) : null
+    };
+  }
+
+  function topologyNode(entry) {
+    var node = entry.node;
+    var connectivity = connectivityInfo(entry);
+    return '<button class="topology-node topology-' + connectivity.state + '" data-node-id="' + escapeHtml(node.node_id) + '" type="button">'
+      + '<span class="topology-node-icon">' + icon(connectivity.state === "relay_only" ? "route-off" : connectivity.state === "public" ? "wifi" : "network") + '</span>'
+      + '<span class="topology-node-copy"><strong>' + escapeHtml(shortId(node.node_id)) + '</strong><small>' + escapeHtml(connectivity.label) + '</small></span>'
+      + '<span class="topology-node-state">' + escapeHtml(connectivity.confidence == null ? "-" : connectivity.confidence + "%") + '</span></button>';
+  }
+
+  function topologyLink(path) {
+    var local = path.key && path.key.local || "-";
+    var remote = path.key && path.key.remote || "-";
+    var selectedState = normalizePathState(path.selected_state);
+    return '<div class="topology-link"><button class="topology-peer" data-node-id="' + escapeHtml(local) + '" type="button">' + escapeHtml(shortId(local)) + '</button>'
+      + '<span class="topology-line"><span></span></span><button class="topology-peer" data-node-id="' + escapeHtml(remote) + '" type="button">' + escapeHtml(shortId(remote)) + '</button>'
+      + statusPill(selectedState) + '</div>';
+  }
+
+  function renderTopology(nodes, paths) {
+    var visibleNodes = nodes.slice(0, 12);
+    var visiblePaths = paths.slice(0, 16);
+    var nodeMarkup = visibleNodes.length ? visibleNodes.map(topologyNode).join("") : emptyState("No devices registered", "Connect a device to map network reachability.", "network");
+    var pathMarkup = visiblePaths.length ? visiblePaths.map(topologyLink).join("") : '<div class="topology-empty">No path reports yet.</div>';
+    return '<section class="section-panel topology-panel"><div class="section-header"><div><h2>Connectivity map</h2><p>Detected NAT posture and selected peer paths</p></div><div class="topology-legend"><span><i class="legend-dot public"></i>Public</span><span><i class="legend-dot nat"></i>NAT</span><span><i class="legend-dot double-nat"></i>Double NAT</span><span><i class="legend-dot relay-only"></i>Relay only</span></div></div><div class="topology-body"><div class="topology-nodes">' + nodeMarkup + '</div><div class="topology-links">' + pathMarkup + '</div></div>'
+      + (nodes.length > visibleNodes.length || paths.length > visiblePaths.length ? '<div class="topology-footnote">Showing ' + visibleNodes.length + ' of ' + nodes.length + ' devices and ' + visiblePaths.length + ' of ' + paths.length + ' paths.</div>' : '') + '</section>';
   }
 
   function statusClass(value) {
@@ -354,17 +448,18 @@
       var node = entry.node;
       var health = entry.health || {};
       var label = shortId(node.node_id);
+      var connectivity = connectivityInfo(entry);
       return '<tr class="' + (state.selectedNodeId === node.node_id ? "selected" : "") + '"><td><button class="primary-link" data-node-id="'
         + escapeHtml(node.node_id) + '" type="button"><span class="table-primary"><span class="peer-avatar">'
         + escapeHtml(initials(node.node_id)) + '</span><span><strong>' + escapeHtml(label)
         + '</strong><small title="' + escapeHtml(node.node_id) + '">' + escapeHtml(node.node_id) + '</small></span></span></button></td><td class="mono">'
         + escapeHtml(node.vpn_ip) + '</td><td>' + statusPill(health.state || "unknown") + '</td><td><span class="role-badge">'
-        + escapeHtml(node.role || "member") + '</span></td><td>' + listTags(node.tags) + '</td><td>'
+        + escapeHtml(node.role || "member") + '</span></td><td>' + statusPill(connectivity.state, connectivity.label) + '</td><td>' + listTags(node.tags) + '</td><td>'
         + escapeHtml(node.relay_capability ? "Available" : "No") + '</td><td class="faint">' + escapeHtml(age(health.last_seen_at || node.registered_at)) + '</td><td><button class="detail-link" data-node-id="'
         + escapeHtml(node.node_id) + '" type="button" aria-label="Open device details" title="Open device details">'
         + icon("arrow-up-right") + "</button></td></tr>";
     }).join("");
-    return rows || '<tr><td colspan="8"><div class="filter-empty"><strong>No devices found</strong><span>Try changing the search or status filter.</span></div></td></tr>';
+    return rows || '<tr><td colspan="9"><div class="filter-empty"><strong>No devices found</strong><span>Try changing the search or status filter.</span></div></td></tr>';
   }
 
   function emptyState(title, message, iconName) {
@@ -378,6 +473,7 @@
     var paths = overview.paths || [];
     var nodes = overview.nodes || [];
     var routeCount = nodes.reduce(function (total, entry) { return total + (entry.node.routes || []).length; }, 0);
+    var natProfiles = nodes.filter(function (entry) { return connectivityInfo(entry).state !== "unknown"; }).length;
     var counts = {};
     paths.forEach(function (path) {
       var pathState = normalizePathState(path.selected_state);
@@ -396,12 +492,13 @@
     });
     var staleClass = metrics.stale_path_count ? "warn" : "";
     var recentContent = recent.length
-      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
+      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Connectivity</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
       : emptyState("No devices registered", "Connect a device to see it here.", "server");
     return '<div class="metric-grid">'
       + metricCard("Devices", metrics.node_count || 0, (metrics.healthy_node_count || 0) + " healthy", "server", icon("circle-check") + (metrics.healthy_node_count || 0), "")
       + metricCard("Connections", metrics.path_count || 0, (metrics.stale_path_count || 0) + " stale", "network", icon(metrics.stale_path_count ? "circle-alert" : "activity") + (metrics.stale_path_count || 0), staleClass)
       + metricCard("Advertised routes", routeCount, "Across registered devices", "route", "", "")
+      + metricCard("NAT profiles", natProfiles, natProfiles === nodes.length ? "All devices classified" : "Awaiting STUN reports", "wifi", "", natProfiles === nodes.length ? "" : "warn")
       + metricCard("Access rules", (policy.acl_rules || []).length, policy.allow_relay_fallback ? "Relay fallback enabled" : "Relay fallback disabled", "shield-check", "", "")
       + '</div><div class="overview-grid"><section class="section-panel"><div class="section-header"><div><h2>Connection health</h2><p>Selected path distribution</p></div><span class="status-pill info">' + paths.length + ' paths</span></div><div class="section-body"><div class="state-list">'
       + stateRows + '</div></div></section><section class="section-panel"><div class="section-header"><div><h2>Policy posture</h2><p>Runtime settings</p></div><button class="button button-secondary button-small" data-navigate="acl" type="button">Edit policy</button></div><div class="section-body"><div class="policy-summary">'
@@ -409,7 +506,7 @@
       + '<div class="policy-summary-row"><span>NAT traversal</span>' + statusPill(policy.allow_nat_traversal ? "healthy" : "unreachable", policy.allow_nat_traversal ? "Enabled" : "Disabled") + '</div>'
       + '<div class="policy-summary-row"><span>Relay fallback</span>' + statusPill(policy.allow_relay_fallback ? "healthy" : "unreachable", policy.allow_relay_fallback ? "Enabled" : "Disabled") + '</div>'
       + '<div class="policy-summary-row"><span>Path state TTL</span><span class="policy-summary-value">' + escapeHtml(policy.path_state_ttl_seconds) + " seconds</span></div>"
-      + '</div></div></section></div><section class="section-panel"><div class="section-header"><div><h2>Recently seen devices</h2><p>Latest control-plane observations</p></div><button class="button button-secondary button-small" data-navigate="nodes" type="button">View all</button></div>'
+      + '</div></div></section></div>' + renderTopology(nodes, paths) + '<section class="section-panel"><div class="section-header"><div><h2>Recently seen devices</h2><p>Latest control-plane observations</p></div><button class="button button-secondary button-small" data-navigate="nodes" type="button">View all</button></div>'
       + recentContent + "</section>";
   }
 
@@ -440,7 +537,7 @@
       { value: "unreachable", label: "Unreachable" }
     ];
     var tableBody = entries.length
-      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(entries) + "</tbody></table></div>"
+      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Connectivity</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(entries) + "</tbody></table></div>"
       : emptyState("No devices found", "Try changing the search or status filter.", "server");
     var table = '<section class="section-panel">' + tableToolbar("nodes", "Search devices", "nodeHealth", options, entries.length) + tableBody + "</section>";
     return table;
@@ -586,6 +683,13 @@
     var routes = node.routes || [];
     state.selectedNodeId = nodeId;
     $("drawer-root").innerHTML = '<div class="drawer-backdrop" data-close-drawer></div><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title"><header class="drawer-header"><div><h2 id="drawer-title">Device details</h2><span class="drawer-subtitle">Registered node</span></div><button class="drawer-close" data-close-drawer type="button" aria-label="Close device details" title="Close">' + icon("x") + '</button></header><div class="drawer-body"><div class="drawer-identity"><span class="peer-avatar">' + escapeHtml(initials(node.node_id)) + '</span><div><strong>' + escapeHtml(shortId(node.node_id)) + '</strong><small>' + escapeHtml(node.node_id) + '</small></div></div><div class="drawer-section" style="border-top:0;margin-top:0;padding-top:0"><span class="status-pill ' + statusClass(health.state) + '">' + escapeHtml(pretty(health.state || "unknown")) + '</span></div><dl class="detail-list"><dt>VPN address</dt><dd class="mono">' + escapeHtml(node.vpn_ip) + '</dd><dt>Role</dt><dd>' + escapeHtml(node.role || "member") + '</dd><dt>Last seen</dt><dd>' + escapeHtml(formatTime(health.last_seen_at)) + '</dd><dt>Registered</dt><dd>' + escapeHtml(formatTime(node.registered_at)) + '</dd><dt>Relay capability</dt><dd>' + escapeHtml(node.relay_capability ? "Available" : "No") + '</dd><dt>Connections</dt><dd>' + paths.length + '</dd></dl><div class="drawer-section"><h3>Tags</h3>' + listTags(node.tags) + '</div><div class="drawer-section"><h3>Advertised routes</h3>' + (routes.length ? '<div class="chip-list">' + routes.map(function (route) { return '<span class="tag mono">' + escapeHtml(route.cidr) + '</span>'; }).join("") + '</div>' : '<span class="faint">None</span>') + '</div><div class="drawer-actions"><button class="button button-danger" data-remove-node="' + escapeHtml(node.node_id) + '" type="button">' + icon("trash-2") + '<span>Remove device</span></button></div></div></aside>';
+    var connectivity = connectivityInfo(entry);
+    var profile = connectivity.profile || {};
+    var natSection = document.createElement("div");
+    natSection.className = "drawer-section nat-detail-section";
+    natSection.innerHTML = '<h3>Connectivity</h3><div class="drawer-connectivity"><span class="topology-state topology-' + connectivity.state + '">' + escapeHtml(connectivity.label) + '</span><span>' + escapeHtml(connectivity.detail) + '</span></div><dl class="detail-list compact-detail-list"><dt>Observed endpoint</dt><dd class="mono">' + escapeHtml(connectivity.observed || "-") + '</dd><dt>Mapping</dt><dd>' + escapeHtml(pretty(profile.mapping_behavior || profile.mapping || "not reported")) + '</dd><dt>Filtering</dt><dd>' + escapeHtml(pretty(profile.filtering_behavior || profile.filtering || "not reported")) + '</dd><dt>Traversal</dt><dd>' + escapeHtml(pretty(profile.strategy || "not reported")) + '</dd><dt>Confidence</dt><dd>' + escapeHtml(connectivity.confidence == null ? "-" : connectivity.confidence + "%") + '</dd></dl>';
+    var drawerActions = $("drawer-root").querySelector(".drawer-actions");
+    if (drawerActions) drawerActions.parentNode.insertBefore(natSection, drawerActions);
     decorateIcons($("drawer-root"));
   }
 
