@@ -130,6 +130,11 @@ HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS=604800
 HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH=/opt/ipars/bin/iparsd
 ```
 
+The private-key path above is for direct daemon invocation. The packaged
+systemd unit instead loads the root-only
+`/etc/credstore/node-enrollment-issuer.key` as a service credential, so the
+shared Signal, STUN, and Relay Unix account cannot read the source key.
+
 This signer is distinct from the offline root issuer. The verifier limits it to
 non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,
 and redundant bootstrap endpoints. The management endpoint requires the same

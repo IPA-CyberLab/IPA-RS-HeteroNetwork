@@ -196,6 +196,7 @@ const MAX_USERSPACE_WIREGUARD_LIFECYCLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
+const NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID: &str = "node-enrollment-issuer.key";
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
@@ -4501,8 +4502,8 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
             "--node-enrollment-enabled requires --web-public-url"
         );
         anyhow::ensure!(
-            args.node_enrollment_issuer_private_key_path.is_some(),
-            "--node-enrollment-enabled requires --node-enrollment-issuer-private-key-path"
+            node_enrollment_issuer_private_key_path(args).is_some(),
+            "--node-enrollment-enabled requires --node-enrollment-issuer-private-key-path or a systemd node-enrollment-issuer.key credential"
         );
     } else {
         anyhow::ensure!(
@@ -4530,11 +4531,9 @@ fn control_plane_node_enrollment_config(
     if !args.node_enrollment_enabled {
         return Ok(None);
     }
-    let key_path = args
-        .node_enrollment_issuer_private_key_path
-        .as_deref()
-        .context("node enrollment issuer private key path is required")?;
-    let key = read_bounded_bearer_token_file(key_path, "node enrollment issuer private key")?;
+    let key_path = node_enrollment_issuer_private_key_path(args)
+        .context("node enrollment issuer private key path or systemd credential is required")?;
+    let key = read_bounded_bearer_token_file(&key_path, "node enrollment issuer private key")?;
     let issuer = IdentityKeyPair::from_signing_key_b64(&key)
         .context("node enrollment issuer private key is not a canonical Ed25519 signing key")?;
     let issuer_node_id = issuer.node_id();
@@ -4575,6 +4574,17 @@ fn control_plane_node_enrollment_config(
     .map(Some)
     .map_err(anyhow::Error::msg)
     .context("node enrollment configuration")
+}
+
+fn node_enrollment_issuer_private_key_path(args: &ControlPlaneArgs) -> Option<PathBuf> {
+    args.node_enrollment_issuer_private_key_path
+        .clone()
+        .or_else(|| {
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .filter(|directory| !directory.is_empty())
+                .map(PathBuf::from)
+                .map(|directory| directory.join(NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID))
+        })
 }
 
 fn control_plane_operator_api_bearer_token(

@@ -30,6 +30,7 @@ quorum.
 ```sh
 sudo useradd --system --home /var/lib/ipars --create-home --shell /usr/sbin/nologin ipars
 sudo install -d -o root -g ipars -m 0750 /etc/ipars
+sudo install -d -o root -g root -m 0700 /etc/credstore
 sudo install -d -o root -g root -m 0755 /opt/ipars/bin
 sudo install -o root -g root -m 0755 target/release/iparsd /opt/ipars/bin/iparsd
 sudo install -o root -g ipars -m 0640 deploy/systemd/public-node.env.example /etc/ipars/public-node.env
@@ -42,11 +43,15 @@ owned by `ipars:ipars` with mode `0400`. The daemon intentionally rejects
 group/world-readable credential files. The issuer private key is not installed
 on public nodes; only its public key belongs in this environment file. When the
 Web UI **Add device** workflow is enabled, generate a separate Ed25519 enrollment
-signing key, install the same key as
-`/etc/ipars/node-enrollment-issuer.key` on every Control Plane replica with
-ownership `ipars:ipars` and mode `0400`, and never reuse the offline root issuer
-key. Startup rejects key reuse and issuer/key ID collisions. Tokens from this
-online key are verifier-constrained to `edge`, `worker`, or
+signing key and install the same key as
+`/etc/credstore/node-enrollment-issuer.key` on every Control Plane replica with
+ownership `root:root` and mode `0400`. The Control Plane unit imports it with
+systemd `LoadCredential=` into that service's read-only credential namespace;
+Signal, STUN, and Relay do not receive it even though the packaged services use
+the same Unix account. Do not set the direct private-key path variable in the
+shared environment file, and never reuse the offline root issuer key. Startup
+rejects key reuse and issuer/key ID collisions. Tokens from this online key are
+verifier-constrained to `edge`, `worker`, or
 `gateway` joins, matching claim/policy tags, no route authority, finite use
 counts, the configured TTL ceiling, and at least two active Control Plane,
 Signal, and STUN endpoints. Relay-enabled tokens also require two Relay

@@ -38,13 +38,17 @@ Signal must be able to reach at least one control-plane API to authenticate node
 Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. Keep the issuer private key offline; public nodes need only the public key.
 
 To expose **Add device** in the Web UI, create a separate enrollment signer and
-install the same owner-only key on every Control Plane replica. Configure
-`HETERONETWORK_NODE_ENROLLMENT_ENABLED=true`,
-`HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH`, a distinct
+install the same root-owned key as
+`/etc/credstore/node-enrollment-issuer.key` on every Control Plane replica. The
+packaged unit imports that file with systemd `LoadCredential=` so only the
+Control Plane receives a readable copy. Configure
+`HETERONETWORK_NODE_ENROLLMENT_ENABLED=true`, a distinct
 `HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID`, the bounded
 `HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS`, and the release artifact path in
 `HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH`. Do not copy the root issuer private
-key to these nodes. Enrollment issuance requires authenticated management access
+key to these nodes. A direct non-systemd invocation must instead set
+`HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH`. Enrollment issuance
+requires authenticated management access
 and two distinct active URLs for Control Plane, Signal, and STUN, plus two Relay
 URLs when relay permission is requested.
 
