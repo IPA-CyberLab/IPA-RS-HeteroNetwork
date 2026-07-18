@@ -480,7 +480,15 @@
   function formatTime(value) {
     if (!value) return "-";
     var date = new Date(value);
-    return isNaN(date.getTime()) ? "-" : date.toLocaleString(state.locale === "ja" ? "ja-JP" : "en-US", {
+    if (isNaN(date.getTime())) return "-";
+    if (state.locale === "ja") return date.toLocaleString("ja-JP", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    });
+    return date.toLocaleString("en-US", {
       month: "short",
       day: "numeric",
       hour: "2-digit",
