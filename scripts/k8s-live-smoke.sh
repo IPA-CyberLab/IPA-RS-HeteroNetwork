@@ -105,7 +105,7 @@ dump_diagnostics() {
     ' sh heteronetwork0 100.64.0.2 2>&1 || true
     "$kubectl_bin" -n "$namespace" logs "$pod" -c agent --tail=200 2>&1 || true
   done < <("$kubectl_bin" -n "$namespace" get pods \
-    -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
+    -l "app.kubernetes.io/name=heteronetwork,app.kubernetes.io/instance=${release}" \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
 }
 
@@ -494,7 +494,7 @@ wait_for_relay_dataplane() {
         return 0
       fi
     done < <("$kubectl_bin" -n "$namespace" get pods \
-      -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=$release" \
+      -l "app.kubernetes.io/name=heteronetwork,app.kubernetes.io/instance=$release" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
     sleep 2
   done
@@ -634,13 +634,7 @@ fi
 
 require_dns_label "$namespace" "HETERONETWORK_K8S_SMOKE_NAMESPACE" 63
 require_dns_label "$release" "HETERONETWORK_K8S_SMOKE_RELEASE" 53
-if [[ "$release" == *ipars* ]]; then
-  chart_fullname="$release"
-else
-  chart_fullname="${release}-ipars"
-  chart_fullname="${chart_fullname:0:53}"
-  chart_fullname="${chart_fullname%-}"
-fi
+chart_fullname="$release"
 relay_service_name="${chart_fullname}-relay"
 require_command "$kubectl_bin"
 require_command "$helm_bin"
@@ -940,7 +934,7 @@ if [[ "$("$kubectl_bin" auth can-i list services \
 fi
 
 mapfile -t agent_pods < <("$kubectl_bin" -n "$namespace" get pods \
-  -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
+  -l "app.kubernetes.io/name=heteronetwork,app.kubernetes.io/instance=${release}" \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 desired_agents="$("$kubectl_bin" -n "$namespace" get daemonset "$chart_fullname" -o jsonpath='{.status.desiredNumberScheduled}')"
 if [[ ! "$desired_agents" =~ ^[1-9][0-9]*$ || ${#agent_pods[@]} -ne $desired_agents ]]; then
@@ -1058,7 +1052,7 @@ route_provider_node_id="${node_ids[0]}"
 
 "$kubectl_bin" -n "$namespace" rollout status "daemonset/${chart_fullname}" --timeout="${timeout_seconds}s"
 mapfile -t updated_agent_pods < <("$kubectl_bin" -n "$namespace" get pods \
-  -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
+  -l "app.kubernetes.io/name=heteronetwork,app.kubernetes.io/instance=${release}" \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 if [[ ${#updated_agent_pods[@]} -ne $desired_agents ]]; then
   echo "route-provider rollout did not preserve the expected number of agent pods" >&2
@@ -1116,7 +1110,7 @@ for index in "${!node_ids[@]}"; do
         break 2
       fi
     done < <("$kubectl_bin" -n "$namespace" get pods \
-      -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
+      -l "app.kubernetes.io/name=heteronetwork,app.kubernetes.io/instance=${release}" \
       --field-selector "spec.nodeName=${pod_node}" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
     sleep 2
