@@ -72,6 +72,13 @@ readiness. The admin endpoints behind the UI are authenticated; node removal,
 path pinning, and policy updates are available from the browser. The UI is
 embedded in the Rust binary and does not require a Node.js build.
 
+The UI supports explicit light/dark themes (with the operating-system preference
+as the first-run default) and English/Japanese locale selection. Both choices
+are stored locally without storing OIDC credentials or enrollment tokens. With
+node enrollment enabled, **Add device** creates a bounded single-use or reusable
+join token from the live HA service directory and returns a copyable Linux
+install command plus script. The raw token stays only in page memory.
+
 OIDC is enabled by default with Keycloak:
 
 ```bash
@@ -111,6 +118,22 @@ the UI; an existing `HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN` or i
 file-backed variant can also be entered in the UI as an operator-token
 fallback. The OIDC access token is checked server-side through the configured
 provider userinfo endpoint before any `/v1/admin/*` request is handled.
+
+Enable the enrollment workflow with a dedicated owner-only signer that is
+shared by the active Control Plane replicas:
+
+```bash
+HETERONETWORK_NODE_ENROLLMENT_ENABLED=true
+HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH=/etc/ipars/node-enrollment-issuer.key
+HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID=web-enrollment
+HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS=604800
+HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH=/opt/ipars/bin/iparsd
+```
+
+This signer is distinct from the offline root issuer. The verifier limits it to
+non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,
+and redundant bootstrap endpoints. The management endpoint requires the same
+OIDC/operator authorization as the rest of `/v1/admin/*`.
 
 Linux network namespace integration tests are gated because they create host network namespaces and require `iproute2` plus `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`:
 

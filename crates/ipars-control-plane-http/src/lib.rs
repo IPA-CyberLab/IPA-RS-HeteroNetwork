@@ -1,20 +1,26 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ipars_control_plane::{
-    ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
+    node_enrollment_role_is_allowed, ControlPlane, ControlPlaneError, ControlPlaneJoinService,
+    ControlPlaneStore, TokenLedger, MAX_NODE_ENROLLMENT_TOKEN_USES,
 };
+use ipars_crypto::IdentityKeyPair;
 use ipars_types::api::{
     ControlPlaneMetricsResponse, ControlPlaneNodeOverview, ControlPlaneNodeQueryKind,
     ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse, ControlPlanePathsResponse,
@@ -23,7 +29,11 @@ use ipars_types::api::{
     RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
-use ipars_types::{ClusterPolicy, NodeId, PathRecord, PathState, TokenLedgerMetrics};
+use ipars_types::{
+    BootstrapEndpointKind, ClusterPolicy, JoinTokenClaims, KeyId, NodeId, PathRecord, PathState,
+    Role, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+};
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
 use reqwest::Client;
@@ -32,6 +42,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tokio_util::io::ReaderStream;
 use url::Url;
 
 const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
@@ -40,6 +51,13 @@ const WEB_OIDC_LOGIN_STATE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const WEB_OIDC_STATE_COOKIE: &str = "heteronetwork_oidc_state";
 const WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY: &str = "heteronetwork_access_token";
+const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
+const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
+const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
+const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
+const NODE_ENROLLMENT_ARCH: &str = "linux-amd64";
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -47,11 +65,218 @@ macro_rules! prometheus_line {
     }};
 }
 
+#[derive(Clone)]
+pub struct NodeEnrollmentConfig {
+    issuer: IdentityKeyPair,
+    key_id: KeyId,
+    install_base_url: Arc<str>,
+    binary_path: Arc<PathBuf>,
+    binary: Arc<std::fs::File>,
+    binary_sha256: Arc<str>,
+    binary_size: u64,
+    max_ttl_seconds: u64,
+}
+
+impl NodeEnrollmentConfig {
+    pub fn new(
+        issuer: IdentityKeyPair,
+        key_id: String,
+        install_base_url: String,
+        binary_path: PathBuf,
+        max_ttl_seconds: u64,
+    ) -> Result<Self, String> {
+        validate_enrollment_identifier(&key_id, "node enrollment issuer key ID")?;
+        if !(MIN_NODE_ENROLLMENT_TTL_SECONDS..=MAX_JOIN_TOKEN_TTL_SECONDS as u64)
+            .contains(&max_ttl_seconds)
+        {
+            return Err(format!(
+                "node enrollment maximum TTL must be between {MIN_NODE_ENROLLMENT_TTL_SECONDS} and {MAX_JOIN_TOKEN_TTL_SECONDS} seconds"
+            ));
+        }
+        if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+            return Err(format!(
+                "node enrollment binary serving currently requires Linux x86_64; got {} {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ));
+        }
+
+        let install_base_url =
+            validate_web_auth_base_url(install_base_url, "node enrollment public URL")?;
+        let parsed = Url::parse(&install_base_url)
+            .map_err(|error| format!("node enrollment public URL is invalid: {error}"))?;
+        if !matches!(parsed.path(), "" | "/") {
+            return Err("node enrollment public URL must not contain a path".to_string());
+        }
+
+        let path_metadata = std::fs::symlink_metadata(&binary_path).map_err(|error| {
+            format!(
+                "failed to inspect node enrollment binary {}: {error}",
+                binary_path.display()
+            )
+        })?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(format!(
+                "node enrollment binary {} must be a regular non-symlink file",
+                binary_path.display()
+            ));
+        }
+        let mut binary = std::fs::File::open(&binary_path).map_err(|error| {
+            format!(
+                "failed to open node enrollment binary {}: {error}",
+                binary_path.display()
+            )
+        })?;
+        let metadata = binary.metadata().map_err(|error| {
+            format!(
+                "failed to inspect opened node enrollment binary {}: {error}",
+                binary_path.display()
+            )
+        })?;
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_NODE_ENROLLMENT_BINARY_BYTES
+        {
+            return Err(format!(
+                "node enrollment binary {} must be a non-empty regular file no larger than {MAX_NODE_ENROLLMENT_BINARY_BYTES} bytes",
+                binary_path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+                return Err(format!(
+                    "node enrollment binary {} changed while it was opened",
+                    binary_path.display()
+                ));
+            }
+        }
+
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = binary.read(&mut buffer).map_err(|error| {
+                format!(
+                    "failed to hash node enrollment binary {}: {error}",
+                    binary_path.display()
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        binary.seek(SeekFrom::Start(0)).map_err(|error| {
+            format!(
+                "failed to rewind node enrollment binary {}: {error}",
+                binary_path.display()
+            )
+        })?;
+
+        Ok(Self {
+            issuer,
+            key_id: KeyId::from_string(key_id),
+            install_base_url: Arc::from(install_base_url),
+            binary_path: Arc::new(binary_path),
+            binary: Arc::new(binary),
+            binary_sha256: Arc::from(format!("{:x}", digest.finalize())),
+            binary_size: metadata.len(),
+            max_ttl_seconds,
+        })
+    }
+
+    pub fn issuer_node_id(&self) -> NodeId {
+        self.issuer.node_id()
+    }
+
+    pub fn issuer_key_id(&self) -> KeyId {
+        self.key_id.clone()
+    }
+
+    pub fn issuer_public_key_b64(&self) -> String {
+        self.issuer.public_key_b64()
+    }
+
+    pub fn max_ttl_seconds(&self) -> u64 {
+        self.max_ttl_seconds
+    }
+
+    fn open_binary(&self) -> Result<std::fs::File, String> {
+        let path_metadata =
+            std::fs::symlink_metadata(self.binary_path.as_ref()).map_err(|error| {
+                format!(
+                    "failed to inspect node enrollment binary {}: {error}",
+                    self.binary_path.display()
+                )
+            })?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(format!(
+                "node enrollment binary {} is no longer a regular non-symlink file",
+                self.binary_path.display()
+            ));
+        }
+        let binary = std::fs::File::open(self.binary_path.as_ref()).map_err(|error| {
+            format!(
+                "failed to open node enrollment binary {}: {error}",
+                self.binary_path.display()
+            )
+        })?;
+        let original = self.binary.metadata().map_err(|error| {
+            format!(
+                "failed to inspect pinned node enrollment binary {}: {error}",
+                self.binary_path.display()
+            )
+        })?;
+        let opened = binary.metadata().map_err(|error| {
+            format!(
+                "failed to inspect opened node enrollment binary {}: {error}",
+                self.binary_path.display()
+            )
+        })?;
+        if !opened.is_file() || opened.len() != self.binary_size {
+            return Err(format!(
+                "node enrollment binary {} changed after startup",
+                self.binary_path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if path_metadata.dev() != opened.dev()
+                || path_metadata.ino() != opened.ino()
+                || original.dev() != opened.dev()
+                || original.ino() != opened.ino()
+            {
+                return Err(format!(
+                    "node enrollment binary {} changed after startup",
+                    self.binary_path.display()
+                ));
+            }
+        }
+        Ok(binary)
+    }
+}
+
+fn validate_enrollment_identifier(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > ipars_types::MAX_JOIN_TOKEN_IDENTIFIER_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{label} must be 1 to {} non-control characters",
+            ipars_types::MAX_JOIN_TOKEN_IDENTIFIER_BYTES
+        ));
+    }
+    Ok(())
+}
+
 pub struct ControlPlaneHttpState<S, L> {
     plane: Arc<ControlPlane<S>>,
     join_service: Arc<ControlPlaneJoinService<S, L>>,
     operator_api_bearer_token: Option<Arc<str>>,
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
+    node_enrollment: Option<Arc<NodeEnrollmentConfig>>,
 }
 
 impl<S, L> Clone for ControlPlaneHttpState<S, L> {
@@ -61,6 +286,7 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
             join_service: self.join_service.clone(),
             operator_api_bearer_token: self.operator_api_bearer_token.clone(),
             web_ui_auth: self.web_ui_auth.clone(),
+            node_enrollment: self.node_enrollment.clone(),
         }
     }
 }
@@ -75,6 +301,7 @@ impl<S, L> ControlPlaneHttpState<S, L> {
             join_service,
             operator_api_bearer_token: None,
             web_ui_auth: None,
+            node_enrollment: None,
         }
     }
 
@@ -85,6 +312,11 @@ impl<S, L> ControlPlaneHttpState<S, L> {
 
     pub fn enable_web_ui(mut self, auth: WebUiAuthConfig) -> Self {
         self.web_ui_auth = Some(Arc::new(auth));
+        self
+    }
+
+    pub fn enable_node_enrollment(mut self, config: NodeEnrollmentConfig) -> Self {
+        self.node_enrollment = Some(Arc::new(config));
         self
     }
 }
@@ -109,7 +341,15 @@ where
             "/v1/nodes/{node_id}/wireguard-key",
             put(rotate_wireguard_key::<S, L>),
         )
-        .route("/v1/tokens/revoke", post(revoke_token::<S, L>));
+        .route("/v1/tokens/revoke", post(revoke_token::<S, L>))
+        .route(
+            "/v1/install/linux-amd64.sh",
+            get(node_enrollment_linux_script::<S, L>),
+        )
+        .route(
+            "/v1/install/iparsd-linux-amd64",
+            get(node_enrollment_binary::<S, L>),
+        );
 
     let management_auth = Arc::new(ManagementAuth {
         operator_api_bearer_token: state.operator_api_bearer_token.clone(),
@@ -120,6 +360,11 @@ where
         .route("/v1/admin/services", get(admin_services::<S, L>))
         .route("/v1/admin/nodes", get(admin_nodes::<S, L>))
         .route("/v1/admin/paths", get(admin_paths::<S, L>))
+        .route(
+            "/v1/admin/enrollment",
+            post(admin_create_node_enrollment::<S, L>)
+                .layer(DefaultBodyLimit::max(MAX_NODE_ENROLLMENT_REQUEST_BYTES)),
+        )
         .route(
             "/v1/admin/policy",
             get(admin_policy::<S, L>).put(update_admin_policy::<S, L>),
@@ -150,12 +395,15 @@ where
     } else {
         protocol.merge(admin)
     };
-    app.route("/ui", get(ui_index))
+    app.route("/", get(ui_root))
+        .route("/ui", get(ui_index))
         .route("/ui/", get(ui_index))
         .route("/ui/login", get(ui_login::<S, L>))
         .route("/ui/callback", get(ui_callback::<S, L>))
         .route("/ui/app.js", get(ui_app))
+        .route("/ui/theme.js", get(ui_theme))
         .route("/ui/styles.css", get(ui_styles))
+        .route("/ui/fonts/noto-sans-jp-ui.ttf", get(ui_japanese_font))
         .route("/ui/config", get(ui_config::<S, L>))
         .with_state(state)
 }
@@ -519,6 +767,7 @@ impl WebUiAuthConfig {
             token_endpoint: Some(self.token_endpoint.clone()),
             logout_endpoint: Some(self.logout_endpoint.clone()),
             login_endpoint: self.public_url.as_ref().map(|_| "/ui/login".to_string()),
+            node_enrollment_enabled: false,
         }
     }
 }
@@ -644,6 +893,7 @@ struct WebUiPublicConfig {
     token_endpoint: Option<String>,
     logout_endpoint: Option<String>,
     login_endpoint: Option<String>,
+    node_enrollment_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -693,10 +943,24 @@ async fn ui_index() -> impl IntoResponse {
     response
 }
 
+async fn ui_root() -> Redirect {
+    Redirect::temporary("/ui/")
+}
+
 async fn ui_app() -> impl IntoResponse {
     let mut response = (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../../../webui/app.js"),
+    )
+        .into_response();
+    apply_ui_security_headers(&mut response, false);
+    response
+}
+
+async fn ui_theme() -> impl IntoResponse {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../../webui/theme.js"),
     )
         .into_response();
     apply_ui_security_headers(&mut response, false);
@@ -710,6 +974,24 @@ async fn ui_styles() -> impl IntoResponse {
     )
         .into_response();
     apply_ui_security_headers(&mut response, false);
+    response
+}
+
+async fn ui_japanese_font() -> impl IntoResponse {
+    let mut response = (
+        [(header::CONTENT_TYPE, "font/ttf")],
+        include_bytes!("../../../webui/noto-sans-jp-ui.ttf").as_slice(),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
     response
 }
 
@@ -911,8 +1193,10 @@ where
             token_endpoint: None,
             logout_endpoint: None,
             login_endpoint: None,
+            node_enrollment_enabled: false,
         });
     config.operator_token_enabled = state.operator_api_bearer_token.is_some();
+    config.node_enrollment_enabled = state.node_enrollment.is_some();
     Json(config)
 }
 
@@ -924,6 +1208,554 @@ struct AdminPolicyRequest {
 #[derive(Debug, Deserialize)]
 struct AdminPathPinRequest {
     pinned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminNodeEnrollmentRequest {
+    expires_in_seconds: u64,
+    #[serde(default = "default_node_enrollment_role")]
+    role: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    allow_relay: bool,
+    #[serde(default)]
+    reusable: bool,
+    max_uses: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminNodeEnrollmentResponse {
+    token: SignedJoinToken,
+    expires_at: DateTime<Utc>,
+    max_uses: u32,
+    install_command: String,
+    install_script: String,
+    binary_sha256: String,
+    architecture: &'static str,
+}
+
+fn default_node_enrollment_role() -> String {
+    Role::edge().as_str().to_string()
+}
+
+#[derive(Debug)]
+struct NodeEnrollmentApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl NodeEnrollmentApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
+    }
+}
+
+impl IntoResponse for NodeEnrollmentApiError {
+    fn into_response(self) -> Response {
+        let mut response = (
+            self.status,
+            Json(ErrorResponse {
+                error: self.message,
+            }),
+        )
+            .into_response();
+        apply_node_enrollment_security_headers(&mut response);
+        response
+    }
+}
+
+async fn admin_create_node_enrollment<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<AdminNodeEnrollmentRequest>,
+) -> Result<Response, NodeEnrollmentApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let enrollment = state
+        .node_enrollment
+        .as_deref()
+        .ok_or_else(|| NodeEnrollmentApiError::unavailable("node enrollment is not configured"))?;
+    let role = request.role.trim();
+    validate_enrollment_identifier(role, "node role")
+        .map_err(NodeEnrollmentApiError::bad_request)?;
+    let role = Role::from_string(role);
+    if !node_enrollment_role_is_allowed(&role) {
+        return Err(NodeEnrollmentApiError::bad_request(
+            "node role must be edge, worker, or gateway",
+        ));
+    }
+    if request.tags.len() > MAX_JOIN_TOKEN_TAGS {
+        return Err(NodeEnrollmentApiError::bad_request(format!(
+            "no more than {MAX_JOIN_TOKEN_TAGS} tags may be requested"
+        )));
+    }
+    let max_uses = node_enrollment_max_uses(&request)?;
+    let mut tags = BTreeSet::new();
+    for value in request.tags {
+        let value = value.trim();
+        validate_enrollment_identifier(value, "node tag")
+            .map_err(NodeEnrollmentApiError::bad_request)?;
+        if !tags.insert(Tag::from_string(value)) {
+            return Err(NodeEnrollmentApiError::bad_request(format!(
+                "duplicate node tag: {value}"
+            )));
+        }
+    }
+    if !(MIN_NODE_ENROLLMENT_TTL_SECONDS..=enrollment.max_ttl_seconds)
+        .contains(&request.expires_in_seconds)
+    {
+        return Err(NodeEnrollmentApiError::bad_request(format!(
+            "enrollment token lifetime must be between {MIN_NODE_ENROLLMENT_TTL_SECONDS} and {} seconds",
+            enrollment.max_ttl_seconds
+        )));
+    }
+    let directory = state
+        .plane
+        .service_directory()
+        .await
+        .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
+    require_ha_node_enrollment_directory(&directory, request.allow_relay)?;
+
+    let now = Utc::now();
+    let expires_at = now
+        .checked_add_signed(ChronoDuration::seconds(request.expires_in_seconds as i64))
+        .ok_or_else(|| NodeEnrollmentApiError::bad_request("token expiration is out of range"))?;
+    let claims = JoinTokenClaims {
+        cluster_id: state.plane.config().cluster_id.clone(),
+        bootstrap_endpoints: directory.bootstrap_endpoints,
+        expires_at,
+        not_before: now - ChronoDuration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
+        role,
+        tags: tags.clone(),
+        issuer: enrollment.issuer.node_id(),
+        key_id: enrollment.key_id.clone(),
+        policy: TokenPolicy {
+            allow_join: true,
+            allow_relay: request.allow_relay,
+            allowed_routes: Vec::new(),
+            allowed_tags: tags,
+            max_token_uses: Some(max_uses),
+        },
+        nonce: format!("enroll-{}", random_oidc_value(24)),
+    };
+    let token = enrollment
+        .issuer
+        .sign_join_token(claims)
+        .map_err(|error| NodeEnrollmentApiError::bad_request(error.to_string()))?;
+    state
+        .join_service
+        .issue_join_token(&token, now)
+        .await
+        .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
+    let encoded_token = encode_node_enrollment_authorization(&token)?;
+    let install_script = node_enrollment_install_script(enrollment, &encoded_token);
+    let install_command = format!(
+        "curl -fsS -H 'Authorization: {NODE_ENROLLMENT_AUTH_SCHEME} {encoded_token}' '{}/v1/install/linux-amd64.sh' | sudo sh",
+        enrollment.install_base_url
+    );
+    let payload = AdminNodeEnrollmentResponse {
+        token,
+        expires_at,
+        max_uses,
+        install_command,
+        install_script,
+        binary_sha256: enrollment.binary_sha256.to_string(),
+        architecture: NODE_ENROLLMENT_ARCH,
+    };
+    let mut response = Json(payload).into_response();
+    apply_node_enrollment_security_headers(&mut response);
+    Ok(response)
+}
+
+fn node_enrollment_max_uses(
+    request: &AdminNodeEnrollmentRequest,
+) -> Result<u32, NodeEnrollmentApiError> {
+    if !request.reusable {
+        if request.max_uses.is_some_and(|uses| uses != 1) {
+            return Err(NodeEnrollmentApiError::bad_request(
+                "max_uses must be 1 for a single-use token",
+            ));
+        }
+        return Ok(1);
+    }
+    let max_uses = request
+        .max_uses
+        .unwrap_or(DEFAULT_REUSABLE_NODE_ENROLLMENT_USES);
+    if !(2..=MAX_NODE_ENROLLMENT_TOKEN_USES).contains(&max_uses) {
+        return Err(NodeEnrollmentApiError::bad_request(format!(
+            "a reusable token must allow between 2 and {MAX_NODE_ENROLLMENT_TOKEN_USES} uses"
+        )));
+    }
+    Ok(max_uses)
+}
+
+fn require_ha_node_enrollment_directory(
+    directory: &ipars_types::ServiceDirectory,
+    require_relay: bool,
+) -> Result<(), NodeEnrollmentApiError> {
+    let mut missing = Vec::new();
+    for kind in [
+        BootstrapEndpointKind::ControlPlane,
+        BootstrapEndpointKind::Signal,
+        BootstrapEndpointKind::Stun,
+    ] {
+        if service_instance_count(directory, kind) < 2
+            || service_endpoint_count(directory, kind) < 2
+        {
+            missing.push(kind.to_string());
+        }
+    }
+    if require_relay
+        && (service_instance_count(directory, BootstrapEndpointKind::Relay) < 2
+            || service_endpoint_count(directory, BootstrapEndpointKind::Relay) < 2)
+    {
+        missing.push(BootstrapEndpointKind::Relay.to_string());
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(NodeEnrollmentApiError::unavailable(format!(
+            "cannot issue an HA enrollment token until at least two active service instances advertise each required endpoint kind; insufficient: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+fn service_instance_count(
+    directory: &ipars_types::ServiceDirectory,
+    kind: BootstrapEndpointKind,
+) -> usize {
+    directory
+        .instances
+        .iter()
+        .filter(|instance| {
+            instance
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.kind == kind)
+        })
+        .map(|instance| instance.instance_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn service_endpoint_count(
+    directory: &ipars_types::ServiceDirectory,
+    kind: BootstrapEndpointKind,
+) -> usize {
+    directory
+        .instances
+        .iter()
+        .flat_map(|instance| instance.endpoints.iter())
+        .filter(|endpoint| endpoint.kind == kind)
+        .map(|endpoint| endpoint.url.trim_end_matches('/'))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn encode_node_enrollment_authorization(
+    token: &SignedJoinToken,
+) -> Result<String, NodeEnrollmentApiError> {
+    let encoded = serde_json::to_vec(token)
+        .map(|json| STANDARD.encode(json))
+        .map_err(|error| NodeEnrollmentApiError::bad_request(error.to_string()))?;
+    if encoded.len() > MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES {
+        return Err(NodeEnrollmentApiError::bad_request(
+            "enrollment token exceeds its authorization header size limit",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_node_enrollment_authorization(
+    headers: &HeaderMap,
+) -> Result<SignedJoinToken, NodeEnrollmentApiError> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .ok_or_else(|| {
+            NodeEnrollmentApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "missing node enrollment authorization",
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            NodeEnrollmentApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid node enrollment authorization",
+            )
+        })?;
+    if value.len() > MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES {
+        return Err(NodeEnrollmentApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "node enrollment authorization exceeds its size limit",
+        ));
+    }
+    let (scheme, encoded) = value.split_once(' ').ok_or_else(|| {
+        NodeEnrollmentApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid node enrollment authorization scheme",
+        )
+    })?;
+    if scheme != NODE_ENROLLMENT_AUTH_SCHEME
+        || encoded.is_empty()
+        || encoded.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(NodeEnrollmentApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid node enrollment authorization",
+        ));
+    }
+    let decoded = STANDARD.decode(encoded).map_err(|_| {
+        NodeEnrollmentApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid node enrollment authorization encoding",
+        )
+    })?;
+    if decoded.len() > MAX_NODE_ENROLLMENT_REQUEST_BYTES {
+        return Err(NodeEnrollmentApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "node enrollment token exceeds its size limit",
+        ));
+    }
+    serde_json::from_slice(&decoded).map_err(|_| {
+        NodeEnrollmentApiError::new(StatusCode::UNAUTHORIZED, "invalid node enrollment token")
+    })
+}
+
+async fn authorize_node_enrollment<S, L>(
+    state: &ControlPlaneHttpState<S, L>,
+    headers: &HeaderMap,
+) -> Result<Arc<NodeEnrollmentConfig>, NodeEnrollmentApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let enrollment = state.node_enrollment.clone().ok_or_else(|| {
+        NodeEnrollmentApiError::new(StatusCode::NOT_FOUND, "node enrollment is not configured")
+    })?;
+    let token = decode_node_enrollment_authorization(headers)?;
+    if token.claims.issuer != enrollment.issuer.node_id()
+        || token.claims.key_id != enrollment.key_id
+    {
+        return Err(NodeEnrollmentApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "node enrollment authorization was rejected",
+        ));
+    }
+    state
+        .join_service
+        .validate_issued_join_token(&token, Utc::now())
+        .await
+        .map_err(|_| {
+            NodeEnrollmentApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "node enrollment authorization was rejected",
+            )
+        })?;
+    Ok(enrollment)
+}
+
+async fn node_enrollment_linux_script<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    headers: HeaderMap,
+) -> Result<Response, NodeEnrollmentApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let enrollment = authorize_node_enrollment(&state, &headers).await?;
+    let token = decode_node_enrollment_authorization(&headers)?;
+    let encoded_token = encode_node_enrollment_authorization(&token)?;
+    let script = node_enrollment_install_script(&enrollment, &encoded_token);
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
+    )
+        .into_response();
+    apply_node_enrollment_security_headers(&mut response);
+    Ok(response)
+}
+
+async fn node_enrollment_binary<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    headers: HeaderMap,
+) -> Result<Response, NodeEnrollmentApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let enrollment = authorize_node_enrollment(&state, &headers).await?;
+    let binary = enrollment
+        .open_binary()
+        .map_err(NodeEnrollmentApiError::unavailable)?;
+    let stream = ReaderStream::new(tokio::fs::File::from_std(binary));
+    let mut response = Response::new(Body::from_stream(stream));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_static("attachment; filename=iparsd-linux-amd64"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&enrollment.binary_size.to_string()).map_err(|_| {
+            NodeEnrollmentApiError::unavailable("invalid node enrollment binary size")
+        })?,
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-heteronetwork-sha256"),
+        header::HeaderValue::from_str(&enrollment.binary_sha256).map_err(|_| {
+            NodeEnrollmentApiError::unavailable("invalid node enrollment binary checksum")
+        })?,
+    );
+    apply_node_enrollment_security_headers(&mut response);
+    Ok(response)
+}
+
+fn apply_node_enrollment_security_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
+}
+
+fn node_enrollment_install_script(
+    enrollment: &NodeEnrollmentConfig,
+    encoded_token: &str,
+) -> String {
+    const TEMPLATE: &str = r#"#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "HeteroNetwork installation must run as root" >&2
+  exit 1
+fi
+if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+  echo "This installer supports Linux x86_64 only" >&2
+  exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "HeteroNetwork requires systemd" >&2
+  exit 1
+fi
+
+install_dependencies() {
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl iproute2 wireguard-tools
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates curl iproute wireguard-tools
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates curl iproute wireguard-tools
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install ca-certificates curl iproute2 wireguard-tools
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm ca-certificates curl iproute2 wireguard-tools
+  else
+    echo "Unsupported package manager; install curl, CA certificates, iproute2, and wireguard-tools" >&2
+    exit 1
+  fi
+}
+
+for command in curl ip wg; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    install_dependencies
+    break
+  fi
+done
+command -v modprobe >/dev/null 2>&1 && modprobe wireguard 2>/dev/null || true
+
+umask 077
+install -d -m 0755 /opt/heteronetwork/bin
+install -d -m 0700 /var/lib/heteronetwork
+tmp_dir=$(mktemp -d /var/lib/heteronetwork/install.XXXXXX)
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+auth='__AUTH__'
+binary="$tmp_dir/iparsd"
+curl -fsS -H "Authorization: HeteroNetworkJoin $auth" '__BASE__/v1/install/iparsd-linux-amd64' -o "$binary"
+actual_sha=$(sha256sum "$binary" | awk '{print $1}')
+if [ "$actual_sha" != '__SHA256__' ]; then
+  echo "HeteroNetwork binary checksum verification failed" >&2
+  exit 1
+fi
+chmod 0755 "$binary"
+install -m 0755 "$binary" /opt/heteronetwork/bin/.iparsd.new
+mv -f /opt/heteronetwork/bin/.iparsd.new /opt/heteronetwork/bin/iparsd
+
+token_file="$tmp_dir/join-token.json"
+printf '%s' "$auth" | base64 -d >"$token_file"
+chmod 0600 "$token_file"
+/opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only
+rm -f "$token_file"
+
+cat >/etc/systemd/system/heteronetwork-agent.service <<'UNIT'
+[Unit]
+Description=HeteroNetwork Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink
+Restart=on-failure
+RestartSec=5s
+StateDirectory=heteronetwork
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/heteronetwork
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now heteronetwork-agent.service
+echo "HeteroNetwork node enrolled and started"
+"#;
+    TEMPLATE
+        .replace("__AUTH__", encoded_token)
+        .replace("__BASE__", &enrollment.install_base_url)
+        .replace("__SHA256__", &enrollment.binary_sha256)
 }
 
 async fn admin_node_snapshot<S>(
@@ -1781,7 +2613,9 @@ struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::io::Write as _;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::process::Stdio;
 
     use axum::body::Body;
     use axum::http::{header, Request};
@@ -1802,7 +2636,8 @@ mod tests {
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
         EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
         NatClassification, NatProbeObservation, NodeHealth, NodeId, PathMetrics, PathRecord,
-        PathScore, PathState, PeerPathKey, Role, Tag, TokenPolicy, TokenStatus, TransportProtocol,
+        PathScore, PathState, PeerPathKey, Role, ServiceInstance, Tag, TokenPolicy, TokenStatus,
+        TransportProtocol,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -2025,6 +2860,332 @@ mod tests {
 
     fn node_id(label: &str) -> NodeId {
         identity_for_node(label).node_id()
+    }
+
+    fn enrollment_service_instance(
+        cluster_id: &ClusterId,
+        instance_id: &str,
+        host: &str,
+    ) -> ServiceInstance {
+        let now = Utc::now();
+        ServiceInstance {
+            cluster_id: cluster_id.clone(),
+            instance_id: instance_id.to_string(),
+            endpoints: vec![
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: format!("https://{host}:8443"),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: format!("https://{host}:9443"),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: format!("udp://{host}:3478"),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Relay,
+                    url: format!("udp://{host}:51820"),
+                },
+            ],
+            lease_expires_at: now + chrono::Duration::minutes(5),
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn node_enrollment_issues_ha_single_use_token_and_protects_artifacts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let issuer_private_key = issuer.signing_key_b64();
+        let key_id = KeyId::from_string("web-enrollment");
+        let cluster_id = ClusterId::from_string("cluster-enrollment");
+        let store = Arc::new(InMemoryStore::default());
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let plane = Arc::new(ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store,
+        ));
+        for (instance_id, host) in [
+            ("public-a", "public-a.example"),
+            ("public-b", "public-b.example"),
+        ] {
+            plane
+                .advertise_service_instance(enrollment_service_instance(
+                    &cluster_id,
+                    instance_id,
+                    host,
+                ))
+                .await?;
+        }
+
+        let mut key_ring = IssuerKeyRing::default();
+        key_ring.insert_node_enrollment_key(
+            issuer.node_id(),
+            key_id.clone(),
+            issuer.public_key_b64(),
+            7 * 24 * 60 * 60,
+        );
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            ledger,
+            key_ring,
+        ));
+        let binary_contents = b"test-iparsd-linux-amd64";
+        let binary_path = std::env::temp_dir().join(format!(
+            "heteronetwork-enrollment-test-{}",
+            random_oidc_value(12)
+        ));
+        std::fs::write(&binary_path, binary_contents)?;
+        let enrollment = NodeEnrollmentConfig::new(
+            issuer,
+            key_id.as_str().to_string(),
+            "http://127.0.0.1:8443".to_string(),
+            binary_path.clone(),
+            7 * 24 * 60 * 60,
+        )?;
+        let expected_sha256 = enrollment.binary_sha256.to_string();
+        let app = router(
+            ControlPlaneHttpState::new(plane, join_service)
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string())
+                .enable_node_enrollment(enrollment),
+        );
+        let request_body = serde_json::json!({
+            "expires_in_seconds": 86_400,
+            "role": "edge",
+            "tags": ["production", "linux"],
+            "allow_relay": true,
+            "reusable": false,
+            "max_uses": 1
+        });
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request_body)?))?,
+            )
+            .await?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&header::HeaderValue::from_static("/ui/"))
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&request_body)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store"))
+        );
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let response_body: Value = serde_json::from_slice(&response_body)?;
+        assert_eq!(response_body["max_uses"], 1);
+        assert_eq!(response_body["architecture"], NODE_ENROLLMENT_ARCH);
+        assert_eq!(response_body["binary_sha256"], expected_sha256);
+        let token: SignedJoinToken = serde_json::from_value(response_body["token"].clone())?;
+        assert_eq!(token.claims.bootstrap_endpoints.len(), 8);
+        assert_eq!(token.claims.policy.max_token_uses, Some(1));
+        assert!(token.claims.policy.allow_relay);
+        let encoded_token = encode_node_enrollment_authorization(&token)
+            .map_err(|error| std::io::Error::other(error.message))?;
+        let authorization = format!("{NODE_ENROLLMENT_AUTH_SCHEME} {encoded_token}");
+
+        let missing_script_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/install/linux-amd64.sh")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing_script_auth.status(), StatusCode::UNAUTHORIZED);
+        let script_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/install/linux-amd64.sh")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(script_response.status(), StatusCode::OK);
+        assert_eq!(
+            script_response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static("no-store"))
+        );
+        let script = String::from_utf8(
+            axum::body::to_bytes(script_response.into_body(), usize::MAX)
+                .await?
+                .to_vec(),
+        )?;
+        assert!(script.contains("--enroll-only"));
+        assert!(script.contains(&expected_sha256));
+        assert!(script.contains(&encoded_token));
+        assert!(!script.contains(&issuer_private_key));
+        let mut shell = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        shell
+            .stdin
+            .take()
+            .ok_or("shell syntax checker stdin is unavailable")?
+            .write_all(script.as_bytes())?;
+        let shell_output = shell.wait_with_output()?;
+        assert!(
+            shell_output.status.success(),
+            "generated installer is not valid POSIX shell: {}",
+            String::from_utf8_lossy(&shell_output.stderr)
+        );
+
+        let binary_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/install/iparsd-linux-amd64")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(binary_response.status(), StatusCode::OK);
+        assert_eq!(
+            binary_response
+                .headers()
+                .get("x-heteronetwork-sha256")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_sha256.as_str())
+        );
+        assert_eq!(
+            axum::body::to_bytes(binary_response.into_body(), usize::MAX).await?,
+            binary_contents.as_slice()
+        );
+
+        let first_join = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&JoinNodeRequest {
+                        token: token.clone(),
+                        registration: registration("enrolled-a"),
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(first_join.status(), StatusCode::CREATED);
+        let second_join = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&JoinNodeRequest {
+                        token,
+                        registration: registration("enrolled-b"),
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(second_join.status(), StatusCode::FORBIDDEN);
+        let exhausted_artifact = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/install/linux-amd64.sh")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(exhausted_artifact.status(), StatusCode::UNAUTHORIZED);
+        std::fs::remove_file(binary_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn node_enrollment_requires_redundant_service_kinds_and_bounded_uses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-enrollment-degraded");
+        let instance = enrollment_service_instance(&cluster_id, "public-a", "public-a.example");
+        let directory = ipars_types::ServiceDirectory {
+            cluster_id,
+            bootstrap_endpoints: instance.endpoints.clone(),
+            instances: vec![instance],
+            generated_at: Utc::now(),
+        };
+        let error = match require_ha_node_enrollment_directory(&directory, true) {
+            Ok(_) => return Err("a single public service instance issued an HA token".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("control_plane"));
+        assert!(error.message.contains("relay"));
+
+        let mut duplicate_instance = directory.instances[0].clone();
+        duplicate_instance.instance_id = "public-b".to_string();
+        let duplicate_directory = ipars_types::ServiceDirectory {
+            instances: vec![directory.instances[0].clone(), duplicate_instance],
+            bootstrap_endpoints: directory.bootstrap_endpoints.clone(),
+            ..directory.clone()
+        };
+        let duplicate_error = match require_ha_node_enrollment_directory(&duplicate_directory, true)
+        {
+            Ok(_) => return Err("duplicate service URLs counted as independent endpoints".into()),
+            Err(error) => error,
+        };
+        assert_eq!(duplicate_error.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let invalid = AdminNodeEnrollmentRequest {
+            expires_in_seconds: 86_400,
+            role: "edge".to_string(),
+            tags: Vec::new(),
+            allow_relay: false,
+            reusable: true,
+            max_uses: Some(1),
+        };
+        assert!(node_enrollment_max_uses(&invalid).is_err());
+        let valid = AdminNodeEnrollmentRequest {
+            max_uses: Some(MAX_NODE_ENROLLMENT_TOKEN_USES),
+            ..invalid
+        };
+        assert_eq!(
+            node_enrollment_max_uses(&valid).map_err(|error| error.message),
+            Ok(MAX_NODE_ENROLLMENT_TOKEN_USES)
+        );
+        Ok(())
     }
 
     fn candidate(node_id: &str) -> EndpointCandidate {
@@ -2629,6 +3790,52 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("function renderServices()"));
         assert!(body.contains("service_directory"));
+        assert!(body.contains("function renderEnrollment()"));
+        assert!(body.contains("heteronetwork_locale"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/theme.js")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("prefers-color-scheme: dark"));
+        assert!(body.contains("heteronetwork_theme"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/fonts/noto-sans-jp-ui.ttf")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("font/ttf")
+        );
+        assert!(response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("immutable")));
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await?
+                .len()
+                > 100_000
+        );
 
         let response = app
             .clone()
@@ -2644,6 +3851,7 @@ mod tests {
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
         assert_eq!(ui_config["enabled"], true);
         assert_eq!(ui_config["operator_token_enabled"], true);
+        assert_eq!(ui_config["node_enrollment_enabled"], false);
 
         let request_body = JoinNodeRequest {
             token: issuer.sign_join_token(claims(

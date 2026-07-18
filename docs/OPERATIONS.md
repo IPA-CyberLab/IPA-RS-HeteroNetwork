@@ -37,6 +37,17 @@ Signal must be able to reach at least one control-plane API to authenticate node
 
 Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. Keep the issuer private key offline; public nodes need only the public key.
 
+To expose **Add device** in the Web UI, create a separate enrollment signer and
+install the same owner-only key on every Control Plane replica. Configure
+`HETERONETWORK_NODE_ENROLLMENT_ENABLED=true`,
+`HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH`, a distinct
+`HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID`, the bounded
+`HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS`, and the release artifact path in
+`HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH`. Do not copy the root issuer private
+key to these nodes. Enrollment issuance requires authenticated management access
+and two distinct active URLs for Control Plane, Signal, and STUN, plus two Relay
+URLs when relay permission is requested.
+
 The four local services form one advertised failure domain. The packaged Control Plane unit is bound to Signal, STUN, and Relay, so stopping or losing any of them stops the local lease renewal. A failed instance disappears from `/v1/admin/services` after `HETERONETWORK_SERVICE_LEASE_TTL_SECONDS`. Use a managed HA PostgreSQL service or a quorum deployment outside the two application failure domains; a single database on either public host makes whole-host failover asymmetric.
 
 Mint join tokens from the active directory instead of manually copying endpoint lists:
@@ -53,6 +64,14 @@ ipars token create \
 ```
 
 The command requires two active endpoints for Control Plane, Signal, and STUN, and two Relay endpoints when `--allow-relay` is present. `--allow-degraded-service-directory` exists for deliberate disaster recovery, not routine provisioning. Agents persist the directory learned from registration, heartbeat, and peer-map responses, prefer those active entries on every later loop, and retain signed token entries as fallback seeds.
+
+The Web UI workflow performs the same HA directory check, signs and records the
+token in the shared ledger, and returns a Linux x86_64 install command. The
+generated installer checks root/systemd prerequisites, downloads the pinned
+daemon through the still-active token, verifies SHA-256, enrolls once into an
+owner-only state file, deletes the token, and enables the Agent service. A
+single-use token cannot download the artifact again after its successful join;
+expired, revoked, exhausted, or unknown tokens are rejected.
 
 Before declaring failover ready, verify both public APIs report two active instances and `ipars_control_plane_ha_ready 1`. Stop `ipars-public-node.target` on one host, wait one lease TTL, and verify the survivor reports one instance, existing WireGuard traffic continues, and a fresh Agent can register using the previously minted HA token. Restart the target and require HA readiness to return to `1`.
 
