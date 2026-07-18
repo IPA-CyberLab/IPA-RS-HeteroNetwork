@@ -47,6 +47,7 @@
     activeView: "overview",
     selectedNodeId: null,
     loading: false,
+    policyDirty: false,
     sidebarCollapsed: localStorage.getItem("ipars_sidebar_collapsed") === "true",
     mobileNavOpen: false,
     filters: {
@@ -119,14 +120,18 @@
   }
 
   function pretty(value) {
-    return String(value || "unknown")
+    return String(value || "unknown").toLowerCase()
       .replace(/_/g, " ")
       .replace(/\b\w/g, function (letter) { return letter.toUpperCase(); });
   }
 
+  function normalizePathState(value) {
+    return String(value || "unknown").toLowerCase();
+  }
+
   function statusClass(value) {
     var text = String(value || "unknown").toLowerCase();
-    if (text.indexOf("unreachable") !== -1 || text === "offline" || text === "denied") return "unreachable";
+    if (text.indexOf("unreachable") !== -1 || text.indexOf("unhealthy") !== -1 || text === "offline" || text === "denied") return "unreachable";
     if (text.indexOf("relay") !== -1) return "relay";
     if (text.indexOf("degraded") !== -1 || text.indexOf("stale") !== -1) return "degraded";
     if (text.indexOf("pinned") !== -1) return "pinned";
@@ -318,7 +323,7 @@
   }
 
   function loadOverview() {
-    if (!state.token || state.loading) return Promise.resolve();
+    if (!state.token || state.loading || state.policyDirty) return Promise.resolve();
     state.loading = true;
     return api("/v1/admin/overview").then(function (overview) {
       state.overview = overview;
@@ -374,7 +379,10 @@
     var nodes = overview.nodes || [];
     var routeCount = nodes.reduce(function (total, entry) { return total + (entry.node.routes || []).length; }, 0);
     var counts = {};
-    paths.forEach(function (path) { counts[path.selected_state] = (counts[path.selected_state] || 0) + 1; });
+    paths.forEach(function (path) {
+      var pathState = normalizePathState(path.selected_state);
+      counts[pathState] = (counts[pathState] || 0) + 1;
+    });
     var totalStates = paths.length || 1;
     var stateRows = ["direct_public", "direct_ipv6", "direct_nat_traversal", "relay", "unreachable"].map(function (name) {
       var count = counts[name] || 0;
@@ -442,7 +450,7 @@
     var query = state.filters.paths.toLowerCase();
     var pathFilter = state.filters.pathState;
     return (state.overview.paths || []).filter(function (path) {
-      var haystack = [path.key.local, path.key.remote, path.selected_state, path.selected_candidate && path.selected_candidate.addr, path.relay_node].join(" ").toLowerCase();
+      var haystack = [path.key.local, path.key.remote, normalizePathState(path.selected_state), path.selected_candidate && path.selected_candidate.addr, path.relay_node].join(" ").toLowerCase();
       return (!query || haystack.indexOf(query) !== -1) && (pathFilter === "all" || statusClass(path.selected_state) === pathFilter);
     });
   }
@@ -504,7 +512,7 @@
   }
 
   function renderRule(rule, index) {
-    var protocols = ["any", "tcp", "udp", "icmp", "icmpv6", "sctp"];
+    var protocols = ["any", "ip_in_ip", "tcp", "udp", "sctp", "icmp", "ipv6_encap", "gre", "esp", "ah"];
     var protocolOptions = protocols.map(function (protocol) {
       return '<option value="' + protocol + '" ' + (rule.protocol === protocol ? "selected" : "") + '>' + protocol.toUpperCase() + "</option>";
     }).join("");
@@ -637,6 +645,7 @@
     setStatus("Saving policy...");
     return api("/v1/admin/policy", { method: "PUT", body: JSON.stringify({ cluster_policy: state.overview.cluster_policy }) }).then(function (response) {
       state.overview.cluster_policy = response.cluster_policy;
+      state.policyDirty = false;
       setStatus("");
       toast("Policy saved.");
       renderView();
@@ -660,6 +669,7 @@
       protocol: "any",
       action: "allow"
     });
+    state.policyDirty = true;
     state.filters.acl = "";
     toast("Rule added locally.");
     renderView();
@@ -667,6 +677,7 @@
 
   function deleteRule(index) {
     state.overview.cluster_policy.acl_rules.splice(index, 1);
+    state.policyDirty = true;
     toast("Rule deleted locally. Save policy to apply it.");
     renderView();
   }
@@ -722,7 +733,15 @@
       handleFilterInput(event.target);
       return;
     }
-    if (event.target.matches("[data-rule-index][data-rule-field]")) updateRuleField(event.target);
+    if (event.target.matches("[data-rule-index][data-rule-field]")) {
+      updateRuleField(event.target);
+      state.policyDirty = true;
+      return;
+    }
+    if (event.target.matches("[data-policy-boolean], #idle-timeout, #endpoint-ttl, #path-ttl")) {
+      updatePolicyFromForm();
+      state.policyDirty = true;
+    }
   });
 
   document.addEventListener("change", function (event) {
@@ -731,7 +750,15 @@
       renderView();
       return;
     }
-    if (event.target.matches("[data-rule-index][data-rule-field]")) updateRuleField(event.target);
+    if (event.target.matches("[data-rule-index][data-rule-field]")) {
+      updateRuleField(event.target);
+      state.policyDirty = true;
+      return;
+    }
+    if (event.target.matches("[data-policy-boolean], #idle-timeout, #endpoint-ttl, #path-ttl")) {
+      updatePolicyFromForm();
+      state.policyDirty = true;
+    }
   });
 
   document.addEventListener("click", function (event) {
@@ -788,9 +815,20 @@
       toggleMobileNav();
       return;
     }
+    if (event.target.closest("#mobile-backdrop")) {
+      closeMobileNav();
+      return;
+    }
     if (event.target.closest("#sidebar-toggle")) {
       toggleSidebar();
       return;
+    }
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      closeMobileNav();
+      if ($("drawer-root").firstElementChild) closeDrawer();
     }
   });
 
@@ -818,7 +856,7 @@
   $("sidebar-toggle").setAttribute("title", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
 
   setInterval(function () {
-    if (state.token && !state.loading) loadOverview();
+    if (state.token && !state.loading && !state.policyDirty) loadOverview();
   }, 10000);
 
   loadConfig().then(function () {
