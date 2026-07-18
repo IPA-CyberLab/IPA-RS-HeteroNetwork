@@ -467,7 +467,7 @@ pub struct NatFilteringObservation {
     pub observed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NatTraversalStrategy {
     DirectCandidate,
@@ -1596,12 +1596,14 @@ impl TokenLedgerMetrics {
 pub mod api {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct RegisterNodeRequest {
         pub node_id: NodeId,
         pub identity_public_key: String,
         pub wireguard_public_key: String,
         pub candidates: Vec<EndpointCandidate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nat_classification: Option<NatClassification>,
         pub relay_capability: Option<RelayCapability>,
         pub requested_routes: Vec<Route>,
     }
@@ -1614,7 +1616,7 @@ pub mod api {
         pub cluster_policy: ClusterPolicy,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct JoinNodeRequest {
         pub token: SignedJoinToken,
         pub registration: RegisterNodeRequest,
@@ -1718,6 +1720,8 @@ pub mod api {
         pub node_id: NodeId,
         pub health: NodeHealth,
         pub candidates: Vec<EndpointCandidate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nat_classification: Option<NatClassification>,
         pub relay_capability: Option<RelayCapability>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub routes: Option<Vec<Route>>,
@@ -1781,6 +1785,8 @@ pub mod api {
         pub node_id: NodeId,
         pub health: NodeHealth,
         pub candidates: Vec<EndpointCandidate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nat_classification: Option<NatClassification>,
         #[serde(default)]
         pub relay_capability: Option<RelayCapability>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1796,6 +1802,7 @@ pub mod api {
                 node_id: self.node_id.clone(),
                 health: self.health.clone(),
                 candidates: self.candidates.clone(),
+                nat_classification: self.nat_classification.clone(),
                 relay_capability: self.relay_capability.clone(),
                 routes: self.routes.clone(),
                 path_state: self.path_state.clone(),
@@ -1960,6 +1967,41 @@ pub mod api {
         pub endpoint_candidate_ttl_seconds: u64,
         #[serde(default = "super::default_path_state_ttl_seconds")]
         pub path_state_ttl_seconds: u64,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ControlPlaneNodeOverview {
+        pub node: NodeRecord,
+        pub health: Option<NodeHealth>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nat_classification: Option<NatClassification>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneNatDiscoveryOverview {
+        pub nat_classification_count: usize,
+        #[serde(default)]
+        pub stale_nat_classification_count: usize,
+        #[serde(default)]
+        pub fresh_low_confidence_nat_classification_count: usize,
+        #[serde(default)]
+        pub fresh_nat_classification_strategy_counts: Vec<NatTraversalStrategyCount>,
+        #[serde(default = "super::default_nat_classification_ttl_seconds")]
+        pub nat_classification_ttl_seconds: u64,
+        #[serde(default = "super::default_nat_classification_min_confidence_percent")]
+        pub nat_classification_min_confidence_percent: u8,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ControlPlaneOverviewResponse {
+        pub cluster_id: ClusterId,
+        pub vpn_pool: Ipv4Net,
+        pub cluster_policy: ClusterPolicy,
+        pub metrics: ControlPlaneMetricsResponse,
+        pub nodes: Vec<ControlPlaneNodeOverview>,
+        pub paths: Vec<PathRecord>,
+        pub nat_discovery: ControlPlaneNatDiscoveryOverview,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -6815,8 +6857,8 @@ pub mod api {
     const GENEVE_PROTOCOL_TRANSPARENT_ETHERNET: u16 = 0x6558;
     const STUN_HEADER_LEN: usize = 20;
     const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
-    const IPARS_RELAY_FRAME_MAGIC_V1: &[u8] = b"IPARS-RLY1";
-    const IPARS_RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
+    const HETERONETWORK_RELAY_FRAME_MAGIC_V1: &[u8] = b"IPARS-RLY1";
+    const HETERONETWORK_RELAY_FRAME_MAGIC_V2: &[u8] = b"IPARS-RLY2";
     const OPENVPN_CONTROL_MIN_LEN: usize = 14;
     const OPENVPN_MAX_ACKED_PACKET_IDS: usize = 32;
 
@@ -6915,8 +6957,8 @@ pub mod api {
     }
 
     fn relay_frame_payload(payload: &[u8]) -> bool {
-        payload.starts_with(IPARS_RELAY_FRAME_MAGIC_V1)
-            || payload.starts_with(IPARS_RELAY_FRAME_MAGIC_V2)
+        payload.starts_with(HETERONETWORK_RELAY_FRAME_MAGIC_V1)
+            || payload.starts_with(HETERONETWORK_RELAY_FRAME_MAGIC_V2)
     }
 
     fn stun_payload(payload: &[u8]) -> bool {

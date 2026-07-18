@@ -2,32 +2,32 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ipars_bin="${IPARS_AGENT_NAT_SMOKE_IPARS_BIN:-${repo_root}/target/debug/ipars}"
-iparsd_bin="${IPARS_AGENT_NAT_SMOKE_IPARSD_BIN:-${repo_root}/target/debug/iparsd}"
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-agent-nat-smoke.XXXXXX")"
+ipars_bin="${HETERONETWORK_AGENT_NAT_SMOKE_HETERONETWORK_BIN:-${repo_root}/target/debug/ipars}"
+iparsd_bin="${HETERONETWORK_AGENT_NAT_SMOKE_IPARSD_BIN:-${repo_root}/target/debug/iparsd}"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-agent-nat-smoke.XXXXXX")"
 state_dir="${work_dir}/bootstrap"
 init_output="${work_dir}/init.json"
 init_error="${work_dir}/init.stderr"
 join_token_path="${work_dir}/agent.join-token"
 control_plane_operator_token_path="${state_dir}/control-plane-operator.token"
 control_plane_operator_header_path="${work_dir}/control-plane-operator.header"
-nat_profile="${IPARS_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
-direct_probe_timeout_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PROBE_TIMEOUT_SECONDS:-30}"
-relay_warmup_attempts="${IPARS_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS:-30}"
-pause_before_direct_seconds="${IPARS_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}"
-direct_path_ping_interval_seconds="${IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PING_INTERVAL_SECONDS:-1}"
-direct_path_priming_attempts="${IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PRIMING_ATTEMPTS:-5}"
+nat_profile="${HETERONETWORK_AGENT_NAT_SMOKE_PROFILE:-endpoint-independent}"
+direct_probe_timeout_seconds="${HETERONETWORK_AGENT_NAT_SMOKE_DIRECT_PROBE_TIMEOUT_SECONDS:-30}"
+relay_warmup_attempts="${HETERONETWORK_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS:-30}"
+pause_before_direct_seconds="${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_BEFORE_DIRECT_SECONDS:-0}"
+direct_path_ping_interval_seconds="${HETERONETWORK_AGENT_NAT_SMOKE_DIRECT_PATH_PING_INTERVAL_SECONDS:-1}"
+direct_path_priming_attempts="${HETERONETWORK_AGENT_NAT_SMOKE_DIRECT_PATH_PRIMING_ATTEMPTS:-5}"
 
 [[ "$relay_warmup_attempts" =~ ^[1-9][0-9]*$ ]] || {
-  echo "IPARS_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS must be a positive integer" >&2
+  echo "HETERONETWORK_AGENT_NAT_SMOKE_RELAY_WARMUP_ATTEMPTS must be a positive integer" >&2
   exit 1
 }
 [[ "$direct_path_ping_interval_seconds" =~ ^[1-9][0-9]*$ ]] || {
-  echo "IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PING_INTERVAL_SECONDS must be a positive integer" >&2
+  echo "HETERONETWORK_AGENT_NAT_SMOKE_DIRECT_PATH_PING_INTERVAL_SECONDS must be a positive integer" >&2
   exit 1
 }
 [[ "$direct_path_priming_attempts" =~ ^[1-9][0-9]*$ ]] || {
-  echo "IPARS_AGENT_NAT_SMOKE_DIRECT_PATH_PRIMING_ATTEMPTS must be a positive integer" >&2
+  echo "HETERONETWORK_AGENT_NAT_SMOKE_DIRECT_PATH_PRIMING_ATTEMPTS must be a positive integer" >&2
   exit 1
 }
 
@@ -35,7 +35,7 @@ case "$nat_profile" in
   endpoint-independent|fixed-port|mixed-port|symmetric|asymmetric|one-sided|one-sided-port-preserving|one-sided-symmetric)
     ;;
   *)
-    echo "unsupported IPARS_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
+    echo "unsupported HETERONETWORK_AGENT_NAT_SMOKE_PROFILE: ${nat_profile}" >&2
     echo "expected endpoint-independent, fixed-port, mixed-port, symmetric, asymmetric, one-sided, one-sided-port-preserving, or one-sided-symmetric" >&2
     exit 1
     ;;
@@ -63,10 +63,10 @@ esac
 
 suffix="$$"
 bridge="ipbn${suffix}"
-nat_a="ipars-nat-a-${suffix}"
-nat_b="ipars-nat-b-${suffix}"
-agent_a="ipars-agent-a-${suffix}"
-agent_b="ipars-agent-b-${suffix}"
+nat_a="heteronetwork-nat-a-${suffix}"
+nat_b="heteronetwork-nat-b-${suffix}"
+agent_a="heteronetwork-agent-a-${suffix}"
+agent_b="heteronetwork-agent-b-${suffix}"
 
 root_public_ip="198.18.100.1"
 # Keep each invocation on a separate public tuple so conntrack state from a
@@ -176,13 +176,13 @@ dump_failure() {
       echo "--- ${namespace} peers ---" >&2
       agent_peers "$namespace" | jq . >&2 || true
       echo "--- ${namespace} WireGuard endpoints ---" >&2
-      ip netns exec "$namespace" wg show ipars0 endpoints >&2 || true
+      ip netns exec "$namespace" wg show heteronetwork0 endpoints >&2 || true
       echo "--- ${namespace} WireGuard allowed IPs ---" >&2
-      ip netns exec "$namespace" wg show ipars0 allowed-ips >&2 || true
+      ip netns exec "$namespace" wg show heteronetwork0 allowed-ips >&2 || true
       echo "--- ${namespace} WireGuard transfer ---" >&2
-      ip netns exec "$namespace" wg show ipars0 transfer >&2 || true
+      ip netns exec "$namespace" wg show heteronetwork0 transfer >&2 || true
       echo "--- ${namespace} WireGuard latest handshakes ---" >&2
-      ip netns exec "$namespace" wg show ipars0 latest-handshakes >&2 || true
+      ip netns exec "$namespace" wg show heteronetwork0 latest-handshakes >&2 || true
     fi
   done
   for log in "${work_dir}"/agent-*.log "${state_dir}"/logs/*.log; do
@@ -499,7 +499,7 @@ ping_overlay() {
   local namespace="$1"
   local target="$2"
   for attempt in $(seq 1 "$relay_warmup_attempts"); do
-    if ip netns exec "$namespace" ping -I ipars0 -c 3 -W 2 "$target"; then
+    if ip netns exec "$namespace" ping -I heteronetwork0 -c 3 -W 2 "$target"; then
       return 0
     fi
     sleep 1
@@ -522,7 +522,7 @@ ping_overlay_pair() {
 ping_overlay_once() {
   local namespace="$1"
   local target="$2"
-  ip netns exec "$namespace" ping -I ipars0 -c 1 -W 2 "$target" >/dev/null 2>&1
+  ip netns exec "$namespace" ping -I heteronetwork0 -c 1 -W 2 "$target" >/dev/null 2>&1
 }
 
 ping_overlay_a_status=1
@@ -924,8 +924,8 @@ vpn_b="$(jq -r '.vpn_ip' "${work_dir}/agent-b.log.status.json")"
 pin_agent_peer "$agent_a" "$node_b"
 pin_agent_peer "$agent_b" "$node_a"
 wait_for_relay_path "$node_a" "$node_b"
-if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS:-0}" != "0" ]]; then
-  sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS}"
+if [[ "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS:-0}" != "0" ]]; then
+  sleep "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_RELAY_SECONDS}"
 fi
 ping_overlay_pair
 ping_overlay "$agent_a" "$vpn_b"
@@ -951,13 +951,13 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port"
     sleep "$pause_before_direct_seconds"
   fi
   wait_for_direct_path "$node_a" "$node_b"
-  if [[ "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
-    sleep "${IPARS_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
+  if [[ "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
+    sleep "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
   fi
   wait_for_direct_dataplane "$node_a" "$node_b"
-  ip netns exec "$agent_a" wg show ipars0 endpoints \
+  ip netns exec "$agent_a" wg show heteronetwork0 endpoints \
     | grep -F -- "${nat_b_public_ip}:${nat_b_expected_public_port}" >/dev/null
-  ip netns exec "$agent_b" wg show ipars0 endpoints \
+  ip netns exec "$agent_b" wg show heteronetwork0 endpoints \
     | grep -F -- "${nat_a_public_ip}:${nat_a_expected_public_port}" >/dev/null
   case "$nat_profile" in
     one-sided)

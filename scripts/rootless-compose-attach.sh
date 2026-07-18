@@ -127,7 +127,7 @@ for service in "${workload_services[@]}"; do
 done
 
 umask 077
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-rootless-compose-attach.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-rootless-compose-attach.XXXXXX")"
 trap cleanup EXIT
 rendered_config="$tmp_dir/config.json"
 
@@ -174,7 +174,7 @@ declare -a agent_port_records=()
 declare -a moved_port_records=()
 declare -A target_keys=()
 declare -A published_keys=()
-empty_field="__IPARS_EMPTY_FIELD__"
+empty_field="__HETERONETWORK_EMPTY_FIELD__"
 
 add_port_records() {
   local service="$1"
@@ -220,7 +220,7 @@ add_port_records() {
     jq -r --arg service "$service" '
       (.services[$service].ports // [])[] |
       [(.target // ""), (.published // ""), (.protocol // "tcp"), (.host_ip // ""), (.mode // "")] |
-      map(if . == "" then "__IPARS_EMPTY_FIELD__" else tostring end) | @tsv
+      map(if . == "" then "__HETERONETWORK_EMPTY_FIELD__" else tostring end) | @tsv
     ' "$rendered_config"
   )
 }

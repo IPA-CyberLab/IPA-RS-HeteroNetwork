@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_bin="${CARGO:-/home/coder/.cargo/bin/cargo}"
 suffix="$$-$(date +%s%N)"
-docker_stderr="/tmp/ipars-docker-smoke-docker-${suffix}.stderr"
-compose_stderr="/tmp/ipars-docker-smoke-compose-${suffix}.stderr"
+docker_stderr="/tmp/heteronetwork-docker-smoke-docker-${suffix}.stderr"
+compose_stderr="/tmp/heteronetwork-docker-smoke-compose-${suffix}.stderr"
 
 cleanup() {
   rm -f "${docker_stderr}" "${compose_stderr}"
@@ -43,7 +43,7 @@ cd "$repo_root"
 env \
   DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}" \
   COMPOSE_DOCKER_CLI_BUILD="${COMPOSE_DOCKER_CLI_BUILD:-1}" \
-  IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 \
+  HETERONETWORK_RUN_DOCKER_COMPOSE_SMOKE=1 \
   "$cargo_bin" test --locked -p ipars-cli --test docker_compose_smoke -- --nocapture
 
 echo "Docker Compose smoke checks completed"

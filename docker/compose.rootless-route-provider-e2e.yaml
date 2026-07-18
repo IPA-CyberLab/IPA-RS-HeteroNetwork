@@ -1,40 +1,40 @@
 services:
   agent:
-    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    image: ${HETERONETWORK_ROOTLESS_E2E_IMAGE:-heteronetwork-rootless-route-provider-e2e:local}
     networks: !override
       default:
         ipv4_address: 172.30.250.11
       workload-a:
         ipv4_address: 172.30.251.2
     environment: !override
-      IPARS_ROLE: agent
-      IPARS_AGENT_JOIN_TOKEN_PATH: /run/secrets/ipars-agent-join-token
-      IPARS_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/ipars-agent-api-bearer-token
-      IPARS_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
-      IPARS_AGENT_SIGNAL_URL: http://172.30.250.4:9443
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:51821
-      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51821"
-      IPARS_AGENT_RUNTIME_BACKEND: linux-command
-      IPARS_AGENT_WIREGUARD_BACKEND: userspace-boringtun
-      IPARS_AGENT_ROUTE_BACKEND: command
-      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
-      IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
-      IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
-      IPARS_DOCKER_CONTAINER_NAMESPACE: rootless-workload-a
-      IPARS_DOCKER_CONTAINER_CIDRS: 172.30.251.0/24
-      IPARS_DOCKER_HOST_INTERFACE: eth0
-      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
-      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_JOIN_TOKEN_PATH: /run/secrets/heteronetwork-agent-join-token
+      HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/heteronetwork-agent-api-bearer-token
+      HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      HETERONETWORK_AGENT_SIGNAL_URL: http://172.30.250.4:9443
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51821
+      HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51821"
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command
+      HETERONETWORK_AGENT_WIREGUARD_BACKEND: userspace-boringtun
+      HETERONETWORK_AGENT_ROUTE_BACKEND: command
+      HETERONETWORK_AGENT_DISABLE_PEER_PROBE: "true"
+      HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
+      HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
+      HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES: "true"
+      HETERONETWORK_DOCKER_DISCOVER_NETWORKS: "false"
+      HETERONETWORK_DOCKER_CONTAINER_NAMESPACE: rootless-workload-a
+      HETERONETWORK_DOCKER_CONTAINER_CIDRS: 172.30.251.0/24
+      HETERONETWORK_DOCKER_HOST_INTERFACE: eth0
+      HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     volumes: !override
-      - rootless-agent-a:/var/lib/ipars
+      - rootless-agent-a:/var/lib/heteronetwork
     secrets: !override
-      - ipars-agent-join-token
-      - ipars-agent-api-bearer-token
+      - heteronetwork-agent-join-token
+      - heteronetwork-agent-api-bearer-token
 
   agent-b:
-    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    image: ${HETERONETWORK_ROOTLESS_E2E_IMAGE:-heteronetwork-rootless-route-provider-e2e:local}
     build: !reset null
     pull_policy: never
     networks: !override
@@ -43,34 +43,34 @@ services:
       workload-b:
         ipv4_address: 172.30.252.2
     environment: !override
-      IPARS_ROLE: agent
-      IPARS_AGENT_JOIN_TOKEN_PATH: /run/secrets/ipars-agent-join-token
-      IPARS_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/ipars-agent-api-bearer-token
-      IPARS_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
-      IPARS_AGENT_SIGNAL_URL: http://172.30.250.4:9443
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:51821
-      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51821"
-      IPARS_AGENT_RUNTIME_BACKEND: linux-command
-      IPARS_AGENT_WIREGUARD_BACKEND: userspace-boringtun
-      IPARS_AGENT_ROUTE_BACKEND: command
-      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
-      IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
-      IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
-      IPARS_DOCKER_CONTAINER_NAMESPACE: rootless-workload-b
-      IPARS_DOCKER_CONTAINER_CIDRS: 172.30.252.0/24
-      IPARS_DOCKER_HOST_INTERFACE: eth0
-      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
-      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_JOIN_TOKEN_PATH: /run/secrets/heteronetwork-agent-join-token
+      HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH: /run/secrets/heteronetwork-agent-api-bearer-token
+      HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      HETERONETWORK_AGENT_SIGNAL_URL: http://172.30.250.4:9443
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51821
+      HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51821"
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command
+      HETERONETWORK_AGENT_WIREGUARD_BACKEND: userspace-boringtun
+      HETERONETWORK_AGENT_ROUTE_BACKEND: command
+      HETERONETWORK_AGENT_DISABLE_PEER_PROBE: "true"
+      HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: "30"
+      HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: "180"
+      HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES: "true"
+      HETERONETWORK_DOCKER_DISCOVER_NETWORKS: "false"
+      HETERONETWORK_DOCKER_CONTAINER_NAMESPACE: rootless-workload-b
+      HETERONETWORK_DOCKER_CONTAINER_CIDRS: 172.30.252.0/24
+      HETERONETWORK_DOCKER_HOST_INTERFACE: eth0
+      HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     volumes: !override
-      - rootless-agent-b:/var/lib/ipars
+      - rootless-agent-b:/var/lib/heteronetwork
     secrets: !override
-      - ipars-agent-join-token
-      - ipars-agent-api-bearer-token
+      - heteronetwork-agent-join-token
+      - heteronetwork-agent-api-bearer-token
 
   workload-a:
-    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    image: ${HETERONETWORK_ROOTLESS_E2E_IMAGE:-heteronetwork-rootless-route-provider-e2e:local}
     build: !reset null
     pull_policy: never
     entrypoint:
@@ -85,7 +85,7 @@ services:
       workload-a:
         ipv4_address: 172.30.251.3
     ports:
-      - "${IPARS_ROOTLESS_WORKLOAD_A_HTTP_PORT:-18080}:8080/tcp"
+      - "${HETERONETWORK_ROOTLESS_WORKLOAD_A_HTTP_PORT:-18080}:8080/tcp"
     depends_on:
       agent:
         condition: service_healthy
@@ -97,7 +97,7 @@ services:
       start_period: 5s
 
   workload-b:
-    image: ${IPARS_ROOTLESS_E2E_IMAGE:-ipars-rootless-route-provider-e2e:local}
+    image: ${HETERONETWORK_ROOTLESS_E2E_IMAGE:-heteronetwork-rootless-route-provider-e2e:local}
     build: !reset null
     pull_policy: never
     entrypoint:
@@ -112,7 +112,7 @@ services:
       workload-b:
         ipv4_address: 172.30.252.3
     ports:
-      - "${IPARS_ROOTLESS_WORKLOAD_B_HTTP_PORT:-18081}:8080/tcp"
+      - "${HETERONETWORK_ROOTLESS_WORKLOAD_B_HTTP_PORT:-18081}:8080/tcp"
     depends_on:
       agent-b:
         condition: service_healthy

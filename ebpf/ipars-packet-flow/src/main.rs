@@ -71,7 +71,7 @@ struct UserMsghdr {
 }
 
 #[map]
-pub static IPARS_PACKET_FLOWS: RingBuf = RingBuf::with_byte_size(RINGBUF_BYTES, 0);
+pub static HETERONETWORK_PACKET_FLOWS: RingBuf = RingBuf::with_byte_size(RINGBUF_BYTES, 0);
 
 #[tracepoint]
 pub fn ipars_sys_enter_connect(ctx: TracePointContext) -> u32 {
@@ -415,7 +415,7 @@ fn emit_sockaddr_in6(sockaddr: *const SockAddrIn6) {
 }
 
 fn emit_event(event: PacketFlowEvent) {
-    let _ = IPARS_PACKET_FLOWS.output(&event, 0);
+    let _ = HETERONETWORK_PACKET_FLOWS.output(&event, 0);
 }
 
 #[panic_handler]

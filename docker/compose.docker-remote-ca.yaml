@@ -1,11 +1,11 @@
 services:
   agent:
     environment:
-      - IPARS_DOCKER_API_CA_CERT_PATH=/run/ipars/docker-api-ca.crt
+      - HETERONETWORK_DOCKER_API_CA_CERT_PATH=/run/heteronetwork/docker-api-ca.crt
     volumes:
       - type: bind
-        source: ${IPARS_DOCKER_API_CA_CERT_PATH_HOST:?set IPARS_DOCKER_API_CA_CERT_PATH_HOST}
-        target: /run/ipars/docker-api-ca.crt
+        source: ${HETERONETWORK_DOCKER_API_CA_CERT_PATH_HOST:?set HETERONETWORK_DOCKER_API_CA_CERT_PATH_HOST}
+        target: /run/heteronetwork/docker-api-ca.crt
         read_only: true
         bind:
           create_host_path: false

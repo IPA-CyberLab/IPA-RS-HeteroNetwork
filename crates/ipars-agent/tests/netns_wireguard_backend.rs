@@ -16,9 +16,13 @@ use ipars_types::{NodeId, VpnIp};
 #[tokio::test]
 async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_WG_NETNS_TESTS").ok().as_deref() != Some("1") {
+    if std::env::var("HETERONETWORK_RUN_WG_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         eprintln!(
-            "skipping WireGuard netns integration test; set IPARS_RUN_WG_NETNS_TESTS=1 to run it"
+            "skipping WireGuard netns integration test; set HETERONETWORK_RUN_WG_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -110,13 +114,13 @@ async fn kernel_wireguard_backend_manages_peer_inside_network_namespace(
 #[tokio::test]
 async fn boringtun_backend_manages_peer_inside_network_namespace(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_BORINGTUN_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping BoringTun netns integration test; set IPARS_RUN_BORINGTUN_NETNS_TESTS=1 to run it"
+            "skipping BoringTun netns integration test; set HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -228,13 +232,13 @@ async fn boringtun_backend_manages_peer_inside_network_namespace(
 #[tokio::test]
 async fn boringtun_backends_transport_vpn_packets_between_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_BORINGTUN_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping BoringTun packet netns integration test; set IPARS_RUN_BORINGTUN_NETNS_TESTS=1 to run it"
+            "skipping BoringTun packet netns integration test; set HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }

@@ -13,18 +13,18 @@ use ipars_crypto::{
     verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-    ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse, PathStateCount, PeerMap,
-    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RemoveNodeRequest, RemoveNodeResponse,
-    RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
-    SignalNodeUpsertRequest,
+    ControlPlaneMetricsResponse, ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind,
+    ControlPlaneNodeQueryRequest, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
+    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayMap, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
     endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
-    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NodeHealth, NodeId,
-    NodeRecord, PathRecord, PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics,
-    TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
-    TransportProtocol, VpnIp,
+    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NatClassification,
+    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability,
+    Route, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome,
+    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -147,6 +147,18 @@ pub trait ControlPlaneStore: Send + Sync {
         health: NodeHealth,
     ) -> Result<(), ControlPlaneError>;
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
+    async fn upsert_nat_classification(
+        &self,
+        node_id: NodeId,
+        classification: NatClassification,
+    ) -> Result<(), ControlPlaneError>;
+    async fn get_nat_classification(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<NatClassification>, ControlPlaneError>;
+    async fn list_nat_classifications(
+        &self,
+    ) -> Result<BTreeMap<NodeId, NatClassification>, ControlPlaneError>;
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError>;
     async fn upsert_path(&self, path: PathRecord) -> Result<(), ControlPlaneError>;
     async fn replace_node_paths(
@@ -168,6 +180,7 @@ pub struct RemovedNode {
 pub struct HeartbeatStoreUpdate {
     pub node_id: NodeId,
     pub candidates: Vec<EndpointCandidate>,
+    pub nat_classification: Option<NatClassification>,
     pub relay_capability: Option<RelayCapability>,
     pub routes: Option<Vec<Route>>,
     pub health: NodeHealth,
@@ -205,6 +218,7 @@ pub trait TokenLedger: Send + Sync {
 pub struct InMemoryStore {
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
+    nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
     paths: RwLock<Vec<PathRecord>>,
 }
 
@@ -235,6 +249,7 @@ impl ControlPlaneStore for InMemoryStore {
             .remove(node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let removed_health = self.health.write().await.remove(node_id).is_some();
+        self.nat_classifications.write().await.remove(node_id);
         let mut removed_path_count = 0;
         self.paths.write().await.retain(|path| {
             let keep = &path.key.local != node_id && &path.key.remote != node_id;
@@ -322,6 +337,31 @@ impl ControlPlaneStore for InMemoryStore {
         Ok(self.health.read().await.get(node_id).cloned())
     }
 
+    async fn upsert_nat_classification(
+        &self,
+        node_id: NodeId,
+        classification: NatClassification,
+    ) -> Result<(), ControlPlaneError> {
+        self.nat_classifications
+            .write()
+            .await
+            .insert(node_id, classification);
+        Ok(())
+    }
+
+    async fn get_nat_classification(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<NatClassification>, ControlPlaneError> {
+        Ok(self.nat_classifications.read().await.get(node_id).cloned())
+    }
+
+    async fn list_nat_classifications(
+        &self,
+    ) -> Result<BTreeMap<NodeId, NatClassification>, ControlPlaneError> {
+        Ok(self.nat_classifications.read().await.clone())
+    }
+
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
         let mut nodes = self.nodes.write().await;
         let mut health = self.health.write().await;
@@ -345,6 +385,12 @@ impl ControlPlaneStore for InMemoryStore {
         node.relay_capability = update.relay_capability;
         if let Some(routes) = update.routes {
             node.routes = routes;
+        }
+        if let Some(classification) = update.nat_classification {
+            self.nat_classifications
+                .write()
+                .await
+                .insert(update.node_id.clone(), classification);
         }
         health.insert(update.node_id.clone(), update.health);
         paths.retain(|path| path.key.local != update.node_id);
@@ -804,6 +850,61 @@ where
         self.store.get_health(node_id).await
     }
 
+    pub async fn nat_classification_for(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<NatClassification>, ControlPlaneError> {
+        self.store.get_nat_classification(node_id).await
+    }
+
+    pub async fn nat_classifications(
+        &self,
+    ) -> Result<BTreeMap<NodeId, NatClassification>, ControlPlaneError> {
+        self.store.list_nat_classifications().await
+    }
+
+    pub async fn nat_discovery_overview(
+        &self,
+    ) -> Result<ControlPlaneNatDiscoveryOverview, ControlPlaneError> {
+        let classifications = self.store.list_nat_classifications().await?;
+        let policy = self.policy_snapshot()?;
+        let now = Utc::now();
+        let mut stale_count = 0;
+        let mut low_confidence_count = 0;
+        let mut strategy_counts = BTreeMap::<NatTraversalStrategy, usize>::new();
+        for classification in classifications.values() {
+            if !nat_classification_is_fresh(
+                classification,
+                now,
+                policy.nat_classification_ttl_seconds,
+            ) {
+                stale_count += 1;
+                continue;
+            }
+            if classification.confidence * 100.0
+                < f32::from(policy.nat_classification_min_confidence_percent)
+            {
+                low_confidence_count += 1;
+            }
+            *strategy_counts.entry(classification.strategy).or_default() += 1;
+        }
+        Ok(ControlPlaneNatDiscoveryOverview {
+            nat_classification_count: classifications.len(),
+            stale_nat_classification_count: stale_count,
+            fresh_low_confidence_nat_classification_count: low_confidence_count,
+            fresh_nat_classification_strategy_counts: NatTraversalStrategy::ALL
+                .into_iter()
+                .map(|strategy| NatTraversalStrategyCount {
+                    strategy,
+                    count: *strategy_counts.get(&strategy).unwrap_or(&0),
+                })
+                .collect(),
+            nat_classification_ttl_seconds: policy.nat_classification_ttl_seconds,
+            nat_classification_min_confidence_percent: policy
+                .nat_classification_min_confidence_percent,
+        })
+    }
+
     pub async fn list_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
         let nodes = self.store.list_nodes().await?;
         let mut paths = Vec::new();
@@ -898,6 +999,7 @@ where
             return Err(ControlPlaneError::JoinDenied);
         }
         let now = Utc::now();
+        let nat_classification = request.nat_classification.clone();
         validate_registration_request(&request, now, self.config.heartbeat_signature_max_age)?;
         for route in &request.requested_routes {
             if !route_allowed(route, &claims) {
@@ -923,6 +1025,11 @@ where
             }
             Err(error) => return Err(error),
         };
+        if let Some(classification) = nat_classification {
+            self.store
+                .upsert_nat_classification(node.node_id.clone(), classification)
+                .await?;
+        }
         self.registration_response_for_node(node, now).await
     }
 
@@ -1318,6 +1425,7 @@ where
             .apply_heartbeat(HeartbeatStoreUpdate {
                 node_id: request.node_id,
                 candidates: request.candidates,
+                nat_classification: request.nat_classification,
                 relay_capability,
                 routes: request.routes,
                 health: request.health,
@@ -1457,6 +1565,18 @@ where
             node_id: request.node_id.clone(),
             reason,
         })?;
+        if let Some(classification) = request.nat_classification.as_ref() {
+            validate_nat_classification_shape(
+                &request.node_id,
+                classification,
+                now,
+                self.config.heartbeat_signature_max_age,
+            )
+            .map_err(|reason| ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason,
+            })?;
+        }
         if let Some(candidate) = request
             .candidates
             .iter()
@@ -2133,6 +2253,20 @@ fn path_is_fresh(path: &PathRecord, now: chrono::DateTime<Utc>, ttl_seconds: u64
     }
 }
 
+fn nat_classification_is_fresh(
+    classification: &NatClassification,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    match now
+        .signed_duration_since(classification.assessed_at)
+        .to_std()
+    {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
+}
+
 fn timestamp_within_skew(
     timestamp: chrono::DateTime<Utc>,
     now: chrono::DateTime<Utc>,
@@ -2491,6 +2625,18 @@ fn validate_registration_request(
             ),
         });
     }
+    if let Some(classification) = request.nat_classification.as_ref() {
+        validate_nat_classification_shape(
+            &request.node_id,
+            classification,
+            now,
+            max_timestamp_skew,
+        )
+        .map_err(|reason| ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.node_id.clone(),
+            reason,
+        })?;
+    }
     validate_advertised_routes_shape(&request.node_id, &request.requested_routes).map_err(
         |reason| ControlPlaneError::NodeRegistrationRejected {
             node_id: request.node_id.clone(),
@@ -2509,6 +2655,59 @@ fn validate_registration_request(
                 route.id, route.advertised_by, request.node_id
             ),
         });
+    }
+    Ok(())
+}
+
+fn validate_nat_classification_shape(
+    _node_id: &NodeId,
+    classification: &NatClassification,
+    now: chrono::DateTime<Utc>,
+    max_timestamp_skew: Duration,
+) -> Result<(), String> {
+    let validate_addr = |addr: std::net::SocketAddr, label: &str| {
+        endpoint_addr_is_usable(addr)
+            .then_some(())
+            .ok_or_else(|| format!("NAT classification {label} {addr} is unusable"))
+    };
+    if let Some(observed_endpoint) = classification.observed_endpoint {
+        validate_addr(observed_endpoint, "observed endpoint")?;
+    }
+    if !timestamp_not_after_skew(classification.assessed_at, now, max_timestamp_skew) {
+        return Err(format!(
+            "NAT classification assessed_at {} is too far in the future",
+            classification.assessed_at
+        ));
+    }
+    if !classification.confidence.is_finite() || !(0.0..=1.0).contains(&classification.confidence) {
+        return Err(
+            "NAT classification confidence must be a finite value between 0 and 1".to_string(),
+        );
+    }
+    for observation in &classification.observations {
+        validate_addr(observation.stun_server, "probe STUN server")?;
+        validate_addr(observation.reflexive_addr, "probe reflexive endpoint")?;
+        if !timestamp_not_after_skew(observation.observed_at, now, max_timestamp_skew) {
+            return Err(format!(
+                "NAT probe observation observed_at {} is too far in the future",
+                observation.observed_at
+            ));
+        }
+    }
+    for observation in &classification.filtering_observations {
+        validate_addr(observation.stun_server, "filtering STUN server")?;
+        if let Some(response_origin) = observation.response_origin {
+            validate_addr(response_origin, "filtering response origin")?;
+        }
+        if let Some(other_address) = observation.other_address {
+            validate_addr(other_address, "filtering other address")?;
+        }
+        if !timestamp_not_after_skew(observation.observed_at, now, max_timestamp_skew) {
+            return Err(format!(
+                "NAT filtering observation observed_at {} is too far in the future",
+                observation.observed_at
+            ));
+        }
     }
     Ok(())
 }
@@ -2766,6 +2965,7 @@ mod tests {
             identity_public_key: identity.public_key_b64(),
             wireguard_public_key: wireguard_public_key_for_node(node_id),
             candidates: Vec::new(),
+            nat_classification: None,
             relay_capability: None,
             requested_routes: Vec::new(),
         }
@@ -2972,6 +3172,29 @@ mod tests {
             self.inner.get_health(node_id).await
         }
 
+        async fn upsert_nat_classification(
+            &self,
+            node_id: NodeId,
+            classification: NatClassification,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner
+                .upsert_nat_classification(node_id, classification)
+                .await
+        }
+
+        async fn get_nat_classification(
+            &self,
+            node_id: &NodeId,
+        ) -> Result<Option<NatClassification>, ControlPlaneError> {
+            self.inner.get_nat_classification(node_id).await
+        }
+
+        async fn list_nat_classifications(
+            &self,
+        ) -> Result<BTreeMap<NodeId, NatClassification>, ControlPlaneError> {
+            self.inner.list_nat_classifications().await
+        }
+
         async fn apply_heartbeat(
             &self,
             update: HeartbeatStoreUpdate,
@@ -3122,6 +3345,7 @@ mod tests {
             identity_public_key: identity.public_key_b64(),
             wireguard_public_key: wireguard_public_key_for_node("node-a"),
             candidates: Vec::new(),
+            nat_classification: None,
             relay_capability: Some(relay_capability()),
             requested_routes: Vec::new(),
         };
@@ -3190,6 +3414,7 @@ mod tests {
                     relay_capability: Some(relay_capability()),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -3279,6 +3504,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
                 signed_at,
@@ -4362,6 +4588,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![path("node-a", "node-b")],
+                    nat_classification: None,
                     node_signature: None,
                 },
                 reported_at,
@@ -4399,6 +4626,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
                 second_reported_at,
@@ -4472,6 +4700,7 @@ mod tests {
                         relay_capability: None,
                         routes: None,
                         path_state: Vec::new(),
+                        nat_classification: None,
                         node_signature: None,
                     },
                     signed_at,
@@ -4521,6 +4750,7 @@ mod tests {
                     relay_capability: None,
                     routes: Some(vec![route.clone()]),
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4551,6 +4781,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4599,6 +4830,7 @@ mod tests {
                     relay_capability: None,
                     routes: Some(vec![route("route-denied", "10.43.1.0/24", "node-a")?]),
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4643,6 +4875,7 @@ mod tests {
                     relay_capability: None,
                     routes: Some(vec![route("route-unowned", "10.42.1.0/24", "node-b")?]),
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4690,6 +4923,7 @@ mod tests {
                     relay_capability: None,
                     routes: Some(vec![zero_metric]),
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4737,6 +4971,7 @@ mod tests {
                 relay_capability: None,
                 routes: None,
                 path_state: Vec::new(),
+                nat_classification: None,
                 node_signature: None,
             },
             signed_at,
@@ -4781,6 +5016,7 @@ mod tests {
             relay_capability: None,
             routes: None,
             path_state: Vec::new(),
+            nat_classification: None,
             node_signature: None,
         };
 
@@ -4829,6 +5065,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4848,6 +5085,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![path("node-b", "node-c")],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4890,6 +5128,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4943,6 +5182,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -4988,6 +5228,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![path("node-a", "node-b"), path("node-a", "node-b")],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5032,6 +5273,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![path("node-a", "node-b")],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5103,6 +5345,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![path("node-a", "node-b")],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5150,6 +5393,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
                 signed_at,
@@ -5224,6 +5468,7 @@ mod tests {
                         relay_capability: None,
                         routes: None,
                         path_state: vec![reported_path],
+                        nat_classification: None,
                         node_signature: None,
                     },
                     signed_at,
@@ -5275,6 +5520,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
                 signed_at,
@@ -5331,6 +5577,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
                 signed_at,
@@ -5378,6 +5625,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5429,6 +5677,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5476,6 +5725,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![relay_path("node-a", "node-b", None)],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5524,6 +5774,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5579,6 +5830,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5641,6 +5893,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5689,6 +5942,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("node-a"))],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5761,6 +6015,7 @@ mod tests {
                     relay_capability: Some(relay_capability()),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5788,6 +6043,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5861,6 +6117,7 @@ mod tests {
                     relay_capability: Some(relay_capability()),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5888,6 +6145,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5933,6 +6191,7 @@ mod tests {
                     relay_capability: Some(relay_capability()),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -5960,6 +6219,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6004,6 +6264,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: vec![reported_path],
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6049,6 +6310,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6099,6 +6361,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
                 signed_at,
@@ -6155,6 +6418,7 @@ mod tests {
                     relay_capability: Some(heartbeat_relay),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6207,6 +6471,7 @@ mod tests {
                     relay_capability: Some(relay_capability()),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6229,6 +6494,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6277,6 +6543,7 @@ mod tests {
                     relay_capability: Some(relay_capability()),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))
@@ -6320,6 +6587,7 @@ mod tests {
                     relay_capability: Some(bad_admission_url),
                     routes: None,
                     path_state: Vec::new(),
+                    nat_classification: None,
                     node_signature: None,
                 },
             ))

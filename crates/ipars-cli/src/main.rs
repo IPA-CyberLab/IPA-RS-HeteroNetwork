@@ -125,26 +125,26 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "IPARS_AGENT_API_BEARER_TOKEN",
+        env = "HETERONETWORK_AGENT_API_BEARER_TOKEN",
         conflicts_with = "agent_api_bearer_token_path"
     )]
     agent_api_bearer_token: Option<String>,
-    #[arg(long, global = true, env = "IPARS_AGENT_API_BEARER_TOKEN_PATH")]
+    #[arg(long, global = true, env = "HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH")]
     agent_api_bearer_token_path: Option<PathBuf>,
     #[arg(
         long,
         global = true,
-        env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+        env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
         conflicts_with = "control_plane_operator_api_bearer_token_path"
     )]
     control_plane_operator_api_bearer_token: Option<String>,
     #[arg(
         long,
         global = true,
-        env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"
+        env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"
     )]
     control_plane_operator_api_bearer_token_path: Option<PathBuf>,
-    #[arg(long, global = true, env = "IPARS_AGENT_STATE_PATH")]
+    #[arg(long, global = true, env = "HETERONETWORK_AGENT_STATE_PATH")]
     agent_state_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -328,11 +328,11 @@ struct InitArgs {
     public_endpoint: SocketAddr,
     #[arg(long, default_value = "http", value_parser = parse_bootstrap_scheme)]
     bootstrap_scheme: String,
-    #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_KEY_ID", default_value = "root")]
     issuer_key_id: String,
-    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PRIVATE_KEY")]
     issuer_private_key_b64: Option<String>,
-    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY_PATH")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PRIVATE_KEY_PATH")]
     issuer_private_key_path: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     emit_issuer_private_key: bool,
@@ -354,7 +354,7 @@ struct InitArgs {
     spawn_daemons: bool,
     #[arg(long, default_value_t = DEFAULT_INIT_DAEMON_READY_TIMEOUT_SECONDS)]
     daemon_ready_timeout_seconds: u64,
-    #[arg(long, env = "IPARS_IPARSD_BIN", default_value = "iparsd")]
+    #[arg(long, env = "HETERONETWORK_IPARSD_BIN", default_value = "iparsd")]
     daemon_binary: PathBuf,
     #[arg(long, default_value = "/var/lib/ipars/bootstrap")]
     daemon_state_dir: PathBuf,
@@ -362,7 +362,10 @@ struct InitArgs {
     control_plane_listen: SocketAddr,
     #[arg(long)]
     control_plane_database_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"
+    )]
     control_plane_operator_api_bearer_token_path: Option<PathBuf>,
     #[arg(long, default_value = "0.0.0.0:9443")]
     signal_listen: SocketAddr,
@@ -378,7 +381,7 @@ struct InitArgs {
     relay_http_listen: SocketAddr,
     #[arg(long)]
     relay_admission_url: Option<String>,
-    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
     relay_admission_bearer_token_path: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:9781")]
     relay_agent_listen: SocketAddr,
@@ -389,7 +392,7 @@ struct JoinArgs {
     token: String,
     #[arg(long)]
     control_plane_url: Option<String>,
-    #[arg(long, env = "IPARS_JOIN_STATE_PATH")]
+    #[arg(long, env = "HETERONETWORK_JOIN_STATE_PATH")]
     state_path: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -397,29 +400,41 @@ struct JoinArgs {
 
 #[derive(Debug, Args)]
 struct StatusArgs {
-    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_URL",
+        conflicts_with = "control_plane_url"
+    )]
     agent_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct PeersArgs {
-    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_URL",
+        conflicts_with = "control_plane_url"
+    )]
     agent_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
-    #[arg(long, env = "IPARS_NODE_ID")]
+    #[arg(long, env = "HETERONETWORK_NODE_ID")]
     node_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct RoutesArgs {
-    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_URL",
+        conflicts_with = "control_plane_url"
+    )]
     agent_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
-    #[arg(long, env = "IPARS_NODE_ID")]
+    #[arg(long, env = "HETERONETWORK_NODE_ID")]
     node_id: Option<String>,
 }
 
@@ -436,9 +451,9 @@ enum KeyCommand {
 
 #[derive(Debug, Args)]
 struct KeyRotateArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_URL")]
     agent_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
 }
 
@@ -449,9 +464,9 @@ enum NodeCommand {
 
 #[derive(Debug, Args)]
 struct NodeRemoveArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_URL")]
     agent_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
 }
 
@@ -459,11 +474,11 @@ struct NodeRemoveArgs {
 struct TokenCreateArgs {
     #[arg(long)]
     cluster_id: Option<String>,
-    #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_KEY_ID", default_value = "root")]
     issuer_key_id: String,
-    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PRIVATE_KEY")]
     issuer_private_key_b64: Option<String>,
-    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY_PATH")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PRIVATE_KEY_PATH")]
     issuer_private_key_path: Option<PathBuf>,
     #[arg(long, default_value = "edge")]
     role: String,
@@ -499,11 +514,11 @@ struct TokenRevokeArgs {
     cluster_id: String,
     #[arg(long)]
     nonce: String,
-    #[arg(long, env = "IPARS_ISSUER_KEY_ID", default_value = "root")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_KEY_ID", default_value = "root")]
     issuer_key_id: String,
-    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PRIVATE_KEY")]
     issuer_private_key_b64: Option<String>,
-    #[arg(long, env = "IPARS_ISSUER_PRIVATE_KEY_PATH")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PRIVATE_KEY_PATH")]
     issuer_private_key_path: Option<PathBuf>,
 }
 
@@ -515,17 +530,17 @@ enum RelayCommand {
 
 #[derive(Debug, Args)]
 struct RelayStatusArgs {
-    #[arg(long, env = "IPARS_RELAY_URL")]
+    #[arg(long, env = "HETERONETWORK_RELAY_URL")]
     relay_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct RelayProbeArgs {
-    #[arg(long, env = "IPARS_RELAY_URL")]
+    #[arg(long, env = "HETERONETWORK_RELAY_URL")]
     relay_url: Option<String>,
-    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN")]
+    #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN")]
     relay_admission_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_RELAY_UDP", default_value = DEFAULT_LOCAL_RELAY_UDP)]
+    #[arg(long, env = "HETERONETWORK_RELAY_UDP", default_value = DEFAULT_LOCAL_RELAY_UDP)]
     relay_udp: SocketAddr,
     #[arg(long, default_value = "probe-left")]
     left_node_id: String,
@@ -550,7 +565,7 @@ enum StunCommand {
 
 #[derive(Debug, Args)]
 struct StunProbeArgs {
-    #[arg(long, env = "IPARS_STUN_SERVER", default_value = DEFAULT_LOCAL_STUN_UDP)]
+    #[arg(long, env = "HETERONETWORK_STUN_SERVER", default_value = DEFAULT_LOCAL_STUN_UDP)]
     stun_server: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:0")]
     local_bind: SocketAddr,
@@ -566,23 +581,27 @@ enum PathCommand {
 
 #[derive(Debug, Args)]
 struct PathStatusArgs {
-    #[arg(long, env = "IPARS_AGENT_URL", conflicts_with = "control_plane_url")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_URL",
+        conflicts_with = "control_plane_url"
+    )]
     agent_url: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
-    #[arg(long, env = "IPARS_NODE_ID")]
+    #[arg(long, env = "HETERONETWORK_NODE_ID")]
     node_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct PathEventsArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_URL")]
     agent_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct PathActivityArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_URL")]
     agent_url: Option<String>,
     #[arg(long)]
     peer: String,
@@ -592,7 +611,7 @@ struct PathActivityArgs {
 
 #[derive(Debug, Args)]
 struct PathProbeArgs {
-    #[arg(long, env = "IPARS_AGENT_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_URL")]
     agent_url: Option<String>,
     #[arg(long)]
     peer: String,
@@ -2429,6 +2448,7 @@ async fn join(
         identity_public_key: identity.public_key_b64(),
         wireguard_public_key: wireguard.public_key_b64.clone(),
         candidates: Vec::new(),
+        nat_classification: None,
         relay_capability: None,
         requested_routes: Vec::new(),
     };
@@ -5162,7 +5182,7 @@ fn validate_kubernetes_service_annotation_args(
         }
         if kubernetes_service_annotation_controls_proxy_protocol(&annotation.key) {
             anyhow::bail!(
-                "{flag} annotation key {} must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers",
+                "{flag} annotation key {} must not enable PROXY protocol; HeteroNetwork Services do not accept PROXY protocol headers",
                 annotation.key
             );
         }
@@ -5174,7 +5194,7 @@ fn validate_kubernetes_service_annotation_args(
         }
         if kubernetes_service_annotation_controls_listener_protocol(&annotation.key) {
             anyhow::bail!(
-                "{flag} annotation key {} must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead",
+                "{flag} annotation key {} must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain HeteroNetwork listeners instead",
                 annotation.key
             );
         }
@@ -5198,7 +5218,7 @@ fn validate_kubernetes_service_annotation_args(
         }
         if kubernetes_service_annotation_controls_operational_attributes(&annotation.key) {
             anyhow::bail!(
-                "{flag} annotation key {} must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead",
+                "{flag} annotation key {} must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and HeteroNetwork listener controls instead",
                 annotation.key
             );
         }
@@ -6005,12 +6025,12 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     let mut prerequisites = vec![
         "Docker Engine with the Compose plugin".to_string(),
         "A reusable issuer private key for init/token create workflows".to_string(),
-        "A separate 32-512 byte control-plane operator API Bearer token in docker/control-plane-operator-api.token, or IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
-        "A separate 32-512 byte signal operator API Bearer token in docker/signal-operator-api.token, or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
-        "A separate 32-512 byte STUN operator API Bearer token in docker/stun-operator-api.token, or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
-        "A separate 32-512 byte relay operator API Bearer token in docker/relay-operator-api.token, or IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
-        "A separate 32-512 byte relay admission Bearer token in docker/relay-admission.token, or IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file shared only with authorized agents".to_string(),
-        "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or IPARS_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate 32-512 byte control-plane operator API Bearer token in docker/control-plane-operator-api.token, or HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate 32-512 byte signal operator API Bearer token in docker/signal-operator-api.token, or HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate 32-512 byte STUN operator API Bearer token in docker/stun-operator-api.token, or HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate 32-512 byte relay operator API Bearer token in docker/relay-operator-api.token, or HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
+        "A separate 32-512 byte relay admission Bearer token in docker/relay-admission.token, or HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file shared only with authorized agents".to_string(),
+        "A separate 32-512 byte agent API Bearer token in docker/agent-api.token, or HETERONETWORK_AGENT_API_BEARER_TOKEN_FILE pointing to an equivalent owner-restricted file".to_string(),
     ];
     if args.rootless {
         prerequisites.push(
@@ -6063,21 +6083,21 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
     }
     notes.extend([
         "The bundled Compose file uses healthchecks and host-network loopback URLs for colocated control-plane, signal, relay, and agent HTTP endpoints".to_string(),
-        "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and IPARS_AGENT_JOIN_TOKEN_PATH".to_string(),
-        "The bundled Compose file reads a distinct control-plane operator API Bearer token from docker/control-plane-operator-api.token (or IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE) and protects metrics and policy routes".to_string(),
-        "The bundled Compose file reads a distinct signal operator API Bearer token from docker/signal-operator-api.token (or IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics".to_string(),
-        "The bundled Compose file reads a distinct STUN operator API Bearer token from docker/stun-operator-api.token (or IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics without affecting UDP Binding requests".to_string(),
-        "The bundled Compose file reads a distinct relay operator API Bearer token from docker/relay-operator-api.token (or IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE) and protects Prometheus metrics without changing the public capability status contract or admission authentication".to_string(),
-        "The bundled Compose file mounts docker/relay-admission.token (or IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE) into the Relay and Agent as one shared file-backed admission credential without placing it in either service environment".to_string(),
-        "The bundled Compose file reads a separate agent API Bearer token from docker/agent-api.token (or IPARS_AGENT_API_BEARER_TOKEN_FILE) through a file-backed Compose secret and protects every endpoint except /healthz".to_string(),
-        "The bundled Compose file enables RFC5780 STUN filtering probes by passing IPARS_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
-        "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND, IPARS_AGENT_USERSPACE_WIREGUARD_ARGS, IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
-        "The bundled Compose file passes relay daemon advertisement through IPARS_RELAY_PUBLIC_ENDPOINT/IPARS_RELAY_ADMISSION_URL and agent relay capability advertisement through IPARS_AGENT_RELAY_PUBLIC_ENDPOINT/IPARS_AGENT_RELAY_ADMISSION_URL; ipars docker install --relay-public-endpoint and --relay-admission-url emit both sides together so advertised relay metadata stays consistent".to_string(),
-        "The bundled Compose file passes the relay admission secret through IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH and IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH, and exposes relay admission abuse controls through IPARS_RELAY_MAX_SESSIONS_PER_NODE, IPARS_RELAY_ADMISSION_RATE_LIMIT, and IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
-        "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through IPARS_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
+        "The bundled Compose file reads the agent join token from docker/join.token through a file-backed Compose secret and HETERONETWORK_AGENT_JOIN_TOKEN_PATH".to_string(),
+        "The bundled Compose file reads a distinct control-plane operator API Bearer token from docker/control-plane-operator-api.token (or HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE) and protects metrics and policy routes".to_string(),
+        "The bundled Compose file reads a distinct signal operator API Bearer token from docker/signal-operator-api.token (or HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics".to_string(),
+        "The bundled Compose file reads a distinct STUN operator API Bearer token from docker/stun-operator-api.token (or HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_FILE) and protects JSON and Prometheus metrics without affecting UDP Binding requests".to_string(),
+        "The bundled Compose file reads a distinct relay operator API Bearer token from docker/relay-operator-api.token (or HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_FILE) and protects Prometheus metrics without changing the public capability status contract or admission authentication".to_string(),
+        "The bundled Compose file mounts docker/relay-admission.token (or HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE) into the Relay and Agent as one shared file-backed admission credential without placing it in either service environment".to_string(),
+        "The bundled Compose file reads a separate agent API Bearer token from docker/agent-api.token (or HETERONETWORK_AGENT_API_BEARER_TOKEN_FILE) through a file-backed Compose secret and protects every endpoint except /healthz".to_string(),
+        "The bundled Compose file enables RFC5780 STUN filtering probes by passing HETERONETWORK_STUN_ALTERNATE_LISTEN and publishing the alternate UDP port".to_string(),
+        "The bundled Compose file can pass userspace WireGuard launch/readiness/shutdown settings through HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND, HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS, HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS, and HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+        "The bundled Compose file passes relay daemon advertisement through HETERONETWORK_RELAY_PUBLIC_ENDPOINT/HETERONETWORK_RELAY_ADMISSION_URL and agent relay capability advertisement through HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT/HETERONETWORK_AGENT_RELAY_ADMISSION_URL; ipars docker install --relay-public-endpoint and --relay-admission-url emit both sides together so advertised relay metadata stays consistent".to_string(),
+        "The bundled Compose file passes the relay admission secret through HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH and HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH, and exposes relay admission abuse controls through HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE, HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT, and HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        "The bundled Compose file can pass relay forwarder endpoint, bind, WireGuard endpoint, namespace placement, capacity, restart backoff, and crash-loop cooldown settings through HETERONETWORK_AGENT_RELAY_FORWARDER_* environment variables".to_string(),
     ]);
     if args.docker_discover_networks && args.docker_api_url.is_none() {
-        notes.push("Docker network discovery plans add a read-only Docker API socket override so the agent receives IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock; rootful plans use docker/compose.docker-discovery.yaml and explicit rootless route-provider plans use docker/compose.rootless-docker-discovery.yaml with XDG_RUNTIME_DIR/docker.sock as the default host path".to_string());
+        notes.push("Docker network discovery plans add a read-only Docker API socket override so the agent receives HETERONETWORK_DOCKER_API_SOCKET=/run/heteronetwork/docker.sock; rootful plans use docker/compose.docker-discovery.yaml and explicit rootless route-provider plans use docker/compose.rootless-docker-discovery.yaml with XDG_RUNTIME_DIR/docker.sock as the default host path".to_string());
         notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments".to_string());
     }
     if let Some(url) = args.docker_api_url.as_deref() {
@@ -6085,10 +6105,10 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("Use --docker-discover-networks with repeated --docker-network values for multi-network Compose deployments; filters are checked by the agent against the remote Engine".to_string());
     }
     if let Some(path) = args.docker_api_ca_cert_path.as_ref() {
-        notes.push(format!("The Docker API CA certificate `{}` is validated as a bounded PEM file and mounted read-only at /run/ipars/docker-api-ca.crt", path.display()));
+        notes.push(format!("The Docker API CA certificate `{}` is validated as a bounded PEM file and mounted read-only at /run/heteronetwork/docker-api-ca.crt", path.display()));
     }
     if args.docker_discover_networks && args.docker_api_url.is_none() {
-        notes.push("Docker network discovery plans include a host-side socket preflight command that checks IPARS_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute dot-component-free non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
+        notes.push("Docker network discovery plans include a host-side socket preflight command that checks HETERONETWORK_DOCKER_API_SOCKET_HOST, the explicit --docker-api-socket path, the rootless XDG runtime socket, or /var/run/docker.sock as an absolute dot-component-free non-symlink Unix socket before the discovery Compose override bind-mounts it into the agent".to_string());
     }
     if args.rootless {
         notes.push("Rootless Docker install plans add docker/compose.rootless.yaml; the default linux-command runtime also adds docker/compose.rootless-dataplane.yaml to request user-namespace CAP_NET_ADMIN and /dev/net/tun".to_string());
@@ -6107,7 +6127,7 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         notes.push("For rootless Docker container CIDR reachability, run a separate rootful route-provider agent or an equivalent userspace routing layer instead of the rootless Compose override".to_string());
     }
     if args.relay_forwarder_netns.is_some() {
-        notes.push("Relay forwarder namespace placement keeps the base Compose service least-privileged; add CAP_SYS_ADMIN and bind-mount the host /var/run/netns directory when enabling IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string());
+        notes.push("Relay forwarder namespace placement keeps the base Compose service least-privileged; add CAP_SYS_ADMIN and bind-mount the host /var/run/netns directory when enabling HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS".to_string());
     }
 
     let mut commands = Vec::new();
@@ -6129,12 +6149,12 @@ fn docker_install_plan(args: DockerInstallArgs) -> anyhow::Result<InstallPlan> {
         security: vec![
             "The bundled Compose file uses plain HTTP on a private development network".to_string(),
             "Expose control-plane, signal, relay, or agent APIs through an external TLS proxy before using public networks".to_string(),
-            "Control-plane metrics and policy require IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse issuer, join-token, or node identity material".to_string(),
-            "Signal metrics require IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from the control-plane operator credential and node identity material".to_string(),
-            "STUN metrics require IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from other operator credentials while leaving the public UDP Binding service credentialless".to_string(),
-            "Relay metrics require IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse the separately scoped relay admission credential".to_string(),
-            "Agent API requests require the separate IPARS_AGENT_API_BEARER_TOKEN_FILE secret; do not reuse the signed join token".to_string(),
-            "Relay admission uses the shared IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE secret; rotate it independently from operator, issuer, join-token, node identity, and Agent API credentials".to_string(),
+            "Control-plane metrics and policy require HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse issuer, join-token, or node identity material".to_string(),
+            "Signal metrics require HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from the control-plane operator credential and node identity material".to_string(),
+            "STUN metrics require HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_FILE; keep it distinct from other operator credentials while leaving the public UDP Binding service credentialless".to_string(),
+            "Relay metrics require HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_FILE; do not reuse the separately scoped relay admission credential".to_string(),
+            "Agent API requests require the separate HETERONETWORK_AGENT_API_BEARER_TOKEN_FILE secret; do not reuse the signed join token".to_string(),
+            "Relay admission uses the shared HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE secret; rotate it independently from operator, issuer, join-token, node identity, and Agent API credentials".to_string(),
             "Relay use still requires signed join-token policy permission".to_string(),
         ],
         notes,
@@ -6246,7 +6266,7 @@ fn docker_api_socket_preflight_command(args: &DockerInstallArgs) -> String {
         "docker_socket=/var/run/docker.sock".to_string()
     };
     let mut command = format!(
-        "docker_socket=${{IPARS_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; case \"$docker_socket\" in */../*|*/..|*/./*|*/.) echo \"Docker API socket path must not contain '.' or '..' path components\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
+        "docker_socket=${{HETERONETWORK_DOCKER_API_SOCKET_HOST:-}}; if [ -z \"$docker_socket\" ]; then {fallback}; fi; case \"$docker_socket\" in /*) ;; *) echo \"Docker API socket path must be an absolute Unix socket path\" >&2; exit 1;; esac; case \"$docker_socket\" in */../*|*/..|*/./*|*/.) echo \"Docker API socket path must not contain '.' or '..' path components\" >&2; exit 1;; esac; test ! -L \"$docker_socket\" && test -S \"$docker_socket\" && docker --host \"unix://$docker_socket\" version >/dev/null"
     );
     if !args.docker_networks.is_empty() {
         command.push_str("; docker_discovered_subnets=''");
@@ -6755,7 +6775,7 @@ fn validate_docker_userspace_wireguard_args(args: &DockerInstallArgs) -> anyhow:
         }
         if argument.contains(',') {
             anyhow::bail!(
-                "--userspace-wireguard-arg must not contain ',' because Docker Compose passes userspace WireGuard arguments through comma-delimited IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"
+                "--userspace-wireguard-arg must not contain ',' because Docker Compose passes userspace WireGuard arguments through comma-delimited HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS"
             );
         }
     }
@@ -7045,37 +7065,37 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
     };
     let mut environment = vec![
         InstallEnvironment {
-            name: "IPARS_AGENT_RUNTIME_BACKEND".to_string(),
+            name: "HETERONETWORK_AGENT_RUNTIME_BACKEND".to_string(),
             value: args.agent_runtime_backend.clone(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+            name: "HETERONETWORK_AGENT_WIREGUARD_BACKEND".to_string(),
             value: agent_wireguard_backend.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
             value: args.agent_http_connect_timeout_seconds.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
             value: args.agent_http_request_timeout_seconds.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS".to_string(),
             value: args.agent_direct_path_probe_timeout_seconds.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
             value: args.agent_direct_handshake_max_age_seconds.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
+            name: "HETERONETWORK_AGENT_DISABLE_PEER_PROBE".to_string(),
             value: (args.agent_peer_probe.disabled
                 || args.agent_runtime_backend != "linux-command")
                 .to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_PORT".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_PORT".to_string(),
             value: args
                 .agent_peer_probe
                 .port
@@ -7083,100 +7103,100 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
                 .to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_INTERVAL_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_INTERVAL_SECONDS".to_string(),
             value: args.agent_peer_probe.interval_seconds.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
             value: args.agent_peer_probe.sample_count.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS".to_string(),
             value: args.agent_peer_probe.response_timeout_millis.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS".to_string(),
             value: args.agent_peer_probe.sample_interval_millis.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_MAX_CONCURRENCY".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_MAX_CONCURRENCY".to_string(),
             value: args.agent_peer_probe.max_concurrency.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND".to_string(),
             value: args
                 .agent_peer_probe
                 .responder_max_requests_per_second
                 .to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
             value: args
                 .agent_peer_probe
                 .observation_max_age_seconds
                 .to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS".to_string(),
+            name: "HETERONETWORK_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS".to_string(),
             value: args
                 .agent_peer_probe
                 .observation_max_age_seconds
                 .to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+            name: "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES".to_string(),
             value: apply_docker_routes.to_string(),
         },
         InstallEnvironment {
-            name: "IPARS_STUN_ALTERNATE_LISTEN".to_string(),
+            name: "HETERONETWORK_STUN_ALTERNATE_LISTEN".to_string(),
             value: DEFAULT_STUN_ALTERNATE_LISTEN.to_string(),
         },
     ];
     if apply_docker_routes {
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+            name: "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
             value: (!args.disable_docker_expose_host_routes).to_string(),
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+            name: "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
             value: args.docker_route_interval_seconds.to_string(),
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_ROUTE_BACKEND".to_string(),
+            name: "HETERONETWORK_AGENT_ROUTE_BACKEND".to_string(),
             value: args.route_backend.clone(),
         });
         if args.docker_discover_networks {
             environment.push(InstallEnvironment {
-                name: "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+                name: "HETERONETWORK_DOCKER_DISCOVER_NETWORKS".to_string(),
                 value: "true".to_string(),
             });
             if let Some(url) = args.docker_api_url.as_ref() {
                 environment.push(InstallEnvironment {
-                    name: "IPARS_DOCKER_API_URL".to_string(),
+                    name: "HETERONETWORK_DOCKER_API_URL".to_string(),
                     value: url.clone(),
                 });
             } else {
                 environment.push(InstallEnvironment {
-                    name: "IPARS_DOCKER_API_SOCKET".to_string(),
-                    value: "/run/ipars/docker.sock".to_string(),
+                    name: "HETERONETWORK_DOCKER_API_SOCKET".to_string(),
+                    value: "/run/heteronetwork/docker.sock".to_string(),
                 });
             }
         }
         if !args.docker_networks.is_empty() {
             environment.push(InstallEnvironment {
-                name: "IPARS_DOCKER_NETWORKS".to_string(),
+                name: "HETERONETWORK_DOCKER_NETWORKS".to_string(),
                 value: args.docker_networks.join(","),
             });
         }
         if let Some(socket) = args.docker_api_socket.as_ref() {
             environment.push(InstallEnvironment {
-                name: "IPARS_DOCKER_API_SOCKET_HOST".to_string(),
+                name: "HETERONETWORK_DOCKER_API_SOCKET_HOST".to_string(),
                 value: socket.display().to_string(),
             });
         }
         if let Some(path) = args.docker_api_ca_cert_path.as_ref() {
             environment.push(InstallEnvironment {
-                name: "IPARS_DOCKER_API_CA_CERT_PATH_HOST".to_string(),
+                name: "HETERONETWORK_DOCKER_API_CA_CERT_PATH_HOST".to_string(),
                 value: path.display().to_string(),
             });
         }
@@ -7185,11 +7205,11 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
             .clone()
             .unwrap_or_else(|| "compose-default".to_string());
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+            name: "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE".to_string(),
             value: container_namespace,
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+            name: "HETERONETWORK_DOCKER_HOST_INTERFACE".to_string(),
             value: args.docker_host_interface.clone(),
         });
         if !args.docker_discover_networks {
@@ -7203,42 +7223,42 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
                     .join(",")
             };
             environment.push(InstallEnvironment {
-                name: "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
+                name: "HETERONETWORK_DOCKER_CONTAINER_CIDRS".to_string(),
                 value: container_cidrs,
             });
         }
         if let Some(network) = args.rootless_workload_network.as_deref() {
             environment.push(InstallEnvironment {
-                name: "IPARS_ROOTLESS_WORKLOAD_NETWORK".to_string(),
+                name: "HETERONETWORK_ROOTLESS_WORKLOAD_NETWORK".to_string(),
                 value: network.to_string(),
             });
         }
     }
     if args.userspace_wireguard_command.is_some() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+            name: "HETERONETWORK_AGENT_WIREGUARD_BACKEND".to_string(),
             value: "userspace-command".to_string(),
         });
     }
     if let Some(command) = args.userspace_wireguard_command.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+            name: "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
             value: command.to_string(),
         });
     }
     if !args.userspace_wireguard_args.is_empty() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+            name: "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
             value: args.userspace_wireguard_args.join(","),
         });
     }
     if args.userspace_wireguard_command.is_some() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
             value: args.userspace_wireguard_ready_timeout_seconds.to_string(),
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+            name: "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
             value: args
                 .userspace_wireguard_shutdown_timeout_seconds
                 .to_string(),
@@ -7257,60 +7277,60 @@ fn append_docker_relay_advertisement_environment(
 ) {
     if let Some(public_endpoint) = args.relay_public_endpoint.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_RELAY_PUBLIC_ENDPOINT".to_string(),
+            name: "HETERONETWORK_RELAY_PUBLIC_ENDPOINT".to_string(),
             value: public_endpoint.to_string(),
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT".to_string(),
+            name: "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT".to_string(),
             value: public_endpoint.to_string(),
         });
     }
     if let Some(admission_url) = args.relay_admission_url.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_RELAY_ADMISSION_URL".to_string(),
+            name: "HETERONETWORK_RELAY_ADMISSION_URL".to_string(),
             value: admission_url.to_string(),
         });
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_RELAY_ADMISSION_URL".to_string(),
+            name: "HETERONETWORK_AGENT_RELAY_ADMISSION_URL".to_string(),
             value: admission_url.to_string(),
         });
     }
     if let Some(status_url) = args.relay_status_url.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_RELAY_STATUS_URL".to_string(),
+            name: "HETERONETWORK_AGENT_RELAY_STATUS_URL".to_string(),
             value: status_url.to_string(),
         });
     }
     environment.push(InstallEnvironment {
-        name: "IPARS_RELAY_MAX_SESSIONS".to_string(),
+        name: "HETERONETWORK_RELAY_MAX_SESSIONS".to_string(),
         value: args.relay_max_sessions.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_MAX_SESSIONS".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_MAX_SESSIONS".to_string(),
         value: args.relay_max_sessions.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_RELAY_MAX_SESSIONS_PER_NODE".to_string(),
+        name: "HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE".to_string(),
         value: args.relay_max_sessions_per_node.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_RELAY_MAX_MBPS".to_string(),
+        name: "HETERONETWORK_RELAY_MAX_MBPS".to_string(),
         value: args.relay_max_mbps.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_MAX_MBPS".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_MAX_MBPS".to_string(),
         value: args.relay_max_mbps.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_RELAY_SESSION_TTL_SECONDS".to_string(),
+        name: "HETERONETWORK_RELAY_SESSION_TTL_SECONDS".to_string(),
         value: args.relay_session_ttl_seconds.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_RELAY_ADMISSION_RATE_LIMIT".to_string(),
+        name: "HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT".to_string(),
         value: args.relay_admission_rate_limit.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
+        name: "HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS".to_string(),
         value: args.relay_admission_rate_limit_window_seconds.to_string(),
     });
 }
@@ -7321,7 +7341,7 @@ fn append_docker_relay_forwarder_environment(
 ) {
     if let Some(endpoint) = args.relay_forwarder_endpoint.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
+            name: "HETERONETWORK_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
             value: endpoint.to_string(),
         });
     }
@@ -7329,39 +7349,39 @@ fn append_docker_relay_forwarder_environment(
         return;
     };
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_FORWARDER_BIND".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_FORWARDER_BIND".to_string(),
         value: bind.to_string(),
     });
     if let Some(wireguard_endpoint) = args.relay_forwarder_wireguard_endpoint.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
+            name: "HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
             value: wireguard_endpoint.to_string(),
         });
     }
     if let Some(namespace) = args.relay_forwarder_netns.as_deref() {
         environment.push(InstallEnvironment {
-            name: "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+            name: "HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS".to_string(),
             value: namespace.to_string(),
         });
     }
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
         value: args.relay_forwarder_max_sessions.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
         value: args.relay_forwarder_restart_backoff_seconds.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
         value: args.relay_forwarder_crash_window_seconds.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
         value: args.relay_forwarder_max_crashes_per_window.to_string(),
     });
     environment.push(InstallEnvironment {
-        name: "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
+        name: "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
         value: args.relay_forwarder_crash_cooldown_seconds.to_string(),
     });
 }
@@ -9036,7 +9056,7 @@ fn validate_kubernetes_path_not_sensitive(
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
     {
         return Err(format!(
-            "{label} `{path}` must not be a sensitive system path; choose a dedicated IPARS state directory such as /var/lib/ipars or /opt/ipars/state"
+            "{label} `{path}` must not be a sensitive system path; choose a dedicated HeteroNetwork state directory such as /var/lib/heteronetwork or /opt/heteronetwork/state"
         ));
     }
     Ok(())
@@ -12184,8 +12204,8 @@ if test "${PATH:-}" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
    test "${LANG:-}" = "C" &&
    test "${LC_ALL:-}" = "C" &&
    test -z "${HOME+x}" &&
-   test -z "${IPARS_ISSUER_PRIVATE_KEY+x}" &&
-   test -z "${IPARS_ISSUER_PRIVATE_KEY_PATH+x}" &&
+   test -z "${HETERONETWORK_ISSUER_PRIVATE_KEY+x}" &&
+   test -z "${HETERONETWORK_ISSUER_PRIVATE_KEY_PATH+x}" &&
    test -z "${LD_PRELOAD+x}"; then
     printf 'ok\n' > "$1"
 else
@@ -12194,8 +12214,8 @@ else
         printf 'LANG=%s\n' "${LANG-<unset>}"
         printf 'LC_ALL=%s\n' "${LC_ALL-<unset>}"
         printf 'HOME=%s\n' "${HOME-<unset>}"
-        printf 'IPARS_ISSUER_PRIVATE_KEY=%s\n' "${IPARS_ISSUER_PRIVATE_KEY-<unset>}"
-        printf 'IPARS_ISSUER_PRIVATE_KEY_PATH=%s\n' "${IPARS_ISSUER_PRIVATE_KEY_PATH-<unset>}"
+        printf 'HETERONETWORK_ISSUER_PRIVATE_KEY=%s\n' "${HETERONETWORK_ISSUER_PRIVATE_KEY-<unset>}"
+        printf 'HETERONETWORK_ISSUER_PRIVATE_KEY_PATH=%s\n' "${HETERONETWORK_ISSUER_PRIVATE_KEY_PATH-<unset>}"
         printf 'LD_PRELOAD=%s\n' "${LD_PRELOAD-<unset>}"
     } > "$1"
     exit 1
@@ -12204,8 +12224,8 @@ fi
         let mut command = ProcessCommand::new("/bin/sh");
         command
             .env("HOME", "/tmp/ipars-parent-home")
-            .env("IPARS_ISSUER_PRIVATE_KEY", "secret-signing-key")
-            .env("IPARS_ISSUER_PRIVATE_KEY_PATH", "/tmp/issuer.key")
+            .env("HETERONETWORK_ISSUER_PRIVATE_KEY", "secret-signing-key")
+            .env("HETERONETWORK_ISSUER_PRIVATE_KEY_PATH", "/tmp/issuer.key")
             .env("LD_PRELOAD", "/tmp/injected.so");
         configure_init_daemon_process(&mut command);
         let status = command
@@ -13444,50 +13464,54 @@ fi
             .any(|requirement| requirement.contains("net.ipv4.ip_forward")));
         assert!(plan.prerequisites.iter().any(|requirement| {
             requirement.contains("docker/signal-operator-api.token")
-                && requirement.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
+                && requirement.contains("HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
         }));
         assert!(plan.prerequisites.iter().any(|requirement| {
             requirement.contains("docker/stun-operator-api.token")
-                && requirement.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE")
+                && requirement.contains("HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_FILE")
         }));
         assert!(plan.prerequisites.iter().any(|requirement| {
             requirement.contains("docker/relay-operator-api.token")
-                && requirement.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE")
+                && requirement.contains("HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_FILE")
         }));
         assert!(plan.prerequisites.iter().any(|requirement| {
             requirement.contains("docker/relay-admission.token")
-                && requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE")
+                && requirement.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE")
         }));
         assert!(plan.environment.iter().any(|environment| {
-            environment.name == "IPARS_AGENT_APPLY_DOCKER_ROUTES" && environment.value == "true"
+            environment.name == "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES"
+                && environment.value == "true"
         }));
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_EXPOSE_HOST_ROUTES"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES"),
             Some("true")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS"),
             Some("60")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
+            environment_value(&plan, "HETERONETWORK_AGENT_ROUTE_BACKEND"),
             Some("command")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_STUN_ALTERNATE_LISTEN"),
+            environment_value(&plan, "HETERONETWORK_STUN_ALTERNATE_LISTEN"),
             Some(DEFAULT_STUN_ALTERNATE_LISTEN)
         );
-        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET"),
             None
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET_HOST"),
+            None
+        );
+        assert_eq!(
+            environment_value(&plan, "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE"),
             Some("compose-default")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_CONTAINER_CIDRS"),
             Some("172.18.0.0/16")
         );
         assert!(plan
@@ -13495,7 +13519,7 @@ fi
             .iter()
             .any(|requirement| requirement.contains("plain HTTP")));
         assert!(plan.security.iter().any(|requirement| {
-            requirement.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE")
+            requirement.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE")
                 && requirement.contains("rotate it independently")
         }));
         assert!(plan
@@ -13503,7 +13527,8 @@ fi
             .iter()
             .any(|note| note.contains("healthchecks") && note.contains("loopback URLs")));
         assert!(plan.notes.iter().any(|note| {
-            note.contains("IPARS_STUN_ALTERNATE_LISTEN") && note.contains("alternate UDP port")
+            note.contains("HETERONETWORK_STUN_ALTERNATE_LISTEN")
+                && note.contains("alternate UDP port")
         }));
         assert!(plan
             .notes
@@ -13526,33 +13551,33 @@ fi
                 && note.contains("shared file-backed admission credential")
         }));
         assert!(plan.security.iter().any(|requirement| {
-            requirement.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
+            requirement.contains("HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE")
                 && requirement.contains("control-plane operator credential")
         }));
         assert!(plan.security.iter().any(|requirement| {
-            requirement.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE")
+            requirement.contains("HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_FILE")
                 && requirement.contains("UDP Binding service")
         }));
         assert!(plan.security.iter().any(|requirement| {
-            requirement.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE")
+            requirement.contains("HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_FILE")
                 && requirement.contains("relay admission credential")
         }));
         assert!(plan.notes.iter().any(|note| {
-            note.contains("IPARS_RELAY_PUBLIC_ENDPOINT")
-                && note.contains("IPARS_RELAY_ADMISSION_URL")
-                && note.contains("IPARS_AGENT_RELAY_PUBLIC_ENDPOINT")
-                && note.contains("IPARS_AGENT_RELAY_ADMISSION_URL")
+            note.contains("HETERONETWORK_RELAY_PUBLIC_ENDPOINT")
+                && note.contains("HETERONETWORK_RELAY_ADMISSION_URL")
+                && note.contains("HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT")
+                && note.contains("HETERONETWORK_AGENT_RELAY_ADMISSION_URL")
         }));
         assert!(plan.notes.iter().any(|note| {
-            note.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")
-                && note.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
-                && note.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE")
-                && note.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT")
+            note.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+                && note.contains("HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+                && note.contains("HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE")
+                && note.contains("HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT")
         }));
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("IPARS_AGENT_RELAY_FORWARDER_*")));
+            .any(|note| note.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_*")));
         Ok(())
     }
 
@@ -13629,11 +13654,11 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_EXPOSE_HOST_ROUTES"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES"),
             Some("false")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS"),
             Some("15")
         );
 
@@ -13661,11 +13686,11 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS"),
             Some("7")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS"),
             Some("45")
         );
 
@@ -13701,11 +13726,17 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS"
+            ),
             Some("90")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS"
+            ),
             Some("240")
         );
 
@@ -13770,19 +13801,31 @@ fi
             ..docker_install_test_args()
         })?;
         for (name, expected) in [
-            ("IPARS_AGENT_DISABLE_PEER_PROBE", "false"),
-            ("IPARS_AGENT_PEER_PROBE_PORT", "51900"),
-            ("IPARS_AGENT_PEER_PROBE_INTERVAL_SECONDS", "45"),
-            ("IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
-            ("IPARS_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS", "750"),
-            ("IPARS_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS", "25"),
-            ("IPARS_AGENT_PEER_PROBE_MAX_CONCURRENCY", "8"),
+            ("HETERONETWORK_AGENT_DISABLE_PEER_PROBE", "false"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_PORT", "51900"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_INTERVAL_SECONDS", "45"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
             (
-                "IPARS_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND",
+                "HETERONETWORK_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS",
+                "750",
+            ),
+            (
+                "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS",
+                "25",
+            ),
+            ("HETERONETWORK_AGENT_PEER_PROBE_MAX_CONCURRENCY", "8"),
+            (
+                "HETERONETWORK_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND",
                 "200",
             ),
-            ("IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS", "90"),
-            ("IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS", "90"),
+            (
+                "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS",
+                "90",
+            ),
+            (
+                "HETERONETWORK_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS",
+                "90",
+            ),
         ] {
             assert_eq!(environment_value(&plan, name), Some(expected));
         }
@@ -13793,7 +13836,7 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&rootless, "IPARS_AGENT_DISABLE_PEER_PROBE"),
+            environment_value(&rootless, "HETERONETWORK_AGENT_DISABLE_PEER_PROBE"),
             Some("false")
         );
 
@@ -13872,7 +13915,7 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_ROUTE_BACKEND"),
+            environment_value(&plan, "HETERONETWORK_AGENT_ROUTE_BACKEND"),
             Some("kernel-netlink")
         );
         assert!(
@@ -13890,7 +13933,7 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RUNTIME_BACKEND"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RUNTIME_BACKEND"),
             Some("dry-run")
         );
         assert!(Cli::try_parse_from([
@@ -13907,11 +13950,11 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&rootless, "IPARS_AGENT_RUNTIME_BACKEND"),
+            environment_value(&rootless, "HETERONETWORK_AGENT_RUNTIME_BACKEND"),
             Some("linux-command")
         );
         assert_eq!(
-            environment_value(&rootless, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            environment_value(&rootless, "HETERONETWORK_AGENT_WIREGUARD_BACKEND"),
             Some("userspace-boringtun")
         );
         assert!(rootless.commands[0].contains("-f docker/compose.rootless-dataplane.yaml"));
@@ -13922,11 +13965,11 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&rootless_dry_run, "IPARS_AGENT_RUNTIME_BACKEND"),
+            environment_value(&rootless_dry_run, "HETERONETWORK_AGENT_RUNTIME_BACKEND"),
             Some("dry-run")
         );
         assert_eq!(
-            environment_value(&rootless_dry_run, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            environment_value(&rootless_dry_run, "HETERONETWORK_AGENT_WIREGUARD_BACKEND"),
             Some("command")
         );
         assert!(!rootless_dry_run.commands[0].contains("rootless-dataplane"));
@@ -13949,55 +13992,58 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_PUBLIC_ENDPOINT"),
+            environment_value(&plan, "HETERONETWORK_RELAY_PUBLIC_ENDPOINT"),
             Some("203.0.113.30:51820")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT"),
             Some("203.0.113.30:51820")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_ADMISSION_URL"),
+            environment_value(&plan, "HETERONETWORK_RELAY_ADMISSION_URL"),
             Some("https://relay.example.com:9580")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_ADMISSION_URL"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_ADMISSION_URL"),
             Some("https://relay.example.com:9580")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_STATUS_URL"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_STATUS_URL"),
             Some("https://relay.example.com:9580")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_MAX_SESSIONS"),
+            environment_value(&plan, "HETERONETWORK_RELAY_MAX_SESSIONS"),
             Some("250")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_MAX_SESSIONS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_MAX_SESSIONS"),
             Some("250")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_MAX_SESSIONS_PER_NODE"),
+            environment_value(&plan, "HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE"),
             Some("25")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_MAX_MBPS"),
+            environment_value(&plan, "HETERONETWORK_RELAY_MAX_MBPS"),
             Some("750")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_MAX_MBPS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_MAX_MBPS"),
             Some("750")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_SESSION_TTL_SECONDS"),
+            environment_value(&plan, "HETERONETWORK_RELAY_SESSION_TTL_SECONDS"),
             Some("900")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_ADMISSION_RATE_LIMIT"),
+            environment_value(&plan, "HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT"),
             Some("123")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
+            ),
             Some("30")
         );
         assert!(plan.notes.iter().any(|note| {
@@ -14098,15 +14144,21 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"),
+            environment_value(
+                &endpoint_only,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_ENDPOINT"
+            ),
             Some("127.0.0.1:45182")
         );
         assert_eq!(
-            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_BIND"),
+            environment_value(&endpoint_only, "HETERONETWORK_AGENT_RELAY_FORWARDER_BIND"),
             None
         );
         assert_eq!(
-            environment_value(&endpoint_only, "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
+            environment_value(
+                &endpoint_only,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS"
+            ),
             None
         );
 
@@ -14123,35 +14175,50 @@ fi
             ..docker_install_test_args()
         })?;
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_BIND"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_FORWARDER_BIND"),
             Some("0.0.0.0:45182")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"
+            ),
             Some("127.0.0.1:51820")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_NETNS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS"),
             Some("relay-fw")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS"),
             Some("7")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS"
+            ),
             Some("11")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"
+            ),
             Some("22")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"
+            ),
             Some("4")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"),
+            environment_value(
+                &plan,
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"
+            ),
             Some("33")
         );
         assert!(plan
@@ -14161,7 +14228,7 @@ fi
         assert!(plan
             .notes
             .iter()
-            .any(|note| note.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS")));
+            .any(|note| note.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS")));
 
         let invalid_endpoint = match docker_install_plan(DockerInstallArgs {
             relay_forwarder_endpoint: Some("0.0.0.0:45182".to_string()),
@@ -14276,59 +14343,65 @@ fi
             .iter()
             .any(|requirement| requirement.contains("Docker API access")));
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_APPLY_DOCKER_ROUTES"),
+            environment_value(&plan, "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES"),
             Some("false")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_DISCOVER_NETWORKS"),
-            None
-        );
-        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
-        assert_eq!(environment_value(&plan, "IPARS_DOCKER_NETWORKS"), None);
-        assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_DISCOVER_NETWORKS"),
             None
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_WIREGUARD_BACKEND"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET"),
+            None
+        );
+        assert_eq!(
+            environment_value(&plan, "HETERONETWORK_DOCKER_NETWORKS"),
+            None
+        );
+        assert_eq!(
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET_HOST"),
+            None
+        );
+        assert_eq!(
+            environment_value(&plan, "HETERONETWORK_AGENT_WIREGUARD_BACKEND"),
             Some("command")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_RUNTIME_BACKEND"),
+            environment_value(&plan, "HETERONETWORK_AGENT_RUNTIME_BACKEND"),
             Some("dry-run")
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"),
+            environment_value(&plan, "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND"),
             None
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"),
+            environment_value(&plan, "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS"),
             None
         );
         assert_eq!(
             environment_value(
                 &plan,
-                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"
             ),
             None
         );
         assert_eq!(
             environment_value(
                 &plan,
-                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"
             ),
             None
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_CONTAINER_NAMESPACE"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE"),
             None
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_HOST_INTERFACE"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_HOST_INTERFACE"),
             None
         );
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_CONTAINER_CIDRS"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_CONTAINER_CIDRS"),
             None
         );
         assert_eq!(
@@ -14427,179 +14500,195 @@ fi
         let rootless_discovery = std::fs::read_to_string(rootless_discovery_path)?;
 
         assert!(compose
-            .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-false}"));
+            .contains("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES=${HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES:-false}"));
         assert!(compose
-            .contains("IPARS_AGENT_WIREGUARD_BACKEND=${IPARS_AGENT_WIREGUARD_BACKEND:-command}"));
-        assert!(compose.contains("IPARS_AGENT_ROUTE_BACKEND=${IPARS_AGENT_ROUTE_BACKEND:-command}"));
-        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
-        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_ARGS"));
-        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
-        assert!(compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS"));
+            .contains("HETERONETWORK_AGENT_WIREGUARD_BACKEND=${HETERONETWORK_AGENT_WIREGUARD_BACKEND:-command}"));
         assert!(compose.contains(
-            "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS=${IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS:-120}"
+            "HETERONETWORK_AGENT_ROUTE_BACKEND=${HETERONETWORK_AGENT_ROUTE_BACKEND:-command}"
+        ));
+        assert!(compose.contains("HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND"));
+        assert!(compose.contains("HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS"));
+        assert!(compose.contains("HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
+        assert!(
+            compose.contains("HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS")
+        );
+        assert!(compose.contains(
+            "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS=${HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS:-120}"
         ));
         assert!(compose.contains(
-            "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS=${IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS:-180}"
+            "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS=${HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS:-180}"
         ));
         assert!(compose
-            .contains("IPARS_DOCKER_DISCOVER_NETWORKS=${IPARS_DOCKER_DISCOVER_NETWORKS:-false}"));
-        assert!(compose.contains("IPARS_DOCKER_API_URL"));
-        assert!(compose.contains("IPARS_DOCKER_API_CA_CERT_PATH"));
-        assert!(!compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
-        assert!(compose.contains("IPARS_DOCKER_NETWORKS"));
-        assert!(compose.contains("IPARS_DOCKER_CONTAINER_NAMESPACE"));
-        assert!(compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
+            .contains("HETERONETWORK_DOCKER_DISCOVER_NETWORKS=${HETERONETWORK_DOCKER_DISCOVER_NETWORKS:-false}"));
+        assert!(compose.contains("HETERONETWORK_DOCKER_API_URL"));
+        assert!(compose.contains("HETERONETWORK_DOCKER_API_CA_CERT_PATH"));
+        assert!(!compose.contains("HETERONETWORK_DOCKER_API_SOCKET=/run/heteronetwork/docker.sock"));
+        assert!(compose.contains("HETERONETWORK_DOCKER_NETWORKS"));
+        assert!(compose.contains("HETERONETWORK_DOCKER_CONTAINER_NAMESPACE"));
+        assert!(compose.contains("HETERONETWORK_DOCKER_CONTAINER_CIDRS"));
         assert!(compose
-            .contains("IPARS_DOCKER_EXPOSE_HOST_ROUTES=${IPARS_DOCKER_EXPOSE_HOST_ROUTES:-true}"));
+            .contains("HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES=${HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES:-true}"));
         assert!(compose.contains(
-            "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS=${IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:-60}"
+            "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS=${HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS:-60}"
         ));
         assert!(compose.contains(
-            "IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
+            "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/heteronetwork-relay-admission-bearer-token"
         ));
         assert!(compose.contains(
-            "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
+            "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/heteronetwork-relay-admission-bearer-token"
         ));
-        assert!(compose.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE"));
-        assert!(compose.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"));
-        assert!(compose.contains("ipars-control-plane-operator-api-bearer-token"));
-        assert!(compose.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE"));
-        assert!(compose.contains("IPARS_RELAY_PUBLIC_ENDPOINT"));
-        assert!(compose.contains("IPARS_RELAY_ADMISSION_URL"));
+        assert!(compose.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE"));
+        assert!(compose.contains("HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"));
+        assert!(compose.contains("heteronetwork-control-plane-operator-api-bearer-token"));
+        assert!(compose.contains("HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE"));
+        assert!(compose.contains("HETERONETWORK_RELAY_PUBLIC_ENDPOINT"));
+        assert!(compose.contains("HETERONETWORK_RELAY_ADMISSION_URL"));
         assert!(compose.contains(
-            "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
-        ));
-        assert!(compose.contains(
-            "IPARS_AGENT_RELAY_ADMISSION_URL=${IPARS_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
+            "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT=${HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
         ));
         assert!(compose.contains(
-            "IPARS_AGENT_RELAY_STATUS_URL=${IPARS_AGENT_RELAY_STATUS_URL:-http://127.0.0.1:9580}"
+            "HETERONETWORK_AGENT_RELAY_ADMISSION_URL=${HETERONETWORK_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
         ));
-        assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS=${IPARS_RELAY_MAX_SESSIONS:-10000}"));
+        assert!(compose.contains(
+            "HETERONETWORK_AGENT_RELAY_STATUS_URL=${HETERONETWORK_AGENT_RELAY_STATUS_URL:-http://127.0.0.1:9580}"
+        ));
+        assert!(compose.contains(
+            "HETERONETWORK_RELAY_MAX_SESSIONS=${HETERONETWORK_RELAY_MAX_SESSIONS:-10000}"
+        ));
         assert!(compose
-            .contains("IPARS_AGENT_RELAY_MAX_SESSIONS=${IPARS_AGENT_RELAY_MAX_SESSIONS:-10000}"));
-        assert!(compose.contains("IPARS_RELAY_MAX_MBPS=${IPARS_RELAY_MAX_MBPS:-1000}"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_MAX_MBPS=${IPARS_AGENT_RELAY_MAX_MBPS:-1000}"));
-        assert!(compose.contains("IPARS_RELAY_MAX_SESSIONS_PER_NODE"));
+            .contains("HETERONETWORK_AGENT_RELAY_MAX_SESSIONS=${HETERONETWORK_AGENT_RELAY_MAX_SESSIONS:-10000}"));
+        assert!(
+            compose.contains("HETERONETWORK_RELAY_MAX_MBPS=${HETERONETWORK_RELAY_MAX_MBPS:-1000}")
+        );
+        assert!(compose.contains(
+            "HETERONETWORK_AGENT_RELAY_MAX_MBPS=${HETERONETWORK_AGENT_RELAY_MAX_MBPS:-1000}"
+        ));
+        assert!(compose.contains("HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE"));
         assert!(compose
-            .contains("IPARS_RELAY_SESSION_TTL_SECONDS=${IPARS_RELAY_SESSION_TTL_SECONDS:-300}"));
-        assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT"));
-        assert!(compose.contains("IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS"));
+            .contains("HETERONETWORK_RELAY_SESSION_TTL_SECONDS=${HETERONETWORK_RELAY_SESSION_TTL_SECONDS:-300}"));
+        assert!(compose.contains("HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT"));
+        assert!(compose.contains("HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS"));
         assert!(compose
-            .contains("IPARS_STUN_ALTERNATE_LISTEN: ${IPARS_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"));
+            .contains("HETERONETWORK_STUN_ALTERNATE_LISTEN: ${HETERONETWORK_STUN_ALTERNATE_LISTEN:-0.0.0.0:3480}"));
         assert!(compose.contains("\"3480:3480/udp\""));
         assert!(compose.contains("--http-listen"));
         assert!(compose.contains("0.0.0.0:3479"));
         assert!(compose.contains("127.0.0.1:3479/healthz"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_BIND"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_ENDPOINT"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_BIND"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS"));
         assert!(compose.contains(
-            "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS=${IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS:-1024}"
+            "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS=${HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS:-1024}"
         ));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"));
-        assert!(compose.contains("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW"));
+        assert!(compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS"));
         assert!(!compose.contains(
-            "${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/ipars/docker.sock:ro"
+            "${HETERONETWORK_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}:/run/heteronetwork/docker.sock:ro"
         ));
-        assert!(discovery_compose.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock"));
+        assert!(discovery_compose
+            .contains("HETERONETWORK_DOCKER_API_SOCKET=/run/heteronetwork/docker.sock"));
         assert!(discovery_compose.contains("type: bind"));
         assert!(discovery_compose
-            .contains("source: ${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}"));
-        assert!(discovery_compose.contains("target: /run/ipars/docker.sock"));
+            .contains("source: ${HETERONETWORK_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}"));
+        assert!(discovery_compose.contains("target: /run/heteronetwork/docker.sock"));
         assert!(discovery_compose.contains("read_only: true"));
         assert!(discovery_compose.contains("create_host_path: false"));
-        assert!(remote_ca_compose
-            .contains("IPARS_DOCKER_API_CA_CERT_PATH=/run/ipars/docker-api-ca.crt"));
         assert!(remote_ca_compose.contains(
-            "source: ${IPARS_DOCKER_API_CA_CERT_PATH_HOST:?set IPARS_DOCKER_API_CA_CERT_PATH_HOST}"
+            "HETERONETWORK_DOCKER_API_CA_CERT_PATH=/run/heteronetwork/docker-api-ca.crt"
         ));
-        assert!(remote_ca_compose.contains("target: /run/ipars/docker-api-ca.crt"));
+        assert!(remote_ca_compose.contains(
+            "source: ${HETERONETWORK_DOCKER_API_CA_CERT_PATH_HOST:?set HETERONETWORK_DOCKER_API_CA_CERT_PATH_HOST}"
+        ));
+        assert!(remote_ca_compose.contains("target: /run/heteronetwork/docker-api-ca.crt"));
         assert!(remote_ca_compose.contains("read_only: true"));
         assert!(remote_ca_compose.contains("create_host_path: false"));
-        assert!(
-            rootless_docker_discovery.contains("IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock")
-        );
+        assert!(rootless_docker_discovery
+            .contains("HETERONETWORK_DOCKER_API_SOCKET=/run/heteronetwork/docker.sock"));
         assert!(rootless_docker_discovery.contains(
-            "${IPARS_DOCKER_API_SOCKET_HOST:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/docker.sock}"
+            "${HETERONETWORK_DOCKER_API_SOCKET_HOST:-${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/docker.sock}"
         ));
         assert!(rootless_docker_discovery.contains("read_only: true"));
         assert!(rootless_docker_discovery.contains("create_host_path: false"));
         assert!(rootless_compose.contains("cap_add: !reset []"));
         assert!(rootless_compose.contains("devices: !reset []"));
         assert!(rootless_compose.contains("environment: !override"));
-        assert!(rootless_compose.contains("IPARS_AGENT_RUNTIME_BACKEND=dry-run"));
+        assert!(rootless_compose.contains("HETERONETWORK_AGENT_RUNTIME_BACKEND=dry-run"));
         assert!(rootless_compose.contains(
-            "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS=${IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS:-5}"
+            "HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS=${HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS:-5}"
         ));
         assert!(rootless_compose.contains(
-            "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS=${IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS:-120}"
+            "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS=${HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS:-120}"
         ));
-        assert!(rootless_compose.contains("IPARS_AGENT_DISABLE_PEER_PROBE=true"));
-        assert!(rootless_compose
-            .contains("IPARS_AGENT_PEER_PROBE_PORT=${IPARS_AGENT_PEER_PROBE_PORT:-51822}"));
+        assert!(rootless_compose.contains("HETERONETWORK_AGENT_DISABLE_PEER_PROBE=true"));
         assert!(rootless_compose.contains(
-            "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS=${IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS:-120}"
+            "HETERONETWORK_AGENT_PEER_PROBE_PORT=${HETERONETWORK_AGENT_PEER_PROBE_PORT:-51822}"
         ));
         assert!(rootless_compose.contains(
-            "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/ipars-relay-admission-bearer-token"
-        ));
-        assert!(rootless_compose.contains("IPARS_AGENT_WIREGUARD_BACKEND=command"));
-        assert!(rootless_compose.contains("IPARS_AGENT_ROUTE_BACKEND=command"));
-        assert!(rootless_compose.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=false"));
-        assert!(rootless_compose.contains("IPARS_DOCKER_DISCOVER_NETWORKS=false"));
-        assert!(!rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND"));
-        assert!(!rootless_compose.contains("IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
-        assert!(!rootless_compose.contains("IPARS_DOCKER_NETWORKS"));
-        assert!(!rootless_compose.contains("IPARS_DOCKER_CONTAINER_CIDRS"));
-        assert!(!rootless_compose.contains("IPARS_DOCKER_API_SOCKET"));
-        assert!(!rootless_compose.contains("IPARS_AGENT_RELAY_FORWARDER_"));
-        assert!(rootless_compose.contains(
-            "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
+            "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS=${HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS:-120}"
         ));
         assert!(rootless_compose.contains(
-            "IPARS_AGENT_RELAY_ADMISSION_URL=${IPARS_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
+            "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/run/secrets/heteronetwork-relay-admission-bearer-token"
         ));
-        assert!(!rootless_compose.contains("IPARS_AGENT_RELAY_FORWARDER_NETNS"));
+        assert!(rootless_compose.contains("HETERONETWORK_AGENT_WIREGUARD_BACKEND=command"));
+        assert!(rootless_compose.contains("HETERONETWORK_AGENT_ROUTE_BACKEND=command"));
+        assert!(rootless_compose.contains("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES=false"));
+        assert!(rootless_compose.contains("HETERONETWORK_DOCKER_DISCOVER_NETWORKS=false"));
+        assert!(!rootless_compose.contains("HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND"));
+        assert!(!rootless_compose
+            .contains("HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS"));
+        assert!(!rootless_compose.contains("HETERONETWORK_DOCKER_NETWORKS"));
+        assert!(!rootless_compose.contains("HETERONETWORK_DOCKER_CONTAINER_CIDRS"));
+        assert!(!rootless_compose.contains("HETERONETWORK_DOCKER_API_SOCKET"));
+        assert!(!rootless_compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_"));
+        assert!(rootless_compose.contains(
+            "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT=${HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT:-127.0.0.1:51820}"
+        ));
+        assert!(rootless_compose.contains(
+            "HETERONETWORK_AGENT_RELAY_ADMISSION_URL=${HETERONETWORK_AGENT_RELAY_ADMISSION_URL:-http://127.0.0.1:9580}"
+        ));
+        assert!(!rootless_compose.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS"));
         assert!(rootless_dataplane.contains("- NET_ADMIN"));
         assert!(rootless_dataplane.contains("/dev/net/tun:/dev/net/tun"));
-        assert!(rootless_dataplane.contains("IPARS_AGENT_WIREGUARD_BACKEND=userspace-boringtun"));
-        assert!(rootless_dataplane.contains("IPARS_AGENT_RUNTIME_BACKEND=linux-command"));
-        assert!(rootless_dataplane.contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=false"));
-        assert!(rootless_dataplane.contains("IPARS_DOCKER_DISCOVER_NETWORKS=false"));
+        assert!(rootless_dataplane
+            .contains("HETERONETWORK_AGENT_WIREGUARD_BACKEND=userspace-boringtun"));
+        assert!(rootless_dataplane.contains("HETERONETWORK_AGENT_RUNTIME_BACKEND=linux-command"));
+        assert!(rootless_dataplane.contains("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES=false"));
+        assert!(rootless_dataplane.contains("HETERONETWORK_DOCKER_DISCOVER_NETWORKS=false"));
         assert!(rootless_route_provider.contains("network_mode: !reset null"));
         assert!(rootless_route_provider.contains("command: !override"));
         assert!(rootless_route_provider
-            .contains("IPARS_AGENT_APPLY_DOCKER_ROUTES=${IPARS_AGENT_APPLY_DOCKER_ROUTES:-true}"));
-        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_API_URL\n"));
-        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_API_CA_CERT_PATH\n"));
-        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_NETWORKS\n"));
-        assert!(rootless_route_provider.contains("      - IPARS_DOCKER_CONTAINER_CIDRS\n"));
-        assert!(rootless_route_provider.contains("${IPARS_ROOTLESS_STUN_SERVER:-127.0.0.1:3478}"));
+            .contains("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES=${HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES:-true}"));
+        assert!(rootless_route_provider.contains("      - HETERONETWORK_DOCKER_API_URL\n"));
+        assert!(rootless_route_provider.contains("      - HETERONETWORK_DOCKER_API_CA_CERT_PATH\n"));
+        assert!(rootless_route_provider.contains("      - HETERONETWORK_DOCKER_NETWORKS\n"));
+        assert!(rootless_route_provider.contains("      - HETERONETWORK_DOCKER_CONTAINER_CIDRS\n"));
+        assert!(rootless_route_provider
+            .contains("${HETERONETWORK_ROOTLESS_STUN_SERVER:-127.0.0.1:3478}"));
         assert!(rootless_route_provider.contains(
-            "IPARS_AGENT_CONTROL_PLANE_URL=${IPARS_ROOTLESS_CONTROL_PLANE_URL:-http://control-plane:8443}"
+            "HETERONETWORK_AGENT_CONTROL_PLANE_URL=${HETERONETWORK_ROOTLESS_CONTROL_PLANE_URL:-http://control-plane:8443}"
         ));
         assert!(rootless_route_provider
-            .contains("IPARS_AGENT_SIGNAL_URL=${IPARS_ROOTLESS_SIGNAL_URL:-http://signal:9443}"));
+            .contains("HETERONETWORK_AGENT_SIGNAL_URL=${HETERONETWORK_ROOTLESS_SIGNAL_URL:-http://signal:9443}"));
         assert!(rootless_route_provider.contains("network_mode: service:agent"));
         assert!(rootless_route_provider.contains(
-            "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT=${IPARS_AGENT_RELAY_PUBLIC_ENDPOINT:-172.31.254.5:51820}"
+            "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT=${HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT:-172.31.254.5:51820}"
         ));
         assert!(rootless_route_provider
-            .contains("ipv4_address: ${IPARS_ROOTLESS_RELAY_ADDRESS:-172.31.254.5}"));
-        assert!(rootless_route_provider.contains("${IPARS_ROOTLESS_AGENT_HTTP_PORT:-9780}:9780"));
+            .contains("ipv4_address: ${HETERONETWORK_ROOTLESS_RELAY_ADDRESS:-172.31.254.5}"));
+        assert!(rootless_route_provider
+            .contains("${HETERONETWORK_ROOTLESS_AGENT_HTTP_PORT:-9780}:9780"));
         assert!(rootless_route_provider.contains(
-            "name: ${IPARS_ROOTLESS_WORKLOAD_NETWORK:?set IPARS_ROOTLESS_WORKLOAD_NETWORK}"
+            "name: ${HETERONETWORK_ROOTLESS_WORKLOAD_NETWORK:?set HETERONETWORK_ROOTLESS_WORKLOAD_NETWORK}"
         ));
         assert!(rootless_route_provider.contains("external: true"));
-        assert!(rootless_discovery.contains("IPARS_DOCKER_DISCOVER_NETWORKS: \"true\""));
-        assert!(rootless_discovery.contains("IPARS_DOCKER_CONTAINER_CIDRS: !reset null"));
+        assert!(rootless_discovery.contains("HETERONETWORK_DOCKER_DISCOVER_NETWORKS: \"true\""));
+        assert!(rootless_discovery.contains("HETERONETWORK_DOCKER_CONTAINER_CIDRS: !reset null"));
         assert!(rootless_discovery
-            .contains("${IPARS_ROOTLESS_DOCKER_NETWORK_A:?set IPARS_ROOTLESS_DOCKER_NETWORK_A}"));
+            .contains("${HETERONETWORK_ROOTLESS_DOCKER_NETWORK_A:?set HETERONETWORK_ROOTLESS_DOCKER_NETWORK_A}"));
         assert!(rootless_discovery
-            .contains("${IPARS_ROOTLESS_DOCKER_NETWORK_B:?set IPARS_ROOTLESS_DOCKER_NETWORK_B}"));
+            .contains("${HETERONETWORK_ROOTLESS_DOCKER_NETWORK_B:?set HETERONETWORK_ROOTLESS_DOCKER_NETWORK_B}"));
         Ok(())
     }
 
@@ -14655,10 +14744,10 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET_HOST"),
             Some("/run/user/1000/docker.sock")
         );
-        assert!(plan.commands[0].contains("IPARS_DOCKER_API_SOCKET_HOST"));
+        assert!(plan.commands[0].contains("HETERONETWORK_DOCKER_API_SOCKET_HOST"));
         assert!(plan.commands[0].contains("/run/user/1000/docker.sock"));
         assert!(plan.commands[0].contains("test ! -L \"$docker_socket\""));
         assert!(plan.commands[0].contains("test -S \"$docker_socket\""));
@@ -14681,12 +14770,15 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_URL"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_URL"),
             Some("https://docker.example:2376/engine")
         );
-        assert_eq!(environment_value(&plan, "IPARS_DOCKER_API_SOCKET"), None);
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_API_SOCKET_HOST"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET"),
+            None
+        );
+        assert_eq!(
+            environment_value(&plan, "HETERONETWORK_DOCKER_API_SOCKET_HOST"),
             None
         );
         assert!(plan.commands[0].contains("docker_api_url=https://docker.example:2376/engine"));
@@ -14755,7 +14847,7 @@ fi
         })?;
 
         assert_eq!(
-            environment_value(&plan, "IPARS_DOCKER_NETWORKS"),
+            environment_value(&plan, "HETERONETWORK_DOCKER_NETWORKS"),
             Some("edge_default,edge_backend")
         );
         assert!(plan.commands[0].contains("docker_network=edge_default"));
@@ -15541,11 +15633,11 @@ fi
         assert!(route_provider.commands[1]
             .contains("-f docker/compose.rootless-route-provider.yaml config"));
         assert_eq!(
-            environment_value(&route_provider, "IPARS_AGENT_APPLY_DOCKER_ROUTES"),
+            environment_value(&route_provider, "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES"),
             Some("true")
         );
         assert_eq!(
-            environment_value(&route_provider, "IPARS_ROOTLESS_WORKLOAD_NETWORK"),
+            environment_value(&route_provider, "HETERONETWORK_ROOTLESS_WORKLOAD_NETWORK"),
             Some("edge_workload")
         );
         assert!(route_provider.notes.iter().any(|note| {
@@ -15569,8 +15661,8 @@ fi
         assert!(socket_route_provider.commands[2]
             .contains("-f docker/compose.rootless-route-provider.yaml config"));
         assert_eq!(
-            environment_value(&socket_route_provider, "IPARS_DOCKER_API_SOCKET"),
-            Some("/run/ipars/docker.sock")
+            environment_value(&socket_route_provider, "HETERONETWORK_DOCKER_API_SOCKET"),
+            Some("/run/heteronetwork/docker.sock")
         );
 
         let dry_run = match docker_install_plan(DockerInstallArgs {
@@ -15809,7 +15901,7 @@ fi
             agent_api_port: Some(9781),
             agent_api_target_port: Some(9790),
             agent_api_node_port: Some(31080),
-            agent_api_app_protocol: Some("ipars.io/agent-http".to_string()),
+            agent_api_app_protocol: Some("heteronetwork.io/agent-http".to_string()),
             agent_api_publish_not_ready_addresses: true,
             agent_api_load_balancer_class: Some("example.com/internal-api".to_string()),
             agent_api_load_balancer_ip: Some("198.51.100.10".parse()?),
@@ -15839,7 +15931,7 @@ fi
             relay_http_target_port: Some(9580),
             relay_udp_node_port: Some(31820),
             relay_http_node_port: Some(31580),
-            relay_udp_app_protocol: Some("ipars.io/relay-udp".to_string()),
+            relay_udp_app_protocol: Some("heteronetwork.io/relay-udp".to_string()),
             relay_http_app_protocol: Some("http".to_string()),
             relay_publish_not_ready_addresses: true,
             relay_load_balancer_class: Some("example.com/internal-relay".to_string()),
@@ -15912,7 +16004,7 @@ fi
         assert!(plan.commands[2].contains("--set agent.apiService.targetPort=9790"));
         assert!(plan.commands[2].contains("--set agent.apiService.nodePort=31080"));
         assert!(plan.commands[2]
-            .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+            .contains("--set-string agent.apiService.appProtocol=heteronetwork.io/agent-http"));
         assert!(plan.commands[2].contains("--set agent.apiService.publishNotReadyAddresses=true"));
         assert!(plan.commands[2]
             .contains("--set-string agent.apiService.loadBalancerClass=example.com/internal-api"));
@@ -15961,7 +16053,7 @@ fi
         assert!(plan.commands[2].contains("--set agent.relayService.udpNodePort=31820"));
         assert!(plan.commands[2].contains("--set agent.relayService.httpNodePort=31580"));
         assert!(plan.commands[2]
-            .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
+            .contains("--set-string agent.relayService.udpAppProtocol=heteronetwork.io/relay-udp"));
         assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
         assert!(plan.commands[2].contains("--set agent.relayService.publishNotReadyAddresses=true"));
         assert!(plan.commands[2].contains(
@@ -16452,7 +16544,7 @@ fi
         agent_target_node_annotation.expose_agent_api = true;
         agent_target_node_annotation.agent_api_service_annotations = vec![KeyValueArg {
             key: "service.beta.kubernetes.io/aws-load-balancer-target-node-labels".to_string(),
-            value: "ipars.io/edge=true".to_string(),
+            value: "heteronetwork.io/edge=true".to_string(),
         }];
         let error = match k8s_install_plan(agent_target_node_annotation) {
             Ok(_) => panic!("agent API target-node annotation should be rejected"),
@@ -17152,10 +17244,10 @@ fi
         let service_template = std::fs::read_to_string(service_template_path)?;
         let network_policy_template = std::fs::read_to_string(network_policy_template_path)?;
 
-        assert!(helpers.contains("ipars.validateRestrictedCidr"));
-        assert!(helpers.contains("define \"ipars.validateCidrContainedBySourceRanges\""));
-        assert!(helpers.contains("define \"ipars.ipv6AddressNibbles\""));
-        assert!(helpers.contains("define \"ipars.ipv6CidrBits\""));
+        assert!(helpers.contains("heteronetwork.validateRestrictedCidr"));
+        assert!(helpers.contains("define \"heteronetwork.validateCidrContainedBySourceRanges\""));
+        assert!(helpers.contains("define \"heteronetwork.ipv6AddressNibbles\""));
+        assert!(helpers.contains("define \"heteronetwork.ipv6CidrBits\""));
         assert!(helpers.contains(
             "NetworkPolicy must not allow sources broader than the LoadBalancer source ranges"
         ));
@@ -17168,20 +17260,20 @@ fi
         assert!(helpers.contains("must not include multicast CIDRs"));
         assert!(helpers.contains("must not include broadcast CIDRs"));
         assert!(service_template.contains(
-            "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
+            "heteronetwork.validateRestrictedCidr\" (dict \"path\" \"agent.apiService.loadBalancerSourceRanges\""
         ));
         assert!(service_template
             .contains("agent.apiService.loadBalancerSourceRanges entry %q must not be repeated"));
         assert!(service_template.contains(
-            "ipars.validateRestrictedCidr\" (dict \"path\" \"agent.relayService.loadBalancerSourceRanges\""
+            "heteronetwork.validateRestrictedCidr\" (dict \"path\" \"agent.relayService.loadBalancerSourceRanges\""
         ));
         assert!(service_template
             .contains("agent.relayService.loadBalancerSourceRanges entry %q must not be repeated"));
         assert!(network_policy_template.contains(
-            "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
+            "heteronetwork.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
         assert!(network_policy_template.contains(
-            "ipars.validateCidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
+            "heteronetwork.validateCidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.agentApi.allowedCidrs\""
         ));
         assert!(network_policy_template
             .contains("\"sourcePath\" \"agent.apiService.loadBalancerSourceRanges\""));
@@ -17211,10 +17303,10 @@ fi
         );
         assert!(!network_policy_template.contains("port: 9780"));
         assert!(network_policy_template.contains(
-            "ipars.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
+            "heteronetwork.validateRestrictedCidr\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));
         assert!(network_policy_template.contains(
-            "ipars.validateCidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
+            "heteronetwork.validateCidrContainedBySourceRanges\" (dict \"path\" \"networkPolicy.relay.allowedCidrs\""
         ));
         assert!(network_policy_template
             .contains("\"sourcePath\" \"agent.relayService.loadBalancerSourceRanges\""));
@@ -17238,8 +17330,8 @@ fi
         let daemonset = std::fs::read_to_string(daemonset_path)?;
         let values = std::fs::read_to_string(values_path)?;
 
-        assert!(helpers.contains("define \"ipars.validateChartMetadata\""));
-        assert!(helpers.contains("define \"ipars.validateDnsLabelWithMax\""));
+        assert!(helpers.contains("define \"heteronetwork.validateChartMetadata\""));
+        assert!(helpers.contains("define \"heteronetwork.validateDnsLabelWithMax\""));
         assert!(helpers.contains("\"path\" \"Release.Name\""));
         assert!(helpers.contains("\"path\" \"Release.Namespace\""));
         assert!(helpers.contains("\"path\" \"nameOverride\""));
@@ -17258,9 +17350,9 @@ fi
         assert!(values.contains("schedulerName: \"\""));
         assert!(values.contains("runtimeClassName: \"\""));
         assert!(values.contains("topologySpreadConstraints: []"));
-        assert!(daemonset.contains("include \"ipars.validateChartMetadata\" ."));
-        assert!(helpers.contains("define \"ipars.validateNodeSelectorExpression\""));
-        assert!(helpers.contains("define \"ipars.validatePodAffinityTerm\""));
+        assert!(daemonset.contains("include \"heteronetwork.validateChartMetadata\" ."));
+        assert!(helpers.contains("define \"heteronetwork.validateNodeSelectorExpression\""));
+        assert!(helpers.contains("define \"heteronetwork.validatePodAffinityTerm\""));
         assert!(daemonset.contains("agent.nodeAffinity.required.matchExpressions[%d]"));
         assert!(daemonset.contains("agent.podAffinity.required[%d]"));
         assert!(daemonset.contains("podAntiAffinity:"));
@@ -17293,13 +17385,13 @@ fi
         assert!(service_template.matches(instance_label).count() >= 4);
         assert!(network_policy_template.matches(instance_label).count() >= 4);
         assert!(pdb.matches(instance_label).count() >= 2);
-        assert!(daemonset.contains("name: {{ include \"ipars.fullname\" . }}"));
-        assert!(service_template.contains("name: {{ include \"ipars.fullname\" . }}-agent"));
-        assert!(service_template.contains("name: {{ include \"ipars.fullname\" . }}-relay"));
-        assert!(
-            network_policy_template.contains("name: {{ include \"ipars.fullname\" . }}-agent-api")
-        );
-        assert!(network_policy_template.contains("name: {{ include \"ipars.fullname\" . }}-relay"));
+        assert!(daemonset.contains("name: {{ include \"heteronetwork.fullname\" . }}"));
+        assert!(service_template.contains("name: {{ include \"heteronetwork.fullname\" . }}-agent"));
+        assert!(service_template.contains("name: {{ include \"heteronetwork.fullname\" . }}-relay"));
+        assert!(network_policy_template
+            .contains("name: {{ include \"heteronetwork.fullname\" . }}-agent-api"));
+        assert!(network_policy_template
+            .contains("name: {{ include \"heteronetwork.fullname\" . }}-relay"));
         Ok(())
     }
 
@@ -17318,30 +17410,30 @@ fi
         let daemonset = std::fs::read_to_string(daemonset_path)?;
         let service_template = std::fs::read_to_string(service_template_path)?;
 
-        assert!(helpers.contains("define \"ipars.validateAnnotationValue\""));
-        assert!(helpers.contains("define \"ipars.validateServiceAnnotationKey\""));
+        assert!(helpers.contains("define \"heteronetwork.validateAnnotationValue\""));
+        assert!(helpers.contains("define \"heteronetwork.validateServiceAnnotationKey\""));
         assert!(helpers.contains("annotation value must be a string"));
         assert!(helpers.contains("annotation value exceeds 262144 bytes"));
         assert!(helpers.contains("annotation value must not contain control characters"));
         assert!(helpers.contains("must not configure LoadBalancer source ranges"));
         assert!(helpers.contains("must not configure LoadBalancer fixed addresses"));
         assert!(daemonset.contains(
-            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"serviceAccount.annotations.%s\""
+            "heteronetwork.validateAnnotationValue\" (dict \"path\" (printf \"serviceAccount.annotations.%s\""
         ));
         assert!(daemonset.contains(
-            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.podAnnotations.%s\""
+            "heteronetwork.validateAnnotationValue\" (dict \"path\" (printf \"agent.podAnnotations.%s\""
         ));
         assert!(service_template.contains(
-            "ipars.validateServiceAnnotationKey\" (dict \"path\" \"agent.apiService.annotations\""
+            "heteronetwork.validateServiceAnnotationKey\" (dict \"path\" \"agent.apiService.annotations\""
         ));
         assert!(service_template.contains(
-            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.apiService.annotations.%s\""
+            "heteronetwork.validateAnnotationValue\" (dict \"path\" (printf \"agent.apiService.annotations.%s\""
         ));
         assert!(service_template.contains(
-            "ipars.validateServiceAnnotationKey\" (dict \"path\" \"agent.relayService.annotations\""
+            "heteronetwork.validateServiceAnnotationKey\" (dict \"path\" \"agent.relayService.annotations\""
         ));
         assert!(service_template.contains(
-            "ipars.validateAnnotationValue\" (dict \"path\" (printf \"agent.relayService.annotations.%s\""
+            "heteronetwork.validateAnnotationValue\" (dict \"path\" (printf \"agent.relayService.annotations.%s\""
         ));
         Ok(())
     }
@@ -17377,8 +17469,8 @@ fi
         let service_account = std::fs::read_to_string(service_account_path)?;
         let pdb = std::fs::read_to_string(pdb_path)?;
 
-        assert!(helpers.contains("define \"ipars.validateBoolean\""));
-        assert!(helpers.contains("define \"ipars.validateOptionalBoolean\""));
+        assert!(helpers.contains("define \"heteronetwork.validateBoolean\""));
+        assert!(helpers.contains("define \"heteronetwork.validateOptionalBoolean\""));
         assert!(helpers.contains("kindIs \"bool\" .value"));
         assert!(helpers.contains("%s must be true or false"));
         assert!(helpers.contains("%s must be true, false, or empty"));
@@ -17484,21 +17576,22 @@ fi
         let helpers = std::fs::read_to_string(helpers_path)?;
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
-        assert!(helpers.contains("define \"ipars.validateSocketAddress\""));
-        assert!(helpers.contains("define \"ipars.validateAdvertisedSocketAddress\""));
-        assert!(helpers.contains("define \"ipars.validateBindSocketAddress\""));
+        assert!(helpers.contains("define \"heteronetwork.validateSocketAddress\""));
+        assert!(helpers.contains("define \"heteronetwork.validateAdvertisedSocketAddress\""));
+        assert!(helpers.contains("define \"heteronetwork.validateBindSocketAddress\""));
         assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port socket address"));
         assert!(helpers.contains("must be an IPv4 host:port or [IPv6]:port bind socket address"));
         assert!(helpers.contains("must not use an unspecified address"));
         assert!(helpers.contains("must not use a multicast address"));
         assert!(helpers.contains("must not use a broadcast address"));
-        assert!(daemonset
-            .contains("ipars.validateSocketAddress\" (dict \"path\" \"cluster.stunEndpoint\""));
         assert!(daemonset.contains(
-            "ipars.validateAdvertisedSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
+            "heteronetwork.validateSocketAddress\" (dict \"path\" \"cluster.stunEndpoint\""
         ));
         assert!(daemonset.contains(
-            "ipars.validateBindSocketAddress\" (dict \"path\" \"agent.relayForwarder.bind\""
+            "heteronetwork.validateAdvertisedSocketAddress\" (dict \"path\" \"agent.relayAdvertisement.publicEndpoint\""
+        ));
+        assert!(daemonset.contains(
+            "heteronetwork.validateBindSocketAddress\" (dict \"path\" \"agent.relayForwarder.bind\""
         ));
         assert!(daemonset.contains("{{- if .Values.agent.relayForwarder.bind }}"));
         assert!(daemonset.contains("- --relay-forwarder-bind"));
@@ -17518,7 +17611,7 @@ fi
         assert!(!daemonset.contains("port: 9780"));
         assert!(!daemonset.contains("0.0.0.0:9780"));
         assert!(!daemonset.contains("cluster.relayEndpoint"));
-        assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
+        assert!(!daemonset.contains("HETERONETWORK_RELAY_ENDPOINT"));
         Ok(())
     }
 
@@ -17533,8 +17626,8 @@ fi
         let helpers = std::fs::read_to_string(helpers_path)?;
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
-        assert!(helpers.contains("define \"ipars.validateHttpEndpointURL\""));
-        assert!(helpers.contains("define \"ipars.validateAdvertisedHttpEndpointURL\""));
+        assert!(helpers.contains("define \"heteronetwork.validateHttpEndpointURL\""));
+        assert!(helpers.contains("define \"heteronetwork.validateAdvertisedHttpEndpointURL\""));
         assert!(helpers.contains("must be an absolute HTTP(S) URL with a host"));
         assert!(helpers.contains("must not include userinfo"));
         assert!(helpers.contains("port must be between 1 and 65535"));
@@ -17542,15 +17635,16 @@ fi
         assert!(helpers.contains("host must not be a multicast address"));
         assert!(helpers.contains("host must not be a broadcast address"));
         assert!(daemonset.contains(
-            "ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.controlPlaneUrl\""
-        ));
-        assert!(daemonset
-            .contains("ipars.validateHttpEndpointURL\" (dict \"path\" \"cluster.signalUrl\""));
-        assert!(daemonset.contains(
-            "ipars.validateAdvertisedHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.admissionUrl\""
+            "heteronetwork.validateHttpEndpointURL\" (dict \"path\" \"cluster.controlPlaneUrl\""
         ));
         assert!(daemonset.contains(
-            "ipars.validateAdvertisedHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.statusUrl\""
+            "heteronetwork.validateHttpEndpointURL\" (dict \"path\" \"cluster.signalUrl\""
+        ));
+        assert!(daemonset.contains(
+            "heteronetwork.validateAdvertisedHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.admissionUrl\""
+        ));
+        assert!(daemonset.contains(
+            "heteronetwork.validateAdvertisedHttpEndpointURL\" (dict \"path\" \"agent.relayAdvertisement.statusUrl\""
         ));
         assert!(!daemonset.contains("$clusterUrlPattern"));
         Ok(())
@@ -17570,7 +17664,7 @@ fi
 
         assert!(!values.contains("relayEndpoint:"));
         assert!(!values.contains("relayAdmissionUrl:"));
-        assert!(!values.contains("IPARS_RELAY_ENDPOINT"));
+        assert!(!values.contains("HETERONETWORK_RELAY_ENDPOINT"));
         assert!(values.contains("relayAdvertisement:"));
         assert!(values.contains("publicEndpoint: \"\""));
         assert!(values.contains("admissionUrl: \"\""));
@@ -17582,7 +17676,7 @@ fi
         assert!(daemonset.contains("- {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}"));
         assert!(!daemonset.contains("cluster.relayEndpoint"));
         assert!(!daemonset.contains("cluster.relayAdmissionUrl"));
-        assert!(!daemonset.contains("IPARS_RELAY_ENDPOINT"));
+        assert!(!daemonset.contains("HETERONETWORK_RELAY_ENDPOINT"));
         Ok(())
     }
 
@@ -17597,8 +17691,9 @@ fi
         let helpers_template = std::fs::read_to_string(helpers_template_path)?;
         let daemonset = std::fs::read_to_string(daemonset_path)?;
 
-        assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
-        assert!(helpers_template.contains("define \"ipars.validateOptionalNonNegativeIntegerMax\""));
+        assert!(helpers_template.contains("define \"heteronetwork.validateNonNegativeIntegerMax\""));
+        assert!(helpers_template
+            .contains("define \"heteronetwork.validateOptionalNonNegativeIntegerMax\""));
         for (path, value, max) in [
             (
                 "agent.peerMap.pollIntervalSeconds",
@@ -17678,7 +17773,7 @@ fi
             );
         }
         assert!(daemonset.contains(
-            "ipars.validateNonNegativeInt64\" (dict \"path\" \"agent.terminationGracePeriodSeconds\""
+            "heteronetwork.validateNonNegativeInt64\" (dict \"path\" \"agent.terminationGracePeriodSeconds\""
         ));
         assert!(daemonset.contains(
             "\"agent.lifecycle.preStopSleepSeconds\" \"value\" $agentPreStopSleepSeconds \"max\" 2147483647"
@@ -17686,7 +17781,7 @@ fi
         assert!(daemonset
             .contains("agent.lifecycle.preStopSleepSeconds must be greater than zero when set"));
         assert!(daemonset.contains(
-            "ipars.validateNonNegativeInt64\" (dict \"path\" (printf \"%s.tolerationSeconds\" $path)"
+            "heteronetwork.validateNonNegativeInt64\" (dict \"path\" (printf \"%s.tolerationSeconds\" $path)"
         ));
         assert!(daemonset.contains("agent.topologySpreadConstraints[%d]"));
         assert!(daemonset.contains("\"%s.maxSkew\" $path"));
@@ -17699,7 +17794,7 @@ fi
         assert!(daemonset.contains(
             "\"agent.rollout.revisionHistoryLimit\" \"value\" $agentRevisionHistoryLimit \"max\" 2147483647"
         ));
-        assert!(!daemonset.contains("ipars.validateNonNegativeInteger\" (dict"));
+        assert!(!daemonset.contains("heteronetwork.validateNonNegativeInteger\" (dict"));
         Ok(())
     }
 
@@ -17718,13 +17813,13 @@ fi
         let daemonset = std::fs::read_to_string(daemonset_path)?;
         let pdb = std::fs::read_to_string(pdb_path)?;
 
-        assert!(helpers_template.contains("define \"ipars.validateIntOrPercent\""));
+        assert!(helpers_template.contains("define \"heteronetwork.validateIntOrPercent\""));
         assert!(helpers_template.contains("no greater than 2147483647"));
         assert!(helpers_template.contains("percentage from 0%% to 100%%"));
         for path in ["agent.rollout.maxUnavailable", "agent.rollout.maxSurge"] {
             assert!(
                 daemonset.contains(&format!(
-                    "ipars.validateIntOrPercent\" (dict \"path\" \"{path}\""
+                    "heteronetwork.validateIntOrPercent\" (dict \"path\" \"{path}\""
                 )),
                 "{path} should validate as bounded IntOrString before rendering"
             );
@@ -17735,7 +17830,7 @@ fi
         ] {
             assert!(
                 pdb.contains(&format!(
-                    "ipars.validateIntOrPercent\" (dict \"path\" \"{path}\""
+                    "heteronetwork.validateIntOrPercent\" (dict \"path\" \"{path}\""
                 )),
                 "{path} should validate as bounded IntOrString before rendering"
             );
@@ -17774,8 +17869,9 @@ fi
         assert!(service_template.contains("(ne $relayUdpTargetPort 51830)"));
         assert!(service_template.contains("(ne $relayHttpPort 9580)"));
         assert!(service_template.contains("(ne $relayHttpTargetPort 9580)"));
-        assert!(service_template
-            .contains("(ne .Values.agent.relayService.udpAppProtocol \"ipars.io/relay-udp\")"));
+        assert!(service_template.contains(
+            "(ne .Values.agent.relayService.udpAppProtocol \"heteronetwork.io/relay-udp\")"
+        ));
         assert!(
             service_template.contains("(ne .Values.agent.relayService.httpAppProtocol \"http\")")
         );
@@ -17838,13 +17934,13 @@ fi
             "agent.relayService.externalTrafficPolicy requires agent.relayService.type NodePort or LoadBalancer"
         ));
         assert!(helpers_template.contains(
-            "must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers"
+            "must not enable PROXY protocol; HeteroNetwork Services do not accept PROXY protocol headers"
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer health checks; use typed Service health-check controls instead"
         ));
         assert!(helpers_template.contains(
-            "must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead"
+            "must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain HeteroNetwork listeners instead"
         ));
         assert!(helpers_template.contains(
             "must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead"
@@ -17856,9 +17952,9 @@ fi
             "must not configure LoadBalancer network placement; use typed Service type, loadBalancerClass, source-range, and exposure controls instead"
         ));
         assert!(helpers_template.contains(
-            "must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead"
+            "must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and HeteroNetwork listener controls instead"
         ));
-        assert!(helpers_template.contains("define \"ipars.validateNonNegativeIntegerMax\""));
+        assert!(helpers_template.contains("define \"heteronetwork.validateNonNegativeIntegerMax\""));
         assert!(helpers_template.contains("must be a non-negative integer no greater than %s"));
         for path in [
             "agent.apiService.port",
@@ -17877,7 +17973,7 @@ fi
         ] {
             assert!(
                 service_template.contains(&format!(
-                    "ipars.validateNonNegativeIntegerMax\" (dict \"path\" \"{path}\""
+                    "heteronetwork.validateNonNegativeIntegerMax\" (dict \"path\" \"{path}\""
                 )),
                 "{path} should validate as a bounded integer before int conversion"
             );
@@ -17984,30 +18080,30 @@ fi
         let helpers = std::fs::read_to_string(helpers_path)?;
         let service_template = std::fs::read_to_string(service_template_path)?;
 
-        assert!(helpers.contains("ipars.validateUsableServiceIPAddress"));
-        assert!(helpers.contains("ipars.validateExternalServiceIPAddress"));
+        assert!(helpers.contains("heteronetwork.validateUsableServiceIPAddress"));
+        assert!(helpers.contains("heteronetwork.validateExternalServiceIPAddress"));
         assert!(helpers.contains("must not be an unspecified address"));
         assert!(helpers.contains("must not be a loopback address"));
         assert!(helpers.contains("must not be a link-local address"));
         assert!(helpers.contains("must not be a multicast address"));
         assert!(helpers.contains("must not be a broadcast address"));
         assert!(service_template.contains(
-            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIP\""
+            "heteronetwork.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIP\""
         ));
         assert!(service_template.contains(
-            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIPs\""
+            "heteronetwork.validateUsableServiceIPAddress\" (dict \"path\" \"agent.apiService.clusterIPs\""
         ));
         assert!(service_template.contains(
-            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIP\""
+            "heteronetwork.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIP\""
         ));
         assert!(service_template.contains(
-            "ipars.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIPs\""
+            "heteronetwork.validateUsableServiceIPAddress\" (dict \"path\" \"agent.relayService.clusterIPs\""
         ));
         assert!(service_template.contains(
-            "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.apiService.loadBalancerIP\""
+            "heteronetwork.validateExternalServiceIPAddress\" (dict \"path\" \"agent.apiService.loadBalancerIP\""
         ));
         assert!(service_template.contains(
-            "ipars.validateExternalServiceIPAddress\" (dict \"path\" \"agent.relayService.loadBalancerIP\""
+            "heteronetwork.validateExternalServiceIPAddress\" (dict \"path\" \"agent.relayService.loadBalancerIP\""
         ));
         assert!(service_template.contains(
             "agent.relayService.loadBalancerIP %q must not reuse fixed external IP assigned by %s"
@@ -18232,7 +18328,7 @@ fi
         args.kubernetes_api_server_cidrs = vec!["10.0.0.1/32".parse()?];
         args.kubernetes_service_cidrs = vec!["10.96.0.0/12".parse()?];
         args.kubernetes_namespaces = vec!["default".to_string(), "platform".to_string()];
-        args.kubernetes_service_label_selector = Some("ipars.io/expose=true".to_string());
+        args.kubernetes_service_label_selector = Some("heteronetwork.io/expose=true".to_string());
         args.kubernetes_route_provider = Some("route-provider-a".to_string());
         args.kubernetes_route_interval_seconds = 15;
         args.agent_runtime_backend = "dry-run".to_string();
@@ -18254,9 +18350,9 @@ fi
         assert!(helm.contains("--set-string 'serviceExposure.serviceCidrs[0]=10.96.0.0/12'"));
         assert!(helm.contains("--set-string 'serviceExposure.namespaces[0]=default'"));
         assert!(helm.contains("--set-string 'serviceExposure.namespaces[1]=platform'"));
-        assert!(
-            helm.contains("--set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true")
-        );
+        assert!(helm.contains(
+            "--set-string serviceExposure.serviceLabelSelector=heteronetwork.io/expose=true"
+        ));
         assert!(helm.contains("--set agent.routeProvider=false"));
         assert!(helm.contains("--set-string serviceExposure.routeProviderNodeId=route-provider-a"));
         Ok(())
@@ -18847,7 +18943,7 @@ fi
     fn k8s_install_plan_wires_agent_pod_scheduling_options() -> anyhow::Result<()> {
         let mut args = base_k8s_install_args();
         args.agent_pod_labels = vec![KeyValueArg {
-            key: "ipars.io/role".to_string(),
+            key: "heteronetwork.io/role".to_string(),
             value: "agent".to_string(),
         }];
         args.agent_pod_annotations = vec![KeyValueArg {
@@ -18888,7 +18984,7 @@ fi
             term: KubernetesPodAffinityTermArg {
                 topology_key: "topology.kubernetes.io/zone".to_string(),
                 match_expressions: vec![KubernetesLabelSelectorExpressionArg {
-                    key: "ipars.io/role".to_string(),
+                    key: "heteronetwork.io/role".to_string(),
                     operator: "Exists".to_string(),
                     values: Vec::new(),
                 }],
@@ -18924,7 +19020,7 @@ fi
         args.disable_agent_service_account_token = true;
         args.agent_dns_policy = Some("Default".to_string());
         args.agent_state_host_path = Some("/opt/ipars/state".to_string());
-        args.agent_state_mount_path = Some("/run/ipars/state".to_string());
+        args.agent_state_mount_path = Some("/run/heteronetwork/state".to_string());
         args.agent_state_host_path_type = Some("Directory".to_string());
         args.disable_agent_liveness_probe = true;
         args.disable_agent_readiness_probe = true;
@@ -18938,7 +19034,7 @@ fi
         let helm = &plan.commands[2];
 
         assert!(!helm.contains("--set agent.hostNetwork=false"));
-        assert!(helm.contains("--set-string 'agent.podLabels.ipars\\.io/role=agent'"));
+        assert!(helm.contains("--set-string 'agent.podLabels.heteronetwork\\.io/role=agent'"));
         assert!(helm.contains("--set-string 'agent.podAnnotations.prometheus\\.io/scrape=true'"));
         assert!(helm.contains("--set-string agent.priorityClassName=ipars-agent-critical"));
         assert!(helm.contains("--set-string 'agent.nodeSelector.kubernetes\\.io/os=linux'"));
@@ -18982,7 +19078,7 @@ fi
             "--set-string 'agent.podAntiAffinity.preferred[0].topologyKey=topology.kubernetes.io/zone'"
         ));
         assert!(helm.contains(
-            "--set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=ipars.io/role'"
+            "--set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=heteronetwork.io/role'"
         ));
         assert!(helm.contains(
             "--set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].operator=Exists'"
@@ -19012,7 +19108,7 @@ fi
         assert!(helm.contains("--set agent.automountServiceAccountToken=false"));
         assert!(helm.contains("--set agent.dnsPolicy=Default"));
         assert!(helm.contains("--set-string agent.state.hostPath=/opt/ipars/state"));
-        assert!(helm.contains("--set-string agent.state.mountPath=/run/ipars/state"));
+        assert!(helm.contains("--set-string agent.state.mountPath=/run/heteronetwork/state"));
         assert!(helm.contains("--set agent.state.hostPathType=Directory"));
         assert!(helm.contains("--set agent.probes.liveness.enabled=false"));
         assert!(helm.contains("--set agent.probes.readiness.enabled=false"));
@@ -19575,7 +19671,7 @@ fi
 
         let mut selector_without_discovery = base_k8s_install_args();
         selector_without_discovery.kubernetes_service_label_selector =
-            Some("ipars.io/expose=true".to_string());
+            Some("heteronetwork.io/expose=true".to_string());
         let error = match k8s_install_plan(selector_without_discovery) {
             Ok(_) => panic!("selector without discovery should be rejected"),
             Err(error) => error,
@@ -19608,7 +19704,7 @@ fi
         let mut invalid_selector = base_k8s_install_args();
         invalid_selector.kubernetes_discover_services = true;
         invalid_selector.kubernetes_service_label_selector =
-            Some("ipars.io/expose=true\n".to_string());
+            Some("heteronetwork.io/expose=true\n".to_string());
         let error = match k8s_install_plan(invalid_selector) {
             Ok(_) => panic!("invalid selector should be rejected"),
             Err(error) => error,
@@ -19850,7 +19946,7 @@ fi
             "--kubernetes-namespace",
             "default",
             "--kubernetes-service-label-selector",
-            "ipars.io/expose=true",
+            "heteronetwork.io/expose=true",
             "--kubernetes-route-provider",
             "route-provider-a",
             "--kubernetes-route-interval-seconds",
@@ -19881,7 +19977,7 @@ fi
             "--service-account-annotation",
             "eks.amazonaws.com/role-arn=arn:aws:iam::123456789012:role/ipars-agent",
             "--agent-pod-label",
-            "ipars.io/role=agent",
+            "heteronetwork.io/role=agent",
             "--agent-pod-annotation",
             "prometheus.io/scrape=true",
             "--agent-priority-class",
@@ -19899,9 +19995,9 @@ fi
             "--agent-pod-affinity-required",
             "topologyKey=kubernetes.io/hostname,key=app.kubernetes.io/name,operator=In,values=ipars,namespaces=edge-system",
             "--agent-pod-affinity-preferred",
-            "weight=60,topologyKey=topology.kubernetes.io/zone,key=ipars.io/role,operator=Exists",
+            "weight=60,topologyKey=topology.kubernetes.io/zone,key=heteronetwork.io/role,operator=Exists",
             "--agent-pod-anti-affinity-required",
-            "topologyKey=kubernetes.io/hostname,key=ipars.io/role,operator=In,values=relay",
+            "topologyKey=kubernetes.io/hostname,key=heteronetwork.io/role,operator=In,values=relay",
             "--agent-pod-anti-affinity-preferred",
             "weight=90,topologyKey=topology.kubernetes.io/zone,key=app.kubernetes.io/name,operator=NotIn,values=legacy",
             "--agent-toleration",
@@ -19913,7 +20009,7 @@ fi
             "--agent-state-host-path",
             "/opt/ipars/state",
             "--agent-state-mount-path",
-            "/run/ipars/state",
+            "/run/heteronetwork/state",
             "--agent-state-host-path-type",
             "Directory",
             "--disable-agent-liveness-probe",
@@ -20093,7 +20189,7 @@ fi
             assert_eq!(args.kubernetes_namespaces, vec!["default"]);
             assert_eq!(
                 args.kubernetes_service_label_selector.as_deref(),
-                Some("ipars.io/expose=true")
+                Some("heteronetwork.io/expose=true")
             );
             assert_eq!(
                 args.kubernetes_route_provider.as_deref(),
@@ -20126,7 +20222,7 @@ fi
             assert_eq!(
                 args.agent_pod_labels,
                 vec![KeyValueArg {
-                    key: "ipars.io/role".to_string(),
+                    key: "heteronetwork.io/role".to_string(),
                     value: "agent".to_string(),
                 }]
             );
@@ -20191,7 +20287,7 @@ fi
                     term: KubernetesPodAffinityTermArg {
                         topology_key: "topology.kubernetes.io/zone".to_string(),
                         match_expressions: vec![KubernetesLabelSelectorExpressionArg {
-                            key: "ipars.io/role".to_string(),
+                            key: "heteronetwork.io/role".to_string(),
                             operator: "Exists".to_string(),
                             values: Vec::new(),
                         }],
@@ -20204,7 +20300,7 @@ fi
                 vec![KubernetesPodAffinityTermArg {
                     topology_key: "kubernetes.io/hostname".to_string(),
                     match_expressions: vec![KubernetesLabelSelectorExpressionArg {
-                        key: "ipars.io/role".to_string(),
+                        key: "heteronetwork.io/role".to_string(),
                         operator: "In".to_string(),
                         values: vec!["relay".to_string()],
                     }],
@@ -20257,7 +20353,7 @@ fi
             );
             assert_eq!(
                 args.agent_state_mount_path.as_deref(),
-                Some("/run/ipars/state")
+                Some("/run/heteronetwork/state")
             );
             assert_eq!(
                 args.agent_state_host_path_type.as_deref(),
@@ -20865,19 +20961,19 @@ fi
         let mut valid = base_k8s_install_args();
         valid.expose_agent_api = true;
         valid.agent_api_service_type = "ClusterIP".to_string();
-        valid.agent_api_app_protocol = Some("ipars.io/agent-http".to_string());
+        valid.agent_api_app_protocol = Some("heteronetwork.io/agent-http".to_string());
         valid.expose_relay = true;
         valid.relay_service_type = "ClusterIP".to_string();
-        valid.relay_udp_app_protocol = Some("ipars.io/relay-udp".to_string());
+        valid.relay_udp_app_protocol = Some("heteronetwork.io/relay-udp".to_string());
         valid.relay_http_app_protocol = Some("http".to_string());
         valid.relay_public_endpoint = Some("203.0.113.10:51820".to_string());
         valid.relay_admission_url = Some("http://203.0.113.10:9580".to_string());
 
         let plan = k8s_install_plan(valid)?;
         assert!(plan.commands[2]
-            .contains("--set-string agent.apiService.appProtocol=ipars.io/agent-http"));
+            .contains("--set-string agent.apiService.appProtocol=heteronetwork.io/agent-http"));
         assert!(plan.commands[2]
-            .contains("--set-string agent.relayService.udpAppProtocol=ipars.io/relay-udp"));
+            .contains("--set-string agent.relayService.udpAppProtocol=heteronetwork.io/relay-udp"));
         assert!(plan.commands[2].contains("--set-string agent.relayService.httpAppProtocol=http"));
 
         let parsed = Cli::try_parse_from([
@@ -20899,7 +20995,8 @@ fi
         assert!(error.contains("--agent-api-app-protocol requires"));
 
         let mut missing_relay_exposure = base_k8s_install_args();
-        missing_relay_exposure.relay_udp_app_protocol = Some("ipars.io/relay-udp".to_string());
+        missing_relay_exposure.relay_udp_app_protocol =
+            Some("heteronetwork.io/relay-udp".to_string());
         let error = match k8s_install_plan(missing_relay_exposure) {
             Ok(_) => panic!("relay appProtocol requires exposed relay Service"),
             Err(error) => error.to_string(),
@@ -23228,14 +23325,14 @@ fi
         );
         assert!(parse_kubernetes_fs_group_change_policy("Sometimes").is_err());
         assert_eq!(
-            parse_kubernetes_label_pair("ipars.io/role=agent"),
+            parse_kubernetes_label_pair("heteronetwork.io/role=agent"),
             Ok(KeyValueArg {
-                key: "ipars.io/role".to_string(),
+                key: "heteronetwork.io/role".to_string(),
                 value: "agent".to_string(),
             })
         );
         assert!(parse_kubernetes_label_pair("Example.com/role=agent").is_err());
-        assert!(parse_kubernetes_label_pair("ipars.io/role=-agent").is_err());
+        assert!(parse_kubernetes_label_pair("heteronetwork.io/role=-agent").is_err());
         assert_eq!(
             parse_kubernetes_node_affinity_required_arg(
                 "key=node-role.kubernetes.io/worker,operator=Exists"
@@ -23291,14 +23388,14 @@ fi
         );
         assert_eq!(
             parse_kubernetes_pod_affinity_preferred_arg(
-                "weight=90,topologyKey=topology.kubernetes.io/zone,key=ipars.io/role,operator=Exists"
+                "weight=90,topologyKey=topology.kubernetes.io/zone,key=heteronetwork.io/role,operator=Exists"
             ),
             Ok(KubernetesPreferredPodAffinityArg {
                 weight: 90,
                 term: KubernetesPodAffinityTermArg {
                     topology_key: "topology.kubernetes.io/zone".to_string(),
                     match_expressions: vec![KubernetesLabelSelectorExpressionArg {
-                        key: "ipars.io/role".to_string(),
+                        key: "heteronetwork.io/role".to_string(),
                         operator: "Exists".to_string(),
                         values: Vec::new(),
                     }],

@@ -17,7 +17,7 @@ use ipars_types::{ClusterId, ClusterPolicy, NodeId, NodeRecord, Role, TokenPolic
 #[tokio::test]
 async fn udp_peer_probe_crosses_linux_network_namespaces() -> Result<(), Box<dyn std::error::Error>>
 {
-    if std::env::var_os("IPARS_RUN_PEER_PROBE_NETNS_TESTS").is_none() {
+    if std::env::var_os("HETERONETWORK_RUN_PEER_PROBE_NETNS_TESTS").is_none() {
         return Ok(());
     }
 

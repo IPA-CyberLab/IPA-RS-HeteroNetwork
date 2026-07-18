@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use ipars_control_plane::{
@@ -6,9 +6,9 @@ use ipars_control_plane::{
     RemovedNode, TokenLedger,
 };
 use ipars_types::{
-    ClusterId, EndpointCandidate, NodeHealth, NodeId, NodeRecord, PathRecord, RelayCapability,
-    Route, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord,
-    TokenStatus, VpnIp,
+    ClusterId, EndpointCandidate, NatClassification, NodeHealth, NodeId, NodeRecord, PathRecord,
+    RelayCapability, Route, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome,
+    TokenRevocationRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -69,6 +69,17 @@ impl SqliteControlPlaneStore {
             .execute(
                 r#"
                 CREATE TABLE IF NOT EXISTS health (
+                    node_id TEXT PRIMARY KEY NOT NULL,
+                    record_json TEXT NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS nat_classifications (
                     node_id TEXT PRIMARY KEY NOT NULL,
                     record_json TEXT NOT NULL
                 );
@@ -151,6 +162,11 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .transpose()?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let health_result = sqlx::query("DELETE FROM health WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nat_classifications WHERE node_id = ?1")
             .bind(node_id.as_str())
             .execute(&mut *transaction)
             .await
@@ -295,6 +311,55 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         row.map(row_to_health).transpose()
     }
 
+    async fn upsert_nat_classification(
+        &self,
+        node_id: NodeId,
+        classification: NatClassification,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO nat_classifications (node_id, record_json)
+            VALUES (?1, ?2)
+            ON CONFLICT(node_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(node_id.as_str())
+        .bind(serde_json::to_string(&classification).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_nat_classification(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<NatClassification>, ControlPlaneError> {
+        let row = sqlx::query("SELECT record_json FROM nat_classifications WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        row.map(row_to_nat_classification).transpose()
+    }
+
+    async fn list_nat_classifications(
+        &self,
+    ) -> Result<BTreeMap<NodeId, NatClassification>, ControlPlaneError> {
+        let rows =
+            sqlx::query("SELECT node_id, record_json FROM nat_classifications ORDER BY node_id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        let mut classifications = BTreeMap::new();
+        for row in rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            classifications.insert(node_id, row_to_nat_classification(row)?);
+        }
+        Ok(classifications)
+    }
+
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
         let mut transaction = self.pool.begin().await.map_err(sql_error)?;
         sqlx::query("UPDATE nodes SET record_json = record_json WHERE node_id = ?1")
@@ -344,6 +409,21 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         .execute(&mut *transaction)
         .await
         .map_err(sql_error)?;
+        if let Some(classification) = update.nat_classification {
+            sqlx::query(
+                r#"
+                INSERT INTO nat_classifications (node_id, record_json)
+                VALUES (?1, ?2)
+                ON CONFLICT(node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(update.node_id.as_str())
+            .bind(serde_json::to_string(&classification).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
         sqlx::query("DELETE FROM paths WHERE local_node_id = ?1")
             .bind(update.node_id.as_str())
             .execute(&mut *transaction)
@@ -719,6 +799,17 @@ impl PostgresControlPlaneStore {
         transaction
             .execute(
                 r#"
+                CREATE TABLE IF NOT EXISTS nat_classifications (
+                    node_id TEXT PRIMARY KEY NOT NULL,
+                    record_json JSONB NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
                 CREATE TABLE IF NOT EXISTS tokens (
                     cluster_id TEXT NOT NULL,
                     nonce TEXT NOT NULL,
@@ -792,6 +883,11 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .transpose()?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM nat_classifications WHERE node_id = $1")
             .bind(node_id.as_str())
             .execute(&mut *transaction)
             .await
@@ -936,6 +1032,55 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         row.map(pg_row_to_health).transpose()
     }
 
+    async fn upsert_nat_classification(
+        &self,
+        node_id: NodeId,
+        classification: NatClassification,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO nat_classifications (node_id, record_json)
+            VALUES ($1, $2)
+            ON CONFLICT(node_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(node_id.as_str())
+        .bind(serde_json::to_value(&classification).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn get_nat_classification(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<NatClassification>, ControlPlaneError> {
+        let row = sqlx::query("SELECT record_json FROM nat_classifications WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        row.map(pg_row_to_nat_classification).transpose()
+    }
+
+    async fn list_nat_classifications(
+        &self,
+    ) -> Result<BTreeMap<NodeId, NatClassification>, ControlPlaneError> {
+        let rows =
+            sqlx::query("SELECT node_id, record_json FROM nat_classifications ORDER BY node_id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        let mut classifications = BTreeMap::new();
+        for row in rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            classifications.insert(node_id, pg_row_to_nat_classification(row)?);
+        }
+        Ok(classifications)
+    }
+
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
         let mut transaction = self.pool.begin().await.map_err(sql_error)?;
         let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
@@ -980,6 +1125,21 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .execute(&mut *transaction)
         .await
         .map_err(sql_error)?;
+        if let Some(classification) = update.nat_classification {
+            sqlx::query(
+                r#"
+                INSERT INTO nat_classifications (node_id, record_json)
+                VALUES ($1, $2)
+                ON CONFLICT(node_id)
+                DO UPDATE SET record_json = excluded.record_json
+                "#,
+            )
+            .bind(update.node_id.as_str())
+            .bind(serde_json::to_value(&classification).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
         sqlx::query("DELETE FROM paths WHERE local_node_id = $1")
             .bind(update.node_id.as_str())
             .execute(&mut *transaction)
@@ -1300,6 +1460,13 @@ fn row_to_health(row: sqlx::sqlite::SqliteRow) -> Result<NodeHealth, ControlPlan
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_nat_classification(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<NatClassification, ControlPlaneError> {
+    let record_json: String = row.get("record_json");
+    serde_json::from_str(&record_json).map_err(json_error)
+}
+
 fn row_to_token(row: sqlx::sqlite::SqliteRow) -> Result<TokenLedgerRecord, ControlPlaneError> {
     let record_json: String = row.get("record_json");
     serde_json::from_str(&record_json).map_err(json_error)
@@ -1323,6 +1490,13 @@ fn pg_row_to_path(row: sqlx::postgres::PgRow) -> Result<PathRecord, ControlPlane
 }
 
 fn pg_row_to_health(row: sqlx::postgres::PgRow) -> Result<NodeHealth, ControlPlaneError> {
+    let record_json: serde_json::Value = row.get("record_json");
+    serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_nat_classification(
+    row: sqlx::postgres::PgRow,
+) -> Result<NatClassification, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
 }
@@ -1436,8 +1610,9 @@ mod tests {
     use ipars_control_plane::{ControlPlaneStore, TokenAdmission};
     use ipars_types::{
         CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, HealthState,
-        JoinTokenClaims, KeyId, NodeHealth, NodeRecord, PathMetrics, PathRecord, PathScore,
-        PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy, VpnIp,
+        JoinTokenClaims, KeyId, NatClassification, NatProbeObservation, NodeHealth, NodeRecord,
+        PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, RelayCapability, Role, Tag,
+        TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -1543,6 +1718,7 @@ mod tests {
         Ok(HeartbeatStoreUpdate {
             node_id: local.node_id.clone(),
             candidates: vec![candidate],
+            nat_classification: None,
             relay_capability: Some(relay),
             routes: Some(vec![route]),
             health: NodeHealth {
@@ -1699,6 +1875,25 @@ mod tests {
             .upsert_health(local.node_id.clone(), health.clone())
             .await?;
         assert_eq!(store.get_health(&local.node_id).await?, Some(health));
+        let assessed_at = Utc::now();
+        let nat_classification = NatClassification::from_observations(
+            SocketAddr::from(([10, 0, 0, 10], 51820)),
+            vec![NatProbeObservation {
+                local_addr: SocketAddr::from(([10, 0, 0, 10], 51820)),
+                stun_server: SocketAddr::from(([198, 51, 100, 1], 3478)),
+                reflexive_addr: SocketAddr::from(([203, 0, 113, 10], 40000)),
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+        store
+            .upsert_nat_classification(local.node_id.clone(), nat_classification.clone())
+            .await?;
+        assert_eq!(
+            store.get_nat_classification(&local.node_id).await?,
+            Some(nat_classification.clone())
+        );
+        assert_eq!(store.list_nat_classifications().await?.len(), 1);
 
         let removed = store.remove_node(&local.node_id).await?;
         assert_eq!(removed.node.node_id, local.node_id);
@@ -1706,6 +1901,7 @@ mod tests {
         assert!(removed.removed_health);
         assert_eq!(store.get_node(&local.node_id).await?, None);
         assert_eq!(store.get_health(&local.node_id).await?, None);
+        assert_eq!(store.get_nat_classification(&local.node_id).await?, None);
         assert!(store.list_paths_for(&remote.node_id).await?.is_empty());
         assert!(matches!(
             store.remove_node(&local.node_id).await,

@@ -8,16 +8,16 @@ services:
       - --listen
       - 0.0.0.0:8443
       - --cluster-id
-      - ${IPARS_DATAPLANE_CLUSTER_ID:?set IPARS_DATAPLANE_CLUSTER_ID}
+      - ${HETERONETWORK_DATAPLANE_CLUSTER_ID:?set HETERONETWORK_DATAPLANE_CLUSTER_ID}
       - --issuer-node-id
-      - ${IPARS_DATAPLANE_ISSUER_NODE_ID:?set IPARS_DATAPLANE_ISSUER_NODE_ID}
+      - ${HETERONETWORK_DATAPLANE_ISSUER_NODE_ID:?set HETERONETWORK_DATAPLANE_ISSUER_NODE_ID}
       - --issuer-key-id
       - root
       - --issuer-public-key
-      - ${IPARS_DATAPLANE_ISSUER_PUBLIC_KEY:?set IPARS_DATAPLANE_ISSUER_PUBLIC_KEY}
+      - ${HETERONETWORK_DATAPLANE_ISSUER_PUBLIC_KEY:?set HETERONETWORK_DATAPLANE_ISSUER_PUBLIC_KEY}
     environment: !override
-      IPARS_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
-      IPARS_ROLE: control-plane
+      HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@postgres:5432/heteronetwork
+      HETERONETWORK_ROLE: control-plane
     ports: !reset []
     secrets: !reset []
 
@@ -32,16 +32,16 @@ services:
       - --listen
       - 0.0.0.0:8443
       - --cluster-id
-      - ${IPARS_DATAPLANE_CLUSTER_ID:?set IPARS_DATAPLANE_CLUSTER_ID}
+      - ${HETERONETWORK_DATAPLANE_CLUSTER_ID:?set HETERONETWORK_DATAPLANE_CLUSTER_ID}
       - --issuer-node-id
-      - ${IPARS_DATAPLANE_ISSUER_NODE_ID:?set IPARS_DATAPLANE_ISSUER_NODE_ID}
+      - ${HETERONETWORK_DATAPLANE_ISSUER_NODE_ID:?set HETERONETWORK_DATAPLANE_ISSUER_NODE_ID}
       - --issuer-key-id
       - root
       - --issuer-public-key
-      - ${IPARS_DATAPLANE_ISSUER_PUBLIC_KEY:?set IPARS_DATAPLANE_ISSUER_PUBLIC_KEY}
+      - ${HETERONETWORK_DATAPLANE_ISSUER_PUBLIC_KEY:?set HETERONETWORK_DATAPLANE_ISSUER_PUBLIC_KEY}
     environment:
-      IPARS_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
-      IPARS_ROLE: control-plane
+      HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@postgres:5432/heteronetwork
+      HETERONETWORK_ROLE: control-plane
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,8 +57,8 @@ services:
   signal:
     network_mode: service:control-plane
     environment: !override
-      IPARS_ROLE: signal
-      IPARS_SIGNAL_CONTROL_PLANE_URLS: http://127.0.0.1:8443,http://control-plane-b:8443
+      HETERONETWORK_ROLE: signal
+      HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS: http://127.0.0.1:8443,http://control-plane-b:8443
     depends_on: !override
       control-plane:
         condition: service_healthy
@@ -77,8 +77,8 @@ services:
       - 0.0.0.0:9443
     network_mode: service:control-plane-b
     environment:
-      IPARS_ROLE: signal
-      IPARS_SIGNAL_CONTROL_PLANE_URLS: http://127.0.0.1:8443,http://control-plane:8443
+      HETERONETWORK_ROLE: signal
+      HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS: http://127.0.0.1:8443,http://control-plane:8443
     depends_on:
       control-plane-b:
         condition: service_healthy
@@ -94,8 +94,8 @@ services:
   stun:
     network_mode: service:control-plane
     environment: !override
-      IPARS_ROLE: stun
-      IPARS_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
+      HETERONETWORK_ROLE: stun
+      HETERONETWORK_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
     ports: !reset []
     secrets: !reset []
 
@@ -113,8 +113,8 @@ services:
       - 0.0.0.0:3479
     network_mode: service:control-plane-b
     environment:
-      IPARS_ROLE: stun
-      IPARS_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
+      HETERONETWORK_ROLE: stun
+      HETERONETWORK_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
     depends_on:
       control-plane-b:
         condition: service_healthy
@@ -143,7 +143,7 @@ services:
       - --listen
       - 0.0.0.0:9780
       - --state-path
-      - /var/lib/ipars/agent.json
+      - /var/lib/heteronetwork/agent.json
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
@@ -152,25 +152,25 @@ services:
       - --heartbeat-interval-seconds
       - "1"
       - --stun-server
-      - ${IPARS_DATAPLANE_BOOTSTRAP_IP:?set IPARS_DATAPLANE_BOOTSTRAP_IP}:3478
+      - ${HETERONETWORK_DATAPLANE_BOOTSTRAP_IP:?set HETERONETWORK_DATAPLANE_BOOTSTRAP_IP}:3478
     environment: !override
-      IPARS_ROLE: agent
-      IPARS_AGENT_JOIN_TOKEN: ${IPARS_DATAPLANE_JOIN_TOKEN:?set IPARS_DATAPLANE_JOIN_TOKEN}
-      IPARS_AGENT_API_BEARER_TOKEN: ${IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN:?set IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN}
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:51820
-      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51820"
-      IPARS_AGENT_RUNTIME_BACKEND: linux-command
-      IPARS_AGENT_WIREGUARD_BACKEND: command
-      IPARS_AGENT_ROUTE_BACKEND: command
-      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "true"
-      IPARS_DOCKER_API_SOCKET: /run/ipars/docker.sock
-      IPARS_DOCKER_NETWORKS: ${IPARS_DATAPLANE_WORKLOAD_A_NETWORK:?set IPARS_DATAPLANE_WORKLOAD_A_NETWORK},${IPARS_DATAPLANE_WORKLOAD_A_V6_NETWORK:?set IPARS_DATAPLANE_WORKLOAD_A_V6_NETWORK},${IPARS_DATAPLANE_ROUTE_A_NETWORK:?set IPARS_DATAPLANE_ROUTE_A_NETWORK}
-      IPARS_DOCKER_CONTAINER_NAMESPACE: docker-workload-a
-      IPARS_DOCKER_HOST_INTERFACE: eth1
-      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
-      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_JOIN_TOKEN: ${HETERONETWORK_DATAPLANE_JOIN_TOKEN:?set HETERONETWORK_DATAPLANE_JOIN_TOKEN}
+      HETERONETWORK_AGENT_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN}
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51820
+      HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51820"
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command
+      HETERONETWORK_AGENT_WIREGUARD_BACKEND: command
+      HETERONETWORK_AGENT_ROUTE_BACKEND: command
+      HETERONETWORK_AGENT_DISABLE_PEER_PROBE: "true"
+      HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES: "true"
+      HETERONETWORK_DOCKER_DISCOVER_NETWORKS: "true"
+      HETERONETWORK_DOCKER_API_SOCKET: /run/heteronetwork/docker.sock
+      HETERONETWORK_DOCKER_NETWORKS: ${HETERONETWORK_DATAPLANE_WORKLOAD_A_NETWORK:?set HETERONETWORK_DATAPLANE_WORKLOAD_A_NETWORK},${HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_NETWORK:?set HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_NETWORK},${HETERONETWORK_DATAPLANE_ROUTE_A_NETWORK:?set HETERONETWORK_DATAPLANE_ROUTE_A_NETWORK}
+      HETERONETWORK_DOCKER_CONTAINER_NAMESPACE: docker-workload-a
+      HETERONETWORK_DOCKER_HOST_INTERFACE: eth1
+      HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     depends_on: !override
       control-plane:
         condition: service_healthy
@@ -190,10 +190,10 @@ services:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
     volumes: !override
-      - agent-dataplane-a:/var/lib/ipars
+      - agent-dataplane-a:/var/lib/heteronetwork
       - type: bind
-        source: ${IPARS_DOCKER_API_SOCKET_HOST:?set IPARS_DOCKER_API_SOCKET_HOST}
-        target: /run/ipars/docker.sock
+        source: ${HETERONETWORK_DOCKER_API_SOCKET_HOST:?set HETERONETWORK_DOCKER_API_SOCKET_HOST}
+        target: /run/heteronetwork/docker.sock
         read_only: true
         bind:
           create_host_path: false
@@ -213,7 +213,7 @@ services:
       - --listen
       - 0.0.0.0:9780
       - --state-path
-      - /var/lib/ipars/agent-b.json
+      - /var/lib/heteronetwork/agent-b.json
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
@@ -222,25 +222,25 @@ services:
       - --heartbeat-interval-seconds
       - "1"
       - --stun-server
-      - ${IPARS_DATAPLANE_BOOTSTRAP_IP:?set IPARS_DATAPLANE_BOOTSTRAP_IP}:3478
+      - ${HETERONETWORK_DATAPLANE_BOOTSTRAP_IP:?set HETERONETWORK_DATAPLANE_BOOTSTRAP_IP}:3478
     environment:
-      IPARS_ROLE: agent
-      IPARS_AGENT_JOIN_TOKEN: ${IPARS_DATAPLANE_JOIN_TOKEN:?set IPARS_DATAPLANE_JOIN_TOKEN}
-      IPARS_AGENT_API_BEARER_TOKEN: ${IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN:?set IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN}
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:51820
-      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51820"
-      IPARS_AGENT_RUNTIME_BACKEND: linux-command
-      IPARS_AGENT_WIREGUARD_BACKEND: command
-      IPARS_AGENT_ROUTE_BACKEND: command
-      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "true"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "true"
-      IPARS_DOCKER_API_SOCKET: /run/ipars/docker.sock
-      IPARS_DOCKER_NETWORKS: ${IPARS_DATAPLANE_WORKLOAD_B_NETWORK:?set IPARS_DATAPLANE_WORKLOAD_B_NETWORK},${IPARS_DATAPLANE_WORKLOAD_B_V6_NETWORK:?set IPARS_DATAPLANE_WORKLOAD_B_V6_NETWORK},${IPARS_DATAPLANE_ROUTE_B_NETWORK:?set IPARS_DATAPLANE_ROUTE_B_NETWORK}
-      IPARS_DOCKER_CONTAINER_NAMESPACE: docker-workload-b
-      IPARS_DOCKER_HOST_INTERFACE: eth1
-      IPARS_DOCKER_EXPOSE_HOST_ROUTES: "true"
-      IPARS_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_JOIN_TOKEN: ${HETERONETWORK_DATAPLANE_JOIN_TOKEN:?set HETERONETWORK_DATAPLANE_JOIN_TOKEN}
+      HETERONETWORK_AGENT_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN}
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51820
+      HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51820"
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command
+      HETERONETWORK_AGENT_WIREGUARD_BACKEND: command
+      HETERONETWORK_AGENT_ROUTE_BACKEND: command
+      HETERONETWORK_AGENT_DISABLE_PEER_PROBE: "true"
+      HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES: "true"
+      HETERONETWORK_DOCKER_DISCOVER_NETWORKS: "true"
+      HETERONETWORK_DOCKER_API_SOCKET: /run/heteronetwork/docker.sock
+      HETERONETWORK_DOCKER_NETWORKS: ${HETERONETWORK_DATAPLANE_WORKLOAD_B_NETWORK:?set HETERONETWORK_DATAPLANE_WORKLOAD_B_NETWORK},${HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_NETWORK:?set HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_NETWORK},${HETERONETWORK_DATAPLANE_ROUTE_B_NETWORK:?set HETERONETWORK_DATAPLANE_ROUTE_B_NETWORK}
+      HETERONETWORK_DOCKER_CONTAINER_NAMESPACE: docker-workload-b
+      HETERONETWORK_DOCKER_HOST_INTERFACE: eth1
+      HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES: "true"
+      HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS: "1"
     depends_on:
       control-plane:
         condition: service_healthy
@@ -263,10 +263,10 @@ services:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
     volumes:
-      - agent-dataplane-b:/var/lib/ipars
+      - agent-dataplane-b:/var/lib/heteronetwork
       - type: bind
-        source: ${IPARS_DOCKER_API_SOCKET_HOST:?set IPARS_DOCKER_API_SOCKET_HOST}
-        target: /run/ipars/docker.sock
+        source: ${HETERONETWORK_DOCKER_API_SOCKET_HOST:?set HETERONETWORK_DOCKER_API_SOCKET_HOST}
+        target: /run/heteronetwork/docker.sock
         read_only: true
         bind:
           create_host_path: false
@@ -282,7 +282,7 @@ services:
       - --listen
       - 0.0.0.0:9780
       - --state-path
-      - /var/lib/ipars/agent-failover.json
+      - /var/lib/heteronetwork/agent-failover.json
       - --apply-peer-map
       - --peer-map-poll-interval-seconds
       - "1"
@@ -291,15 +291,15 @@ services:
       - --signal-path-interval-seconds
       - "1"
     environment:
-      IPARS_ROLE: agent
-      IPARS_AGENT_JOIN_TOKEN: ${IPARS_DATAPLANE_JOIN_TOKEN:?set IPARS_DATAPLANE_JOIN_TOKEN}
-      IPARS_AGENT_API_BEARER_TOKEN: ${IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN:?set IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN}
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:51820
-      IPARS_AGENT_WIREGUARD_LISTEN_PORT: "51820"
-      IPARS_AGENT_RUNTIME_BACKEND: dry-run
-      IPARS_AGENT_WIREGUARD_BACKEND: command
-      IPARS_AGENT_ROUTE_BACKEND: command
-      IPARS_AGENT_DISABLE_PEER_PROBE: "true"
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_JOIN_TOKEN: ${HETERONETWORK_DATAPLANE_JOIN_TOKEN:?set HETERONETWORK_DATAPLANE_JOIN_TOKEN}
+      HETERONETWORK_AGENT_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN}
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51820
+      HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51820"
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: dry-run
+      HETERONETWORK_AGENT_WIREGUARD_BACKEND: command
+      HETERONETWORK_AGENT_ROUTE_BACKEND: command
+      HETERONETWORK_AGENT_DISABLE_PEER_PROBE: "true"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9780/healthz >/dev/null"]
       interval: 2s
@@ -311,7 +311,7 @@ services:
     devices: !reset []
     secrets: !reset []
     volumes:
-      - agent-dataplane-failover:/var/lib/ipars
+      - agent-dataplane-failover:/var/lib/heteronetwork
 
   workload-a:
     build:
@@ -412,12 +412,12 @@ networks:
     enable_ipv6: true
     ipam:
       config:
-        - subnet: ${IPARS_DATAPLANE_WORKLOAD_A_V6_CIDR:?set IPARS_DATAPLANE_WORKLOAD_A_V6_CIDR}
+        - subnet: ${HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_CIDR:?set HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_CIDR}
   workload-b-v6:
     enable_ipv6: true
     ipam:
       config:
-        - subnet: ${IPARS_DATAPLANE_WORKLOAD_B_V6_CIDR:?set IPARS_DATAPLANE_WORKLOAD_B_V6_CIDR}
+        - subnet: ${HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_CIDR:?set HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_CIDR}
 
 volumes:
   agent-dataplane-a:

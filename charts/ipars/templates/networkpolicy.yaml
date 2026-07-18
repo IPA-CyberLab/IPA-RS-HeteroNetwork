@@ -1,12 +1,12 @@
-{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.enabled" "value" .Values.networkPolicy.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "networkPolicy.enabled" "value" .Values.networkPolicy.enabled) -}}
 {{- $root := . -}}
-{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.acknowledgeHostNetwork" "value" .Values.networkPolicy.acknowledgeHostNetwork) -}}
-{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.agentApi.enabled" "value" .Values.networkPolicy.agentApi.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "networkPolicy.relay.enabled" "value" .Values.networkPolicy.relay.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "networkPolicy.acknowledgeHostNetwork" "value" .Values.networkPolicy.acknowledgeHostNetwork) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "networkPolicy.agentApi.enabled" "value" .Values.networkPolicy.agentApi.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "networkPolicy.relay.enabled" "value" .Values.networkPolicy.relay.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.apiService.enabled" "value" .Values.agent.apiService.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.relayService.enabled" "value" .Values.agent.relayService.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
 {{- $networkPolicyEnabled := .Values.networkPolicy.enabled -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentApiNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.agentApi.enabled -}}
@@ -48,8 +48,8 @@
 {{- $agentApiNetworkPolicyCidrSet := dict -}}
 {{- range $cidr := .Values.networkPolicy.agentApi.allowedCidrs -}}
 {{- $cidrValue := printf "%v" $cidr -}}
-{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue) -}}
-{{- include "ipars.validateCidrContainedBySourceRanges" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue "sourcePath" "agent.apiService.loadBalancerSourceRanges" "sourceRanges" $root.Values.agent.apiService.loadBalancerSourceRanges) -}}
+{{- include "heteronetwork.validateRestrictedCidr" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue) -}}
+{{- include "heteronetwork.validateCidrContainedBySourceRanges" (dict "path" "networkPolicy.agentApi.allowedCidrs" "value" $cidrValue "sourcePath" "agent.apiService.loadBalancerSourceRanges" "sourceRanges" $root.Values.agent.apiService.loadBalancerSourceRanges) -}}
 {{- if hasKey $agentApiNetworkPolicyCidrSet $cidrValue -}}
 {{- fail (printf "networkPolicy.agentApi.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
 {{- end -}}
@@ -58,15 +58,15 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "ipars.fullname" . }}-agent-api
+  name: {{ include "heteronetwork.fullname" . }}-agent-api
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: agent
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
   policyTypes:
     - Ingress
@@ -87,8 +87,8 @@ spec:
 {{- $relayNetworkPolicyCidrSet := dict -}}
 {{- range $cidr := .Values.networkPolicy.relay.allowedCidrs -}}
 {{- $cidrValue := printf "%v" $cidr -}}
-{{- include "ipars.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue) -}}
-{{- include "ipars.validateCidrContainedBySourceRanges" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue "sourcePath" "agent.relayService.loadBalancerSourceRanges" "sourceRanges" $root.Values.agent.relayService.loadBalancerSourceRanges) -}}
+{{- include "heteronetwork.validateRestrictedCidr" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue) -}}
+{{- include "heteronetwork.validateCidrContainedBySourceRanges" (dict "path" "networkPolicy.relay.allowedCidrs" "value" $cidrValue "sourcePath" "agent.relayService.loadBalancerSourceRanges" "sourceRanges" $root.Values.agent.relayService.loadBalancerSourceRanges) -}}
 {{- if hasKey $relayNetworkPolicyCidrSet $cidrValue -}}
 {{- fail (printf "networkPolicy.relay.allowedCidrs entry %q must not be repeated" $cidrValue) -}}
 {{- end -}}
@@ -97,15 +97,15 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "ipars.fullname" . }}-relay
+  name: {{ include "heteronetwork.fullname" . }}-relay
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: relay
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
   policyTypes:
     - Ingress

@@ -11,14 +11,14 @@ if [[ -z "${cargo_bin}" || ! -x "${cargo_bin}" ]]; then
   exit 1
 fi
 suffix="$$-$(date +%s%N)"
-probe_netns="ipars-smoke-probe-${suffix}"
+probe_netns="heteronetwork-smoke-probe-${suffix}"
 probe_netns_path="/var/run/netns/${probe_netns}"
-preflight_stderr="/tmp/ipars-netns-smoke-preflight-${suffix}.stderr"
-agent_preflight_log="/tmp/ipars-netns-smoke-agent-preflight-${suffix}.log"
-agent_preflight_state="/tmp/ipars-netns-smoke-agent-${suffix}.json"
-agent_preflight_token="/tmp/ipars-netns-smoke-agent-${suffix}.join-token.json"
-iparsd_bin="${IPARS_NETNS_SMOKE_IPARSD_BIN:-}"
-ebpf_object_path="${IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH:-}"
+preflight_stderr="/tmp/heteronetwork-netns-smoke-preflight-${suffix}.stderr"
+agent_preflight_log="/tmp/heteronetwork-netns-smoke-agent-preflight-${suffix}.log"
+agent_preflight_state="/tmp/heteronetwork-netns-smoke-agent-${suffix}.json"
+agent_preflight_token="/tmp/heteronetwork-netns-smoke-agent-${suffix}.join-token.json"
+iparsd_bin="${HETERONETWORK_NETNS_SMOKE_IPARSD_BIN:-}"
+ebpf_object_path="${HETERONETWORK_NETNS_SMOKE_EBPF_OBJECT_PATH:-}"
 
 cleanup() {
   ip netns del "${probe_netns}" >/dev/null 2>&1 || true
@@ -98,7 +98,7 @@ prepare_iparsd() {
     iparsd_bin="${repo_root}/target/debug/iparsd"
   fi
   if [[ ! -x "${iparsd_bin}" ]]; then
-    echo "IPARS_NETNS_SMOKE_IPARSD_BIN must point to an executable iparsd binary: ${iparsd_bin}" >&2
+    echo "HETERONETWORK_NETNS_SMOKE_IPARSD_BIN must point to an executable iparsd binary: ${iparsd_bin}" >&2
     exit 1
   fi
 }
@@ -108,8 +108,8 @@ run_agent_runtime_preflight() {
   local wireguard_backend="$2"
   local route_backend="$3"
   rm -f "${agent_preflight_log}" "${agent_preflight_state}" "${agent_preflight_token}"
-  if ip -n "${probe_netns}" link show dev ipars0 >/dev/null 2>&1; then
-    echo "runtime preflight namespace unexpectedly contains ipars0 before ${name}" >&2
+  if ip -n "${probe_netns}" link show dev heteronetwork0 >/dev/null 2>&1; then
+    echo "runtime preflight namespace unexpectedly contains heteronetwork0 before ${name}" >&2
     exit 1
   fi
   if ! "${iparsd_bin}" agent \
@@ -140,8 +140,8 @@ run_agent_runtime_preflight() {
     echo "${name} agent runtime preflight created state or token material" >&2
     exit 1
   fi
-  if ip -n "${probe_netns}" link show dev ipars0 >/dev/null 2>&1; then
-    echo "${name} agent runtime preflight created WireGuard interface ipars0" >&2
+  if ip -n "${probe_netns}" link show dev heteronetwork0 >/dev/null 2>&1; then
+    echo "${name} agent runtime preflight created WireGuard interface heteronetwork0" >&2
     exit 1
   fi
 }
@@ -167,19 +167,19 @@ run_agent_runtime_preflights() {
 
 run_ebpf_attach_smoke() {
   if [[ -z "${ebpf_object_path}" ]]; then
-    echo "skipping eBPF attach smoke because IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH is unset"
+    echo "skipping eBPF attach smoke because HETERONETWORK_NETNS_SMOKE_EBPF_OBJECT_PATH is unset"
     return
   fi
   echo "running eBPF attach and ring-buffer event smoke"
   env \
-    IPARS_RUN_EBPF_ATTACH_TESTS=1 \
-    IPARS_EBPF_OBJECT_PATH="${ebpf_object_path}" \
+    HETERONETWORK_RUN_EBPF_ATTACH_TESTS=1 \
+    HETERONETWORK_EBPF_OBJECT_PATH="${ebpf_object_path}" \
     "$cargo_bin" test --locked -p ipars-daemon \
       tests::ebpf_ringbuf_privileged_attach_reads_sendto_event -- \
       --exact --nocapture
   env \
-    IPARS_RUN_EBPF_ATTACH_TESTS=1 \
-    IPARS_EBPF_OBJECT_PATH="${ebpf_object_path}" \
+    HETERONETWORK_RUN_EBPF_ATTACH_TESTS=1 \
+    HETERONETWORK_EBPF_OBJECT_PATH="${ebpf_object_path}" \
     "$cargo_bin" test --locked -p ipars-daemon \
       tests::ebpf_ringbuf_privileged_cgroup_hooks_read_connect_and_sendmsg_events -- \
       --exact --nocapture
@@ -192,28 +192,28 @@ prepare_iparsd
 run_agent_runtime_preflights
 run_ebpf_attach_smoke
 
-run_cargo_test route-netns IPARS_RUN_NETNS_TESTS \
+run_cargo_test route-netns HETERONETWORK_RUN_NETNS_TESTS \
   -p ipars-route-manager --test netns_route_backend
 
-run_cargo_test peer-probe-netns IPARS_RUN_PEER_PROBE_NETNS_TESTS \
+run_cargo_test peer-probe-netns HETERONETWORK_RUN_PEER_PROBE_NETNS_TESTS \
   -p ipars-agent --test netns_peer_probe
 
-if [[ "${IPARS_NETNS_SMOKE_SKIP_WIREGUARD:-0}" == "1" ]]; then
-  echo "skipping WireGuard netns smoke because IPARS_NETNS_SMOKE_SKIP_WIREGUARD=1"
+if [[ "${HETERONETWORK_NETNS_SMOKE_SKIP_WIREGUARD:-0}" == "1" ]]; then
+  echo "skipping WireGuard netns smoke because HETERONETWORK_NETNS_SMOKE_SKIP_WIREGUARD=1"
 elif command -v wg >/dev/null 2>&1; then
-  run_cargo_test wireguard-netns IPARS_RUN_WG_NETNS_TESTS \
+  run_cargo_test wireguard-netns HETERONETWORK_RUN_WG_NETNS_TESTS \
     -p ipars-agent --test netns_wireguard_backend
 else
   echo "skipping WireGuard netns smoke because 'wg' is not available"
 fi
 
-run_cargo_test boringtun-netns IPARS_RUN_BORINGTUN_NETNS_TESTS \
+run_cargo_test boringtun-netns HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS \
   -p ipars-agent --test netns_wireguard_backend
 
-run_cargo_test_serial hole-punch-netns IPARS_RUN_HOLE_PUNCH_NETNS_TESTS \
+run_cargo_test_serial hole-punch-netns HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS \
   -p ipars-agent --test netns_hole_punch
 
-run_cargo_test relay-fallback-netns IPARS_RUN_RELAY_NETNS_TESTS \
+run_cargo_test relay-fallback-netns HETERONETWORK_RUN_RELAY_NETNS_TESTS \
   -p ipars-agent --test netns_relay_fallback
 
 echo "Network namespace smoke checks completed"

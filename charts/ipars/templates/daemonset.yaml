@@ -1,4 +1,4 @@
-{{- include "ipars.validateChartMetadata" . -}}
+{{- include "heteronetwork.validateChartMetadata" . -}}
 {{- if or (eq .Values.agent.joinTokenSecretName "") (gt (len .Values.agent.joinTokenSecretName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.joinTokenSecretName)) -}}
 {{- fail "agent.joinTokenSecretName must be a Kubernetes DNS subdomain" -}}
 {{- end -}}
@@ -65,27 +65,28 @@
 {{- $agentPeerProbeObservationMaxAgeSeconds := printf "%v" .Values.agent.peerProbe.observationMaxAgeSeconds -}}
 {{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
+{{- $agentNatDiscoveryIntervalSeconds := printf "%v" .Values.agent.natDiscovery.intervalSeconds -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
 {{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
-{{- include "ipars.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
-{{- include "ipars.validateBoolean" (dict "path" "serviceAccount.create" "value" .Values.serviceAccount.create) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.automountServiceAccountToken" "value" .Values.agent.automountServiceAccountToken) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.privileged" "value" .Values.agent.privileged) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.routeProvider" "value" .Values.agent.routeProvider) -}}
-{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.allowPrivilegeEscalation" "value" .Values.agent.securityContext.allowPrivilegeEscalation) -}}
-{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
-{{- include "ipars.validateOptionalBoolean" (dict "path" "agent.podSecurityContext.runAsNonRoot" "value" .Values.agent.podSecurityContext.runAsNonRoot) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.peerProbe.enabled" "value" .Values.agent.peerProbe.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "serviceAccount.create" "value" .Values.serviceAccount.create) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.automountServiceAccountToken" "value" .Values.agent.automountServiceAccountToken) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.privileged" "value" .Values.agent.privileged) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.routeProvider" "value" .Values.agent.routeProvider) -}}
+{{- include "heteronetwork.validateOptionalBoolean" (dict "path" "agent.securityContext.allowPrivilegeEscalation" "value" .Values.agent.securityContext.allowPrivilegeEscalation) -}}
+{{- include "heteronetwork.validateOptionalBoolean" (dict "path" "agent.securityContext.readOnlyRootFilesystem" "value" .Values.agent.securityContext.readOnlyRootFilesystem) -}}
+{{- include "heteronetwork.validateOptionalBoolean" (dict "path" "agent.podSecurityContext.runAsNonRoot" "value" .Values.agent.podSecurityContext.runAsNonRoot) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.peerProbe.enabled" "value" .Values.agent.peerProbe.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- if hasKey .Values.serviceExposure "apiServer" -}}
 {{- fail "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs" -}}
 {{- end -}}
-{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
-{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "serviceExposure.discoverApiServer" "value" .Values.serviceExposure.discoverApiServer) -}}
 {{- if not .Values.serviceExposure.enabled -}}
 {{- if .Values.serviceExposure.discoverServices -}}
 {{- fail "serviceExposure.discoverServices requires serviceExposure.enabled=true" -}}
@@ -101,7 +102,7 @@
 {{- end -}}
 {{- end -}}
 {{- $agentRelayForwarderEnabled := printf "%v" .Values.agent.relayForwarder.enabled -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.relayForwarder.enabled" "value" .Values.agent.relayForwarder.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.relayForwarder.enabled" "value" .Values.agent.relayForwarder.enabled) -}}
 {{- $agentRelayForwarderMaxSessions := printf "%v" .Values.agent.relayForwarder.maxSessions -}}
 {{- $agentRelayForwarderRestartBackoffSeconds := printf "%v" .Values.agent.relayForwarder.restartBackoffSeconds -}}
 {{- $agentRelayForwarderCrashWindowSeconds := printf "%v" .Values.agent.relayForwarder.crashWindowSeconds -}}
@@ -114,22 +115,26 @@
 {{- $agentReadinessProbeEnabled := printf "%v" .Values.agent.probes.readiness.enabled -}}
 {{- $agentStartupProbeEnabled := printf "%v" .Values.agent.probes.startup.enabled -}}
 {{- $agentPreStopSleepSeconds := printf "%v" .Values.agent.lifecycle.preStopSleepSeconds -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.probes.liveness.enabled" "value" .Values.agent.probes.liveness.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.probes.readiness.enabled" "value" .Values.agent.probes.readiness.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "agent.probes.startup.enabled" "value" .Values.agent.probes.startup.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.probes.liveness.enabled" "value" .Values.agent.probes.liveness.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.probes.readiness.enabled" "value" .Values.agent.probes.readiness.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.probes.startup.enabled" "value" .Values.agent.probes.startup.enabled) -}}
 {{- $absolutePathPattern := "^/[A-Za-z0-9._/@%+=:,/-]+$" -}}
 {{- $httpPathPattern := "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$" -}}
 {{- if or (eq .Values.agent.interfaceName "") (gt (len .Values.agent.interfaceName) 15) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.interfaceName)) -}}
 {{- fail "agent.interfaceName must be a Linux interface name of 1-15 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.wireguardListenPort" "value" $agentWireguardListenPortValue "max" 65535) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.wireguardListenPort" "value" $agentWireguardListenPortValue "max" 65535) -}}
 {{- if lt (int $agentWireguardListenPortValue) 1 -}}
 {{- fail "agent.wireguardListenPort must be between 1 and 65535" -}}
 {{- end -}}
-{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.stunBind" "value" $agentStunBind) -}}
+{{- include "heteronetwork.validateBindSocketAddress" (dict "path" "agent.stunBind" "value" $agentStunBind) -}}
 {{- $agentStunBindPort := int (regexFind "[0-9]+$" $agentStunBind) -}}
 {{- if ne $agentStunBindPort (int $agentWireguardListenPortValue) -}}
 {{- fail "agent.stunBind port must equal agent.wireguardListenPort" -}}
+{{- end -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.natDiscovery.intervalSeconds" "value" $agentNatDiscoveryIntervalSeconds "max" 86400) -}}
+{{- if lt (int $agentNatDiscoveryIntervalSeconds) 1 -}}
+{{- fail "agent.natDiscovery.intervalSeconds must be greater than zero" -}}
 {{- end -}}
 {{- if not (or (eq $agentRuntimeBackend "linux-command") (eq $agentRuntimeBackend "dry-run")) -}}
 {{- fail "agent.runtimeBackend must be linux-command or dry-run" -}}
@@ -140,12 +145,12 @@
 {{- if not (or (eq $agentPeerMapEnabled "true") (eq $agentPeerMapEnabled "false")) -}}
 {{- fail "agent.peerMap.enabled must be true or false" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds "max" 9223372036854775807) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerMap.pollIntervalSeconds" "value" $agentPeerMapPollIntervalSeconds "max" 9223372036854775807) -}}
 {{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentPeerMapPollIntervalSeconds) 1) -}}
 {{- fail "agent.peerMap.pollIntervalSeconds must be greater than zero when agent.peerMap.enabled=true" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.http.connectTimeoutSeconds" "value" $agentHttpConnectTimeoutSeconds "max" 3600) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.http.requestTimeoutSeconds" "value" $agentHttpRequestTimeoutSeconds "max" 3600) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.http.connectTimeoutSeconds" "value" $agentHttpConnectTimeoutSeconds "max" 3600) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.http.requestTimeoutSeconds" "value" $agentHttpRequestTimeoutSeconds "max" 3600) -}}
 {{- if lt (int $agentHttpConnectTimeoutSeconds) 1 -}}
 {{- fail "agent.http.connectTimeoutSeconds must be greater than zero" -}}
 {{- end -}}
@@ -155,8 +160,8 @@
 {{- if gt (int $agentHttpConnectTimeoutSeconds) (int $agentHttpRequestTimeoutSeconds) -}}
 {{- fail "agent.http.connectTimeoutSeconds must not exceed agent.http.requestTimeoutSeconds" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.directPathVerification.probeTimeoutSeconds" "value" $agentDirectPathProbeTimeoutSeconds "max" 86400) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.directPathVerification.handshakeMaxAgeSeconds" "value" $agentDirectHandshakeMaxAgeSeconds "max" 86400) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.directPathVerification.probeTimeoutSeconds" "value" $agentDirectPathProbeTimeoutSeconds "max" 86400) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.directPathVerification.handshakeMaxAgeSeconds" "value" $agentDirectHandshakeMaxAgeSeconds "max" 86400) -}}
 {{- if lt (int $agentDirectPathProbeTimeoutSeconds) 1 -}}
 {{- fail "agent.directPathVerification.probeTimeoutSeconds must be greater than zero" -}}
 {{- end -}}
@@ -166,14 +171,14 @@
 {{- if and (eq $agentPeerMapEnabled "true") (lt (int $agentDirectPathProbeTimeoutSeconds) (add (int $agentPeerMapPollIntervalSeconds) 60)) -}}
 {{- fail "agent.directPathVerification.probeTimeoutSeconds must be at least agent.peerMap.pollIntervalSeconds plus two 30-second signal path intervals" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.port" "value" $agentPeerProbePort "max" 65535) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.intervalSeconds" "value" $agentPeerProbeIntervalSeconds "max" 86400) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.sampleCount" "value" $agentPeerProbeSampleCount "max" 64) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.responseTimeoutMillis" "value" $agentPeerProbeResponseTimeoutMillis "max" 10000) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.sampleIntervalMillis" "value" $agentPeerProbeSampleIntervalMillis "max" 10000) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.maxConcurrency" "value" $agentPeerProbeMaxConcurrency "max" 1024) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.responderMaxRequestsPerSecond" "value" $agentPeerProbeResponderMaxRequestsPerSecond "max" 100000) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.observationMaxAgeSeconds" "value" $agentPeerProbeObservationMaxAgeSeconds "max" 86400) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.port" "value" $agentPeerProbePort "max" 65535) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.intervalSeconds" "value" $agentPeerProbeIntervalSeconds "max" 86400) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.sampleCount" "value" $agentPeerProbeSampleCount "max" 64) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.responseTimeoutMillis" "value" $agentPeerProbeResponseTimeoutMillis "max" 10000) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.sampleIntervalMillis" "value" $agentPeerProbeSampleIntervalMillis "max" 10000) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.maxConcurrency" "value" $agentPeerProbeMaxConcurrency "max" 1024) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.responderMaxRequestsPerSecond" "value" $agentPeerProbeResponderMaxRequestsPerSecond "max" 100000) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.peerProbe.observationMaxAgeSeconds" "value" $agentPeerProbeObservationMaxAgeSeconds "max" 86400) -}}
 {{- if and (eq $agentPeerMapEnabled "true") (eq $agentPeerProbeEnabled "true") -}}
 {{- if lt (int $agentPeerProbePort) 1 -}}
 {{- fail "agent.peerProbe.port must be greater than zero" -}}
@@ -209,24 +214,24 @@
 {{- if not (or (eq $agentRelayForwarderEnabled "true") (eq $agentRelayForwarderEnabled "false")) -}}
 {{- fail "agent.relayForwarder.enabled must be true or false" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxSessions" "value" $agentRelayForwarderMaxSessions "max" 9223372036854775807) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.restartBackoffSeconds" "value" $agentRelayForwarderRestartBackoffSeconds "max" 9223372036854775807) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashWindowSeconds" "value" $agentRelayForwarderCrashWindowSeconds "max" 9223372036854775807) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxCrashesPerWindow" "value" $agentRelayForwarderMaxCrashesPerWindow "max" 4294967295) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashCooldownSeconds" "value" $agentRelayForwarderCrashCooldownSeconds "max" 9223372036854775807) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxSessions" "value" $agentRelayForwarderMaxSessions "max" 9223372036854775807) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.restartBackoffSeconds" "value" $agentRelayForwarderRestartBackoffSeconds "max" 9223372036854775807) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashWindowSeconds" "value" $agentRelayForwarderCrashWindowSeconds "max" 9223372036854775807) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.maxCrashesPerWindow" "value" $agentRelayForwarderMaxCrashesPerWindow "max" 4294967295) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayForwarder.crashCooldownSeconds" "value" $agentRelayForwarderCrashCooldownSeconds "max" 9223372036854775807) -}}
 {{- if eq $agentRelayForwarderEnabled "true" -}}
 {{- if not (or .Values.agent.relayForwarder.endpoint .Values.agent.relayForwarder.bind) -}}
 {{- fail "agent.relayForwarder.enabled=true requires agent.relayForwarder.endpoint or agent.relayForwarder.bind" -}}
 {{- end -}}
 {{- if .Values.agent.relayForwarder.endpoint -}}
-{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.endpoint" "value" .Values.agent.relayForwarder.endpoint) -}}
+{{- include "heteronetwork.validateSocketAddress" (dict "path" "agent.relayForwarder.endpoint" "value" .Values.agent.relayForwarder.endpoint) -}}
 {{- end -}}
 {{- if .Values.agent.relayForwarder.bind -}}
 {{- if not .Values.agent.relayForwarder.wireguardEndpoint -}}
 {{- fail "agent.relayForwarder.wireguardEndpoint is required when agent.relayForwarder.bind is set" -}}
 {{- end -}}
-{{- include "ipars.validateBindSocketAddress" (dict "path" "agent.relayForwarder.bind" "value" .Values.agent.relayForwarder.bind "allowPortZero" true) -}}
-{{- include "ipars.validateSocketAddress" (dict "path" "agent.relayForwarder.wireguardEndpoint" "value" .Values.agent.relayForwarder.wireguardEndpoint) -}}
+{{- include "heteronetwork.validateBindSocketAddress" (dict "path" "agent.relayForwarder.bind" "value" .Values.agent.relayForwarder.bind "allowPortZero" true) -}}
+{{- include "heteronetwork.validateSocketAddress" (dict "path" "agent.relayForwarder.wireguardEndpoint" "value" .Values.agent.relayForwarder.wireguardEndpoint) -}}
 {{- if and .Values.agent.relayForwarder.netns (or (gt (len .Values.agent.relayForwarder.netns) 64) (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.agent.relayForwarder.netns))) -}}
 {{- fail "agent.relayForwarder.netns must be a Linux network namespace name of 1-64 ASCII letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
@@ -327,8 +332,8 @@
 {{- fail "serviceAccount.annotations require serviceAccount.create=true" -}}
 {{- end -}}
 {{- range $key, $value := .Values.serviceAccount.annotations -}}
-{{- include "ipars.validateAnnotationKey" (dict "path" "serviceAccount.annotations" "key" $key) -}}
-{{- include "ipars.validateAnnotationValue" (dict "path" (printf "serviceAccount.annotations.%s" $key) "value" $value) -}}
+{{- include "heteronetwork.validateAnnotationKey" (dict "path" "serviceAccount.annotations" "key" $key) -}}
+{{- include "heteronetwork.validateAnnotationValue" (dict "path" (printf "serviceAccount.annotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- if not (or (eq $agentAutomountServiceAccountToken "true") (eq $agentAutomountServiceAccountToken "false")) -}}
 {{- fail "agent.automountServiceAccountToken must be true or false" -}}
@@ -357,9 +362,9 @@
 {{- if and (eq $agentPrivileged "true") (eq $agentAllowPrivilegeEscalation "false") -}}
 {{- fail "agent.securityContext.allowPrivilegeEscalation=false cannot be used with agent.privileged=true" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.runAsUser" "value" $agentRunAsUser) -}}
-{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.runAsGroup" "value" $agentRunAsGroup) -}}
-{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.fsGroup" "value" $agentFsGroup) -}}
+{{- include "heteronetwork.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.runAsUser" "value" $agentRunAsUser) -}}
+{{- include "heteronetwork.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.runAsGroup" "value" $agentRunAsGroup) -}}
+{{- include "heteronetwork.validateNonNegativeInt64" (dict "path" "agent.podSecurityContext.fsGroup" "value" $agentFsGroup) -}}
 {{- if and (eq $agentRunAsNonRoot "true") (eq $agentRunAsUser "0") -}}
 {{- fail "agent.podSecurityContext.runAsNonRoot=true cannot be used with runAsUser=0" -}}
 {{- end -}}
@@ -372,7 +377,7 @@
 {{- $agentSupplementalGroups := dict -}}
 {{- range $index, $group := .Values.agent.podSecurityContext.supplementalGroups -}}
 {{- $groupValue := printf "%v" $group -}}
-{{- include "ipars.validateNonNegativeInt64" (dict "path" (printf "agent.podSecurityContext.supplementalGroups[%d]" $index) "value" $groupValue) -}}
+{{- include "heteronetwork.validateNonNegativeInt64" (dict "path" (printf "agent.podSecurityContext.supplementalGroups[%d]" $index) "value" $groupValue) -}}
 {{- if hasKey $agentSupplementalGroups $groupValue -}}
 {{- fail (printf "agent.podSecurityContext.supplementalGroups entry %s must not be repeated" $groupValue) -}}
 {{- end -}}
@@ -388,7 +393,7 @@
 {{- fail "agent.state.hostPath must be an absolute host path without '..' segments or trailing '/'" -}}
 {{- end -}}
 {{- if or (eq $agentStateHostPath "/bin") (hasPrefix "/bin/" $agentStateHostPath) (eq $agentStateHostPath "/boot") (hasPrefix "/boot/" $agentStateHostPath) (eq $agentStateHostPath "/dev") (hasPrefix "/dev/" $agentStateHostPath) (eq $agentStateHostPath "/etc") (hasPrefix "/etc/" $agentStateHostPath) (eq $agentStateHostPath "/lib") (hasPrefix "/lib/" $agentStateHostPath) (eq $agentStateHostPath "/lib32") (hasPrefix "/lib32/" $agentStateHostPath) (eq $agentStateHostPath "/lib64") (hasPrefix "/lib64/" $agentStateHostPath) (eq $agentStateHostPath "/proc") (hasPrefix "/proc/" $agentStateHostPath) (eq $agentStateHostPath "/root") (hasPrefix "/root/" $agentStateHostPath) (eq $agentStateHostPath "/run") (hasPrefix "/run/" $agentStateHostPath) (eq $agentStateHostPath "/sbin") (hasPrefix "/sbin/" $agentStateHostPath) (eq $agentStateHostPath "/sys") (hasPrefix "/sys/" $agentStateHostPath) (eq $agentStateHostPath "/tmp") (hasPrefix "/tmp/" $agentStateHostPath) (eq $agentStateHostPath "/usr") (hasPrefix "/usr/" $agentStateHostPath) (eq $agentStateHostPath "/var/run") (hasPrefix "/var/run/" $agentStateHostPath) (eq $agentStateHostPath "/var/tmp") (hasPrefix "/var/tmp/" $agentStateHostPath) -}}
-{{- fail "agent.state.hostPath must not be a sensitive system path; choose a dedicated IPARS state directory such as /var/lib/ipars or /opt/ipars/state" -}}
+{{- fail "agent.state.hostPath must not be a sensitive system path; choose a dedicated HeteroNetwork state directory such as /var/lib/heteronetwork or /opt/heteronetwork/state" -}}
 {{- end -}}
 {{- if not (or (eq $agentStateHostPathType "DirectoryOrCreate") (eq $agentStateHostPathType "Directory")) -}}
 {{- fail "agent.state.hostPathType must be DirectoryOrCreate or Directory" -}}
@@ -397,7 +402,7 @@
 {{- fail "agent.state.mountPath must be an absolute container path other than '/' without '..' segments or trailing '/'" -}}
 {{- end -}}
 {{- if or (eq $agentStateMountPath "/bin") (hasPrefix "/bin/" $agentStateMountPath) (eq $agentStateMountPath "/boot") (hasPrefix "/boot/" $agentStateMountPath) (eq $agentStateMountPath "/dev") (hasPrefix "/dev/" $agentStateMountPath) (eq $agentStateMountPath "/etc") (hasPrefix "/etc/" $agentStateMountPath) (eq $agentStateMountPath "/lib") (hasPrefix "/lib/" $agentStateMountPath) (eq $agentStateMountPath "/lib32") (hasPrefix "/lib32/" $agentStateMountPath) (eq $agentStateMountPath "/lib64") (hasPrefix "/lib64/" $agentStateMountPath) (eq $agentStateMountPath "/proc") (hasPrefix "/proc/" $agentStateMountPath) (eq $agentStateMountPath "/root") (hasPrefix "/root/" $agentStateMountPath) (eq $agentStateMountPath "/sbin") (hasPrefix "/sbin/" $agentStateMountPath) (eq $agentStateMountPath "/sys") (hasPrefix "/sys/" $agentStateMountPath) (eq $agentStateMountPath "/usr") (hasPrefix "/usr/" $agentStateMountPath) -}}
-{{- fail "agent.state.mountPath must not be a sensitive system path; choose a dedicated IPARS state mount such as /var/lib/ipars or /opt/ipars/state" -}}
+{{- fail "agent.state.mountPath must not be a sensitive system path; choose a dedicated HeteroNetwork state mount such as /var/lib/heteronetwork or /opt/heteronetwork/state" -}}
 {{- end -}}
 {{- if not (or (eq $agentLivenessProbeEnabled "true") (eq $agentLivenessProbeEnabled "false")) -}}
 {{- fail "agent.probes.liveness.enabled must be true or false" -}}
@@ -417,10 +422,10 @@
 {{- $periodSeconds := printf "%v" $probe.periodSeconds -}}
 {{- $timeoutSeconds := printf "%v" $probe.timeoutSeconds -}}
 {{- $failureThreshold := printf "%v" $probe.failureThreshold -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds "max" 2147483647) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds "max" 2147483647) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds "max" 2147483647) -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold "max" 2147483647) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds "max" 2147483647) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.periodSeconds" $probeName) "value" $periodSeconds "max" 2147483647) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds "max" 2147483647) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "agent.probes.%s.failureThreshold" $probeName) "value" $failureThreshold "max" 2147483647) -}}
 {{- if lt (int $periodSeconds) 1 -}}
 {{- fail (printf "agent.probes.%s.periodSeconds must be greater than zero" $probeName) -}}
 {{- end -}}
@@ -431,11 +436,11 @@
 {{- fail (printf "agent.probes.%s.failureThreshold must be greater than zero" $probeName) -}}
 {{- end -}}
 {{- end -}}
-{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.lifecycle.preStopSleepSeconds" "value" $agentPreStopSleepSeconds "max" 2147483647) -}}
+{{- include "heteronetwork.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.lifecycle.preStopSleepSeconds" "value" $agentPreStopSleepSeconds "max" 2147483647) -}}
 {{- if eq $agentPreStopSleepSeconds "0" -}}
 {{- fail "agent.lifecycle.preStopSleepSeconds must be greater than zero when set" -}}
 {{- end -}}
-{{- include "ipars.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
+{{- include "heteronetwork.validateNonNegativeInt64" (dict "path" "agent.terminationGracePeriodSeconds" "value" $agentTerminationGracePeriodSeconds) -}}
 {{- if .Values.agent.priorityClassName -}}
 {{- if or (gt (len .Values.agent.priorityClassName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.priorityClassName)) -}}
 {{- fail "agent.priorityClassName must be a Kubernetes DNS subdomain" -}}
@@ -452,19 +457,19 @@
 {{- end -}}
 {{- end -}}
 {{- range $key, $value := .Values.agent.podLabels -}}
-{{- include "ipars.validateLabelKey" (dict "path" "agent.podLabels" "key" $key) -}}
-{{- include "ipars.validateLabelValue" (dict "path" "agent.podLabels" "value" (printf "%v" $value)) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" "agent.podLabels" "key" $key) -}}
+{{- include "heteronetwork.validateLabelValue" (dict "path" "agent.podLabels" "value" (printf "%v" $value)) -}}
 {{- end -}}
 {{- range $key, $value := .Values.agent.podAnnotations -}}
-{{- include "ipars.validateAnnotationKey" (dict "path" "agent.podAnnotations" "key" $key) -}}
-{{- include "ipars.validateAnnotationValue" (dict "path" (printf "agent.podAnnotations.%s" $key) "value" $value) -}}
+{{- include "heteronetwork.validateAnnotationKey" (dict "path" "agent.podAnnotations" "key" $key) -}}
+{{- include "heteronetwork.validateAnnotationValue" (dict "path" (printf "agent.podAnnotations.%s" $key) "value" $value) -}}
 {{- end -}}
 {{- range $key, $value := .Values.agent.nodeSelector -}}
-{{- include "ipars.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}
-{{- include "ipars.validateLabelValue" (dict "path" "agent.nodeSelector" "value" (printf "%v" $value)) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" "agent.nodeSelector" "key" $key) -}}
+{{- include "heteronetwork.validateLabelValue" (dict "path" "agent.nodeSelector" "value" (printf "%v" $value)) -}}
 {{- end -}}
 {{- range $index, $expression := .Values.agent.nodeAffinity.required.matchExpressions -}}
-{{- include "ipars.validateNodeSelectorExpression" (dict "path" (printf "agent.nodeAffinity.required.matchExpressions[%d]" $index) "expression" $expression) -}}
+{{- include "heteronetwork.validateNodeSelectorExpression" (dict "path" (printf "agent.nodeAffinity.required.matchExpressions[%d]" $index) "expression" $expression) -}}
 {{- end -}}
 {{- range $index, $preference := .Values.agent.nodeAffinity.preferred -}}
 {{- $path := printf "agent.nodeAffinity.preferred[%d]" $index -}}
@@ -480,7 +485,7 @@
 {{- fail (printf "%s.weight is required" $path) -}}
 {{- end -}}
 {{- $weight := printf "%v" $preference.weight -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
 {{- if lt (int $weight) 1 -}}
 {{- fail (printf "%s.weight must be between 1 and 100" $path) -}}
 {{- end -}}
@@ -494,11 +499,11 @@
 {{- fail (printf "%s.matchExpressions must not be empty" $path) -}}
 {{- end -}}
 {{- range $expressionIndex, $expression := $preference.matchExpressions -}}
-{{- include "ipars.validateNodeSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
+{{- include "heteronetwork.validateNodeSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
 {{- end -}}
 {{- end -}}
 {{- range $index, $term := .Values.agent.podAffinity.required -}}
-{{- include "ipars.validatePodAffinityTerm" (dict "path" (printf "agent.podAffinity.required[%d]" $index) "term" $term) -}}
+{{- include "heteronetwork.validatePodAffinityTerm" (dict "path" (printf "agent.podAffinity.required[%d]" $index) "term" $term) -}}
 {{- end -}}
 {{- range $index, $preference := .Values.agent.podAffinity.preferred -}}
 {{- $path := printf "agent.podAffinity.preferred[%d]" $index -}}
@@ -514,14 +519,14 @@
 {{- fail (printf "%s.weight is required" $path) -}}
 {{- end -}}
 {{- $weight := printf "%v" $preference.weight -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
 {{- if lt (int $weight) 1 -}}
 {{- fail (printf "%s.weight must be between 1 and 100" $path) -}}
 {{- end -}}
-{{- include "ipars.validatePodAffinityTerm" (dict "path" $path "term" (omit $preference "weight")) -}}
+{{- include "heteronetwork.validatePodAffinityTerm" (dict "path" $path "term" (omit $preference "weight")) -}}
 {{- end -}}
 {{- range $index, $term := .Values.agent.podAntiAffinity.required -}}
-{{- include "ipars.validatePodAffinityTerm" (dict "path" (printf "agent.podAntiAffinity.required[%d]" $index) "term" $term) -}}
+{{- include "heteronetwork.validatePodAffinityTerm" (dict "path" (printf "agent.podAntiAffinity.required[%d]" $index) "term" $term) -}}
 {{- end -}}
 {{- range $index, $preference := .Values.agent.podAntiAffinity.preferred -}}
 {{- $path := printf "agent.podAntiAffinity.preferred[%d]" $index -}}
@@ -537,11 +542,11 @@
 {{- fail (printf "%s.weight is required" $path) -}}
 {{- end -}}
 {{- $weight := printf "%v" $preference.weight -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "%s.weight" $path) "value" $weight "max" 100) -}}
 {{- if lt (int $weight) 1 -}}
 {{- fail (printf "%s.weight must be between 1 and 100" $path) -}}
 {{- end -}}
-{{- include "ipars.validatePodAffinityTerm" (dict "path" $path "term" (omit $preference "weight")) -}}
+{{- include "heteronetwork.validatePodAffinityTerm" (dict "path" $path "term" (omit $preference "weight")) -}}
 {{- end -}}
 {{- range $index, $toleration := .Values.agent.tolerations -}}
 {{- $path := printf "agent.tolerations[%d]" $index -}}
@@ -550,7 +555,7 @@
 {{- $tolerationValue := default "" $toleration.value -}}
 {{- $tolerationEffect := default "" $toleration.effect -}}
 {{- if ne $tolerationKey "" -}}
-{{- include "ipars.validateLabelKey" (dict "path" $path "key" $tolerationKey) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" $path "key" $tolerationKey) -}}
 {{- end -}}
 {{- if and (ne $tolerationOperator "Exists") (ne $tolerationOperator "Equal") -}}
 {{- fail (printf "%s.operator must be Exists or Equal" $path) -}}
@@ -562,14 +567,14 @@
 {{- fail (printf "%s.value must be empty when operator is Exists" $path) -}}
 {{- end -}}
 {{- if ne $tolerationValue "" -}}
-{{- include "ipars.validateLabelValue" (dict "path" $path "value" (printf "%v" $tolerationValue)) -}}
+{{- include "heteronetwork.validateLabelValue" (dict "path" $path "value" (printf "%v" $tolerationValue)) -}}
 {{- end -}}
 {{- if and (ne $tolerationEffect "") (not (or (eq $tolerationEffect "NoSchedule") (eq $tolerationEffect "PreferNoSchedule") (eq $tolerationEffect "NoExecute"))) -}}
 {{- fail (printf "%s.effect must be NoSchedule, PreferNoSchedule, or NoExecute" $path) -}}
 {{- end -}}
 {{- if hasKey $toleration "tolerationSeconds" -}}
 {{- $tolerationSeconds := printf "%v" $toleration.tolerationSeconds -}}
-{{- include "ipars.validateNonNegativeInt64" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
+{{- include "heteronetwork.validateNonNegativeInt64" (dict "path" (printf "%s.tolerationSeconds" $path) "value" $tolerationSeconds) -}}
 {{- if ne $tolerationEffect "NoExecute" -}}
 {{- fail (printf "%s.tolerationSeconds requires effect NoExecute" $path) -}}
 {{- end -}}
@@ -589,12 +594,12 @@
 {{- if eq $topologyKey "" -}}
 {{- fail (printf "%s.topologyKey is required" $path) -}}
 {{- end -}}
-{{- include "ipars.validateLabelKey" (dict "path" $path "key" $topologyKey) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" $path "key" $topologyKey) -}}
 {{- if not (hasKey $constraint "maxSkew") -}}
 {{- fail (printf "%s.maxSkew is required" $path) -}}
 {{- end -}}
 {{- $maxSkew := printf "%v" $constraint.maxSkew -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.maxSkew" $path) "value" $maxSkew "max" 2147483647) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "%s.maxSkew" $path) "value" $maxSkew "max" 2147483647) -}}
 {{- if lt (int $maxSkew) 1 -}}
 {{- fail (printf "%s.maxSkew must be greater than zero" $path) -}}
 {{- end -}}
@@ -604,7 +609,7 @@
 {{- end -}}
 {{- if hasKey $constraint "minDomains" -}}
 {{- $minDomains := printf "%v" $constraint.minDomains -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" (printf "%s.minDomains" $path) "value" $minDomains "max" 2147483647) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "%s.minDomains" $path) "value" $minDomains "max" 2147483647) -}}
 {{- if lt (int $minDomains) 1 -}}
 {{- fail (printf "%s.minDomains must be greater than zero" $path) -}}
 {{- end -}}
@@ -623,10 +628,10 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.cpu" "value" (printf "%v" .Values.agent.resources.requests.cpu)) -}}
-{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
-{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
-{{- include "ipars.validateResourceQuantity" (dict "path" "agent.resources.limits.memory" "value" (printf "%v" .Values.agent.resources.limits.memory)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "agent.resources.requests.cpu" "value" (printf "%v" .Values.agent.resources.requests.cpu)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "agent.resources.requests.memory" "value" (printf "%v" .Values.agent.resources.requests.memory)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "agent.resources.limits.cpu" "value" (printf "%v" .Values.agent.resources.limits.cpu)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "agent.resources.limits.memory" "value" (printf "%v" .Values.agent.resources.limits.memory)) -}}
 {{- $agentCapabilityAdds := dict -}}
 {{- range .Values.agent.securityContext.capabilities.add -}}
 {{- $capability := printf "%v" . -}}
@@ -670,44 +675,44 @@
 {{- if and (eq $agentRolloutUpdateStrategy "OnDelete") $agentRollingUpdateConfigured -}}
 {{- fail "agent.rollout.maxUnavailable and agent.rollout.maxSurge require agent.rollout.updateStrategy RollingUpdate or empty" -}}
 {{- end -}}
-{{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxUnavailable" "value" $agentRolloutMaxUnavailable) -}}
-{{- include "ipars.validateIntOrPercent" (dict "path" "agent.rollout.maxSurge" "value" $agentRolloutMaxSurge) -}}
-{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds "max" 2147483647) -}}
-{{- include "ipars.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit "max" 2147483647) -}}
+{{- include "heteronetwork.validateIntOrPercent" (dict "path" "agent.rollout.maxUnavailable" "value" $agentRolloutMaxUnavailable) -}}
+{{- include "heteronetwork.validateIntOrPercent" (dict "path" "agent.rollout.maxSurge" "value" $agentRolloutMaxSurge) -}}
+{{- include "heteronetwork.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.minReadySeconds" "value" $agentMinReadySeconds "max" 2147483647) -}}
+{{- include "heteronetwork.validateOptionalNonNegativeIntegerMax" (dict "path" "agent.rollout.revisionHistoryLimit" "value" $agentRevisionHistoryLimit "max" 2147483647) -}}
 {{- if and (or (eq $agentRolloutMaxUnavailable "0") (eq $agentRolloutMaxUnavailable "0%")) (or (eq $agentRolloutMaxSurge "") (eq $agentRolloutMaxSurge "0") (eq $agentRolloutMaxSurge "0%")) -}}
 {{- fail "agent.rollout.maxUnavailable cannot be zero when agent.rollout.maxSurge is zero or unset" -}}
 {{- end -}}
-{{- include "ipars.validateHttpEndpointURL" (dict "path" "cluster.controlPlaneUrl" "value" .Values.cluster.controlPlaneUrl) -}}
-{{- include "ipars.validateHttpEndpointURL" (dict "path" "cluster.signalUrl" "value" .Values.cluster.signalUrl) -}}
+{{- include "heteronetwork.validateHttpEndpointURL" (dict "path" "cluster.controlPlaneUrl" "value" .Values.cluster.controlPlaneUrl) -}}
+{{- include "heteronetwork.validateHttpEndpointURL" (dict "path" "cluster.signalUrl" "value" .Values.cluster.signalUrl) -}}
 {{- if .Values.cluster.stunEndpoint -}}
-{{- include "ipars.validateSocketAddress" (dict "path" "cluster.stunEndpoint" "value" .Values.cluster.stunEndpoint) -}}
+{{- include "heteronetwork.validateSocketAddress" (dict "path" "cluster.stunEndpoint" "value" .Values.cluster.stunEndpoint) -}}
 {{- end -}}
 {{- if .Values.agent.relayAdvertisement.enabled -}}
 {{- if not .Values.agent.relayAdvertisement.publicEndpoint -}}
 {{- fail "agent.relayAdvertisement.publicEndpoint is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- include "ipars.validateAdvertisedSocketAddress" (dict "path" "agent.relayAdvertisement.publicEndpoint" "value" .Values.agent.relayAdvertisement.publicEndpoint) -}}
+{{- include "heteronetwork.validateAdvertisedSocketAddress" (dict "path" "agent.relayAdvertisement.publicEndpoint" "value" .Values.agent.relayAdvertisement.publicEndpoint) -}}
 {{- if not .Values.agent.relayAdvertisement.admissionUrl -}}
 {{- fail "agent.relayAdvertisement.admissionUrl is required when agent.relayAdvertisement.enabled=true" -}}
 {{- end -}}
-{{- include "ipars.validateAdvertisedHttpEndpointURL" (dict "path" "agent.relayAdvertisement.admissionUrl" "value" .Values.agent.relayAdvertisement.admissionUrl) -}}
+{{- include "heteronetwork.validateAdvertisedHttpEndpointURL" (dict "path" "agent.relayAdvertisement.admissionUrl" "value" .Values.agent.relayAdvertisement.admissionUrl) -}}
 {{- if .Values.agent.relayAdvertisement.statusUrl -}}
-{{- include "ipars.validateAdvertisedHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
+{{- include "heteronetwork.validateAdvertisedHttpEndpointURL" (dict "path" "agent.relayAdvertisement.statusUrl" "value" .Values.agent.relayAdvertisement.statusUrl) -}}
 {{- end -}}
 {{- $relayAdvertisementMaxSessions := printf "%v" .Values.agent.relayAdvertisement.maxSessions -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxSessions" "value" $relayAdvertisementMaxSessions "max" 4294967295) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxSessions" "value" $relayAdvertisementMaxSessions "max" 4294967295) -}}
 {{- if not (gt (int $relayAdvertisementMaxSessions) 0) -}}
 {{- fail "agent.relayAdvertisement.maxSessions must be greater than zero" -}}
 {{- end -}}
 {{- $relayAdvertisementMaxMbps := printf "%v" .Values.agent.relayAdvertisement.maxMbps -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxMbps" "value" $relayAdvertisementMaxMbps "max" 4294967295) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.relayAdvertisement.maxMbps" "value" $relayAdvertisementMaxMbps "max" 4294967295) -}}
 {{- if not (gt (int $relayAdvertisementMaxMbps) 0) -}}
 {{- fail "agent.relayAdvertisement.maxMbps must be greater than zero" -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.serviceExposure.enabled -}}
 {{- $serviceExposureRouteIntervalSeconds := printf "%v" .Values.serviceExposure.routeIntervalSeconds -}}
-{{- include "ipars.validateNonNegativeIntegerMax" (dict "path" "serviceExposure.routeIntervalSeconds" "value" $serviceExposureRouteIntervalSeconds "max" 9223372036854775807) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "serviceExposure.routeIntervalSeconds" "value" $serviceExposureRouteIntervalSeconds "max" 9223372036854775807) -}}
 {{- if not (gt (int $serviceExposureRouteIntervalSeconds) 0) -}}
 {{- fail "serviceExposure.routeIntervalSeconds must be greater than zero" -}}
 {{- end -}}
@@ -723,7 +728,7 @@
 {{- $serviceExposureRouteCidrs := dict -}}
 {{- range .Values.serviceExposure.apiServerCidrs -}}
 {{- $cidr := printf "%v" . -}}
-{{- include "ipars.validateKubernetesRouteCidr" (dict "path" "serviceExposure.apiServerCidrs" "value" $cidr) -}}
+{{- include "heteronetwork.validateKubernetesRouteCidr" (dict "path" "serviceExposure.apiServerCidrs" "value" $cidr) -}}
 {{- if hasKey $serviceExposureRouteCidrs $cidr -}}
 {{- fail (printf "serviceExposure.apiServerCidrs entry %q must not repeat a Kubernetes underlay route CIDR" $cidr) -}}
 {{- end -}}
@@ -731,7 +736,7 @@
 {{- end -}}
 {{- range .Values.serviceExposure.serviceCidrs -}}
 {{- $cidr := printf "%v" . -}}
-{{- include "ipars.validateKubernetesRouteCidr" (dict "path" "serviceExposure.serviceCidrs" "value" $cidr) -}}
+{{- include "heteronetwork.validateKubernetesRouteCidr" (dict "path" "serviceExposure.serviceCidrs" "value" $cidr) -}}
 {{- if hasKey $serviceExposureRouteCidrs $cidr -}}
 {{- fail (printf "serviceExposure.serviceCidrs entry %q must not repeat a Kubernetes underlay route CIDR" $cidr) -}}
 {{- end -}}
@@ -767,9 +772,9 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "ipars.fullname" . }}
+  name: {{ include "heteronetwork.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
 spec:
   {{- if ne $agentMinReadySeconds "" }}
@@ -793,12 +798,12 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+        app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
         app.kubernetes.io/instance: {{ .Release.Name | quote }}
         {{- range $key, $value := .Values.agent.podLabels }}
         {{ $key }}: {{ $value | quote }}
@@ -810,7 +815,7 @@ spec:
         {{- end }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "ipars.serviceAccountName" . }}
+      serviceAccountName: {{ include "heteronetwork.serviceAccountName" . }}
       automountServiceAccountToken: {{ $agentAutomountServiceAccountToken }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -1043,7 +1048,7 @@ spec:
           whenUnsatisfiable: {{ .whenUnsatisfiable | quote }}
           labelSelector:
             matchLabels:
-              app.kubernetes.io/name: {{ include "ipars.name" $ | quote }}
+              app.kubernetes.io/name: {{ include "heteronetwork.name" $ | quote }}
               app.kubernetes.io/instance: {{ $.Release.Name | quote }}
           {{- if hasKey . "minDomains" }}
           minDomains: {{ int .minDomains }}
@@ -1064,10 +1069,10 @@ spec:
             - /bin/sh
             - -ec
             - |
-              mkdir -p "$IPARS_AGENT_STATE_DIR"
-              chmod 0700 "$IPARS_AGENT_STATE_DIR"
+              mkdir -p "$HETERONETWORK_AGENT_STATE_DIR"
+              chmod 0700 "$HETERONETWORK_AGENT_STATE_DIR"
           env:
-            - name: IPARS_AGENT_STATE_DIR
+            - name: HETERONETWORK_AGENT_STATE_DIR
               value: {{ $agentStateMountPath | quote }}
           securityContext:
             runAsUser: 0
@@ -1097,6 +1102,8 @@ spec:
             - {{ $agentWireguardListenPortValue | quote }}
             - --stun-bind
             - {{ $agentStunBind | quote }}
+            - --nat-discovery-interval-seconds
+            - {{ $agentNatDiscoveryIntervalSeconds | quote }}
             - --runtime-backend
             - {{ $agentRuntimeBackend | quote }}
             - --join-token-path
@@ -1215,33 +1222,35 @@ spec:
             {{- end }}
             {{- end }}
           env:
-            - name: IPARS_AGENT_API_BEARER_TOKEN
+            - name: HETERONETWORK_AGENT_API_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.agent.joinTokenSecretName | quote }}
                   key: {{ .Values.agent.apiBearerTokenSecretKey | quote }}
-            - name: IPARS_KUBERNETES_NODE_NAME
+            - name: HETERONETWORK_KUBERNETES_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
             {{- if .Values.serviceExposure.enabled }}
-            - name: IPARS_KUBERNETES_DISCOVER_API_SERVER
+            - name: HETERONETWORK_KUBERNETES_DISCOVER_API_SERVER
               value: {{ .Values.serviceExposure.discoverApiServer | quote }}
             {{- end }}
-            - name: IPARS_CONTROL_PLANE_URL
+            - name: HETERONETWORK_CONTROL_PLANE_URL
               value: {{ .Values.cluster.controlPlaneUrl | quote }}
-            - name: IPARS_SIGNAL_URL
+            - name: HETERONETWORK_SIGNAL_URL
               value: {{ .Values.cluster.signalUrl | quote }}
-            - name: IPARS_STUN_ENDPOINT
+            - name: HETERONETWORK_STUN_ENDPOINT
               value: {{ .Values.cluster.stunEndpoint | quote }}
+            - name: HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS
+              value: {{ $agentNatDiscoveryIntervalSeconds | quote }}
             {{- if and $relayAdmissionBearerTokenSecretName $relayAdmissionBearerTokenSecretKey }}
-            - name: IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN
+            - name: HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ $relayAdmissionBearerTokenSecretName | quote }}
                   key: {{ $relayAdmissionBearerTokenSecretKey | quote }}
             {{- end }}
-            - name: IPARS_AGENT_WIREGUARD_INTERFACE
+            - name: HETERONETWORK_AGENT_WIREGUARD_INTERFACE
               value: {{ .Values.agent.interfaceName | quote }}
           securityContext:
             privileged: {{ $agentPrivileged }}
@@ -1364,20 +1373,20 @@ spec:
             - --relay-node-id-path
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
           env:
-            - name: IPARS_RELAY_UDP_LISTEN
+            - name: HETERONETWORK_RELAY_UDP_LISTEN
               value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.udpTargetPort) | quote }}
-            - name: IPARS_RELAY_HTTP_LISTEN
+            - name: HETERONETWORK_RELAY_HTTP_LISTEN
               value: {{ printf "0.0.0.0:%d" (int .Values.agent.relayService.httpTargetPort) | quote }}
-            - name: IPARS_RELAY_PUBLIC_ENDPOINT
+            - name: HETERONETWORK_RELAY_PUBLIC_ENDPOINT
               value: {{ .Values.agent.relayAdvertisement.publicEndpoint | quote }}
-            - name: IPARS_RELAY_ADMISSION_URL
+            - name: HETERONETWORK_RELAY_ADMISSION_URL
               value: {{ .Values.agent.relayAdvertisement.admissionUrl | quote }}
-            - name: IPARS_RELAY_MAX_SESSIONS
+            - name: HETERONETWORK_RELAY_MAX_SESSIONS
               value: {{ .Values.agent.relayAdvertisement.maxSessions | quote }}
-            - name: IPARS_RELAY_MAX_MBPS
+            - name: HETERONETWORK_RELAY_MAX_MBPS
               value: {{ .Values.agent.relayAdvertisement.maxMbps | quote }}
             {{- if and $relayAdmissionBearerTokenSecretName $relayAdmissionBearerTokenSecretKey }}
-            - name: IPARS_RELAY_ADMISSION_BEARER_TOKEN
+            - name: HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ $relayAdmissionBearerTokenSecretName | quote }}

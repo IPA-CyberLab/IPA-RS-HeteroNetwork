@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/ipa-cyberlab/ipars
+  repository: ghcr.io/ipa-cyberlab/heteronetwork
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -9,8 +9,8 @@ fullnameOverride: ""
 imagePullSecrets: []
 
 cluster:
-  controlPlaneUrl: "http://ipars-control-plane:8443"
-  signalUrl: "http://ipars-signal:9443"
+  controlPlaneUrl: "http://heteronetwork-control-plane:8443"
+  signalUrl: "http://heteronetwork-signal:9443"
   stunEndpoint: ""
 
 rbac:
@@ -22,9 +22,11 @@ serviceAccount:
   annotations: {}
 
 agent:
-  interfaceName: ipars0
+  interfaceName: heteronetwork0
   wireguardListenPort: 51820
   stunBind: "0.0.0.0:51820"
+  natDiscovery:
+    intervalSeconds: 60
   runtimeBackend: linux-command
   routeBackend: command
   peerMap:
@@ -46,7 +48,7 @@ agent:
     maxConcurrency: 32
     responderMaxRequestsPerSecond: 100
     observationMaxAgeSeconds: 120
-  joinTokenSecretName: ipars-join-token
+  joinTokenSecretName: heteronetwork-join-token
   joinTokenSecretKey: token
   apiBearerTokenSecretKey: agent-api-token
   routeProvider: true
@@ -54,9 +56,9 @@ agent:
   dnsPolicy: ClusterFirstWithHostNet
   automountServiceAccountToken: true
   state:
-    hostPath: /var/lib/ipars
+    hostPath: /var/lib/heteronetwork
     hostPathType: DirectoryOrCreate
-    mountPath: /var/lib/ipars
+    mountPath: /var/lib/heteronetwork
   probes:
     liveness:
       enabled: true
@@ -206,7 +208,7 @@ agent:
     sessionAffinity: ""
     sessionAffinityTimeoutSeconds: 0
     externalTrafficPolicy: Local
-    udpAppProtocol: ipars.io/relay-udp
+    udpAppProtocol: heteronetwork.io/relay-udp
     httpAppProtocol: http
     publishNotReadyAddresses: false
     udpPort: 51820

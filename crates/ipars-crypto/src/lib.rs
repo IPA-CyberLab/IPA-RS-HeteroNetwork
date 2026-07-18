@@ -710,6 +710,7 @@ mod tests {
                 message: Some("ok".to_string()),
             },
             candidates: Vec::new(),
+            nat_classification: None,
             relay_capability: None,
             routes: None,
             path_state: Vec::new(),

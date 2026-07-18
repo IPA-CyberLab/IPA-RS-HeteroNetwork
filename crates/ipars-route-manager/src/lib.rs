@@ -37,9 +37,9 @@ const MAX_LINUX_ROUTE_COMMAND_ARGS: usize = 1024;
 const MAX_LINUX_ROUTE_COMMAND_ARG_BYTES: usize = 128 * 1024;
 const MAX_LINUX_ROUTE_COMMAND_ARGV_BYTES: usize = 1024 * 1024;
 /// Numeric Linux route protocol reserved for peer-map routes owned by IPARS.
-pub const IPARS_MANAGED_ROUTE_PROTOCOL: u8 = 240;
-pub const IPARS_DOCKER_ROUTE_PROTOCOL: u8 = 241;
-pub const IPARS_KUBERNETES_ROUTE_PROTOCOL: u8 = 242;
+pub const HETERONETWORK_MANAGED_ROUTE_PROTOCOL: u8 = 240;
+pub const HETERONETWORK_DOCKER_ROUTE_PROTOCOL: u8 = 241;
+pub const HETERONETWORK_KUBERNETES_ROUTE_PROTOCOL: u8 = 242;
 const LINUX_ROUTE_PROTOCOL_BOOT: u8 = 3;
 const LINUX_ROUTE_PROTOCOL_STATIC: u8 = 4;
 const LINUX_MAIN_ROUTE_TABLE: u32 = 254;
@@ -80,9 +80,9 @@ pub enum RoutePlanOwner {
 impl RoutePlanOwner {
     pub const fn protocol(self) -> u8 {
         match self {
-            Self::PeerMap => IPARS_MANAGED_ROUTE_PROTOCOL,
-            Self::Docker => IPARS_DOCKER_ROUTE_PROTOCOL,
-            Self::Kubernetes => IPARS_KUBERNETES_ROUTE_PROTOCOL,
+            Self::PeerMap => HETERONETWORK_MANAGED_ROUTE_PROTOCOL,
+            Self::Docker => HETERONETWORK_DOCKER_ROUTE_PROTOCOL,
+            Self::Kubernetes => HETERONETWORK_KUBERNETES_ROUTE_PROTOCOL,
         }
     }
 
@@ -863,9 +863,9 @@ fn validate_managed_route_inventory(
         }
         if !matches!(
             route.protocol,
-            IPARS_MANAGED_ROUTE_PROTOCOL
-                | IPARS_DOCKER_ROUTE_PROTOCOL
-                | IPARS_KUBERNETES_ROUTE_PROTOCOL
+            HETERONETWORK_MANAGED_ROUTE_PROTOCOL
+                | HETERONETWORK_DOCKER_ROUTE_PROTOCOL
+                | HETERONETWORK_KUBERNETES_ROUTE_PROTOCOL
                 | LINUX_ROUTE_PROTOCOL_BOOT
                 | LINUX_ROUTE_PROTOCOL_STATIC
         ) {
@@ -897,9 +897,9 @@ fn validate_managed_route_inventory(
     for rule in &inventory.policy_rules {
         if !matches!(
             rule.protocol,
-            0 | IPARS_MANAGED_ROUTE_PROTOCOL
-                | IPARS_DOCKER_ROUTE_PROTOCOL
-                | IPARS_KUBERNETES_ROUTE_PROTOCOL
+            0 | HETERONETWORK_MANAGED_ROUTE_PROTOCOL
+                | HETERONETWORK_DOCKER_ROUTE_PROTOCOL
+                | HETERONETWORK_KUBERNETES_ROUTE_PROTOCOL
         ) {
             return Err(invalid_route_plan(format!(
                 "managed policy rule priority {} uses unsupported protocol {}",
@@ -2375,7 +2375,9 @@ fn route_protocol_is_in_scope(protocol: u8, owner: RoutePlanOwner) -> bool {
     protocol == owner.protocol()
         || matches!(
             protocol,
-            IPARS_MANAGED_ROUTE_PROTOCOL | LINUX_ROUTE_PROTOCOL_BOOT | LINUX_ROUTE_PROTOCOL_STATIC
+            HETERONETWORK_MANAGED_ROUTE_PROTOCOL
+                | LINUX_ROUTE_PROTOCOL_BOOT
+                | LINUX_ROUTE_PROTOCOL_STATIC
         )
 }
 
@@ -3182,7 +3184,12 @@ fn parse_netlink_rule_network(
 
 #[cfg(test)]
 fn netlink_route_message(route: &Route, interface_index: u32, table: Option<u32>) -> RouteMessage {
-    netlink_route_message_with_protocol(route, interface_index, table, IPARS_MANAGED_ROUTE_PROTOCOL)
+    netlink_route_message_with_protocol(
+        route,
+        interface_index,
+        table,
+        HETERONETWORK_MANAGED_ROUTE_PROTOCOL,
+    )
 }
 
 fn netlink_route_message_with_protocol(
@@ -4681,14 +4688,14 @@ mod tests {
                     cidr: "172.18.0.0/16".parse()?,
                     metric: 100,
                     table: 10_064,
-                    protocol: IPARS_DOCKER_ROUTE_PROTOCOL,
+                    protocol: HETERONETWORK_DOCKER_ROUTE_PROTOCOL,
                     scope: u8::from(RouteScope::Universe),
                 },
                 ManagedRoute {
                     cidr: "172.19.0.0/16".parse()?,
                     metric: 777,
                     table: 10_065,
-                    protocol: IPARS_DOCKER_ROUTE_PROTOCOL,
+                    protocol: HETERONETWORK_DOCKER_ROUTE_PROTOCOL,
                     scope: u8::from(RouteScope::Universe),
                 },
                 ManagedRoute {
@@ -4711,7 +4718,7 @@ mod tests {
             parse_managed_policy_rules(rules, RoutePlanOwner::Docker, PolicyRuleFamily::Ipv4)?;
         assert_eq!(parsed_rules.len(), 3);
         assert!(parsed_rules.iter().any(|rule| {
-            rule.protocol == IPARS_DOCKER_ROUTE_PROTOCOL
+            rule.protocol == HETERONETWORK_DOCKER_ROUTE_PROTOCOL
                 && rule.rule.priority == 10063
                 && rule.rule.table == 10_065
         }));
@@ -4763,7 +4770,7 @@ mod tests {
         assert_eq!(message.header.destination_prefix_length, 16);
         assert_eq!(
             message.header.protocol,
-            RouteProtocol::Other(IPARS_MANAGED_ROUTE_PROTOCOL)
+            RouteProtocol::Other(HETERONETWORK_MANAGED_ROUTE_PROTOCOL)
         );
         assert!(message
             .attributes
@@ -4812,8 +4819,11 @@ mod tests {
             fwmark: Some(0x6473),
         };
 
-        let message =
-            netlink_rule_message(&rule, PolicyRuleFamily::Ipv4, IPARS_DOCKER_ROUTE_PROTOCOL)?;
+        let message = netlink_rule_message(
+            &rule,
+            PolicyRuleFamily::Ipv4,
+            HETERONETWORK_DOCKER_ROUTE_PROTOCOL,
+        )?;
 
         assert_eq!(message.header.family, AddressFamily::Inet);
         assert_eq!(message.header.action, RuleAction::ToTable);
@@ -4845,7 +4855,7 @@ mod tests {
         };
 
         assert!(matches!(
-            netlink_rule_message(&rule, PolicyRuleFamily::Ipv4, IPARS_DOCKER_ROUTE_PROTOCOL),
+            netlink_rule_message(&rule, PolicyRuleFamily::Ipv4, HETERONETWORK_DOCKER_ROUTE_PROTOCOL),
             Err(RouteManagerError::InvalidPolicyRule(message))
                 if message.contains("mixes IPv4 and IPv6")
         ));

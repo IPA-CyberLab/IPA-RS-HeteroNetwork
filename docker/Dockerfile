@@ -14,7 +14,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl iproute2 wireguard-tools \
     && rm -rf /var/lib/apt/lists/* \
-    && install -d -m 0700 /var/lib/ipars
+    && install -d -m 0700 /var/lib/heteronetwork
 COPY --from=build /usr/local/bin/ipars /usr/local/bin/ipars
 COPY --from=build /usr/local/bin/iparsd /usr/local/bin/iparsd
 ENTRYPOINT ["/usr/local/bin/ipars"]

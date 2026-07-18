@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use ipars_crypto::WireGuardKeyPair;
-use ipars_route_manager::IPARS_MANAGED_ROUTE_PROTOCOL;
+use ipars_route_manager::HETERONETWORK_MANAGED_ROUTE_PROTOCOL;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde_json::Value;
 
@@ -25,13 +25,13 @@ const COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN: &str = "compose-relay-operator-ap
 
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
-    if std::env::var("IPARS_RUN_DOCKER_COMPOSE_SMOKE")
+    if std::env::var("HETERONETWORK_RUN_DOCKER_COMPOSE_SMOKE")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping Docker Compose smoke test; set IPARS_RUN_DOCKER_COMPOSE_SMOKE=1 to run it"
+            "skipping Docker Compose smoke test; set HETERONETWORK_RUN_DOCKER_COMPOSE_SMOKE=1 to run it"
         );
         return Ok(());
     }
@@ -116,33 +116,33 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered base Compose config did not enable agent peer-map application"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_AGENT_API_BEARER_TOKEN_PATH")
+        rendered.contains("HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-agent-api-bearer-token"),
         "rendered base Compose config did not mount the agent API Bearer secret"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")
+        rendered.contains("HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-control-plane-operator-api-bearer-token"),
         "rendered base Compose config did not mount the control-plane operator API Bearer secret"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")
+        rendered.contains("HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-signal-operator-api-bearer-token"),
         "rendered base Compose config did not mount the signal operator API Bearer secret"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN_PATH")
+        rendered.contains("HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-stun-operator-api-bearer-token"),
         "rendered base Compose config did not mount the STUN operator API Bearer secret"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")
+        rendered.contains("HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-relay-operator-api-bearer-token"),
         "rendered base Compose config did not mount the relay operator API Bearer secret"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")
-            && rendered.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+        rendered.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")
+            && rendered.contains("HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")
             && rendered.contains("/run/secrets/ipars-relay-admission-bearer-token"),
         "rendered base Compose config did not share the file-backed relay admission Bearer secret"
     );
@@ -157,103 +157,103 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         docker_socket,
         extra_env: vec![
             (
-                "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+                "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES".to_string(),
                 "true".to_string(),
             ),
             (
-                "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+                "HETERONETWORK_DOCKER_DISCOVER_NETWORKS".to_string(),
                 "true".to_string(),
             ),
             (
-                "IPARS_DOCKER_NETWORKS".to_string(),
+                "HETERONETWORK_DOCKER_NETWORKS".to_string(),
                 "edge_default,edge_apps".to_string(),
             ),
             (
-                "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+                "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE".to_string(),
                 "compose-edge".to_string(),
             ),
             (
-                "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+                "HETERONETWORK_DOCKER_HOST_INTERFACE".to_string(),
                 "br-edge".to_string(),
             ),
             (
-                "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+                "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
                 "false".to_string(),
             ),
             (
-                "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+                "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
                 "15".to_string(),
             ),
             (
-                "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+                "HETERONETWORK_AGENT_WIREGUARD_BACKEND".to_string(),
                 "userspace-command".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
                 "wireguard-go".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
                 "ipars0,--foreground".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
                 "30".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
                 "20".to_string(),
             ),
             (
-                "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
+                "HETERONETWORK_AGENT_DISABLE_PEER_PROBE".to_string(),
                 "false".to_string(),
             ),
             (
-                "IPARS_AGENT_PEER_PROBE_PORT".to_string(),
+                "HETERONETWORK_AGENT_PEER_PROBE_PORT".to_string(),
                 "51900".to_string(),
             ),
             (
-                "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
+                "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
                 "7".to_string(),
             ),
             (
-                "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
                 "90".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_ENDPOINT".to_string(),
                 "127.0.0.1:45182".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_BIND".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_BIND".to_string(),
                 "0.0.0.0:45182".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT".to_string(),
                 "127.0.0.1:51820".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS".to_string(),
                 "relay-fw".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS".to_string(),
                 "7".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS".to_string(),
                 "11".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS".to_string(),
                 "22".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW".to_string(),
                 "4".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS".to_string(),
                 "33".to_string(),
             ),
         ],
@@ -264,47 +264,68 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_rendered_compose_env(
         &rendered,
         &[
-            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "true"),
-            ("IPARS_AGENT_STUN_BIND", "0.0.0.0:51821"),
-            ("IPARS_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
-            ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
-            ("IPARS_DOCKER_DISCOVER_NETWORKS", "true"),
-            ("IPARS_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
-            ("IPARS_DOCKER_NETWORKS", "edge_default,edge_apps"),
-            ("IPARS_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
-            ("IPARS_DOCKER_HOST_INTERFACE", "br-edge"),
-            ("IPARS_DOCKER_EXPOSE_HOST_ROUTES", "false"),
-            ("IPARS_DOCKER_ROUTE_INTERVAL_SECONDS", "15"),
-            ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-command"),
-            ("IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND", "wireguard-go"),
+            ("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES", "true"),
+            ("HETERONETWORK_AGENT_STUN_BIND", "0.0.0.0:51821"),
+            ("HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
+            ("HETERONETWORK_AGENT_RUNTIME_BACKEND", "linux-command"),
+            ("HETERONETWORK_DOCKER_DISCOVER_NETWORKS", "true"),
+            ("HETERONETWORK_DOCKER_API_SOCKET", "/run/ipars/docker.sock"),
+            ("HETERONETWORK_DOCKER_NETWORKS", "edge_default,edge_apps"),
+            ("HETERONETWORK_DOCKER_CONTAINER_NAMESPACE", "compose-edge"),
+            ("HETERONETWORK_DOCKER_HOST_INTERFACE", "br-edge"),
+            ("HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES", "false"),
+            ("HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS", "15"),
+            ("HETERONETWORK_AGENT_WIREGUARD_BACKEND", "userspace-command"),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS",
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND",
+                "wireguard-go",
+            ),
+            (
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS",
                 "ipars0,--foreground",
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
                 "30",
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
                 "20",
             ),
-            ("IPARS_AGENT_DISABLE_PEER_PROBE", "false"),
-            ("IPARS_AGENT_PEER_PROBE_PORT", "51900"),
-            ("IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
-            ("IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS", "90"),
-            ("IPARS_AGENT_RELAY_FORWARDER_ENDPOINT", "127.0.0.1:45182"),
-            ("IPARS_AGENT_RELAY_FORWARDER_BIND", "0.0.0.0:45182"),
+            ("HETERONETWORK_AGENT_DISABLE_PEER_PROBE", "false"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_PORT", "51900"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT",
+                "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS",
+                "90",
+            ),
+            (
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_ENDPOINT",
+                "127.0.0.1:45182",
+            ),
+            ("HETERONETWORK_AGENT_RELAY_FORWARDER_BIND", "0.0.0.0:45182"),
+            (
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT",
                 "127.0.0.1:51820",
             ),
-            ("IPARS_AGENT_RELAY_FORWARDER_NETNS", "relay-fw"),
-            ("IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS", "7"),
-            ("IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS", "11"),
-            ("IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS", "22"),
-            ("IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW", "4"),
-            ("IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS", "33"),
+            ("HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS", "relay-fw"),
+            ("HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS", "7"),
+            (
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS",
+                "11",
+            ),
+            (
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS",
+                "22",
+            ),
+            (
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW",
+                "4",
+            ),
+            (
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS",
+                "33",
+            ),
         ],
     )?;
     anyhow::ensure!(
@@ -343,95 +364,95 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         docker_socket: temp_dir.join("rootless-docker.sock"),
         extra_env: vec![
             (
-                "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS".to_string(),
                 "7".to_string(),
             ),
             (
-                "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS".to_string(),
                 "45".to_string(),
             ),
             (
-                "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS".to_string(),
                 "90".to_string(),
             ),
             (
-                "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
                 "240".to_string(),
             ),
             (
-                "IPARS_AGENT_APPLY_DOCKER_ROUTES".to_string(),
+                "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES".to_string(),
                 "true".to_string(),
             ),
             (
-                "IPARS_DOCKER_DISCOVER_NETWORKS".to_string(),
+                "HETERONETWORK_DOCKER_DISCOVER_NETWORKS".to_string(),
                 "true".to_string(),
             ),
             (
-                "IPARS_DOCKER_API_SOCKET".to_string(),
+                "HETERONETWORK_DOCKER_API_SOCKET".to_string(),
                 "/run/ipars/docker.sock".to_string(),
             ),
             (
-                "IPARS_DOCKER_NETWORKS".to_string(),
+                "HETERONETWORK_DOCKER_NETWORKS".to_string(),
                 "edge_default,edge_apps".to_string(),
             ),
             (
-                "IPARS_DOCKER_CONTAINER_NAMESPACE".to_string(),
+                "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE".to_string(),
                 "compose-edge".to_string(),
             ),
             (
-                "IPARS_DOCKER_HOST_INTERFACE".to_string(),
+                "HETERONETWORK_DOCKER_HOST_INTERFACE".to_string(),
                 "br-edge".to_string(),
             ),
             (
-                "IPARS_DOCKER_CONTAINER_CIDRS".to_string(),
+                "HETERONETWORK_DOCKER_CONTAINER_CIDRS".to_string(),
                 "172.31.0.0/16".to_string(),
             ),
             (
-                "IPARS_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
+                "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES".to_string(),
                 "false".to_string(),
             ),
             (
-                "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
+                "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS".to_string(),
                 "15".to_string(),
             ),
             (
-                "IPARS_AGENT_WIREGUARD_BACKEND".to_string(),
+                "HETERONETWORK_AGENT_WIREGUARD_BACKEND".to_string(),
                 "command".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND".to_string(),
                 "wireguard-go".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS".to_string(),
                 "ipars0".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS".to_string(),
                 "30".to_string(),
             ),
             (
-                "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS".to_string(),
                 "20".to_string(),
             ),
             (
-                "IPARS_AGENT_DISABLE_PEER_PROBE".to_string(),
+                "HETERONETWORK_AGENT_DISABLE_PEER_PROBE".to_string(),
                 "false".to_string(),
             ),
             (
-                "IPARS_AGENT_PEER_PROBE_PORT".to_string(),
+                "HETERONETWORK_AGENT_PEER_PROBE_PORT".to_string(),
                 "51900".to_string(),
             ),
             (
-                "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
+                "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT".to_string(),
                 "7".to_string(),
             ),
             (
-                "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
+                "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS".to_string(),
                 "90".to_string(),
             ),
             (
-                "IPARS_AGENT_RELAY_FORWARDER_NETNS".to_string(),
+                "HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS".to_string(),
                 "relay-fw".to_string(),
             ),
         ],
@@ -442,36 +463,45 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_rendered_compose_env(
         &rendered,
         &[
-            ("IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS", "7"),
-            ("IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS", "45"),
-            ("IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS", "90"),
-            ("IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS", "240"),
-            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
-            ("IPARS_AGENT_STUN_BIND", "0.0.0.0:51821"),
-            ("IPARS_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
-            ("IPARS_AGENT_RUNTIME_BACKEND", "dry-run"),
-            ("IPARS_AGENT_DISABLE_PEER_PROBE", "true"),
-            ("IPARS_AGENT_PEER_PROBE_PORT", "51900"),
-            ("IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
-            ("IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS", "90"),
-            ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
-            ("IPARS_AGENT_WIREGUARD_BACKEND", "command"),
-            ("IPARS_AGENT_ROUTE_BACKEND", "command"),
+            ("HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS", "7"),
+            ("HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS", "45"),
+            (
+                "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS",
+                "90",
+            ),
+            (
+                "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS",
+                "240",
+            ),
+            ("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("HETERONETWORK_AGENT_STUN_BIND", "0.0.0.0:51821"),
+            ("HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
+            ("HETERONETWORK_AGENT_RUNTIME_BACKEND", "dry-run"),
+            ("HETERONETWORK_AGENT_DISABLE_PEER_PROBE", "true"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_PORT", "51900"),
+            ("HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
+            (
+                "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS",
+                "90",
+            ),
+            ("HETERONETWORK_DOCKER_DISCOVER_NETWORKS", "false"),
+            ("HETERONETWORK_AGENT_WIREGUARD_BACKEND", "command"),
+            ("HETERONETWORK_AGENT_ROUTE_BACKEND", "command"),
         ],
     )?;
     for forbidden in [
-        "IPARS_DOCKER_API_SOCKET:",
-        "IPARS_DOCKER_NETWORKS:",
-        "IPARS_DOCKER_CONTAINER_NAMESPACE:",
-        "IPARS_DOCKER_CONTAINER_CIDRS:",
-        "IPARS_DOCKER_HOST_INTERFACE:",
-        "IPARS_DOCKER_EXPOSE_HOST_ROUTES:",
-        "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS:",
-        "IPARS_AGENT_RELAY_FORWARDER_",
-        "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND:",
-        "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS:",
-        "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS:",
-        "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS:",
+        "HETERONETWORK_DOCKER_API_SOCKET:",
+        "HETERONETWORK_DOCKER_NETWORKS:",
+        "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE:",
+        "HETERONETWORK_DOCKER_CONTAINER_CIDRS:",
+        "HETERONETWORK_DOCKER_HOST_INTERFACE:",
+        "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES:",
+        "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS:",
+        "HETERONETWORK_AGENT_RELAY_FORWARDER_",
+        "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND:",
+        "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS:",
+        "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS:",
+        "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS:",
         "target: /run/ipars/docker.sock",
     ] {
         anyhow::ensure!(
@@ -505,12 +535,15 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     assert_rendered_compose_env(
         &rendered,
         &[
-            ("IPARS_AGENT_RUNTIME_BACKEND", "linux-command"),
-            ("IPARS_AGENT_WIREGUARD_BACKEND", "userspace-boringtun"),
-            ("IPARS_AGENT_ROUTE_BACKEND", "command"),
-            ("IPARS_AGENT_APPLY_DOCKER_ROUTES", "false"),
-            ("IPARS_DOCKER_DISCOVER_NETWORKS", "false"),
-            ("IPARS_AGENT_DISABLE_PEER_PROBE", "false"),
+            ("HETERONETWORK_AGENT_RUNTIME_BACKEND", "linux-command"),
+            (
+                "HETERONETWORK_AGENT_WIREGUARD_BACKEND",
+                "userspace-boringtun",
+            ),
+            ("HETERONETWORK_AGENT_ROUTE_BACKEND", "command"),
+            ("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES", "false"),
+            ("HETERONETWORK_DOCKER_DISCOVER_NETWORKS", "false"),
+            ("HETERONETWORK_AGENT_DISABLE_PEER_PROBE", "false"),
         ],
     )?;
     anyhow::ensure!(
@@ -522,11 +555,11 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         "rendered rootless dataplane Compose config did not mount /dev/net/tun"
     );
     for forbidden in [
-        "IPARS_DOCKER_API_SOCKET:",
-        "IPARS_DOCKER_NETWORKS:",
-        "IPARS_DOCKER_CONTAINER_NAMESPACE:",
-        "IPARS_DOCKER_CONTAINER_CIDRS:",
-        "IPARS_AGENT_RELAY_FORWARDER_",
+        "HETERONETWORK_DOCKER_API_SOCKET:",
+        "HETERONETWORK_DOCKER_NETWORKS:",
+        "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE:",
+        "HETERONETWORK_DOCKER_CONTAINER_CIDRS:",
+        "HETERONETWORK_AGENT_RELAY_FORWARDER_",
         "target: /run/ipars/docker.sock",
     ] {
         anyhow::ensure!(
@@ -555,46 +588,46 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         String::from_utf8(rendered.stdout).context("compose config output was not UTF-8")?;
     anyhow::ensure!(
         rendered.contains(&format!(
-            "IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}"
+            "HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}"
         )),
         "rendered Compose config did not include the control-plane host port override"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_AGENT_JOIN_TOKEN:"),
+        rendered.contains("HETERONETWORK_AGENT_JOIN_TOKEN:"),
         "rendered smoke Compose config did not include the inline join token override"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_RELAY_ADMISSION_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN")
             && rendered.contains(COMPOSE_RELAY_ADMISSION_BEARER_TOKEN),
         "rendered smoke Compose config did not require relay admission Bearer auth"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN")
             && rendered.contains(COMPOSE_RELAY_ADMISSION_BEARER_TOKEN),
         "rendered smoke Compose config did not pass the relay admission Bearer token to the agent"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_AGENT_API_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_AGENT_API_BEARER_TOKEN")
             && rendered.contains(COMPOSE_AGENT_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require agent API Bearer auth"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN")
             && rendered.contains(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require control-plane operator API Bearer auth"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN")
             && rendered.contains(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require signal operator API Bearer auth"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_STUN_OPERATOR_API_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN")
             && rendered.contains(COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require STUN operator API Bearer auth"
     );
     anyhow::ensure!(
-        rendered.contains("IPARS_RELAY_OPERATOR_API_BEARER_TOKEN")
+        rendered.contains("HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN")
             && rendered.contains(COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN),
         "rendered smoke Compose config did not require relay operator API Bearer auth"
     );
@@ -777,16 +810,16 @@ fn assert_compose_postgres_token_revocation(
 
     let mut join_command = compose_command(compose);
     let join_output = join_command
-        .env("IPARS_UNUSED_JOIN_TOKEN", &unused_token_json)
+        .env("HETERONETWORK_UNUSED_JOIN_TOKEN", &unused_token_json)
         .args([
             "exec",
             "-T",
             "-e",
-            "IPARS_UNUSED_JOIN_TOKEN",
+            "HETERONETWORK_UNUSED_JOIN_TOKEN",
             "control-plane",
             "/bin/sh",
             "-c",
-            "exec /usr/local/bin/ipars join \"$IPARS_UNUSED_JOIN_TOKEN\" --control-plane-url http://127.0.0.1:8443",
+            "exec /usr/local/bin/ipars join \"$HETERONETWORK_UNUSED_JOIN_TOKEN\" --control-plane-url http://127.0.0.1:8443",
         ])
         .output()
         .context("failed to attempt preemptively revoked PostgreSQL token join")?;
@@ -816,13 +849,13 @@ fn assert_compose_postgres_token_revocation(
 fn compose_issuer_ipars_command(compose: &ComposeProject, issuer_private_key: &str) -> Command {
     let mut command = compose_command(compose);
     command
-        .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
-        .env_remove("IPARS_ISSUER_PRIVATE_KEY_PATH")
+        .env("HETERONETWORK_ISSUER_PRIVATE_KEY", issuer_private_key)
+        .env_remove("HETERONETWORK_ISSUER_PRIVATE_KEY_PATH")
         .args([
             "exec",
             "-T",
             "-e",
-            "IPARS_ISSUER_PRIVATE_KEY",
+            "HETERONETWORK_ISSUER_PRIVATE_KEY",
             "control-plane",
             "/usr/local/bin/ipars",
         ]);
@@ -912,51 +945,60 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         ],
         docker_socket,
         extra_env: vec![
-            ("IPARS_DATAPLANE_CLUSTER_ID".to_string(), cluster_id.clone()),
-            ("IPARS_DATAPLANE_ISSUER_NODE_ID".to_string(), issuer_node_id),
             (
-                "IPARS_DATAPLANE_ISSUER_PUBLIC_KEY".to_string(),
+                "HETERONETWORK_DATAPLANE_CLUSTER_ID".to_string(),
+                cluster_id.clone(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_ISSUER_NODE_ID".to_string(),
+                issuer_node_id,
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_ISSUER_PUBLIC_KEY".to_string(),
                 issuer_public_key,
             ),
             (
-                "IPARS_DATAPLANE_BOOTSTRAP_IP".to_string(),
+                "HETERONETWORK_DATAPLANE_BOOTSTRAP_IP".to_string(),
                 "127.0.0.1".to_string(),
             ),
-            ("IPARS_DATAPLANE_JOIN_TOKEN".to_string(), placeholder_token),
             (
-                "IPARS_DATAPLANE_AGENT_API_BEARER_TOKEN".to_string(),
+                "HETERONETWORK_DATAPLANE_JOIN_TOKEN".to_string(),
+                placeholder_token,
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN".to_string(),
                 agent_api_bearer_token,
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_A_NETWORK".to_string(),
+                "HETERONETWORK_DATAPLANE_WORKLOAD_A_NETWORK".to_string(),
                 "placeholder-workload-a".to_string(),
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_B_NETWORK".to_string(),
+                "HETERONETWORK_DATAPLANE_WORKLOAD_B_NETWORK".to_string(),
                 "placeholder-workload-b".to_string(),
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_A_V6_NETWORK".to_string(),
+                "HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_NETWORK".to_string(),
                 "placeholder-workload-a-v6".to_string(),
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_B_V6_NETWORK".to_string(),
+                "HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_NETWORK".to_string(),
                 "placeholder-workload-b-v6".to_string(),
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_A_V6_CIDR".to_string(),
+                "HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_CIDR".to_string(),
                 workload_a_v6_cidr.to_string(),
             ),
             (
-                "IPARS_DATAPLANE_WORKLOAD_B_V6_CIDR".to_string(),
+                "HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_CIDR".to_string(),
                 workload_b_v6_cidr.to_string(),
             ),
             (
-                "IPARS_DATAPLANE_ROUTE_A_NETWORK".to_string(),
+                "HETERONETWORK_DATAPLANE_ROUTE_A_NETWORK".to_string(),
                 route_a_network.clone(),
             ),
             (
-                "IPARS_DATAPLANE_ROUTE_B_NETWORK".to_string(),
+                "HETERONETWORK_DATAPLANE_ROUTE_B_NETWORK".to_string(),
                 route_b_network.clone(),
             ),
         ],
@@ -975,22 +1017,22 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     let workload_b_v6_network = compose_network_name(&compose, "workload-b-v6")?;
     replace_compose_env(
         &mut compose,
-        "IPARS_DATAPLANE_WORKLOAD_A_NETWORK",
+        "HETERONETWORK_DATAPLANE_WORKLOAD_A_NETWORK",
         workload_a_network,
     )?;
     replace_compose_env(
         &mut compose,
-        "IPARS_DATAPLANE_WORKLOAD_B_NETWORK",
+        "HETERONETWORK_DATAPLANE_WORKLOAD_B_NETWORK",
         workload_b_network,
     )?;
     replace_compose_env(
         &mut compose,
-        "IPARS_DATAPLANE_WORKLOAD_A_V6_NETWORK",
+        "HETERONETWORK_DATAPLANE_WORKLOAD_A_V6_NETWORK",
         workload_a_v6_network,
     )?;
     replace_compose_env(
         &mut compose,
-        "IPARS_DATAPLANE_WORKLOAD_B_V6_NETWORK",
+        "HETERONETWORK_DATAPLANE_WORKLOAD_B_V6_NETWORK",
         workload_b_v6_network,
     )?;
 
@@ -1064,12 +1106,12 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     )?;
     replace_compose_env(
         &mut compose,
-        "IPARS_DATAPLANE_BOOTSTRAP_IP",
+        "HETERONETWORK_DATAPLANE_BOOTSTRAP_IP",
         bootstrap_ip.to_string(),
     )?;
     replace_compose_env(
         &mut compose,
-        "IPARS_DATAPLANE_JOIN_TOKEN",
+        "HETERONETWORK_DATAPLANE_JOIN_TOKEN",
         join_token.to_string(),
     )?;
     let rendered = run_compose(&compose, ["config"])?;
@@ -1077,14 +1119,14 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         String::from_utf8(rendered.stdout).context("dataplane Compose config was not UTF-8")?;
     anyhow::ensure!(
         rendered
-            .matches("IPARS_AGENT_RUNTIME_BACKEND: linux-command")
+            .matches("HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command")
             .count()
             == 2,
         "dataplane Compose config did not render two production Agent backends\n{rendered}"
     );
     anyhow::ensure!(
         rendered
-            .matches("IPARS_AGENT_RUNTIME_BACKEND: dry-run")
+            .matches("HETERONETWORK_AGENT_RUNTIME_BACKEND: dry-run")
             .count()
             == 1,
         "dataplane Compose config did not render one post-failover dry-run Agent backend\n{rendered}"
@@ -1094,12 +1136,12 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "dataplane Compose config unexpectedly mounted /dev/net/tun\n{rendered}"
     );
     anyhow::ensure!(
-        !rendered.contains("IPARS_AGENT_SIGNAL_URL"),
+        !rendered.contains("HETERONETWORK_AGENT_SIGNAL_URL"),
         "dataplane Compose config unexpectedly pinned an Agent to one Signal service\n{rendered}"
     );
     anyhow::ensure!(
         rendered
-            .matches("IPARS_DOCKER_DISCOVER_NETWORKS: \"true\"")
+            .matches("HETERONETWORK_DOCKER_DISCOVER_NETWORKS: \"true\"")
             .count()
             == 2
             && rendered.matches("target: /run/ipars/docker.sock").count() == 2
@@ -1393,7 +1435,7 @@ fn generated_dataplane_join_token(
     let stun_b = "udp://control-plane-b:3478";
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipars"));
     command
-        .env("IPARS_ISSUER_PRIVATE_KEY", issuer_private_key)
+        .env("HETERONETWORK_ISSUER_PRIVATE_KEY", issuer_private_key)
         .args([
             "token",
             "create",
@@ -1520,27 +1562,27 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       - --issuer-public-key
       - {issuer_public_key}
     environment: !override
-      IPARS_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
-      IPARS_ROLE: control-plane
-      IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: {control_plane_operator_api_bearer_token}
+      HETERONETWORK_DATABASE_URL: postgres://ipars:ipars-dev@postgres:5432/ipars
+      HETERONETWORK_ROLE: control-plane
+      HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: {control_plane_operator_api_bearer_token}
     secrets: !reset []
     ports:
       - "{control_plane_port}:8443"
 
   signal:
     environment: !override
-      IPARS_ROLE: signal
-      IPARS_SIGNAL_CONTROL_PLANE_URLS: http://control-plane:8443
-      IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN: {signal_operator_api_bearer_token}
+      HETERONETWORK_ROLE: signal
+      HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS: http://control-plane:8443
+      HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN: {signal_operator_api_bearer_token}
     secrets: !reset []
     ports:
       - "{signal_port}:9443"
 
   stun:
     environment: !override
-      IPARS_ROLE: stun
-      IPARS_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
-      IPARS_STUN_OPERATOR_API_BEARER_TOKEN: {stun_operator_api_bearer_token}
+      HETERONETWORK_ROLE: stun
+      HETERONETWORK_STUN_ALTERNATE_LISTEN: 0.0.0.0:3480
+      HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN: {stun_operator_api_bearer_token}
     secrets: !reset []
     ports:
       - "{stun_port}:3478/udp"
@@ -1551,17 +1593,17 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
     cap_add: !reset []
     devices: !reset []
     environment: !override
-      IPARS_ROLE: relay
-      IPARS_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
-      IPARS_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
-      IPARS_RELAY_MAX_SESSIONS: "10000"
-      IPARS_RELAY_MAX_SESSIONS_PER_NODE: "0"
-      IPARS_RELAY_MAX_MBPS: "1000"
-      IPARS_RELAY_SESSION_TTL_SECONDS: "300"
-      IPARS_RELAY_ADMISSION_RATE_LIMIT: "4096"
-      IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: "60"
-      IPARS_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
-      IPARS_RELAY_OPERATOR_API_BEARER_TOKEN: {relay_operator_api_bearer_token}
+      HETERONETWORK_ROLE: relay
+      HETERONETWORK_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
+      HETERONETWORK_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
+      HETERONETWORK_RELAY_MAX_SESSIONS: "10000"
+      HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE: "0"
+      HETERONETWORK_RELAY_MAX_MBPS: "1000"
+      HETERONETWORK_RELAY_SESSION_TTL_SECONDS: "300"
+      HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT: "4096"
+      HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: "60"
+      HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
+      HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN: {relay_operator_api_bearer_token}
     secrets: !reset []
     ports:
       - "{relay_udp_port}:51820/udp"
@@ -1574,21 +1616,21 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
     volumes: !reset
       - agent-data:/var/lib/ipars
     environment: !override
-      IPARS_ROLE: agent
-      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
-      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
-      IPARS_AGENT_JOIN_TOKEN: {join_token}
-      IPARS_AGENT_API_BEARER_TOKEN: {agent_api_bearer_token}
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:0
-      IPARS_AGENT_RUNTIME_BACKEND: dry-run
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
-      IPARS_AGENT_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
-      IPARS_AGENT_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
-      IPARS_AGENT_RELAY_STATUS_URL: http://127.0.0.1:{relay_http_port}
-      IPARS_AGENT_RELAY_MAX_SESSIONS: "10000"
-      IPARS_AGENT_RELAY_MAX_MBPS: "1000"
-      IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
+      HETERONETWORK_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
+      HETERONETWORK_AGENT_JOIN_TOKEN: {join_token}
+      HETERONETWORK_AGENT_API_BEARER_TOKEN: {agent_api_bearer_token}
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:0
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: dry-run
+      HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES: "false"
+      HETERONETWORK_DOCKER_DISCOVER_NETWORKS: "false"
+      HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:{relay_udp_port}
+      HETERONETWORK_AGENT_RELAY_ADMISSION_URL: http://127.0.0.1:{relay_http_port}
+      HETERONETWORK_AGENT_RELAY_STATUS_URL: http://127.0.0.1:{relay_http_port}
+      HETERONETWORK_AGENT_RELAY_MAX_SESSIONS: "10000"
+      HETERONETWORK_AGENT_RELAY_MAX_MBPS: "1000"
+      HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN: {relay_admission_bearer_token}
     command:
       - agent
       - --listen
@@ -1621,15 +1663,15 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
     volumes:
       - agent-b-data:/var/lib/ipars
     environment:
-      IPARS_ROLE: agent
-      IPARS_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
-      IPARS_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
-      IPARS_AGENT_JOIN_TOKEN: {join_token}
-      IPARS_AGENT_API_BEARER_TOKEN: {agent_api_bearer_token}
-      IPARS_AGENT_STUN_BIND: 0.0.0.0:0
-      IPARS_AGENT_RUNTIME_BACKEND: dry-run
-      IPARS_AGENT_APPLY_DOCKER_ROUTES: "false"
-      IPARS_DOCKER_DISCOVER_NETWORKS: "false"
+      HETERONETWORK_ROLE: agent
+      HETERONETWORK_AGENT_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
+      HETERONETWORK_AGENT_SIGNAL_URL: http://127.0.0.1:{signal_port}
+      HETERONETWORK_AGENT_JOIN_TOKEN: {join_token}
+      HETERONETWORK_AGENT_API_BEARER_TOKEN: {agent_api_bearer_token}
+      HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:0
+      HETERONETWORK_AGENT_RUNTIME_BACKEND: dry-run
+      HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES: "false"
+      HETERONETWORK_DOCKER_DISCOVER_NETWORKS: "false"
     command:
       - agent
       - --listen
@@ -1756,7 +1798,7 @@ fn docker_engine_socket_path() -> Result<PathBuf> {
     anyhow::bail!("Docker dataplane discovery smoke requires a Unix host");
 
     let mut candidates = Vec::new();
-    if let Some(configured) = std::env::var_os("IPARS_DOCKER_API_SOCKET_HOST") {
+    if let Some(configured) = std::env::var_os("HETERONETWORK_DOCKER_API_SOCKET_HOST") {
         candidates.push(PathBuf::from(configured));
     }
     candidates.push(client_socket);
@@ -2298,7 +2340,7 @@ fn assert_compose_reconciles_unknown_managed_route(
 ) -> Result<()> {
     let stale_cidr = "192.0.2.253/32";
     let stale_destination = "192.0.2.253";
-    let managed_protocol = IPARS_MANAGED_ROUTE_PROTOCOL.to_string();
+    let managed_protocol = HETERONETWORK_MANAGED_ROUTE_PROTOCOL.to_string();
     run_compose_with_diagnostics(
         compose,
         [
@@ -4165,7 +4207,10 @@ fn compose_command(compose: &ComposeProject) -> Command {
     let mut command = Command::new("docker");
     command
         .current_dir(&compose.repo_root)
-        .env("IPARS_DOCKER_API_SOCKET_HOST", &compose.docker_socket)
+        .env(
+            "HETERONETWORK_DOCKER_API_SOCKET_HOST",
+            &compose.docker_socket,
+        )
         .args(["compose", "-p", &compose.project_name]);
     for (name, value) in &compose.extra_env {
         command.env(name, value);

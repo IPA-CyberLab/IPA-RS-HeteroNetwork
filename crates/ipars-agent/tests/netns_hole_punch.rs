@@ -55,17 +55,17 @@ const NAT_PUNCH_ATTEMPTS: usize = 20;
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -111,11 +111,11 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
         DIRECT_TEST_NAME,
         &namespace_a,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.0.1:40101"),
-            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "receiver"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.0.1:40101"),
+            ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
             (
-                "IPARS_HOLE_PUNCH_READY_FILE",
+                "HETERONETWORK_HOLE_PUNCH_READY_FILE",
                 ready_a.to_str().unwrap_or_default(),
             ),
         ],
@@ -124,11 +124,11 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
         DIRECT_TEST_NAME,
         &namespace_b,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.0.2:40102"),
-            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "receiver"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.0.2:40102"),
+            ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
             (
-                "IPARS_HOLE_PUNCH_READY_FILE",
+                "HETERONETWORK_HOLE_PUNCH_READY_FILE",
                 ready_b.to_str().unwrap_or_default(),
             ),
         ],
@@ -140,18 +140,18 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
         DIRECT_TEST_NAME,
         &namespace_a,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "puncher"),
-            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.0.1:0"),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "puncher"),
+            ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.0.1:0"),
         ],
     )?;
     let puncher_b = spawn_child(
         DIRECT_TEST_NAME,
         &namespace_b,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "puncher"),
-            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.0.2:0"),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "puncher"),
+            ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.0.2:0"),
         ],
     )?;
 
@@ -168,17 +168,17 @@ async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
 #[tokio::test]
 async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -231,11 +231,11 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         SIGNAL_PLAN_TEST_NAME,
         &namespace_a,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.1:40111"),
-            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "receiver"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.1:40111"),
+            ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
             (
-                "IPARS_HOLE_PUNCH_READY_FILE",
+                "HETERONETWORK_HOLE_PUNCH_READY_FILE",
                 ready_a.to_str().unwrap_or_default(),
             ),
         ],
@@ -244,11 +244,11 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         SIGNAL_PLAN_TEST_NAME,
         &namespace_b,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "receiver"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.2:40112"),
-            ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "receiver"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.2:40112"),
+            ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
             (
-                "IPARS_HOLE_PUNCH_READY_FILE",
+                "HETERONETWORK_HOLE_PUNCH_READY_FILE",
                 ready_b.to_str().unwrap_or_default(),
             ),
         ],
@@ -260,20 +260,20 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         SIGNAL_PLAN_TEST_NAME,
         &namespace_a,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
-            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.1:0"),
-            ("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
+            ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.1:0"),
+            ("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
         ],
     )?;
     let puncher_b = spawn_child(
         SIGNAL_PLAN_TEST_NAME,
         &namespace_b,
         [
-            ("IPARS_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
-            ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-            ("IPARS_HOLE_PUNCH_BIND", "10.240.2.2:0"),
-            ("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
+            ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
+            ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.2:0"),
+            ("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
         ],
     )?;
 
@@ -290,17 +290,17 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
 #[tokio::test]
 async fn udp_hole_puncher_uses_signal_plan_across_endpoint_independent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan endpoint-independent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan endpoint-independent SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -345,17 +345,17 @@ async fn udp_hole_puncher_uses_signal_plan_across_endpoint_independent_snat_netw
 #[tokio::test]
 async fn udp_hole_puncher_uses_signal_plan_across_fixed_port_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan fixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan fixed-port SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -400,17 +400,17 @@ async fn udp_hole_puncher_uses_signal_plan_across_fixed_port_snat_network_namesp
 #[tokio::test]
 async fn udp_hole_puncher_uses_signal_plan_across_mixed_port_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan mixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan mixed-port SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -455,17 +455,17 @@ async fn udp_hole_puncher_uses_signal_plan_across_mixed_port_snat_network_namesp
 #[tokio::test]
 async fn udp_hole_puncher_does_not_traverse_signal_plan_address_port_dependent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan address/port-dependent SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -510,17 +510,17 @@ async fn udp_hole_puncher_does_not_traverse_signal_plan_address_port_dependent_s
 #[tokio::test]
 async fn udp_hole_puncher_does_not_traverse_signal_plan_asymmetric_address_port_dependent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan asymmetric address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan asymmetric address/port-dependent SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -565,17 +565,17 @@ async fn udp_hole_puncher_does_not_traverse_signal_plan_asymmetric_address_port_
 #[tokio::test]
 async fn udp_hole_puncher_uses_signal_plan_across_one_sided_public_peer_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan one-sided public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan one-sided public-peer SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -619,17 +619,17 @@ async fn udp_hole_puncher_uses_signal_plan_across_one_sided_public_peer_snat_net
 #[tokio::test]
 async fn udp_hole_puncher_uses_signal_plan_across_one_sided_port_preserving_public_peer_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan one-sided port-preserving public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan one-sided port-preserving public-peer SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -673,17 +673,17 @@ async fn udp_hole_puncher_uses_signal_plan_across_one_sided_port_preserving_publ
 #[tokio::test]
 async fn udp_hole_puncher_does_not_traverse_signal_plan_one_sided_address_port_dependent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping signal-plan one-sided address/port-dependent public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping signal-plan one-sided address/port-dependent public-peer SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -727,17 +727,17 @@ async fn udp_hole_puncher_does_not_traverse_signal_plan_one_sided_address_port_d
 #[tokio::test]
 async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping hole-punch NAT netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping hole-punch NAT netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -766,17 +766,17 @@ async fn udp_hole_puncher_traverses_endpoint_independent_nat_network_namespaces(
 #[tokio::test]
 async fn udp_hole_puncher_traverses_fixed_port_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping fixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping fixed-port SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -805,17 +805,17 @@ async fn udp_hole_puncher_traverses_fixed_port_snat_network_namespaces(
 #[tokio::test]
 async fn udp_hole_puncher_traverses_mixed_port_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping mixed-port SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping mixed-port SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -844,17 +844,17 @@ async fn udp_hole_puncher_traverses_mixed_port_snat_network_namespaces(
 #[tokio::test]
 async fn udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping address/port-dependent SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -883,17 +883,17 @@ async fn udp_hole_puncher_does_not_traverse_address_port_dependent_snat_network_
 #[tokio::test]
 async fn udp_hole_puncher_does_not_traverse_asymmetric_address_port_dependent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping asymmetric address/port-dependent SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping asymmetric address/port-dependent SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -922,17 +922,17 @@ async fn udp_hole_puncher_does_not_traverse_asymmetric_address_port_dependent_sn
 #[tokio::test]
 async fn udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping one-sided public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping one-sided public-peer SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -947,17 +947,17 @@ async fn udp_hole_puncher_traverses_one_sided_public_peer_snat_network_namespace
 #[tokio::test]
 async fn udp_hole_puncher_traverses_one_sided_port_preserving_public_peer_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping one-sided port-preserving public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping one-sided port-preserving public-peer SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -985,17 +985,17 @@ async fn udp_hole_puncher_traverses_one_sided_port_preserving_public_peer_snat_n
 #[tokio::test]
 async fn udp_hole_puncher_does_not_traverse_one_sided_address_port_dependent_snat_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_HOLE_PUNCH_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_HOLE_PUNCH_NETNS_TESTS")
+    if std::env::var("HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS")
         .ok()
         .as_deref()
         != Some("1")
     {
         eprintln!(
-            "skipping one-sided address/port-dependent public-peer SNAT hole-punch netns integration test; set IPARS_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
+            "skipping one-sided address/port-dependent public-peer SNAT hole-punch netns integration test; set HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -1175,56 +1175,68 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
     };
 
     let mut left_env = vec![
-        ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
-        ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-        ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", child_role),
+        ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+        ("HETERONETWORK_HOLE_PUNCH_BIND", left_bind.as_str()),
         (
-            "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_SOURCE_REFLEXIVE",
             source_reflexive.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_TARGET_REFLEXIVE",
             target_reflexive.as_str(),
         ),
-        ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
-        ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
-        ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            "HETERONETWORK_HOLE_PUNCH_READY_FILE",
+            left_ready_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_START_FILE",
+            start_file_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_READY_FILE",
             left_mapping_ready_str.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
             mapping_continue_str.as_str(),
         ),
     ];
     let mut right_env = vec![
-        ("IPARS_HOLE_PUNCH_CHILD_ROLE", child_role),
-        ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-        ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", child_role),
+        ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+        ("HETERONETWORK_HOLE_PUNCH_BIND", right_bind.as_str()),
         (
-            "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_SOURCE_REFLEXIVE",
             source_reflexive.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_TARGET_REFLEXIVE",
             target_reflexive.as_str(),
         ),
-        ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
-        ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
-        ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            "HETERONETWORK_HOLE_PUNCH_READY_FILE",
+            right_ready_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_START_FILE",
+            start_file_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_READY_FILE",
             right_mapping_ready_str.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
             mapping_continue_str.as_str(),
         ),
     ];
     if let Some(plan_json) = plan_json {
-        left_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
-        right_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
+        left_env.push(("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json));
+        right_env.push(("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json));
     }
 
     let left = spawn_child(test_name, &left_namespace, left_env)?;
@@ -1394,56 +1406,68 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
     };
 
     let mut left_env = vec![
-        ("IPARS_HOLE_PUNCH_CHILD_ROLE", left_child_role),
-        ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-        ("IPARS_HOLE_PUNCH_BIND", left_bind.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", left_child_role),
+        ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-a"),
+        ("HETERONETWORK_HOLE_PUNCH_BIND", left_bind.as_str()),
         (
-            "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_SOURCE_REFLEXIVE",
             source_reflexive.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_TARGET_REFLEXIVE",
             target_reflexive.as_str(),
         ),
-        ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
-        ("IPARS_HOLE_PUNCH_READY_FILE", left_ready_str.as_str()),
-        ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            "HETERONETWORK_HOLE_PUNCH_READY_FILE",
+            left_ready_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_START_FILE",
+            start_file_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_READY_FILE",
             left_mapping_ready_str.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
             mapping_continue_str.as_str(),
         ),
     ];
     let mut right_env = vec![
-        ("IPARS_HOLE_PUNCH_CHILD_ROLE", right_child_role),
-        ("IPARS_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-        ("IPARS_HOLE_PUNCH_BIND", right_bind.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", right_child_role),
+        ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-b"),
+        ("HETERONETWORK_HOLE_PUNCH_BIND", right_bind.as_str()),
         (
-            "IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_SOURCE_REFLEXIVE",
             source_reflexive.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_TARGET_REFLEXIVE",
+            "HETERONETWORK_HOLE_PUNCH_TARGET_REFLEXIVE",
             target_reflexive.as_str(),
         ),
-        ("IPARS_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
-        ("IPARS_HOLE_PUNCH_READY_FILE", right_ready_str.as_str()),
-        ("IPARS_HOLE_PUNCH_START_FILE", start_file_str.as_str()),
+        ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_READY_FILE",
+            "HETERONETWORK_HOLE_PUNCH_READY_FILE",
+            right_ready_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_START_FILE",
+            start_file_str.as_str(),
+        ),
+        (
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_READY_FILE",
             right_mapping_ready_str.as_str(),
         ),
         (
-            "IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+            "HETERONETWORK_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
             mapping_continue_str.as_str(),
         ),
     ];
     if let Some(plan_json) = plan_json {
-        left_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
-        right_env.push(("IPARS_HOLE_PUNCH_PLAN_JSON", plan_json));
+        left_env.push(("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json));
+        right_env.push(("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json));
     }
 
     let left = spawn_child(test_name, &left_namespace, left_env)?;
@@ -1479,9 +1503,9 @@ async fn run_child(role: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_receiver() -> Result<(), Box<dyn std::error::Error>> {
-    let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
-    let expected_local = required_env("IPARS_HOLE_PUNCH_EXPECT_LOCAL")?;
-    let ready_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_READY_FILE")?);
+    let bind = required_env("HETERONETWORK_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
+    let expected_local = required_env("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL")?;
+    let ready_file = PathBuf::from(required_env("HETERONETWORK_HOLE_PUNCH_READY_FILE")?);
     let socket = tokio::net::UdpSocket::bind(bind).await?;
     fs::write(&ready_file, b"ready")?;
 
@@ -1497,8 +1521,8 @@ async fn run_receiver() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_puncher() -> Result<(), Box<dyn std::error::Error>> {
-    let local_node = NodeId::from_string(required_env("IPARS_HOLE_PUNCH_LOCAL_NODE")?);
-    let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
+    let local_node = NodeId::from_string(required_env("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE")?);
+    let bind = required_env("HETERONETWORK_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
     let plan = SignalHolePunchPlanResponse {
         key: PeerPathKey::new(NodeId::from_string("node-a"), NodeId::from_string("node-b")),
         source_reflexive: Some(reflexive_candidate("node-a", "10.240.0.1:40101")?),
@@ -1517,10 +1541,10 @@ async fn run_puncher() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_signal_plan_puncher() -> Result<(), Box<dyn std::error::Error>> {
-    let local_node = NodeId::from_string(required_env("IPARS_HOLE_PUNCH_LOCAL_NODE")?);
-    let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
+    let local_node = NodeId::from_string(required_env("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE")?);
+    let bind = required_env("HETERONETWORK_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
     let plan = serde_json::from_str::<SignalHolePunchPlanResponse>(&required_env(
-        "IPARS_HOLE_PUNCH_PLAN_JSON",
+        "HETERONETWORK_HOLE_PUNCH_PLAN_JSON",
     )?)?;
 
     let sent = UdpHolePuncher::new(bind)
@@ -1533,23 +1557,25 @@ async fn run_signal_plan_puncher() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_nat_duplex(expect_packet: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let local_node = NodeId::from_string(required_env("IPARS_HOLE_PUNCH_LOCAL_NODE")?);
-    let bind = required_env("IPARS_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
+    let local_node = NodeId::from_string(required_env("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE")?);
+    let bind = required_env("HETERONETWORK_HOLE_PUNCH_BIND")?.parse::<SocketAddr>()?;
     let source_reflexive =
-        required_env("IPARS_HOLE_PUNCH_SOURCE_REFLEXIVE")?.parse::<SocketAddr>()?;
+        required_env("HETERONETWORK_HOLE_PUNCH_SOURCE_REFLEXIVE")?.parse::<SocketAddr>()?;
     let target_reflexive =
-        required_env("IPARS_HOLE_PUNCH_TARGET_REFLEXIVE")?.parse::<SocketAddr>()?;
-    let expected_local = required_env("IPARS_HOLE_PUNCH_EXPECT_LOCAL")?;
-    let ready_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_READY_FILE")?);
-    let start_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_START_FILE")?);
-    let mapping_ready_file = PathBuf::from(required_env("IPARS_HOLE_PUNCH_MAPPING_READY_FILE")?);
-    let mapping_continue_file =
-        PathBuf::from(required_env("IPARS_HOLE_PUNCH_MAPPING_CONTINUE_FILE")?);
+        required_env("HETERONETWORK_HOLE_PUNCH_TARGET_REFLEXIVE")?.parse::<SocketAddr>()?;
+    let expected_local = required_env("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL")?;
+    let ready_file = PathBuf::from(required_env("HETERONETWORK_HOLE_PUNCH_READY_FILE")?);
+    let start_file = PathBuf::from(required_env("HETERONETWORK_HOLE_PUNCH_START_FILE")?);
+    let mapping_ready_file =
+        PathBuf::from(required_env("HETERONETWORK_HOLE_PUNCH_MAPPING_READY_FILE")?);
+    let mapping_continue_file = PathBuf::from(required_env(
+        "HETERONETWORK_HOLE_PUNCH_MAPPING_CONTINUE_FILE",
+    )?);
     let socket = tokio::net::UdpSocket::bind(bind).await?;
     fs::write(&ready_file, b"ready")?;
     wait_for_file(&start_file)?;
 
-    let plan = if let Ok(plan_json) = std::env::var("IPARS_HOLE_PUNCH_PLAN_JSON") {
+    let plan = if let Ok(plan_json) = std::env::var("HETERONETWORK_HOLE_PUNCH_PLAN_JSON") {
         serde_json::from_str::<SignalHolePunchPlanResponse>(&plan_json)?
     } else {
         SignalHolePunchPlanResponse {

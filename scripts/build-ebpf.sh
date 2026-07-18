@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 CARGO_BIN="${CARGO:-$HOME/.cargo/bin/cargo}"
-TOOLCHAIN="${IPARS_EBPF_TOOLCHAIN:-nightly-2026-07-05}"
-BPF_LINKER_VERSION="${IPARS_EBPF_BPF_LINKER_VERSION:-0.10.3}"
-TARGET="${IPARS_EBPF_TARGET:-bpfel-unknown-none}"
-PROFILE="${IPARS_EBPF_PROFILE:-release}"
+TOOLCHAIN="${HETERONETWORK_EBPF_TOOLCHAIN:-nightly-2026-07-05}"
+BPF_LINKER_VERSION="${HETERONETWORK_EBPF_BPF_LINKER_VERSION:-0.10.3}"
+TARGET="${HETERONETWORK_EBPF_TARGET:-bpfel-unknown-none}"
+PROFILE="${HETERONETWORK_EBPF_PROFILE:-release}"
 MANIFEST="$ROOT_DIR/ebpf/ipars-packet-flow/Cargo.toml"
 OUT_DIR="$ROOT_DIR/target/ebpf"
 ARTIFACT_BASENAME="libipars_packet_flow_ebpf.so"
@@ -42,7 +42,7 @@ case "$PROFILE" in
     SOURCE="$ROOT_DIR/ebpf/ipars-packet-flow/target/$TARGET/debug/$ARTIFACT_BASENAME"
     ;;
   *)
-    echo "IPARS_EBPF_PROFILE must be 'release' or 'debug', got '${PROFILE}'" >&2
+    echo "HETERONETWORK_EBPF_PROFILE must be 'release' or 'debug', got '${PROFILE}'" >&2
     exit 1
     ;;
 esac

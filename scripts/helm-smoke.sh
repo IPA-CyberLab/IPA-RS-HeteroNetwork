@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-helm_image="${IPARS_HELM_IMAGE:-alpine/helm:3.14.4}"
+helm_image="${HETERONETWORK_HELM_IMAGE:-alpine/helm:3.14.4}"
 
 helm_cmd() {
   tar -C "$repo_root" -cf - charts/ipars | docker run --rm -i --entrypoint sh "$helm_image" -c '
@@ -16,22 +16,22 @@ helm "$@"
 template_ok() {
   local name="$1"
   shift
-  helm_cmd template ipars /work/charts/ipars "$@" >/tmp/"ipars-helm-${name}.yaml"
+  helm_cmd template ipars /work/charts/ipars "$@" >/tmp/"heteronetwork-helm-${name}.yaml"
 }
 
 template_release_ok() {
   local name="$1"
   local release="$2"
   shift 2
-  helm_cmd template "$release" /work/charts/ipars "$@" >/tmp/"ipars-helm-${name}.yaml"
+  helm_cmd template "$release" /work/charts/ipars "$@" >/tmp/"heteronetwork-helm-${name}.yaml"
 }
 
 template_fails() {
   local name="$1"
   local expected="$2"
   shift 2
-  local stderr="/tmp/ipars-helm-${name}.stderr"
-  if helm_cmd template ipars /work/charts/ipars "$@" >/tmp/"ipars-helm-${name}.yaml" 2>"$stderr"; then
+  local stderr="/tmp/heteronetwork-helm-${name}.stderr"
+  if helm_cmd template ipars /work/charts/ipars "$@" >/tmp/"heteronetwork-helm-${name}.yaml" 2>"$stderr"; then
     echo "expected Helm template failure for ${name}" >&2
     exit 1
   fi
@@ -45,7 +45,7 @@ template_fails() {
 assert_rendered_contains() {
   local name="$1"
   local expected="$2"
-  local rendered="/tmp/ipars-helm-${name}.yaml"
+  local rendered="/tmp/heteronetwork-helm-${name}.yaml"
   if ! grep -Fq -- "$expected" "$rendered"; then
     echo "Helm template output for ${name} did not include expected content: ${expected}" >&2
     cat "$rendered" >&2
@@ -56,7 +56,7 @@ assert_rendered_contains() {
 assert_rendered_absent() {
   local name="$1"
   local unexpected="$2"
-  local rendered="/tmp/ipars-helm-${name}.yaml"
+  local rendered="/tmp/heteronetwork-helm-${name}.yaml"
   if grep -Fq -- "$unexpected" "$rendered"; then
     echo "Helm template output for ${name} unexpectedly included content: ${unexpected}" >&2
     cat "$rendered" >&2
@@ -64,25 +64,25 @@ assert_rendered_absent() {
   fi
 }
 
-helm_cmd lint /work/charts/ipars >/tmp/ipars-helm-lint.txt
+helm_cmd lint /work/charts/ipars >/tmp/heteronetwork-helm-lint.txt
 
 template_ok default
 
 assert_rendered_absent default "mountPath: /dev/net/tun"
 assert_rendered_absent default "name: dev-net-tun"
-assert_rendered_absent default "name: IPARS_ROUTE_PROVIDER"
+assert_rendered_absent default "name: HETERONETWORK_ROUTE_PROVIDER"
 assert_rendered_absent default "- --kubernetes-route-provider"
 assert_rendered_contains default "- --wireguard-listen-port"
 assert_rendered_contains default '- "51820"'
 assert_rendered_contains default "- --stun-bind"
 assert_rendered_contains default '- "0.0.0.0:51820"'
-assert_rendered_contains default '- "ip link delete dev ipars0 2>/dev/null || true"'
+assert_rendered_contains default '- "ip link delete dev heteronetwork0 2>/dev/null || true"'
 assert_rendered_contains default "- --peer-probe-port"
 assert_rendered_contains default '- "51821"'
-assert_rendered_contains default "name: IPARS_AGENT_API_BEARER_TOKEN"
+assert_rendered_contains default "name: HETERONETWORK_AGENT_API_BEARER_TOKEN"
 assert_rendered_contains default 'key: "agent-api-token"'
-assert_rendered_contains default '- "/var/lib/ipars/join-token"'
-assert_rendered_contains default 'mountPath: "/var/lib/ipars/join-token"'
+assert_rendered_contains default '- "/var/lib/heteronetwork/join-token"'
+assert_rendered_contains default 'mountPath: "/var/lib/heteronetwork/join-token"'
 assert_rendered_contains default 'subPath: "token"'
 assert_rendered_contains default "defaultMode: 0400"
 
@@ -137,7 +137,7 @@ template_ok pod-network-kubernetes-forwarding \
 
 assert_rendered_contains pod-network-kubernetes-forwarding "name: net.ipv4.ip_forward"
 assert_rendered_contains pod-network-kubernetes-forwarding 'value: "1"'
-assert_rendered_absent pod-network-kubernetes-forwarding "ip link delete dev ipars0"
+assert_rendered_absent pod-network-kubernetes-forwarding "ip link delete dev heteronetwork0"
 
 template_ok host-network-kubernetes-forwarding \
   --set agent.hostNetwork=true
@@ -242,9 +242,9 @@ assert_rendered_contains cluster-endpoints "- --signal-url"
 assert_rendered_contains cluster-endpoints '"https://signal.example.com:9443"'
 assert_rendered_contains cluster-endpoints "- --stun-server"
 assert_rendered_contains cluster-endpoints '"203.0.113.53:3478"'
-assert_rendered_contains cluster-endpoints "name: IPARS_CONTROL_PLANE_URL"
-assert_rendered_contains cluster-endpoints "name: IPARS_SIGNAL_URL"
-assert_rendered_contains cluster-endpoints "name: IPARS_STUN_ENDPOINT"
+assert_rendered_contains cluster-endpoints "name: HETERONETWORK_CONTROL_PLANE_URL"
+assert_rendered_contains cluster-endpoints "name: HETERONETWORK_SIGNAL_URL"
+assert_rendered_contains cluster-endpoints "name: HETERONETWORK_STUN_ENDPOINT"
 
 template_release_ok release-scoping edge \
   --set agent.apiService.enabled=true \
@@ -256,28 +256,28 @@ template_release_ok release-scoping edge \
   --set networkPolicy.agentApi.enabled=true \
   --set-string 'networkPolicy.agentApi.allowedCidrs[0]=10.0.0.0/8'
 
-assert_rendered_contains release-scoping "name: edge-ipars"
-assert_rendered_contains release-scoping "name: edge-ipars-agent"
-assert_rendered_contains release-scoping "name: edge-ipars-agent-api"
+assert_rendered_contains release-scoping "name: edge-heteronetwork"
+assert_rendered_contains release-scoping "name: edge-heteronetwork-agent"
+assert_rendered_contains release-scoping "name: edge-heteronetwork-agent-api"
 assert_rendered_contains release-scoping 'app.kubernetes.io/instance: "edge"'
 assert_rendered_absent release-scoping "name: ipars-agent"
 
 template_release_ok name-overrides edge \
   --set-string nameOverride=agent \
-  --set-string fullnameOverride=fixed-ipars \
+  --set-string fullnameOverride=fixed-heteronetwork \
   --set agent.apiService.enabled=true \
   --set agent.apiService.type=ClusterIP
 
-assert_rendered_contains name-overrides "name: fixed-ipars"
-assert_rendered_contains name-overrides "name: fixed-ipars-agent"
-assert_rendered_absent name-overrides "name: edge-ipars"
+assert_rendered_contains name-overrides "name: fixed-heteronetwork"
+assert_rendered_contains name-overrides "name: fixed-heteronetwork-agent"
+assert_rendered_absent name-overrides "name: edge-heteronetwork"
 
 template_ok pod-runtime \
-  --set-string agent.schedulerName=ipars-scheduler \
-  --set-string agent.runtimeClassName=ipars-runtime
+  --set-string agent.schedulerName=heteronetwork-scheduler \
+  --set-string agent.runtimeClassName=heteronetwork-runtime
 
-assert_rendered_contains pod-runtime 'schedulerName: "ipars-scheduler"'
-assert_rendered_contains pod-runtime 'runtimeClassName: "ipars-runtime"'
+assert_rendered_contains pod-runtime 'schedulerName: "heteronetwork-scheduler"'
+assert_rendered_contains pod-runtime 'runtimeClassName: "heteronetwork-runtime"'
 
 template_ok pod-security-context \
   --set agent.podSecurityContext.runAsUser=1000 \
@@ -328,7 +328,7 @@ assert_rendered_contains pod-lifecycle "preStop:"
 assert_rendered_contains pod-lifecycle "command:"
 assert_rendered_contains pod-lifecycle "- /bin/sh"
 assert_rendered_contains pod-lifecycle "- -c"
-assert_rendered_contains pod-lifecycle '- "sleep 20; ip link delete dev ipars0 2>/dev/null || true"'
+assert_rendered_contains pod-lifecycle '- "sleep 20; ip link delete dev heteronetwork0 2>/dev/null || true"'
 assert_rendered_contains pod-lifecycle "terminationGracePeriodSeconds: 60"
 
 template_fails pod-lifecycle-zero \
@@ -379,13 +379,13 @@ assert_rendered_contains node-affinity '- "m7i.large"'
 
 template_ok pod-affinity \
   --set-string 'agent.podAffinity.required[0].topologyKey=kubernetes.io/hostname' \
-  --set-string 'agent.podAffinity.required[0].namespaces[0]=ipars-system' \
+  --set-string 'agent.podAffinity.required[0].namespaces[0]=heteronetwork-system' \
   --set-string 'agent.podAffinity.required[0].matchExpressions[0].key=app.kubernetes.io/name' \
   --set-string 'agent.podAffinity.required[0].matchExpressions[0].operator=In' \
   --set-string 'agent.podAffinity.required[0].matchExpressions[0].values[0]=ipars' \
   --set 'agent.podAntiAffinity.preferred[0].weight=90' \
   --set-string 'agent.podAntiAffinity.preferred[0].topologyKey=topology.kubernetes.io/zone' \
-  --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=ipars.io/role' \
+  --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].key=heteronetwork.io/role' \
   --set-string 'agent.podAntiAffinity.preferred[0].matchExpressions[0].operator=Exists'
 
 assert_rendered_contains pod-affinity "podAffinity:"
@@ -393,13 +393,13 @@ assert_rendered_contains pod-affinity "podAntiAffinity:"
 assert_rendered_contains pod-affinity 'topologyKey: "kubernetes.io/hostname"'
 assert_rendered_contains pod-affinity 'topologyKey: "topology.kubernetes.io/zone"'
 assert_rendered_contains pod-affinity "namespaces:"
-assert_rendered_contains pod-affinity '- "ipars-system"'
+assert_rendered_contains pod-affinity '- "heteronetwork-system"'
 assert_rendered_contains pod-affinity 'key: "app.kubernetes.io/name"'
 assert_rendered_contains pod-affinity 'operator: "In"'
 assert_rendered_contains pod-affinity '- "ipars"'
 assert_rendered_contains pod-affinity "podAffinityTerm:"
 assert_rendered_contains pod-affinity "weight: 90"
-assert_rendered_contains pod-affinity 'key: "ipars.io/role"'
+assert_rendered_contains pod-affinity 'key: "heteronetwork.io/role"'
 assert_rendered_contains pod-affinity 'operator: "Exists"'
 
 template_ok topology-spread \
@@ -432,7 +432,7 @@ template_ok relay-service \
 
 assert_rendered_contains relay-service "- name: relay"
 assert_rendered_contains relay-service "--relay-node-id-path"
-assert_rendered_contains relay-service "IPARS_RELAY_PUBLIC_ENDPOINT"
+assert_rendered_contains relay-service "HETERONETWORK_RELAY_PUBLIC_ENDPOINT"
 assert_rendered_contains relay-service "containerPort: 51830"
 assert_rendered_contains relay-service "targetPort: 51830"
 assert_rendered_contains relay-service "readOnlyRootFilesystem: true"
@@ -625,7 +625,7 @@ template_ok namespaced-service-discovery-rbac \
   --set serviceExposure.discoverApiServer=false \
   --set-string 'serviceExposure.namespaces[0]=default' \
   --set-string 'serviceExposure.namespaces[1]=platform' \
-  --set-string serviceExposure.serviceLabelSelector=ipars.io/expose=true
+  --set-string serviceExposure.serviceLabelSelector=heteronetwork.io/expose=true
 
 assert_rendered_contains namespaced-service-discovery-rbac "kind: Role"
 assert_rendered_contains namespaced-service-discovery-rbac "kind: RoleBinding"
@@ -896,7 +896,7 @@ template_fails agent-api-backend-config-annotation \
   --set agent.apiService.type=LoadBalancer \
   --set agent.apiService.exposureAcknowledged=true \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
-  --set-string 'agent.apiService.annotations.cloud\.google\.com/backend-config=ipars-backend'
+  --set-string 'agent.apiService.annotations.cloud\.google\.com/backend-config=heteronetwork-backend'
 
 template_fails relay-tcp-reset-annotation \
   "agent.relayService.annotations annotation key \"service.beta.kubernetes.io/azure-load-balancer-disable-tcp-reset\" must not configure LoadBalancer operational attributes" \
@@ -961,7 +961,7 @@ template_fails agent-api-target-node-labels-annotation \
   --set agent.apiService.type=LoadBalancer \
   --set agent.apiService.exposureAcknowledged=true \
   --set agent.apiService.allowUnrestrictedLoadBalancer=true \
-  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-target-node-labels=ipars.io/edge=true'
+  --set-string 'agent.apiService.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-target-node-labels=heteronetwork.io/edge=true'
 
 template_fails agent-api-source-nat-annotation \
   "agent.apiService.annotations annotation key \"service.beta.kubernetes.io/azure-disable-load-balancer-snat\" must not configure LoadBalancer source NAT behavior" \
@@ -1148,7 +1148,7 @@ template_fails relay-forwarder-netns-without-sys-admin \
 
 template_fails agent-state-hostpath-sensitive-system-path \
   "agent.state.hostPath must not be a sensitive system path" \
-  --set-string agent.state.hostPath=/etc/ipars
+  --set-string agent.state.hostPath=/etc/heteronetwork
 
 template_fails agent-state-mountpath-sensitive-system-path \
   "agent.state.mountPath must not be a sensitive system path" \

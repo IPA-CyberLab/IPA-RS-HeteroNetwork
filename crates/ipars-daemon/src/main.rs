@@ -265,19 +265,19 @@ impl Command {
 
 #[derive(Debug, Args, Clone)]
 struct ObservabilityArgs {
-    #[arg(long, env = "IPARS_OTEL_ENABLED", default_value_t = false)]
+    #[arg(long, env = "HETERONETWORK_OTEL_ENABLED", default_value_t = false)]
     otel_enabled: bool,
-    #[arg(long, env = "IPARS_OTEL_ENDPOINT")]
+    #[arg(long, env = "HETERONETWORK_OTEL_ENDPOINT")]
     otel_endpoint: Option<String>,
-    #[arg(long, env = "IPARS_OTEL_SERVICE_NAME")]
+    #[arg(long, env = "HETERONETWORK_OTEL_SERVICE_NAME")]
     otel_service_name: Option<String>,
     #[arg(
         long,
-        env = "IPARS_OTEL_METRICS_POLL_INTERVAL_SECONDS",
+        env = "HETERONETWORK_OTEL_METRICS_POLL_INTERVAL_SECONDS",
         default_value_t = 15
     )]
     otel_metrics_poll_interval_seconds: u64,
-    #[arg(long, env = "IPARS_LOG_FILTER", default_value = "info")]
+    #[arg(long, env = "HETERONETWORK_LOG_FILTER", default_value = "info")]
     log_filter: String,
 }
 
@@ -357,73 +357,92 @@ fn validate_observability_config(args: &ObservabilityArgs) -> anyhow::Result<()>
 
 #[derive(Debug, Args, Clone)]
 struct ControlPlaneArgs {
-    #[arg(long, env = "IPARS_LISTEN", default_value = "0.0.0.0:8443")]
+    #[arg(long, env = "HETERONETWORK_LISTEN", default_value = "0.0.0.0:8443")]
     listen: SocketAddr,
     #[arg(
         long,
-        env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+        env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
         conflicts_with = "operator_api_bearer_token_path"
     )]
     operator_api_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"
+    )]
     operator_api_bearer_token_path: Option<PathBuf>,
     #[arg(
         long,
-        env = "IPARS_WEB_UI_ENABLED",
+        env = "HETERONETWORK_WEB_UI_ENABLED",
         default_value_t = true,
         action = clap::ArgAction::Set
     )]
     web_ui_enabled: bool,
-    #[arg(long, env = "IPARS_WEB_AUTH_PROVIDER", default_value = "keycloak")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_WEB_AUTH_PROVIDER",
+        default_value = "keycloak"
+    )]
     web_auth_provider: String,
     #[arg(
         long,
-        env = "IPARS_WEB_OIDC_ISSUER_URL",
+        env = "HETERONETWORK_WEB_OIDC_ISSUER_URL",
         default_value = "http://localhost:8080/realms/ipars"
     )]
     web_oidc_issuer_url: String,
-    #[arg(long, env = "IPARS_WEB_OIDC_CLIENT_ID", default_value = "ipars-web")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_WEB_OIDC_CLIENT_ID",
+        default_value = "ipars-web"
+    )]
     web_oidc_client_id: String,
-    #[arg(long, env = "IPARS_WEB_OIDC_AUTH_BASE_URL")]
+    #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
     web_oidc_auth_base_url: Option<String>,
     #[arg(
         long,
-        env = "IPARS_WEB_OIDC_SCOPES",
+        env = "HETERONETWORK_WEB_OIDC_SCOPES",
         default_value = "openid profile email"
     )]
     web_oidc_scopes: String,
-    #[arg(long, env = "IPARS_CLUSTER_ID")]
+    #[arg(long, env = "HETERONETWORK_CLUSTER_ID")]
     cluster_id: String,
-    #[arg(long, env = "IPARS_VPN_POOL", default_value = "100.64.0.0/10")]
+    #[arg(long, env = "HETERONETWORK_VPN_POOL", default_value = "100.64.0.0/10")]
     vpn_pool: ipnet::Ipv4Net,
-    #[arg(long, env = "IPARS_RELAY_HEALTH_TTL_SECONDS", default_value_t = 90)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_HEALTH_TTL_SECONDS",
+        default_value_t = 90
+    )]
     relay_health_ttl_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_ENDPOINT_CANDIDATE_TTL_SECONDS",
+        env = "HETERONETWORK_ENDPOINT_CANDIDATE_TTL_SECONDS",
         default_value_t = 120
     )]
     endpoint_candidate_ttl_seconds: u64,
-    #[arg(long, env = "IPARS_PATH_STATE_TTL_SECONDS", default_value_t = 600)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_PATH_STATE_TTL_SECONDS",
+        default_value_t = 600
+    )]
     path_state_ttl_seconds: u64,
-    #[arg(long, env = "IPARS_DATABASE_URL")]
+    #[arg(long, env = "HETERONETWORK_DATABASE_URL")]
     database_url: Option<String>,
-    #[arg(long, env = "IPARS_ISSUER_NODE_ID")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_NODE_ID")]
     issuer_node_id: String,
-    #[arg(long, env = "IPARS_ISSUER_KEY_ID")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_KEY_ID")]
     issuer_key_id: String,
-    #[arg(long, env = "IPARS_ISSUER_PUBLIC_KEY")]
+    #[arg(long, env = "HETERONETWORK_ISSUER_PUBLIC_KEY")]
     issuer_public_key: String,
     #[arg(
         long = "trusted-issuer-key",
-        env = "IPARS_TRUSTED_ISSUER_KEYS",
+        env = "HETERONETWORK_TRUSTED_ISSUER_KEYS",
         value_delimiter = ';',
         value_parser = parse_trusted_issuer_key
     )]
     trusted_issuer_keys: Vec<TrustedIssuerKeyArg>,
     #[arg(
         long = "acl-rule",
-        env = "IPARS_ACL_RULES",
+        env = "HETERONETWORK_ACL_RULES",
         value_delimiter = ';',
         value_parser = parse_acl_rule
     )]
@@ -439,72 +458,84 @@ struct TrustedIssuerKeyArg {
 
 #[derive(Debug, Args, Clone)]
 struct SignalArgs {
-    #[arg(long, env = "IPARS_SIGNAL_LISTEN", default_value = "0.0.0.0:9443")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_SIGNAL_LISTEN",
+        default_value = "0.0.0.0:9443"
+    )]
     listen: SocketAddr,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN",
+        env = "HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN",
         conflicts_with = "operator_api_bearer_token_path"
     )]
     operator_api_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_PATH")]
     operator_api_bearer_token_path: Option<PathBuf>,
     #[arg(
         long = "control-plane-url",
-        env = "IPARS_SIGNAL_CONTROL_PLANE_URLS",
+        env = "HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS",
         value_delimiter = ',',
         default_value = "http://127.0.0.1:8443"
     )]
     control_plane_urls: Vec<String>,
-    #[arg(long, env = "IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS", default_value_t = 90)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_SIGNAL_NODE_AUTH_TTL_SECONDS",
+        default_value_t = 90
+    )]
     node_auth_ttl_seconds: u64,
-    #[arg(long, env = "IPARS_SIGNAL_IDLE_TIMEOUT_SECONDS", default_value_t = 300)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_SIGNAL_IDLE_TIMEOUT_SECONDS",
+        default_value_t = 300
+    )]
     idle_timeout_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_RELAY_HEALTH_TTL_SECONDS",
+        env = "HETERONETWORK_SIGNAL_RELAY_HEALTH_TTL_SECONDS",
         default_value_t = 90
     )]
     relay_health_ttl_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_ENDPOINT_CANDIDATE_TTL_SECONDS",
+        env = "HETERONETWORK_SIGNAL_ENDPOINT_CANDIDATE_TTL_SECONDS",
         default_value_t = 120
     )]
     endpoint_candidate_ttl_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS",
+        env = "HETERONETWORK_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS",
         default_value_t = DEFAULT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS
     )]
     path_quality_observation_ttl_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_NAT_CLASSIFICATION_TTL_SECONDS",
+        env = "HETERONETWORK_SIGNAL_NAT_CLASSIFICATION_TTL_SECONDS",
         default_value_t = 300
     )]
     nat_classification_ttl_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_NAT_CLASSIFICATION_MIN_CONFIDENCE_PERCENT",
+        env = "HETERONETWORK_SIGNAL_NAT_CLASSIFICATION_MIN_CONFIDENCE_PERCENT",
         default_value_t = 50
     )]
     nat_classification_min_confidence_percent: u8,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_DISABLE_IPV6_DIRECT",
+        env = "HETERONETWORK_SIGNAL_DISABLE_IPV6_DIRECT",
         default_value_t = false
     )]
     disable_ipv6_direct: bool,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL",
+        env = "HETERONETWORK_SIGNAL_DISABLE_NAT_TRAVERSAL",
         default_value_t = false
     )]
     disable_nat_traversal: bool,
     #[arg(
         long,
-        env = "IPARS_SIGNAL_DISABLE_RELAY_FALLBACK",
+        env = "HETERONETWORK_SIGNAL_DISABLE_RELAY_FALLBACK",
         default_value_t = false
     )]
     disable_relay_fallback: bool,
@@ -512,19 +543,27 @@ struct SignalArgs {
 
 #[derive(Debug, Args, Clone)]
 struct StunArgs {
-    #[arg(long, env = "IPARS_STUN_LISTEN", default_value = "0.0.0.0:3478")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_STUN_LISTEN",
+        default_value = "0.0.0.0:3478"
+    )]
     listen: SocketAddr,
-    #[arg(long, env = "IPARS_STUN_ALTERNATE_LISTEN")]
+    #[arg(long, env = "HETERONETWORK_STUN_ALTERNATE_LISTEN")]
     alternate_listen: Option<SocketAddr>,
-    #[arg(long, env = "IPARS_STUN_HTTP_LISTEN", default_value = "0.0.0.0:3479")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_STUN_HTTP_LISTEN",
+        default_value = "0.0.0.0:3479"
+    )]
     http_listen: SocketAddr,
     #[arg(
         long,
-        env = "IPARS_STUN_OPERATOR_API_BEARER_TOKEN",
+        env = "HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN",
         conflicts_with = "operator_api_bearer_token_path"
     )]
     operator_api_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_STUN_OPERATOR_API_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_PATH")]
     operator_api_bearer_token_path: Option<PathBuf>,
 }
 
@@ -532,567 +571,657 @@ struct StunArgs {
 struct RelayArgs {
     #[arg(
         long,
-        env = "IPARS_RELAY_NODE_ID",
+        env = "HETERONETWORK_RELAY_NODE_ID",
         conflicts_with = "relay_node_id_path"
     )]
     relay_node_id: Option<String>,
     #[arg(
         long,
-        env = "IPARS_RELAY_NODE_ID_PATH",
+        env = "HETERONETWORK_RELAY_NODE_ID_PATH",
         conflicts_with = "relay_node_id"
     )]
     relay_node_id_path: Option<PathBuf>,
-    #[arg(long, env = "IPARS_RELAY_UDP_LISTEN", default_value = "0.0.0.0:51820")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_UDP_LISTEN",
+        default_value = "0.0.0.0:51820"
+    )]
     udp_listen: SocketAddr,
-    #[arg(long, env = "IPARS_RELAY_HTTP_LISTEN", default_value = "0.0.0.0:9580")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_HTTP_LISTEN",
+        default_value = "0.0.0.0:9580"
+    )]
     http_listen: SocketAddr,
-    #[arg(long, env = "IPARS_RELAY_PUBLIC_ENDPOINT")]
+    #[arg(long, env = "HETERONETWORK_RELAY_PUBLIC_ENDPOINT")]
     public_endpoint: Option<SocketAddr>,
-    #[arg(long, env = "IPARS_RELAY_ADMISSION_URL")]
+    #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_URL")]
     admission_url: Option<String>,
-    #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_MAX_SESSIONS",
+        default_value_t = 10_000
+    )]
     max_sessions: u32,
-    #[arg(long, env = "IPARS_RELAY_MAX_SESSIONS_PER_NODE", default_value_t = 0)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_MAX_SESSIONS_PER_NODE",
+        default_value_t = 0
+    )]
     max_sessions_per_node: u32,
-    #[arg(long, env = "IPARS_RELAY_MAX_MBPS", default_value_t = 1000)]
+    #[arg(long, env = "HETERONETWORK_RELAY_MAX_MBPS", default_value_t = 1000)]
     max_mbps: u32,
-    #[arg(long, env = "IPARS_RELAY_SESSION_TTL_SECONDS", default_value_t = 300)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_SESSION_TTL_SECONDS",
+        default_value_t = 300
+    )]
     session_ttl_seconds: u64,
-    #[arg(long, env = "IPARS_RELAY_ADMISSION_RATE_LIMIT", default_value_t = 4096)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT",
+        default_value_t = 4096
+    )]
     admission_rate_limit: u32,
     #[arg(
         long,
-        env = "IPARS_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
+        env = "HETERONETWORK_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
         default_value_t = 60
     )]
     admission_rate_limit_window_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN",
+        env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN",
         conflicts_with = "admission_bearer_token_path"
     )]
     admission_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
     admission_bearer_token_path: Option<PathBuf>,
     #[arg(
         long,
-        env = "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN",
+        env = "HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN",
         conflicts_with = "operator_api_bearer_token_path"
     )]
     operator_api_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_PATH")]
     operator_api_bearer_token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
 struct AgentArgs {
-    #[arg(long, env = "IPARS_AGENT_LISTEN", default_value = "127.0.0.1:9780")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_LISTEN",
+        default_value = "127.0.0.1:9780"
+    )]
     listen: SocketAddr,
     #[arg(
         long,
-        env = "IPARS_AGENT_STATE_PATH",
+        env = "HETERONETWORK_AGENT_STATE_PATH",
         default_value = "/var/lib/ipars/agent.json"
     )]
     state_path: std::path::PathBuf,
     #[arg(
         long,
-        env = "IPARS_AGENT_API_BEARER_TOKEN",
+        env = "HETERONETWORK_AGENT_API_BEARER_TOKEN",
         conflicts_with = "api_bearer_token_path"
     )]
     api_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_API_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH")]
     api_bearer_token_path: Option<PathBuf>,
     #[arg(
         long = "stun-server",
-        env = "IPARS_AGENT_STUN_SERVER",
+        env = "HETERONETWORK_AGENT_STUN_SERVER",
         value_delimiter = ','
     )]
     stun_servers: Vec<SocketAddr>,
-    #[arg(long, env = "IPARS_AGENT_STUN_BIND", default_value = "0.0.0.0:51820")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_STUN_BIND",
+        default_value = "0.0.0.0:51820"
+    )]
     stun_bind: SocketAddr,
     #[arg(
         long,
-        env = "IPARS_AGENT_WIREGUARD_LISTEN_PORT",
+        env = "HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS",
+        default_value_t = 60
+    )]
+    nat_discovery_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT",
         default_value_t = 51820
     )]
     wireguard_listen_port: u16,
-    #[arg(long, env = "IPARS_AGENT_CONTROL_PLANE_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_CONTROL_PLANE_URL")]
     control_plane_url: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_SIGNAL_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_SIGNAL_URL")]
     signal_url: Option<String>,
     #[arg(
         long,
-        env = "IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS",
+        env = "HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS",
         default_value_t = DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS
     )]
     http_connect_timeout_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS",
+        env = "HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS",
         default_value_t = DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS
     )]
     http_request_timeout_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_JOIN_TOKEN",
+        env = "HETERONETWORK_AGENT_JOIN_TOKEN",
         conflicts_with = "join_token_path"
     )]
     join_token: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_JOIN_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_JOIN_TOKEN_PATH")]
     join_token_path: Option<PathBuf>,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_PUBLIC_ENDPOINT",
+        env = "HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT",
         requires = "relay_admission_url"
     )]
     relay_public_endpoint: Option<SocketAddr>,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_ADMISSION_URL",
+        env = "HETERONETWORK_AGENT_RELAY_ADMISSION_URL",
         requires = "relay_public_endpoint"
     )]
     relay_admission_url: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_STATUS_URL")]
+    #[arg(long, env = "HETERONETWORK_AGENT_RELAY_STATUS_URL")]
     relay_status_url: Option<String>,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN",
+        env = "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN",
         conflicts_with = "relay_admission_bearer_token_path"
     )]
     relay_admission_bearer_token: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
     relay_admission_bearer_token_path: Option<PathBuf>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_MAX_SESSIONS", default_value_t = 10_000)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_RELAY_MAX_SESSIONS",
+        default_value_t = 10_000
+    )]
     relay_max_sessions: u32,
-    #[arg(long, env = "IPARS_AGENT_RELAY_MAX_MBPS", default_value_t = 1000)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_RELAY_MAX_MBPS",
+        default_value_t = 1000
+    )]
     relay_max_mbps: u32,
-    #[arg(long, env = "IPARS_AGENT_APPLY_PEER_MAP", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_APPLY_PEER_MAP",
+        default_value_t = false
+    )]
     apply_peer_map: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_RUNTIME_BACKEND",
+        env = "HETERONETWORK_AGENT_RUNTIME_BACKEND",
         value_enum,
         default_value_t = AgentRuntimeBackend::LinuxCommand
     )]
     runtime_backend: AgentRuntimeBackend,
     #[arg(
         long,
-        env = "IPARS_AGENT_PREFLIGHT_ONLY",
+        env = "HETERONETWORK_AGENT_PREFLIGHT_ONLY",
         default_value_t = false,
         conflicts_with = "skip_runtime_preflight"
     )]
     preflight_only: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_SKIP_RUNTIME_PREFLIGHT",
+        env = "HETERONETWORK_AGENT_SKIP_RUNTIME_PREFLIGHT",
         default_value_t = false
     )]
     skip_runtime_preflight: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_RUNTIME_COMMAND_TIMEOUT_SECONDS",
+        env = "HETERONETWORK_AGENT_RUNTIME_COMMAND_TIMEOUT_SECONDS",
         default_value_t = 30
     )]
     runtime_command_timeout_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_RUNTIME_COMMAND_OUTPUT_MAX_BYTES",
+        env = "HETERONETWORK_AGENT_RUNTIME_COMMAND_OUTPUT_MAX_BYTES",
         default_value_t = 65_536
     )]
     runtime_command_output_max_bytes: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
+        env = "HETERONETWORK_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS",
         default_value_t = 30
     )]
     peer_map_poll_interval_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_HEARTBEAT_INTERVAL_SECONDS",
+        env = "HETERONETWORK_AGENT_HEARTBEAT_INTERVAL_SECONDS",
         default_value_t = 15
     )]
     heartbeat_interval_seconds: u64,
-    #[arg(long, env = "IPARS_AGENT_DISABLE_HEARTBEAT", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_DISABLE_HEARTBEAT",
+        default_value_t = false
+    )]
     disable_heartbeat: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_SIGNAL_REGISTRATION_INTERVAL_SECONDS",
+        env = "HETERONETWORK_AGENT_SIGNAL_REGISTRATION_INTERVAL_SECONDS",
         default_value_t = 30
     )]
     signal_registration_interval_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_DISABLE_SIGNAL_REGISTRATION",
+        env = "HETERONETWORK_AGENT_DISABLE_SIGNAL_REGISTRATION",
         default_value_t = false
     )]
     disable_signal_registration: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_SIGNAL_PATH_INTERVAL_SECONDS",
+        env = "HETERONETWORK_AGENT_SIGNAL_PATH_INTERVAL_SECONDS",
         default_value_t = 30
     )]
     signal_path_interval_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS",
+        env = "HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS",
         default_value_t = DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS
     )]
     direct_path_probe_timeout_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS",
+        env = "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS",
         default_value_t = DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS
     )]
     direct_handshake_max_age_seconds: u64,
-    #[arg(long, env = "IPARS_AGENT_DISABLE_PEER_PROBE", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_DISABLE_PEER_PROBE",
+        default_value_t = false
+    )]
     disable_peer_probe: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_PORT",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_PORT",
         default_value_t = DEFAULT_PEER_PROBE_PORT
     )]
     peer_probe_port: u16,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_INTERVAL_SECONDS",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_INTERVAL_SECONDS",
         default_value_t = DEFAULT_PEER_PROBE_INTERVAL_SECONDS
     )]
     peer_probe_interval_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_SAMPLE_COUNT",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT",
         default_value_t = DEFAULT_PEER_PROBE_SAMPLE_COUNT
     )]
     peer_probe_sample_count: u16,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS",
         default_value_t = DEFAULT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS
     )]
     peer_probe_response_timeout_millis: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS",
         default_value_t = DEFAULT_PEER_PROBE_SAMPLE_INTERVAL_MILLIS
     )]
     peer_probe_sample_interval_millis: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_MAX_CONCURRENCY",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_MAX_CONCURRENCY",
         default_value_t = DEFAULT_PEER_PROBE_MAX_CONCURRENCY
     )]
     peer_probe_max_concurrency: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND",
         default_value_t = DEFAULT_PEER_PROBE_RESPONDER_MAX_REQUESTS_PER_SECOND
     )]
     peer_probe_responder_max_requests_per_second: u32,
     #[arg(
         long,
-        env = "IPARS_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS",
+        env = "HETERONETWORK_AGENT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS",
         default_value_t = DEFAULT_PEER_PROBE_OBSERVATION_MAX_AGE_SECONDS
     )]
     peer_probe_observation_max_age_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_DETECTOR",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_DETECTOR",
         value_enum,
         default_value_t = PacketFlowDetector::Disabled
     )]
     packet_flow_detector: PacketFlowDetector,
-    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_CONNTRACK_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_PACKET_FLOW_CONNTRACK_PATH")]
     packet_flow_conntrack_path: Option<PathBuf>,
-    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_EVENT_PATH")]
     packet_flow_ebpf_event_path: Option<PathBuf>,
-    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_OBJECT_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_OBJECT_PATH")]
     packet_flow_ebpf_object_path: Option<PathBuf>,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_RINGBUF_MAP",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_RINGBUF_MAP",
         default_value = DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAP
     )]
     packet_flow_ebpf_ringbuf_map: String,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_ATTACH",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_ATTACH",
         value_name = "PROGRAM:CATEGORY:NAME"
     )]
     packet_flow_ebpf_attach: Vec<String>,
-    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_EBPF_CGROUP_PATH")]
+    #[arg(long, env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_CGROUP_PATH")]
     packet_flow_ebpf_cgroup_path: Option<PathBuf>,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_CGROUP_ATTACH",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_CGROUP_ATTACH",
         value_name = "PROGRAM"
     )]
     packet_flow_ebpf_cgroup_attach: Vec<String>,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_SOCKOPS_ATTACH",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_SOCKOPS_ATTACH",
         value_name = "PROGRAM"
     )]
     packet_flow_ebpf_sockops_attach: Vec<String>,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_POLL_INTERVAL_SECONDS",
         default_value_t = 5
     )]
     packet_flow_poll_interval_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_DEDUP_TTL_SECONDS",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_DEDUP_TTL_SECONDS",
         default_value_t = 30
     )]
     packet_flow_dedup_ttl_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_PROCFS_MAX_BYTES",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_PROCFS_MAX_BYTES",
         default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES
     )]
     packet_flow_procfs_max_bytes: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES",
         default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES
     )]
     packet_flow_procfs_max_line_bytes: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_PROCFS_MAX_FLOWS",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_PROCFS_MAX_FLOWS",
         default_value_t = DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS
     )]
     packet_flow_procfs_max_flows: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_NETLINK_MAX_FLOWS",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_NETLINK_MAX_FLOWS",
         default_value_t = DEFAULT_PACKET_FLOW_NETLINK_MAX_FLOWS
     )]
     packet_flow_netlink_max_flows: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES",
         default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_BYTES
     )]
     packet_flow_ebpf_event_max_bytes: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES",
         default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_LINE_BYTES
     )]
     packet_flow_ebpf_event_max_line_bytes: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS",
         default_value_t = DEFAULT_PACKET_FLOW_EBPF_EVENT_MAX_FLOWS
     )]
     packet_flow_ebpf_event_max_flows: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS",
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS",
         default_value_t = DEFAULT_PACKET_FLOW_EBPF_RINGBUF_MAX_EVENTS
     )]
     packet_flow_ebpf_ringbuf_max_events: usize,
-    #[arg(long, env = "IPARS_AGENT_PACKET_FLOW_PIN", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PACKET_FLOW_PIN",
+        default_value_t = false
+    )]
     packet_flow_pin: bool,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_SESSION_RENEW_BEFORE_SECONDS",
+        env = "HETERONETWORK_AGENT_RELAY_SESSION_RENEW_BEFORE_SECONDS",
         default_value_t = 60
     )]
     relay_session_renew_before_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_DISABLE_SIGNAL_PATHS",
+        env = "HETERONETWORK_AGENT_DISABLE_SIGNAL_PATHS",
         default_value_t = false
     )]
     disable_signal_paths: bool,
-    #[arg(long, env = "IPARS_AGENT_HOLE_PUNCH_BIND", default_value = "0.0.0.0:0")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_HOLE_PUNCH_BIND",
+        default_value = "0.0.0.0:0"
+    )]
     hole_punch_bind: SocketAddr,
-    #[arg(long, env = "IPARS_AGENT_HOLE_PUNCH_ATTEMPTS", default_value_t = 5)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_HOLE_PUNCH_ATTEMPTS",
+        default_value_t = 5
+    )]
     hole_punch_attempts: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_HOLE_PUNCH_INTERVAL_MILLIS",
+        env = "HETERONETWORK_AGENT_HOLE_PUNCH_INTERVAL_MILLIS",
         default_value_t = 100
     )]
     hole_punch_interval_millis: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_WIREGUARD_INTERFACE",
+        env = "HETERONETWORK_AGENT_WIREGUARD_INTERFACE",
         default_value = "ipars0"
     )]
     wireguard_interface: String,
     #[arg(
         long,
-        env = "IPARS_AGENT_WIREGUARD_BACKEND",
+        env = "HETERONETWORK_AGENT_WIREGUARD_BACKEND",
         default_value_t = WireGuardApplyBackend::Command
     )]
     wireguard_backend: WireGuardApplyBackend,
-    #[arg(long, env = "IPARS_AGENT_USERSPACE_WIREGUARD_COMMAND")]
+    #[arg(long, env = "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND")]
     userspace_wireguard_command: Option<String>,
     #[arg(
         long = "userspace-wireguard-arg",
-        env = "IPARS_AGENT_USERSPACE_WIREGUARD_ARGS",
+        env = "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_ARGS",
         value_delimiter = ','
     )]
     userspace_wireguard_args: Vec<String>,
     #[arg(
         long,
-        env = "IPARS_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
+        env = "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_READY_TIMEOUT_SECONDS",
         default_value_t = 10
     )]
     userspace_wireguard_ready_timeout_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
+        env = "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_SHUTDOWN_TIMEOUT_SECONDS",
         default_value_t = 5
     )]
     userspace_wireguard_shutdown_timeout_seconds: u64,
-    #[arg(long, env = "IPARS_AGENT_USERSPACE_TUN_FD")]
+    #[arg(long, env = "HETERONETWORK_AGENT_USERSPACE_TUN_FD")]
     userspace_tun_fd: Option<i32>,
     #[arg(
         long,
-        env = "IPARS_AGENT_ROUTE_BACKEND",
+        env = "HETERONETWORK_AGENT_ROUTE_BACKEND",
         default_value_t = RouteApplyBackend::Command
     )]
     route_backend: RouteApplyBackend,
-    #[arg(long, env = "IPARS_AGENT_LINUX_NETNS")]
+    #[arg(long, env = "HETERONETWORK_AGENT_LINUX_NETNS")]
     linux_netns: Option<String>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_ENDPOINT")]
+    #[arg(long, env = "HETERONETWORK_AGENT_RELAY_FORWARDER_ENDPOINT")]
     relay_forwarder_endpoint: Option<SocketAddr>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_BIND")]
+    #[arg(long, env = "HETERONETWORK_AGENT_RELAY_FORWARDER_BIND")]
     relay_forwarder_bind: Option<SocketAddr>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT")]
+    #[arg(long, env = "HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT")]
     relay_forwarder_wireguard_endpoint: Option<SocketAddr>,
-    #[arg(long, env = "IPARS_AGENT_RELAY_FORWARDER_NETNS")]
+    #[arg(long, env = "HETERONETWORK_AGENT_RELAY_FORWARDER_NETNS")]
     relay_forwarder_netns: Option<String>,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_FORWARDER_MAX_SESSIONS",
+        env = "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_SESSIONS",
         default_value_t = 1024
     )]
     relay_forwarder_max_sessions: usize,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS",
+        env = "HETERONETWORK_AGENT_RELAY_FORWARDER_RESTART_BACKOFF_SECONDS",
         default_value_t = 5
     )]
     relay_forwarder_restart_backoff_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS",
+        env = "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_WINDOW_SECONDS",
         default_value_t = 60
     )]
     relay_forwarder_crash_window_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW",
+        env = "HETERONETWORK_AGENT_RELAY_FORWARDER_MAX_CRASHES_PER_WINDOW",
         default_value_t = 3
     )]
     relay_forwarder_max_crashes_per_window: u32,
     #[arg(
         long,
-        env = "IPARS_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS",
+        env = "HETERONETWORK_AGENT_RELAY_FORWARDER_CRASH_COOLDOWN_SECONDS",
         default_value_t = 60
     )]
     relay_forwarder_crash_cooldown_seconds: u64,
     #[arg(
         long,
-        env = "IPARS_AGENT_APPLY_KUBERNETES_UNDERLAY",
+        env = "HETERONETWORK_AGENT_APPLY_KUBERNETES_UNDERLAY",
         default_value_t = false
     )]
     apply_kubernetes_underlay: bool,
-    #[arg(long, env = "IPARS_AGENT_APPLY_DOCKER_ROUTES", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES",
+        default_value_t = false
+    )]
     apply_docker_routes: bool,
-    #[arg(long, env = "IPARS_DOCKER_DISCOVER_NETWORKS", default_value_t = false)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_DOCKER_DISCOVER_NETWORKS",
+        default_value_t = false
+    )]
     docker_discover_networks: bool,
-    #[arg(long, env = "IPARS_DOCKER_API_SOCKET")]
+    #[arg(long, env = "HETERONETWORK_DOCKER_API_SOCKET")]
     docker_api_socket: Option<PathBuf>,
     #[arg(
         long,
-        env = "IPARS_DOCKER_API_URL",
+        env = "HETERONETWORK_DOCKER_API_URL",
         conflicts_with = "docker_api_socket"
     )]
     docker_api_url: Option<String>,
-    #[arg(long, env = "IPARS_DOCKER_API_CA_CERT_PATH")]
+    #[arg(long, env = "HETERONETWORK_DOCKER_API_CA_CERT_PATH")]
     docker_api_ca_cert_path: Option<PathBuf>,
-    #[arg(long, env = "IPARS_DOCKER_API_VERSION", default_value = "v1.43")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_DOCKER_API_VERSION",
+        default_value = "v1.43"
+    )]
     docker_api_version: String,
     #[arg(
         long = "docker-network",
-        env = "IPARS_DOCKER_NETWORKS",
+        env = "HETERONETWORK_DOCKER_NETWORKS",
         value_delimiter = ','
     )]
     docker_networks: Vec<String>,
-    #[arg(long, env = "IPARS_DOCKER_CONTAINER_NAMESPACE")]
+    #[arg(long, env = "HETERONETWORK_DOCKER_CONTAINER_NAMESPACE")]
     docker_container_namespace: Option<String>,
-    #[arg(long, env = "IPARS_DOCKER_HOST_INTERFACE", default_value = "docker0")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_DOCKER_HOST_INTERFACE",
+        default_value = "docker0"
+    )]
     docker_host_interface: String,
     #[arg(
         long = "docker-container-cidr",
-        env = "IPARS_DOCKER_CONTAINER_CIDRS",
+        env = "HETERONETWORK_DOCKER_CONTAINER_CIDRS",
         value_delimiter = ','
     )]
     docker_container_cidrs: Vec<ipnet::IpNet>,
-    #[arg(long, env = "IPARS_DOCKER_EXPOSE_HOST_ROUTES", default_value_t = true)]
+    #[arg(
+        long,
+        env = "HETERONETWORK_DOCKER_EXPOSE_HOST_ROUTES",
+        default_value_t = true
+    )]
     docker_expose_host_routes: bool,
     #[arg(
         long,
-        env = "IPARS_DOCKER_ROUTE_INTERVAL_SECONDS",
+        env = "HETERONETWORK_DOCKER_ROUTE_INTERVAL_SECONDS",
         default_value_t = 60
     )]
     docker_route_interval_seconds: u64,
-    #[arg(long, env = "IPARS_KUBERNETES_NODE_NAME")]
+    #[arg(long, env = "HETERONETWORK_KUBERNETES_NODE_NAME")]
     kubernetes_node_name: Option<String>,
     #[arg(
         long,
-        env = "IPARS_KUBERNETES_DISCOVER_SERVICES",
+        env = "HETERONETWORK_KUBERNETES_DISCOVER_SERVICES",
         default_value_t = false
     )]
     kubernetes_discover_services: bool,
-    #[arg(long, env = "IPARS_KUBERNETES_API_URL")]
+    #[arg(long, env = "HETERONETWORK_KUBERNETES_API_URL")]
     kubernetes_api_url: Option<String>,
     #[arg(
         long,
-        env = "IPARS_KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH",
+        env = "HETERONETWORK_KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH",
         default_value = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     )]
     kubernetes_service_account_token_path: PathBuf,
-    #[arg(long, env = "IPARS_KUBERNETES_CA_CERT_PATH")]
+    #[arg(long, env = "HETERONETWORK_KUBERNETES_CA_CERT_PATH")]
     kubernetes_ca_cert_path: Option<PathBuf>,
     #[arg(
         long = "kubernetes-namespace",
-        env = "IPARS_KUBERNETES_NAMESPACES",
+        env = "HETERONETWORK_KUBERNETES_NAMESPACES",
         value_delimiter = ','
     )]
     kubernetes_namespaces: Vec<String>,
-    #[arg(long, env = "IPARS_KUBERNETES_SERVICE_LABEL_SELECTOR")]
+    #[arg(long, env = "HETERONETWORK_KUBERNETES_SERVICE_LABEL_SELECTOR")]
     kubernetes_service_label_selector: Option<String>,
     #[arg(
         long,
-        env = "IPARS_KUBERNETES_DISCOVER_API_SERVER",
+        env = "HETERONETWORK_KUBERNETES_DISCOVER_API_SERVER",
         default_value_t = true,
         action = clap::ArgAction::Set
     )]
     kubernetes_discover_api_server: bool,
     #[arg(
         long = "kubernetes-api-server-cidr",
-        env = "IPARS_KUBERNETES_API_SERVER_CIDRS",
+        env = "HETERONETWORK_KUBERNETES_API_SERVER_CIDRS",
         value_delimiter = ','
     )]
     kubernetes_api_server_cidrs: Vec<ipnet::IpNet>,
     #[arg(
         long = "kubernetes-service-cidr",
-        env = "IPARS_KUBERNETES_SERVICE_CIDRS",
+        env = "HETERONETWORK_KUBERNETES_SERVICE_CIDRS",
         value_delimiter = ','
     )]
     kubernetes_service_cidrs: Vec<ipnet::IpNet>,
-    #[arg(long, env = "IPARS_KUBERNETES_ROUTE_PROVIDER")]
+    #[arg(long, env = "HETERONETWORK_KUBERNETES_ROUTE_PROVIDER")]
     kubernetes_route_provider: Option<String>,
     #[arg(
         long,
-        env = "IPARS_KUBERNETES_ROUTE_INTERVAL_SECONDS",
+        env = "HETERONETWORK_KUBERNETES_ROUTE_INTERVAL_SECONDS",
         default_value_t = 60
     )]
     kubernetes_route_interval_seconds: u64,
@@ -1629,6 +1758,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             "--heartbeat-interval-seconds",
         )?;
     }
+    validate_positive_seconds(
+        args.nat_discovery_interval_seconds,
+        "--nat-discovery-interval-seconds",
+    )?;
     if args.apply_peer_map {
         validate_positive_seconds(
             args.peer_map_poll_interval_seconds,
@@ -4167,7 +4300,10 @@ fn control_plane_operator_api_bearer_token(
     args: &ControlPlaneArgs,
 ) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
-        validate_api_bearer_token(token, "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN")?;
+        validate_api_bearer_token(
+            token,
+            "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+        )?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
@@ -4269,7 +4405,7 @@ fn validate_signal_runtime_config(args: &SignalArgs) -> anyhow::Result<()> {
 
 fn signal_operator_api_bearer_token(args: &SignalArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
-        validate_api_bearer_token(token, "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN")?;
+        validate_api_bearer_token(token, "HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
@@ -4328,7 +4464,7 @@ async fn run_stun(
 
 fn stun_operator_api_bearer_token(args: &StunArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
-        validate_api_bearer_token(token, "IPARS_STUN_OPERATOR_API_BEARER_TOKEN")?;
+        validate_api_bearer_token(token, "HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
@@ -7307,7 +7443,7 @@ async fn relay_node_id(args: &RelayArgs) -> anyhow::Result<NodeId> {
 
 fn relay_operator_api_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
-        validate_api_bearer_token(token, "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN")?;
+        validate_api_bearer_token(token, "HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.operator_api_bearer_token_path.as_deref() else {
@@ -7318,7 +7454,7 @@ fn relay_operator_api_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<St
 
 fn relay_admission_bearer_token(args: &RelayArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.admission_bearer_token.as_deref() {
-        validate_relay_admission_bearer_token(token, "IPARS_RELAY_ADMISSION_BEARER_TOKEN")?;
+        validate_relay_admission_bearer_token(token, "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.admission_bearer_token_path.as_deref() else {
@@ -7395,7 +7531,7 @@ async fn run_agent(
         &persisted_bootstrap_endpoints,
     )
     .await?;
-    if stun_servers.len() > 1 {
+    if !stun_servers.is_empty() {
         if let Err(error) = runtime
             .classify_nat(args.stun_bind, stun_servers.clone())
             .await
@@ -7404,14 +7540,6 @@ async fn run_agent(
                 %error,
                 stun_servers = stun_servers.len(),
                 "startup STUN NAT classification failed; continuing without initial NAT classification"
-            );
-        }
-    } else if let Some(stun_server) = stun_servers.first().copied() {
-        if let Err(error) = runtime.probe_stun(args.stun_bind, stun_server).await {
-            tracing::warn!(
-                %error,
-                %stun_server,
-                "startup STUN probe failed; continuing without initial reflexive candidate"
             );
         }
     }
@@ -7500,6 +7628,14 @@ async fn run_agent(
         start_userspace_wireguard_process(&args, runtime.clone()).await?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
+    if !stun_servers.is_empty() {
+        background_tasks.push(start_nat_discovery(
+            runtime.clone(),
+            stun_servers.clone(),
+            args.stun_bind,
+            Duration::from_secs(args.nat_discovery_interval_seconds),
+        ));
+    }
     if otel_metrics_enabled {
         background_tasks.push(start_agent_otel_metrics_export(
             runtime.clone(),
@@ -11488,6 +11624,7 @@ async fn register_agent(
             identity_public_key: status.identity_public_key,
             wireguard_public_key: status.wireguard_public_key,
             candidates: status.candidates,
+            nat_classification: status.nat_classification,
             relay_capability,
             requested_routes,
         },
@@ -11553,6 +11690,34 @@ fn start_heartbeat_reporting(
             route_reporter,
         )
         .await;
+    })
+}
+
+fn start_nat_discovery(
+    runtime: Arc<AgentRuntime>,
+    stun_servers: Vec<SocketAddr>,
+    stun_bind: SocketAddr,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
+            match runtime
+                .classify_nat_without_candidate_refresh(probe_bind, stun_servers.clone())
+                .await
+            {
+                Ok(classification) => tracing::info!(
+                    strategy = ?classification.strategy,
+                    confidence = classification.confidence,
+                    "refreshed agent NAT discovery"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "periodic STUN NAT discovery failed; retaining the last classification"
+                ),
+            }
+        }
     })
 }
 
@@ -11672,6 +11837,7 @@ async fn heartbeat_request(
         node_id: status.node_id,
         health,
         candidates: status.candidates,
+        nat_classification: status.nat_classification,
         relay_capability,
         routes,
         path_state,
@@ -13140,7 +13306,7 @@ fn agent_join_token(args: &AgentArgs) -> anyhow::Result<Option<SignedJoinToken>>
 
 fn agent_api_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.api_bearer_token.as_deref() {
-        validate_api_bearer_token(token, "IPARS_AGENT_API_BEARER_TOKEN")?;
+        validate_api_bearer_token(token, "HETERONETWORK_AGENT_API_BEARER_TOKEN")?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.api_bearer_token_path.as_deref() else {
@@ -13151,7 +13317,10 @@ fn agent_api_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
 
 fn agent_relay_admission_bearer_token(args: &AgentArgs) -> anyhow::Result<Option<String>> {
     if let Some(token) = args.relay_admission_bearer_token.as_deref() {
-        validate_relay_admission_bearer_token(token, "IPARS_AGENT_RELAY_ADMISSION_BEARER_TOKEN")?;
+        validate_relay_admission_bearer_token(
+            token,
+            "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN",
+        )?;
         return Ok(Some(token.to_string()));
     }
     let Some(path) = args.relay_admission_bearer_token_path.as_deref() else {
@@ -20708,7 +20877,7 @@ mod tests {
             "--packet-flow-ebpf-object-path",
             "/run/ipars/ipars-packet-flow.bpf.o",
             "--packet-flow-ebpf-ringbuf-map",
-            "IPARS_PACKET_FLOWS",
+            "HETERONETWORK_PACKET_FLOWS",
             "--packet-flow-ebpf-attach",
             "ipars_ingress:net:netif_receive_skb",
             "--packet-flow-ebpf-attach",
@@ -20725,7 +20894,10 @@ mod tests {
                 args.packet_flow_ebpf_object_path.as_deref(),
                 Some(Path::new("/run/ipars/ipars-packet-flow.bpf.o"))
             );
-            assert_eq!(args.packet_flow_ebpf_ringbuf_map, "IPARS_PACKET_FLOWS");
+            assert_eq!(
+                args.packet_flow_ebpf_ringbuf_map,
+                "HETERONETWORK_PACKET_FLOWS"
+            );
             assert_eq!(args.packet_flow_ebpf_attach.len(), 2);
             assert_eq!(args.packet_flow_ebpf_ringbuf_max_events, 128);
             assert_eq!(
@@ -21562,14 +21734,14 @@ mod tests {
 
     #[tokio::test]
     async fn ebpf_ringbuf_privileged_attach_reads_sendto_event() -> anyhow::Result<()> {
-        if !env_flag_enabled("IPARS_RUN_EBPF_ATTACH_TESTS") {
+        if !env_flag_enabled("HETERONETWORK_RUN_EBPF_ATTACH_TESTS") {
             eprintln!(
-                "skipping eBPF attach integration test; set IPARS_RUN_EBPF_ATTACH_TESTS=1 to run it"
+                "skipping eBPF attach integration test; set HETERONETWORK_RUN_EBPF_ATTACH_TESTS=1 to run it"
             );
             return Ok(());
         }
 
-        let object_path = std::env::var_os("IPARS_EBPF_OBJECT_PATH")
+        let object_path = std::env::var_os("HETERONETWORK_EBPF_OBJECT_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/ebpf/ipars-packet-flow.bpf.o"));
         let config = EbpfRingbufConfig {
@@ -21656,17 +21828,17 @@ mod tests {
     #[tokio::test]
     async fn ebpf_ringbuf_privileged_cgroup_hooks_read_connect_and_sendmsg_events(
     ) -> anyhow::Result<()> {
-        if !env_flag_enabled("IPARS_RUN_EBPF_ATTACH_TESTS") {
+        if !env_flag_enabled("HETERONETWORK_RUN_EBPF_ATTACH_TESTS") {
             eprintln!(
-                "skipping eBPF cgroup attach integration test; set IPARS_RUN_EBPF_ATTACH_TESTS=1 to run it"
+                "skipping eBPF cgroup attach integration test; set HETERONETWORK_RUN_EBPF_ATTACH_TESTS=1 to run it"
             );
             return Ok(());
         }
 
-        let object_path = std::env::var_os("IPARS_EBPF_OBJECT_PATH")
+        let object_path = std::env::var_os("HETERONETWORK_EBPF_OBJECT_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/ebpf/ipars-packet-flow.bpf.o"));
-        let cgroup_path = std::env::var_os("IPARS_EBPF_CGROUP_PATH")
+        let cgroup_path = std::env::var_os("HETERONETWORK_EBPF_CGROUP_PATH")
             .map(PathBuf::from)
             .map_or_else(current_process_cgroup_v2_path, Ok)?;
         let argv = vec![
@@ -28603,13 +28775,13 @@ exec sleep 60
     #[tokio::test]
     async fn docker_api_discovery_supports_multiple_real_docker_engines_and_churn(
     ) -> anyhow::Result<()> {
-        if std::env::var("IPARS_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE")
+        if std::env::var("HETERONETWORK_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE")
             .ok()
             .as_deref()
             != Some("1")
         {
             eprintln!(
-                "skipping real multi-Docker-Engine discovery smoke; set IPARS_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE=1 to run it"
+                "skipping real multi-Docker-Engine discovery smoke; set HETERONETWORK_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE=1 to run it"
             );
             return Ok(());
         }
@@ -28619,16 +28791,20 @@ exec sleep 60
                 format!("real multi-Docker-Engine discovery smoke requires {name}")
             })
         };
-        let api_url_a = required_env("IPARS_DOCKER_MULTI_ENGINE_URL_A")?;
-        let api_url_b = required_env("IPARS_DOCKER_MULTI_ENGINE_URL_B")?;
-        let network_a = required_env("IPARS_DOCKER_MULTI_ENGINE_NETWORK_A")?;
-        let network_b = required_env("IPARS_DOCKER_MULTI_ENGINE_NETWORK_B")?;
-        let first_cidr_a = required_env("IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_A")?;
-        let first_cidr_b = required_env("IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_B")?;
-        let second_cidr_a = required_env("IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_A")?;
-        let second_cidr_b = required_env("IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_B")?;
-        let ready_path = PathBuf::from(required_env("IPARS_DOCKER_MULTI_ENGINE_READY_FILE")?);
-        let release_path = PathBuf::from(required_env("IPARS_DOCKER_MULTI_ENGINE_RELEASE_FILE")?);
+        let api_url_a = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_URL_A")?;
+        let api_url_b = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_URL_B")?;
+        let network_a = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_NETWORK_A")?;
+        let network_b = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_NETWORK_B")?;
+        let first_cidr_a = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_FIRST_CIDR_A")?;
+        let first_cidr_b = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_FIRST_CIDR_B")?;
+        let second_cidr_a = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_SECOND_CIDR_A")?;
+        let second_cidr_b = required_env("HETERONETWORK_DOCKER_MULTI_ENGINE_SECOND_CIDR_B")?;
+        let ready_path = PathBuf::from(required_env(
+            "HETERONETWORK_DOCKER_MULTI_ENGINE_READY_FILE",
+        )?);
+        let release_path = PathBuf::from(required_env(
+            "HETERONETWORK_DOCKER_MULTI_ENGINE_RELEASE_FILE",
+        )?);
 
         let make_discovery = |url: &str,
                               container_namespace: &str,

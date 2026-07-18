@@ -2,7 +2,7 @@ use core::fmt;
 
 pub const PACKET_FLOW_EVENT_VERSION: u8 = 1;
 pub const PACKET_FLOW_EVENT_LEN: usize = 48;
-pub const PACKET_FLOW_RINGBUF_MAP: &str = "IPARS_PACKET_FLOWS";
+pub const PACKET_FLOW_RINGBUF_MAP: &str = "HETERONETWORK_PACKET_FLOWS";
 
 pub const PACKET_FLOW_IP_FAMILY_IPV4: u8 = 4;
 pub const PACKET_FLOW_IP_FAMILY_IPV6: u8 = 6;

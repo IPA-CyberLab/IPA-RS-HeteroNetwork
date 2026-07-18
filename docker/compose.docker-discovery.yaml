@@ -1,11 +1,11 @@
 services:
   agent:
     environment:
-      - IPARS_DOCKER_API_SOCKET=/run/ipars/docker.sock
+      - HETERONETWORK_DOCKER_API_SOCKET=/run/heteronetwork/docker.sock
     volumes:
       - type: bind
-        source: ${IPARS_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}
-        target: /run/ipars/docker.sock
+        source: ${HETERONETWORK_DOCKER_API_SOCKET_HOST:-/var/run/docker.sock}
+        target: /run/heteronetwork/docker.sock
         read_only: true
         bind:
           create_host_path: false

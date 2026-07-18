@@ -1542,6 +1542,25 @@ impl AgentRuntime {
         local_bind: std::net::SocketAddr,
         stun_servers: Vec<std::net::SocketAddr>,
     ) -> Result<NatClassification, AgentError> {
+        self.classify_nat_internal(local_bind, stun_servers, true)
+            .await
+    }
+
+    pub async fn classify_nat_without_candidate_refresh(
+        &self,
+        local_bind: std::net::SocketAddr,
+        stun_servers: Vec<std::net::SocketAddr>,
+    ) -> Result<NatClassification, AgentError> {
+        self.classify_nat_internal(local_bind, stun_servers, false)
+            .await
+    }
+
+    async fn classify_nat_internal(
+        &self,
+        local_bind: std::net::SocketAddr,
+        stun_servers: Vec<std::net::SocketAddr>,
+        refresh_candidates: bool,
+    ) -> Result<NatClassification, AgentError> {
         let _refresh = self.stun_refresh.lock().await;
         if stun_servers.is_empty() {
             return Err(AgentError::Stun(StunError::InvalidResponse(
@@ -1573,16 +1592,18 @@ impl AgentRuntime {
             Utc::now(),
         );
 
-        let refreshed_candidates = observations
-            .iter()
-            .flat_map(|observation| {
-                vec![
-                    self.stun_candidate_from_observation(observation),
-                    self.local_candidate_from_observation(observation),
-                ]
-            })
-            .collect();
-        self.replace_stun_candidates(refreshed_candidates).await;
+        if refresh_candidates {
+            let refreshed_candidates = observations
+                .iter()
+                .flat_map(|observation| {
+                    vec![
+                        self.stun_candidate_from_observation(observation),
+                        self.local_candidate_from_observation(observation),
+                    ]
+                })
+                .collect();
+            self.replace_stun_candidates(refreshed_candidates).await;
+        }
         *self.nat_classification.write().await = Some(classification.clone());
 
         Ok(classification)

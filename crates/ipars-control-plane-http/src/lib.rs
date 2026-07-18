@@ -13,15 +13,14 @@ use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-    ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse,
-    RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    ControlPlaneMetricsResponse, ControlPlaneNodeOverview, ControlPlaneNodeQueryKind,
+    ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse, ControlPlanePathsResponse,
+    ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
+    RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+    RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
-use ipars_types::{
-    ClusterPolicy, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, TokenLedgerMetrics,
-};
+use ipars_types::{ClusterPolicy, NodeId, PathRecord, PathState, TokenLedgerMetrics};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -400,23 +399,6 @@ where
     Json(config)
 }
 
-#[derive(Debug, Serialize)]
-struct AdminNodeResponse {
-    node: NodeRecord,
-    health: Option<NodeHealth>,
-}
-
-#[derive(Debug, Serialize)]
-struct AdminOverviewResponse {
-    cluster_id: ipars_types::ClusterId,
-    vpn_pool: ipnet::Ipv4Net,
-    cluster_policy: ClusterPolicy,
-    metrics: ControlPlaneMetricsResponse,
-    nodes: Vec<AdminNodeResponse>,
-    paths: Vec<PathRecord>,
-    generated_at: chrono::DateTime<Utc>,
-}
-
 #[derive(Debug, Deserialize)]
 struct AdminPolicyRequest {
     cluster_policy: ClusterPolicy,
@@ -429,15 +411,16 @@ struct AdminPathPinRequest {
 
 async fn admin_node_snapshot<S>(
     plane: &ControlPlane<S>,
-) -> Result<Vec<AdminNodeResponse>, ControlPlaneError>
+) -> Result<Vec<ControlPlaneNodeOverview>, ControlPlaneError>
 where
     S: ControlPlaneStore,
 {
     let nodes = plane.list_nodes().await?;
     let mut snapshot = Vec::with_capacity(nodes.len());
     for node in nodes {
-        snapshot.push(AdminNodeResponse {
+        snapshot.push(ControlPlaneNodeOverview {
             health: plane.health_for_node(&node.node_id).await?,
+            nat_classification: plane.nat_classification_for(&node.node_id).await?,
             node,
         });
     }
@@ -446,27 +429,28 @@ where
 
 async fn admin_overview<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
-) -> Result<Json<AdminOverviewResponse>, ApiError>
+) -> Result<Json<ControlPlaneOverviewResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
     let generated_at = Utc::now();
     let config = state.plane.config();
-    Ok(Json(AdminOverviewResponse {
+    Ok(Json(ControlPlaneOverviewResponse {
         cluster_id: config.cluster_id.clone(),
         vpn_pool: config.vpn_pool,
         cluster_policy: state.plane.cluster_policy()?,
         metrics: control_plane_metrics(&state).await?,
         nodes: admin_node_snapshot(&state.plane).await?,
         paths: state.plane.list_paths().await?,
+        nat_discovery: state.plane.nat_discovery_overview().await?,
         generated_at,
     }))
 }
 
 async fn admin_nodes<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
-) -> Result<Json<Vec<AdminNodeResponse>>, ApiError>
+) -> Result<Json<Vec<ControlPlaneNodeOverview>>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
@@ -1223,7 +1207,7 @@ struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use axum::body::Body;
     use axum::http::{header, Request};
@@ -1234,16 +1218,17 @@ mod tests {
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
         ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-        ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
-        JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse, RemoveNodeRequest,
-        RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
-        RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
+        ControlPlaneOverviewResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
+        HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
+        RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+        RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
-        EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NodeHealth,
-        NodeId, PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, Role, Tag, TokenPolicy,
-        TokenStatus, TransportProtocol,
+        EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
+        NatClassification, NatProbeObservation, NodeHealth, NodeId, PathMetrics, PathRecord,
+        PathScore, PathState, PeerPathKey, Role, Tag, TokenPolicy, TokenStatus, TransportProtocol,
     };
     use ipnet::Ipv4Net;
     use tower::ServiceExt;
@@ -1326,6 +1311,7 @@ mod tests {
             identity_public_key: identity.public_key_b64(),
             wireguard_public_key: wireguard_public_key_for_node(node_id),
             candidates: Vec::new(),
+            nat_classification: None,
             relay_capability: None,
             requested_routes: Vec::new(),
         }
@@ -1479,6 +1465,203 @@ mod tests {
         request
     }
 
+    fn nat_classification(
+        local_addr: SocketAddr,
+        stun_server: SocketAddr,
+        reflexive_addrs: &[SocketAddr],
+    ) -> NatClassification {
+        let assessed_at = Utc::now();
+        NatClassification::from_observations(
+            local_addr,
+            reflexive_addrs
+                .iter()
+                .enumerate()
+                .map(|(index, reflexive_addr)| NatProbeObservation {
+                    local_addr,
+                    stun_server: SocketAddr::new(
+                        stun_server.ip(),
+                        stun_server.port() + index as u16,
+                    ),
+                    reflexive_addr: *reflexive_addr,
+                    observed_at: assessed_at,
+                })
+                .collect(),
+            assessed_at,
+        )
+    }
+
+    #[tokio::test]
+    async fn http_admin_overview_updates_for_three_node_nat_discovery(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let plane = Arc::new(ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store,
+        ));
+        let mut key_ring = IssuerKeyRing::default();
+        key_ring.insert(issuer.node_id(), key_id.clone(), issuer.public_key_b64());
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            ledger,
+            key_ring,
+        ));
+        let app = router(
+            ControlPlaneHttpState::new(plane, join_service)
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
+        );
+        let public_endpoint = SocketAddr::from(([203, 0, 113, 10], 40_000));
+        let nat_endpoint = SocketAddr::from(([203, 0, 113, 11], 40_001));
+        let relay_endpoint_a = SocketAddr::from(([203, 0, 113, 12], 40_002));
+        let relay_endpoint_b = SocketAddr::from(([203, 0, 113, 13], 40_003));
+        let classifications = [
+            (
+                "node-public",
+                nat_classification(
+                    public_endpoint,
+                    SocketAddr::from(([198, 51, 100, 1], 3478)),
+                    &[public_endpoint, public_endpoint],
+                ),
+            ),
+            (
+                "node-nat",
+                nat_classification(
+                    SocketAddr::from(([10, 0, 0, 11], 51_001)),
+                    SocketAddr::from(([198, 51, 100, 1], 3478)),
+                    &[nat_endpoint, nat_endpoint],
+                ),
+            ),
+            (
+                "node-relay",
+                nat_classification(
+                    SocketAddr::from(([10, 0, 0, 12], 51_002)),
+                    SocketAddr::from(([198, 51, 100, 2], 3478)),
+                    &[relay_endpoint_a, relay_endpoint_b],
+                ),
+            ),
+        ];
+        for (label, classification) in classifications {
+            let mut token_claims = claims(cluster_id.clone(), issuer.node_id(), key_id.clone());
+            token_claims.nonce = format!("nat-{label}");
+            let mut registration = registration(label);
+            registration.nat_classification = Some(classification);
+            let request = JoinNodeRequest {
+                token: issuer.sign_join_token(token_claims)?,
+                registration,
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/join")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&request)?))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/overview")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let overview: ControlPlaneOverviewResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(overview.nodes.len(), 3);
+        assert_eq!(overview.nat_discovery.nat_classification_count, 3);
+        assert!(overview
+            .nodes
+            .iter()
+            .all(|entry| entry.nat_classification.is_some()));
+        assert!(overview
+            .nat_discovery
+            .fresh_nat_classification_strategy_counts
+            .iter()
+            .any(|entry| entry.count > 0));
+
+        let mut updated = nat_classification(
+            SocketAddr::from(([10, 0, 0, 12], 51_002)),
+            SocketAddr::from(([198, 51, 100, 2], 3478)),
+            &[relay_endpoint_a, relay_endpoint_a],
+        );
+        updated.assessed_at = Utc::now();
+        let heartbeat = signed_heartbeat(
+            "node-relay",
+            HeartbeatRequest {
+                node_id: node_id("node-relay"),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: None,
+                routes: None,
+                path_state: Vec::new(),
+                nat_classification: Some(updated),
+                node_signature: None,
+            },
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/heartbeat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&heartbeat)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/overview")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let overview: ControlPlaneOverviewResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        let relay_node = overview
+            .nodes
+            .iter()
+            .find(|entry| entry.node.node_id == node_id("node-relay"))
+            .ok_or("updated node missing from overview")?;
+        assert_eq!(
+            relay_node
+                .nat_classification
+                .as_ref()
+                .map(|classification| classification.observed_endpoint),
+            Some(Some(relay_endpoint_a))
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn http_heartbeat_rejects_direct_path_candidate_kind_mismatch(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1537,6 +1720,7 @@ mod tests {
                 relay_capability: None,
                 routes: None,
                 path_state: vec![reported_path],
+                nat_classification: None,
                 node_signature: None,
             },
         );
@@ -1703,7 +1887,7 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-        assert!(String::from_utf8(body.to_vec())?.contains("IPARS Control"));
+        assert!(String::from_utf8(body.to_vec())?.contains("HeteroNetwork"));
 
         let response = app
             .clone()
@@ -1901,6 +2085,7 @@ mod tests {
                 relay_capability: None,
                 routes: None,
                 path_state: Vec::new(),
+                nat_classification: None,
                 node_signature: None,
             },
         );
@@ -2055,6 +2240,7 @@ mod tests {
                 relay_capability: None,
                 routes: None,
                 path_state: vec![path("node-http", "node-peer")],
+                nat_classification: None,
                 node_signature: None,
             },
             path_reported_at,

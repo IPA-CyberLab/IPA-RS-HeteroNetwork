@@ -1,6 +1,6 @@
 # Operations Runbook
 
-This runbook covers the current operational path for a Linux-first IPA-RS deployment.
+This runbook covers the current operational path for a Linux-first HeteroNetwork deployment.
 
 ## Bootstrap A Public Node
 
@@ -18,7 +18,7 @@ ipars init \
   --allow-relay \
   --unlimited-uses \
   --spawn-daemons \
-  --daemon-state-dir ./ipars-state
+  --daemon-state-dir ./heteronetwork-state
 ```
 
 With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and `C` locale rather than the operator's full environment. `init` passes the selected Control Plane listener to Signal and waits for each service's `/healthz` endpoint before returning; `--daemon-ready-timeout-seconds` bounds that wait. If a service exits or never becomes ready, already-started services are terminated and the per-service log path is included in the error. When `--allow-relay` is set, `init` also creates an owner-only relay-agent state/token and starts a dry-run relay-agent after the four core services are ready; it registers the same relay Node ID used by the UDP Relay and keeps the capability fresh through signed heartbeats. The Control Plane receives the operator credential by file path, not token value in argv. Its policy and metric routes are absent when no operator credential is configured. The bootstrap state directory and `logs/` directory are made owner-only, and service log files must be regular, non-symlink, non-hardlinked owner-only files. Without `--spawn-daemons`, run the emitted `iparsd control-plane`, `iparsd signal`, `iparsd stun`, and `iparsd relay` commands manually or under systemd. When `--allow-relay` is set, `init` also emits an `iparsd agent` relay-agent command with a one-use state/token, so the manually supervised Relay publishes its capability to Control Plane.
@@ -27,11 +27,11 @@ All file-backed daemon Bearer credentials must be direct regular files with one 
 
 When `--allow-relay` is used with `--spawn-daemons`, `init` creates or validates the owner-only relay admission credential at `--relay-admission-bearer-token-path` or `<daemon-state-dir>/relay-admission.token`. Without `--spawn-daemons`, `--relay-admission-bearer-token-path` is required so an emitted manual Relay command cannot accidentally run without admission authentication; the parent directory must already exist and the file is created or validated there. The value is passed to Relay and relay-agent by file path only and is never included in daemon argv or JSON output.
 
-Signal metrics also require a distinct operator token. For a manually supervised Signal service, generate one with `umask 077`, pass `--operator-api-bearer-token-path /etc/ipars/signal-operator-api.token`, and configure the same credential in the metrics scraper. If omitted, Signal metric routes remain absent while health and signed protocol routes continue operating.
+Signal metrics also require a distinct operator token. For a manually supervised Signal service, generate one with `umask 077`, pass `--operator-api-bearer-token-path /etc/heteronetwork/signal-operator-api.token`, and configure the same credential in the metrics scraper. If omitted, Signal metric routes remain absent while health and signed protocol routes continue operating.
 
-STUN HTTP metrics require another distinct token through `iparsd stun --operator-api-bearer-token-path /etc/ipars/stun-operator-api.token`. Omitting it removes only `/metrics` and `/v1/metrics`; UDP Binding, RFC5780 probes, and `/healthz` remain available.
+STUN HTTP metrics require another distinct token through `iparsd stun --operator-api-bearer-token-path /etc/heteronetwork/stun-operator-api.token`. Omitting it removes only `/metrics` and `/v1/metrics`; UDP Binding, RFC5780 probes, and `/healthz` remain available.
 
-Signal must be able to reach at least one control-plane API to authenticate node registrations. Configure repeated `iparsd signal --control-plane-url http://control-plane-a:8443 --control-plane-url http://control-plane-b:8443` values, or the comma-delimited `IPARS_SIGNAL_CONTROL_PLANE_URLS` environment variable. The default authenticated-membership TTL is 90 seconds; agents refresh every 30 seconds. Tune it with `--node-auth-ttl-seconds` or `IPARS_SIGNAL_NODE_AUTH_TTL_SECONDS` between 1 and 3600 seconds, keeping it above the refresh interval and consistent across redundant Signal instances.
+Signal must be able to reach at least one control-plane API to authenticate node registrations. Configure repeated `iparsd signal --control-plane-url http://control-plane-a:8443 --control-plane-url http://control-plane-b:8443` values, or the comma-delimited `HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS` environment variable. The default authenticated-membership TTL is 90 seconds; agents refresh every 30 seconds. Tune it with `--node-auth-ttl-seconds` or `HETERONETWORK_SIGNAL_NODE_AUTH_TTL_SECONDS` between 1 and 3600 seconds, keeping it above the refresh interval and consistent across redundant Signal instances.
 
 Revoke a join token with the same trusted issuer key family used to mint it:
 
@@ -72,8 +72,8 @@ Use file-backed tokens for agents:
 
 ```bash
 iparsd agent \
-  --join-token-path /etc/ipars/join.token \
-  --state-path /var/lib/ipars/agent.json \
+  --join-token-path /etc/heteronetwork/join.token \
+  --state-path /var/lib/heteronetwork/agent.json \
   --runtime-backend linux-command \
   --apply-peer-map
 ```
@@ -83,9 +83,9 @@ starting the Agent daemon:
 
 ```bash
 ipars join "$(cat ./join.token)" \
-  --state-path /var/lib/ipars/agent.json
+  --state-path /var/lib/heteronetwork/agent.json
 iparsd agent \
-  --state-path /var/lib/ipars/agent.json \
+  --state-path /var/lib/heteronetwork/agent.json \
   --control-plane-url https://203.0.113.10:8443 \
   --apply-peer-map
 ```
@@ -97,9 +97,9 @@ rejects an existing state path instead of silently replacing another node
 identity; use a new state path for a new node. `--dry-run` validates the token
 and bootstrap selection but does not write state.
 
-The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/ipars/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
+The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/heteronetwork/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
 
-Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `IPARS_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `IPARS_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
+Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
 
 For a real `--apply-peer-map` runtime, keep `--stun-bind` and
 `--wireguard-listen-port` on the same nonzero UDP port. The agent performs its
@@ -121,8 +121,8 @@ admissible. `--direct-path-probe-timeout-seconds` defaults to 120 seconds and
 must cover at least one peer-map poll plus two Signal intervals;
 `--direct-handshake-max-age-seconds` defaults to 180 seconds and must be at least
 the Signal interval. The corresponding environment variables are
-`IPARS_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS` and
-`IPARS_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS`. Docker and Kubernetes install
+`HETERONETWORK_AGENT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS` and
+`HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS`. Docker and Kubernetes install
 plans expose the same settings as `--agent-direct-path-probe-timeout-seconds`
 and `--agent-direct-handshake-max-age-seconds`. Monitor
 `ipars_agent_direct_path_probes_started_total`,
@@ -139,7 +139,7 @@ per-peer request rate limit. Only lazy-connect-active or pinned paths are
 measured, with bounded concurrency, so this does not create a full-mesh probe
 loop. Defaults are five samples every 30 seconds, a 500 ms response timeout, a
 20 ms inter-sample delay, concurrency 32, and 100 responder requests per second
-per peer. Configure these through `IPARS_AGENT_PEER_PROBE_*` or the matching
+per peer. Configure these through `HETERONETWORK_AGENT_PEER_PROBE_*` or the matching
 `--peer-probe-*` flags; `--disable-peer-probe` disables both measurement and the
 responder. `ipars docker install` and `ipars k8s install` expose the same values
 as `--agent-peer-probe-*` and `--disable-agent-peer-probe`. Install plans disable
@@ -155,7 +155,7 @@ The latest observation is included in the node-identity-signed Signal request;
 Signal validates sample/loss consistency and applies it only when state,
 candidate address or relay node, and freshness all match the selected path.
 `--peer-probe-observation-max-age-seconds` and
-`IPARS_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS` default to 120 seconds.
+`HETERONETWORK_SIGNAL_PATH_QUALITY_OBSERVATION_TTL_SECONDS` default to 120 seconds.
 Docker install plans set the Agent observation age and bundled Signal TTL from
 the same `--agent-peer-probe-observation-max-age-seconds` value. Kubernetes
 installs must keep the external Signal service TTL at least as fresh as the
@@ -176,8 +176,8 @@ For validation without host route mutation:
 
 ```bash
 iparsd agent \
-  --join-token-path /etc/ipars/join.token \
-  --state-path /var/lib/ipars/agent.json \
+  --join-token-path /etc/heteronetwork/join.token \
+  --state-path /var/lib/heteronetwork/agent.json \
   --runtime-backend dry-run
 ```
 
@@ -185,8 +185,8 @@ iparsd agent \
 
 The base Compose stack starts PostgreSQL, control plane, signal, STUN, relay, and agent services. The agent continuously applies its peer map after joining so the selected WireGuard and route backends configure the data plane. Docker Engine API access is not mounted into the agent unless the discovery override is used; the override mounts the selected Docker socket read-only and does not create a missing host socket path.
 
-The bundled agent uses `IPARS_AGENT_STUN_BIND=0.0.0.0:51821` and
-`IPARS_AGENT_WIREGUARD_LISTEN_PORT=51821`, deliberately separate from the
+The bundled agent uses `HETERONETWORK_AGENT_STUN_BIND=0.0.0.0:51821` and
+`HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT=51821`, deliberately separate from the
 bundled relay UDP listener on `51820`. Override the two variables together with
 the same nonzero port for a real data-plane deployment. The Compose smoke uses
 an ephemeral STUN bind only because its two host-network agents run with the
@@ -205,12 +205,12 @@ head -c 32 /dev/urandom | base64 > docker/agent-api.token
 head -c 32 /dev/urandom | base64 > docker/relay-admission.token
 ```
 
-Set `IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_STUN_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_RELAY_OPERATOR_API_BEARER_TOKEN_FILE`,
-`IPARS_RELAY_ADMISSION_BEARER_TOKEN_FILE`, or
-`IPARS_AGENT_API_BEARER_TOKEN_FILE` when a token lives at a different host path.
+Set `HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_FILE`,
+`HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN_FILE`,
+`HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN_FILE`,
+`HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN_FILE`,
+`HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_FILE`, or
+`HETERONETWORK_AGENT_API_BEARER_TOKEN_FILE` when a token lives at a different host path.
 Keep all six credentials distinct. Compose mounts the one Relay admission file into both Relay and Agent without copying its value into service environment variables.
 
 ```bash
@@ -232,7 +232,7 @@ ipars docker install \
   --relay-admission-rate-limit 4096 \
   --relay-admission-rate-limit-window-seconds 60 \
   --docker-discover-networks \
-  --docker-network ipars_default
+  --docker-network heteronetwork_default
 ```
 
 Set `--agent-runtime-backend dry-run` for Compose validation that must not create
@@ -260,7 +260,7 @@ the bundled STUN sidecar in the agent namespace, and applies routes there with
 no iptables mutation. For Docker API discovery, add
 `--docker-discover-networks` and one or more `--docker-network` filters; the
 generated plan adds `docker/compose.rootless-docker-discovery.yaml`, mounts the host
-Docker socket read-only at `/run/ipars/docker.sock`, and reconciles discovered
+Docker socket read-only at `/run/heteronetwork/docker.sock`, and reconciles discovered
 CIDR changes without creating, disconnecting, or deleting Docker networks. For a
 remote Engine, use `--docker-api-url https://docker.example:2376` instead; the
 plan omits the socket bind and accepts an optional bounded PEM trust bundle via
@@ -384,7 +384,7 @@ Prepare separate join and Agent API token files. The install plan creates one
 Kubernetes Secret with distinct keys and rejects key reuse:
 
 ```bash
-kubectl -n ipars-system create secret generic ipars-join-token \
+kubectl -n heteronetwork-system create secret generic ipars-join-token \
   --from-file=token=./join.token \
   --from-file=agent-api-token=./agent-api.token
 ```
@@ -392,7 +392,7 @@ kubectl -n ipars-system create secret generic ipars-join-token \
 ```bash
 ipars k8s install \
   --release ipars \
-  --namespace ipars-system \
+  --namespace heteronetwork-system \
   --join-token-secret ipars-join-token \
   --join-token-key token \
   --expose-relay \
@@ -419,16 +419,16 @@ NodePort, relay-candidate publication, and, by default, a cross-agent WireGuard
 handshake plus encrypted HTTP traffic:
 
 ```bash
-IPARS_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/ipars \
-IPARS_K8S_SMOKE_IMAGE_TAG=ci \
+HETERONETWORK_K8S_SMOKE_IMAGE_REPOSITORY=registry.example.com/heteronetwork \
+HETERONETWORK_K8S_SMOKE_IMAGE_TAG=ci \
 scripts/k8s-live-smoke.sh
 ```
 
-The runner requires `kubectl`, `helm`, `jq`, and either `IPARS_K8S_SMOKE_IPARS_BIN`
+The runner requires `kubectl`, `helm`, `jq`, and either `HETERONETWORK_K8S_SMOKE_HETERONETWORK_BIN`
 or Cargo. It refuses an existing namespace, removes its generated namespace by default,
 and never writes the signed token to command-line arguments. Set
-`IPARS_K8S_SMOKE_KEEP_RESOURCES=1` only when retaining diagnostics is required.
-Set `IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND=dry-run` only for clusters where the
+`HETERONETWORK_K8S_SMOKE_KEEP_RESOURCES=1` only when retaining diagnostics is required.
+Set `HETERONETWORK_K8S_SMOKE_AGENT_RUNTIME_BACKEND=dry-run` only for clusters where the
 real WireGuard backend is intentionally unavailable; the default is `linux-command`.
 
 For kind-based CI or a local disposable cluster, the wrapper creates a control-plane
@@ -440,7 +440,7 @@ scripts/kind-k8s-smoke.sh
 ```
 
 It requires `docker`, `kind`, `kubectl`, `helm`, `jq`, and Cargo or
-`IPARS_K8S_SMOKE_IPARS_BIN`. Set `IPARS_KIND_K8S_SMOKE_KEEP_CLUSTER=1` to retain
+`HETERONETWORK_K8S_SMOKE_HETERONETWORK_BIN`. Set `HETERONETWORK_KIND_K8S_SMOKE_KEEP_CLUSTER=1` to retain
 the cluster and live-smoke namespace for diagnostics.
 
 ## Health Checks
@@ -448,13 +448,13 @@ the cluster and live-smoke namespace for diagnostics.
 Common probes:
 
 ```bash
-export IPARS_AGENT_API_BEARER_TOKEN_PATH=/etc/ipars/agent-api.token
+export HETERONETWORK_AGENT_API_BEARER_TOKEN_PATH=/etc/heteronetwork/agent-api.token
 ipars status --agent-url http://127.0.0.1:9780
-ipars --control-plane-operator-api-bearer-token-path /etc/ipars/control-plane-operator-api.token status --control-plane-url http://127.0.0.1:8443
-ipars --agent-state-path /var/lib/ipars/agent.json peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
-ipars --agent-state-path /var/lib/ipars/agent.json routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
+ipars --control-plane-operator-api-bearer-token-path /etc/heteronetwork/control-plane-operator-api.token status --control-plane-url http://127.0.0.1:8443
+ipars --agent-state-path /var/lib/heteronetwork/agent.json peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
+ipars --agent-state-path /var/lib/heteronetwork/agent.json routes --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path status --agent-url http://127.0.0.1:9780
-ipars --agent-state-path /var/lib/ipars/agent.json path status --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
+ipars --agent-state-path /var/lib/heteronetwork/agent.json path status --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
 ipars path events --agent-url http://127.0.0.1:9780
 ipars relay status --relay-url http://127.0.0.1:9580
 ipars relay probe --relay-url http://127.0.0.1:9580 --relay-udp 127.0.0.1:51820 --relay-admission-bearer-token <relay-secret> --send-invalid-credential
@@ -467,7 +467,7 @@ Prometheus-style metrics are exposed by control-plane, signal, STUN, relay, and 
 
 - Existing WireGuard data-plane state and relay sessions continue when the control plane is unavailable.
 - New joins, peer-map refreshes, policy changes, route changes, key rotations, and node removals require at least one reachable control plane.
-- A successful peer-map refresh serializes application and inventories the live WireGuard interface plus its IPv4/IPv6 main-table routes before changing peers. It removes restart-surviving or rotated keys outside the active/pinned map directly by public key and removes stale IPARS protocol-240 routes by their live CIDR/metric/protocol identity. Shape-compatible direct `boot`/`static` routes on that dedicated interface are migrated from older releases. An unreachable control plane does not trigger cleanup; an inventory or stale-route deletion error leaves WireGuard peer state unchanged for that attempt and is retried on the next poll.
+- A successful peer-map refresh serializes application and inventories the live WireGuard interface plus its IPv4/IPv6 main-table routes before changing peers. It removes restart-surviving or rotated keys outside the active/pinned map directly by public key and removes stale HeteroNetwork protocol-240 routes by their live CIDR/metric/protocol identity. Shape-compatible direct `boot`/`static` routes on that dedicated interface are migrated from older releases. An unreachable control plane does not trigger cleanup; an inventory or stale-route deletion error leaves WireGuard peer state unchanged for that attempt and is retried on the next poll.
 - Agents keep ordered control-plane and signal endpoint lists and retry failover endpoints without stopping the local data-plane loop. Connect and whole-request deadlines bound each endpoint attempt, including peers that accept TCP but never return HTTP.
 - Signal failure prevents new path negotiation and hole-punch planning; existing selected paths remain in local runtime state until they expire or are replaced.
 - Relay failure causes affected relay paths to renew or renegotiate. If direct candidates are available, path scoring can promote back to direct.
@@ -482,7 +482,7 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 scripts/helm-smoke.sh
 scripts/docker-smoke.sh
-IPARS_LOAD_SMOKE_BUILD_DAEMON=1 scripts/load-smoke.sh
+HETERONETWORK_LOAD_SMOKE_BUILD_DAEMON=1 scripts/load-smoke.sh
 ```
 
 Privileged Linux hosts can also run:
@@ -491,6 +491,6 @@ Privileged Linux hosts can also run:
 scripts/netns-smoke.sh
 ```
 
-That suite requires network namespace creation privileges, runs the actual `iparsd agent --preflight-only` path for kernel-netlink and (when `wg` is installed) command backends, proves that a restarted kernel-netlink backend can remove a pre-existing peer by public key without its lost Node ID cache, and proves that fresh command and netlink route managers can inventory and remove protocol-marked routes created by an earlier instance. It also runs the routed peer-quality UDP probe alongside route, WireGuard, hole-punch, and relay-fallback checks. Set `IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH` to a built object to make real tracepoint attach and ring-buffer event delivery a required part of the suite; CI always sets it. The suite may require `wireguard-tools`, kernel WireGuard support, `iptables`, tracefs, BPF privileges, and forwarding sysctls.
+That suite requires network namespace creation privileges, runs the actual `iparsd agent --preflight-only` path for kernel-netlink and (when `wg` is installed) command backends, proves that a restarted kernel-netlink backend can remove a pre-existing peer by public key without its lost Node ID cache, and proves that fresh command and netlink route managers can inventory and remove protocol-marked routes created by an earlier instance. It also runs the routed peer-quality UDP probe alongside route, WireGuard, hole-punch, and relay-fallback checks. Set `HETERONETWORK_NETNS_SMOKE_EBPF_OBJECT_PATH` to a built object to make real tracepoint attach and ring-buffer event delivery a required part of the suite; CI always sets it. The suite may require `wireguard-tools`, kernel WireGuard support, `iptables`, tracefs, BPF privileges, and forwarding sysctls.
 
 `.github/workflows/ci.yml` runs the Rust/MSRV, 3/10/1000-node plus daemon-failover load, Helm, Docker Compose, privileged namespace, and two-node kind suites as independent CI jobs for every pull request and `master` push. The privileged namespace job installs pinned eBPF Rust and linker tools, builds the repository object, requires real syscall tracepoint attach plus `sendto(2)` delivery and cgroup-only IPv4/IPv6 TCP `connect(2)`, TCP established/closing sockops state, and UDP send-message delivery with kernel-derived endpoint metadata, and installs the matching Ubuntu kernel module package only when WireGuard is not already available. The Kubernetes job downloads fixed kind, kubectl, and Helm versions and verifies each binary archive against its pinned SHA-256 before creating the disposable cluster.

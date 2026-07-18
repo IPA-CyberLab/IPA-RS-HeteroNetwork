@@ -105,8 +105,8 @@ jobs:
       - name: Build packet-flow eBPF object
         run: |
           set -euo pipefail
-          IPARS_EBPF_TOOLCHAIN="$RUST_EBPF_TOOLCHAIN" \
-          IPARS_EBPF_BPF_LINKER_VERSION="$BPF_LINKER_VERSION" \
+          HETERONETWORK_EBPF_TOOLCHAIN="$RUST_EBPF_TOOLCHAIN" \
+          HETERONETWORK_EBPF_BPF_LINKER_VERSION="$BPF_LINKER_VERSION" \
             scripts/build-ebpf.sh
 
       - name: Run privileged namespace integration suite
@@ -119,11 +119,11 @@ jobs:
             CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
-            IPARS_AGENT_NAT_SMOKE_IPARS_BIN="$PWD/target/debug/ipars" \
-            IPARS_AGENT_NAT_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
-            IPARS_NETNS_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
-            IPARS_NETNS_SMOKE_EBPF_OBJECT_PATH="$PWD/target/ebpf/ipars-packet-flow.bpf.o" \
-            bash -c 'scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=fixed-port scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=mixed-port scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided-port-preserving scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=one-sided-symmetric scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=asymmetric scripts/agent-nat-smoke.sh && IPARS_AGENT_NAT_SMOKE_PROFILE=symmetric scripts/agent-nat-smoke.sh && scripts/netns-smoke.sh'
+            HETERONETWORK_AGENT_NAT_SMOKE_HETERONETWORK_BIN="$PWD/target/debug/ipars" \
+            HETERONETWORK_AGENT_NAT_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
+            HETERONETWORK_NETNS_SMOKE_IPARSD_BIN="$PWD/target/debug/iparsd" \
+            HETERONETWORK_NETNS_SMOKE_EBPF_OBJECT_PATH="$PWD/target/ebpf/ipars-packet-flow.bpf.o" \
+            bash -c 'scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=fixed-port scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=mixed-port scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=one-sided scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=one-sided-port-preserving scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=one-sided-symmetric scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=asymmetric scripts/agent-nat-smoke.sh && HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=symmetric scripts/agent-nat-smoke.sh && scripts/netns-smoke.sh'
 
   docker-compose-smoke:
     name: Docker Compose smoke
@@ -239,8 +239,8 @@ jobs:
       - name: Run scale, transport, and daemon failover suite
         env:
           CARGO: cargo
-          IPARS_LOAD_SMOKE_BUILD_DAEMON: "1"
-          IPARS_LOAD_SMOKE_POSTGRES_DATABASE_URL: postgresql://ipars:ipars-load-password@127.0.0.1:5432/ipars?sslmode=disable
+          HETERONETWORK_LOAD_SMOKE_BUILD_DAEMON: "1"
+          HETERONETWORK_LOAD_SMOKE_POSTGRES_DATABASE_URL: postgresql://ipars:ipars-load-password@127.0.0.1:5432/ipars?sslmode=disable
         run: scripts/load-smoke.sh
 
   init-spawn-smoke:
@@ -273,7 +273,7 @@ jobs:
 
       - name: Run Helm lint and render suite
         env:
-          IPARS_HELM_IMAGE: alpine/helm@sha256:31ce11c4ee98c5e1e13628ead9212e665f32c3277cae63bd55ced32989089f3e
+          HETERONETWORK_HELM_IMAGE: alpine/helm@sha256:31ce11c4ee98c5e1e13628ead9212e665f32c3277cae63bd55ced32989089f3e
         run: scripts/helm-smoke.sh
 
   kind-smoke:
@@ -345,6 +345,6 @@ jobs:
       - name: Run three-node Kubernetes relay integration suite
         env:
           CARGO: cargo
-          IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND: linux-command
-          IPARS_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS: "300"
+          HETERONETWORK_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND: linux-command
+          HETERONETWORK_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS: "300"
         run: scripts/kind-k8s-smoke.sh

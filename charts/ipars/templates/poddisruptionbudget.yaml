@@ -1,9 +1,9 @@
-{{- include "ipars.validateBoolean" (dict "path" "agent.podDisruptionBudget.enabled" "value" .Values.agent.podDisruptionBudget.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.podDisruptionBudget.enabled" "value" .Values.agent.podDisruptionBudget.enabled) -}}
 {{- $pdbEnabled := .Values.agent.podDisruptionBudget.enabled -}}
 {{- $pdbMinAvailable := printf "%v" .Values.agent.podDisruptionBudget.minAvailable -}}
 {{- $pdbMaxUnavailable := printf "%v" .Values.agent.podDisruptionBudget.maxUnavailable -}}
-{{- include "ipars.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.minAvailable" "value" $pdbMinAvailable) -}}
-{{- include "ipars.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.maxUnavailable" "value" $pdbMaxUnavailable) -}}
+{{- include "heteronetwork.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.minAvailable" "value" $pdbMinAvailable) -}}
+{{- include "heteronetwork.validateIntOrPercent" (dict "path" "agent.podDisruptionBudget.maxUnavailable" "value" $pdbMaxUnavailable) -}}
 {{- if and (ne $pdbMinAvailable "") (ne $pdbMaxUnavailable "") -}}
 {{- fail "agent.podDisruptionBudget.minAvailable and agent.podDisruptionBudget.maxUnavailable are mutually exclusive" -}}
 {{- end -}}
@@ -17,14 +17,14 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{ include "ipars.fullname" . }}
+  name: {{ include "heteronetwork.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "ipars.name" . | quote }}
+      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
   {{- if ne $pdbMinAvailable "" }}
   minAvailable: {{- if regexMatch "%$" $pdbMinAvailable }} {{ $pdbMinAvailable | quote }}{{- else }} {{ int $pdbMinAvailable }}{{- end }}

@@ -114,7 +114,7 @@ struct Cli {
 
     #[arg(
         long,
-        env = "IPARS_LOAD_DAEMON_DATABASE_URL",
+        env = "HETERONETWORK_LOAD_DAEMON_DATABASE_URL",
         value_name = "URL",
         help = "External PostgreSQL URL for daemon control-plane load (credentials are passed only through child process environment)"
     )]
@@ -5144,11 +5144,11 @@ impl DaemonProcessGroup {
                 issuer.public_key_b64(),
             ];
             let mut control_plane_env = vec![(
-                "IPARS_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
+                "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
                 control_plane_operator_api_bearer_token.as_str(),
             )];
             if let Some(database_url) = database_url {
-                control_plane_env.push(("IPARS_DATABASE_URL", database_url));
+                control_plane_env.push(("HETERONETWORK_DATABASE_URL", database_url));
             } else {
                 control_plane_args.extend([
                     "--database-url".to_string(),
@@ -5196,7 +5196,7 @@ impl DaemonProcessGroup {
             "signal",
             &runtime_dir,
             &[(
-                "IPARS_SIGNAL_OPERATOR_API_BEARER_TOKEN",
+                "HETERONETWORK_SIGNAL_OPERATOR_API_BEARER_TOKEN",
                 signal_operator_api_bearer_token.as_str(),
             )],
         )?);
@@ -5229,7 +5229,7 @@ impl DaemonProcessGroup {
             "relay",
             &runtime_dir,
             &[(
-                "IPARS_RELAY_OPERATOR_API_BEARER_TOKEN",
+                "HETERONETWORK_RELAY_OPERATOR_API_BEARER_TOKEN",
                 relay_operator_api_bearer_token.as_str(),
             )],
         )?);
@@ -5245,7 +5245,7 @@ impl DaemonProcessGroup {
             "stun",
             &runtime_dir,
             &[(
-                "IPARS_STUN_OPERATOR_API_BEARER_TOKEN",
+                "HETERONETWORK_STUN_OPERATOR_API_BEARER_TOKEN",
                 stun_operator_api_bearer_token.as_str(),
             )],
         )?);
@@ -7990,6 +7990,7 @@ fn register_request(index: usize, scenario: Scenario) -> anyhow::Result<Register
         identity_public_key: identity.public_key_b64(),
         wireguard_public_key: wireguard_public_key_for_index(index),
         candidates: endpoint_candidates(index, scenario),
+        nat_classification: None,
         relay_capability: relay_capability(index, scenario),
         requested_routes: advertised_routes(index, scenario)?,
     })
@@ -8010,6 +8011,7 @@ fn heartbeat_request(index: usize, node: &NodeRecord) -> anyhow::Result<Heartbea
         node_id: node.node_id.clone(),
         health: healthy_node_health(),
         candidates: node.endpoint_candidates.clone(),
+        nat_classification: None,
         relay_capability: node.relay_capability.clone(),
         routes: Some(node.routes.clone()),
         path_state: Vec::new(),
@@ -11535,8 +11537,8 @@ if test "${PATH:-}" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
    test "${LANG:-}" = "C" &&
    test "${LC_ALL:-}" = "C" &&
    test -z "${HOME+x}" &&
-   test -z "${IPARS_ISSUER_PRIVATE_KEY+x}" &&
-   test -z "${IPARS_ISSUER_PRIVATE_KEY_PATH+x}" &&
+   test -z "${HETERONETWORK_ISSUER_PRIVATE_KEY+x}" &&
+   test -z "${HETERONETWORK_ISSUER_PRIVATE_KEY_PATH+x}" &&
    test -z "${LD_PRELOAD+x}"; then
     printf 'ok\n' > "$1"
 else
@@ -11545,8 +11547,8 @@ else
         printf 'LANG=%s\n' "${LANG-<unset>}"
         printf 'LC_ALL=%s\n' "${LC_ALL-<unset>}"
         printf 'HOME=%s\n' "${HOME-<unset>}"
-        printf 'IPARS_ISSUER_PRIVATE_KEY=%s\n' "${IPARS_ISSUER_PRIVATE_KEY-<unset>}"
-        printf 'IPARS_ISSUER_PRIVATE_KEY_PATH=%s\n' "${IPARS_ISSUER_PRIVATE_KEY_PATH-<unset>}"
+        printf 'HETERONETWORK_ISSUER_PRIVATE_KEY=%s\n' "${HETERONETWORK_ISSUER_PRIVATE_KEY-<unset>}"
+        printf 'HETERONETWORK_ISSUER_PRIVATE_KEY_PATH=%s\n' "${HETERONETWORK_ISSUER_PRIVATE_KEY_PATH-<unset>}"
         printf 'LD_PRELOAD=%s\n' "${LD_PRELOAD-<unset>}"
     } > "$1"
     exit 1
@@ -11776,7 +11778,8 @@ fi
     #[tokio::test]
     async fn load_harness_can_drive_daemon_processes_when_binary_is_provided() -> anyhow::Result<()>
     {
-        let Some(iparsd_bin) = std::env::var_os("IPARS_TEST_IPARSD_BIN").map(PathBuf::from) else {
+        let Some(iparsd_bin) = std::env::var_os("HETERONETWORK_TEST_IPARSD_BIN").map(PathBuf::from)
+        else {
             return Ok(());
         };
 

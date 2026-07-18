@@ -24,13 +24,17 @@ const RELAY_NODE: &str = "relay-a";
 #[tokio::test]
 async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(role) = std::env::var("IPARS_RELAY_NETNS_CHILD_ROLE") {
+    if let Ok(role) = std::env::var("HETERONETWORK_RELAY_NETNS_CHILD_ROLE") {
         return run_child(&role).await;
     }
 
-    if std::env::var("IPARS_RUN_RELAY_NETNS_TESTS").ok().as_deref() != Some("1") {
+    if std::env::var("HETERONETWORK_RUN_RELAY_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         eprintln!(
-            "skipping relay fallback netns integration test; set IPARS_RUN_RELAY_NETNS_TESTS=1 to run it"
+            "skipping relay fallback netns integration test; set HETERONETWORK_RUN_RELAY_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }
@@ -109,14 +113,17 @@ async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
     let relay = spawn_child(
         &relay_namespace,
         [
-            ("IPARS_RELAY_NETNS_CHILD_ROLE", "relay"),
-            ("IPARS_RELAY_BIND", "0.0.0.0:41000"),
-            ("IPARS_RELAY_PUBLIC_ENDPOINT", "10.241.0.2:41000"),
-            ("IPARS_RELAY_LEFT_ADDR", "10.241.0.1:42000"),
-            ("IPARS_RELAY_RIGHT_ADDR", "10.241.0.5:43000"),
-            ("IPARS_RELAY_READY_FILE", relay_ready_str.as_str()),
-            ("IPARS_RELAY_STOP_FILE", relay_stop_str.as_str()),
-            ("IPARS_RELAY_METRICS_FILE", relay_metrics_str.as_str()),
+            ("HETERONETWORK_RELAY_NETNS_CHILD_ROLE", "relay"),
+            ("HETERONETWORK_RELAY_BIND", "0.0.0.0:41000"),
+            ("HETERONETWORK_RELAY_PUBLIC_ENDPOINT", "10.241.0.2:41000"),
+            ("HETERONETWORK_RELAY_LEFT_ADDR", "10.241.0.1:42000"),
+            ("HETERONETWORK_RELAY_RIGHT_ADDR", "10.241.0.5:43000"),
+            ("HETERONETWORK_RELAY_READY_FILE", relay_ready_str.as_str()),
+            ("HETERONETWORK_RELAY_STOP_FILE", relay_stop_str.as_str()),
+            (
+                "HETERONETWORK_RELAY_METRICS_FILE",
+                relay_metrics_str.as_str(),
+            ),
         ],
     )?;
     wait_for_file(&relay_ready)?;
@@ -124,10 +131,13 @@ async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
     let peer = spawn_child(
         &peer_namespace,
         [
-            ("IPARS_RELAY_NETNS_CHILD_ROLE", "peer"),
-            ("IPARS_RELAY_PEER_BIND", "10.241.0.5:43000"),
-            ("IPARS_RELAY_PEER_ENDPOINT", "10.241.0.6:41000"),
-            ("IPARS_RELAY_PEER_READY_FILE", peer_ready_str.as_str()),
+            ("HETERONETWORK_RELAY_NETNS_CHILD_ROLE", "peer"),
+            ("HETERONETWORK_RELAY_PEER_BIND", "10.241.0.5:43000"),
+            ("HETERONETWORK_RELAY_PEER_ENDPOINT", "10.241.0.6:41000"),
+            (
+                "HETERONETWORK_RELAY_PEER_READY_FILE",
+                peer_ready_str.as_str(),
+            ),
         ],
     )?;
     wait_for_file(&peer_ready)?;
@@ -135,12 +145,18 @@ async fn relay_forwarder_fallback_proxies_datagrams_between_network_namespaces(
     let forwarder = spawn_child(
         &client_namespace,
         [
-            ("IPARS_RELAY_NETNS_CHILD_ROLE", "forwarder"),
-            ("IPARS_RELAY_FORWARDER_BIND", "10.241.0.1:42000"),
-            ("IPARS_RELAY_FORWARDER_RELAY_ENDPOINT", "10.241.0.2:41000"),
-            ("IPARS_RELAY_FORWARDER_PEER_ADDR", "10.241.0.5:43000"),
+            ("HETERONETWORK_RELAY_NETNS_CHILD_ROLE", "forwarder"),
+            ("HETERONETWORK_RELAY_FORWARDER_BIND", "10.241.0.1:42000"),
             (
-                "IPARS_RELAY_FORWARDER_WIREGUARD_ENDPOINT",
+                "HETERONETWORK_RELAY_FORWARDER_RELAY_ENDPOINT",
+                "10.241.0.2:41000",
+            ),
+            (
+                "HETERONETWORK_RELAY_FORWARDER_PEER_ADDR",
+                "10.241.0.5:43000",
+            ),
+            (
+                "HETERONETWORK_RELAY_FORWARDER_WIREGUARD_ENDPOINT",
                 "127.0.0.1:44000",
             ),
         ],
@@ -188,13 +204,14 @@ async fn run_child(role: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_relay() -> Result<(), Box<dyn std::error::Error>> {
-    let bind = required_env("IPARS_RELAY_BIND")?.parse::<SocketAddr>()?;
-    let public_endpoint = required_env("IPARS_RELAY_PUBLIC_ENDPOINT")?.parse::<SocketAddr>()?;
-    let left_addr = required_env("IPARS_RELAY_LEFT_ADDR")?.parse::<SocketAddr>()?;
-    let right_addr = required_env("IPARS_RELAY_RIGHT_ADDR")?.parse::<SocketAddr>()?;
-    let ready_file = PathBuf::from(required_env("IPARS_RELAY_READY_FILE")?);
-    let stop_file = PathBuf::from(required_env("IPARS_RELAY_STOP_FILE")?);
-    let metrics_file = std::env::var("IPARS_RELAY_METRICS_FILE")
+    let bind = required_env("HETERONETWORK_RELAY_BIND")?.parse::<SocketAddr>()?;
+    let public_endpoint =
+        required_env("HETERONETWORK_RELAY_PUBLIC_ENDPOINT")?.parse::<SocketAddr>()?;
+    let left_addr = required_env("HETERONETWORK_RELAY_LEFT_ADDR")?.parse::<SocketAddr>()?;
+    let right_addr = required_env("HETERONETWORK_RELAY_RIGHT_ADDR")?.parse::<SocketAddr>()?;
+    let ready_file = PathBuf::from(required_env("HETERONETWORK_RELAY_READY_FILE")?);
+    let stop_file = PathBuf::from(required_env("HETERONETWORK_RELAY_STOP_FILE")?);
+    let metrics_file = std::env::var("HETERONETWORK_RELAY_METRICS_FILE")
         .ok()
         .map(PathBuf::from);
 
@@ -246,9 +263,10 @@ async fn run_relay() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_peer() -> Result<(), Box<dyn std::error::Error>> {
-    let bind = required_env("IPARS_RELAY_PEER_BIND")?.parse::<SocketAddr>()?;
-    let relay_endpoint = required_env("IPARS_RELAY_PEER_ENDPOINT")?.parse::<SocketAddr>()?;
-    let ready_file = PathBuf::from(required_env("IPARS_RELAY_PEER_READY_FILE")?);
+    let bind = required_env("HETERONETWORK_RELAY_PEER_BIND")?.parse::<SocketAddr>()?;
+    let relay_endpoint =
+        required_env("HETERONETWORK_RELAY_PEER_ENDPOINT")?.parse::<SocketAddr>()?;
+    let ready_file = PathBuf::from(required_env("HETERONETWORK_RELAY_PEER_READY_FILE")?);
     let socket = tokio::net::UdpSocket::bind(bind).await?;
     fs::write(&ready_file, b"ready")?;
 
@@ -273,12 +291,13 @@ async fn run_peer() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_forwarder() -> Result<(), Box<dyn std::error::Error>> {
-    let bind = required_env("IPARS_RELAY_FORWARDER_BIND")?.parse::<SocketAddr>()?;
+    let bind = required_env("HETERONETWORK_RELAY_FORWARDER_BIND")?.parse::<SocketAddr>()?;
     let relay_endpoint =
-        required_env("IPARS_RELAY_FORWARDER_RELAY_ENDPOINT")?.parse::<SocketAddr>()?;
-    let peer_addr = required_env("IPARS_RELAY_FORWARDER_PEER_ADDR")?.parse::<SocketAddr>()?;
+        required_env("HETERONETWORK_RELAY_FORWARDER_RELAY_ENDPOINT")?.parse::<SocketAddr>()?;
+    let peer_addr =
+        required_env("HETERONETWORK_RELAY_FORWARDER_PEER_ADDR")?.parse::<SocketAddr>()?;
     let wireguard_endpoint =
-        required_env("IPARS_RELAY_FORWARDER_WIREGUARD_ENDPOINT")?.parse::<SocketAddr>()?;
+        required_env("HETERONETWORK_RELAY_FORWARDER_WIREGUARD_ENDPOINT")?.parse::<SocketAddr>()?;
 
     let forwarder_socket = tokio::net::UdpSocket::bind(bind).await?;
     let forwarder_addr = forwarder_socket.local_addr()?;

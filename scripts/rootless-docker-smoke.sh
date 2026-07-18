@@ -13,7 +13,7 @@ workload_network_a=""
 workload_network_b=""
 daemon_pid=""
 daemon_pid_file=""
-project_name="ipars-rootless-${suffix}"
+project_name="heteronetwork-rootless-${suffix}"
 override_path=""
 rootless_attach_overrides=()
 e2e_started=0
@@ -114,7 +114,7 @@ fi
 
 trap cleanup EXIT
 umask 077
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-rootless-smoke.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-rootless-smoke.XXXXXX")"
 runtime_dir="$tmp_dir/runtime"
 mkdir -m 700 "$runtime_dir"
 docker_socket="$runtime_dir/docker.sock"
@@ -185,8 +185,8 @@ DOCKER_HOST="unix://${docker_socket}" "$docker_bin" compose \
   -f "$repo_root/docker/compose.rootless.yaml" \
   -f "$repo_root/docker/compose.rootless-dataplane.yaml" \
   config --no-interpolate >"$rendered_config"
-grep -F 'IPARS_AGENT_RUNTIME_BACKEND=linux-command' "$rendered_config" >/dev/null
-grep -F 'IPARS_AGENT_WIREGUARD_BACKEND=userspace-boringtun' "$rendered_config" >/dev/null
+grep -F 'HETERONETWORK_AGENT_RUNTIME_BACKEND=linux-command' "$rendered_config" >/dev/null
+grep -F 'HETERONETWORK_AGENT_WIREGUARD_BACKEND=userspace-boringtun' "$rendered_config" >/dev/null
 grep -F '/dev/net/tun' "$rendered_config" >/dev/null
 grep -F 'NET_ADMIN' "$rendered_config" >/dev/null
 
@@ -294,24 +294,24 @@ for secret_path in \
   generate_secret >"$secret_path"
 done
 
-export IPARS_ROOTLESS_CLUSTER_ID="$rootless_cluster_id"
-export IPARS_ROOTLESS_ISSUER_NODE_ID="$rootless_issuer_node_id"
-export IPARS_ROOTLESS_ISSUER_KEY_ID="$rootless_issuer_key_id"
-export IPARS_ROOTLESS_ISSUER_PUBLIC_KEY="$rootless_issuer_public_key"
-export IPARS_ROOTLESS_JOIN_TOKEN_FILE="$join_token_path"
-export IPARS_ROOTLESS_AGENT_API_TOKEN_FILE="$agent_api_token_path"
-export IPARS_ROOTLESS_CONTROL_PLANE_OPERATOR_TOKEN_FILE="$control_plane_operator_token_path"
-export IPARS_ROOTLESS_SIGNAL_OPERATOR_TOKEN_FILE="$signal_operator_token_path"
-export IPARS_ROOTLESS_STUN_OPERATOR_TOKEN_FILE="$stun_operator_token_path"
-export IPARS_ROOTLESS_RELAY_OPERATOR_TOKEN_FILE="$relay_operator_token_path"
-export IPARS_ROOTLESS_RELAY_ADMISSION_TOKEN_FILE="$relay_admission_token_path"
+export HETERONETWORK_ROOTLESS_CLUSTER_ID="$rootless_cluster_id"
+export HETERONETWORK_ROOTLESS_ISSUER_NODE_ID="$rootless_issuer_node_id"
+export HETERONETWORK_ROOTLESS_ISSUER_KEY_ID="$rootless_issuer_key_id"
+export HETERONETWORK_ROOTLESS_ISSUER_PUBLIC_KEY="$rootless_issuer_public_key"
+export HETERONETWORK_ROOTLESS_JOIN_TOKEN_FILE="$join_token_path"
+export HETERONETWORK_ROOTLESS_AGENT_API_TOKEN_FILE="$agent_api_token_path"
+export HETERONETWORK_ROOTLESS_CONTROL_PLANE_OPERATOR_TOKEN_FILE="$control_plane_operator_token_path"
+export HETERONETWORK_ROOTLESS_SIGNAL_OPERATOR_TOKEN_FILE="$signal_operator_token_path"
+export HETERONETWORK_ROOTLESS_STUN_OPERATOR_TOKEN_FILE="$stun_operator_token_path"
+export HETERONETWORK_ROOTLESS_RELAY_OPERATOR_TOKEN_FILE="$relay_operator_token_path"
+export HETERONETWORK_ROOTLESS_RELAY_ADMISSION_TOKEN_FILE="$relay_admission_token_path"
 workload_network_a="${project_name}_workload-a"
 workload_network_b="${project_name}_workload-b"
-export IPARS_DOCKER_API_SOCKET_HOST="$docker_socket"
-export IPARS_ROOTLESS_DOCKER_NETWORK_A="$workload_network_a"
-export IPARS_ROOTLESS_DOCKER_NETWORK_B="$workload_network_b"
-workload_a_http_port="${IPARS_ROOTLESS_WORKLOAD_A_HTTP_PORT:-18080}"
-workload_b_http_port="${IPARS_ROOTLESS_WORKLOAD_B_HTTP_PORT:-18081}"
+export HETERONETWORK_DOCKER_API_SOCKET_HOST="$docker_socket"
+export HETERONETWORK_ROOTLESS_DOCKER_NETWORK_A="$workload_network_a"
+export HETERONETWORK_ROOTLESS_DOCKER_NETWORK_B="$workload_network_b"
+workload_a_http_port="${HETERONETWORK_ROOTLESS_WORKLOAD_A_HTTP_PORT:-18080}"
+workload_b_http_port="${HETERONETWORK_ROOTLESS_WORKLOAD_B_HTTP_PORT:-18081}"
 for workload_http_port in "$workload_a_http_port" "$workload_b_http_port"; do
   if [[ ! "$workload_http_port" =~ ^[0-9]+$ || "$workload_http_port" -lt 1 || "$workload_http_port" -gt 65535 ]]; then
     echo "rootless workload HTTP ports must be integers between 1 and 65535" >&2
@@ -322,8 +322,8 @@ if [[ "$workload_a_http_port" == "$workload_b_http_port" ]]; then
   echo "rootless workload HTTP ports must be distinct across Agent namespaces" >&2
   exit 1
 fi
-export IPARS_ROOTLESS_WORKLOAD_A_HTTP_PORT="$workload_a_http_port"
-export IPARS_ROOTLESS_WORKLOAD_B_HTTP_PORT="$workload_b_http_port"
+export HETERONETWORK_ROOTLESS_WORKLOAD_A_HTTP_PORT="$workload_a_http_port"
+export HETERONETWORK_ROOTLESS_WORKLOAD_B_HTTP_PORT="$workload_b_http_port"
 
 rootless_e2e_compose() {
   local compose_files=(
@@ -355,15 +355,15 @@ if ! rootless_e2e_compose config --format json >"$tmp_dir/rootless-e2e-config.js
   exit 1
 fi
 if ! jq -e --arg network_a "$workload_network_a" --arg network_b "$workload_network_b" '
-  .services.agent.environment.IPARS_DOCKER_DISCOVER_NETWORKS == "true"
-  and .services.agent.environment.IPARS_DOCKER_NETWORKS == $network_a
-  and .services.agent.environment.IPARS_DOCKER_CONTAINER_CIDRS == null
-  and .services["agent-b"].environment.IPARS_DOCKER_DISCOVER_NETWORKS == "true"
-  and .services["agent-b"].environment.IPARS_DOCKER_NETWORKS == $network_b
-  and .services["agent-b"].environment.IPARS_DOCKER_CONTAINER_CIDRS == null
+  .services.agent.environment.HETERONETWORK_DOCKER_DISCOVER_NETWORKS == "true"
+  and .services.agent.environment.HETERONETWORK_DOCKER_NETWORKS == $network_a
+  and .services.agent.environment.HETERONETWORK_DOCKER_CONTAINER_CIDRS == null
+  and .services["agent-b"].environment.HETERONETWORK_DOCKER_DISCOVER_NETWORKS == "true"
+  and .services["agent-b"].environment.HETERONETWORK_DOCKER_NETWORKS == $network_b
+  and .services["agent-b"].environment.HETERONETWORK_DOCKER_CONTAINER_CIDRS == null
   # Compose v2.38 omits false-valued bind fields from JSON; reject only true.
-  and any(.services.agent.volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and ((.bind.create_host_path // false) == false))
-  and any(.services["agent-b"].volumes[]; .target == "/run/ipars/docker.sock" and .read_only == true and ((.bind.create_host_path // false) == false))
+  and any(.services.agent.volumes[]; .target == "/run/heteronetwork/docker.sock" and .read_only == true and ((.bind.create_host_path // false) == false))
+  and any(.services["agent-b"].volumes[]; .target == "/run/heteronetwork/docker.sock" and .read_only == true and ((.bind.create_host_path // false) == false))
 ' "$tmp_dir/rootless-e2e-config.json" >/dev/null; then
   echo "rootless e2e Compose discovery contract mismatch" >&2
   "$docker_bin" compose version >&2 || true
@@ -439,7 +439,7 @@ agent_get() {
   local service="$1"
   local path="$2"
   rootless_e2e_compose exec -T "$service" sh -ec '
-    token="$(cat /run/secrets/ipars-agent-api-bearer-token)"
+    token="$(cat /run/secrets/heteronetwork-agent-api-bearer-token)"
     curl --noproxy "*" -fsS -H "Authorization: Bearer ${token}" "http://127.0.0.1:9780${1}"
   ' sh "$path"
 }
@@ -448,7 +448,7 @@ agent_post_peer_activity() {
   local service="$1"
   local peer="$2"
   rootless_e2e_compose exec -T "$service" sh -ec '
-    token="$(cat /run/secrets/ipars-agent-api-bearer-token)"
+    token="$(cat /run/secrets/heteronetwork-agent-api-bearer-token)"
     body="$(printf '\''{"peer":"%s","pin":true}'\'' "$1")"
     curl --noproxy "*" -fsS \
       -H "Authorization: Bearer ${token}" \
@@ -548,7 +548,7 @@ assert_vpn_route() {
   local service="$1"
   local remote_vpn_ip="$2"
   rootless_e2e_compose exec -T "$service" sh -ec '
-    ip route get "$1" | grep -Eq " dev ipars0( |$)"
+    ip route get "$1" | grep -Eq " dev heteronetwork0( |$)"
   ' sh "$remote_vpn_ip"
 }
 
@@ -564,7 +564,7 @@ assert_workload_http() {
   local service="$1"
   local remote_workload_ip="$2"
   rootless_e2e_compose exec -T "$service" sh -ec '
-    ip route get "$1" | grep -Eq " dev ipars0( |$)"
+    ip route get "$1" | grep -Eq " dev heteronetwork0( |$)"
     curl --noproxy "*" --connect-timeout 5 --max-time 15 -fsS "http://${1}:8080/healthz" | grep -F '\''"status":"ok"'\'' >/dev/null
   ' sh "$remote_workload_ip"
 }
@@ -589,10 +589,10 @@ wait_for_workload_route_churn() {
   for _ in $(seq 1 120); do
     if assert_workload_http "$service" "$remote_workload_ip" >/dev/null 2>&1 \
       && ! rootless_e2e_compose exec -T "$service" sh -ec '
-        wg show ipars0 allowed-ips | grep -F -- "$1" >/dev/null
+        wg show heteronetwork0 allowed-ips | grep -F -- "$1" >/dev/null
       ' sh "$stale_workload_cidr" \
       && ! rootless_e2e_compose exec -T "$service" sh -ec '
-        ip route get "$1" | grep -Eq " dev ipars0( |$)"
+        ip route get "$1" | grep -Eq " dev heteronetwork0( |$)"
       ' sh "$stale_workload_ip"; then
       return 0
     fi
@@ -613,7 +613,7 @@ rootless_dataplane_diagnostics() {
     rootless_e2e_compose exec -T "$service" sh -ec '
       ip address show
       ip route show
-      wg show ipars0
+      wg show heteronetwork0
     ' >&2 || true
   done
   echo "--- agent logs ---" >&2

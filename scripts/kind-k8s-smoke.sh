@@ -6,17 +6,17 @@ docker_bin="${DOCKER:-docker}"
 kind_bin="${KIND:-kind}"
 kubectl_bin="${KUBECTL:-kubectl}"
 helm_bin="${HELM:-helm}"
-ipars_bin="${IPARS_K8S_SMOKE_IPARS_BIN:-}"
+ipars_bin="${HETERONETWORK_K8S_SMOKE_HETERONETWORK_BIN:-}"
 cargo_bin="${CARGO:-cargo}"
 suffix="$$-$(date +%s%N)"
-cluster_name="${IPARS_KIND_K8S_SMOKE_CLUSTER_NAME:-ipars-kind-${suffix}}"
-image_repository="ipars-kind-smoke"
+cluster_name="${HETERONETWORK_KIND_K8S_SMOKE_CLUSTER_NAME:-heteronetwork-kind-${suffix}}"
+image_repository="heteronetwork-kind-smoke"
 image_tag="run-${suffix}"
 image_ref="${image_repository}:${image_tag}"
-cluster_wait_seconds="${IPARS_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS:-180}"
-agent_runtime_backend="${IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
-keep_cluster="${IPARS_KIND_K8S_SMOKE_KEEP_CLUSTER:-0}"
-agent_host_network="${IPARS_KIND_K8S_SMOKE_AGENT_HOST_NETWORK:-true}"
+cluster_wait_seconds="${HETERONETWORK_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS:-180}"
+agent_runtime_backend="${HETERONETWORK_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
+keep_cluster="${HETERONETWORK_KIND_K8S_SMOKE_KEEP_CLUSTER:-0}"
+agent_host_network="${HETERONETWORK_KIND_K8S_SMOKE_AGENT_HOST_NETWORK:-true}"
 tmp_dir=""
 cluster_requested=0
 image_built=0
@@ -63,23 +63,23 @@ cleanup() {
 }
 
 if [[ ! "$cluster_wait_seconds" =~ ^[0-9]+$ || "$cluster_wait_seconds" -lt 30 || "$cluster_wait_seconds" -gt 900 ]]; then
-  echo "IPARS_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS must be an integer between 30 and 900" >&2
+  echo "HETERONETWORK_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS must be an integer between 30 and 900" >&2
   exit 1
 fi
 if [[ "$agent_runtime_backend" != "linux-command" && "$agent_runtime_backend" != "dry-run" ]]; then
-  echo "IPARS_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
+  echo "HETERONETWORK_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
   exit 1
 fi
 if [[ "$agent_host_network" != "true" && "$agent_host_network" != "false" ]]; then
-  echo "IPARS_KIND_K8S_SMOKE_AGENT_HOST_NETWORK must be true or false" >&2
+  echo "HETERONETWORK_KIND_K8S_SMOKE_AGENT_HOST_NETWORK must be true or false" >&2
   exit 1
 fi
 if [[ "$keep_cluster" != "0" && "$keep_cluster" != "1" ]]; then
-  echo "IPARS_KIND_K8S_SMOKE_KEEP_CLUSTER must be 0 or 1" >&2
+  echo "HETERONETWORK_KIND_K8S_SMOKE_KEEP_CLUSTER must be 0 or 1" >&2
   exit 1
 fi
 
-require_dns_label "$cluster_name" "IPARS_KIND_K8S_SMOKE_CLUSTER_NAME" 63
+require_dns_label "$cluster_name" "HETERONETWORK_KIND_K8S_SMOKE_CLUSTER_NAME" 63
 require_command "$docker_bin"
 require_command "$kind_bin"
 require_command "$kubectl_bin"
@@ -87,7 +87,7 @@ require_command "$helm_bin"
 require_command jq
 if [[ -n "$ipars_bin" ]]; then
   if [[ ! -x "$ipars_bin" ]]; then
-    echo "IPARS_K8S_SMOKE_IPARS_BIN must be an executable file" >&2
+    echo "HETERONETWORK_K8S_SMOKE_HETERONETWORK_BIN must be an executable file" >&2
     exit 1
   fi
 else
@@ -158,12 +158,12 @@ image_built=1
 KUBECONFIG="$kubeconfig" \
 KUBECTL="$kubectl_bin" \
 HELM="$helm_bin" \
-IPARS_K8S_SMOKE_IMAGE_REPOSITORY="$image_repository" \
-IPARS_K8S_SMOKE_IMAGE_TAG="$image_tag" \
-IPARS_K8S_SMOKE_IMAGE_PULL_POLICY=Never \
-IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND="$agent_runtime_backend" \
-IPARS_K8S_SMOKE_AGENT_HOST_NETWORK="$agent_host_network" \
-IPARS_K8S_SMOKE_KEEP_RESOURCES="$keep_cluster" \
+HETERONETWORK_K8S_SMOKE_IMAGE_REPOSITORY="$image_repository" \
+HETERONETWORK_K8S_SMOKE_IMAGE_TAG="$image_tag" \
+HETERONETWORK_K8S_SMOKE_IMAGE_PULL_POLICY=Never \
+HETERONETWORK_K8S_SMOKE_AGENT_RUNTIME_BACKEND="$agent_runtime_backend" \
+HETERONETWORK_K8S_SMOKE_AGENT_HOST_NETWORK="$agent_host_network" \
+HETERONETWORK_K8S_SMOKE_KEEP_RESOURCES="$keep_cluster" \
 "$repo_root/scripts/k8s-live-smoke.sh"
 
 echo "kind Kubernetes smoke checks completed"

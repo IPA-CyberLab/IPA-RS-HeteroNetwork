@@ -5,27 +5,27 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kubectl_bin="${KUBECTL:-kubectl}"
 helm_bin="${HELM:-helm}"
 cargo_bin="${CARGO:-cargo}"
-ipars_bin="${IPARS_K8S_SMOKE_IPARS_BIN:-}"
-image_repository="${IPARS_K8S_SMOKE_IMAGE_REPOSITORY:-}"
-image_tag="${IPARS_K8S_SMOKE_IMAGE_TAG:-}"
-image_pull_policy="${IPARS_K8S_SMOKE_IMAGE_PULL_POLICY:-IfNotPresent}"
-agent_runtime_backend="${IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
-timeout_seconds="${IPARS_K8S_SMOKE_TIMEOUT_SECONDS:-300}"
-keep_resources="${IPARS_K8S_SMOKE_KEEP_RESOURCES:-0}"
-agent_host_network="${IPARS_K8S_SMOKE_AGENT_HOST_NETWORK:-true}"
+ipars_bin="${HETERONETWORK_K8S_SMOKE_HETERONETWORK_BIN:-}"
+image_repository="${HETERONETWORK_K8S_SMOKE_IMAGE_REPOSITORY:-}"
+image_tag="${HETERONETWORK_K8S_SMOKE_IMAGE_TAG:-}"
+image_pull_policy="${HETERONETWORK_K8S_SMOKE_IMAGE_PULL_POLICY:-IfNotPresent}"
+agent_runtime_backend="${HETERONETWORK_K8S_SMOKE_AGENT_RUNTIME_BACKEND:-linux-command}"
+timeout_seconds="${HETERONETWORK_K8S_SMOKE_TIMEOUT_SECONDS:-300}"
+keep_resources="${HETERONETWORK_K8S_SMOKE_KEEP_RESOURCES:-0}"
+agent_host_network="${HETERONETWORK_K8S_SMOKE_AGENT_HOST_NETWORK:-true}"
 suffix="$$-$(date +%s%N)"
-namespace="${IPARS_K8S_SMOKE_NAMESPACE:-ipars-live-${suffix}}"
-release="${IPARS_K8S_SMOKE_RELEASE:-ipars-live-${suffix}}"
-bootstrap_name="ipars-bootstrap"
-signal_name="ipars-signal"
-token_secret="ipars-live-join"
+namespace="${HETERONETWORK_K8S_SMOKE_NAMESPACE:-heteronetwork-live-${suffix}}"
+release="${HETERONETWORK_K8S_SMOKE_RELEASE:-heteronetwork-live-${suffix}}"
+bootstrap_name="heteronetwork-bootstrap"
+signal_name="heteronetwork-signal"
+token_secret="heteronetwork-live-join"
 agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
-service_route_name="ipars-route-target"
+service_route_name="heteronetwork-route-target"
 service_route_port="18080"
-relay_udp_node_port="${IPARS_K8S_SMOKE_RELAY_UDP_NODE_PORT:-31820}"
-relay_http_node_port="${IPARS_K8S_SMOKE_RELAY_HTTP_NODE_PORT:-31958}"
-service_cidr="${IPARS_K8S_SMOKE_SERVICE_CIDR:-10.96.0.0/12}"
+relay_udp_node_port="${HETERONETWORK_K8S_SMOKE_RELAY_UDP_NODE_PORT:-31820}"
+relay_http_node_port="${HETERONETWORK_K8S_SMOKE_RELAY_HTTP_NODE_PORT:-31958}"
+service_cidr="${HETERONETWORK_K8S_SMOKE_SERVICE_CIDR:-10.96.0.0/12}"
 stale_kubernetes_route_cidr="198.18.0.0/15"
 chart_fullname=""
 relay_service_name=""
@@ -102,7 +102,7 @@ dump_diagnostics() {
       echo "[remote healthz]"
       curl --noproxy "*" --silent --show-error --max-time 5 \
         -o /dev/null -w "http_code=%{http_code}\n" "http://${2}:9780/healthz"
-    ' sh ipars0 100.64.0.2 2>&1 || true
+    ' sh heteronetwork0 100.64.0.2 2>&1 || true
     "$kubectl_bin" -n "$namespace" logs "$pod" -c agent --tail=200 2>&1 || true
   done < <("$kubectl_bin" -n "$namespace" get pods \
     -l "app.kubernetes.io/name=ipars,app.kubernetes.io/instance=${release}" \
@@ -141,7 +141,7 @@ wait_for_bootstrap_health() {
   local attempt
   for attempt in $(seq 1 60); do
     pod="$("$kubectl_bin" -n "$namespace" get pods \
-      -l app.kubernetes.io/component=ipars-bootstrap \
+      -l app.kubernetes.io/component=heteronetwork-bootstrap \
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -n "$pod" ]] \
       && "$kubectl_bin" -n "$namespace" exec "$pod" -c control-plane -- \
@@ -161,7 +161,7 @@ wait_for_signal_health() {
   local attempt
   for attempt in $(seq 1 60); do
     pod="$($kubectl_bin -n "$namespace" get pods \
-      -l app.kubernetes.io/component=ipars-signal \
+      -l app.kubernetes.io/component=heteronetwork-signal \
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -n "$pod" ]] \
       && "$kubectl_bin" -n "$namespace" exec "$pod" -c signal -- \
@@ -339,11 +339,11 @@ pin_relay_service_to_pod() {
     return 1
   fi
 
-  "$kubectl_bin" -n "$namespace" label pod "$pod" ipars.io/live-smoke-relay=true --overwrite >/dev/null
+  "$kubectl_bin" -n "$namespace" label pod "$pod" heteronetwork.io/live-smoke-relay=true --overwrite >/dev/null
   selector_patch="$(jq -cn \
     --arg name "$pod_name_label" \
     --arg instance "$pod_instance_label" \
-    '{spec:{selector:{"app.kubernetes.io/name":$name,"app.kubernetes.io/instance":$instance,"ipars.io/live-smoke-relay":"true"}}}')"
+    '{spec:{selector:{"app.kubernetes.io/name":$name,"app.kubernetes.io/instance":$instance,"heteronetwork.io/live-smoke-relay":"true"}}}')"
   "$kubectl_bin" -n "$namespace" patch service "$relay_service_name" \
     --type=merge -p "$selector_patch" >/dev/null
   echo "Kubernetes relay Service ${relay_service_name} pinned to Agent pod ${pod} (${pod_ip})"
@@ -413,7 +413,7 @@ wait_for_wireguard_path() {
         wg show "$interface" allowed-ips | grep -F -- "$remote_cidr" >/dev/null
         curl --noproxy "*" --fail --silent --show-error --max-time 5 "$remote_url" >/dev/null
         wg show "$interface" latest-handshakes | awk '\''$2 > 0 { found = 1 } END { exit !found }'\''
-      ' sh ipars0 "${local_vpn_ip}/32" "${remote_vpn_ip}/32" \
+      ' sh heteronetwork0 "${local_vpn_ip}/32" "${remote_vpn_ip}/32" \
         "http://${remote_url_host}:9780/healthz" >/dev/null 2>&1; then
       return 0
     fi
@@ -582,47 +582,47 @@ wait_for_control_plane_relay_candidates() {
 }
 
 if [[ -z "$image_repository" || -z "$image_tag" ]]; then
-  echo "set IPARS_K8S_SMOKE_IMAGE_REPOSITORY and IPARS_K8S_SMOKE_IMAGE_TAG to an image reachable by the target cluster" >&2
+  echo "set HETERONETWORK_K8S_SMOKE_IMAGE_REPOSITORY and HETERONETWORK_K8S_SMOKE_IMAGE_TAG to an image reachable by the target cluster" >&2
   exit 1
 fi
 if [[ ! "$image_repository" =~ ^[a-z0-9]([a-z0-9._:/-]*[a-z0-9])?$ ]]; then
-  echo "IPARS_K8S_SMOKE_IMAGE_REPOSITORY must be a lowercase image repository" >&2
+  echo "HETERONETWORK_K8S_SMOKE_IMAGE_REPOSITORY must be a lowercase image repository" >&2
   exit 1
 fi
 if [[ ! "$image_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
-  echo "IPARS_K8S_SMOKE_IMAGE_TAG must be a valid image tag" >&2
+  echo "HETERONETWORK_K8S_SMOKE_IMAGE_TAG must be a valid image tag" >&2
   exit 1
 fi
 if [[ ! "$image_pull_policy" =~ ^(Always|IfNotPresent|Never)$ ]]; then
-  echo "IPARS_K8S_SMOKE_IMAGE_PULL_POLICY must be Always, IfNotPresent, or Never" >&2
+  echo "HETERONETWORK_K8S_SMOKE_IMAGE_PULL_POLICY must be Always, IfNotPresent, or Never" >&2
   exit 1
 fi
 if [[ "$agent_runtime_backend" != "linux-command" && "$agent_runtime_backend" != "dry-run" ]]; then
-  echo "IPARS_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
+  echo "HETERONETWORK_K8S_SMOKE_AGENT_RUNTIME_BACKEND must be linux-command or dry-run" >&2
   exit 1
 fi
 if [[ "$agent_host_network" != "true" && "$agent_host_network" != "false" ]]; then
-  echo "IPARS_K8S_SMOKE_AGENT_HOST_NETWORK must be true or false" >&2
+  echo "HETERONETWORK_K8S_SMOKE_AGENT_HOST_NETWORK must be true or false" >&2
   exit 1
 fi
 if [[ ! "$timeout_seconds" =~ ^[0-9]+$ || "$timeout_seconds" -lt 1 || "$timeout_seconds" -gt 1800 ]]; then
-  echo "IPARS_K8S_SMOKE_TIMEOUT_SECONDS must be an integer between 1 and 1800" >&2
+  echo "HETERONETWORK_K8S_SMOKE_TIMEOUT_SECONDS must be an integer between 1 and 1800" >&2
   exit 1
 fi
 if [[ "$keep_resources" != "0" && "$keep_resources" != "1" ]]; then
-  echo "IPARS_K8S_SMOKE_KEEP_RESOURCES must be 0 or 1" >&2
+  echo "HETERONETWORK_K8S_SMOKE_KEEP_RESOURCES must be 0 or 1" >&2
   exit 1
 fi
 if [[ ! "$relay_udp_node_port" =~ ^[0-9]+$ || "$relay_udp_node_port" -lt 30000 || "$relay_udp_node_port" -gt 32767 ]]; then
-  echo "IPARS_K8S_SMOKE_RELAY_UDP_NODE_PORT must be between 30000 and 32767" >&2
+  echo "HETERONETWORK_K8S_SMOKE_RELAY_UDP_NODE_PORT must be between 30000 and 32767" >&2
   exit 1
 fi
 if [[ ! "$relay_http_node_port" =~ ^[0-9]+$ || "$relay_http_node_port" -lt 30000 || "$relay_http_node_port" -gt 32767 ]]; then
-  echo "IPARS_K8S_SMOKE_RELAY_HTTP_NODE_PORT must be between 30000 and 32767" >&2
+  echo "HETERONETWORK_K8S_SMOKE_RELAY_HTTP_NODE_PORT must be between 30000 and 32767" >&2
   exit 1
 fi
 if [[ "$relay_udp_node_port" == "$relay_http_node_port" ]]; then
-  echo "IPARS_K8S_SMOKE_RELAY_UDP_NODE_PORT and IPARS_K8S_SMOKE_RELAY_HTTP_NODE_PORT must differ" >&2
+  echo "HETERONETWORK_K8S_SMOKE_RELAY_UDP_NODE_PORT and HETERONETWORK_K8S_SMOKE_RELAY_HTTP_NODE_PORT must differ" >&2
   exit 1
 fi
 
@@ -632,8 +632,8 @@ else
   agent_dns_policy="ClusterFirst"
 fi
 
-require_dns_label "$namespace" "IPARS_K8S_SMOKE_NAMESPACE" 63
-require_dns_label "$release" "IPARS_K8S_SMOKE_RELEASE" 53
+require_dns_label "$namespace" "HETERONETWORK_K8S_SMOKE_NAMESPACE" 63
+require_dns_label "$release" "HETERONETWORK_K8S_SMOKE_RELEASE" 53
 if [[ "$release" == *ipars* ]]; then
   chart_fullname="$release"
 else
@@ -647,7 +647,7 @@ require_command "$helm_bin"
 require_command jq
 if [[ -n "$ipars_bin" ]]; then
   if [[ ! -x "$ipars_bin" ]]; then
-    echo "IPARS_K8S_SMOKE_IPARS_BIN must be an executable file" >&2
+    echo "HETERONETWORK_K8S_SMOKE_HETERONETWORK_BIN must be an executable file" >&2
     exit 1
   fi
 else
@@ -691,11 +691,11 @@ kind: Service
 metadata:
   name: ${bootstrap_name}
   labels:
-    app.kubernetes.io/component: ipars-bootstrap
-    ipars.io/live-smoke-bootstrap: "true"
+    app.kubernetes.io/component: heteronetwork-bootstrap
+    heteronetwork.io/live-smoke-bootstrap: "true"
 spec:
   selector:
-    app.kubernetes.io/component: ipars-bootstrap
+    app.kubernetes.io/component: heteronetwork-bootstrap
   ports:
     - name: control-plane
       port: 8443
@@ -710,11 +710,11 @@ kind: Service
 metadata:
   name: ${signal_name}
   labels:
-    app.kubernetes.io/component: ipars-signal
-    ipars.io/live-smoke-bootstrap: "true"
+    app.kubernetes.io/component: heteronetwork-signal
+    heteronetwork.io/live-smoke-bootstrap: "true"
 spec:
   selector:
-    app.kubernetes.io/component: ipars-signal
+    app.kubernetes.io/component: heteronetwork-signal
   ports:
     - name: signal
       port: 9443
@@ -771,16 +771,16 @@ kind: Deployment
 metadata:
   name: ${bootstrap_name}
   labels:
-    app.kubernetes.io/component: ipars-bootstrap
+    app.kubernetes.io/component: heteronetwork-bootstrap
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/component: ipars-bootstrap
+      app.kubernetes.io/component: heteronetwork-bootstrap
   template:
     metadata:
       labels:
-        app.kubernetes.io/component: ipars-bootstrap
+        app.kubernetes.io/component: heteronetwork-bootstrap
     spec:
       containers:
         - name: control-plane
@@ -799,7 +799,7 @@ spec:
             - --issuer-public-key
             - ${issuer_public_key_json}
             - --database-url
-            - sqlite:///var/lib/ipars/control-plane.sqlite?mode=rwc
+            - sqlite:///var/lib/heteronetwork/control-plane.sqlite?mode=rwc
             - --operator-api-bearer-token-path
             - /run/secrets/control-plane/operator-api-token
           ports:
@@ -807,7 +807,7 @@ spec:
               containerPort: 8443
           volumeMounts:
             - name: control-plane-state
-              mountPath: /var/lib/ipars
+              mountPath: /var/lib/heteronetwork
             - name: control-plane-operator-api-token
               mountPath: /run/secrets/control-plane/operator-api-token
               subPath: operator-api-token
@@ -843,16 +843,16 @@ kind: Deployment
 metadata:
   name: ${signal_name}
   labels:
-    app.kubernetes.io/component: ipars-signal
+    app.kubernetes.io/component: heteronetwork-signal
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/component: ipars-signal
+      app.kubernetes.io/component: heteronetwork-signal
   template:
     metadata:
       labels:
-        app.kubernetes.io/component: ipars-signal
+        app.kubernetes.io/component: heteronetwork-signal
     spec:
       containers:
         - name: signal
@@ -865,9 +865,9 @@ spec:
             - --control-plane-url
             - http://${bootstrap_name}.${namespace}.svc:8443
           env:
-            - name: IPARS_SIGNAL_DISABLE_IPV6_DIRECT
+            - name: HETERONETWORK_SIGNAL_DISABLE_IPV6_DIRECT
               value: "true"
-            - name: IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL
+            - name: HETERONETWORK_SIGNAL_DISABLE_NAT_TRAVERSAL
               value: "true"
           ports:
             - name: signal
@@ -881,7 +881,7 @@ wait_for_signal_health
 
 control_plane_url="http://${bootstrap_name}.${namespace}.svc:8443"
 signal_url="http://${signal_name}.${namespace}.svc:9443"
-agent_state_path="/var/lib/ipars-live/${release}"
+agent_state_path="/var/lib/heteronetwork-live/${release}"
 agent_api_service_name="${chart_fullname}-agent"
 "$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \
   --namespace "$namespace" \
@@ -927,7 +927,7 @@ agent_api_service_name="${chart_fullname}-agent"
   --set serviceExposure.discoverApiServer=true \
   --set-json 'serviceExposure.serviceCidrs=[]' \
   --set-string "serviceExposure.namespaces[0]=${namespace}" \
-  --set-string 'serviceExposure.serviceLabelSelector=ipars.io/live-smoke=true'
+  --set-string 'serviceExposure.serviceLabelSelector=heteronetwork.io/live-smoke=true'
 helm_installed=1
 
 "$kubectl_bin" -n "$namespace" rollout status "daemonset/${chart_fullname}" --timeout="${timeout_seconds}s"
@@ -988,10 +988,10 @@ kind: Service
 metadata:
   name: ${service_route_name}
   labels:
-    ipars.io/live-smoke: "true"
+    heteronetwork.io/live-smoke: "true"
 spec:
   selector:
-    app.kubernetes.io/component: ipars-bootstrap
+    app.kubernetes.io/component: heteronetwork-bootstrap
   ports:
     - name: http
       port: ${service_route_port}
@@ -1053,7 +1053,7 @@ route_provider_node_id="${node_ids[0]}"
   --set serviceExposure.discoverApiServer=true \
   --set-json 'serviceExposure.serviceCidrs=[]' \
   --set-string "serviceExposure.namespaces[0]=${namespace}" \
-  --set-string 'serviceExposure.serviceLabelSelector=ipars.io/live-smoke=true' \
+  --set-string 'serviceExposure.serviceLabelSelector=heteronetwork.io/live-smoke=true' \
   --set-string "serviceExposure.routeProviderNodeId=${route_provider_node_id}"
 
 "$kubectl_bin" -n "$namespace" rollout status "daemonset/${chart_fullname}" --timeout="${timeout_seconds}s"
@@ -1195,8 +1195,8 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
 
   "$kubectl_bin" -n "$namespace" set env "deployment/$signal_name" \
     --containers=signal \
-    IPARS_SIGNAL_DISABLE_IPV6_DIRECT=false \
-    IPARS_SIGNAL_DISABLE_NAT_TRAVERSAL=false
+    HETERONETWORK_SIGNAL_DISABLE_IPV6_DIRECT=false \
+    HETERONETWORK_SIGNAL_DISABLE_NAT_TRAVERSAL=false
   "$kubectl_bin" -n "$namespace" rollout status "deployment/$signal_name" --timeout="$timeout_seconds"s
   wait_for_signal_health
   wait_for_wireguard_path \
@@ -1225,15 +1225,15 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
       "${vpn_ips[$local_index]}" \
       "${vpn_ips[$remote_index]}"
     allowed_ips="$("$kubectl_bin" -n "$namespace" exec "${agent_pods[$local_index]}" -c agent -- \
-      wg show ipars0 allowed-ips)"
+      wg show heteronetwork0 allowed-ips)"
     if grep -Fq -- "${bootstrap_cluster_ip}/32" <<<"$allowed_ips"; then
       echo "agent pod ${agent_pods[$local_index]} routed its locally advertised bootstrap Service through a peer" >&2
       exit 1
     fi
     route_to_bootstrap="$("$kubectl_bin" -n "$namespace" exec "${agent_pods[$local_index]}" -c agent -- \
       ip route get "$bootstrap_cluster_ip")"
-    if grep -Fq -- "dev ipars0" <<<"$route_to_bootstrap"; then
-      echo "agent pod ${agent_pods[$local_index]} installed its local bootstrap Service route on ipars0" >&2
+    if grep -Fq -- "dev heteronetwork0" <<<"$route_to_bootstrap"; then
+      echo "agent pod ${agent_pods[$local_index]} installed its local bootstrap Service route on heteronetwork0" >&2
       exit 1
     fi
   done
@@ -1245,7 +1245,7 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
     api_server_cidr_route="${api_server_service_ip}/32"
     for attempt in $(seq 1 90); do
       consumer_allowed_ips="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
-        wg show ipars0 allowed-ips 2>/dev/null || true)"
+        wg show heteronetwork0 allowed-ips 2>/dev/null || true)"
       consumer_service_route="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
         ip route get "$service_route_ip" 2>/dev/null || true)"
       consumer_api_route="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \
@@ -1264,15 +1264,15 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
         ' sh "$api_server_service_ip" 2>/dev/null || true)"
       if grep -Fq -- "$service_cidr_route" <<<"$consumer_allowed_ips" \
         && grep -Fq -- "$api_server_cidr_route" <<<"$consumer_allowed_ips" \
-        && grep -Fq -- "dev ipars0" <<<"$consumer_service_route" \
-        && grep -Fq -- "dev ipars0" <<<"$consumer_api_route" \
+        && grep -Fq -- "dev heteronetwork0" <<<"$consumer_service_route" \
+        && grep -Fq -- "dev heteronetwork0" <<<"$consumer_api_route" \
         && [[ "$service_response_code" == "200" ]] \
         && [[ "$api_response_code" == "200" ]]; then
         echo "Kubernetes Service ${service_route_ip} and API ${api_server_service_ip} reached through route provider ${route_provider_node_id}"
         break
       fi
       if [[ "$attempt" == 90 ]]; then
-        echo "consumer pod did not reach Kubernetes Service/API through ipars0" >&2
+        echo "consumer pod did not reach Kubernetes Service/API through heteronetwork0" >&2
         echo "allowed IPs:\n${consumer_allowed_ips}" >&2
         echo "Service route:\n${consumer_service_route}" >&2
         echo "API route:\n${consumer_api_route}" >&2
@@ -1285,14 +1285,14 @@ if [[ "$agent_runtime_backend" == "linux-command" ]]; then
 
     provider_service_route="$($kubectl_bin -n "$namespace" exec "$provider_pod" -c agent -- \
       ip route get "$service_route_ip")"
-    if grep -Fq -- "dev ipars0" <<<"$provider_service_route"; then
-      echo "route provider ${route_provider_node_id} routed its local Kubernetes Service through ipars0" >&2
+    if grep -Fq -- "dev heteronetwork0" <<<"$provider_service_route"; then
+      echo "route provider ${route_provider_node_id} routed its local Kubernetes Service through heteronetwork0" >&2
       exit 1
     fi
 
     "$kubectl_bin" -n "$namespace" exec "$consumer_pod" -c agent -- \
       sh -ec '
-        ip -4 route replace "$1" dev ipars0 scope global protocol 240 metric 50
+        ip -4 route replace "$1" dev heteronetwork0 scope global protocol 240 metric 50
       ' sh "$stale_kubernetes_route_cidr"
     for attempt in $(seq 1 90); do
       stale_routes="$($kubectl_bin -n "$namespace" exec "$consumer_pod" -c agent -- \

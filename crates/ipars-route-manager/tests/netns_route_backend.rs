@@ -16,8 +16,12 @@ static NEXT_NAMESPACE_ID: AtomicU64 = AtomicU64::new(0);
 #[tokio::test]
 async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_NETNS_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("skipping netns integration test; set IPARS_RUN_NETNS_TESTS=1 to run it");
+    if std::env::var("HETERONETWORK_RUN_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!("skipping netns integration test; set HETERONETWORK_RUN_NETNS_TESTS=1 to run it");
         return Ok(());
     }
 
@@ -103,8 +107,12 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
 #[tokio::test]
 async fn linux_route_manager_applies_docker_and_kubernetes_intents_inside_network_namespace(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_NETNS_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("skipping netns integration test; set IPARS_RUN_NETNS_TESTS=1 to run it");
+    if std::env::var("HETERONETWORK_RUN_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!("skipping netns integration test; set HETERONETWORK_RUN_NETNS_TESTS=1 to run it");
         return Ok(());
     }
 
@@ -347,8 +355,12 @@ async fn linux_route_manager_applies_docker_and_kubernetes_intents_inside_networ
 #[tokio::test]
 async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_namespace(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_NETNS_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("skipping netns integration test; set IPARS_RUN_NETNS_TESTS=1 to run it");
+    if std::env::var("HETERONETWORK_RUN_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!("skipping netns integration test; set HETERONETWORK_RUN_NETNS_TESTS=1 to run it");
         return Ok(());
     }
 
@@ -460,9 +472,13 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
 
 #[test]
 fn namespace_guard_removes_network_namespace_on_drop() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("IPARS_RUN_NETNS_TESTS").ok().as_deref() != Some("1") {
+    if std::env::var("HETERONETWORK_RUN_NETNS_TESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         eprintln!(
-            "skipping netns lifecycle integration test; set IPARS_RUN_NETNS_TESTS=1 to run it"
+            "skipping netns lifecycle integration test; set HETERONETWORK_RUN_NETNS_TESTS=1 to run it"
         );
         return Ok(());
     }

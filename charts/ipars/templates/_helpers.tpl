@@ -1,12 +1,12 @@
-{{- define "ipars.name" -}}
+{{- define "heteronetwork.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "ipars.fullname" -}}
+{{- define "heteronetwork.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 53 | trimSuffix "-" -}}
 {{- else -}}
-{{- $name := include "ipars.name" . -}}
+{{- $name := include "heteronetwork.name" . -}}
 {{- if contains $name .Release.Name -}}
 {{- .Release.Name | trunc 53 | trimSuffix "-" -}}
 {{- else -}}
@@ -15,15 +15,15 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.serviceAccountName" -}}
+{{- define "heteronetwork.serviceAccountName" -}}
 {{- if .Values.serviceAccount.name -}}
 {{- .Values.serviceAccount.name -}}
 {{- else -}}
-{{- include "ipars.fullname" . -}}
+{{- include "heteronetwork.fullname" . -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateDnsLabelWithMax" -}}
+{{- define "heteronetwork.validateDnsLabelWithMax" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $maxBytes := int .maxBytes -}}
@@ -32,20 +32,20 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateChartMetadata" -}}
-{{- include "ipars.validateDnsLabelWithMax" (dict "path" "Release.Name" "value" .Release.Name "maxBytes" 53) -}}
-{{- include "ipars.validateDnsLabelWithMax" (dict "path" "Release.Namespace" "value" .Release.Namespace "maxBytes" 63) -}}
+{{- define "heteronetwork.validateChartMetadata" -}}
+{{- include "heteronetwork.validateDnsLabelWithMax" (dict "path" "Release.Name" "value" .Release.Name "maxBytes" 53) -}}
+{{- include "heteronetwork.validateDnsLabelWithMax" (dict "path" "Release.Namespace" "value" .Release.Namespace "maxBytes" 63) -}}
 {{- $nameOverride := printf "%v" (default "" .Values.nameOverride) -}}
 {{- $fullnameOverride := printf "%v" (default "" .Values.fullnameOverride) -}}
 {{- if ne $nameOverride "" -}}
-{{- include "ipars.validateDnsLabelWithMax" (dict "path" "nameOverride" "value" $nameOverride "maxBytes" 53) -}}
+{{- include "heteronetwork.validateDnsLabelWithMax" (dict "path" "nameOverride" "value" $nameOverride "maxBytes" 53) -}}
 {{- end -}}
 {{- if ne $fullnameOverride "" -}}
-{{- include "ipars.validateDnsLabelWithMax" (dict "path" "fullnameOverride" "value" $fullnameOverride "maxBytes" 53) -}}
+{{- include "heteronetwork.validateDnsLabelWithMax" (dict "path" "fullnameOverride" "value" $fullnameOverride "maxBytes" 53) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateCidr" -}}
+{{- define "heteronetwork.validateCidr" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
@@ -56,14 +56,14 @@
 {{- end -}}
 {{- if $ipv6 -}}
 {{- $parts := splitList "/" $value -}}
-{{- $_ := include "ipars.ipv6AddressNibbles" (dict "path" $path "value" (index $parts 0)) -}}
+{{- $_ := include "heteronetwork.ipv6AddressNibbles" (dict "path" $path "value" (index $parts 0)) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateRestrictedCidr" -}}
+{{- define "heteronetwork.validateRestrictedCidr" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
-{{- include "ipars.validateCidr" (dict "path" $path "value" $value) -}}
+{{- include "heteronetwork.validateCidr" (dict "path" $path "value" $value) -}}
 {{- if or (eq $value "0.0.0.0/0") (and (contains ":" $value) (regexMatch "/0$" $value)) -}}
 {{- fail (printf "%s entry %q must not be an unrestricted CIDR" $path $value) -}}
 {{- end -}}
@@ -97,7 +97,7 @@
 {{- else if contains ":" $value -}}
 {{- $parts := splitList "/" $value -}}
 {{- $prefix := int (index $parts 1) -}}
-{{- $bits := include "ipars.ipv6CidrBits" (dict "path" $path "value" $value) -}}
+{{- $bits := include "heteronetwork.ipv6CidrBits" (dict "path" $path "value" $value) -}}
 {{- if regexMatch "1" (substr $prefix 128 $bits) -}}
 {{- fail (printf "%s entry %q must be a canonical IPv6 CIDR" $path $value) -}}
 {{- end -}}
@@ -116,7 +116,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.ipv4CidrRange" -}}
+{{- define "heteronetwork.ipv4CidrRange" -}}
 {{- $value := printf "%v" .value -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value -}}
 {{- $parts := splitList "/" $value -}}
@@ -131,7 +131,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.hexNibbleBits" -}}
+{{- define "heteronetwork.hexNibbleBits" -}}
 {{- $value := lower (printf "%v" .value) -}}
 {{- $path := default "IPv6 address" .path -}}
 {{- $bitsByNibble := dict "0" "0000" "1" "0001" "2" "0010" "3" "0011" "4" "0100" "5" "0101" "6" "0110" "7" "0111" "8" "1000" "9" "1001" "a" "1010" "b" "1011" "c" "1100" "d" "1101" "e" "1110" "f" "1111" -}}
@@ -141,7 +141,7 @@
 {{- get $bitsByNibble $value -}}
 {{- end -}}
 
-{{- define "ipars.ipv6AddressNibbles" -}}
+{{- define "heteronetwork.ipv6AddressNibbles" -}}
 {{- $address := printf "%v" .value -}}
 {{- $path := default "IPv6 address" .path -}}
 {{- if contains "." $address -}}
@@ -200,37 +200,37 @@
 {{- get $out "value" -}}
 {{- end -}}
 
-{{- define "ipars.ipv6CidrBits" -}}
+{{- define "heteronetwork.ipv6CidrBits" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $parts := splitList "/" $value -}}
 {{- if ne (len $parts) 2 -}}
 {{- fail (printf "%s entry %q must be an IPv6 CIDR" $path $value) -}}
 {{- end -}}
-{{- $nibbles := include "ipars.ipv6AddressNibbles" (dict "path" $path "value" (index $parts 0)) -}}
+{{- $nibbles := include "heteronetwork.ipv6AddressNibbles" (dict "path" $path "value" (index $parts 0)) -}}
 {{- $out := dict "value" "" -}}
 {{- range $idx := until (len $nibbles) -}}
 {{- $nibble := substr $idx (int (add $idx 1)) $nibbles -}}
-{{- $_ := set $out "value" (printf "%s%s" (get $out "value") (include "ipars.hexNibbleBits" (dict "path" $path "value" $nibble))) -}}
+{{- $_ := set $out "value" (printf "%s%s" (get $out "value") (include "heteronetwork.hexNibbleBits" (dict "path" $path "value" $nibble))) -}}
 {{- end -}}
 {{- get $out "value" -}}
 {{- end -}}
 
-{{- define "ipars.validateCidrContainedBySourceRanges" -}}
+{{- define "heteronetwork.validateCidrContainedBySourceRanges" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $sourcePath := .sourcePath -}}
 {{- $sourceRanges := .sourceRanges -}}
 {{- if and $sourceRanges (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value) -}}
-{{- $bounds := splitList ":" (include "ipars.ipv4CidrRange" (dict "value" $value)) -}}
+{{- $bounds := splitList ":" (include "heteronetwork.ipv4CidrRange" (dict "value" $value)) -}}
 {{- $start := int (index $bounds 0) -}}
 {{- $end := int (index $bounds 1) -}}
 {{- $contained := dict "ok" false -}}
 {{- range $source := $sourceRanges -}}
 {{- $sourceValue := printf "%v" $source -}}
-{{- include "ipars.validateCidr" (dict "path" $sourcePath "value" $sourceValue) -}}
+{{- include "heteronetwork.validateCidr" (dict "path" $sourcePath "value" $sourceValue) -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $sourceValue -}}
-{{- $sourceBounds := splitList ":" (include "ipars.ipv4CidrRange" (dict "value" $sourceValue)) -}}
+{{- $sourceBounds := splitList ":" (include "heteronetwork.ipv4CidrRange" (dict "value" $sourceValue)) -}}
 {{- $sourceStart := int (index $sourceBounds 0) -}}
 {{- $sourceEnd := int (index $sourceBounds 1) -}}
 {{- if and (le $sourceStart $start) (le $end $sourceEnd) -}}
@@ -244,16 +244,16 @@
 {{- else if and $sourceRanges (contains ":" $value) -}}
 {{- $parts := splitList "/" $value -}}
 {{- $prefix := int (index $parts 1) -}}
-{{- $bits := include "ipars.ipv6CidrBits" (dict "path" $path "value" $value) -}}
+{{- $bits := include "heteronetwork.ipv6CidrBits" (dict "path" $path "value" $value) -}}
 {{- $contained := dict "ok" false -}}
 {{- range $source := $sourceRanges -}}
 {{- $sourceValue := printf "%v" $source -}}
-{{- include "ipars.validateCidr" (dict "path" $sourcePath "value" $sourceValue) -}}
+{{- include "heteronetwork.validateCidr" (dict "path" $sourcePath "value" $sourceValue) -}}
 {{- if contains ":" $sourceValue -}}
 {{- $sourceParts := splitList "/" $sourceValue -}}
 {{- $sourcePrefix := int (index $sourceParts 1) -}}
 {{- if le $sourcePrefix $prefix -}}
-{{- $sourceBits := include "ipars.ipv6CidrBits" (dict "path" $sourcePath "value" $sourceValue) -}}
+{{- $sourceBits := include "heteronetwork.ipv6CidrBits" (dict "path" $sourcePath "value" $sourceValue) -}}
 {{- if eq (substr 0 $sourcePrefix $bits) (substr 0 $sourcePrefix $sourceBits) -}}
 {{- $_ := set $contained "ok" true -}}
 {{- end -}}
@@ -266,10 +266,10 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateKubernetesRouteCidr" -}}
+{{- define "heteronetwork.validateKubernetesRouteCidr" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
-{{- include "ipars.validateRestrictedCidr" (dict "path" $path "value" $value) -}}
+{{- include "heteronetwork.validateRestrictedCidr" (dict "path" $path "value" $value) -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+$" $value -}}
 {{- $parts := splitList "/" $value -}}
 {{- $octets := splitList "." (index $parts 0) -}}
@@ -313,7 +313,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateIPAddress" -}}
+{{- define "heteronetwork.validateIPAddress" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
@@ -324,10 +324,10 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateUsableServiceIPAddress" -}}
+{{- define "heteronetwork.validateUsableServiceIPAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
-{{- include "ipars.validateIPAddress" (dict "path" $path "value" $value) -}}
+{{- include "heteronetwork.validateIPAddress" (dict "path" $path "value" $value) -}}
 {{- if or (eq $value "0.0.0.0") (eq $value "::") (eq $value "0:0:0:0:0:0:0:0") -}}
 {{- fail (printf "%s value %q must not be an unspecified address" $path $value) -}}
 {{- end -}}
@@ -345,25 +345,25 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateExternalServiceIPAddress" -}}
-{{- include "ipars.validateUsableServiceIPAddress" . -}}
+{{- define "heteronetwork.validateExternalServiceIPAddress" -}}
+{{- include "heteronetwork.validateUsableServiceIPAddress" . -}}
 {{- end -}}
 
-{{- define "ipars.validateBoolean" -}}
+{{- define "heteronetwork.validateBoolean" -}}
 {{- $path := .path -}}
 {{- if not (kindIs "bool" .value) -}}
 {{- fail (printf "%s must be true or false" $path) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateOptionalBoolean" -}}
+{{- define "heteronetwork.validateOptionalBoolean" -}}
 {{- $path := .path -}}
 {{- if and (not (kindIs "bool" .value)) (ne (printf "%v" .value) "") -}}
 {{- fail (printf "%s must be true, false, or empty" $path) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateHttpEndpointURL" -}}
+{{- define "heteronetwork.validateHttpEndpointURL" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- if not (regexMatch "^https?://[^/[:space:]?#]+[^[:space:]]*$" $value) -}}
@@ -417,25 +417,25 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateAdvertisedHttpEndpointURL" -}}
-{{- include "ipars.validateHttpEndpointURL" . -}}
+{{- define "heteronetwork.validateAdvertisedHttpEndpointURL" -}}
+{{- include "heteronetwork.validateHttpEndpointURL" . -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $authorityWithScheme := regexFind "^https?://[^/[:space:]?#]+" $value -}}
 {{- $authority := trimPrefix "https://" (trimPrefix "http://" $authorityWithScheme) -}}
 {{- if hasPrefix "[" $authority -}}
 {{- $host := trimSuffix "]" (trimPrefix "[" (regexFind "^\\[[^\\]]+\\]" $authority)) -}}
-{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- include "heteronetwork.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
 {{- else -}}
 {{- $host := regexFind "^[^:]+" $authority -}}
 {{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
 {{- if regexMatch (printf "^%s\\.%s\\.%s\\.%s$" $ipv4Octet $ipv4Octet $ipv4Octet $ipv4Octet) $host -}}
-{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- include "heteronetwork.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateSocketAddress" -}}
+{{- define "heteronetwork.validateSocketAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $ipv4Octet := "([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
@@ -470,20 +470,20 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateAdvertisedSocketAddress" -}}
-{{- include "ipars.validateSocketAddress" . -}}
+{{- define "heteronetwork.validateAdvertisedSocketAddress" -}}
+{{- include "heteronetwork.validateSocketAddress" . -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- if hasPrefix "[" $value -}}
 {{- $host := trimSuffix "]" (trimPrefix "[" (regexFind "^\\[[^\\]]+\\]" $value)) -}}
-{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- include "heteronetwork.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
 {{- else -}}
 {{- $host := regexFind "^[^:]+" $value -}}
-{{- include "ipars.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
+{{- include "heteronetwork.validateUsableServiceIPAddress" (dict "path" (printf "%s host" $path) "value" $host) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateBindSocketAddress" -}}
+{{- define "heteronetwork.validateBindSocketAddress" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
 {{- $allowPortZero := default false .allowPortZero -}}
@@ -517,7 +517,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateLabelKey" -}}
+{{- define "heteronetwork.validateLabelKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}
 {{- $parts := splitList "/" $key -}}
@@ -540,7 +540,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateLabelValue" -}}
+{{- define "heteronetwork.validateLabelValue" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- if or (gt (len $value) 63) (and (ne $value "") (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$" $value))) -}}
@@ -548,7 +548,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateNodeSelectorExpression" -}}
+{{- define "heteronetwork.validateNodeSelectorExpression" -}}
 {{- $path := .path -}}
 {{- $expression := .expression -}}
 {{- if not (kindIs "map" $expression) -}}
@@ -563,7 +563,7 @@
 {{- if eq $key "" -}}
 {{- fail (printf "%s.key is required" $path) -}}
 {{- end -}}
-{{- include "ipars.validateLabelKey" (dict "path" $path "key" $key) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" $path "key" $key) -}}
 {{- $operator := default "" $expression.operator -}}
 {{- if not (has $operator (list "In" "NotIn" "Exists" "DoesNotExist" "Gt" "Lt")) -}}
 {{- fail (printf "%s.operator must be In, NotIn, Exists, DoesNotExist, Gt, or Lt" $path) -}}
@@ -580,7 +580,7 @@
 {{- fail (printf "%s.values is required when operator is %s" $path $operator) -}}
 {{- end -}}
 {{- range $value := $values -}}
-{{- include "ipars.validateLabelValue" (dict "path" (printf "%s.values" $path) "value" (printf "%v" $value)) -}}
+{{- include "heteronetwork.validateLabelValue" (dict "path" (printf "%s.values" $path) "value" (printf "%v" $value)) -}}
 {{- end -}}
 {{- else if or (eq $operator "Exists") (eq $operator "DoesNotExist") -}}
 {{- if $values -}}
@@ -597,7 +597,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateLabelSelectorExpression" -}}
+{{- define "heteronetwork.validateLabelSelectorExpression" -}}
 {{- $path := .path -}}
 {{- $expression := .expression -}}
 {{- if not (kindIs "map" $expression) -}}
@@ -612,7 +612,7 @@
 {{- if eq $key "" -}}
 {{- fail (printf "%s.key is required" $path) -}}
 {{- end -}}
-{{- include "ipars.validateLabelKey" (dict "path" $path "key" $key) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" $path "key" $key) -}}
 {{- $operator := default "" $expression.operator -}}
 {{- if not (has $operator (list "In" "NotIn" "Exists" "DoesNotExist")) -}}
 {{- fail (printf "%s.operator must be In, NotIn, Exists, or DoesNotExist" $path) -}}
@@ -629,7 +629,7 @@
 {{- fail (printf "%s.values is required when operator is %s" $path $operator) -}}
 {{- end -}}
 {{- range $value := $values -}}
-{{- include "ipars.validateLabelValue" (dict "path" (printf "%s.values" $path) "value" (printf "%v" $value)) -}}
+{{- include "heteronetwork.validateLabelValue" (dict "path" (printf "%s.values" $path) "value" (printf "%v" $value)) -}}
 {{- end -}}
 {{- else -}}
 {{- if $values -}}
@@ -638,7 +638,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validatePodAffinityTerm" -}}
+{{- define "heteronetwork.validatePodAffinityTerm" -}}
 {{- $path := .path -}}
 {{- $term := .term -}}
 {{- if not (kindIs "map" $term) -}}
@@ -653,7 +653,7 @@
 {{- if eq $topologyKey "" -}}
 {{- fail (printf "%s.topologyKey is required" $path) -}}
 {{- end -}}
-{{- include "ipars.validateLabelKey" (dict "path" $path "key" $topologyKey) -}}
+{{- include "heteronetwork.validateLabelKey" (dict "path" $path "key" $topologyKey) -}}
 {{- if not (hasKey $term "matchExpressions") -}}
 {{- fail (printf "%s.matchExpressions is required" $path) -}}
 {{- end -}}
@@ -664,7 +664,7 @@
 {{- fail (printf "%s.matchExpressions must not be empty" $path) -}}
 {{- end -}}
 {{- range $expressionIndex, $expression := $term.matchExpressions -}}
-{{- include "ipars.validateLabelSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
+{{- include "heteronetwork.validateLabelSelectorExpression" (dict "path" (printf "%s.matchExpressions[%d]" $path $expressionIndex) "expression" $expression) -}}
 {{- end -}}
 {{- if hasKey $term "namespaces" -}}
 {{- if not (kindIs "slice" $term.namespaces) -}}
@@ -673,7 +673,7 @@
 {{- $namespaces := dict -}}
 {{- range $namespaceIndex, $namespace := $term.namespaces -}}
 {{- $namespaceValue := printf "%v" $namespace -}}
-{{- include "ipars.validateDnsLabelWithMax" (dict "path" (printf "%s.namespaces[%d]" $path $namespaceIndex) "value" $namespaceValue "maxBytes" 63) -}}
+{{- include "heteronetwork.validateDnsLabelWithMax" (dict "path" (printf "%s.namespaces[%d]" $path $namespaceIndex) "value" $namespaceValue "maxBytes" 63) -}}
 {{- if hasKey $namespaces $namespaceValue -}}
 {{- fail (printf "%s.namespaces entry %q must not be repeated" $path $namespaceValue) -}}
 {{- end -}}
@@ -682,7 +682,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateResourceQuantity" -}}
+{{- define "heteronetwork.validateResourceQuantity" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- if and (ne $value "") (or (gt (len $value) 64) (not (regexMatch "^[0-9]([0-9A-Za-z.+-]*[0-9A-Za-z])?$" $value))) -}}
@@ -690,7 +690,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateNonNegativeInteger" -}}
+{{- define "heteronetwork.validateNonNegativeInteger" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- if and (ne $value "") (not (regexMatch "^([0-9]|[1-9][0-9]*)$" $value)) -}}
@@ -698,36 +698,36 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateNonNegativeIntegerMax" -}}
+{{- define "heteronetwork.validateNonNegativeIntegerMax" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- $max := printf "%v" .max -}}
 {{- if eq $value "" -}}
 {{- fail (printf "%s must be a non-negative integer" $path) -}}
 {{- end -}}
-{{- include "ipars.validateOptionalNonNegativeIntegerMax" . -}}
+{{- include "heteronetwork.validateOptionalNonNegativeIntegerMax" . -}}
 {{- end -}}
 
-{{- define "ipars.validateOptionalNonNegativeIntegerMax" -}}
+{{- define "heteronetwork.validateOptionalNonNegativeIntegerMax" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- $max := printf "%v" .max -}}
-{{- include "ipars.validateNonNegativeInteger" . -}}
+{{- include "heteronetwork.validateNonNegativeInteger" . -}}
 {{- if or (gt (len $value) (len $max)) (and (eq (len $value) (len $max)) (gt $value $max)) -}}
 {{- fail (printf "%s must be a non-negative integer no greater than %s" $path $max) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateNonNegativeInt64" -}}
+{{- define "heteronetwork.validateNonNegativeInt64" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
-{{- include "ipars.validateNonNegativeInteger" . -}}
+{{- include "heteronetwork.validateNonNegativeInteger" . -}}
 {{- if and (ne $value "") (or (gt (len $value) 19) (and (eq (len $value) 19) (gt $value "9223372036854775807"))) -}}
 {{- fail (printf "%s %q must be a non-negative int64" $path $value) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateIntOrPercent" -}}
+{{- define "heteronetwork.validateIntOrPercent" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- if and (ne $value "") (not (regexMatch "^([0-9]|[1-9][0-9]*|[0-9]%|[1-9][0-9]%|100%)$" $value)) -}}
@@ -738,7 +738,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateAnnotationKey" -}}
+{{- define "heteronetwork.validateAnnotationKey" -}}
 {{- $key := .key -}}
 {{- $path := .path -}}
 {{- $parts := splitList "/" $key -}}
@@ -761,8 +761,8 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateServiceAnnotationKey" -}}
-{{- include "ipars.validateAnnotationKey" . -}}
+{{- define "heteronetwork.validateServiceAnnotationKey" -}}
+{{- include "heteronetwork.validateAnnotationKey" . -}}
 {{- $key := lower (printf "%v" .key) -}}
 {{- $path := .path -}}
 {{- if or (contains "source-range" $key) (contains "inbound-cidr" $key) -}}
@@ -770,11 +770,11 @@
 {{- else if or (contains "load-balancer-ip" $key) (contains "loadbalancerip" $key) (contains "load-balancer-eip" $key) (contains "eip-allocations" $key) (hasSuffix "/load-balancer-address" $key) (hasSuffix "/loadbalancer-address" $key) (contains "static-ip" $key) (contains "ip-address" $key) (contains "private-ipv4-address" $key) (contains "pip-name" $key) (contains "pip-prefix" $key) (contains "public-ip-prefix" $key) (contains "public-ips" $key) (contains "lb-ipam-ips" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer fixed addresses; use loadBalancerIP or externalIPs values instead" $path .key) -}}
 {{- else if or (contains "proxy-protocol" $key) (contains "proxyprotocol" $key) -}}
-{{- fail (printf "%s annotation key %q must not enable PROXY protocol; IPARS Services do not accept PROXY protocol headers" $path .key) -}}
+{{- fail (printf "%s annotation key %q must not enable PROXY protocol; HeteroNetwork Services do not accept PROXY protocol headers" $path .key) -}}
 {{- else if or (contains "healthcheck" $key) (contains "health-check" $key) (contains "health_probe" $key) (contains "health-probe" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer health checks; use typed Service health-check controls instead" $path .key) -}}
 {{- else if or (contains "ssl-cert" $key) (contains "ssl-ports" $key) (contains "ssl-negotiation-policy" $key) (contains "tls-cert" $key) (contains "tls-ports" $key) (contains "certificate-arn" $key) (contains "certificate" $key) (contains "load-balancer-protocol" $key) (contains "loadbalancer-protocol" $key) (contains "backend-protocol" $key) (contains "backend-protocol-version" $key) (contains "app-protocol" $key) (contains "app_protocol" $key) (contains "http2-ports" $key) (contains "http3-ports" $key) (contains "redirect-http" $key) (contains "listener" $key) (contains "alpn-policy" $key) (contains "high-availability-ports" $key) (contains "ha-ports" $key) (contains "enable-icmp" $key) -}}
-{{- fail (printf "%s annotation key %q must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain IPARS listeners instead" $path .key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer TLS, listeners, or backend protocols; use typed Service ports/appProtocol and plain HeteroNetwork listeners instead" $path .key) -}}
 {{- else if or (contains "load-balancer-scheme" $key) (contains "loadbalancer-scheme" $key) (contains "load-balancer-internal" $key) (contains "loadbalancer-internal" $key) (contains "internal-load-balancer" $key) (contains "load-balancer-type" $key) (contains "loadbalancer-type" $key) (contains "load-balancer-address-type" $key) (contains "loadbalancer-address-type" $key) (contains "load-balancer-class" $key) (contains "loadbalancerclass" $key) (contains "load-balancer-shape" $key) (contains "loadbalancer-shape" $key) (contains "load-balancer-cloud-provider-ip-type" $key) (contains "nlb-target-type" $key) (contains "l4-rbs" $key) (contains "global-access" $key) (contains "allow-global-access" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer scope or implementation type; use typed Service type, loadBalancerClass, exposure acknowledgement, and source-range controls instead" $path .key) -}}
 {{- else if or (contains "security-group" $key) (contains "securitygroup" $key) (contains "firewall" $key) (contains "waf" $key) (contains "web-acl" $key) (contains "webacl" $key) (contains "security-policy" $key) (contains "securitypolicy" $key) (contains "security-list" $key) (contains "allowed-service-tags" $key) (contains "allowed-ip-ranges" $key) (contains "shared-securityrule" $key) -}}
@@ -782,7 +782,7 @@
 {{- else if or (contains "subnet" $key) (contains "vlan" $key) (contains "network-tier" $key) (contains "network-endpoint-group" $key) (contains "cloud.google.com/neg" $key) (contains "resource-group" $key) (contains "availability-zone" $key) (contains "cloud-provider-zone" $key) -}}
 {{- fail (printf "%s annotation key %q must not configure LoadBalancer network placement; use typed Service type, loadBalancerClass, source-range, and exposure controls instead" $path .key) -}}
 {{- else if or (contains "load-balancer-attributes" $key) (contains "loadbalancer-attributes" $key) (contains "backend-config" $key) (contains "target-group-attributes" $key) (contains "targetgroup-attributes" $key) (contains "access-log" $key) (contains "accesslog" $key) (contains "enable-features" $key) (contains "idle-timeout" $key) (contains "connection-draining" $key) (contains "deregistration-delay" $key) (contains "cross-zone" $key) (contains "preserve-client-ip" $key) (contains "tcp-reset" $key) (contains "size-unit" $key) (contains "flavor-id" $key) -}}
-{{- fail (printf "%s annotation key %q must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and IPARS listener controls instead" $path .key) -}}
+{{- fail (printf "%s annotation key %q must not configure LoadBalancer operational attributes; use typed Service traffic policy, appProtocol, and HeteroNetwork listener controls instead" $path .key) -}}
 {{- else if or (contains "external-dns" $key) (contains "dns-name" $key) (contains "dns-label" $key) (contains "dns-record" $key) (contains "load-balancer-hostname" $key) (contains "loadbalancer-hostname" $key) (contains "domain-name" $key) (contains "domainname" $key) (contains "fqdn" $key) -}}
 {{- fail (printf "%s annotation key %q must not publish LoadBalancer DNS names; use relayAdvertisement values and explicit Service exposure controls instead" $path .key) -}}
 {{- else if or (contains "load-balancer-name" $key) (contains "loadbalancer-name" $key) (contains "target-group-name" $key) (contains "targetgroup-name" $key) (contains "load-balancer-configuration" $key) (contains "load-balancer-mode" $key) (contains "resource-tags" $key) (contains "additional-resource-tags" $key) (contains "defined-tags" $key) (contains "freeform-tags" $key) (contains "pip-ip-tags" $key) (contains "pip-tags" $key) (contains "address-pool" $key) (contains "addresspool" $key) (contains "ip-pool" $key) (contains "ippool" $key) -}}
@@ -798,7 +798,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateAnnotationValue" -}}
+{{- define "heteronetwork.validateAnnotationValue" -}}
 {{- $rawValue := .value -}}
 {{- $path := .path -}}
 {{- if not (kindIs "string" $rawValue) -}}
@@ -813,7 +813,7 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "ipars.validateOptionalQualifiedNameWithPrefix" -}}
+{{- define "heteronetwork.validateOptionalQualifiedNameWithPrefix" -}}
 {{- $value := .value -}}
 {{- $path := .path -}}
 {{- if ne $value "" -}}

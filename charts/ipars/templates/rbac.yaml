@@ -1,11 +1,11 @@
-{{- include "ipars.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
-{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
-{{- include "ipars.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "rbac.create" "value" .Values.rbac.create) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "serviceExposure.enabled" "value" .Values.serviceExposure.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "serviceExposure.discoverServices" "value" .Values.serviceExposure.discoverServices) -}}
 {{- $root := . -}}
 {{- $rbacCreate := .Values.rbac.create -}}
 {{- if and $rbacCreate .Values.serviceExposure.enabled .Values.serviceExposure.discoverServices -}}
-{{- $name := include "ipars.fullname" . -}}
-{{- $serviceAccountName := include "ipars.serviceAccountName" . -}}
+{{- $name := include "heteronetwork.fullname" . -}}
+{{- $serviceAccountName := include "heteronetwork.serviceAccountName" . -}}
 {{- $serviceAccountNamespace := .Release.Namespace -}}
 {{- if .Values.serviceExposure.namespaces -}}
 {{- range $index, $namespace := .Values.serviceExposure.namespaces }}
@@ -18,7 +18,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ $namespace }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" $root | quote }}
     app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 rules:
   - apiGroups: [""]
@@ -31,7 +31,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ $namespace }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" $root | quote }}
     app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -48,7 +48,7 @@ kind: ClusterRole
 metadata:
   name: {{ $name }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" $root | quote }}
     app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 rules:
   - apiGroups: [""]
@@ -60,7 +60,7 @@ kind: ClusterRoleBinding
 metadata:
   name: {{ $name }}
   labels:
-    app.kubernetes.io/name: {{ include "ipars.name" $root | quote }}
+    app.kubernetes.io/name: {{ include "heteronetwork.name" $root | quote }}
     app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io

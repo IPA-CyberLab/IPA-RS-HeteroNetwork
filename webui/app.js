@@ -41,14 +41,14 @@
   var state = {
     config: null,
     overview: null,
-    token: sessionStorage.getItem("ipars_access_token")
-      || sessionStorage.getItem("ipars_operator_token")
+    token: sessionStorage.getItem("heteronetwork_access_token")
+      || sessionStorage.getItem("heteronetwork_operator_token")
       || "",
     activeView: "overview",
     selectedNodeId: null,
     loading: false,
     policyDirty: false,
-    sidebarCollapsed: localStorage.getItem("ipars_sidebar_collapsed") === "true",
+    sidebarCollapsed: localStorage.getItem("heteronetwork_sidebar_collapsed") === "true",
     mobileNavOpen: false,
     filters: {
       nodes: "",
@@ -130,45 +130,26 @@
   }
 
   function natProfile(entry) {
-    var node = entry && entry.node || {};
-    var health = entry && entry.health || {};
-    return entry && (entry.nat_classification || entry.natClassification)
-      || node.nat_classification
-      || node.natClassification
-      || health.nat_classification
-      || health.natClassification
-      || {};
+    return entry && entry.nat_classification || {};
   }
 
   function connectivityInfo(entry) {
     var node = entry && entry.node || {};
     var profile = natProfile(entry);
-    var connectivity = entry && (entry.connectivity || entry.connectivity_state || entry.connectivityState)
-      || node.connectivity
-      || node.connectivity_state
-      || node.connectivityState
-      || profile.connectivity
-      || {};
-    if (typeof connectivity !== "object") connectivity = { state: connectivity };
-    var explicit = String(connectivity.state || connectivity.kind || connectivity.mode
-      || connectivity.classification || entry && (entry.nat_state || entry.natState) || "").toLowerCase();
-    var mapping = String(profile.mapping_behavior || profile.mapping || profile.nat_type || "").toLowerCase();
+    var hasProfile = Object.keys(profile).length > 0;
+    var explicit = String(profile.connectivity_state || "").toLowerCase();
+    var mapping = String(profile.mapping_behavior || "").toLowerCase();
     var strategy = String(profile.strategy || "").toLowerCase();
-    var hasDoubleNat = Boolean(connectivity.double_nat || connectivity.doubleNat || profile.double_nat || profile.doubleNat)
-      || explicit.indexOf("double") !== -1 || mapping.indexOf("double") !== -1;
-    var relayOnly = Boolean(connectivity.relay_only || connectivity.relayOnly || profile.relay_only || profile.relayOnly)
-      || explicit.indexOf("relay_only") !== -1 || explicit.indexOf("relay-only") !== -1;
-    var publicNode = explicit.indexOf("public") !== -1 || explicit.indexOf("no_nat") !== -1
-      || explicit.indexOf("no-nat") !== -1 || mapping === "no_nat" || mapping === "nonat"
-      || mapping === "no-nat";
-    var natNode = explicit.indexOf("nat") !== -1 || mapping.indexOf("dependent") !== -1
-      || mapping.indexOf("nat") !== -1;
+    var hasDoubleNat = explicit === "double_nat";
+    var relayOnly = explicit === "relay_only" || strategy === "relay_preferred";
+    var publicNode = explicit === "public" || mapping === "no_nat";
+    var natNode = ["endpoint_independent", "address_dependent", "address_and_port_dependent"].indexOf(mapping) !== -1;
     var candidates = Array.isArray(node.endpoint_candidates) ? node.endpoint_candidates : [];
     var hasPublicCandidate = candidates.some(function (candidate) {
       var kind = String(candidate && candidate.kind || "").toLowerCase();
       return kind.indexOf("public") !== -1 || kind.indexOf("stun_reflexive") !== -1;
     });
-    var state = hasDoubleNat ? "double_nat" : relayOnly ? "relay_only" : publicNode || (!natNode && hasPublicCandidate) ? "public" : natNode ? "nat" : "unknown";
+    var state = hasDoubleNat ? "double_nat" : relayOnly ? "relay_only" : publicNode || (!hasProfile && hasPublicCandidate) ? "public" : natNode ? "nat" : "unknown";
     var labels = {
       public: "Public",
       nat: "NAT",
@@ -183,7 +164,7 @@
       relay_only: "Direct traversal unavailable",
       unknown: "Waiting for STUN report"
     };
-    var observed = profile.observed_endpoint || profile.public_endpoint || connectivity.observed_endpoint || connectivity.public_endpoint;
+    var observed = profile.observed_endpoint;
     var confidence = Number(profile.confidence);
     return {
       state: state,
@@ -295,8 +276,8 @@
 
   function clearSession() {
     state.token = "";
-    sessionStorage.removeItem("ipars_access_token");
-    sessionStorage.removeItem("ipars_operator_token");
+    sessionStorage.removeItem("heteronetwork_access_token");
+    sessionStorage.removeItem("heteronetwork_operator_token");
   }
 
   function showAuth(message) {
@@ -341,8 +322,8 @@
     var verifier = base64Url(randomBytes(32));
     return pkceChallenge(verifier).then(function (challenge) {
       var loginState = base64Url(randomBytes(24));
-      sessionStorage.setItem("ipars_pkce_verifier", verifier);
-      sessionStorage.setItem("ipars_login_state", loginState);
+      sessionStorage.setItem("heteronetwork_pkce_verifier", verifier);
+      sessionStorage.setItem("heteronetwork_login_state", loginState);
       var params = new URLSearchParams({
         response_type: "code",
         client_id: state.config.client_id,
@@ -360,10 +341,10 @@
     var query = new URLSearchParams(location.search);
     var code = query.get("code");
     if (!code) return Promise.resolve(false);
-    if (query.get("state") !== sessionStorage.getItem("ipars_login_state")) {
+    if (query.get("state") !== sessionStorage.getItem("heteronetwork_login_state")) {
       return Promise.reject(new Error("OIDC state validation failed"));
     }
-    var verifier = sessionStorage.getItem("ipars_pkce_verifier");
+    var verifier = sessionStorage.getItem("heteronetwork_pkce_verifier");
     if (!verifier) return Promise.reject(new Error("OIDC verifier is missing"));
     var body = new URLSearchParams({
       grant_type: "authorization_code",
@@ -382,9 +363,9 @@
     }).then(function (tokens) {
       if (!tokens.access_token) throw new Error("OIDC response did not include an access token");
       state.token = tokens.access_token;
-      sessionStorage.setItem("ipars_access_token", state.token);
-      sessionStorage.removeItem("ipars_pkce_verifier");
-      sessionStorage.removeItem("ipars_login_state");
+      sessionStorage.setItem("heteronetwork_access_token", state.token);
+      sessionStorage.removeItem("heteronetwork_pkce_verifier");
+      sessionStorage.removeItem("heteronetwork_login_state");
       history.replaceState({}, document.title, location.origin + "/ui/");
       return true;
     });
@@ -473,7 +454,12 @@
     var paths = overview.paths || [];
     var nodes = overview.nodes || [];
     var routeCount = nodes.reduce(function (total, entry) { return total + (entry.node.routes || []).length; }, 0);
-    var natProfiles = nodes.filter(function (entry) { return connectivityInfo(entry).state !== "unknown"; }).length;
+    var natDiscovery = overview.nat_discovery || {};
+    var natProfiles = Number.isFinite(natDiscovery.nat_classification_count)
+      ? natDiscovery.nat_classification_count
+      : nodes.filter(function (entry) { return connectivityInfo(entry).state !== "unknown"; }).length;
+    var staleNatProfiles = natDiscovery.stale_nat_classification_count || 0;
+    var natNote = staleNatProfiles ? staleNatProfiles + " stale" : natProfiles === nodes.length ? "All devices classified" : "Awaiting STUN reports";
     var counts = {};
     paths.forEach(function (path) {
       var pathState = normalizePathState(path.selected_state);
@@ -498,7 +484,7 @@
       + metricCard("Devices", metrics.node_count || 0, (metrics.healthy_node_count || 0) + " healthy", "server", icon("circle-check") + (metrics.healthy_node_count || 0), "")
       + metricCard("Connections", metrics.path_count || 0, (metrics.stale_path_count || 0) + " stale", "network", icon(metrics.stale_path_count ? "circle-alert" : "activity") + (metrics.stale_path_count || 0), staleClass)
       + metricCard("Advertised routes", routeCount, "Across registered devices", "route", "", "")
-      + metricCard("NAT profiles", natProfiles, natProfiles === nodes.length ? "All devices classified" : "Awaiting STUN reports", "wifi", "", natProfiles === nodes.length ? "" : "warn")
+      + metricCard("NAT profiles", natProfiles, natNote, "wifi", "", staleNatProfiles || natProfiles !== nodes.length ? "warn" : "")
       + metricCard("Access rules", (policy.acl_rules || []).length, policy.allow_relay_fallback ? "Relay fallback enabled" : "Relay fallback disabled", "shield-check", "", "")
       + '</div><div class="overview-grid"><section class="section-panel"><div class="section-header"><div><h2>Connection health</h2><p>Selected path distribution</p></div><span class="status-pill info">' + paths.length + ' paths</span></div><div class="section-body"><div class="state-list">'
       + stateRows + '</div></div></section><section class="section-panel"><div class="section-header"><div><h2>Policy posture</h2><p>Runtime settings</p></div><button class="button button-secondary button-small" data-navigate="acl" type="button">Edit policy</button></div><div class="section-body"><div class="policy-summary">'
@@ -814,7 +800,7 @@
   function toggleSidebar() {
     state.sidebarCollapsed = !state.sidebarCollapsed;
     document.documentElement.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
-    localStorage.setItem("ipars_sidebar_collapsed", state.sidebarCollapsed);
+    localStorage.setItem("heteronetwork_sidebar_collapsed", state.sidebarCollapsed);
     $("sidebar-toggle").setAttribute("aria-label", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
     $("sidebar-toggle").setAttribute("title", state.sidebarCollapsed ? "Expand navigation" : "Collapse navigation");
   }
@@ -945,7 +931,7 @@
     var token = $("operator-token").value.trim();
     if (!token) return;
     state.token = token;
-    sessionStorage.setItem("ipars_operator_token", token);
+    sessionStorage.setItem("heteronetwork_operator_token", token);
     loadOverview();
   });
 

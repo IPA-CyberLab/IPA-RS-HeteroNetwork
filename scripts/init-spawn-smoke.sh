@@ -3,10 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_bin="${CARGO:-cargo}"
-ipars_bin="${IPARS_INIT_SMOKE_IPARS_BIN:-}"
-iparsd_bin="${IPARS_INIT_SMOKE_IPARSD_BIN:-}"
-ready_timeout="${IPARS_INIT_SMOKE_READY_TIMEOUT_SECONDS:-20}"
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-init-spawn-smoke.XXXXXX")"
+ipars_bin="${HETERONETWORK_INIT_SMOKE_HETERONETWORK_BIN:-}"
+iparsd_bin="${HETERONETWORK_INIT_SMOKE_IPARSD_BIN:-}"
+ready_timeout="${HETERONETWORK_INIT_SMOKE_READY_TIMEOUT_SECONDS:-20}"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-init-spawn-smoke.XXXXXX")"
 state_dir="${work_dir}/state"
 output_path="${work_dir}/init.json"
 

@@ -7,7 +7,7 @@ docker_bin="${DOCKER:-docker}"
 dockerd_bin="${DOCKERD:-dockerd}"
 containerd_bin="${CONTAINERD:-containerd}"
 suffix="$$-$(date +%s%N)"
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ipars-docker-multi-engine.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-docker-multi-engine.XXXXXX")"
 engine_a_port="$((25000 + ($$ % 1000)))"
 engine_b_port="$((engine_a_port + 1))"
 engine_a_data="$tmp_dir/data-a"
@@ -36,8 +36,8 @@ test_log="$tmp_dir/test.log"
 test_exit="$tmp_dir/test.exit"
 ready_file="$tmp_dir/ready"
 release_file="$tmp_dir/release"
-engine_a_network="ipars-engine-a-${suffix}"
-engine_b_network="ipars-engine-b-${suffix}"
+engine_a_network="heteronetwork-engine-a-${suffix}"
+engine_b_network="heteronetwork-engine-b-${suffix}"
 
 if (( EUID == 0 )); then
   root_prefix=()
@@ -126,7 +126,7 @@ start_engine() {
   local log_path="${11}"
   run_root mkdir -p "$data_root" "$exec_root" "$containerd_root" "$containerd_state"
   run_root sh -c 'printf "%s\n" "$$" > "$1"; shift; exec "$@"' \
-    ipars-containerd "$containerd_pidfile" "$containerd_bin" \
+    heteronetwork-containerd "$containerd_pidfile" "$containerd_bin" \
     --config=/dev/null \
     --address="$containerd_socket" \
     --root="$containerd_root" \
@@ -211,17 +211,17 @@ cd "$repo_root"
 (
   set +e
   env \
-    IPARS_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE=1 \
-    IPARS_DOCKER_MULTI_ENGINE_URL_A="http://127.0.0.1:${engine_a_port}" \
-    IPARS_DOCKER_MULTI_ENGINE_URL_B="http://127.0.0.1:${engine_b_port}" \
-    IPARS_DOCKER_MULTI_ENGINE_NETWORK_A="$engine_a_network" \
-    IPARS_DOCKER_MULTI_ENGINE_NETWORK_B="$engine_b_network" \
-    IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_A=172.31.10.0/24 \
-    IPARS_DOCKER_MULTI_ENGINE_FIRST_CIDR_B=172.31.20.0/24 \
-    IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_A=172.31.12.0/24 \
-    IPARS_DOCKER_MULTI_ENGINE_SECOND_CIDR_B=172.31.22.0/24 \
-    IPARS_DOCKER_MULTI_ENGINE_READY_FILE="$ready_file" \
-    IPARS_DOCKER_MULTI_ENGINE_RELEASE_FILE="$release_file" \
+    HETERONETWORK_RUN_REAL_DOCKER_MULTI_ENGINE_SMOKE=1 \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_URL_A="http://127.0.0.1:${engine_a_port}" \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_URL_B="http://127.0.0.1:${engine_b_port}" \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_NETWORK_A="$engine_a_network" \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_NETWORK_B="$engine_b_network" \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_FIRST_CIDR_A=172.31.10.0/24 \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_FIRST_CIDR_B=172.31.20.0/24 \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_SECOND_CIDR_A=172.31.12.0/24 \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_SECOND_CIDR_B=172.31.22.0/24 \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_READY_FILE="$ready_file" \
+    HETERONETWORK_DOCKER_MULTI_ENGINE_RELEASE_FILE="$release_file" \
     "$cargo_bin" test --locked -p ipars-daemon --all-features \
       docker_api_discovery_supports_multiple_real_docker_engines_and_churn -- --nocapture \
       >"$test_log" 2>&1
