@@ -61,7 +61,7 @@ stop_spawned_daemons() {
 
 dump_failure() {
   if [[ -s "$output_path" ]]; then
-    echo "ipars init output:" >&2
+    echo "HeteroNetwork init output:" >&2
     jq . "$output_path" >&2 || cat "$output_path" >&2
   fi
   if [[ -d "${state_dir}/logs" ]]; then
@@ -202,4 +202,4 @@ if grep -Fq "$admission_token" "$output_path"; then
   exit 1
 fi
 
-echo "ipars init spawn smoke passed: relay-agent registered, heartbeat made it a relay candidate, and five daemons became healthy"
+echo "HeteroNetwork init spawn smoke passed: relay-agent registered, heartbeat made it a relay candidate, and five daemons became healthy"

@@ -119,8 +119,8 @@ const DOCKER_NETWORK_SUBNETS_TEMPLATE: &str =
     "'{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}} {{end}}{{end}}'";
 
 #[derive(Debug, Parser)]
-#[command(name = "ipars")]
-#[command(about = "IPA-RS-HeteroNetwork P2P VPN control CLI")]
+#[command(name = "heteronetwork")]
+#[command(about = "HeteroNetwork P2P VPN control CLI")]
 struct Cli {
     #[arg(
         long,
@@ -356,7 +356,7 @@ struct InitArgs {
     daemon_ready_timeout_seconds: u64,
     #[arg(long, env = "HETERONETWORK_IPARSD_BIN", default_value = "iparsd")]
     daemon_binary: PathBuf,
-    #[arg(long, default_value = "/var/lib/ipars/bootstrap")]
+    #[arg(long, default_value = "/var/lib/heteronetwork/bootstrap")]
     daemon_state_dir: PathBuf,
     #[arg(long, default_value = "0.0.0.0:8443")]
     control_plane_listen: SocketAddr,
@@ -550,7 +550,7 @@ struct RelayProbeArgs {
     left_bind: SocketAddr,
     #[arg(long, default_value = "127.0.0.1:0")]
     right_bind: SocketAddr,
-    #[arg(long, default_value = "ipars-relay-probe")]
+    #[arg(long, default_value = "heteronetwork-relay-probe")]
     payload: String,
     #[arg(long)]
     send_invalid_credential: bool,
@@ -721,7 +721,7 @@ impl Default for AgentPeerProbeInstallArgs {
 struct DockerInstallArgs {
     #[arg(long, default_value = "docker/compose.yaml")]
     compose_file: PathBuf,
-    #[arg(long, default_value = "ipars")]
+    #[arg(long, default_value = "heteronetwork")]
     project_name: String,
     #[arg(long, default_value_t = false)]
     rootless: bool,
@@ -900,9 +900,9 @@ impl K8sProbeArgs {
 
 #[derive(Debug, Args)]
 struct K8sInstallArgs {
-    #[arg(long, default_value = "ipars")]
+    #[arg(long, default_value = "heteronetwork")]
     release: String,
-    #[arg(long, default_value = "ipars-system")]
+    #[arg(long, default_value = "heteronetwork-system")]
     namespace: String,
     #[arg(long, default_value = "charts/ipars")]
     chart: PathBuf,
@@ -910,7 +910,7 @@ struct K8sInstallArgs {
     chart_name_override: Option<String>,
     #[arg(long = "chart-fullname-override", value_parser = parse_kubernetes_chart_name_override)]
     chart_fullname_override: Option<String>,
-    #[arg(long, default_value = "ipars-join-token")]
+    #[arg(long, default_value = "heteronetwork-join-token")]
     join_token_secret: String,
     #[arg(long, default_value = "token")]
     join_token_key: String,
@@ -2490,12 +2490,12 @@ async fn join(
 
 fn default_join_state_path() -> PathBuf {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(path).join("ipars/agent.json");
+        return PathBuf::from(path).join("heteronetwork/agent.json");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/state/ipars/agent.json");
+        return PathBuf::from(home).join(".local/state/heteronetwork/agent.json");
     }
-    PathBuf::from("/var/lib/ipars/agent.json")
+    PathBuf::from("/var/lib/heteronetwork/agent.json")
 }
 
 fn ensure_join_state_path_available(path: &Path) -> anyhow::Result<()> {

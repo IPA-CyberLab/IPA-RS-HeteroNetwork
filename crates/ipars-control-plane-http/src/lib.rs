@@ -1241,8 +1241,8 @@ mod tests {
     fn web_auth_config_derives_keycloak_and_cognito_endpoints() {
         let keycloak = match WebUiAuthConfig::new(
             WebAuthProvider::Keycloak,
-            "http://localhost:8080/realms/ipars".to_string(),
-            "ipars-web".to_string(),
+            "http://localhost:8080/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
             None,
             "openid profile email".to_string(),
         ) {
@@ -1252,12 +1252,12 @@ mod tests {
         let keycloak_config = keycloak.public_config();
         assert_eq!(
             keycloak_config.authorization_endpoint.as_deref(),
-            Some("http://localhost:8080/realms/ipars/protocol/openid-connect/auth")
+            Some("http://localhost:8080/realms/heteronetwork/protocol/openid-connect/auth")
         );
         let cognito = match WebUiAuthConfig::new(
             WebAuthProvider::Cognito,
             "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example".to_string(),
-            "ipars-web".to_string(),
+            "heteronetwork-web".to_string(),
             Some("https://login.example.com".to_string()),
             "openid".to_string(),
         ) {
@@ -1276,7 +1276,7 @@ mod tests {
         assert!(WebUiAuthConfig::new(
             WebAuthProvider::Keycloak,
             "ftp://localhost/realm".to_string(),
-            "ipars-web".to_string(),
+            "heteronetwork-web".to_string(),
             None,
             "openid".to_string(),
         )

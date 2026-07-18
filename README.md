@@ -72,7 +72,7 @@ OIDC is enabled by default with Keycloak:
 
 ```bash
 HETERONETWORK_WEB_AUTH_PROVIDER=keycloak
-HETERONETWORK_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/ipars
+HETERONETWORK_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/heteronetwork
 HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web
 iparsd control-plane
 ```
@@ -80,7 +80,7 @@ iparsd control-plane
 Register `https://control-plane.example.com/ui/` as the public client redirect
 URI and enable Authorization Code with PKCE. The Keycloak client must allow the
 control-plane origin as a Web Origin. The default development issuer is
-`http://localhost:8080/realms/ipars`.
+`http://localhost:8080/realms/heteronetwork`.
 
 To use Amazon Cognito, keep the issuer URL for token validation and set the
 hosted UI domain separately:
@@ -88,7 +88,7 @@ hosted UI domain separately:
 ```bash
 HETERONETWORK_WEB_AUTH_PROVIDER=cognito
 HETERONETWORK_WEB_OIDC_ISSUER_URL=https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example
-HETERONETWORK_WEB_OIDC_AUTH_BASE_URL=https://ipars.auth.us-east-1.amazoncognito.com
+HETERONETWORK_WEB_OIDC_AUTH_BASE_URL=https://heteronetwork.auth.us-east-1.amazoncognito.com
 HETERONETWORK_WEB_OIDC_CLIENT_ID=exampleclient
 iparsd control-plane
 ```
@@ -121,6 +121,14 @@ It verifies temporary namespace creation before running the route, Docker/Kubern
 The WireGuard namespace test also requires `wireguard-tools` and kernel WireGuard support. The hole-punch namespace tests include a signal-registry generated `DIRECT_NAT_TRAVERSAL` plan executed by the UDP puncher across direct-routed namespaces, fixed-port and port-preserving one-sided public-peer SNAT, IP-only, fixed-port, and mixed port-preserving/fixed-port endpoint-independent two-sided SNAT topologies, plus an address/port-dependent SNAT non-traversal case where advertised STUN reflexive ports differ from peer-destination mappings. Always-on NAT classification and signal tests also cover address-dependent mapping from same-port, different-address STUN probes and keep that strategy on coordinated hole punching when filtering evidence permits it. They require `iptables` plus `sysctl` when the gated tests are enabled.
 
 The privileged gate also runs `scripts/agent-nat-smoke.sh` for eight full multi-daemon Agent loops: endpoint-independent, fixed-port, and mixed-port two-sided SNAT cover registration, NAT classification, peer-map reconciliation, relay admission/forwarding, encrypted overlay ping, and relay-to-direct recovery; the one-sided and one-sided-port-preserving profiles (`HETERONETWORK_AGENT_NAT_SMOKE_PROFILE=one-sided` or `one-sided-port-preserving`) cover a public peer against an endpoint-independent SNAT Agent and direct promotion; the symmetric, asymmetric, and one-sided-symmetric profiles cover address-and-port-dependent classification and encrypted relay-only traffic. The broader namespace matrix remains transport-boundary coverage for the remaining NAT behaviors.
+
+The control-plane NAT discovery contract has a smaller reproducible smoke that registers three signed nodes, submits public, NAT-like, and relay-preferred classifications, reads the authenticated WebConsole overview payload, then updates one node through a signed heartbeat:
+
+```bash
+scripts/nat-discovery-smoke.sh
+```
+
+This verifies that the retained classification count, traversal strategy counts, observed endpoint, and node-level overview data update without manual topology labels. The production Agent performs the same classification at startup and every `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds when token or explicit STUN bootstrap endpoints are available.
 
 Docker Compose smoke coverage is also gated because it requires a Docker daemon with Compose/BuildKit, kernel WireGuard support, and builds the repository image. Its first phase generates a signed join token, verifies the bundled Compose Docker API socket render plus multi-network/rootless capability reset/userspace-WireGuard/relay-forwarder environment rendering, starts PostgreSQL/control-plane/signal/STUN/relay plus two agents with `docker compose up --wait`, and uses agent `dry-run` runtime overrides so management-plane checks do not mutate host routes while validating reciprocal control-plane and agent-local peer maps, packet-flow-triggered lazy-connect path negotiation, agent JSON and Prometheus metrics, peer-activity pinning, signal metrics, and heartbeat propagation of agent path state back to the control plane. Its second phase starts two PostgreSQL-backed Control Planes plus paired Signal/STUN services in separate network namespaces and two `linux-command` Agents in distinct Docker network namespaces. Each Agent discovers only its filtered IPv4/IPv6 workload and route-only bridge CIDRs through the read-only Engine API before joining, then the gate requires separate kernel WireGuard interfaces, reciprocal peer maps and routes, nonzero handshakes and transfer counters, and bidirectional IPv4/IPv6 workload traffic. After stopping the primary Control Plane namespace, it checks the secondary Control Plane, Signal, and STUN endpoints, repeats all traffic checks, and changes a live bridge subnet through surviving heartbeat/peer-map reconciliation. Finally it starts a third Agent for the first time and requires multi-bootstrap STUN discovery, new registration with a distinct VPN IP, Signal registration, heartbeat, automatic peer-map sync, and a fresh identity-signed peer-map query through the surviving Control Plane:
 
@@ -254,8 +262,8 @@ precedence when supplied.
 
 ```bash
 ipars init --public-endpoint 203.0.113.10:51820 --issuer-private-key-path ./issuer.key --issuer-key-id root --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token --allowed-route 10.43.0.0/16 --allow-relay --unlimited-uses --daemon-state-dir ./heteronetwork-state --spawn-daemons
-ipars join '<signed-token>' --state-path ~/.local/state/ipars/agent.json
-iparsd agent --state-path ~/.local/state/ipars/agent.json --apply-peer-map
+ipars join '<signed-token>' --state-path ~/.local/state/heteronetwork/agent.json
+iparsd agent --state-path ~/.local/state/heteronetwork/agent.json --apply-peer-map
 ipars status --agent-url http://127.0.0.1:9780
 ipars --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token status --control-plane-url http://127.0.0.1:8443
 ipars --agent-state-path /var/lib/heteronetwork/agent.json peers --control-plane-url http://127.0.0.1:8443 --node-id <node-id>
@@ -272,8 +280,8 @@ ipars --agent-state-path /var/lib/heteronetwork/agent.json path status --control
 ipars path events --agent-url http://127.0.0.1:9780
 ipars path activity --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --pin
 ipars path probe --agent-url http://127.0.0.1:9780 --peer <peer-node-id> --state DIRECT_NAT_TRAVERSAL --latency-ms 23.5 --loss-ppm 100 --jitter-ms 3.25 --candidate-addr 198.51.100.10:51820 --candidate-kind stun-reflexive --pin
-ipars docker install --project-name ipars --compose-file docker/compose.yaml --docker-discover-networks --docker-network heteronetwork_default
-ipars k8s install --release ipars --namespace heteronetwork-system --join-token-secret ipars-join-token --join-token-key token
+ipars docker install --project-name heteronetwork --compose-file docker/compose.yaml --docker-discover-networks --docker-network heteronetwork_default
+ipars k8s install --release heteronetwork --namespace heteronetwork-system --join-token-secret heteronetwork-join-token --join-token-key token
 ```
 
 All CLI calls to an Agent API accept the global `--agent-api-bearer-token` or `--agent-api-bearer-token-path` option and matching environment variables. Control-plane `status` accepts the separate global `--control-plane-operator-api-bearer-token` or `--control-plane-operator-api-bearer-token-path` source. Prefer file-backed forms. Direct node-scoped queries to a Control Plane require the global `--agent-state-path` option or `HETERONETWORK_AGENT_STATE_PATH` so the CLI can sign each request with the queried node's identity. An agent using its default loopback listener may omit authentication; any non-loopback agent listener requires a separate 32-512 byte printable ASCII Bearer token. On Unix, every daemon file-backed Bearer credential must be a direct, single-link regular file with owner read access and no group/world permissions; final symlinks and file replacement races are rejected. The bundled Compose stack reads distinct Control Plane, Signal, STUN, Relay, and Agent operator/management credentials plus the Relay admission credential from `docker/control-plane-operator-api.token`, `docker/signal-operator-api.token`, `docker/stun-operator-api.token`, `docker/relay-operator-api.token`, `docker/agent-api.token`, and `docker/relay-admission.token`. Do not reuse issuer, join-token, node-identity, admission, operator, or management material across these credentials.

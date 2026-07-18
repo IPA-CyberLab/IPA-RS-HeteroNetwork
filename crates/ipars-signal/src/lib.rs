@@ -1819,9 +1819,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use ipars_types::{
-        CandidateSource, ClusterId, HealthState, NatFilteringObservation, NatFilteringProbeKind,
-        NatMappingBehavior, NatProbeObservation, NodeHealth, NodeId, RelayCapability, Role, Route,
-        Tag, TokenPolicy, VpnIp,
+        CandidateSource, ClusterId, HealthState, NatConnectivityState, NatFilteringObservation,
+        NatFilteringProbeKind, NatMappingBehavior, NatProbeObservation, NodeHealth, NodeId,
+        RelayCapability, Role, Route, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -3926,6 +3926,7 @@ mod tests {
             observations: Vec::new(),
             filtering_observations: Vec::new(),
             strategy: NatTraversalStrategy::CoordinatedHolePunch,
+            connectivity_state: NatConnectivityState::Nat,
             confidence,
             assessed_at: Utc::now(),
         }
@@ -3940,6 +3941,7 @@ mod tests {
             observations: Vec::new(),
             filtering_observations: Vec::new(),
             strategy: NatTraversalStrategy::CoordinatedHolePunch,
+            connectivity_state: NatConnectivityState::DoubleNat,
             confidence: 0.85,
             assessed_at: Utc::now(),
         }
@@ -3954,6 +3956,7 @@ mod tests {
             observations: Vec::new(),
             filtering_observations: Vec::new(),
             strategy: NatTraversalStrategy::RelayPreferred,
+            connectivity_state: NatConnectivityState::RelayOnly,
             confidence: 0.9,
             assessed_at: Utc::now(),
         }

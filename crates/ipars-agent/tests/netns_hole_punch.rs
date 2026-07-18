@@ -12,8 +12,8 @@ use ipars_signal::SignalRegistry;
 use ipars_types::api::{SignalHolePunchPlanResponse, SignalPathRequest};
 use ipars_types::{
     CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
-    NatClassification, NatFilteringBehavior, NatMappingBehavior, NatTraversalStrategy, NodeId,
-    NodeRecord, PathState, PeerPathKey, Role, TokenPolicy, VpnIp,
+    NatClassification, NatConnectivityState, NatFilteringBehavior, NatMappingBehavior,
+    NatTraversalStrategy, NodeId, NodeRecord, PathState, PeerPathKey, Role, TokenPolicy, VpnIp,
 };
 
 const DIRECT_TEST_NAME: &str = "udp_hole_puncher_sends_signal_payload_between_network_namespaces";
@@ -1712,6 +1712,7 @@ fn coordinated_hole_punch_nat(local_addr: SocketAddr) -> NatClassification {
         observations: Vec::new(),
         filtering_observations: Vec::new(),
         strategy: NatTraversalStrategy::CoordinatedHolePunch,
+        connectivity_state: NatConnectivityState::Nat,
         confidence: 1.0,
         assessed_at: Utc::now(),
     }

@@ -476,6 +476,26 @@ pub enum NatTraversalStrategy {
     InsufficientData,
 }
 
+/// Connectivity state derived from the latest STUN mapping observations.
+///
+/// `DoubleNat` is a conservative heuristic for a private local address with
+/// address-dependent mappings observed from multiple reflexive endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NatConnectivityState {
+    Unknown,
+    Public,
+    Nat,
+    DoubleNat,
+    RelayOnly,
+}
+
+impl Default for NatConnectivityState {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 impl NatTraversalStrategy {
     pub const ALL: [Self; 4] = [
         Self::DirectCandidate,
@@ -503,6 +523,8 @@ pub struct NatClassification {
     pub observations: Vec<NatProbeObservation>,
     pub filtering_observations: Vec<NatFilteringObservation>,
     pub strategy: NatTraversalStrategy,
+    #[serde(default)]
+    pub connectivity_state: NatConnectivityState,
     pub confidence: f32,
     pub assessed_at: DateTime<Utc>,
 }
@@ -526,6 +548,8 @@ impl NatClassification {
         let filtering_behavior = classify_nat_filtering(&filtering_observations);
         let observed_endpoint = stable_observed_endpoint(&observations);
         let strategy = nat_traversal_strategy(mapping_behavior, filtering_behavior);
+        let connectivity_state =
+            nat_connectivity_state(local_addr, &observations, mapping_behavior, strategy);
         let confidence = nat_classification_confidence(
             mapping_behavior,
             observations.len(),
@@ -541,9 +565,47 @@ impl NatClassification {
             observations,
             filtering_observations,
             strategy,
+            connectivity_state,
             confidence,
             assessed_at,
         }
+    }
+}
+
+fn nat_connectivity_state(
+    local_addr: SocketAddr,
+    observations: &[NatProbeObservation],
+    mapping_behavior: NatMappingBehavior,
+    strategy: NatTraversalStrategy,
+) -> NatConnectivityState {
+    if mapping_behavior == NatMappingBehavior::NoNat {
+        return NatConnectivityState::Public;
+    }
+    if strategy == NatTraversalStrategy::RelayPreferred {
+        return NatConnectivityState::RelayOnly;
+    }
+    if mapping_behavior == NatMappingBehavior::Unknown || observations.is_empty() {
+        return NatConnectivityState::Unknown;
+    }
+
+    let local_is_private = match local_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    };
+    let distinct_reflexive_endpoints = observations
+        .iter()
+        .map(|observation| observation.reflexive_addr)
+        .collect::<BTreeSet<_>>()
+        .len();
+    if local_is_private
+        && mapping_behavior == NatMappingBehavior::AddressDependent
+        && distinct_reflexive_endpoints > 1
+    {
+        NatConnectivityState::DoubleNat
+    } else {
+        NatConnectivityState::Nat
     }
 }
 
@@ -28883,6 +28945,7 @@ mod tests {
             classification.strategy,
             NatTraversalStrategy::InsufficientData
         );
+        assert_eq!(classification.connectivity_state, NatConnectivityState::Nat);
         assert_eq!(
             classification.observed_endpoint,
             Some(std::net::SocketAddr::from(([203, 0, 113, 10], 40_000)))
@@ -28922,6 +28985,10 @@ mod tests {
         assert_eq!(
             classification.strategy,
             NatTraversalStrategy::RelayPreferred
+        );
+        assert_eq!(
+            classification.connectivity_state,
+            NatConnectivityState::RelayOnly
         );
         assert_eq!(classification.observed_endpoint, None);
     }
@@ -28982,6 +29049,10 @@ mod tests {
             NatMappingBehavior::AddressDependent
         );
         assert_eq!(
+            classification.connectivity_state,
+            NatConnectivityState::DoubleNat
+        );
+        assert_eq!(
             classification.filtering_behavior,
             NatFilteringBehavior::AddressDependent
         );
@@ -29016,6 +29087,10 @@ mod tests {
         assert_eq!(
             classification.strategy,
             NatTraversalStrategy::DirectCandidate
+        );
+        assert_eq!(
+            classification.connectivity_state,
+            NatConnectivityState::Public
         );
         assert_eq!(classification.confidence, 1.0);
     }

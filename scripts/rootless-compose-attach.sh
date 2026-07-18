@@ -5,7 +5,7 @@ set -euo pipefail
 # agent namespace and moves their published ports to the agent boundary.
 
 docker_bin="${DOCKER:-docker}"
-project_name="ipars"
+project_name="heteronetwork"
 agent_service="agent"
 output_path=""
 config_json=""
@@ -21,7 +21,7 @@ Generate a Compose override for an existing rootless route-provider agent.
 
 Options:
   --compose-file PATH       Compose file; may be repeated (default: docker/compose.yaml)
-  --project-name NAME       Compose project name (default: ipars)
+  --project-name NAME       Compose project name (default: heteronetwork)
   --agent-service NAME      Route-provider service (default: agent)
   --workload-service NAME   Service to attach; may be repeated
   --config-json PATH        Use rendered `docker compose config --format json` instead

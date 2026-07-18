@@ -233,8 +233,8 @@ fn prometheus_label(value: &str) -> String {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "iparsd")]
-#[command(about = "IPA-RS-HeteroNetwork daemon processes")]
+#[command(name = "heteronetworkd")]
+#[command(about = "HeteroNetwork daemon processes")]
 struct Cli {
     #[command(flatten)]
     observability: ObservabilityArgs,
@@ -289,7 +289,7 @@ impl ObservabilityArgs {
     fn service_name(&self, component: &str) -> String {
         self.otel_service_name
             .clone()
-            .unwrap_or_else(|| format!("iparsd-{component}"))
+            .unwrap_or_else(|| format!("heteronetworkd-{component}"))
     }
 }
 
@@ -386,13 +386,13 @@ struct ControlPlaneArgs {
     #[arg(
         long,
         env = "HETERONETWORK_WEB_OIDC_ISSUER_URL",
-        default_value = "http://localhost:8080/realms/ipars"
+        default_value = "http://localhost:8080/realms/heteronetwork"
     )]
     web_oidc_issuer_url: String,
     #[arg(
         long,
         env = "HETERONETWORK_WEB_OIDC_CLIENT_ID",
-        default_value = "ipars-web"
+        default_value = "heteronetwork-web"
     )]
     web_oidc_client_id: String,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
@@ -658,7 +658,7 @@ struct AgentArgs {
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_STATE_PATH",
-        default_value = "/var/lib/ipars/agent.json"
+        default_value = "/var/lib/heteronetwork/agent.json"
     )]
     state_path: std::path::PathBuf,
     #[arg(
@@ -1029,7 +1029,7 @@ struct AgentArgs {
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_WIREGUARD_INTERFACE",
-        default_value = "ipars0"
+        default_value = "heteronetwork0"
     )]
     wireguard_interface: String,
     #[arg(
@@ -1488,8 +1488,11 @@ fn init_observability(
     let service_name = args.service_name(component);
     let resource = Resource::builder()
         .with_service_name(service_name)
-        .with_attribute(KeyValue::new("service.namespace", "ipars"))
-        .with_attribute(KeyValue::new("ipars.component", component.to_string()))
+        .with_attribute(KeyValue::new("service.namespace", "heteronetwork"))
+        .with_attribute(KeyValue::new(
+            "heteronetwork.component",
+            component.to_string(),
+        ))
         .build();
 
     let span_exporter = build_span_exporter(args.otel_endpoint.as_deref())?;
@@ -1497,7 +1500,7 @@ fn init_observability(
         .with_resource(resource.clone())
         .with_batch_exporter(span_exporter)
         .build();
-    let tracer = tracer_provider.tracer("iparsd");
+    let tracer = tracer_provider.tracer("heteronetworkd");
     let traces_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(EnvFilter::try_new(args.log_filter.as_str())?);
@@ -17451,7 +17454,7 @@ mod tests {
         };
 
         assert!(!args.otel_active());
-        assert_eq!(args.service_name("relay"), "iparsd-relay");
+        assert_eq!(args.service_name("relay"), "heteronetworkd-relay");
     }
 
     #[test]
@@ -23926,7 +23929,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                     "exec".to_string(),
                     "node-a".to_string(),
                     "wireguard-go".to_string(),
-                    "ipars0".to_string(),
+                    "heteronetwork0".to_string(),
                 ]
             );
             return Ok(());
@@ -24445,7 +24448,7 @@ exec sleep 60
             assert!(
                 error
                     .to_string()
-                    .contains("did not expose interface ipars0 within 1 seconds"),
+                    .contains("did not expose interface heteronetwork0 within 1 seconds"),
                 "unexpected readiness error: {error}"
             );
             assert!(
@@ -24482,7 +24485,7 @@ exec sleep 60
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains("did not expose interface ipars0 within 1 seconds"));
+                .contains("did not expose interface heteronetwork0 within 1 seconds"));
             assert!(status
                 .message
                 .as_deref()
@@ -26764,7 +26767,7 @@ exec sleep 60
             let intent =
                 kubernetes_underlay_intent_with_api_server_host(&args, local.clone(), None)?;
             assert_eq!(intent.node_name, "worker-a");
-            assert_eq!(intent.overlay_interface, "ipars0");
+            assert_eq!(intent.overlay_interface, "heteronetwork0");
             assert_eq!(intent.route_provider, local);
             assert!(intent.api_server_cidrs.is_empty());
             assert_eq!(
@@ -27561,7 +27564,7 @@ exec sleep 60
             let intent = docker_network_intent(&args)?;
             assert_eq!(intent.container_namespace, "compose-default");
             assert_eq!(intent.host_interface, "docker0");
-            assert_eq!(intent.overlay_interface, "ipars0");
+            assert_eq!(intent.overlay_interface, "heteronetwork0");
             assert_eq!(
                 intent.container_cidrs,
                 vec!["172.18.0.0/16".parse::<ipnet::IpNet>()?]

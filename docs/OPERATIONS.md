@@ -109,6 +109,16 @@ the interface to listen on that same port. For example, use
 local-port relationship needed by port-preserving NATs; relay fallback remains
 required where direct traversal is not possible.
 
+With the default token or explicit STUN bootstrap, the Agent runs NAT discovery
+before registration and refreshes it every
+`HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. The signed join and
+heartbeat payloads carry mapping/filtering observations, confidence, traversal
+strategy, and the derived connectivity state (`public`, `nat`, `double_nat`, or
+`relay_only`). Control Plane retains the latest result and the WebConsole reads
+the same state for its node table, drawer, and topology. Run
+`scripts/nat-discovery-smoke.sh` to verify the three-node overview and heartbeat
+update contract without manually assigning NAT labels.
+
 With a real `--apply-peer-map` backend, Signal candidates and successful UDP
 hole-punch sends are provisional. The agent reads each WireGuard peer's current
 endpoint, latest handshake, and RX/TX counters through generic netlink for the
@@ -384,16 +394,16 @@ Prepare separate join and Agent API token files. The install plan creates one
 Kubernetes Secret with distinct keys and rejects key reuse:
 
 ```bash
-kubectl -n heteronetwork-system create secret generic ipars-join-token \
+kubectl -n heteronetwork-system create secret generic heteronetwork-join-token \
   --from-file=token=./join.token \
   --from-file=agent-api-token=./agent-api.token
 ```
 
 ```bash
 ipars k8s install \
-  --release ipars \
+  --release heteronetwork \
   --namespace heteronetwork-system \
-  --join-token-secret ipars-join-token \
+  --join-token-secret heteronetwork-join-token \
   --join-token-key token \
   --expose-relay \
   --relay-public-endpoint 203.0.113.10:51820 \

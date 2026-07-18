@@ -13,7 +13,7 @@ run_load() {
   local name="$1"
   local expected_transport="$2"
   local expected_scenario="$3"
-  local report_path="${output_dir}/ipars-load-${name}.json"
+  local report_path="${output_dir}/heteronetwork-load-${name}.json"
   shift 3
   "$cargo_bin" run --locked -p ipars-load --quiet -- "$@" >"$report_path"
   if ! grep -Fq "\"transport\": \"${expected_transport}\"" "$report_path"; then
@@ -56,7 +56,7 @@ if [[ -n "$daemon_bin" ]]; then
 
   postgres_database_url="${HETERONETWORK_LOAD_SMOKE_POSTGRES_DATABASE_URL:-}"
   if [[ -n "$postgres_database_url" ]]; then
-    postgres_report="${output_dir}/ipars-load-daemon-postgres-three.json"
+    postgres_report="${output_dir}/heteronetwork-load-daemon-postgres-three.json"
     HETERONETWORK_LOAD_DAEMON_DATABASE_URL="$postgres_database_url" run_load daemon-postgres-three daemon three \
       --transport daemon \
       --scenario three \
@@ -72,4 +72,4 @@ if [[ -n "$daemon_bin" ]]; then
   fi
 fi
 
-echo "ipars-load smoke reports written to ${output_dir}/ipars-load-*.json"
+echo "HeteroNetwork load smoke reports written to ${output_dir}/heteronetwork-load-*.json"
