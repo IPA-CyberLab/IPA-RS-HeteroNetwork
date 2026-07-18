@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +21,7 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
     RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{NodeId, PathState};
+use ipars_types::{BootstrapEndpointKind, NodeId, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -194,7 +195,7 @@ async fn rotate_wireguard_key(
     let control_plane_urls = request
         .control_plane_url
         .map(|url| vec![url])
-        .unwrap_or_else(|| state.control_plane_urls.clone());
+        .unwrap_or_else(|| runtime_control_plane_urls(&state));
     if control_plane_urls.is_empty() {
         return Err(AgentError::ControlPlaneClient(
             "control-plane URL is required for WireGuard key rotation".to_string(),
@@ -233,7 +234,7 @@ async fn remove_node(
     let control_plane_urls = request
         .control_plane_url
         .map(|url| vec![url])
-        .unwrap_or_else(|| state.control_plane_urls.clone());
+        .unwrap_or_else(|| runtime_control_plane_urls(&state));
     if control_plane_urls.is_empty() {
         return Err(AgentError::ControlPlaneClient(
             "control-plane URL is required for node removal".to_string(),
@@ -257,6 +258,25 @@ async fn remove_node(
         removed_health: control_plane_response.removed_health,
         removed_at: control_plane_response.removed_at,
     }))
+}
+
+fn runtime_control_plane_urls(state: &AgentHttpState) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    state
+        .runtime
+        .state()
+        .bootstrap_endpoints
+        .into_iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+        .map(|endpoint| endpoint.url.trim_end_matches('/').to_string())
+        .chain(
+            state
+                .control_plane_urls
+                .iter()
+                .map(|url| url.trim_end_matches('/').to_string()),
+        )
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
 }
 
 async fn send_wireguard_key_rotation_to_control_planes(
@@ -1771,6 +1791,7 @@ mod tests {
             peer_map: PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             },
             relay_map: RelayMap {
@@ -2141,6 +2162,7 @@ mod tests {
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         runtime.record_peer_map_snapshot(peer_map.clone()).await;
@@ -2385,6 +2407,7 @@ mod tests {
                     IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
                     vec![peer_route],
                 )],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: peer_map_generated_at,
             })
             .await;

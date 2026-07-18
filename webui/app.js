@@ -393,6 +393,7 @@
     if (!state.overview) return;
     var metrics = state.overview.metrics || {};
     $("nav-node-count").textContent = metrics.node_count == null ? "-" : metrics.node_count;
+    $("nav-service-count").textContent = metrics.active_service_instance_count == null ? "-" : metrics.active_service_instance_count;
     $("nav-path-count").textContent = metrics.path_count == null ? "-" : metrics.path_count;
     $("nav-rule-count").textContent = (state.overview.cluster_policy.acl_rules || []).length;
   }
@@ -450,6 +451,7 @@
   function renderOverview() {
     var overview = state.overview;
     var metrics = overview.metrics || {};
+    var directory = overview.service_directory || { instances: [], bootstrap_endpoints: [] };
     var policy = overview.cluster_policy || {};
     var paths = overview.paths || [];
     var nodes = overview.nodes || [];
@@ -480,20 +482,88 @@
     var recentContent = recent.length
       ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Connectivity</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
       : emptyState("No devices registered", "Connect a device to see it here.", "server");
+    var serviceKinds = [
+      ["Control plane", "active_control_plane_count"],
+      ["Signal", "active_signal_count"],
+      ["STUN", "active_stun_count"],
+      ["Relay", "active_relay_count"]
+    ];
+    var serviceRows = serviceKinds.map(function (entry) {
+      var count = metrics[entry[1]] || 0;
+      return '<div class="policy-summary-row"><span>' + escapeHtml(entry[0]) + '</span>'
+        + statusPill(count >= 2 ? "healthy" : count === 1 ? "degraded" : "unreachable", count + " active")
+        + '</div>';
+    }).join("");
+    var instanceRows = (directory.instances || []).map(function (instance) {
+      var services = (instance.endpoints || []).map(function (endpoint) { return pretty(endpoint.kind); }).join(", ");
+      return '<tr><td class="mono">' + escapeHtml(instance.instance_id) + '</td><td>'
+        + escapeHtml(services || "-") + '</td><td class="faint">' + escapeHtml(formatTime(instance.lease_expires_at))
+        + '</td><td>' + statusPill("healthy", "Active") + '</td></tr>';
+    }).join("");
+    var instanceContent = instanceRows
+      ? '<div class="table-wrap"><table><thead><tr><th>Public instance</th><th>Services</th><th>Lease expires</th><th>Status</th></tr></thead><tbody>' + instanceRows + '</tbody></table></div>'
+      : emptyState("No public services", "No active service lease is registered.", "server");
     return '<div class="metric-grid">'
       + metricCard("Devices", metrics.node_count || 0, (metrics.healthy_node_count || 0) + " healthy", "server", icon("circle-check") + (metrics.healthy_node_count || 0), "")
       + metricCard("Connections", metrics.path_count || 0, (metrics.stale_path_count || 0) + " stale", "network", icon(metrics.stale_path_count ? "circle-alert" : "activity") + (metrics.stale_path_count || 0), staleClass)
       + metricCard("Advertised routes", routeCount, "Across registered devices", "route", "", "")
       + metricCard("NAT profiles", natProfiles, natNote, "wifi", "", staleNatProfiles || natProfiles !== nodes.length ? "warn" : "")
       + metricCard("Access rules", (policy.acl_rules || []).length, policy.allow_relay_fallback ? "Relay fallback enabled" : "Relay fallback disabled", "shield-check", "", "")
+      + metricCard("High availability", metrics.ha_ready ? "Ready" : "Degraded", (metrics.active_service_instance_count || 0) + " public instances", metrics.ha_ready ? "check-check" : "alert-triangle", "", metrics.ha_ready ? "" : "warn")
       + '</div><div class="overview-grid"><section class="section-panel"><div class="section-header"><div><h2>Connection health</h2><p>Selected path distribution</p></div><span class="status-pill info">' + paths.length + ' paths</span></div><div class="section-body"><div class="state-list">'
       + stateRows + '</div></div></section><section class="section-panel"><div class="section-header"><div><h2>Policy posture</h2><p>Runtime settings</p></div><button class="button button-secondary button-small" data-navigate="acl" type="button">Edit policy</button></div><div class="section-body"><div class="policy-summary">'
       + '<div class="policy-summary-row"><span>IPv6 direct</span>' + statusPill(policy.allow_ipv6_direct ? "healthy" : "unreachable", policy.allow_ipv6_direct ? "Enabled" : "Disabled") + '</div>'
       + '<div class="policy-summary-row"><span>NAT traversal</span>' + statusPill(policy.allow_nat_traversal ? "healthy" : "unreachable", policy.allow_nat_traversal ? "Enabled" : "Disabled") + '</div>'
       + '<div class="policy-summary-row"><span>Relay fallback</span>' + statusPill(policy.allow_relay_fallback ? "healthy" : "unreachable", policy.allow_relay_fallback ? "Enabled" : "Disabled") + '</div>'
       + '<div class="policy-summary-row"><span>Path state TTL</span><span class="policy-summary-value">' + escapeHtml(policy.path_state_ttl_seconds) + " seconds</span></div>"
-      + '</div></div></section></div>' + renderTopology(nodes, paths) + '<section class="section-panel"><div class="section-header"><div><h2>Recently seen devices</h2><p>Latest control-plane observations</p></div><button class="button button-secondary button-small" data-navigate="nodes" type="button">View all</button></div>'
+      + '</div></div></section></div>' + renderTopology(nodes, paths) + '<section class="section-panel"><div class="section-header"><div><h2>Public service availability</h2><p>Lease-backed failover members</p></div>'
+      + statusPill(metrics.ha_ready ? "healthy" : "degraded", metrics.ha_ready ? "HA ready" : "HA degraded")
+      + '</div><div class="section-body"><div class="policy-summary">' + serviceRows + '</div></div>' + instanceContent
+      + '</section><section class="section-panel"><div class="section-header"><div><h2>Recently seen devices</h2><p>Latest control-plane observations</p></div><button class="button button-secondary button-small" data-navigate="nodes" type="button">View all</button></div>'
       + recentContent + "</section>";
+  }
+
+  function renderServices() {
+    var overview = state.overview;
+    var metrics = overview.metrics || {};
+    var directory = overview.service_directory || { instances: [], bootstrap_endpoints: [] };
+    var kinds = [
+      ["control_plane", "Control plane", metrics.active_control_plane_count || 0],
+      ["signal", "Signal", metrics.active_signal_count || 0],
+      ["stun", "STUN", metrics.active_stun_count || 0],
+      ["relay", "Relay", metrics.active_relay_count || 0]
+    ];
+    var endpointRows = (directory.instances || []).map(function (instance) {
+      var endpoints = instance.endpoints || [];
+      var endpointByKind = {};
+      endpoints.forEach(function (endpoint) { endpointByKind[endpoint.kind] = endpoint.url; });
+      return '<tr><td><span class="table-primary"><span class="peer-avatar">'
+        + escapeHtml(initials(instance.instance_id)) + '</span><span><strong>'
+        + escapeHtml(shortId(instance.instance_id)) + '</strong><small class="mono" title="'
+        + escapeHtml(instance.instance_id) + '">' + escapeHtml(instance.instance_id)
+        + '</small></span></span></td>' + kinds.map(function (kind) {
+          var endpoint = endpointByKind[kind[0]];
+          return '<td>' + (endpoint
+            ? '<span class="service-endpoint"><span>' + statusPill("healthy", "Active")
+              + '</span><code title="' + escapeHtml(endpoint) + '">' + escapeHtml(endpoint) + '</code></span>'
+            : statusPill("unreachable", "Missing")) + '</td>';
+        }).join("") + '<td><span class="service-endpoint"><span>' + statusPill("healthy", "Leased")
+        + '</span><span class="faint">' + escapeHtml(formatTime(instance.lease_expires_at))
+        + '</span></span></td></tr>';
+    }).join("");
+    var table = endpointRows
+      ? '<div class="table-wrap"><table class="service-matrix"><thead><tr><th>Public node</th>'
+        + kinds.map(function (kind) { return '<th>' + escapeHtml(kind[1]) + '</th>'; }).join("")
+        + '<th>Lease</th></tr></thead><tbody>' + endpointRows + '</tbody></table></div>'
+      : emptyState("No public nodes", "No active public service lease is registered.", "server");
+    return '<div class="metric-grid">'
+      + metricCard("HA status", metrics.ha_ready ? "Ready" : "Degraded", (metrics.active_service_instance_count || 0) + " active public nodes", metrics.ha_ready ? "check-check" : "alert-triangle", "", metrics.ha_ready ? "" : "warn")
+      + kinds.map(function (kind) {
+        return metricCard(kind[1], kind[2], kind[2] >= 2 ? "Redundant" : kind[2] === 1 ? "Single endpoint" : "Unavailable", kind[2] >= 2 ? "circle-check" : "circle-alert", "", kind[2] >= 2 ? "" : "warn");
+      }).join("")
+      + '</div><section class="section-panel"><div class="section-header"><div><h2>Service matrix</h2><p>Active lease directory</p></div>'
+      + statusPill(metrics.ha_ready ? "healthy" : "degraded", metrics.ha_ready ? "HA ready" : "HA degraded")
+      + '</div>' + table + '</section>';
   }
 
   function filteredNodes() {
@@ -636,6 +706,7 @@
     var metadata = {
       overview: ["Overview", "Network health at a glance."],
       nodes: ["Devices", "Registered nodes and their current health."],
+      services: ["Public nodes", "Lease-backed control and traversal services."],
       paths: ["Connections", "Selected paths and operator controls."],
       routes: ["Network routes", "Advertised networks and their owners."],
       acl: ["Access control", "Runtime connectivity policy and rules."]
@@ -646,6 +717,7 @@
     $("view-content").innerHTML = {
       overview: renderOverview,
       nodes: renderNodes,
+      services: renderServices,
       paths: renderPaths,
       routes: renderRoutes,
       acl: renderAcl

@@ -962,6 +962,10 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
                 issuer_public_key,
             ),
             (
+                "HETERONETWORK_DATAPLANE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN".to_string(),
+                COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN.to_string(),
+            ),
+            (
                 "HETERONETWORK_DATAPLANE_BOOTSTRAP_IP".to_string(),
                 "127.0.0.1".to_string(),
             ),
@@ -1056,7 +1060,42 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "signal-b",
             "stun",
             "stun-b",
+            "relay",
+            "relay-b",
         ],
+    )?;
+    wait_for_json(
+        &compose,
+        "HA service directory",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/admin/services",
+        |value| {
+            let instances = value
+                .get("instances")
+                .and_then(Value::as_array)
+                .context("service directory instances must be an array")?;
+            anyhow::ensure!(instances.len() == 2, "expected two active public instances");
+            let endpoints = value
+                .get("bootstrap_endpoints")
+                .and_then(Value::as_array)
+                .context("service directory bootstrap_endpoints must be an array")?;
+            anyhow::ensure!(endpoints.len() == 8, "expected eight distinct HA endpoints");
+            Ok(())
+        },
+    )?;
+    wait_for_json(
+        &compose,
+        "HA-ready control-plane metrics",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/metrics",
+        |value| {
+            ensure_json_bool_equals(value, "ha_ready", true)?;
+            ensure_json_u64_at_least(value, "active_service_instance_count", 2)?;
+            ensure_json_u64_at_least(value, "active_control_plane_count", 2)?;
+            ensure_json_u64_at_least(value, "active_signal_count", 2)?;
+            ensure_json_u64_at_least(value, "active_stun_count", 2)?;
+            ensure_json_u64_at_least(value, "active_relay_count", 2)
+        },
     )?;
     let bootstrap_ip = compose_service_ipv4(&compose, "control-plane")?;
     run_compose_with_diagnostics(
@@ -1091,22 +1130,30 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             && !workload_b_cidr.contains(&workload_a_cidr.network()),
         "Docker assigned overlapping workload networks {workload_a_cidr} and {workload_b_cidr}"
     );
+    let allowed_routes = vec![
+        workload_a_cidr.into(),
+        workload_b_cidr.into(),
+        workload_a_v6_ipv4_cidr.into(),
+        workload_b_v6_ipv4_cidr.into(),
+        workload_a_v6_cidr.into(),
+        workload_b_v6_cidr.into(),
+        route_a_cidr.into(),
+        route_b_cidr.into(),
+        route_b_replacement_cidr.into(),
+    ];
     let join_token = generated_dataplane_join_token(
         &cluster_id,
         &issuer_key_id,
         &issuer_private_key,
         bootstrap_ip,
-        &[
-            workload_a_cidr.into(),
-            workload_b_cidr.into(),
-            workload_a_v6_ipv4_cidr.into(),
-            workload_b_v6_ipv4_cidr.into(),
-            workload_a_v6_cidr.into(),
-            workload_b_v6_cidr.into(),
-            route_a_cidr.into(),
-            route_b_cidr.into(),
-            route_b_replacement_cidr.into(),
-        ],
+        &allowed_routes,
+    )?;
+    let failover_join_token = generated_dataplane_ha_join_token(
+        &compose,
+        &cluster_id,
+        &issuer_key_id,
+        &issuer_private_key,
+        &allowed_routes,
     )?;
     replace_compose_env(
         &mut compose,
@@ -1181,6 +1228,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "signal-b",
             "stun",
             "stun-b",
+            "relay",
+            "relay-b",
             "agent",
             "agent-b",
             "workload-a",
@@ -1311,17 +1360,34 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         workload_b_v6_ip,
     )?;
 
-    run_compose_with_diagnostics(&compose, ["stop", "--timeout", "1", "control-plane"])?;
-    assert_compose_service_not_running(&compose, "control-plane")?;
+    replace_compose_env(
+        &mut compose,
+        "HETERONETWORK_DATAPLANE_JOIN_TOKEN",
+        failover_join_token.to_string(),
+    )?;
+    run_compose_with_diagnostics(
+        &compose,
+        [
+            "stop",
+            "--timeout",
+            "1",
+            "relay",
+            "stun",
+            "signal",
+            "control-plane",
+        ],
+    )?;
+    for service in ["control-plane", "signal", "stun", "relay"] {
+        assert_compose_service_not_running(&compose, service)?;
+    }
     assert_compose_services_running(
         &compose,
         &[
             "postgres",
             "control-plane-b",
-            "signal",
             "signal-b",
-            "stun",
             "stun-b",
+            "relay-b",
             "agent",
             "agent-b",
             "workload-a",
@@ -1347,6 +1413,26 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "agent",
         "http://control-plane-b:3479/healthz",
         "secondary STUN health",
+    )?;
+    wait_for_compose_http(
+        &compose,
+        "agent",
+        "http://control-plane-b:9580/healthz",
+        "secondary relay health",
+    )?;
+    wait_for_json(
+        &compose,
+        "degraded HA metrics after public node loss",
+        "control-plane-b",
+        "http://127.0.0.1:8443/v1/metrics",
+        |value| {
+            ensure_json_bool_equals(value, "ha_ready", false)?;
+            ensure_json_u64_equals(value, "active_service_instance_count", 1)?;
+            ensure_json_u64_equals(value, "active_control_plane_count", 1)?;
+            ensure_json_u64_equals(value, "active_signal_count", 1)?;
+            ensure_json_u64_equals(value, "active_stun_count", 1)?;
+            ensure_json_u64_equals(value, "active_relay_count", 1)
+        },
     )?;
 
     replace_docker_bridge_network(
@@ -1432,11 +1518,8 @@ fn generated_dataplane_join_token(
     allowed_routes: &[IpNet],
 ) -> Result<Value> {
     let control_plane = format!("http://{bootstrap_ip}:8443");
-    let control_plane_b = "http://control-plane-b:8443";
     let signal = format!("http://{bootstrap_ip}:9443");
-    let signal_b = "http://control-plane-b:9443";
     let stun = format!("udp://{bootstrap_ip}:3478");
-    let stun_b = "udp://control-plane-b:3478";
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipars"));
     command
         .env("HETERONETWORK_ISSUER_PRIVATE_KEY", issuer_private_key)
@@ -1453,15 +1536,9 @@ fn generated_dataplane_join_token(
             "--allowed-route",
             "100.64.0.0/10",
         ]);
-    for endpoint in [&control_plane, control_plane_b] {
-        command.arg("--control-plane-bootstrap").arg(endpoint);
-    }
-    for endpoint in [&signal, signal_b] {
-        command.arg("--signal-bootstrap").arg(endpoint);
-    }
-    for endpoint in [&stun, stun_b] {
-        command.arg("--stun-bootstrap").arg(endpoint);
-    }
+    command.arg("--control-plane-bootstrap").arg(control_plane);
+    command.arg("--signal-bootstrap").arg(signal);
+    command.arg("--stun-bootstrap").arg(stun);
     for route in allowed_routes {
         command.arg("--allowed-route").arg(route.to_string());
     }
@@ -1470,6 +1547,65 @@ fn generated_dataplane_join_token(
         .context("failed to create Docker dataplane join token")?;
     ensure_success("Docker dataplane token create", &output)?;
     serde_json::from_slice(&output.stdout).context("failed to parse Docker dataplane join token")
+}
+
+fn generated_dataplane_ha_join_token(
+    compose: &ComposeProject,
+    cluster_id: &str,
+    issuer_key_id: &str,
+    issuer_private_key: &str,
+    allowed_routes: &[IpNet],
+) -> Result<Value> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        "-e",
+        &format!("HETERONETWORK_ISSUER_PRIVATE_KEY={issuer_private_key}"),
+        "control-plane",
+        "/usr/local/bin/ipars",
+        "--control-plane-operator-api-bearer-token",
+        COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN,
+        "token",
+        "create",
+        "--service-directory-url",
+        "http://127.0.0.1:8443",
+        "--cluster-id",
+        cluster_id,
+        "--issuer-key-id",
+        issuer_key_id,
+        "--ttl-seconds",
+        "3600",
+        "--unlimited-uses",
+        "--allow-relay",
+        "--allowed-route",
+        "100.64.0.0/10",
+    ]);
+    for route in allowed_routes {
+        command.arg("--allowed-route").arg(route.to_string());
+    }
+    let output = command
+        .output()
+        .context("failed to create HA Docker dataplane join token from service directory")?;
+    ensure_success("Docker dataplane HA token create", &output)?;
+    let token: Value = serde_json::from_slice(&output.stdout)
+        .context("failed to parse Docker dataplane HA join token")?;
+    let endpoints = token
+        .get("claims")
+        .and_then(|claims| claims.get("bootstrap_endpoints"))
+        .and_then(Value::as_array)
+        .context("HA join token bootstrap_endpoints must be an array")?;
+    for kind in ["control_plane", "signal", "stun", "relay"] {
+        let count = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.get("kind").and_then(Value::as_str) == Some(kind))
+            .count();
+        anyhow::ensure!(
+            count == 2,
+            "HA join token contained {count} {kind} endpoints"
+        );
+    }
+    Ok(token)
 }
 
 fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
@@ -3825,7 +3961,9 @@ fn compose_exec_post_json(
 fn add_api_bearer_header(command: &mut Command, service: &str) {
     let token = match service {
         "agent" | "agent-b" | "agent-failover" => Some(COMPOSE_AGENT_API_BEARER_TOKEN),
-        "control-plane" => Some(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN),
+        "control-plane" | "control-plane-b" => {
+            Some(COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN)
+        }
         "signal" => Some(COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN),
         "stun" => Some(COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN),
         "relay" => Some(COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN),

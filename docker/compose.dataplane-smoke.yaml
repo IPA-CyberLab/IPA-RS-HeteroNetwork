@@ -18,6 +18,14 @@ services:
     environment: !override
       HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@postgres:5432/heteronetwork
       HETERONETWORK_ROLE: control-plane
+      HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN}
+      HETERONETWORK_SERVICE_INSTANCE_ID: public-a
+      HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://control-plane:8443
+      HETERONETWORK_ADVERTISE_SIGNAL_URL: http://control-plane:9443
+      HETERONETWORK_ADVERTISE_STUN_URL: udp://control-plane:3478
+      HETERONETWORK_ADVERTISE_RELAY_URL: udp://control-plane:51820
+      HETERONETWORK_SERVICE_LEASE_TTL_SECONDS: "6"
+      HETERONETWORK_SERVICE_LEASE_RENEW_INTERVAL_SECONDS: "2"
     ports: !reset []
     secrets: !reset []
 
@@ -42,6 +50,14 @@ services:
     environment:
       HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@postgres:5432/heteronetwork
       HETERONETWORK_ROLE: control-plane
+      HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN}
+      HETERONETWORK_SERVICE_INSTANCE_ID: public-b
+      HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://control-plane-b:8443
+      HETERONETWORK_ADVERTISE_SIGNAL_URL: http://control-plane-b:9443
+      HETERONETWORK_ADVERTISE_STUN_URL: udp://control-plane-b:3478
+      HETERONETWORK_ADVERTISE_RELAY_URL: udp://control-plane-b:51820
+      HETERONETWORK_SERVICE_LEASE_TTL_SECONDS: "6"
+      HETERONETWORK_SERVICE_LEASE_RENEW_INTERVAL_SECONDS: "2"
     depends_on:
       postgres:
         condition: service_healthy
@@ -128,9 +144,48 @@ services:
     secrets: !reset []
 
   relay:
+    network_mode: service:control-plane
+    environment: !override
+      HETERONETWORK_ROLE: relay
+      HETERONETWORK_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:51820
+      HETERONETWORK_RELAY_ADMISSION_URL: http://127.0.0.1:9580
+      HETERONETWORK_RELAY_MAX_SESSIONS: "10000"
+      HETERONETWORK_RELAY_MAX_MBPS: "1000"
     cap_add: !reset []
     devices: !reset []
     ports: !reset []
+    secrets: !reset []
+
+  relay-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    entrypoint:
+      - /usr/local/bin/iparsd
+    command:
+      - relay
+      - --relay-node-id
+      - relay-dataplane-b
+      - --udp-listen
+      - 0.0.0.0:51820
+      - --http-listen
+      - 0.0.0.0:9580
+    network_mode: service:control-plane-b
+    environment:
+      HETERONETWORK_ROLE: relay
+      HETERONETWORK_RELAY_PUBLIC_ENDPOINT: 127.0.0.1:51820
+      HETERONETWORK_RELAY_ADMISSION_URL: http://127.0.0.1:9580
+      HETERONETWORK_RELAY_MAX_SESSIONS: "10000"
+      HETERONETWORK_RELAY_MAX_MBPS: "1000"
+    depends_on:
+      control-plane-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9580/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
 
   agent:
     network_mode: !reset null

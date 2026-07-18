@@ -46,6 +46,7 @@ async fn udp_peer_probe_crosses_linux_network_namespaces() -> Result<(), Box<dyn
         .record_peer_map_snapshot(PeerMap {
             cluster_id: ClusterId::from_string("cluster-netns-probe"),
             peers: vec![peer_b],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         })
         .await;

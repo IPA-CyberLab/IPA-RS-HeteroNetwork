@@ -1262,14 +1262,17 @@ name = "ipars-control-plane-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "ipars-control-plane",
  "ipars-crypto",
  "ipars-types",
  "ipnet",
+ "rand_core 0.6.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
  "url",

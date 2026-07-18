@@ -20,11 +20,14 @@ use ipars_types::api::{
     RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, relay_admission_url_is_usable, AclAction, AclRule, ClusterId,
-    ClusterPolicy, EndpointCandidate, HealthState, JoinTokenClaims, KeyId, NatClassification,
-    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathRecord, PathState, RelayCapability,
-    Route, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome,
+    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, relay_admission_url_is_usable,
+    validate_join_token_bootstrap_endpoints, AclAction, AclRule, BootstrapEndpoint,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
+    JoinTokenClaims, KeyId, NatClassification, NatTraversalStrategy, NodeHealth, NodeId,
+    NodeRecord, PathRecord, PathState, RelayCapability, Route, ServiceDirectory, ServiceInstance,
+    SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome,
     TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use ipnet::IpNet;
 use ipnet::Ipv4Net;
@@ -42,6 +45,8 @@ const MAX_PATH_SCORE_REASONS: usize = 16;
 const MAX_PATH_SCORE_REASON_BYTES: usize = 256;
 const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
+const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
+const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -167,6 +172,14 @@ pub trait ControlPlaneStore: Send + Sync {
         paths: Vec<PathRecord>,
     ) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
+    async fn upsert_service_instance(
+        &self,
+        instance: ServiceInstance,
+    ) -> Result<(), ControlPlaneError>;
+    async fn list_service_instances(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Vec<ServiceInstance>, ControlPlaneError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +233,7 @@ pub struct InMemoryStore {
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
     paths: RwLock<Vec<PathRecord>>,
+    service_instances: RwLock<BTreeMap<(ClusterId, String), ServiceInstance>>,
 }
 
 #[async_trait]
@@ -426,6 +440,31 @@ impl ControlPlaneStore for InMemoryStore {
             .await
             .iter()
             .filter(|path| &path.key.local == node_id || &path.key.remote == node_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn upsert_service_instance(
+        &self,
+        instance: ServiceInstance,
+    ) -> Result<(), ControlPlaneError> {
+        self.service_instances.write().await.insert(
+            (instance.cluster_id.clone(), instance.instance_id.clone()),
+            instance,
+        );
+        Ok(())
+    }
+
+    async fn list_service_instances(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Vec<ServiceInstance>, ControlPlaneError> {
+        Ok(self
+            .service_instances
+            .read()
+            .await
+            .values()
+            .filter(|instance| &instance.cluster_id == cluster_id)
             .cloned()
             .collect())
     }
@@ -822,6 +861,67 @@ where
             .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))
     }
 
+    pub async fn advertise_service_instance(
+        &self,
+        instance: ServiceInstance,
+    ) -> Result<(), ControlPlaneError> {
+        validate_service_instance(&instance, &self.config.cluster_id, Utc::now())?;
+        self.store.upsert_service_instance(instance).await
+    }
+
+    pub async fn service_directory(&self) -> Result<ServiceDirectory, ControlPlaneError> {
+        self.service_directory_at(Utc::now()).await
+    }
+
+    async fn service_directory_at(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ServiceDirectory, ControlPlaneError> {
+        let mut instances = self
+            .store
+            .list_service_instances(&self.config.cluster_id)
+            .await?
+            .into_iter()
+            .filter(|instance| instance.lease_expires_at > now)
+            .collect::<Vec<_>>();
+        instances.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.instance_id.cmp(&right.instance_id))
+        });
+        instances.truncate(MAX_ACTIVE_SERVICE_INSTANCES);
+        instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        let mut per_kind = BTreeMap::<BootstrapEndpointKind, usize>::new();
+        let mut seen = BTreeSet::<(BootstrapEndpointKind, String)>::new();
+        let mut bootstrap_endpoints = Vec::new();
+        for instance in &instances {
+            for endpoint in &instance.endpoints {
+                if bootstrap_endpoints.len() >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS {
+                    break;
+                }
+                let count = per_kind.entry(endpoint.kind).or_default();
+                let endpoint_key = canonical_bootstrap_endpoint_url(&endpoint.url)
+                    .unwrap_or_else(|| endpoint.url.clone());
+                if *count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND
+                    || !seen.insert((endpoint.kind, endpoint_key))
+                {
+                    continue;
+                }
+                bootstrap_endpoints.push(endpoint.clone());
+                *count += 1;
+            }
+        }
+
+        Ok(ServiceDirectory {
+            cluster_id: self.config.cluster_id.clone(),
+            instances,
+            bootstrap_endpoints,
+            generated_at: now,
+        })
+    }
+
     pub fn set_cluster_policy(
         &self,
         policy: ClusterPolicy,
@@ -1041,7 +1141,14 @@ where
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let policy = self.policy_snapshot()?;
-        let peer_map = self.filtered_peer_map_for_node(&node, &peers, &policy, now);
+        let directory = self.service_directory_at(now).await?;
+        let peer_map = self.filtered_peer_map_for_node(
+            &node,
+            &peers,
+            &policy,
+            directory.bootstrap_endpoints,
+            now,
+        );
         let relay_map =
             self.filtered_relay_map_for_node(&node, &peers, &health_by_node, &policy, now);
 
@@ -1196,7 +1303,15 @@ where
             .collect::<Vec<_>>();
 
         let policy = self.policy_snapshot()?;
-        Ok(self.filtered_peer_map_for_node(&source, &peers, &policy, Utc::now()))
+        let now = Utc::now();
+        let directory = self.service_directory_at(now).await?;
+        Ok(self.filtered_peer_map_for_node(
+            &source,
+            &peers,
+            &policy,
+            directory.bootstrap_endpoints,
+            now,
+        ))
     }
 
     pub async fn remove_node(
@@ -1433,10 +1548,13 @@ where
             })
             .await?;
 
+        let directory = self.service_directory_at(now).await?;
+
         Ok(HeartbeatResponse {
             accepted: true,
             policy_version: 0,
             peer_delta_available: false,
+            bootstrap_endpoints: directory.bootstrap_endpoints,
         })
     }
 
@@ -1472,7 +1590,14 @@ where
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let policy = self.policy_snapshot()?;
-        let peer_map = self.filtered_peer_map_for_node(&updated_node, &peers, &policy, rotated_at);
+        let directory = self.service_directory_at(rotated_at).await?;
+        let peer_map = self.filtered_peer_map_for_node(
+            &updated_node,
+            &peers,
+            &policy,
+            directory.bootstrap_endpoints,
+            rotated_at,
+        );
         let relay_map = self.filtered_relay_map_for_node(
             &updated_node,
             &peers,
@@ -1947,6 +2072,27 @@ where
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
         let now = Utc::now();
+        let service_directory = self.service_directory_at(now).await?;
+        let active_control_plane_count = service_instance_kind_count(
+            &service_directory.instances,
+            BootstrapEndpointKind::ControlPlane,
+        );
+        let active_signal_count = service_instance_kind_count(
+            &service_directory.instances,
+            BootstrapEndpointKind::Signal,
+        );
+        let active_stun_count =
+            service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::Stun);
+        let active_relay_count =
+            service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::Relay);
+        let ha_ready = [
+            active_control_plane_count,
+            active_signal_count,
+            active_stun_count,
+            active_relay_count,
+        ]
+        .into_iter()
+        .all(|count| count >= 2);
         let relay_candidate_count = nodes
             .iter()
             .filter(|node| {
@@ -1999,6 +2145,12 @@ where
             cluster_id: self.config.cluster_id.clone(),
             node_count: nodes.len(),
             relay_candidate_count,
+            active_service_instance_count: service_directory.instances.len(),
+            active_control_plane_count,
+            active_signal_count,
+            active_stun_count,
+            active_relay_count,
+            ha_ready,
             healthy_node_count,
             degraded_node_count,
             unhealthy_node_count,
@@ -2057,6 +2209,7 @@ where
         source: &NodeRecord,
         peers: &[NodeRecord],
         policy: &ClusterPolicy,
+        bootstrap_endpoints: Vec<BootstrapEndpoint>,
         generated_at: chrono::DateTime<Utc>,
     ) -> PeerMap {
         PeerMap {
@@ -2067,6 +2220,7 @@ where
                 .filter_map(|peer| acl_filter_peer(source, peer, policy))
                 .map(|peer| filter_served_endpoint_candidates(peer, generated_at, policy))
                 .collect(),
+            bootstrap_endpoints,
             generated_at,
         }
     }
@@ -2103,6 +2257,102 @@ where
             generated_at,
         }
     }
+}
+
+fn validate_service_instance(
+    instance: &ServiceInstance,
+    cluster_id: &ClusterId,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), ControlPlaneError> {
+    if &instance.cluster_id != cluster_id {
+        return Err(ControlPlaneError::Store(format!(
+            "service instance {} belongs to cluster {} instead of {}",
+            instance.instance_id, instance.cluster_id, cluster_id
+        )));
+    }
+    if instance.instance_id.is_empty()
+        || instance.instance_id.len() > 255
+        || !instance
+            .instance_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(ControlPlaneError::Store(
+            "service instance ID must be 1 to 255 ASCII letters, digits, '_', '.' or '-'"
+                .to_string(),
+        ));
+    }
+    validate_join_token_bootstrap_endpoints(&instance.endpoints)
+        .map_err(|error| ControlPlaneError::Store(error.to_string()))?;
+    if instance.endpoints.is_empty() {
+        return Err(ControlPlaneError::Store(format!(
+            "service instance {} must advertise at least one endpoint",
+            instance.instance_id
+        )));
+    }
+    let mut kinds = BTreeSet::new();
+    if instance
+        .endpoints
+        .iter()
+        .any(|endpoint| !kinds.insert(endpoint.kind))
+    {
+        return Err(ControlPlaneError::Store(format!(
+            "service instance {} must advertise at most one endpoint per service kind",
+            instance.instance_id
+        )));
+    }
+    if instance.updated_at > now + chrono::Duration::seconds(5) {
+        return Err(ControlPlaneError::Store(format!(
+            "service instance {} update timestamp is in the future",
+            instance.instance_id
+        )));
+    }
+    if instance.lease_expires_at <= instance.updated_at {
+        return Err(ControlPlaneError::Store(format!(
+            "service instance {} lease must expire after its update timestamp",
+            instance.instance_id
+        )));
+    }
+    if instance
+        .lease_expires_at
+        .signed_duration_since(instance.updated_at)
+        > chrono::Duration::seconds(MAX_SERVICE_LEASE_SECONDS)
+    {
+        return Err(ControlPlaneError::Store(format!(
+            "service instance {} lease exceeds {} seconds",
+            instance.instance_id, MAX_SERVICE_LEASE_SECONDS
+        )));
+    }
+    Ok(())
+}
+
+fn service_instance_kind_count(
+    instances: &[ServiceInstance],
+    kind: BootstrapEndpointKind,
+) -> usize {
+    let instance_count = instances
+        .iter()
+        .filter(|instance| {
+            instance
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.kind == kind)
+        })
+        .count();
+    let endpoint_count = instances
+        .iter()
+        .filter_map(|instance| {
+            instance
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == kind)
+        })
+        .map(|endpoint| {
+            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    instance_count.min(endpoint_count)
 }
 
 fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
@@ -3080,6 +3330,39 @@ mod tests {
         }
     }
 
+    fn service_instance(
+        cluster_id: &ClusterId,
+        instance_id: &str,
+        host: &str,
+        updated_at: chrono::DateTime<Utc>,
+        lease_expires_at: chrono::DateTime<Utc>,
+    ) -> ServiceInstance {
+        ServiceInstance {
+            cluster_id: cluster_id.clone(),
+            instance_id: instance_id.to_string(),
+            endpoints: vec![
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: format!("https://{host}:8443"),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: format!("https://{host}:9443"),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: format!("udp://{host}:3478"),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Relay,
+                    url: format!("udp://{host}:51820"),
+                },
+            ],
+            lease_expires_at,
+            updated_at,
+        }
+    }
+
     #[derive(Default)]
     struct RacingVpnIpStore {
         inner: InMemoryStore,
@@ -3220,6 +3503,20 @@ mod tests {
         ) -> Result<Vec<PathRecord>, ControlPlaneError> {
             self.inner.list_paths_for(node_id).await
         }
+
+        async fn upsert_service_instance(
+            &self,
+            instance: ServiceInstance,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.upsert_service_instance(instance).await
+        }
+
+        async fn list_service_instances(
+            &self,
+            cluster_id: &ClusterId,
+        ) -> Result<Vec<ServiceInstance>, ControlPlaneError> {
+            self.inner.list_service_instances(cluster_id).await
+        }
     }
 
     fn route(id: &str, cidr: &str, advertised_by: &str) -> Result<Route, ipnet::AddrParseError> {
@@ -3328,6 +3625,150 @@ mod tests {
         };
         request.issuer_signature = Some(issuer.sign_token_revocation_request(&request, signed_at)?);
         Ok(request)
+    }
+
+    #[tokio::test]
+    async fn service_directory_expires_members_and_requires_two_complete_public_nodes_for_ha(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-ha");
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            Arc::new(InMemoryStore::default()),
+        );
+        let now = Utc::now();
+
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "public-a",
+                "public-a.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "public-b",
+                "public-b.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "expired-public",
+                "expired.example",
+                now - Duration::seconds(60),
+                now - Duration::seconds(30),
+            ))
+            .await?;
+
+        let directory = plane.service_directory().await?;
+        assert_eq!(
+            directory
+                .instances
+                .iter()
+                .map(|instance| instance.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["public-a", "public-b"]
+        );
+        assert_eq!(directory.bootstrap_endpoints.len(), 8);
+        assert!(directory
+            .bootstrap_endpoints
+            .iter()
+            .all(|endpoint| !endpoint.url.contains("expired")));
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.active_service_instance_count, 2);
+        assert_eq!(metrics.active_control_plane_count, 2);
+        assert_eq!(metrics.active_signal_count, 2);
+        assert_eq!(metrics.active_stun_count, 2);
+        assert_eq!(metrics.active_relay_count, 2);
+        assert!(metrics.ha_ready);
+
+        let mut duplicate_kind = service_instance(
+            &cluster_id,
+            "invalid-public",
+            "invalid.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        duplicate_kind
+            .endpoints
+            .push(duplicate_kind.endpoints[0].clone());
+        assert!(plane
+            .advertise_service_instance(duplicate_kind)
+            .await
+            .is_err());
+
+        let mut duplicate_urls = service_instance(
+            &cluster_id,
+            "public-b",
+            "public-b.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        duplicate_urls.endpoints = service_instance(
+            &cluster_id,
+            "public-a-copy",
+            "public-a.example",
+            now,
+            now + Duration::seconds(30),
+        )
+        .endpoints;
+        plane.advertise_service_instance(duplicate_urls).await?;
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.active_control_plane_count, 1);
+        assert!(!metrics.ha_ready);
+
+        let mut degraded = service_instance(
+            &cluster_id,
+            "public-b",
+            "public-b.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        degraded
+            .endpoints
+            .retain(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane);
+        plane.advertise_service_instance(degraded).await?;
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.active_control_plane_count, 2);
+        assert_eq!(metrics.active_signal_count, 1);
+        assert!(!metrics.ha_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_service_instances_are_isolated_by_cluster() -> Result<(), ControlPlaneError>
+    {
+        let store = InMemoryStore::default();
+        let now = Utc::now();
+        for cluster_id in ["cluster-a", "cluster-b"] {
+            let cluster_id = ClusterId::from_string(cluster_id);
+            store
+                .upsert_service_instance(service_instance(
+                    &cluster_id,
+                    "public-a",
+                    &format!("{cluster_id}.example"),
+                    now,
+                    now + Duration::seconds(30),
+                ))
+                .await?;
+        }
+        for cluster_id in ["cluster-a", "cluster-b"] {
+            let cluster_id = ClusterId::from_string(cluster_id);
+            let instances = store.list_service_instances(&cluster_id).await?;
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].cluster_id, cluster_id);
+        }
+        Ok(())
     }
 
     #[tokio::test]

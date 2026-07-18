@@ -37,10 +37,12 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, validate_join_token_bootstrap_endpoints, BootstrapEndpoint,
+    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable,
+    validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
     NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
     PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -141,6 +143,8 @@ pub struct AgentNodeState {
     pub registered_node: Option<NodeRecord>,
     #[serde(default)]
     pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
+    #[serde(default)]
+    pub seed_bootstrap_endpoints: Option<Vec<BootstrapEndpoint>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -158,6 +162,7 @@ impl AgentNodeState {
             vpn_ip: None,
             registered_node: None,
             bootstrap_endpoints: Vec::new(),
+            seed_bootstrap_endpoints: Some(Vec::new()),
             created_at: now,
             updated_at: now,
         }
@@ -206,6 +211,34 @@ impl AgentNodeState {
                 error.reason()
             ))
         })?;
+        if let Some(seeds) = &self.seed_bootstrap_endpoints {
+            validate_join_token_bootstrap_endpoints(seeds).map_err(|error| {
+                AgentError::InvalidState(format!(
+                    "persisted signed seed endpoints are invalid: {}",
+                    error.reason()
+                ))
+            })?;
+            let persisted = self
+                .bootstrap_endpoints
+                .iter()
+                .map(|endpoint| {
+                    (
+                        endpoint.kind,
+                        canonical_bootstrap_endpoint_url(&endpoint.url)
+                            .unwrap_or_else(|| endpoint.url.clone()),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            if seeds.iter().any(|endpoint| {
+                let key = canonical_bootstrap_endpoint_url(&endpoint.url)
+                    .unwrap_or_else(|| endpoint.url.clone());
+                !persisted.contains(&(endpoint.kind, key))
+            }) {
+                return Err(AgentError::InvalidState(
+                    "persisted bootstrap endpoints omit a signed seed endpoint".to_string(),
+                ));
+            }
+        }
         if let Some(node) = &self.registered_node {
             if node.node_id != self.node_id {
                 return Err(AgentError::InvalidState(format!(
@@ -1246,6 +1279,78 @@ fn wireguard_datagram_payload(payload: &[u8]) -> bool {
     }
 }
 
+fn validate_bootstrap_endpoint_set(
+    endpoints: &[BootstrapEndpoint],
+    label: &str,
+) -> Result<(), AgentError> {
+    validate_join_token_bootstrap_endpoints(endpoints).map_err(|error| {
+        AgentError::InvalidState(format!("{label} is invalid: {}", error.reason()))
+    })
+}
+
+pub fn merge_bootstrap_endpoint_sets(
+    active: &[BootstrapEndpoint],
+    seeds: &[BootstrapEndpoint],
+) -> Result<Vec<BootstrapEndpoint>, AgentError> {
+    validate_bootstrap_endpoint_set(active, "control-plane service directory")?;
+    validate_bootstrap_endpoint_set(seeds, "signed seed endpoint set")?;
+
+    let mut seed_keys = BTreeMap::<BootstrapEndpointKind, BTreeSet<String>>::new();
+    for endpoint in seeds {
+        let key =
+            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone());
+        seed_keys.entry(endpoint.kind).or_default().insert(key);
+    }
+    let mut missing_seed_keys = seed_keys.clone();
+    let mut merged = Vec::new();
+    let mut seen = BTreeSet::<(BootstrapEndpointKind, String)>::new();
+    let mut per_kind = BTreeMap::<BootstrapEndpointKind, usize>::new();
+    for endpoint in active {
+        let key =
+            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone());
+        if seen.contains(&(endpoint.kind, key.clone())) {
+            continue;
+        }
+        let count = *per_kind.get(&endpoint.kind).unwrap_or(&0);
+        let missing_seeds = missing_seed_keys
+            .get(&endpoint.kind)
+            .map_or(0, BTreeSet::len);
+        let is_seed = missing_seed_keys
+            .get(&endpoint.kind)
+            .is_some_and(|keys| keys.contains(&key));
+        if !is_seed
+            && count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND.saturating_sub(missing_seeds)
+        {
+            continue;
+        }
+        seen.insert((endpoint.kind, key.clone()));
+        if let Some(keys) = missing_seed_keys.get_mut(&endpoint.kind) {
+            keys.remove(&key);
+        }
+        *per_kind.entry(endpoint.kind).or_default() += 1;
+        merged.push(endpoint.clone());
+    }
+    for endpoint in seeds {
+        let key =
+            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone());
+        if !seen.insert((endpoint.kind, key)) {
+            continue;
+        }
+        let count = per_kind.entry(endpoint.kind).or_default();
+        if *count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND
+            || merged.len() >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS
+        {
+            return Err(AgentError::InvalidState(
+                "merged service directory cannot retain every signed seed endpoint".to_string(),
+            ));
+        }
+        *count += 1;
+        merged.push(endpoint.clone());
+    }
+    validate_bootstrap_endpoint_set(&merged, "merged service directory")?;
+    Ok(merged)
+}
+
 impl AgentRuntime {
     pub fn new(state: AgentNodeState, policy: ClusterPolicy) -> Self {
         Self {
@@ -1413,6 +1518,54 @@ impl AgentRuntime {
             Err(poisoned) => *poisoned.into_inner() = state,
         }
         Ok(())
+    }
+
+    pub fn merge_active_bootstrap_endpoints(
+        &self,
+        active: &[BootstrapEndpoint],
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AgentNodeState>, AgentError> {
+        if active.is_empty() {
+            return Ok(None);
+        }
+
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let seeds = state
+            .seed_bootstrap_endpoints
+            .clone()
+            .unwrap_or_else(|| state.bootstrap_endpoints.clone());
+        let merged = merge_bootstrap_endpoint_sets(active, &seeds)?;
+        let seeds_changed = state.seed_bootstrap_endpoints.is_none();
+        if state.bootstrap_endpoints == merged && !seeds_changed {
+            return Ok(None);
+        }
+        state.bootstrap_endpoints = merged;
+        state.seed_bootstrap_endpoints = Some(seeds);
+        state.updated_at = updated_at;
+        Ok(Some(state.clone()))
+    }
+
+    pub fn replace_seed_bootstrap_endpoints(
+        &self,
+        seeds: &[BootstrapEndpoint],
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AgentNodeState>, AgentError> {
+        validate_bootstrap_endpoint_set(seeds, "signed seed endpoint set")?;
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.seed_bootstrap_endpoints.as_deref() == Some(seeds) {
+            return Ok(None);
+        }
+        state.bootstrap_endpoints =
+            merge_bootstrap_endpoint_sets(&state.bootstrap_endpoints, seeds)?;
+        state.seed_bootstrap_endpoints = Some(seeds.to_vec());
+        state.updated_at = updated_at;
+        Ok(Some(state.clone()))
     }
 
     pub async fn record_userspace_wireguard_process_status(
@@ -8427,6 +8580,7 @@ mod tests {
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: Vec::new(),
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
 
@@ -8691,6 +8845,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -8731,6 +8886,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -8789,6 +8945,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await;
@@ -8836,6 +8993,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers,
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await;
@@ -8875,6 +9033,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await;
@@ -8934,6 +9093,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -8993,6 +9153,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                 )],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9034,6 +9195,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                 )],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await;
@@ -9102,6 +9264,7 @@ mod tests {
                         vec![preferred_route.clone()],
                     ),
                 ],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9171,6 +9334,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![primary, fallback.clone()],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9190,6 +9354,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![fallback],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9255,6 +9420,7 @@ mod tests {
                     Vec::new(),
                     vec![remote_duplicate],
                 )],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9306,6 +9472,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9357,6 +9524,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9364,6 +9532,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9425,6 +9594,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer_with_route],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9432,6 +9602,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer_without_route],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9518,6 +9689,7 @@ mod tests {
             .apply_peer_map(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await?;
@@ -9608,6 +9780,7 @@ mod tests {
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
 
@@ -9836,6 +10009,7 @@ mod tests {
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![active_peer, inactive_peer, pinned_peer],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
 
@@ -11651,6 +11825,7 @@ mod tests {
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: Vec::new(),
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let source = StaticPeerMapSource::new(node_id.clone(), peer_map.clone());
@@ -11813,6 +11988,106 @@ mod tests {
             Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))))
         );
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_prioritizes_active_ha_endpoints_and_retains_seed_fallbacks() -> Result<(), AgentError>
+    {
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.bootstrap_endpoints = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://seed.example:8443/".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://seed.example:9443".to_string(),
+            },
+        ];
+        state.seed_bootstrap_endpoints = Some(state.bootstrap_endpoints.clone());
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let updated_at = Utc::now() + ChronoDuration::seconds(1);
+        let active = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://active.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://seed.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://active.example:9443".to_string(),
+            },
+        ];
+
+        let merged = runtime
+            .merge_active_bootstrap_endpoints(&active, updated_at)?
+            .ok_or_else(|| {
+                AgentError::InvalidState(
+                    "active directory did not change endpoint priority".to_string(),
+                )
+            })?;
+        assert_eq!(
+            merged.bootstrap_endpoints,
+            vec![
+                active[0].clone(),
+                active[1].clone(),
+                active[2].clone(),
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "https://seed.example:9443".to_string(),
+                },
+            ]
+        );
+        assert_eq!(merged.updated_at, updated_at);
+        assert!(runtime
+            .merge_active_bootstrap_endpoints(&active, updated_at)?
+            .is_none());
+
+        let replacement = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://replacement.example:8443".to_string(),
+        }];
+        let replaced = runtime
+            .merge_active_bootstrap_endpoints(
+                &replacement,
+                updated_at + ChronoDuration::seconds(1),
+            )?
+            .ok_or_else(|| {
+                AgentError::InvalidState("replacement directory was not applied".to_string())
+            })?;
+        assert!(replaced
+            .bootstrap_endpoints
+            .iter()
+            .all(|endpoint| !endpoint.url.contains("active.example")));
+        assert!(replaced
+            .bootstrap_endpoints
+            .iter()
+            .any(|endpoint| endpoint.url.contains("seed.example")));
+        Ok(())
+    }
+
+    #[test]
+    fn merged_directory_reserves_bounded_capacity_for_signed_seeds() -> Result<(), AgentError> {
+        let active = (0..MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+            .map(|index| BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: format!("https://active-{index}.example:8443"),
+            })
+            .collect::<Vec<_>>();
+        let seed = BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://signed-seed.example:8443".to_string(),
+        };
+        let merged = merge_bootstrap_endpoint_sets(&active, std::slice::from_ref(&seed))?;
+        assert_eq!(merged.len(), MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND);
+        assert_eq!(merged.last(), Some(&seed));
+        assert!(merged
+            .iter()
+            .all(|endpoint| endpoint.url != active.last().map_or("", |item| item.url.as_str())));
         Ok(())
     }
 

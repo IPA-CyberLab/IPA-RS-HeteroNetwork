@@ -12,6 +12,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - pair-scoped path state and scoring primitives
 - control-plane registration/IP-allocation service that skips already assigned VPN IPs and retries after durable-store insert races
 - SQLite and PostgreSQL control-plane store implementations with typed node-ID/VPN-IP uniqueness guards and transaction-locked PostgreSQL schema initialization for concurrent HA startup
+- PostgreSQL-backed public-service leases that aggregate active Control Plane, Signal, STUN, and Relay endpoints from every public node, expire failed instances, and expose HA readiness through the operator API, Prometheus, OTLP, and the Web UI
 - signed control-plane node removal that reclaims durable VPN IP leases and clears stale health/path state
 - token ledger primitives and control-plane revocation API with durable pre-use revocation tombstones, full-claims nonce collision detection for new records, and transaction-serialized first admission, max-use consumption, and revocation
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, relay-capability policy, WireGuard public-key format, identity-derived node IDs, and candidate/route ownership before registration
@@ -26,6 +27,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - persistent agent node state with owner-only state directory creation, atomic file writes, and symlink rejection, agent status/path/path-probe/STUN probe/NAT classification/peer-activity/packet-flow/WireGuard-key-rotation HTTP API with loopback-only default binding and Bearer authentication for non-loopback listeners, and `iparsd agent`
 - `iparsd agent --join-token` or bounded regular-file `--join-token-path` startup registration using persisted agent identity/WireGuard keys and token bootstrap control-plane discovery with ordered failover
 - `iparsd agent` heartbeat reporting to `/v1/heartbeat` with current health, endpoint candidates, advertised route updates, relay capability updates, and path state, retrying across known control-plane endpoints
+- Agent-side service-directory persistence and runtime failover: registration, heartbeat, and peer-map responses refresh the active endpoint set, while signed token endpoints remain bounded last-resort seeds for recovery after a restart or directory outage
 - `iparsd agent` signed signal-service node registration that refreshes the authoritative control-plane NodeRecord, endpoint candidates, and relay capability across known signal endpoints, with signal-side membership TTL and non-admissible relay capability normalization
 - `iparsd agent` signed signal path negotiation and hole-punch planning that fetches peer maps across known control-plane endpoints, fails over across known signal endpoints, rejects replayed request nonces, records pair-scoped path state, and reports it in heartbeat payloads
 - `iparsd agent` relay admission for signal-selected relay paths, stable reuse of the active relay session while its relay remains admissible, failing over across utilization-ranked relay candidates, aligning stored path state to the admitted relay, downgrading credentialless relay selections to `UNREACHABLE`, and storing expiring relay credentials only in transient agent runtime state
@@ -47,6 +49,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - `iparsd agent --apply-peer-map` continuous identity-signed peer-map polling through `POST /v1/peers/query` and applying active/pinned peers/routes through selectable runtime backends, including Linux command execution with `--linux-netns` namespace placement and a `dry-run` backend for validation without host mutation
 - CLI command surface for `init`, `join`, `status`, `peers`, `routes`, `token create`, `token revoke`, `relay status`, `relay probe`, `stun probe`, `path status`, `path events`, `path activity`, `path probe`, `docker install`, and `k8s install`, with reusable issuer-key token signing, bootstrap daemon command output, opt-in local daemon spawning, token policy flags, validated HTTP API-backed agent/control-plane status, peer, route, relay, path query, path-change event, activation, and path probe operations when URLs are provided, plus STUN Binding and optional-Bearer-auth relay admission/dataplane probes for operator validation
 - Docker Compose manifest with service healthchecks, distinct file-backed control-plane, signal, STUN, and relay operator credentials plus agent join-token and management-API Bearer secrets and a shared file-backed relay admission credential, host-network agent loopback wiring, aligned agent STUN/WireGuard port environment defaults (`51821`, separate from the relay's `51820`), env-driven Docker route, route backend, WireGuard backend/userspace lifecycle, explicit relay advertisement plus separate relay admission auth/abuse-control settings, relay forwarder endpoint/bind/namespace/supervisor wiring, discovery-only Docker API socket binding, gated dry-run management-plane plus isolated two-container kernel-WireGuard dataplane smoke coverage, and Helm chart starting points
+- hardened systemd public-node units that bind the four public services into one lease failure domain and restart them without root or network capabilities; see [`deploy/systemd`](deploy/systemd/README.md)
 - Docker Engine route discovery also accepts an explicit `--docker-api-url` for remote engines, with HTTPS required off-host, optional bounded PEM CA material via `--docker-api-ca-cert-path`, and loopback-only HTTP for local development; the existing Unix socket and rootless socket discovery paths remain available. Daemon tests cover two independent remote Engine URLs queried concurrently with per-host namespace separation and independent subnet churn across repeated discovery cycles.
 - `scripts/docker-multi-engine-smoke.sh` can start two isolated local Docker daemons with separate data roots, containerd sockets, and loopback API endpoints, then verifies real API discovery, per-engine namespace separation, and bridge subnet churn across both endpoints; CI runs this gate beside the Compose integration suite.
 - `ipars docker install` propagates that choice into Compose: URL-backed plans omit the local Docker API socket bind and discovery preflight, and add a read-only CA bind overlay when requested; socket-backed plans retain the existing rootful/rootless discovery overrides. Rootless route-provider plans with a remote URL verify the external workload network on both the Compose Docker Engine and the remote discovery Engine, then use `curl` for the remote check, passing `--docker-api-ca-cert-path` as `--cacert` instead of relying on Docker CLI certificate discovery.
@@ -63,15 +66,17 @@ cargo test --locked --workspace
 ## Web Management UI
 
 The control-plane daemon serves an operations UI at `/ui/`. It shows registered
-devices, health, selected paths, relay/candidate state, advertised routes, and
-the active ACL policy. The admin endpoints behind the UI are authenticated;
-node removal, path pinning, and policy updates are available from the browser.
-The UI is embedded in the Rust binary and does not require a Node.js build.
+devices, health, selected paths, relay/candidate state, advertised routes, the
+active ACL policy, and a public-node service matrix with lease expiry and HA
+readiness. The admin endpoints behind the UI are authenticated; node removal,
+path pinning, and policy updates are available from the browser. The UI is
+embedded in the Rust binary and does not require a Node.js build.
 
 OIDC is enabled by default with Keycloak:
 
 ```bash
 HETERONETWORK_WEB_AUTH_PROVIDER=keycloak
+HETERONETWORK_WEB_PUBLIC_URL=https://control-plane.example.com
 HETERONETWORK_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/heteronetwork
 HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web
 iparsd control-plane
@@ -81,6 +86,13 @@ Register `https://control-plane.example.com/ui/` as the public client redirect
 URI and enable Authorization Code with PKCE. The Keycloak client must allow the
 control-plane origin as a Web Origin. The default development issuer is
 `http://localhost:8080/realms/heteronetwork`.
+
+When `HETERONETWORK_WEB_PUBLIC_URL` is set, the Control Plane performs the PKCE token
+exchange through short-lived, single-use server-side state and publishes
+`/ui/login` as the login endpoint. This is required for plain-HTTP lab IPs where
+browser WebCrypto is unavailable and also avoids a browser-side token exchange.
+Plain HTTP is accepted only for loopback, private, link-local, and CGNAT
+addresses; Internet-facing issuer and public URLs must use HTTPS.
 
 To use Amazon Cognito, keep the issuer URL for token validation and set the
 hosted UI domain separately:

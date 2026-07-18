@@ -1,0 +1,35 @@
+[Unit]
+Description=HeteroNetwork control plane
+Wants=network-online.target
+After=network-online.target ipars-signal.service ipars-stun.service ipars-relay.service
+BindsTo=ipars-signal.service ipars-stun.service ipars-relay.service
+PartOf=ipars-public-node.target
+
+[Service]
+Type=simple
+User=ipars
+Group=ipars
+EnvironmentFile=/etc/ipars/public-node.env
+ExecStart=/opt/ipars/bin/iparsd control-plane
+Restart=always
+RestartSec=3s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=ipars-public-node.target

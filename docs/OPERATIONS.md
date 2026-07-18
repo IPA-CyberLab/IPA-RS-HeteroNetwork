@@ -33,6 +33,29 @@ STUN HTTP metrics require another distinct token through `iparsd stun --operator
 
 Signal must be able to reach at least one control-plane API to authenticate node registrations. Configure repeated `iparsd signal --control-plane-url http://control-plane-a:8443 --control-plane-url http://control-plane-b:8443` values, or the comma-delimited `HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS` environment variable. The default authenticated-membership TTL is 90 seconds; agents refresh every 30 seconds. Tune it with `--node-auth-ttl-seconds` or `HETERONETWORK_SIGNAL_NODE_AUTH_TTL_SECONDS` between 1 and 3600 seconds, keeping it above the refresh interval and consistent across redundant Signal instances.
 
+## Deploy Active-Active Public Nodes
+
+Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. Keep the issuer private key offline; public nodes need only the public key.
+
+The four local services form one advertised failure domain. The packaged Control Plane unit is bound to Signal, STUN, and Relay, so stopping or losing any of them stops the local lease renewal. A failed instance disappears from `/v1/admin/services` after `HETERONETWORK_SERVICE_LEASE_TTL_SECONDS`. Use a managed HA PostgreSQL service or a quorum deployment outside the two application failure domains; a single database on either public host makes whole-host failover asymmetric.
+
+Mint join tokens from the active directory instead of manually copying endpoint lists:
+
+```bash
+ipars token create \
+  --service-directory-url https://public-a.example:8443 \
+  --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token \
+  --issuer-private-key-path ./issuer.key \
+  --issuer-key-id root \
+  --allowed-route 100.64.0.0/10 \
+  --allow-relay \
+  --unlimited-uses
+```
+
+The command requires two active endpoints for Control Plane, Signal, and STUN, and two Relay endpoints when `--allow-relay` is present. `--allow-degraded-service-directory` exists for deliberate disaster recovery, not routine provisioning. Agents persist the directory learned from registration, heartbeat, and peer-map responses, prefer those active entries on every later loop, and retain signed token entries as fallback seeds.
+
+Before declaring failover ready, verify both public APIs report two active instances and `ipars_control_plane_ha_ready 1`. Stop `ipars-public-node.target` on one host, wait one lease TTL, and verify the survivor reports one instance, existing WireGuard traffic continues, and a fresh Agent can register using the previously minted HA token. Restart the target and require HA readiness to return to `1`.
+
 Revoke a join token with the same trusted issuer key family used to mint it:
 
 ```bash

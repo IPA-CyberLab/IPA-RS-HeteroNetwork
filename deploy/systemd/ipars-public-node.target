@@ -1,0 +1,7 @@
+[Unit]
+Description=HeteroNetwork public node
+Wants=ipars-signal.service ipars-stun.service ipars-relay.service ipars-control-plane.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

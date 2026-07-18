@@ -21,16 +21,15 @@ use aya::{Ebpf, EbpfLoader};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ipars_agent::{
-    preferred_peer_local_udp_candidate, AgentError, AgentNodeState, AgentRuntime,
-    BoringTunWireGuardBackend, CommandWireGuardPeerTelemetrySource, FileAgentStateStore,
-    KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner,
-    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
-    PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig,
-    PendingDirectPathProbe, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
-    TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder,
-    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
-    WireGuardPeerInventorySource, WireGuardPeerTelemetry, WireGuardPeerTelemetrySource,
-    DEFAULT_PEER_PROBE_PORT,
+    preferred_peer_local_udp_candidate, AgentError, AgentRuntime, BoringTunWireGuardBackend,
+    CommandWireGuardPeerTelemetrySource, FileAgentStateStore, KernelWireGuardBackend,
+    KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner, LinuxWireGuardBackend,
+    MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier,
+    PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig, PendingDirectPathProbe,
+    RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner,
+    UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder, UdpRelayFrameForwarder,
+    UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerInventorySource,
+    WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{router as agent_router, AgentHttpState};
 use ipars_control_plane::{
@@ -94,11 +93,11 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_TIME_WAIT, PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, http_url_is_usable_endpoint, AclRule, BootstrapEndpoint,
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId,
-    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
-    PathState, RelayCapability, Route, SignedJoinToken, TokenLedgerMetrics, TransportProtocol,
-    VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, validate_join_token_bootstrap_endpoints,
+    AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
+    HealthState, KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
+    PathRecord, PathScore, PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken,
+    TokenLedgerMetrics, TransportProtocol, VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
@@ -244,7 +243,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    ControlPlane(ControlPlaneArgs),
+    ControlPlane(Box<ControlPlaneArgs>),
     Signal(SignalArgs),
     Stun(StunArgs),
     Relay(RelayArgs),
@@ -395,6 +394,8 @@ struct ControlPlaneArgs {
         default_value = "heteronetwork-web"
     )]
     web_oidc_client_id: String,
+    #[arg(long, env = "HETERONETWORK_WEB_PUBLIC_URL")]
+    web_public_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
     web_oidc_auth_base_url: Option<String>,
     #[arg(
@@ -427,6 +428,28 @@ struct ControlPlaneArgs {
     path_state_ttl_seconds: u64,
     #[arg(long, env = "HETERONETWORK_DATABASE_URL")]
     database_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_SERVICE_INSTANCE_ID")]
+    service_instance_id: Option<String>,
+    #[arg(long, env = "HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL")]
+    advertise_control_plane_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_ADVERTISE_SIGNAL_URL")]
+    advertise_signal_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_ADVERTISE_STUN_URL")]
+    advertise_stun_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_ADVERTISE_RELAY_URL")]
+    advertise_relay_url: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_SERVICE_LEASE_TTL_SECONDS",
+        default_value_t = 30
+    )]
+    service_lease_ttl_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_SERVICE_LEASE_RENEW_INTERVAL_SECONDS",
+        default_value_t = 10
+    )]
+    service_lease_renew_interval_seconds: u64,
     #[arg(long, env = "HETERONETWORK_ISSUER_NODE_ID")]
     issuer_node_id: String,
     #[arg(long, env = "HETERONETWORK_ISSUER_KEY_ID")]
@@ -4127,7 +4150,7 @@ async fn main() -> anyhow::Result<()> {
     );
     match cli.command {
         Command::ControlPlane(args) => {
-            run_control_plane(args, otel_metrics_enabled, otel_metrics_interval).await
+            run_control_plane(*args, otel_metrics_enabled, otel_metrics_interval).await
         }
         Command::Signal(args) => {
             run_signal(args, otel_metrics_enabled, otel_metrics_interval).await
@@ -4201,22 +4224,29 @@ where
     L: TokenLedger + 'static,
 {
     validate_control_plane_runtime_config(&args)?;
+    let service_lease = control_plane_service_lease_config(&args)?;
     let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
     let web_ui_auth = if args.web_ui_enabled {
         let provider = WebAuthProvider::parse(&args.web_auth_provider)
             .map_err(anyhow::Error::msg)
             .context("--web-auth-provider")?;
-        Some(
-            WebUiAuthConfig::new(
-                provider,
-                args.web_oidc_issuer_url.clone(),
-                args.web_oidc_client_id.clone(),
-                args.web_oidc_auth_base_url.clone(),
-                args.web_oidc_scopes.clone(),
-            )
-            .map_err(anyhow::Error::msg)
-            .context("web UI OIDC configuration")?,
+        let auth = WebUiAuthConfig::new(
+            provider,
+            args.web_oidc_issuer_url.clone(),
+            args.web_oidc_client_id.clone(),
+            args.web_oidc_auth_base_url.clone(),
+            args.web_oidc_scopes.clone(),
         )
+        .map_err(anyhow::Error::msg)
+        .context("web UI OIDC configuration")?;
+        let auth = match args.web_public_url.clone() {
+            Some(public_url) => auth
+                .with_public_url(public_url)
+                .map_err(anyhow::Error::msg)
+                .context("web UI public URL configuration")?,
+            None => auth,
+        };
+        Some(auth)
     } else {
         None
     };
@@ -4227,6 +4257,18 @@ where
     config.cluster_policy.path_state_ttl_seconds = args.path_state_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
+    let service_lease_task = if let Some(service_lease) = service_lease {
+        plane
+            .advertise_service_instance(service_lease.instance())
+            .await
+            .context("failed to publish initial HA service lease")?;
+        Some(start_control_plane_service_lease(
+            plane.clone(),
+            service_lease,
+        ))
+    } else {
+        None
+    };
     let mut key_ring = IssuerKeyRing::default();
     key_ring.insert(
         NodeId::from_string(args.issuer_node_id),
@@ -4260,10 +4302,104 @@ where
         http_state = http_state.enable_web_ui(auth);
     }
     let result = serve_router(args.listen, router(http_state)).await;
+    if let Some(task) = service_lease_task {
+        task.abort();
+    }
     if let Some(task) = otel_metrics_task {
         task.abort();
     }
     result
+}
+
+#[derive(Debug, Clone)]
+struct ControlPlaneServiceLeaseConfig {
+    cluster_id: ClusterId,
+    instance_id: String,
+    endpoints: Vec<BootstrapEndpoint>,
+    ttl: Duration,
+    renew_interval: Duration,
+}
+
+impl ControlPlaneServiceLeaseConfig {
+    fn instance(&self) -> ServiceInstance {
+        let updated_at = chrono::Utc::now();
+        ServiceInstance {
+            cluster_id: self.cluster_id.clone(),
+            instance_id: self.instance_id.clone(),
+            endpoints: self.endpoints.clone(),
+            lease_expires_at: updated_at
+                + chrono::Duration::from_std(self.ttl)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(30)),
+            updated_at,
+        }
+    }
+}
+
+fn control_plane_service_lease_config(
+    args: &ControlPlaneArgs,
+) -> anyhow::Result<Option<ControlPlaneServiceLeaseConfig>> {
+    let endpoints = [
+        (
+            BootstrapEndpointKind::ControlPlane,
+            args.advertise_control_plane_url.as_ref(),
+        ),
+        (
+            BootstrapEndpointKind::Signal,
+            args.advertise_signal_url.as_ref(),
+        ),
+        (
+            BootstrapEndpointKind::Stun,
+            args.advertise_stun_url.as_ref(),
+        ),
+        (
+            BootstrapEndpointKind::Relay,
+            args.advertise_relay_url.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(kind, url)| {
+        url.map(|url| BootstrapEndpoint {
+            kind,
+            url: url.clone(),
+        })
+    })
+    .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+    validate_join_token_bootstrap_endpoints(&endpoints)
+        .context("invalid advertised HA service endpoint")?;
+    Ok(Some(ControlPlaneServiceLeaseConfig {
+        cluster_id: ClusterId::from_string(args.cluster_id.clone()),
+        instance_id: args
+            .service_instance_id
+            .clone()
+            .context("--service-instance-id is required when advertising HA services")?,
+        endpoints,
+        ttl: Duration::from_secs(args.service_lease_ttl_seconds),
+        renew_interval: Duration::from_secs(args.service_lease_renew_interval_seconds),
+    }))
+}
+
+fn start_control_plane_service_lease<S>(
+    plane: Arc<ControlPlane<S>>,
+    config: ControlPlaneServiceLeaseConfig,
+) -> tokio::task::JoinHandle<()>
+where
+    S: ControlPlaneStore + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(config.renew_interval).await;
+            if let Err(error) = plane.advertise_service_instance(config.instance()).await {
+                tracing::error!(
+                    %error,
+                    instance_id = config.instance_id,
+                    "failed to renew HA service lease"
+                );
+            }
+        }
+    })
 }
 
 fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Result<()> {
@@ -4283,6 +4419,26 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
         "--endpoint-candidate-ttl-seconds",
     )?;
     validate_positive_seconds(args.path_state_ttl_seconds, "--path-state-ttl-seconds")?;
+    validate_positive_seconds(
+        args.service_lease_ttl_seconds,
+        "--service-lease-ttl-seconds",
+    )?;
+    validate_positive_seconds(
+        args.service_lease_renew_interval_seconds,
+        "--service-lease-renew-interval-seconds",
+    )?;
+    anyhow::ensure!(
+        args.service_lease_ttl_seconds <= 300,
+        "--service-lease-ttl-seconds must be at most 300"
+    );
+    anyhow::ensure!(
+        args.service_lease_renew_interval_seconds < args.service_lease_ttl_seconds,
+        "--service-lease-renew-interval-seconds must be less than --service-lease-ttl-seconds"
+    );
+    if let Some(instance_id) = args.service_instance_id.as_deref() {
+        validate_daemon_identifier(instance_id, "--service-instance-id")?;
+    }
+    let _ = control_plane_service_lease_config(args)?;
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
         validate_api_bearer_token(token, "--operator-api-bearer-token")?;
     }
@@ -4908,6 +5064,9 @@ fn start_stun_otel_metrics_export(
 struct ControlPlaneOtelMetrics {
     nodes: Gauge<u64>,
     relay_candidates: Gauge<u64>,
+    ha_ready: Gauge<u64>,
+    service_instances: Gauge<u64>,
+    service_endpoints: Gauge<u64>,
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
     stale_paths: Gauge<u64>,
@@ -4943,6 +5102,20 @@ impl ControlPlaneOtelMetrics {
             relay_candidates: meter
                 .u64_gauge("ipars.control_plane.relay_candidates")
                 .with_description("Relay-capable nodes accepted into relay maps.")
+                .build(),
+            ha_ready: meter
+                .u64_gauge("ipars.control_plane.ha.ready")
+                .with_description(
+                    "One when at least two distinct control-plane, signal, STUN, and relay endpoints have active leases.",
+                )
+                .build(),
+            service_instances: meter
+                .u64_gauge("ipars.control_plane.service_instances")
+                .with_description("Public service instances with active leases.")
+                .build(),
+            service_endpoints: meter
+                .u64_gauge("ipars.control_plane.service_endpoints")
+                .with_description("Distinct active public service endpoints by service kind.")
                 .build(),
             stale_endpoint_candidates: meter
                 .u64_gauge("ipars.control_plane.stale_endpoint_candidates")
@@ -5055,6 +5228,22 @@ impl ControlPlaneOtelMetrics {
         self.nodes.record(metrics.node_count as u64, &cluster_attrs);
         self.relay_candidates
             .record(metrics.relay_candidate_count as u64, &cluster_attrs);
+        self.ha_ready
+            .record(u64::from(metrics.ha_ready), &cluster_attrs);
+        self.service_instances
+            .record(metrics.active_service_instance_count as u64, &cluster_attrs);
+        for (service, count) in [
+            ("control_plane", metrics.active_control_plane_count),
+            ("signal", metrics.active_signal_count),
+            ("stun", metrics.active_stun_count),
+            ("relay", metrics.active_relay_count),
+        ] {
+            let attrs = [
+                KeyValue::new("cluster_id", cluster_id.clone()),
+                KeyValue::new("service", service),
+            ];
+            self.service_endpoints.record(count as u64, &attrs);
+        }
         self.stale_endpoint_candidates.record(
             metrics.stale_endpoint_candidate_count as u64,
             &cluster_attrs,
@@ -7528,6 +7717,9 @@ async fn run_agent(
         .as_ref()
         .map(|reporter| reporter.advertised.clone());
     let join_token = agent_join_token(&args)?;
+    if let Some(token) = join_token.as_ref() {
+        persist_agent_seed_directory(runtime.as_ref(), &store, &token.claims.bootstrap_endpoints)?;
+    }
     let stun_servers = agent_stun_servers_with_persisted(
         &args,
         join_token.as_ref(),
@@ -7563,6 +7755,11 @@ async fn run_agent(
         .context("failed to register agent with control plane")?;
         let response = registration.response;
         registered_control_plane_base = Some(registration.control_plane_url);
+        persist_agent_service_directory(
+            runtime.as_ref(),
+            &store,
+            &response.peer_map.bootstrap_endpoints,
+        )?;
         runtime
             .replace_local_advertised_routes(response.node.routes.clone())
             .await
@@ -7600,12 +7797,6 @@ async fn run_agent(
         if join_token.is_some() && persisted_state.registered_node.as_ref() != Some(node) {
             persisted_state.registered_node = Some(node.clone());
             state_changed = true;
-        }
-        if let Some(token) = join_token.as_ref() {
-            if persisted_state.bootstrap_endpoints != token.claims.bootstrap_endpoints {
-                persisted_state.bootstrap_endpoints = token.claims.bootstrap_endpoints.clone();
-                state_changed = true;
-            }
         }
         if state_changed {
             persisted_state.updated_at = chrono::Utc::now();
@@ -7648,18 +7839,19 @@ async fn run_agent(
     if !args.disable_heartbeat && !control_plane_bases.is_empty() {
         let heartbeat_route_reporter =
             heartbeat_route_reporter(&args, runtime.state().node_id.clone());
-        background_tasks.push(start_heartbeat_reporting(
-            runtime.clone(),
-            http_client.clone(),
-            runtime
+        background_tasks.push(start_heartbeat_reporting(HeartbeatReporterConfig {
+            runtime: runtime.clone(),
+            state_store: store.clone(),
+            client: http_client.clone(),
+            identity: runtime
                 .state()
                 .identity_key_pair()
                 .context("failed to load agent identity key for heartbeat signing")?,
-            control_plane_bases.clone(),
-            Duration::from_secs(args.heartbeat_interval_seconds),
-            relay_capability_reporter.clone(),
-            heartbeat_route_reporter,
-        ));
+            control_plane_urls: control_plane_bases.clone(),
+            interval: Duration::from_secs(args.heartbeat_interval_seconds),
+            relay_capability_reporter: relay_capability_reporter.clone(),
+            route_reporter: heartbeat_route_reporter,
+        }));
     }
     let peer_map_handle = if args.apply_peer_map {
         anyhow::ensure!(
@@ -11121,7 +11313,8 @@ where
         runtime.state().node_id.clone(),
         HttpPeerMapSource::new(
             control_plane_urls,
-            runtime.state().clone(),
+            runtime.clone(),
+            FileAgentStateStore::new(args.state_path.clone()),
             agent_http_client(args)?,
         ),
         sink,
@@ -11673,27 +11866,15 @@ async fn register_agent(
     ))
 }
 
-fn start_heartbeat_reporting(
+struct HeartbeatReporterConfig {
     runtime: Arc<AgentRuntime>,
+    state_store: FileAgentStateStore,
     client: reqwest::Client,
     identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
     route_reporter: Option<HeartbeatRouteReporter>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        run_heartbeat_loop(
-            runtime,
-            client,
-            identity,
-            control_plane_urls,
-            interval,
-            relay_capability_reporter,
-            route_reporter,
-        )
-        .await;
-    })
 }
 
 fn start_nat_discovery(
@@ -11724,15 +11905,21 @@ fn start_nat_discovery(
     })
 }
 
-async fn run_heartbeat_loop(
-    runtime: Arc<AgentRuntime>,
-    client: reqwest::Client,
-    identity: IdentityKeyPair,
-    control_plane_urls: Vec<String>,
-    interval: Duration,
-    relay_capability_reporter: Option<RelayCapabilityReporter>,
-    route_reporter: Option<HeartbeatRouteReporter>,
-) {
+fn start_heartbeat_reporting(config: HeartbeatReporterConfig) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_heartbeat_loop(config))
+}
+
+async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
+    let HeartbeatReporterConfig {
+        runtime,
+        state_store,
+        client,
+        identity,
+        control_plane_urls,
+        interval,
+        relay_capability_reporter,
+        route_reporter,
+    } = config;
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
@@ -11753,8 +11940,23 @@ async fn run_heartbeat_loop(
                 continue;
             }
         };
-        match send_heartbeat_to_control_planes(&client, &control_plane_urls, request).await {
+        let active_control_plane_urls =
+            match runtime_control_plane_urls(runtime.as_ref(), &control_plane_urls) {
+                Ok(urls) => urls,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to resolve current control-plane directory");
+                    control_plane_urls.clone()
+                }
+            };
+        match send_heartbeat_to_control_planes(&client, &active_control_plane_urls, request).await {
             Ok(response) => {
+                if let Err(error) = persist_agent_service_directory(
+                    runtime.as_ref(),
+                    &state_store,
+                    &response.bootstrap_endpoints,
+                ) {
+                    tracing::warn!(%error, "failed to persist heartbeat service directory");
+                }
                 if response.accepted {
                     if let Some(routes) = refreshed_routes {
                         if let Err(error) = runtime.replace_local_advertised_routes(routes).await {
@@ -11904,7 +12106,16 @@ async fn run_signal_registration_loop(
                 continue;
             }
         };
-        match send_signal_node_upsert_to_signal_services(&client, &signal_urls, request).await {
+        let active_signal_urls = match runtime_signal_urls(runtime.as_ref(), &signal_urls) {
+            Ok(urls) => urls,
+            Err(error) => {
+                tracing::warn!(%error, "failed to resolve current signal directory");
+                signal_urls.clone()
+            }
+        };
+        match send_signal_node_upsert_to_signal_services(&client, &active_signal_urls, request)
+            .await
+        {
             Ok(successes) => tracing::info!(
                 node_id = %node.node_id,
                 signal_services = successes,
@@ -12573,11 +12784,24 @@ async fn run_signal_path_negotiation_loop(
     options: SignalPathNegotiationOptions,
 ) {
     loop {
+        let active_control_plane_urls = runtime_control_plane_urls(
+            runtime.as_ref(),
+            &control_plane_urls,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "failed to resolve current control-plane directory for path negotiation");
+            control_plane_urls.clone()
+        });
+        let active_signal_urls = runtime_signal_urls(runtime.as_ref(), &signal_urls)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to resolve current signal directory for path negotiation");
+                signal_urls.clone()
+            });
         if let Err(error) = negotiate_signal_paths(
             &client,
             runtime.as_ref(),
-            &control_plane_urls,
-            &signal_urls,
+            &active_control_plane_urls,
+            &active_signal_urls,
             &hole_puncher,
             &options,
         )
@@ -16320,19 +16544,22 @@ fn tcp_state_from_conntrack_token(token: &str) -> Option<AgentPacketFlowTcpState
 struct HttpPeerMapSource {
     control_plane_urls: Vec<String>,
     client: reqwest::Client,
-    node_state: AgentNodeState,
+    runtime: Arc<AgentRuntime>,
+    state_store: FileAgentStateStore,
 }
 
 impl HttpPeerMapSource {
     fn new(
         control_plane_urls: Vec<String>,
-        node_state: AgentNodeState,
+        runtime: Arc<AgentRuntime>,
+        state_store: FileAgentStateStore,
         client: reqwest::Client,
     ) -> Self {
         Self {
             control_plane_urls,
             client,
-            node_state,
+            runtime,
+            state_store,
         }
     }
 }
@@ -16340,21 +16567,32 @@ impl HttpPeerMapSource {
 #[async_trait]
 impl PeerMapSource for HttpPeerMapSource {
     async fn fetch_peer_map(&self, node_id: &NodeId) -> Result<PeerMap, AgentError> {
-        if node_id != &self.node_state.node_id {
+        let node_state = self.runtime.state();
+        if node_id != &node_state.node_id {
             return Err(AgentError::ControlPlaneClient(format!(
                 "peer-map query node {node_id} does not match local identity {}",
-                self.node_state.node_id
+                node_state.node_id
             )));
         }
-        let identity = self.node_state.identity_key_pair()?;
-        fetch_peer_map_from_control_planes(
+        let identity = node_state.identity_key_pair()?;
+        let control_plane_urls =
+            runtime_control_plane_urls(self.runtime.as_ref(), &self.control_plane_urls)
+                .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
+        let peer_map = fetch_peer_map_from_control_planes(
             &self.client,
-            &self.control_plane_urls,
+            &control_plane_urls,
             node_id,
             &identity,
         )
         .await
-        .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))
+        .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
+        persist_agent_service_directory(
+            self.runtime.as_ref(),
+            &self.state_store,
+            &peer_map.bootstrap_endpoints,
+        )
+        .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
+        Ok(peer_map)
     }
 }
 
@@ -16490,24 +16728,21 @@ fn agent_control_plane_base_urls_with_persisted(
     registered_url: Option<&str>,
     persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<String>> {
-    if override_url.is_some() {
-        return control_plane_base_urls(token, override_url);
+    if let Some(override_url) = override_url {
+        return normalize_http_base_urls([override_url.to_string()], "control-plane URL");
     }
-
     let mut base_urls = Vec::new();
     if let Some(registered_url) = registered_url {
         base_urls.push(normalize_base_url(registered_url));
     }
+    base_urls.extend(
+        persisted_bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.clone()),
+    );
     if let Some(token) = token {
         base_urls.extend(control_plane_base_urls(Some(token), None)?);
-    }
-    if token.is_none() {
-        base_urls.extend(
-            persisted_bootstrap_endpoints
-                .iter()
-                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
-                .map(|endpoint| endpoint.url.clone()),
-        );
     }
     normalize_http_base_urls(base_urls, "control-plane endpoint")
 }
@@ -16578,6 +16813,69 @@ fn dedupe_urls_preserve_order(base_urls: impl IntoIterator<Item = String>) -> Ve
     deduped
 }
 
+fn persist_agent_service_directory(
+    runtime: &AgentRuntime,
+    store: &FileAgentStateStore,
+    active: &[BootstrapEndpoint],
+) -> anyhow::Result<bool> {
+    let Some(state) = runtime
+        .merge_active_bootstrap_endpoints(active, chrono::Utc::now())
+        .context("failed to merge HA service directory into agent state")?
+    else {
+        return Ok(false);
+    };
+    store
+        .save(&state)
+        .context("failed to persist HA service directory in agent state")?;
+    Ok(true)
+}
+
+fn persist_agent_seed_directory(
+    runtime: &AgentRuntime,
+    store: &FileAgentStateStore,
+    seeds: &[BootstrapEndpoint],
+) -> anyhow::Result<bool> {
+    let Some(state) = runtime
+        .replace_seed_bootstrap_endpoints(seeds, chrono::Utc::now())
+        .context("failed to replace signed Agent seed endpoints")?
+    else {
+        return Ok(false);
+    };
+    store
+        .save(&state)
+        .context("failed to persist signed Agent seed endpoints")?;
+    Ok(true)
+}
+
+fn runtime_control_plane_urls(
+    runtime: &AgentRuntime,
+    fallback: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let state = runtime.state();
+    normalize_http_base_urls(
+        state
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.clone())
+            .chain(fallback.iter().cloned()),
+        "runtime control-plane endpoint",
+    )
+}
+
+fn runtime_signal_urls(runtime: &AgentRuntime, fallback: &[String]) -> anyhow::Result<Vec<String>> {
+    let state = runtime.state();
+    normalize_http_base_urls(
+        state
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
+            .map(|endpoint| endpoint.url.clone())
+            .chain(fallback.iter().cloned()),
+        "runtime signal endpoint",
+    )
+}
+
 #[cfg(test)]
 fn signal_base_url(
     token: Option<&SignedJoinToken>,
@@ -16602,39 +16900,30 @@ fn signal_base_urls_with_persisted(
     override_url: Option<&str>,
     persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<String>> {
-    if override_url.is_none() {
-        if let Some(token) = token {
-            token
-                .validate_shape()
-                .context("agent signed join token validation failed")?;
-        }
+    if let Some(override_url) = override_url {
+        return normalize_http_base_urls([override_url.to_string()], "signal URL");
     }
-    let (base_urls, name) = if let Some(url) = override_url {
-        (vec![url.to_string()], "signal URL")
-    } else if let Some(token) = token {
-        (
+    if let Some(token) = token {
+        token
+            .validate_shape()
+            .context("agent signed join token validation failed")?;
+    }
+    let mut base_urls = persisted_bootstrap_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
+        .map(|endpoint| endpoint.url.clone())
+        .collect::<Vec<_>>();
+    if let Some(token) = token {
+        base_urls.extend(
             token
                 .claims
                 .bootstrap_endpoints
                 .iter()
                 .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
-                .map(|endpoint| endpoint.url.clone())
-                .collect::<Vec<_>>(),
-            "signal bootstrap endpoint",
-        )
-    } else if !persisted_bootstrap_endpoints.is_empty() {
-        (
-            persisted_bootstrap_endpoints
-                .iter()
-                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
-                .map(|endpoint| endpoint.url.clone())
-                .collect::<Vec<_>>(),
-            "persisted signal bootstrap endpoint",
-        )
-    } else {
-        anyhow::bail!("signal URL is required and no signal bootstrap exists");
-    };
-    let base_urls = normalize_http_base_urls(base_urls, name)?;
+                .map(|endpoint| endpoint.url.clone()),
+        );
+    }
+    let base_urls = normalize_http_base_urls(base_urls, "signal endpoint")?;
     if base_urls.is_empty() {
         anyhow::bail!("signal URL is required and no signal bootstrap exists");
     }
@@ -16673,17 +16962,27 @@ async fn agent_stun_servers_with_persisted(
             .validate_shape()
             .context("agent signed join token validation failed")?;
     }
-    let bootstrap_endpoints = token
+    let token_bootstrap_endpoints = token
         .map(|token| token.claims.bootstrap_endpoints.as_slice())
-        .unwrap_or(persisted_bootstrap_endpoints);
-    for endpoint in bootstrap_endpoints
+        .unwrap_or_default();
+    let mut bootstrap_failures = Vec::new();
+    for endpoint in persisted_bootstrap_endpoints
         .iter()
+        .chain(token_bootstrap_endpoints.iter())
         .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
     {
         if servers.len() == MAX_AGENT_STUN_SERVERS {
             break;
         }
-        for addr in resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await? {
+        let resolved =
+            match resolve_udp_bootstrap_socket_addrs(&endpoint.url, "STUN bootstrap").await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    bootstrap_failures.push(format!("{}: {error:#}", endpoint.url));
+                    continue;
+                }
+            };
+        for addr in resolved {
             if !servers.contains(&addr) {
                 servers.push(addr);
                 if servers.len() == MAX_AGENT_STUN_SERVERS {
@@ -16691,6 +16990,15 @@ async fn agent_stun_servers_with_persisted(
                 }
             }
         }
+    }
+    if servers.is_empty() && !bootstrap_failures.is_empty() {
+        anyhow::bail!(
+            "all STUN bootstrap endpoints failed: {}",
+            bootstrap_failures.join("; ")
+        );
+    }
+    for failure in bootstrap_failures {
+        tracing::warn!(%failure, "ignored unavailable STUN bootstrap endpoint");
     }
     Ok(servers)
 }
@@ -16969,6 +17277,7 @@ mod tests {
         let peer_map = || PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
 
@@ -17359,6 +17668,7 @@ mod tests {
         let expected = PeerMap {
             cluster_id: ClusterId::from_string("cluster-timeout-failover"),
             peers: Vec::new(),
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let response = expected.clone();
@@ -17390,6 +17700,70 @@ mod tests {
         );
         stalled_task.abort();
         available_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_fails_over_and_persists_discovered_ha_directory() -> anyhow::Result<()> {
+        let discovered = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://public-b.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://public-b.example:9443".to_string(),
+            },
+        ];
+        let response = HeartbeatResponse {
+            accepted: true,
+            policy_version: 1,
+            peer_delta_available: false,
+            bootstrap_endpoints: discovered.clone(),
+        };
+        let (available_url, available_task) = spawn_test_http_service(Router::new().route(
+            "/v1/heartbeat",
+            axum::routing::post(move || {
+                let response = response.clone();
+                async move { axum::Json(response) }
+            }),
+        ))
+        .await?;
+        let unavailable_url = unused_http_base_url().await?;
+        let state = AgentNodeState::generate(Utc::now());
+        let identity = state.identity_key_pair()?;
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let request = heartbeat_request(&runtime, &identity, None, None).await?;
+
+        let received = send_heartbeat_to_control_planes(
+            &reqwest::Client::new(),
+            &[unavailable_url.clone(), available_url],
+            request,
+        )
+        .await?;
+        assert_eq!(received.bootstrap_endpoints, discovered);
+
+        let dir = unique_test_dir("heartbeat-ha-directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let store = FileAgentStateStore::new(dir.join("agent.json"));
+        assert!(persist_agent_service_directory(
+            &runtime,
+            &store,
+            &received.bootstrap_endpoints,
+        )?);
+        assert_eq!(
+            runtime_control_plane_urls(&runtime, std::slice::from_ref(&unavailable_url))?,
+            vec!["https://public-b.example:8443".to_string(), unavailable_url,]
+        );
+        assert_eq!(store.load()?.bootstrap_endpoints, discovered);
+
+        available_task.abort();
+        let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
 
@@ -17505,6 +17879,12 @@ mod tests {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_count: 2,
             relay_candidate_count: 1,
+            active_service_instance_count: 2,
+            active_control_plane_count: 2,
+            active_signal_count: 2,
+            active_stun_count: 2,
+            active_relay_count: 2,
+            ha_ready: true,
             healthy_node_count: 1,
             degraded_node_count: 1,
             unhealthy_node_count: 0,
@@ -31121,6 +31501,7 @@ exec sleep 60
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let (control_plane_base, control_plane_task) =
@@ -31236,6 +31617,7 @@ exec sleep 60
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let (control_plane_base, control_plane_task) =
@@ -31363,6 +31745,7 @@ exec sleep 60
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let (control_plane_base, control_plane_task) =
@@ -31493,6 +31876,7 @@ exec sleep 60
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let (control_plane_base, control_plane_task) =
@@ -31656,6 +32040,7 @@ exec sleep 60
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let (control_plane_base, control_plane_task) =
@@ -31756,6 +32141,7 @@ exec sleep 60
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let (control_plane_base, control_plane_task) =
@@ -32057,6 +32443,7 @@ exec sleep 60
             PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![active, idle, stale, pinned, route_provider],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             },
         )
@@ -32414,6 +32801,7 @@ exec sleep 60
             .record_peer_map_snapshot(PeerMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: now,
             })
             .await;
@@ -33566,6 +33954,56 @@ exec sleep 60
         assert_eq!(
             agent_stun_servers_with_persisted(&args, None, &persisted).await?,
             vec![SocketAddr::from(([203, 0, 113, 10], 3478))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_prioritize_discovered_directory_over_original_token(
+    ) -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://203.0.113.10:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }]);
+        let persisted = vec![BootstrapEndpoint {
+            url: "udp://203.0.113.11:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }];
+
+        assert_eq!(
+            agent_stun_servers_with_persisted(&args, Some(&token), &persisted).await?,
+            vec![
+                SocketAddr::from(([203, 0, 113, 11], 3478)),
+                SocketAddr::from(([203, 0, 113, 10], 3478)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_skip_unresolvable_ha_member() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "udp://stopped-public-node.invalid:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.11:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+        ]);
+
+        assert_eq!(
+            agent_stun_servers(&args, Some(&token)).await?,
+            vec![SocketAddr::from(([203, 0, 113, 11], 3478))]
         );
         Ok(())
     }

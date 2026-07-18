@@ -157,6 +157,12 @@ pub struct BootstrapEndpoint {
     pub kind: BootstrapEndpointKind,
 }
 
+pub fn canonical_bootstrap_endpoint_url(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.as_str().trim_end_matches('/').to_string())
+}
+
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS: usize = 32;
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND: usize = 8;
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES: usize = 2048;
@@ -177,6 +183,23 @@ pub enum BootstrapEndpointKind {
     Signal,
     Stun,
     Relay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceInstance {
+    pub cluster_id: ClusterId,
+    pub instance_id: String,
+    pub endpoints: Vec<BootstrapEndpoint>,
+    pub lease_expires_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceDirectory {
+    pub cluster_id: ClusterId,
+    pub instances: Vec<ServiceInstance>,
+    pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
+    pub generated_at: DateTime<Utc>,
 }
 
 impl Display for BootstrapEndpointKind {
@@ -310,7 +333,11 @@ pub fn validate_join_token_bootstrap_endpoints(
             )));
         }
 
-        let normalized = parsed.as_str().trim_end_matches('/').to_string();
+        let normalized = canonical_bootstrap_endpoint_url(&endpoint.url).ok_or_else(|| {
+            JoinTokenBootstrapValidationError::new(format!(
+                "endpoint {index} is not an absolute URL"
+            ))
+        })?;
         if !seen.insert((endpoint.kind, normalized)) {
             return Err(JoinTokenBootstrapValidationError::new(format!(
                 "endpoint {index} duplicates an earlier {} endpoint",
@@ -1683,6 +1710,8 @@ pub mod api {
     pub struct PeerMap {
         pub cluster_id: ClusterId,
         pub peers: Vec<NodeRecord>,
+        #[serde(default)]
+        pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -1928,6 +1957,8 @@ pub mod api {
         pub accepted: bool,
         pub policy_version: u64,
         pub peer_delta_available: bool,
+        #[serde(default)]
+        pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1973,6 +2004,18 @@ pub mod api {
         pub cluster_id: ClusterId,
         pub node_count: usize,
         pub relay_candidate_count: usize,
+        #[serde(default)]
+        pub active_service_instance_count: usize,
+        #[serde(default)]
+        pub active_control_plane_count: usize,
+        #[serde(default)]
+        pub active_signal_count: usize,
+        #[serde(default)]
+        pub active_stun_count: usize,
+        #[serde(default)]
+        pub active_relay_count: usize,
+        #[serde(default)]
+        pub ha_ready: bool,
         pub healthy_node_count: usize,
         pub degraded_node_count: usize,
         pub unhealthy_node_count: usize,
@@ -2059,6 +2102,7 @@ pub mod api {
         pub nodes: Vec<ControlPlaneNodeOverview>,
         pub paths: Vec<PathRecord>,
         pub nat_discovery: ControlPlaneNatDiscoveryOverview,
+        pub service_directory: ServiceDirectory,
         pub generated_at: DateTime<Utc>,
     }
 
