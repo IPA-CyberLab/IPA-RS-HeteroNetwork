@@ -7,8 +7,8 @@ use ipars_control_plane::{
 };
 use ipars_types::{
     ClusterId, EndpointCandidate, NatClassification, NodeHealth, NodeId, NodeRecord, PathRecord,
-    RelayCapability, Route, TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome,
-    TokenRevocationRecord, TokenStatus, VpnIp,
+    RelayCapability, Route, ServiceInstance, TokenLedgerMetrics, TokenLedgerRecord,
+    TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
 
@@ -108,6 +108,19 @@ impl SqliteControlPlaneStore {
                     nonce TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     PRIMARY KEY (cluster_id, nonce)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS service_instances (
+                    cluster_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (cluster_id, instance_id)
                 );
                 "#,
             )
@@ -514,6 +527,43 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         .map(row_to_path)
         .collect()
     }
+
+    async fn upsert_service_instance(
+        &self,
+        instance: ServiceInstance,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO service_instances (cluster_id, instance_id, record_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(cluster_id, instance_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(instance.cluster_id.as_str())
+        .bind(instance.instance_id.as_str())
+        .bind(serde_json::to_string(&instance).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn list_service_instances(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Vec<ServiceInstance>, ControlPlaneError> {
+        sqlx::query(
+            "SELECT record_json FROM service_instances WHERE cluster_id = ?1 ORDER BY instance_id",
+        )
+        .bind(cluster_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sql_error)?
+        .into_iter()
+        .map(row_to_service_instance)
+        .collect()
+    }
 }
 
 #[async_trait]
@@ -828,6 +878,19 @@ impl PostgresControlPlaneStore {
                     nonce TEXT NOT NULL,
                     record_json JSONB NOT NULL,
                     PRIMARY KEY (cluster_id, nonce)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS service_instances (
+                    cluster_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    record_json JSONB NOT NULL,
+                    PRIMARY KEY (cluster_id, instance_id)
                 );
                 "#,
             )
@@ -1230,6 +1293,43 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .map(pg_row_to_path)
         .collect()
     }
+
+    async fn upsert_service_instance(
+        &self,
+        instance: ServiceInstance,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO service_instances (cluster_id, instance_id, record_json)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(cluster_id, instance_id)
+            DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(instance.cluster_id.as_str())
+        .bind(instance.instance_id.as_str())
+        .bind(serde_json::to_value(&instance).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn list_service_instances(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Vec<ServiceInstance>, ControlPlaneError> {
+        sqlx::query(
+            "SELECT record_json FROM service_instances WHERE cluster_id = $1 ORDER BY instance_id",
+        )
+        .bind(cluster_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sql_error)?
+        .into_iter()
+        .map(pg_row_to_service_instance)
+        .collect()
+    }
 }
 
 #[async_trait]
@@ -1479,6 +1579,13 @@ fn row_to_revocation(
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_service_instance(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ServiceInstance, ControlPlaneError> {
+    let record_json: String = row.get("record_json");
+    serde_json::from_str(&record_json).map_err(json_error)
+}
+
 fn pg_row_to_node(row: sqlx::postgres::PgRow) -> Result<NodeRecord, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
@@ -1509,6 +1616,13 @@ fn pg_row_to_token(row: sqlx::postgres::PgRow) -> Result<TokenLedgerRecord, Cont
 fn pg_row_to_revocation(
     row: sqlx::postgres::PgRow,
 ) -> Result<TokenRevocationRecord, ControlPlaneError> {
+    let record_json: serde_json::Value = row.get("record_json");
+    serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_service_instance(
+    row: sqlx::postgres::PgRow,
+) -> Result<ServiceInstance, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
 }
@@ -1606,13 +1720,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use ipars_control_plane::{ControlPlaneStore, TokenAdmission};
     use ipars_types::{
-        CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, HealthState,
-        JoinTokenClaims, KeyId, NatClassification, NatProbeObservation, NodeHealth, NodeRecord,
-        PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, RelayCapability, Role, Tag,
-        TokenPolicy, VpnIp,
+        BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
+        EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
+        NatProbeObservation, NodeHealth, NodeRecord, PathMetrics, PathRecord, PathScore, PathState,
+        PeerPathKey, RelayCapability, Role, ServiceInstance, Tag, TokenPolicy, VpnIp,
     };
 
     use super::*;
@@ -1929,6 +2043,56 @@ mod tests {
         assert_eq!(token_metrics.active_count, 0);
         assert_eq!(token_metrics.exhausted_count, 1);
         assert_eq!(token_metrics.use_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_service_directory_is_shared_across_store_instances(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("service-directory");
+        let cluster_id = ClusterId::from_string("cluster-ha");
+        let now = Utc::now();
+        let first = ServiceInstance {
+            cluster_id: cluster_id.clone(),
+            instance_id: "public-a".to_string(),
+            endpoints: vec![BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://public-a.example:8443".to_string(),
+            }],
+            lease_expires_at: now + Duration::seconds(30),
+            updated_at: now,
+        };
+        let store_a = SqliteControlPlaneStore::connect(&database_url).await?;
+        let store_b = SqliteControlPlaneStore::connect(&database_url).await?;
+
+        store_a.upsert_service_instance(first.clone()).await?;
+        assert_eq!(
+            store_b.list_service_instances(&cluster_id).await?,
+            vec![first.clone()]
+        );
+
+        let renewed = ServiceInstance {
+            endpoints: vec![BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://public-a.example:9443".to_string(),
+            }],
+            updated_at: now + Duration::seconds(1),
+            lease_expires_at: now + Duration::seconds(31),
+            ..first
+        };
+        store_b.upsert_service_instance(renewed.clone()).await?;
+        assert_eq!(
+            store_a.list_service_instances(&cluster_id).await?,
+            vec![renewed]
+        );
+        assert!(store_a
+            .list_service_instances(&ClusterId::from_string("other-cluster"))
+            .await?
+            .is_empty());
+
+        drop(store_a);
+        drop(store_b);
+        let _ = std::fs::remove_file(database_path);
         Ok(())
     }
 

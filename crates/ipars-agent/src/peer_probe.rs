@@ -635,6 +635,7 @@ mod tests {
             .record_peer_map_snapshot(PeerMap {
                 cluster_id: ClusterId::new(),
                 peers: vec![peer_record(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))],
+                bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
             .await;

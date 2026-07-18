@@ -2909,6 +2909,27 @@ tbody tr.selected {
   background: var(--surface-raised);
 }
 
+.service-matrix {
+  min-width: 1120px;
+}
+
+.service-endpoint {
+  display: grid;
+  gap: 7px;
+  max-width: 230px;
+  min-width: 150px;
+}
+
+.service-endpoint code {
+  color: var(--muted);
+  display: block;
+  font-size: 11px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .table-primary {
   color: var(--text);
   gap: 10px;

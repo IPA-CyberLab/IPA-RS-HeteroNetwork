@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::Utc;
 use ipars_control_plane::{
     ControlPlane, ControlPlaneError, ControlPlaneJoinService, ControlPlaneStore, TokenLedger,
@@ -21,13 +24,22 @@ use ipars_types::api::{
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{ClusterPolicy, NodeId, PathRecord, PathState, TokenLedgerMetrics};
+use rand_core::{OsRng, RngCore};
+use reqwest::redirect::Policy as RedirectPolicy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use url::Url;
 
 const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
+const MAX_WEB_OIDC_LOGIN_STATES: usize = 1024;
+const WEB_OIDC_LOGIN_STATE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+const WEB_OIDC_STATE_COOKIE: &str = "heteronetwork_oidc_state";
+const WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY: &str = "heteronetwork_access_token";
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -102,10 +114,10 @@ where
     let management_auth = Arc::new(ManagementAuth {
         operator_api_bearer_token: state.operator_api_bearer_token.clone(),
         web_ui_auth: state.web_ui_auth.clone(),
-        client: Client::new(),
     });
     let admin = Router::new()
         .route("/v1/admin/overview", get(admin_overview::<S, L>))
+        .route("/v1/admin/services", get(admin_services::<S, L>))
         .route("/v1/admin/nodes", get(admin_nodes::<S, L>))
         .route("/v1/admin/paths", get(admin_paths::<S, L>))
         .route(
@@ -140,6 +152,8 @@ where
     };
     app.route("/ui", get(ui_index))
         .route("/ui/", get(ui_index))
+        .route("/ui/login", get(ui_login::<S, L>))
+        .route("/ui/callback", get(ui_callback::<S, L>))
         .route("/ui/app.js", get(ui_app))
         .route("/ui/styles.css", get(ui_styles))
         .route("/ui/config", get(ui_config::<S, L>))
@@ -178,10 +192,41 @@ pub struct WebUiAuthConfig {
     issuer_url: String,
     client_id: String,
     scopes: String,
+    public_url: Option<String>,
     authorization_endpoint: String,
     token_endpoint: String,
     userinfo_endpoint: String,
     logout_endpoint: String,
+    client: Client,
+    login_states: Arc<Mutex<HashMap<String, OidcLoginState>>>,
+}
+
+#[derive(Debug)]
+struct OidcLoginState {
+    verifier: String,
+    redirect_uri: String,
+    created_at: Instant,
+}
+
+#[derive(Debug)]
+struct OidcLoginStart {
+    location: String,
+    state_cookie: header::HeaderValue,
+}
+
+#[derive(Debug)]
+struct WebAuthFlowError {
+    status: StatusCode,
+    message: String,
+}
+
+impl WebAuthFlowError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
 }
 
 impl WebUiAuthConfig {
@@ -222,25 +267,45 @@ impl WebUiAuthConfig {
                 "/logout",
             ),
         };
+        let client = Client::builder()
+            .redirect(RedirectPolicy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("failed to build OIDC HTTP client: {error}"))?;
         Ok(Self {
             provider,
             issuer_url: issuer_url.clone(),
             client_id,
             scopes,
+            public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
             token_endpoint: endpoint_url(&auth_base_url, token_suffix),
             userinfo_endpoint: endpoint_url(&auth_base_url, userinfo_suffix),
             logout_endpoint: endpoint_url(&auth_base_url, logout_suffix),
+            client,
+            login_states: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub async fn validate_access_token(&self, client: &Client, token: &str) -> bool {
+    pub fn with_public_url(mut self, public_url: String) -> Result<Self, String> {
+        let public_url = validate_web_auth_base_url(public_url, "web public URL")?;
+        let parsed = Url::parse(&public_url)
+            .map_err(|error| format!("web public URL is invalid: {error}"))?;
+        if parsed.path() != "/" {
+            return Err("web public URL must be an origin without a path".to_string());
+        }
+        self.public_url = Some(public_url);
+        Ok(self)
+    }
+
+    pub async fn validate_access_token(&self, token: &str) -> bool {
         if token.is_empty() || token.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES * 16 {
             return false;
         }
         let response = match timeout(
             Duration::from_secs(5),
-            client
+            self.client
                 .get(&self.userinfo_endpoint)
                 .bearer_auth(token)
                 .send(),
@@ -253,13 +318,192 @@ impl WebUiAuthConfig {
         if !response.status().is_success() {
             return false;
         }
-        match response.json::<Value>().await {
+        let body = match bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES).await {
+            Ok(body) => body,
+            Err(_) => return false,
+        };
+        match serde_json::from_slice::<Value>(&body) {
             Ok(claims) => claims
                 .get("sub")
                 .and_then(Value::as_str)
                 .is_some_and(|subject| !subject.is_empty()),
             Err(_) => false,
         }
+    }
+
+    async fn begin_login(&self) -> Result<OidcLoginStart, WebAuthFlowError> {
+        let public_url = self.public_url.as_deref().ok_or_else(|| {
+            WebAuthFlowError::new(
+                StatusCode::NOT_FOUND,
+                "server-side OIDC login is not configured",
+            )
+        })?;
+        let redirect_uri = format!("{public_url}/ui/callback");
+        let verifier = random_oidc_value(32);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let state = random_oidc_value(24);
+        let now = Instant::now();
+        {
+            let mut states = self.login_states.lock().await;
+            states
+                .retain(|_, entry| now.duration_since(entry.created_at) < WEB_OIDC_LOGIN_STATE_TTL);
+            if states.len() >= MAX_WEB_OIDC_LOGIN_STATES {
+                return Err(WebAuthFlowError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many pending OIDC logins",
+                ));
+            }
+            if states.contains_key(&state) {
+                return Err(WebAuthFlowError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "failed to allocate a unique OIDC state",
+                ));
+            }
+            states.insert(
+                state.clone(),
+                OidcLoginState {
+                    verifier,
+                    redirect_uri: redirect_uri.clone(),
+                    created_at: now,
+                },
+            );
+        }
+        let mut authorization_url = Url::parse(&self.authorization_endpoint).map_err(|error| {
+            WebAuthFlowError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("OIDC authorization endpoint is invalid: {error}"),
+            )
+        })?;
+        authorization_url
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("scope", &self.scopes)
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        let secure = public_url.starts_with("https://");
+        let secure_attribute = if secure { "; Secure" } else { "" };
+        let state_cookie = header::HeaderValue::from_str(&format!(
+            "{WEB_OIDC_STATE_COOKIE}={state}; Path=/ui/callback; Max-Age={}; HttpOnly; SameSite=Lax{secure_attribute}",
+            WEB_OIDC_LOGIN_STATE_TTL.as_secs()
+        ))
+        .map_err(|_| {
+            WebAuthFlowError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build the OIDC state cookie",
+            )
+        })?;
+        Ok(OidcLoginStart {
+            location: authorization_url.into(),
+            state_cookie,
+        })
+    }
+
+    async fn complete_login(
+        &self,
+        query: OidcCallbackQuery,
+        state_cookie: Option<&str>,
+    ) -> Result<String, WebAuthFlowError> {
+        let state = query
+            .state
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                WebAuthFlowError::new(StatusCode::BAD_REQUEST, "missing or expired OIDC state")
+            })?;
+        if state.len() > 128
+            || !state_cookie.is_some_and(|cookie| bounded_constant_time_matches(state, cookie, 128))
+        {
+            return Err(WebAuthFlowError::new(
+                StatusCode::BAD_REQUEST,
+                "missing or expired OIDC state",
+            ));
+        }
+        if query
+            .code
+            .as_deref()
+            .is_some_and(|code| code.len() > 16 * 1024)
+            || query
+                .error
+                .as_deref()
+                .is_some_and(|error| error.len() > 1024)
+            || query
+                .error_description
+                .as_deref()
+                .is_some_and(|description| description.len() > 4096)
+        {
+            return Err(WebAuthFlowError::new(
+                StatusCode::BAD_REQUEST,
+                "OIDC callback parameters exceed their size limit",
+            ));
+        }
+        let login = {
+            let mut states = self.login_states.lock().await;
+            let now = Instant::now();
+            states
+                .retain(|_, entry| now.duration_since(entry.created_at) < WEB_OIDC_LOGIN_STATE_TTL);
+            states.remove(state)
+        }
+        .ok_or_else(|| {
+            WebAuthFlowError::new(StatusCode::BAD_REQUEST, "missing or expired OIDC state")
+        })?;
+
+        if let Some(error) = query.error.as_deref() {
+            let description = query.error_description.as_deref().unwrap_or(error);
+            return Err(WebAuthFlowError::new(
+                StatusCode::UNAUTHORIZED,
+                format!("OIDC authorization was rejected: {description}"),
+            ));
+        }
+        let code = query
+            .code
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                WebAuthFlowError::new(StatusCode::BAD_REQUEST, "OIDC callback is missing a code")
+            })?;
+
+        let response = self
+            .client
+            .post(&self.token_endpoint)
+            .header(header::ACCEPT, "application/json")
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", self.client_id.as_str()),
+                ("code", code),
+                ("redirect_uri", login.redirect_uri.as_str()),
+                ("code_verifier", login.verifier.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|error| {
+                WebAuthFlowError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("OIDC token exchange failed: {error}"),
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(WebAuthFlowError::new(
+                StatusCode::UNAUTHORIZED,
+                format!("OIDC token exchange failed ({})", response.status()),
+            ));
+        }
+        let body = bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES).await?;
+        let tokens: OidcTokenResponse = serde_json::from_slice(&body).map_err(|error| {
+            WebAuthFlowError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("OIDC token response is invalid: {error}"),
+            )
+        })?;
+        if !self.validate_access_token(&tokens.access_token).await {
+            return Err(WebAuthFlowError::new(
+                StatusCode::UNAUTHORIZED,
+                "OIDC access token failed provider validation",
+            ));
+        }
+        Ok(tokens.access_token)
     }
 
     fn public_config(&self) -> WebUiPublicConfig {
@@ -274,6 +518,7 @@ impl WebUiAuthConfig {
             authorization_endpoint: Some(self.authorization_endpoint.clone()),
             token_endpoint: Some(self.token_endpoint.clone()),
             logout_endpoint: Some(self.logout_endpoint.clone()),
+            login_endpoint: self.public_url.as_ref().map(|_| "/ui/login".to_string()),
         }
     }
 }
@@ -292,11 +537,98 @@ fn validate_web_auth_base_url(value: String, name: &str) -> Result<String, Strin
             "{name} must be an http(s) URL with a host and no credentials, query, or fragment"
         ));
     }
+    if parsed.scheme() == "http" && !web_auth_plain_http_host_allowed(&parsed) {
+        return Err(format!(
+            "{name} must use https unless its host is loopback, private, link-local, or CGNAT"
+        ));
+    }
     Ok(value)
+}
+
+fn web_auth_plain_http_host_allowed(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => web_auth_plain_http_ipv4_allowed(address),
+        Ok(std::net::IpAddr::V6(address)) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return web_auth_plain_http_ipv4_allowed(mapped);
+            }
+            let first = address.segments()[0];
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && (address.is_loopback() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80)
+        }
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+    }
+}
+
+fn web_auth_plain_http_ipv4_allowed(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !address.is_unspecified()
+        && !address.is_multicast()
+        && (address.is_loopback()
+            || address.is_private()
+            || address.is_link_local()
+            || (octets[0] == 100 && (64..=127).contains(&octets[1])))
 }
 
 fn endpoint_url(base: &str, suffix: &str) -> String {
     format!("{base}{suffix}")
+}
+
+fn random_oidc_value(byte_count: usize) -> String {
+    let mut bytes = vec![0_u8; byte_count];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+async fn bounded_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, WebAuthFlowError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            "OIDC token response exceeds its size limit",
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read OIDC token response: {error}"),
+        )
+    })? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(WebAuthFlowError::new(
+                StatusCode::BAD_GATEWAY,
+                "OIDC token response exceeds its size limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcCallbackQuery {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcTokenResponse {
+    access_token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,13 +643,13 @@ struct WebUiPublicConfig {
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
     logout_endpoint: Option<String>,
+    login_endpoint: Option<String>,
 }
 
 #[derive(Clone)]
 struct ManagementAuth {
     operator_api_bearer_token: Option<Arc<str>>,
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
-    client: Client,
 }
 
 async fn require_management_auth(
@@ -334,7 +666,7 @@ async fn require_management_auth(
     let oidc_authenticated = if operator_authenticated {
         false
     } else if let (Some(oidc), Some(token)) = (auth.web_ui_auth.as_deref(), provided) {
-        oidc.validate_access_token(&auth.client, token).await
+        oidc.validate_access_token(token).await
     } else {
         false
     };
@@ -352,24 +684,208 @@ async fn require_management_auth(
 }
 
 async fn ui_index() -> impl IntoResponse {
-    (
+    let mut response = (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("../../../webui/index.html"),
     )
+        .into_response();
+    apply_ui_security_headers(&mut response, true);
+    response
 }
 
 async fn ui_app() -> impl IntoResponse {
-    (
+    let mut response = (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../../../webui/app.js"),
     )
+        .into_response();
+    apply_ui_security_headers(&mut response, false);
+    response
 }
 
 async fn ui_styles() -> impl IntoResponse {
-    (
+    let mut response = (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../../../webui/styles.css"),
     )
+        .into_response();
+    apply_ui_security_headers(&mut response, false);
+    response
+}
+
+fn apply_ui_security_headers(response: &mut Response, include_policy: bool) {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    if include_policy {
+        headers.insert(
+            header::HeaderName::from_static("content-security-policy"),
+            header::HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            ),
+        );
+    }
+}
+
+async fn ui_login<S, L>(State(state): State<ControlPlaneHttpState<S, L>>) -> Response
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let Some(auth) = state.web_ui_auth.as_deref() else {
+        return web_auth_flow_error_response(WebAuthFlowError::new(
+            StatusCode::NOT_FOUND,
+            "web OIDC authentication is not configured",
+        ));
+    };
+    match auth.begin_login().await {
+        Ok(login) => {
+            let mut response = Redirect::temporary(&login.location).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(header::SET_COOKIE, login.state_cookie);
+            headers.insert(
+                header::HeaderName::from_static("referrer-policy"),
+                header::HeaderValue::from_static("no-referrer"),
+            );
+            response
+        }
+        Err(error) => web_auth_flow_error_response(error),
+    }
+}
+
+async fn ui_callback<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Response
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let Some(auth) = state.web_ui_auth.as_deref() else {
+        return web_auth_flow_error_response(WebAuthFlowError::new(
+            StatusCode::NOT_FOUND,
+            "web OIDC authentication is not configured",
+        ));
+    };
+    let state_cookie = oidc_state_cookie(&headers);
+    let clear_state_cookie = query.state.as_deref().is_some_and(|state| {
+        state_cookie
+            .as_deref()
+            .is_some_and(|cookie| bounded_constant_time_matches(state, cookie, 128))
+    });
+    let mut response = match auth.complete_login(query, state_cookie.as_deref()).await {
+        Ok(access_token) => {
+            let html = oidc_callback_html(&access_token);
+            let mut response = Html(html).into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(
+                header::HeaderName::from_static("content-security-policy"),
+                header::HeaderValue::from_static(
+                    "default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+                ),
+            );
+            headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                header::HeaderValue::from_static("nosniff"),
+            );
+            headers.insert(
+                header::HeaderName::from_static("referrer-policy"),
+                header::HeaderValue::from_static("no-referrer"),
+            );
+            response
+        }
+        Err(error) => web_auth_flow_error_response(error),
+    };
+    if clear_state_cookie {
+        let secure_attribute = if auth
+            .public_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))
+        {
+            "; Secure"
+        } else {
+            ""
+        };
+        if let Ok(cookie) = header::HeaderValue::from_str(&format!(
+            "{WEB_OIDC_STATE_COOKIE}=; Path=/ui/callback; Max-Age=0; HttpOnly; SameSite=Lax{secure_attribute}"
+        )) {
+            response.headers_mut().insert(header::SET_COOKIE, cookie);
+        }
+    }
+    response
+}
+
+fn oidc_callback_html(access_token: &str) -> String {
+    let token_json = serde_json::to_string(access_token)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c");
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>HeteroNetwork Login</title><script>sessionStorage.setItem(\"{WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY}\",{token_json});location.replace(\"/ui/\");</script>"
+    )
+}
+
+fn oidc_state_cookie(headers: &HeaderMap) -> Option<String> {
+    let mut state = None;
+    for header_value in headers.get_all(header::COOKIE) {
+        let header_value = header_value.to_str().ok()?;
+        for pair in header_value.split(';') {
+            let (name, value) = pair.trim().split_once('=')?;
+            if name != WEB_OIDC_STATE_COOKIE {
+                continue;
+            }
+            if state.is_some()
+                || value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return None;
+            }
+            state = Some(value.to_string());
+        }
+    }
+    state
+}
+
+fn web_auth_flow_error_response(error: WebAuthFlowError) -> Response {
+    let mut response = (
+        error.status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ErrorResponse {
+            error: error.message,
+        }),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 async fn ui_config<S, L>(
@@ -394,6 +910,7 @@ where
             authorization_endpoint: None,
             token_endpoint: None,
             logout_endpoint: None,
+            login_endpoint: None,
         });
     config.operator_token_enabled = state.operator_api_bearer_token.is_some();
     Json(config)
@@ -444,8 +961,19 @@ where
         nodes: admin_node_snapshot(&state.plane).await?,
         paths: state.plane.list_paths().await?,
         nat_discovery: state.plane.nat_discovery_overview().await?,
+        service_directory: state.plane.service_directory().await?,
         generated_at,
     }))
+}
+
+async fn admin_services<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<ipars_types::ServiceDirectory>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.service_directory().await?))
 }
 
 async fn admin_nodes<S, L>(
@@ -571,10 +1099,14 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn operator_api_token_matches(expected: &str, provided: &str) -> bool {
+    bounded_constant_time_matches(expected, provided, MAX_OPERATOR_API_BEARER_TOKEN_BYTES)
+}
+
+fn bounded_constant_time_matches(expected: &str, provided: &str, max_bytes: usize) -> bool {
     if expected.is_empty()
         || provided.is_empty()
-        || expected.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES
-        || provided.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES
+        || expected.len() > max_bytes
+        || provided.len() > max_bytes
     {
         return false;
     }
@@ -582,7 +1114,7 @@ fn operator_api_token_matches(expected: &str, provided: &str) -> bool {
     let expected = expected.as_bytes();
     let provided = provided.as_bytes();
     let mut diff = expected.len() ^ provided.len();
-    for index in 0..MAX_OPERATOR_API_BEARER_TOKEN_BYTES {
+    for index in 0..max_bytes {
         let expected_byte = expected.get(index).copied().unwrap_or_default();
         let provided_byte = provided.get(index).copied().unwrap_or_default();
         diff |= usize::from(expected_byte ^ provided_byte);
@@ -852,6 +1384,48 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
         "ipars_control_plane_relay_candidates{{cluster_id=\"{cluster_id}\"}} {}",
         metrics.relay_candidate_count
     );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_ha_ready Whether every required public service has at least two active instances."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_ha_ready gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_ha_ready{{cluster_id=\"{cluster_id}\"}} {}",
+        usize::from(metrics.ha_ready)
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_service_instances Number of active leased public service instances."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_service_instances gauge"
+    );
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_service_instances{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.active_service_instance_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_service_endpoints Active leased instances by public service kind."
+    );
+    prometheus_line!(
+        &mut body,
+        "# TYPE ipars_control_plane_service_endpoints gauge"
+    );
+    for (service, count) in [
+        ("control_plane", metrics.active_control_plane_count),
+        ("signal", metrics.active_signal_count),
+        ("stun", metrics.active_stun_count),
+        ("relay", metrics.active_relay_count),
+    ] {
+        prometheus_line!(
+            &mut body,
+            "ipars_control_plane_service_endpoints{{cluster_id=\"{cluster_id}\",service=\"{service}\"}} {count}"
+        );
+    }
     prometheus_line!(
         &mut body,
         "# HELP ipars_control_plane_stale_endpoint_candidates Number of endpoint candidates older than the control-plane candidate TTL."
@@ -1254,6 +1828,7 @@ mod tests {
             keycloak_config.authorization_endpoint.as_deref(),
             Some("http://localhost:8080/realms/heteronetwork/protocol/openid-connect/auth")
         );
+        assert_eq!(keycloak_config.login_endpoint, None);
         let cognito = match WebUiAuthConfig::new(
             WebAuthProvider::Cognito,
             "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example".to_string(),
@@ -1281,6 +1856,115 @@ mod tests {
             "openid".to_string(),
         )
         .is_err());
+        assert!(WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "http://203.0.113.10:8080/realms/ipars".to_string(),
+            "ipars-web".to_string(),
+            None,
+            "openid".to_string(),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn server_side_oidc_login_uses_public_callback_and_pkce() {
+        let config = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "http://localhost:8080/realms/ipars".to_string(),
+            "ipars-web".to_string(),
+            None,
+            "openid profile email".to_string(),
+        )
+        .and_then(|config| config.with_public_url("http://100.64.0.10:8443".to_string()))
+        .unwrap_or_else(|error| panic!("server-side OIDC config should be valid: {error}"));
+        assert!(config
+            .clone()
+            .with_public_url("http://203.0.113.10:8443".to_string())
+            .is_err());
+        assert_eq!(
+            config.public_config().login_endpoint.as_deref(),
+            Some("/ui/login")
+        );
+
+        let login = config
+            .begin_login()
+            .await
+            .unwrap_or_else(|error| panic!("OIDC login should begin: {}", error.message));
+        let state_cookie = login
+            .state_cookie
+            .to_str()
+            .unwrap_or_else(|error| panic!("OIDC state cookie should be ASCII: {error}"));
+        assert!(state_cookie.starts_with("heteronetwork_oidc_state="));
+        assert!(state_cookie.contains("; HttpOnly; SameSite=Lax"));
+        assert!(!state_cookie.contains("; Secure"));
+        let location = Url::parse(&login.location)
+            .unwrap_or_else(|error| panic!("authorization URL should parse: {error}"));
+        let query = location.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(|value| value.as_ref()),
+            Some("ipars-web")
+        );
+        assert_eq!(
+            query.get("redirect_uri").map(|value| value.as_ref()),
+            Some("http://100.64.0.10:8443/ui/callback")
+        );
+        assert_eq!(
+            query
+                .get("code_challenge_method")
+                .map(|value| value.as_ref()),
+            Some("S256")
+        );
+        assert!(query.get("state").is_some_and(|value| value.len() >= 32));
+        assert!(query
+            .get("code_challenge")
+            .is_some_and(|value| value.len() >= 43));
+        assert_eq!(config.login_states.lock().await.len(), 1);
+
+        let valid_state = query
+            .get("state")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| panic!("authorization URL should contain state"));
+        let error = match config
+            .complete_login(
+                OidcCallbackQuery {
+                    state: Some(valid_state),
+                    code: Some("code".to_string()),
+                    error: None,
+                    error_description: None,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("a callback without the browser-bound cookie must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(config.login_states.lock().await.len(), 1);
+
+        let error = match config
+            .complete_login(
+                OidcCallbackQuery {
+                    state: Some("unknown".to_string()),
+                    code: Some("code".to_string()),
+                    error: None,
+                    error_description: None,
+                },
+                Some("unknown"),
+            )
+            .await
+        {
+            Ok(_) => panic!("an unknown state must be rejected before token exchange"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn server_side_oidc_callback_uses_current_ui_storage_key() {
+        let html = oidc_callback_html("access-token");
+        assert!(html.contains("sessionStorage.setItem(\"heteronetwork_access_token\""));
+        assert!(!html.contains("ipars_access_token"));
     }
 
     fn claims(cluster_id: ClusterId, issuer: NodeId, key_id: KeyId) -> JoinTokenClaims {
@@ -1875,6 +2559,41 @@ mod tests {
         let overview: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
         assert_eq!(overview["cluster_policy"]["allow_relay_fallback"], false);
+        assert_eq!(overview["metrics"]["ha_ready"], false);
+        assert_eq!(
+            overview["service_directory"]["cluster_id"],
+            cluster_id.as_str()
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/services")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/services")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let services: ipars_types::ServiceDirectory =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(services.cluster_id, cluster_id);
+        assert!(services.instances.is_empty());
 
         let response = app
             .clone()
@@ -1886,8 +2605,30 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("script-src 'self'")));
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-        assert!(String::from_utf8(body.to_vec())?.contains("HeteroNetwork"));
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("HeteroNetwork"));
+        assert!(body.contains("Public nodes"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/app.js")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("function renderServices()"));
+        assert!(body.contains("service_directory"));
 
         let response = app
             .clone()
@@ -2303,6 +3044,9 @@ mod tests {
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("ipars_control_plane_metrics_generated_timestamp_seconds"));
         assert!(body.contains("ipars_control_plane_nodes"));
+        assert!(body.contains("ipars_control_plane_ha_ready"));
+        assert!(body.contains("ipars_control_plane_service_instances"));
+        assert!(body.contains("ipars_control_plane_service_endpoints"));
         assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
         assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));
         assert!(body.contains("ipars_control_plane_stale_paths"));

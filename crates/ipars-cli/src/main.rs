@@ -9,7 +9,7 @@ use std::time::{Duration as StdDuration, Instant};
 use anyhow::Context;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
-use ipars_agent::{AgentNodeState, FileAgentStateStore};
+use ipars_agent::{merge_bootstrap_endpoint_sets, AgentNodeState, FileAgentStateStore};
 use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_stun::UdpStunProbe;
@@ -23,12 +23,13 @@ use ipars_types::api::{
     RelayAdmissionResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, http_url_is_usable_endpoint, validate_join_token_bootstrap_endpoints,
-    BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, EndpointCandidate,
-    EndpointCandidateKind, JoinTokenClaims, KeyId, NatProbeObservation, NodeId, NodeRecord,
-    PathMetrics, PathState, Role, Route, SignedJoinToken, Tag, TokenPolicy,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_ALLOWED_ROUTES,
-    MAX_JOIN_TOKEN_IDENTIFIER_BYTES, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, http_url_is_usable_endpoint,
+    validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
+    CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId,
+    NatProbeObservation, NodeId, NodeRecord, PathMetrics, PathState, Role, Route, ServiceDirectory,
+    SignedJoinToken, Tag, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    MAX_JOIN_TOKEN_ALLOWED_ROUTES, MAX_JOIN_TOKEN_IDENTIFIER_BYTES, MAX_JOIN_TOKEN_TAGS,
+    MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -39,6 +40,8 @@ const MAX_USERSPACE_WIREGUARD_COMMAND_BYTES: usize = 4096;
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const MAX_CLI_HTTP_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SERVICE_DIRECTORY_INSTANCES: usize = 64;
+const MAX_SERVICE_DIRECTORY_LEASE_SECONDS: i64 = 300;
 const SANITIZED_INIT_DAEMON_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
@@ -498,6 +501,10 @@ struct TokenCreateArgs {
     stun_bootstrap_endpoints: Vec<String>,
     #[arg(long = "relay-bootstrap")]
     relay_bootstrap_endpoints: Vec<String>,
+    #[arg(long, env = "HETERONETWORK_SERVICE_DIRECTORY_URL")]
+    service_directory_url: Option<String>,
+    #[arg(long, default_value_t = false)]
+    allow_degraded_service_directory: bool,
     #[arg(long, default_value_t = false)]
     allow_relay: bool,
     #[arg(long, conflicts_with = "unlimited_uses")]
@@ -1474,7 +1481,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Token { command } => match command {
-            TokenCommand::Create(args) => print_json(&create_token(*args)?)?,
+            TokenCommand::Create(args) => print_json(
+                &create_token_with_service_directory(
+                    *args,
+                    control_plane_operator_api_auth.bearer_token(),
+                )
+                .await?,
+            )?,
             TokenCommand::Revoke(args) => print_json(&revoke_token(args).await?)?,
         },
         Command::Key { command } => match command {
@@ -1780,6 +1793,27 @@ fn init_daemon_specs(
         issuer_public_key.to_string(),
         "--database-url".to_string(),
         control_plane_database_url,
+        "--service-instance-id".to_string(),
+        node_id.as_str().to_string(),
+        "--advertise-control-plane-url".to_string(),
+        format!(
+            "{}://{}",
+            args.bootstrap_scheme,
+            SocketAddr::new(args.public_endpoint.ip(), args.control_plane_listen.port())
+        ),
+        "--advertise-signal-url".to_string(),
+        format!(
+            "{}://{}",
+            args.bootstrap_scheme,
+            SocketAddr::new(args.public_endpoint.ip(), args.signal_listen.port())
+        ),
+        "--advertise-stun-url".to_string(),
+        format!(
+            "udp://{}",
+            SocketAddr::new(args.public_endpoint.ip(), args.stun_listen.port())
+        ),
+        "--advertise-relay-url".to_string(),
+        format!("udp://{}", args.public_endpoint),
     ];
     if let Some(path) = args.control_plane_operator_api_bearer_token_path.as_ref() {
         control_plane_args.push("--operator-api-bearer-token-path".to_string());
@@ -2006,6 +2040,7 @@ fn prepare_init_relay_agent(
             vpn_ip: None,
             registered_node: None,
             bootstrap_endpoints: Vec::new(),
+            seed_bootstrap_endpoints: Some(Vec::new()),
             created_at: now,
             updated_at: now,
         })
@@ -2551,6 +2586,9 @@ fn persist_joined_agent_state(
     response: &RegisterNodeResponse,
 ) -> anyhow::Result<()> {
     let now = Utc::now();
+    let seeds = token.claims.bootstrap_endpoints.clone();
+    let bootstrap_endpoints =
+        merge_bootstrap_endpoint_sets(&response.peer_map.bootstrap_endpoints, &seeds)?;
     let state = AgentNodeState {
         node_id: identity.node_id(),
         identity_private_key_b64: identity.signing_key_b64(),
@@ -2559,7 +2597,8 @@ fn persist_joined_agent_state(
         wireguard_public_key_b64: wireguard.public_key_b64.clone(),
         vpn_ip: Some(response.node.vpn_ip),
         registered_node: Some(response.node.clone()),
-        bootstrap_endpoints: token.claims.bootstrap_endpoints.clone(),
+        bootstrap_endpoints,
+        seed_bootstrap_endpoints: Some(seeds),
         created_at: now,
         updated_at: now,
     };
@@ -2599,6 +2638,196 @@ async fn post_join_request(
         "all control-plane join endpoints failed: {}",
         failures.join("; ")
     ))
+}
+
+async fn create_token_with_service_directory(
+    mut args: TokenCreateArgs,
+    operator_bearer_token: Option<&str>,
+) -> anyhow::Result<SignedJoinToken> {
+    let Some(service_directory_url) = args.service_directory_url.clone() else {
+        return create_token(args);
+    };
+    let directory: ServiceDirectory = get_json_with_bearer(
+        &service_directory_url,
+        "/v1/admin/services",
+        "HA service directory",
+        operator_bearer_token,
+    )
+    .await?;
+    if let Some(cluster_id) = args.cluster_id.as_deref() {
+        anyhow::ensure!(
+            cluster_id == directory.cluster_id.as_str(),
+            "--cluster-id {} does not match service directory cluster {}",
+            cluster_id,
+            directory.cluster_id
+        );
+    } else {
+        args.cluster_id = Some(directory.cluster_id.as_str().to_string());
+    }
+    validate_service_directory_for_token(
+        &directory,
+        args.allow_relay,
+        args.allow_degraded_service_directory,
+    )?;
+
+    let mut control_plane = Vec::new();
+    let mut signal = Vec::new();
+    let mut stun = Vec::new();
+    let mut relay = Vec::new();
+    for endpoint in directory.bootstrap_endpoints {
+        match endpoint.kind {
+            BootstrapEndpointKind::ControlPlane => control_plane.push(endpoint.url),
+            BootstrapEndpointKind::Signal => signal.push(endpoint.url),
+            BootstrapEndpointKind::Stun => stun.push(endpoint.url),
+            BootstrapEndpointKind::Relay => relay.push(endpoint.url),
+        }
+    }
+    control_plane.append(&mut args.bootstrap_endpoints);
+    control_plane.append(&mut args.control_plane_bootstrap_endpoints);
+    signal.append(&mut args.signal_bootstrap_endpoints);
+    stun.append(&mut args.stun_bootstrap_endpoints);
+    relay.append(&mut args.relay_bootstrap_endpoints);
+    args.bootstrap_endpoints = control_plane;
+    args.signal_bootstrap_endpoints = signal;
+    args.stun_bootstrap_endpoints = stun;
+    args.relay_bootstrap_endpoints = relay;
+    create_token(args)
+}
+
+fn validate_service_directory_for_token(
+    directory: &ServiceDirectory,
+    require_relay: bool,
+    allow_degraded: bool,
+) -> anyhow::Result<()> {
+    validate_token_identifier(
+        directory.cluster_id.as_str(),
+        "service directory cluster ID",
+    )?;
+    anyhow::ensure!(
+        directory.instances.len() <= MAX_SERVICE_DIRECTORY_INSTANCES,
+        "HA service directory contains more than {MAX_SERVICE_DIRECTORY_INSTANCES} service instances"
+    );
+    anyhow::ensure!(
+        !directory.bootstrap_endpoints.is_empty(),
+        "HA service directory has no bootstrap endpoints"
+    );
+    validate_join_token_bootstrap_endpoints(&directory.bootstrap_endpoints)
+        .context("HA service directory contains invalid bootstrap endpoints")?;
+
+    let now = Utc::now();
+    let future_skew = Duration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS);
+    anyhow::ensure!(
+        directory.generated_at <= now + future_skew,
+        "HA service directory generation time is in the future"
+    );
+
+    let mut instance_ids = BTreeSet::new();
+    let mut active_endpoints = BTreeSet::new();
+    for instance in &directory.instances {
+        validate_token_identifier(&instance.instance_id, "service instance ID")?;
+        anyhow::ensure!(
+            instance_ids.insert(instance.instance_id.as_str()),
+            "HA service directory contains duplicate service instance ID {}",
+            instance.instance_id
+        );
+        anyhow::ensure!(
+            instance.cluster_id == directory.cluster_id,
+            "service instance {} belongs to cluster {}, not {}",
+            instance.instance_id,
+            instance.cluster_id,
+            directory.cluster_id
+        );
+        anyhow::ensure!(
+            !instance.endpoints.is_empty(),
+            "service instance {} has no endpoints",
+            instance.instance_id
+        );
+        validate_join_token_bootstrap_endpoints(&instance.endpoints).with_context(|| {
+            format!(
+                "service instance {} contains invalid endpoints",
+                instance.instance_id
+            )
+        })?;
+        let mut kinds = BTreeSet::new();
+        for endpoint in &instance.endpoints {
+            anyhow::ensure!(
+                kinds.insert(endpoint.kind),
+                "service instance {} publishes more than one {} endpoint",
+                instance.instance_id,
+                endpoint.kind
+            );
+            let canonical = canonical_bootstrap_endpoint_url(&endpoint.url)
+                .context("validated service endpoint has no canonical URL")?;
+            active_endpoints.insert((endpoint.kind, canonical, instance.instance_id.as_str()));
+        }
+        anyhow::ensure!(
+            instance.updated_at <= now + future_skew,
+            "service instance {} update time is in the future",
+            instance.instance_id
+        );
+        anyhow::ensure!(
+            instance.lease_expires_at > now,
+            "service instance {} lease has expired",
+            instance.instance_id
+        );
+        anyhow::ensure!(
+            instance.lease_expires_at > directory.generated_at,
+            "service instance {} was not active when the directory was generated",
+            instance.instance_id
+        );
+        let lease_duration = instance.lease_expires_at - instance.updated_at;
+        anyhow::ensure!(
+            lease_duration > Duration::zero()
+                && lease_duration <= Duration::seconds(MAX_SERVICE_DIRECTORY_LEASE_SECONDS),
+            "service instance {} lease duration must be between 1 and {MAX_SERVICE_DIRECTORY_LEASE_SECONDS} seconds",
+            instance.instance_id
+        );
+    }
+
+    let mut bootstrap = BTreeSet::new();
+    for endpoint in &directory.bootstrap_endpoints {
+        let canonical = canonical_bootstrap_endpoint_url(&endpoint.url)
+            .context("validated bootstrap endpoint has no canonical URL")?;
+        anyhow::ensure!(
+            active_endpoints
+                .iter()
+                .any(|(kind, url, _)| *kind == endpoint.kind && *url == canonical),
+            "HA service directory {} endpoint {} does not belong to an active service instance",
+            endpoint.kind,
+            endpoint.url
+        );
+        bootstrap.insert((endpoint.kind, canonical));
+    }
+
+    if !allow_degraded {
+        let mut required_kinds = vec![
+            BootstrapEndpointKind::ControlPlane,
+            BootstrapEndpointKind::Signal,
+            BootstrapEndpointKind::Stun,
+        ];
+        if require_relay {
+            required_kinds.push(BootstrapEndpointKind::Relay);
+        }
+        for kind in required_kinds {
+            let endpoint_urls = bootstrap
+                .iter()
+                .filter_map(|(endpoint_kind, url)| (*endpoint_kind == kind).then_some(url))
+                .collect::<BTreeSet<_>>();
+            let endpoint_instances = active_endpoints
+                .iter()
+                .filter_map(|(endpoint_kind, url, instance_id)| {
+                    (*endpoint_kind == kind && bootstrap.contains(&(*endpoint_kind, url.clone())))
+                        .then_some(*instance_id)
+                })
+                .collect::<BTreeSet<_>>();
+            let count = endpoint_urls.len().min(endpoint_instances.len());
+            anyhow::ensure!(
+                count >= 2,
+                "HA service directory has only {count} independent active {kind} instance(s); use --allow-degraded-service-directory only for an intentional non-HA token"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
@@ -2667,6 +2896,8 @@ fn token_create_bootstrap_endpoints(
             "--relay-bootstrap",
         )?);
     }
+    let mut seen = BTreeSet::new();
+    endpoints.retain(|endpoint| seen.insert((endpoint.kind, endpoint.url.clone())));
     validate_join_token_bootstrap_endpoints(&endpoints)?;
     Ok(endpoints)
 }
@@ -10467,6 +10698,7 @@ fn add_unique_kubernetes_node_port(
 mod tests {
     use ipars_agent::AgentNodeState;
     use ipars_crypto::{verify_control_plane_node_query_signature, verify_join_token};
+    use ipars_types::ServiceInstance;
 
     use super::*;
 
@@ -10497,6 +10729,93 @@ mod tests {
             )?,
             signature: format!("{}==", "A".repeat(86)),
         })
+    }
+
+    fn test_service_directory() -> ServiceDirectory {
+        let now = Utc::now();
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let instances = [10, 11]
+            .into_iter()
+            .map(|host| ServiceInstance {
+                cluster_id: cluster_id.clone(),
+                instance_id: format!("public-{host}"),
+                endpoints: vec![
+                    BootstrapEndpoint {
+                        url: format!("https://203.0.113.{host}:8443"),
+                        kind: BootstrapEndpointKind::ControlPlane,
+                    },
+                    BootstrapEndpoint {
+                        url: format!("https://203.0.113.{host}:9443"),
+                        kind: BootstrapEndpointKind::Signal,
+                    },
+                    BootstrapEndpoint {
+                        url: format!("udp://203.0.113.{host}:3478"),
+                        kind: BootstrapEndpointKind::Stun,
+                    },
+                    BootstrapEndpoint {
+                        url: format!("udp://203.0.113.{host}:51820"),
+                        kind: BootstrapEndpointKind::Relay,
+                    },
+                ],
+                lease_expires_at: now + Duration::seconds(15),
+                updated_at: now,
+            })
+            .collect::<Vec<_>>();
+        ServiceDirectory {
+            cluster_id,
+            bootstrap_endpoints: instances
+                .iter()
+                .flat_map(|instance| instance.endpoints.clone())
+                .collect(),
+            instances,
+            generated_at: now,
+        }
+    }
+
+    #[test]
+    fn service_directory_token_validation_requires_independent_live_instances() -> anyhow::Result<()>
+    {
+        let directory = test_service_directory();
+        validate_service_directory_for_token(&directory, true, false)?;
+
+        let mut duplicate_url = directory.clone();
+        let duplicate = duplicate_url.instances[0].endpoints[0].url.clone();
+        let replaced = duplicate_url.instances[1].endpoints[0].url.clone();
+        duplicate_url.instances[1].endpoints[0].url = duplicate;
+        duplicate_url
+            .bootstrap_endpoints
+            .retain(|endpoint| endpoint.url != replaced);
+        let error = test_error(
+            validate_service_directory_for_token(&duplicate_url, true, false),
+            "two instance IDs sharing one URL must not count as HA",
+        );
+        assert!(error
+            .to_string()
+            .contains("only 1 independent active control_plane instance(s)"));
+
+        let mut expired = directory.clone();
+        expired.instances[0].lease_expires_at = Utc::now() - Duration::seconds(1);
+        let error = test_error(
+            validate_service_directory_for_token(&expired, true, false),
+            "expired leases must not be signed into a join token",
+        );
+        assert!(error.to_string().contains("lease has expired"));
+
+        let mut orphaned = directory.clone();
+        orphaned.bootstrap_endpoints[0].url = "https://203.0.113.99:8443".to_string();
+        let error = test_error(
+            validate_service_directory_for_token(&orphaned, true, false),
+            "bootstrap endpoints must belong to a live instance",
+        );
+        assert!(error
+            .to_string()
+            .contains("does not belong to an active service instance"));
+
+        let mut degraded = directory;
+        degraded.instances.truncate(1);
+        degraded.bootstrap_endpoints = degraded.instances[0].endpoints.clone();
+        validate_service_directory_for_token(&degraded, true, true)?;
+        Ok(())
     }
 
     fn valid_init_args() -> InitArgs {
@@ -10941,6 +11260,7 @@ mod tests {
                 peer_map: PeerMap {
                     cluster_id: node.cluster_id.clone(),
                     peers: Vec::new(),
+                    bootstrap_endpoints: Vec::new(),
                     generated_at: Utc::now(),
                 },
                 relay_map: ipars_types::api::RelayMap {
@@ -11149,6 +11469,8 @@ mod tests {
             signal_bootstrap_endpoints: Vec::new(),
             stun_bootstrap_endpoints: Vec::new(),
             relay_bootstrap_endpoints: Vec::new(),
+            service_directory_url: None,
+            allow_degraded_service_directory: false,
             allow_relay: true,
             max_uses: Some(7),
             unlimited_uses: false,
@@ -11188,6 +11510,8 @@ mod tests {
                 signal_bootstrap_endpoints: Vec::new(),
                 stun_bootstrap_endpoints: Vec::new(),
                 relay_bootstrap_endpoints: Vec::new(),
+                service_directory_url: None,
+                allow_degraded_service_directory: false,
                 allow_relay: false,
                 max_uses: Some(1),
                 unlimited_uses: false,
@@ -11372,6 +11696,8 @@ mod tests {
             signal_bootstrap_endpoints: vec!["https://203.0.113.10:9443".to_string()],
             stun_bootstrap_endpoints: vec!["udp://203.0.113.10:3478".to_string()],
             relay_bootstrap_endpoints: vec!["udp://203.0.113.10:51820".to_string()],
+            service_directory_url: None,
+            allow_degraded_service_directory: false,
             allow_relay: false,
             max_uses: Some(1),
             unlimited_uses: false,
@@ -11425,6 +11751,8 @@ mod tests {
             signal_bootstrap_endpoints: Vec::new(),
             stun_bootstrap_endpoints: Vec::new(),
             relay_bootstrap_endpoints: Vec::new(),
+            service_directory_url: None,
+            allow_degraded_service_directory: false,
             allow_relay: false,
             max_uses: Some(1),
             unlimited_uses: false,
@@ -11544,6 +11872,8 @@ mod tests {
             signal_bootstrap_endpoints: Vec::new(),
             stun_bootstrap_endpoints: vec!["https://203.0.113.10:3478".to_string()],
             relay_bootstrap_endpoints: Vec::new(),
+            service_directory_url: None,
+            allow_degraded_service_directory: false,
             allow_relay: false,
             max_uses: Some(1),
             unlimited_uses: false,
@@ -11586,6 +11916,8 @@ mod tests {
                 signal_bootstrap_endpoints: Vec::new(),
                 stun_bootstrap_endpoints: Vec::new(),
                 relay_bootstrap_endpoints: Vec::new(),
+                service_directory_url: None,
+                allow_degraded_service_directory: false,
                 allow_relay: false,
                 max_uses: Some(1),
                 unlimited_uses: false,
@@ -11949,6 +12281,18 @@ mod tests {
         assert!(control_plane
             .command
             .contains(&output.issuer_public_key.to_string()));
+        for (flag, value) in [
+            ("--service-instance-id", output.issuer_node_id.as_str()),
+            ("--advertise-control-plane-url", "http://203.0.113.10:18443"),
+            ("--advertise-signal-url", "http://203.0.113.10:19443"),
+            ("--advertise-stun-url", "udp://203.0.113.10:13478"),
+            ("--advertise-relay-url", "udp://203.0.113.10:51820"),
+        ] {
+            assert!(control_plane
+                .command
+                .windows(2)
+                .any(|values| values[0] == flag && values[1] == value));
+        }
         assert!(control_plane.command.iter().any(|value| {
             value.starts_with("sqlite://") && value.ends_with("control-plane.sqlite?mode=rwc")
         }));
@@ -13278,6 +13622,7 @@ fi
         let generated_at = Utc::now();
         let peer_map = PeerMap {
             cluster_id: ClusterId::from_string("cluster-a"),
+            bootstrap_endpoints: Vec::new(),
             peers: vec![ipars_types::NodeRecord {
                 node_id: peer.clone(),
                 cluster_id: ClusterId::from_string("cluster-a"),
