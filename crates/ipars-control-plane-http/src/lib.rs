@@ -3357,8 +3357,11 @@ mod tests {
         let client_token: SignedJoinToken =
             serde_json::from_value(client_enrollment_body["token"].clone())?;
         assert!(client_token.claims.role.is_client());
+        assert!(client_token.claims.tags.is_empty());
         assert!(!client_token.claims.policy.allow_relay);
         assert!(client_token.claims.policy.allowed_routes.is_empty());
+        assert!(client_token.claims.policy.allowed_tags.is_empty());
+        assert_eq!(client_token.claims.policy.max_token_uses, Some(1));
 
         let wrong_endpoint = app
             .clone()

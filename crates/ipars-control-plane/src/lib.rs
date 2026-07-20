@@ -62,6 +62,15 @@ pub fn enrollment_role_is_allowed(role: &Role) -> bool {
     node_enrollment_role_is_allowed(role) || role.is_client()
 }
 
+fn client_claims_are_control_only(claims: &JoinTokenClaims) -> bool {
+    claims.role.is_client()
+        && claims.tags.is_empty()
+        && claims.policy.allowed_tags.is_empty()
+        && !claims.policy.allow_relay
+        && claims.policy.allowed_routes.is_empty()
+        && claims.policy.max_token_uses == Some(1)
+}
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
     #[error("join token does not allow node registration")]
@@ -755,6 +764,11 @@ fn validate_issuer_key_policy(
     if !enrollment_role_is_allowed(&claims.role) {
         return Err(reject("role is not allowed"));
     }
+    if claims.role.is_client() && !client_claims_are_control_only(claims) {
+        return Err(reject(
+            "client tokens must be single-use, untagged, route-free, and relay-free",
+        ));
+    }
     if claims.tags != claims.policy.allowed_tags {
         return Err(reject("claim tags and allowed tags must match"));
     }
@@ -897,10 +911,7 @@ where
         now: chrono::DateTime<Utc>,
     ) -> Result<RegisterClientResponse, ControlPlaneError> {
         self.validate_join_token(&token, now)?;
-        if !token.claims.role.is_client()
-            || token.claims.policy.allow_relay
-            || !token.claims.policy.allowed_routes.is_empty()
-        {
+        if !client_claims_are_control_only(&token.claims) {
             return Err(ControlPlaneError::JoinDenied);
         }
         self.plane.require_client_gateway().await?;
@@ -1319,10 +1330,7 @@ where
         claims: JoinTokenClaims,
         request: RegisterClientRequest,
     ) -> Result<RegisterClientResponse, ControlPlaneError> {
-        if !claims.role.is_client()
-            || claims.policy.allow_relay
-            || !claims.policy.allowed_routes.is_empty()
-        {
+        if !client_claims_are_control_only(&claims) {
             return Err(ControlPlaneError::JoinDenied);
         }
         let response = self
@@ -4801,6 +4809,49 @@ mod tests {
         client_claims.role = Role::client();
         client_claims.tags.clear();
         client_claims.policy.allowed_tags.clear();
+        client_claims.policy.max_token_uses = Some(1);
+
+        let mut reusable_client_claims = client_claims.clone();
+        reusable_client_claims.policy.max_token_uses = Some(2);
+        let reusable_identity = identity_for_node("reusable-mac-client");
+        let reusable_wireguard_public_key = wireguard_public_key_for_node("reusable-mac-client");
+        assert!(matches!(
+            plane
+                .register_client_with_claims(
+                    reusable_client_claims,
+                    RegisterClientRequest {
+                        client_id: reusable_identity.node_id(),
+                        identity_public_key: reusable_identity.public_key_b64(),
+                        wireguard_public_key: reusable_wireguard_public_key,
+                    },
+                )
+                .await,
+            Err(ControlPlaneError::JoinDenied)
+        ));
+
+        let mut tagged_client_claims = client_claims.clone();
+        tagged_client_claims
+            .tags
+            .insert(Tag::from_string("privileged"));
+        tagged_client_claims
+            .policy
+            .allowed_tags
+            .insert(Tag::from_string("privileged"));
+        let tagged_identity = identity_for_node("tagged-mac-client");
+        assert!(matches!(
+            plane
+                .register_client_with_claims(
+                    tagged_client_claims,
+                    RegisterClientRequest {
+                        client_id: tagged_identity.node_id(),
+                        identity_public_key: tagged_identity.public_key_b64(),
+                        wireguard_public_key: wireguard_public_key_for_node("tagged-mac-client"),
+                    },
+                )
+                .await,
+            Err(ControlPlaneError::JoinDenied)
+        ));
+
         let registration = plane
             .register_client_with_claims(
                 client_claims,
@@ -8033,6 +8084,25 @@ mod tests {
                 };
                 Ok(error.to_string())
             };
+
+        let mut valid_client = valid_claims.clone();
+        valid_client.role = Role::client();
+        valid_client.tags.clear();
+        valid_client.policy.allowed_tags.clear();
+        valid_client.policy.max_token_uses = Some(1);
+        service.validate_join_token(&issuer.sign_join_token(valid_client.clone())?, now)?;
+
+        let mut reusable_client = valid_client.clone();
+        reusable_client.policy.max_token_uses = Some(2);
+        assert!(rejected_reason(reusable_client)?.contains("client tokens must be single-use"));
+
+        let mut tagged_client = valid_client;
+        tagged_client.tags.insert(Tag::from_string("privileged"));
+        tagged_client
+            .policy
+            .allowed_tags
+            .insert(Tag::from_string("privileged"));
+        assert!(rejected_reason(tagged_client)?.contains("client tokens must be single-use"));
 
         let mut elevated_role = valid_claims.clone();
         elevated_role.role = Role::control_plane();
