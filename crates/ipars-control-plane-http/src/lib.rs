@@ -2184,16 +2184,22 @@ where
 async fn client_peers<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Json(request): Json<ClientControlRequest>,
-) -> Result<Json<PeerMap>, ApiError>
+) -> Result<Json<RegisterClientResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    state
+    let client = state
         .plane
         .authenticate_client_request(&request, ClientRequestKind::PeerMap, Utc::now())
         .await?;
-    Ok(Json(state.plane.peer_map_for(&request.client_id).await?))
+    let peer_map = state.plane.peer_map_for(&request.client_id).await?;
+    let cluster_policy = state.plane.cluster_policy()?;
+    Ok(Json(RegisterClientResponse {
+        client,
+        peer_map,
+        cluster_policy,
+    }))
 }
 
 async fn remove_client<S, L>(
@@ -3417,9 +3423,17 @@ mod tests {
             .await?;
         assert_eq!(peer_map.status(), StatusCode::OK);
         let peer_map_body = axum::body::to_bytes(peer_map.into_body(), usize::MAX).await?;
-        let peer_map: PeerMap = serde_json::from_slice(&peer_map_body)?;
-        assert_eq!(peer_map.peers.len(), 1);
-        assert_eq!(peer_map.peers[0].node_id, gateway.node_id);
+        let client_configuration: RegisterClientResponse = serde_json::from_slice(&peer_map_body)?;
+        assert_eq!(client_configuration.client, client_join.client);
+        assert_eq!(client_configuration.peer_map.peers.len(), 1);
+        assert_eq!(
+            client_configuration.peer_map.peers[0].node_id,
+            gateway.node_id
+        );
+        assert_eq!(
+            client_configuration.cluster_policy,
+            client_join.cluster_policy
+        );
 
         let admin_nodes = app
             .clone()

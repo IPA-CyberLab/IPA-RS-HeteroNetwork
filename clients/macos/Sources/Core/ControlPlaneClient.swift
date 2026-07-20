@@ -48,18 +48,25 @@ public final class ControlPlaneClient {
             wireGuardPublicKey: try keyMaterial.wireGuardPublicKey
         )
         let request = JoinClientRequest(token: token, registration: registration)
-        let response: RegisterClientResponse = try await performFailover(
-            bases: controlPlanes,
-            path: "/v1/clients/join",
-            method: "POST"
-        ) { _ in request }
-        guard response.client.nodeID == registration.clientID,
-              response.client.identityPublicKey == registration.identityPublicKey,
-              response.client.wireGuardPublicKey == registration.wireGuardPublicKey,
-              response.client.role == "client"
-        else {
-            throw ControlPlaneAPIError.invalidResponse
+        let response: RegisterClientResponse
+        do {
+            response = try await performFailover(
+                bases: controlPlanes,
+                path: "/v1/clients/join",
+                method: "POST"
+            ) { _ in request }
+        } catch let joinError {
+            do {
+                response = try await clientConfiguration(
+                    bases: controlPlanes,
+                    clientID: registration.clientID,
+                    keyMaterial: keyMaterial
+                )
+            } catch {
+                throw joinError
+            }
         }
+        try validate(response, matches: registration)
         return ClientSession(
             identityPrivateKey: keyMaterial.identityPrivateKey,
             wireGuardPrivateKey: keyMaterial.wireGuardPrivateKey,
@@ -75,24 +82,22 @@ public final class ControlPlaneClient {
             identityPrivateKey: storedSession.identityPrivateKey,
             wireGuardPrivateKey: storedSession.wireGuardPrivateKey
         )
-        let peerMap: PeerMap = try await performFailover(
+        let response = try await clientConfiguration(
             bases: storedSession.controlPlaneURLs,
-            path: "/v1/clients/peers/query",
-            method: "POST"
-        ) { _ in
-            ClientControlRequest(
-                clientID: storedSession.client.nodeID,
-                requestSignature: try keyMaterial.sign(
-                    clientID: storedSession.client.nodeID,
-                    kind: .peerMap
-                )
-            )
-        }
-        guard peerMap.clusterID == storedSession.client.clusterID else {
+            clientID: storedSession.client.nodeID,
+            keyMaterial: keyMaterial
+        )
+        let registration = RegisterClientRequest(
+            clientID: storedSession.client.nodeID,
+            identityPublicKey: storedSession.client.identityPublicKey,
+            wireGuardPublicKey: storedSession.client.wireGuardPublicKey
+        )
+        try validate(response, matches: registration)
+        guard response.client.clusterID == storedSession.client.clusterID else {
             throw ControlPlaneAPIError.invalidResponse
         }
         var updated = storedSession
-        updated.peerMap = peerMap
+        updated.peerMap = response.peerMap
         updated.refreshedAt = Date()
         return updated
     }
@@ -165,6 +170,40 @@ public final class ControlPlaneClient {
         }
         if let lastRejection { throw lastRejection }
         throw ControlPlaneAPIError.transport(failures)
+    }
+
+    private func clientConfiguration(
+        bases: [URL],
+        clientID: String,
+        keyMaterial: ClientKeyMaterial
+    ) async throws -> RegisterClientResponse {
+        try await performFailover(
+            bases: bases,
+            path: "/v1/clients/peers/query",
+            method: "POST"
+        ) { _ in
+            ClientControlRequest(
+                clientID: clientID,
+                requestSignature: try keyMaterial.sign(
+                    clientID: clientID,
+                    kind: .peerMap
+                )
+            )
+        }
+    }
+
+    private func validate(
+        _ response: RegisterClientResponse,
+        matches registration: RegisterClientRequest
+    ) throws {
+        guard response.client.nodeID == registration.clientID,
+              response.client.identityPublicKey == registration.identityPublicKey,
+              response.client.wireGuardPublicKey == registration.wireGuardPublicKey,
+              response.client.role == "client",
+              response.peerMap.clusterID == response.client.clusterID
+        else {
+            throw ControlPlaneAPIError.invalidResponse
+        }
     }
 
     private func endpointURL(base: URL, path: String) throws -> URL {
