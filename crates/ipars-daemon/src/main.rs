@@ -12265,17 +12265,55 @@ async fn heartbeat_path_state(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<PathRecord> {
     let mut paths = runtime.path_state().await;
+    let current_candidates_by_peer = runtime
+        .peer_map_snapshot()
+        .await
+        .ok()
+        .map(|peer_map| {
+            peer_map
+                .peers
+                .into_iter()
+                .map(|peer| (peer.node_id, peer.endpoint_candidates))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let activities = runtime.recent_local_peer_activities(now).await;
     let activity_by_peer = activities
         .iter()
         .map(|(peer, observed_at, _)| (peer.clone(), *observed_at))
         .collect::<BTreeMap<_, _>>();
     let mut represented_peers = BTreeSet::new();
+    let mut refreshed_selected_candidates = 0_usize;
     for path in &mut paths {
         represented_peers.insert(path.key.remote.clone());
+        if let (Some(selected), Some(current_candidates)) = (
+            path.selected_candidate.as_mut(),
+            current_candidates_by_peer.get(&path.key.remote),
+        ) {
+            let current = current_candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.node_id == path.key.remote
+                        && candidate.kind == selected.kind
+                        && candidate.addr == selected.addr
+                })
+                .max_by_key(|candidate| candidate.observed_at);
+            if let Some(current) =
+                current.filter(|current| current.observed_at > selected.observed_at)
+            {
+                *selected = current.clone();
+                refreshed_selected_candidates += 1;
+            }
+        }
         set_lazy_connect_local_activity_reason(
             path,
             activity_by_peer.get(&path.key.remote).copied(),
+        );
+    }
+    if refreshed_selected_candidates > 0 {
+        tracing::debug!(
+            refreshed_selected_candidates,
+            "refreshed heartbeat path candidates from the latest peer map"
         );
     }
 
@@ -18560,6 +18598,50 @@ mod tests {
 
         available_task.abort();
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_refreshes_selected_candidate_from_latest_peer_map() -> anyhow::Result<()> {
+        let now = Utc::now();
+        let state = AgentNodeState::generate(now);
+        let local_node = state.node_id.clone();
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let mut current_candidate = candidate("peer-a", EndpointCandidateKind::StunReflexive, 20);
+        current_candidate.observed_at = now;
+        let mut stale_candidate = current_candidate.clone();
+        stale_candidate.observed_at = now - ChronoDuration::seconds(121);
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_node, NodeId::from_string("peer-a")),
+                selected_state: PathState::DirectNatTraversal,
+                selected_candidate: Some(stale_candidate),
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::DirectNatTraversal,
+                    &PathMetrics::default(),
+                    true,
+                    current_candidate.cost,
+                ),
+                updated_at: now,
+                pinned: false,
+            })
+            .await?;
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![current_candidate.clone()];
+        runtime
+            .record_peer_map_snapshot(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
+                generated_at: now,
+            })
+            .await;
+
+        let paths = heartbeat_path_state(&runtime, now).await;
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].selected_candidate, Some(current_candidate));
         Ok(())
     }
 
