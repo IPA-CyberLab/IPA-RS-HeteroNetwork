@@ -18,10 +18,58 @@ final class TunnelProfileTests: XCTestCase {
         }
     }
 
-    private func makeSession(routes: [String]) -> ClientSession {
+    func testRejectsMultipleGatewayPeers() {
+        var session = makeSession(routes: [])
+        let gateway = session.peerMap.peers[0]
+        session.peerMap = PeerMap(
+            clusterID: session.peerMap.clusterID,
+            peers: [gateway, gateway],
+            bootstrapEndpoints: session.peerMap.bootstrapEndpoints,
+            generatedAt: session.peerMap.generatedAt
+        )
+
+        XCTAssertThrowsError(try TunnelProfile(session: session)) { error in
+            XCTAssertEqual(error as? TunnelProfileError, .invalidGatewayCount(2))
+        }
+    }
+
+    func testRejectsLocalAndRelayOnlyGatewayEndpoints() {
+        let now = Date(timeIntervalSince1970: 1_784_550_896)
+        let candidates = [
+            EndpointCandidate(
+                nodeID: "node-gateway",
+                kind: .localUDP,
+                address: "192.168.1.10:51820",
+                observedAt: now,
+                priority: 100,
+                cost: 1,
+                source: "interface_scan"
+            ),
+            EndpointCandidate(
+                nodeID: "node-gateway",
+                kind: .relay,
+                address: "198.51.100.20:51820",
+                observedAt: now,
+                priority: 100,
+                cost: 1,
+                source: "relay"
+            ),
+        ]
+
+        XCTAssertThrowsError(
+            try TunnelProfile(session: makeSession(routes: [], candidates: candidates))
+        ) { error in
+            XCTAssertEqual(error as? TunnelProfileError, .missingGatewayEndpoint)
+        }
+    }
+
+    private func makeSession(
+        routes: [String],
+        candidates suppliedCandidates: [EndpointCandidate]? = nil
+    ) -> ClientSession {
         let now = Date(timeIntervalSince1970: 1_784_550_896)
         let gatewayID = "node-gateway"
-        let candidates = [
+        let candidates = suppliedCandidates ?? [
             EndpointCandidate(
                 nodeID: gatewayID,
                 kind: .publicUDP,

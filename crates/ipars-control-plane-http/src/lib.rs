@@ -3402,6 +3402,112 @@ mod tests {
         assert_eq!(client_join.peer_map.peers.len(), 1);
         assert_eq!(client_join.peer_map.peers[0].node_id, gateway.node_id);
 
+        let client_heartbeat = signed_heartbeat(
+            "native-mac-client",
+            HeartbeatRequest {
+                node_id: client_join.client.node_id.clone(),
+                health: NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+                candidates: Vec::new(),
+                relay_capability: None,
+                routes: None,
+                path_state: Vec::new(),
+                nat_classification: None,
+                node_signature: None,
+            },
+        );
+        let heartbeat_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/heartbeat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&client_heartbeat)?))?,
+            )
+            .await?;
+        assert_eq!(heartbeat_response.status(), StatusCode::FORBIDDEN);
+
+        for (path, kind) in [
+            ("/v1/peers/query", ControlPlaneNodeQueryKind::PeerMap),
+            ("/v1/paths/query", ControlPlaneNodeQueryKind::Paths),
+        ] {
+            let query_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&signed_node_query(
+                            "native-mac-client",
+                            kind,
+                        ))?))?,
+                )
+                .await?;
+            assert_eq!(query_response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let mut signal_upsert = SignalNodeUpsertRequest {
+            node: client_join.client.clone(),
+            nat_classification: None,
+            health: None,
+            request_signature: None,
+        };
+        signal_upsert.request_signature =
+            Some(client_identity.sign_signal_node_upsert_request(&signal_upsert, Utc::now())?);
+        let signal_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/nodes/authenticate-signal-upsert")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signal_upsert)?))?,
+            )
+            .await?;
+        assert_eq!(signal_response.status(), StatusCode::FORBIDDEN);
+
+        let normal_removal_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/nodes/{}", client_join.client.node_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signed_remove_node(
+                        "native-mac-client",
+                    ))?))?,
+            )
+            .await?;
+        assert_eq!(normal_removal_response.status(), StatusCode::FORBIDDEN);
+
+        let normal_rotation_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/v1/nodes/{}/wireguard-key",
+                        client_join.client.node_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &signed_wireguard_key_rotation(
+                            "native-mac-client",
+                            client_join.client.wireguard_public_key.clone(),
+                            wireguard_public_key_for_node("native-mac-client-rotated"),
+                        ),
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(normal_rotation_response.status(), StatusCode::FORBIDDEN);
+
         let mut query = ClientControlRequest {
             client_id: client_join.client.node_id.clone(),
             request_signature: None,
