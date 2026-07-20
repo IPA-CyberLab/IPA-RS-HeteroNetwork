@@ -78,14 +78,16 @@ event-driven conntrack detector that activates lazy peers on first traffic. A
 single-use token cannot download the artifact again after its successful join;
 expired, revoked, exhausted, or unknown tokens are rejected.
 
-An idle ACL-visible peer remains installed in WireGuard as a passive receive
-peer with its overlay `/32` AllowedIP and host route, a loopback discard hold
-endpoint, and no keepalive. The host route selects the overlay source address
-for the first socket, and the local hold endpoint keeps that socket retryable
-without sending a handshake outside the host. On activation the Agent replaces
-the passive peer at the selected real endpoint, resetting any hold-endpoint
-handshake timer. The initiating Agent publishes
-the actual local packet-activity timestamp as a bounded marker in its signed
+An idle ACL-visible peer remains installed in WireGuard as a passive quarantine
+entry with its overlay `/32` AllowedIP and host route, a loopback discard hold
+endpoint, no keepalive, and a public key distinct from the advertised real peer
+key. The host route selects the overlay source address for the first socket,
+and the local hold endpoint keeps that socket retryable without sending a
+handshake outside the host. The quarantine key also prevents an incoming real
+peer packet from reactivating the entry through WireGuard endpoint roaming. On
+activation the Agent replaces the quarantine entry with the real peer at the
+selected endpoint, resetting any hold-endpoint handshake timer. The initiating
+Agent publishes the actual local packet-activity timestamp as a bounded marker in its signed
 path snapshot; any healthy Control Plane instance returns a fresh marker as an
 intent to the target Agent, which immediately wakes its Signal and peer-map
 loops. This reciprocal activation allows the first one-sided flow to establish

@@ -145,14 +145,17 @@ Agents do not establish a full mesh. They keep a compact peer map and only negot
 
 ACL-visible idle peers are represented by passive WireGuard peer entries with
 their overlay `/32` AllowedIP and host route, a loopback discard hold endpoint,
-and no keepalive. The route makes the first socket choose the correct overlay
-source address, while the hold endpoint prevents that first send from failing
-or leaving the host before the detector activates the peer. Passive-to-active
-application removes and recreates the WireGuard peer at the selected real
-endpoint so a hold-endpoint handshake retry timer cannot delay the first flow.
-No external handshake, periodic probe, or relay negotiation runs while the peer
-is passive, so this does not turn the cluster into an active full mesh. When
-local packet flow activates a peer, the Agent wakes path negotiation,
+no keepalive, and a deterministic quarantine public key that is distinct from
+the peer's advertised key. The route makes the first socket choose the correct
+overlay source address, while the hold endpoint prevents that first send from
+failing or leaving the host before the detector activates the peer. Because the
+real peer key is absent, an incoming authenticated packet cannot make WireGuard
+roam the passive entry back to an external endpoint. Passive-to-active
+application removes the quarantine entry and recreates the real WireGuard peer
+at the selected endpoint so a hold-endpoint handshake retry timer cannot delay
+the first flow. No external handshake, periodic probe, or relay negotiation
+runs while the peer is passive, so this does not turn the cluster into an active
+full mesh. When local packet flow activates a peer, the Agent wakes path negotiation,
 peer-map application, and heartbeat reporting. Its signed path snapshot carries the actual local packet
 activity timestamp in a bounded marker. The shared HA Control Plane converts a fresh incoming marker into a
 connection intent in the target Agent's heartbeat response; the target records

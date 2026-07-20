@@ -1351,7 +1351,7 @@ where
     }
     let directory = state
         .plane
-        .service_directory()
+        .enrollment_service_directory(Duration::from_secs(enrollment.max_ttl_seconds))
         .await
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     require_ha_node_enrollment_directory(&directory, request.allow_relay)?;
@@ -1433,7 +1433,7 @@ where
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     let directory = state
         .plane
-        .service_directory()
+        .enrollment_service_directory(Duration::from_secs(enrollment.max_ttl_seconds))
         .await
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     require_ha_client_enrollment_directory(&directory)?;
@@ -1511,29 +1511,29 @@ fn require_ha_node_enrollment_directory(
     directory: &ipars_types::ServiceDirectory,
     require_relay: bool,
 ) -> Result<(), NodeEnrollmentApiError> {
+    let required_kinds = required_node_enrollment_service_kinds(require_relay);
+    if !directory.instances.iter().any(|instance| {
+        instance.lease_expires_at > directory.generated_at
+            && service_instance_has_kinds(instance, &required_kinds)
+    }) {
+        return Err(NodeEnrollmentApiError::unavailable(
+            "cannot issue an HA enrollment token without an active complete public service instance",
+        ));
+    }
+
     let mut missing = Vec::new();
-    for kind in [
-        BootstrapEndpointKind::ControlPlane,
-        BootstrapEndpointKind::Signal,
-        BootstrapEndpointKind::Stun,
-    ] {
+    for kind in required_kinds {
         if service_instance_count(directory, kind) < 2
             || service_endpoint_count(directory, kind) < 2
         {
             missing.push(kind.to_string());
         }
     }
-    if require_relay
-        && (service_instance_count(directory, BootstrapEndpointKind::Relay) < 2
-            || service_endpoint_count(directory, BootstrapEndpointKind::Relay) < 2)
-    {
-        missing.push(BootstrapEndpointKind::Relay.to_string());
-    }
     if missing.is_empty() {
         Ok(())
     } else {
         Err(NodeEnrollmentApiError::unavailable(format!(
-            "cannot issue an HA enrollment token until at least two active service instances advertise each required endpoint kind; insufficient: {}",
+            "cannot issue an HA enrollment token until at least two active or recently advertised service instances provide distinct endpoints for each required kind; insufficient: {}",
             missing.join(", ")
         )))
     }
@@ -1542,6 +1542,15 @@ fn require_ha_node_enrollment_directory(
 fn require_ha_client_enrollment_directory(
     directory: &ipars_types::ServiceDirectory,
 ) -> Result<(), NodeEnrollmentApiError> {
+    let has_active_control_plane = directory.instances.iter().any(|instance| {
+        instance.lease_expires_at > directory.generated_at
+            && service_instance_has_kinds(instance, &[BootstrapEndpointKind::ControlPlane])
+    });
+    if !has_active_control_plane {
+        return Err(NodeEnrollmentApiError::unavailable(
+            "client enrollment requires an active control-plane endpoint",
+        ));
+    }
     let count = directory
         .bootstrap_endpoints
         .iter()
@@ -1551,10 +1560,34 @@ fn require_ha_client_enrollment_directory(
         .len();
     if count < 2 {
         return Err(NodeEnrollmentApiError::unavailable(
-            "client enrollment requires at least two active control-plane endpoints",
+            "client enrollment requires at least two active or recently advertised control-plane endpoints",
         ));
     }
     Ok(())
+}
+
+fn required_node_enrollment_service_kinds(require_relay: bool) -> Vec<BootstrapEndpointKind> {
+    let mut kinds = vec![
+        BootstrapEndpointKind::ControlPlane,
+        BootstrapEndpointKind::Signal,
+        BootstrapEndpointKind::Stun,
+    ];
+    if require_relay {
+        kinds.push(BootstrapEndpointKind::Relay);
+    }
+    kinds
+}
+
+fn service_instance_has_kinds(
+    instance: &ipars_types::ServiceInstance,
+    required_kinds: &[BootstrapEndpointKind],
+) -> bool {
+    required_kinds.iter().all(|kind| {
+        instance
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == *kind)
+    })
 }
 
 fn service_instance_count(
@@ -3207,7 +3240,7 @@ mod tests {
         )?;
         let expected_sha256 = enrollment.binary_sha256.to_string();
         let app = router(
-            ControlPlaneHttpState::new(plane, join_service)
+            ControlPlaneHttpState::new(plane.clone(), join_service)
                 .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string())
                 .enable_node_enrollment(enrollment),
         );
@@ -3298,6 +3331,47 @@ mod tests {
         assert_eq!(token.claims.bootstrap_endpoints.len(), 8);
         assert_eq!(token.claims.policy.max_token_uses, Some(1));
         assert!(token.claims.policy.allow_relay);
+
+        let degraded_at = Utc::now();
+        let mut expired_public_a =
+            enrollment_service_instance(&cluster_id, "public-a", "public-a.example");
+        expired_public_a.updated_at = degraded_at - ChronoDuration::seconds(60);
+        expired_public_a.lease_expires_at = degraded_at - ChronoDuration::seconds(30);
+        plane.advertise_service_instance(expired_public_a).await?;
+        let active_directory = plane.service_directory().await?;
+        assert_eq!(active_directory.instances.len(), 1);
+        assert_eq!(active_directory.instances[0].instance_id, "public-b");
+        assert!(!plane.metrics().await?.ha_ready);
+
+        let degraded_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&request_body)?))?,
+            )
+            .await?;
+        assert_eq!(degraded_response.status(), StatusCode::OK);
+        let degraded_response =
+            axum::body::to_bytes(degraded_response.into_body(), usize::MAX).await?;
+        let degraded_response: Value = serde_json::from_slice(&degraded_response)?;
+        let degraded_token: SignedJoinToken =
+            serde_json::from_value(degraded_response["token"].clone())?;
+        assert_eq!(degraded_token.claims.bootstrap_endpoints.len(), 8);
+        for host in ["public-a.example", "public-b.example"] {
+            assert!(degraded_token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .any(|endpoint| endpoint.url.contains(host)));
+        }
+
         let encoded_token = encode_node_enrollment_authorization(&token)
             .map_err(|error| std::io::Error::other(error.message))?;
         let authorization = format!("{NODE_ENROLLMENT_AUTH_SCHEME} {encoded_token}");
@@ -3663,6 +3737,28 @@ mod tests {
         assert_eq!(metrics.client_count, 1);
         assert_eq!(metrics.node_count, 2);
 
+        let stale_lease = Utc::now() - ChronoDuration::days(8);
+        let mut stale_public_a =
+            enrollment_service_instance(&cluster_id, "public-a", "public-a.example");
+        stale_public_a.updated_at = stale_lease - ChronoDuration::seconds(30);
+        stale_public_a.lease_expires_at = stale_lease;
+        plane.advertise_service_instance(stale_public_a).await?;
+        let stale_enrollment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&request_body)?))?,
+            )
+            .await?;
+        assert_eq!(stale_enrollment.status(), StatusCode::SERVICE_UNAVAILABLE);
+
         let mut removal = ClientControlRequest {
             client_id: client_join.client.node_id.clone(),
             request_signature: None,
@@ -3721,6 +3817,39 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(duplicate_error.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let generated_at = Utc::now();
+        let mut recently_expired =
+            enrollment_service_instance(&directory.cluster_id, "public-a", "public-a.example");
+        recently_expired.updated_at = generated_at - ChronoDuration::seconds(60);
+        recently_expired.lease_expires_at = generated_at - ChronoDuration::seconds(30);
+        let active =
+            enrollment_service_instance(&directory.cluster_id, "public-b", "public-b.example");
+        let degraded_directory = ipars_types::ServiceDirectory {
+            cluster_id: directory.cluster_id.clone(),
+            bootstrap_endpoints: recently_expired
+                .endpoints
+                .iter()
+                .chain(active.endpoints.iter())
+                .cloned()
+                .collect(),
+            instances: vec![recently_expired.clone(), active.clone()],
+            generated_at,
+        };
+        require_ha_node_enrollment_directory(&degraded_directory, true)
+            .map_err(|error| error.message)?;
+        require_ha_client_enrollment_directory(&degraded_directory)
+            .map_err(|error| error.message)?;
+
+        let mut inactive = active;
+        inactive.updated_at = generated_at - ChronoDuration::seconds(60);
+        inactive.lease_expires_at = generated_at - ChronoDuration::seconds(30);
+        let inactive_directory = ipars_types::ServiceDirectory {
+            instances: vec![recently_expired, inactive],
+            ..degraded_directory
+        };
+        assert!(require_ha_node_enrollment_directory(&inactive_directory, true).is_err());
+        assert!(require_ha_client_enrollment_directory(&inactive_directory).is_err());
 
         let invalid = AdminNodeEnrollmentRequest {
             expires_in_seconds: 86_400,
