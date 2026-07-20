@@ -1,0 +1,47 @@
+# HeteroNetwork for macOS
+
+The macOS client is a native SwiftUI menu-bar app backed by a
+`NEPacketTunnelProvider` and the official WireGuardKit package. It joins an
+existing HeteroNetwork overlay as a control-only client. It never advertises
+routes, registers with Signal, accepts relay traffic, or appears in the normal
+node inventory.
+
+## Requirements
+
+- macOS 13 or later
+- Xcode with a Developer ID or Apple Development team that has the Network
+  Extension capability
+- XcodeGen 2.45.4
+- Go 1.20.14 for WireGuardKit's `wireguard-go` bridge
+
+## Generate and build
+
+```bash
+cd clients/macos
+xcodegen generate
+open HeteroNetwork.xcodeproj
+```
+
+Set the same Apple development team on `HeteroNetwork`,
+`HeteroNetworkPacketTunnel`, and `HeteroNetworkCore`. The bundle IDs, App Group,
+and shared Keychain group in `project.yml` and `Config/*.entitlements` must be
+registered for that team before an archive can be signed.
+
+The CI job performs an unsigned app/extension build and the core unit tests.
+Running the packet tunnel on a Mac still requires a signed Network Extension.
+
+## Enroll
+
+1. In the control-plane Web UI, create a macOS client enrollment.
+2. Open the returned `heteronetwork://enroll?...` link on the Mac.
+3. Confirm enrollment in HeteroNetwork and approve the VPN configuration prompt.
+4. Select **Connect** from the menu-bar app.
+
+The one-use enrollment token remains in memory only. The Ed25519 identity,
+WireGuard private key, assigned VPN address, and current gateway map are stored
+in the shared, device-only Keychain item used by the app and packet-tunnel
+extension.
+
+The client installs only the gateway and projected overlay CIDRs. It refuses
+default routes, local/relay endpoint candidates, multi-peer client maps, and
+invalid WireGuard keys before starting the tunnel.

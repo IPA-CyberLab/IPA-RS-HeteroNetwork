@@ -51,6 +51,102 @@ jobs:
       - name: Check all targets on MSRV
         run: cargo +"$RUST_MSRV_TOOLCHAIN" check --locked --workspace --all-targets
 
+  macos-client:
+    name: Native macOS client
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned XcodeGen
+        env:
+          XCODEGEN_VERSION: 2.45.4
+          XCODEGEN_SHA256: 090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/xcodegen.zip"
+          install_dir="$RUNNER_TEMP/xcodegen-install"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 300 \
+            --output "$archive" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$archive" | shasum --algorithm 256 --check
+          ditto -x -k "$archive" "$install_dir"
+          printf '%s\n' "$install_dir/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Install WireGuard-compatible Go toolchain
+        env:
+          GO_VERSION: 1.20.14
+          GO_AMD64_SHA256: 754363489e2244e72cb49b4ec6ddfd6a2c60b0700f8c4876e11befb1913b11c5
+          GO_ARM64_SHA256: 6da3f76164b215053daf730a9b8f1d673dbbaa4c61031374a6744b75cb728641
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              go_arch=amd64
+              expected_sha256="$GO_AMD64_SHA256"
+              ;;
+            arm64)
+              go_arch=arm64
+              expected_sha256="$GO_ARM64_SHA256"
+              ;;
+            *)
+              echo "Unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/go${GO_VERSION}.darwin-${go_arch}.tar.gz"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 300 \
+            --output "$archive" \
+            "https://go.dev/dl/go${GO_VERSION}.darwin-${go_arch}.tar.gz"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | shasum --algorithm 256 --check
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          printf '%s\n' "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+
+      - name: Generate Xcode project
+        working-directory: clients/macos
+        run: xcodegen generate
+
+      - name: Resolve pinned WireGuardKit package
+        working-directory: clients/macos
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project HeteroNetwork.xcodeproj \
+            -scheme HeteroNetwork \
+            -derivedDataPath "$RUNNER_TEMP/HeteroNetworkDerivedData" \
+            -resolvePackageDependencies
+
+      - name: Run macOS client tests
+        working-directory: clients/macos
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project HeteroNetwork.xcodeproj \
+            -scheme HeteroNetwork \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/HeteroNetworkDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Build unsigned Release app and packet tunnel
+        working-directory: clients/macos
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project HeteroNetwork.xcodeproj \
+            -scheme HeteroNetwork \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/HeteroNetworkDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
   netns-smoke:
     name: Privileged network namespace smoke
     runs-on: ubuntu-24.04

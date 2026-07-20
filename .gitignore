@@ -11,3 +11,7 @@ docker/signal-operator-api.token
 docker/stun-operator-api.token
 docker/relay-operator-api.token
 docker/relay-admission.token
+clients/macos/HeteroNetwork.xcodeproj/
+clients/macos/Config/App-Info.plist
+clients/macos/Config/PacketTunnel-Info.plist
+clients/macos/.derived-data/

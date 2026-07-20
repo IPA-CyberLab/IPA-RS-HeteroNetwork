@@ -1,0 +1,129 @@
+name: HeteroNetwork
+
+options:
+  bundleIdPrefix: jp.go.ipa.cyberlab
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+packages:
+  WireGuardKit:
+    url: https://git.zx2c4.com/wireguard-apple
+    revision: 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CLANG_ENABLE_MODULES: YES
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+targets:
+  HeteroNetworkCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/Core
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.go.ipa.cyberlab.heteronetwork.core
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+
+  WireGuardGoBridgeMacOS:
+    type: ""
+    platform: macOS
+    settings:
+      base:
+        SDKROOT: macosx
+    legacy:
+      toolPath: /usr/bin/make
+      arguments: $(ACTION)
+      passSettings: true
+      workingDirectory: ${BUILD_DIR%Build/*}SourcePackages/checkouts/wireguard-apple/Sources/WireGuardKitGo
+
+  HeteroNetworkPacketTunnel:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/PacketTunnel
+    dependencies:
+      - target: HeteroNetworkCore
+      - target: WireGuardGoBridgeMacOS
+      - package: WireGuardKit
+        product: WireGuardKit
+    info:
+      path: Config/PacketTunnel-Info.plist
+      properties:
+        CFBundleDisplayName: HeteroNetwork Tunnel
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+        HeteroNetworkKeychainAccessGroup: $(AppIdentifierPrefix)jp.go.ipa.cyberlab.heteronetwork.shared
+    entitlements:
+      path: Config/PacketTunnel.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.go.ipa.cyberlab.heteronetwork.PacketTunnel
+        PRODUCT_NAME: HeteroNetworkPacketTunnel
+        SKIP_INSTALL: YES
+
+  HeteroNetwork:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/App
+    dependencies:
+      - target: HeteroNetworkCore
+      - target: HeteroNetworkPacketTunnel
+        embed: true
+    info:
+      path: Config/App-Info.plist
+      properties:
+        CFBundleDisplayName: HeteroNetwork
+        LSApplicationCategoryType: public.app-category.utilities
+        LSUIElement: true
+        CFBundleURLTypes:
+          - CFBundleURLName: jp.go.ipa.cyberlab.heteronetwork.enrollment
+            CFBundleURLSchemes:
+              - heteronetwork
+        HeteroNetworkKeychainAccessGroup: $(AppIdentifierPrefix)jp.go.ipa.cyberlab.heteronetwork.shared
+    entitlements:
+      path: Config/App.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.go.ipa.cyberlab.heteronetwork
+        PRODUCT_NAME: HeteroNetwork
+
+  HeteroNetworkCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/CoreTests
+    dependencies:
+      - target: HeteroNetworkCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.go.ipa.cyberlab.heteronetwork.core-tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  HeteroNetwork:
+    build:
+      targets:
+        HeteroNetwork: all
+        HeteroNetworkPacketTunnel: all
+        HeteroNetworkCore: all
+        WireGuardGoBridgeMacOS: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HeteroNetworkCoreTests
+    archive:
+      config: Release
