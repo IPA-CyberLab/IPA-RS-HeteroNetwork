@@ -464,6 +464,8 @@ start_agent() {
     --peer-probe-sample-count 3 \
     --peer-probe-response-timeout-millis 500 \
     --peer-probe-sample-interval-millis 100 \
+    --packet-flow-detector conntrack-netlink-events \
+    --packet-flow-poll-interval-seconds 1 \
     >"$log_path" 2>&1 &
   local pid=$!
   agent_pids+=("$pid")

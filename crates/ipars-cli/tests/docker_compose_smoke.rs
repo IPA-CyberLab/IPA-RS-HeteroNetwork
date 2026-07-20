@@ -1302,13 +1302,13 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         &compose,
         "workload-a",
         agent_workload_ip,
-        &[workload_b_cidr, "100.64.0.0/10".parse()?],
+        &[workload_b_cidr, ipv4_host_route_for(agent_b_vpn_ip)?],
     )?;
     configure_compose_workload_routes(
         &compose,
         "workload-b",
         agent_b_workload_ip,
-        &[workload_a_cidr, "100.64.0.0/10".parse()?],
+        &[workload_a_cidr, ipv4_host_route_for(agent_vpn_ip)?],
     )?;
     configure_compose_workload_ipv6_routes(
         &compose,
@@ -2599,6 +2599,13 @@ fn ipv4_network_probe_address(cidr: Ipv4Net) -> Ipv4Addr {
         .filter(|candidate| *candidate < broadcast)
         .map(Ipv4Addr::from)
         .unwrap_or_else(|| cidr.network())
+}
+
+fn ipv4_host_route_for(address: IpAddr) -> Result<Ipv4Net> {
+    let IpAddr::V4(address) = address else {
+        anyhow::bail!("Docker dataplane Agent VPN address must be IPv4, got {address}");
+    };
+    Ok(Ipv4Net::new(address, 32)?)
 }
 
 fn wait_for_compose_advertised_route_replacement(
