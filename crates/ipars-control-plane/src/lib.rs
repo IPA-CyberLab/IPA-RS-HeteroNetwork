@@ -8,30 +8,33 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
-    verify_control_plane_node_query_signature, verify_heartbeat_request_signature,
-    verify_join_token, verify_remove_node_signature, verify_signal_node_upsert_signature,
-    verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
+    verify_client_control_request_signature, verify_control_plane_node_query_signature,
+    verify_heartbeat_request_signature, verify_join_token, verify_remove_node_signature,
+    verify_signal_node_upsert_signature, verify_token_revocation_signature,
+    verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind,
-    ControlPlaneNodeQueryRequest, ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse,
-    NatTraversalStrategyCount, PathStateCount, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
-    RelayMap, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
+    ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse,
+    ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+    ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
+    PathStateCount, PeerMap, RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest,
+    RegisterNodeResponse, RelayMap, RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse,
+    RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    SignalNodeUpsertRequest,
 };
 use ipars_types::{
     canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, relay_admission_url_is_usable,
     validate_join_token_bootstrap_endpoints, AclAction, AclRule, BootstrapEndpoint,
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, HealthState,
-    JoinTokenClaims, KeyId, NatClassification, NatTraversalStrategy, NodeHealth, NodeId,
-    NodeRecord, PathRecord, PathState, RelayCapability, Role, Route, ServiceDirectory,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
+    HealthState, JoinTokenClaims, KeyId, NatClassification, NatTraversalStrategy, NodeHealth,
+    NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Role, Route, ServiceDirectory,
     ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord,
     TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
     JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use ipnet::IpNet;
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
@@ -53,6 +56,10 @@ pub const NODE_ENROLLMENT_ALLOWED_ROLES: [&str; 3] = ["edge", "worker", "gateway
 
 pub fn node_enrollment_role_is_allowed(role: &Role) -> bool {
     NODE_ENROLLMENT_ALLOWED_ROLES.contains(&role.as_str())
+}
+
+pub fn enrollment_role_is_allowed(role: &Role) -> bool {
+    node_enrollment_role_is_allowed(role) || role.is_client()
 }
 
 #[derive(Debug, Error)]
@@ -745,7 +752,7 @@ fn validate_issuer_key_policy(
     {
         return Err(reject("validity exceeds the configured maximum"));
     }
-    if !node_enrollment_role_is_allowed(&claims.role) {
+    if !enrollment_role_is_allowed(&claims.role) {
         return Err(reject("role is not allowed"));
     }
     if claims.tags != claims.policy.allowed_tags {
@@ -761,16 +768,22 @@ fn validate_issuer_key_policy(
     {
         return Err(reject("token uses must be finite and bounded"));
     }
-    for kind in [
-        BootstrapEndpointKind::ControlPlane,
-        BootstrapEndpointKind::Signal,
-        BootstrapEndpointKind::Stun,
-    ] {
-        if join_token_endpoint_count(claims, kind) < 2 {
+    let required_endpoint_kinds: &[BootstrapEndpointKind] = if claims.role.is_client() {
+        &[BootstrapEndpointKind::ControlPlane]
+    } else {
+        &[
+            BootstrapEndpointKind::ControlPlane,
+            BootstrapEndpointKind::Signal,
+            BootstrapEndpointKind::Stun,
+        ]
+    };
+    for kind in required_endpoint_kinds {
+        if join_token_endpoint_count(claims, *kind) < 2 {
             return Err(reject("HA bootstrap endpoints are required"));
         }
     }
-    if claims.policy.allow_relay
+    if !claims.role.is_client()
+        && claims.policy.allow_relay
         && join_token_endpoint_count(claims, BootstrapEndpointKind::Relay) < 2
     {
         return Err(reject("two relay bootstrap endpoints are required"));
@@ -870,8 +883,31 @@ where
         now: chrono::DateTime<Utc>,
     ) -> Result<RegisterNodeResponse, ControlPlaneError> {
         self.validate_join_token(&token, now)?;
+        if token.claims.role.is_client() {
+            return Err(ControlPlaneError::JoinDenied);
+        }
         self.admission.admit_join(&token.claims, now).await?;
         self.plane.register_with_claims(token.claims, request).await
+    }
+
+    pub async fn join_client(
+        &self,
+        token: SignedJoinToken,
+        request: RegisterClientRequest,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RegisterClientResponse, ControlPlaneError> {
+        self.validate_join_token(&token, now)?;
+        if !token.claims.role.is_client()
+            || token.claims.policy.allow_relay
+            || !token.claims.policy.allowed_routes.is_empty()
+        {
+            return Err(ControlPlaneError::JoinDenied);
+        }
+        self.plane.require_client_gateway().await?;
+        self.admission.admit_join(&token.claims, now).await?;
+        self.plane
+            .register_client_with_claims(token.claims, request)
+            .await
     }
 
     pub async fn revoke_token(
@@ -1101,7 +1137,23 @@ where
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
-        self.store.list_nodes().await
+        Ok(self
+            .store
+            .list_nodes()
+            .await?
+            .into_iter()
+            .filter(|node| !node.role.is_client())
+            .collect())
+    }
+
+    pub async fn require_client_gateway(&self) -> Result<NodeRecord, ControlPlaneError> {
+        let now = Utc::now();
+        let policy = self.policy_snapshot()?;
+        select_client_gateway(&self.store.list_nodes().await?, now, &policy)
+            .cloned()
+            .ok_or_else(|| {
+                ControlPlaneError::Store("no reachable client gateway is registered".to_string())
+            })
     }
 
     pub async fn health_for_node(
@@ -1252,6 +1304,49 @@ where
     }
 
     pub async fn register_with_claims(
+        &self,
+        claims: JoinTokenClaims,
+        request: RegisterNodeRequest,
+    ) -> Result<RegisterNodeResponse, ControlPlaneError> {
+        if claims.role.is_client() {
+            return Err(ControlPlaneError::JoinDenied);
+        }
+        self.register_participant_with_claims(claims, request).await
+    }
+
+    pub async fn register_client_with_claims(
+        &self,
+        claims: JoinTokenClaims,
+        request: RegisterClientRequest,
+    ) -> Result<RegisterClientResponse, ControlPlaneError> {
+        if !claims.role.is_client()
+            || claims.policy.allow_relay
+            || !claims.policy.allowed_routes.is_empty()
+        {
+            return Err(ControlPlaneError::JoinDenied);
+        }
+        let response = self
+            .register_participant_with_claims(
+                claims,
+                RegisterNodeRequest {
+                    node_id: request.client_id,
+                    identity_public_key: request.identity_public_key,
+                    wireguard_public_key: request.wireguard_public_key,
+                    candidates: Vec::new(),
+                    nat_classification: None,
+                    relay_capability: None,
+                    requested_routes: Vec::new(),
+                },
+            )
+            .await?;
+        Ok(RegisterClientResponse {
+            client: response.node,
+            peer_map: response.peer_map,
+            cluster_policy: response.cluster_policy,
+        })
+    }
+
+    async fn register_participant_with_claims(
         &self,
         claims: JoinTokenClaims,
         request: RegisterNodeRequest,
@@ -1411,6 +1506,12 @@ where
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        if node.role.is_client() {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.node_id.clone(),
+                reason: "client identities must use the client control API".to_string(),
+            });
+        }
         verify_control_plane_node_query_signature(request, kind, &node.identity_public_key)
             .map_err(|error| ControlPlaneError::NodeSignatureRejected {
                 node_id: request.node_id.clone(),
@@ -1450,6 +1551,66 @@ where
         Ok(node)
     }
 
+    pub async fn authenticate_client_request(
+        &self,
+        request: &ClientControlRequest,
+        kind: ClientRequestKind,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let signature = request
+            .request_signature
+            .as_ref()
+            .ok_or_else(|| ControlPlaneError::NodeSignatureRequired(request.client_id.clone()))?;
+        let client = self
+            .store
+            .get_node(&request.client_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.client_id.clone()))?;
+        if !client.role.is_client() {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.client_id.clone(),
+                reason: "node identities cannot use the client control API".to_string(),
+            });
+        }
+        verify_client_control_request_signature(request, kind, &client.identity_public_key)
+            .map_err(|error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.client_id.clone(),
+                reason: error.to_string(),
+            })?;
+        if !timestamp_within_skew(
+            signature.signed_at,
+            now,
+            self.config.heartbeat_signature_max_age,
+        ) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.client_id.clone(),
+                reason: format!(
+                    "signed_at {} is outside the allowed {}s window",
+                    signature.signed_at,
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+
+        let key = (request.client_id.clone(), signature.nonce.clone());
+        let mut accepted = self.accepted_node_query_nonces.lock().await;
+        accepted.retain(|_, accepted_at| {
+            now.signed_duration_since(*accepted_at)
+                .to_std()
+                .map_or(true, |age| age <= self.config.heartbeat_signature_max_age)
+        });
+        if accepted.contains_key(&key) {
+            return Err(ControlPlaneError::NodeRequestReplay(
+                request.client_id.clone(),
+            ));
+        }
+        if accepted.len() >= MAX_ACCEPTED_NODE_QUERY_NONCES {
+            return Err(ControlPlaneError::NodeRequestAuthenticationCapacity);
+        }
+        accepted.insert(key, now);
+        Ok(client)
+    }
+
     pub async fn peer_map_for(&self, node_id: &NodeId) -> Result<PeerMap, ControlPlaneError> {
         let source = self
             .store
@@ -1475,6 +1636,20 @@ where
         ))
     }
 
+    pub async fn remove_client(
+        &self,
+        request: ClientControlRequest,
+    ) -> Result<RemoveClientResponse, ControlPlaneError> {
+        self.authenticate_client_request(&request, ClientRequestKind::Remove, Utc::now())
+            .await?;
+        let removed = self.store.remove_node(&request.client_id).await?;
+        *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
+        Ok(RemoveClientResponse {
+            client: removed.node,
+            removed_at: Utc::now(),
+        })
+    }
+
     pub async fn remove_node(
         &self,
         request: RemoveNodeRequest,
@@ -1493,6 +1668,12 @@ where
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        if node.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: "client identities must use the client control API".to_string(),
+            });
+        }
         self.validate_remove_node_request(&request, &node, Utc::now())?;
         let removed = self.store.remove_node(&request.node_id).await?;
         *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
@@ -1548,6 +1729,12 @@ where
             .get_node(node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if source.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "clients cannot query node paths".to_string(),
+            });
+        }
         let peers = self.store.list_nodes().await?;
         let peers_by_id = peers
             .iter()
@@ -1608,6 +1795,12 @@ where
             .get_node(&request.node.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node.node_id.clone()))?;
+        if node.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node.node_id.clone(),
+                reason: "clients cannot register with Signal".to_string(),
+            });
+        }
         let signature = request.request_signature.as_ref().ok_or_else(|| {
             ControlPlaneError::NodeSignatureRequired(request.node.node_id.clone())
         })?;
@@ -1643,6 +1836,12 @@ where
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        if node.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: "clients cannot submit node heartbeats".to_string(),
+            });
+        }
         let previous_health = self.store.get_health(&request.node_id).await?;
         let now = Utc::now();
         self.validate_heartbeat_request(&request, &node, previous_health.as_ref(), now)?;
@@ -1738,6 +1937,12 @@ where
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        if node.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: "clients cannot use node key rotation".to_string(),
+            });
+        }
         self.validate_wireguard_key_rotation_request(&request, &node, Utc::now())?;
         let rotated_at = Utc::now();
         let updated_node = self
@@ -2226,7 +2431,16 @@ where
     }
 
     pub async fn metrics(&self) -> Result<ControlPlaneMetricsResponse, ControlPlaneError> {
-        let nodes = self.store.list_nodes().await?;
+        let participants = self.store.list_nodes().await?;
+        let client_count = participants
+            .iter()
+            .filter(|participant| participant.role.is_client())
+            .count();
+        let nodes = participants
+            .iter()
+            .filter(|participant| !participant.role.is_client())
+            .cloned()
+            .collect::<Vec<_>>();
         let health_by_node = self.health_by_node(&nodes).await?;
         let policy = self.policy_snapshot()?;
         let mut healthy_node_count = 0;
@@ -2268,7 +2482,7 @@ where
             })
             .count();
         let vpn_pool_total_count = vpn_pool_usable_host_count(self.config.vpn_pool);
-        let vpn_pool_allocated_count = assigned_ipv4_vpn_ips(&nodes)
+        let vpn_pool_allocated_count = assigned_ipv4_vpn_ips(&participants)
             .into_iter()
             .filter(|ip| vpn_pool_contains_usable_host(self.config.vpn_pool, *ip))
             .count() as u64;
@@ -2305,6 +2519,7 @@ where
         Ok(ControlPlaneMetricsResponse {
             cluster_id: self.config.cluster_id.clone(),
             node_count: nodes.len(),
+            client_count,
             relay_candidate_count,
             active_service_instance_count: service_directory.instances.len(),
             active_control_plane_count,
@@ -2373,14 +2588,14 @@ where
         bootstrap_endpoints: Vec<BootstrapEndpoint>,
         generated_at: chrono::DateTime<Utc>,
     ) -> PeerMap {
+        let visible_peers = if source.role.is_client() {
+            client_gateway_peer_map(source, peers, policy, generated_at)
+        } else {
+            node_peer_map_with_clients(source, peers, policy, generated_at)
+        };
         PeerMap {
             cluster_id: self.config.cluster_id.clone(),
-            peers: peers
-                .iter()
-                .filter(|peer| peer.node_id != source.node_id)
-                .filter_map(|peer| acl_filter_peer(source, peer, policy))
-                .map(|peer| filter_served_endpoint_candidates(peer, generated_at, policy))
-                .collect(),
+            peers: visible_peers,
             bootstrap_endpoints,
             generated_at,
         }
@@ -2417,6 +2632,212 @@ where
                 .collect(),
             generated_at,
         }
+    }
+}
+
+fn client_gateway_peer_map(
+    source: &NodeRecord,
+    peers: &[NodeRecord],
+    policy: &ClusterPolicy,
+    generated_at: chrono::DateTime<Utc>,
+) -> Vec<NodeRecord> {
+    let visible_nodes = peers
+        .iter()
+        .filter(|peer| peer.node_id != source.node_id && !peer.role.is_client())
+        .filter_map(|peer| acl_filter_peer(source, peer, policy))
+        .collect::<Vec<_>>();
+    let Some(gateway) = select_client_gateway(&visible_nodes, generated_at, policy) else {
+        return Vec::new();
+    };
+    let gateway_id = gateway.node_id.clone();
+    let mut projected_gateway = gateway.clone();
+    let mut routes = projected_gateway
+        .routes
+        .drain(..)
+        .map(|route| (route.cidr, route))
+        .collect::<BTreeMap<_, _>>();
+
+    for node in &visible_nodes {
+        if node.node_id == gateway_id {
+            continue;
+        }
+        if let Some(route) = projected_gateway_host_route(&projected_gateway, node) {
+            insert_preferred_gateway_route(&mut routes, route);
+        }
+        for route in &node.routes {
+            insert_preferred_gateway_route(
+                &mut routes,
+                Route {
+                    id: format!("client-via-{}-{}", node.node_id, route.id),
+                    cidr: route.cidr,
+                    advertised_by: gateway_id.clone(),
+                    via: Some(gateway_id.clone()),
+                    metric: route.metric,
+                    tags: route.tags.clone(),
+                },
+            );
+        }
+    }
+    projected_gateway.routes = routes.into_values().collect();
+    vec![filter_served_endpoint_candidates(
+        projected_gateway,
+        generated_at,
+        policy,
+    )]
+}
+
+fn node_peer_map_with_clients(
+    source: &NodeRecord,
+    peers: &[NodeRecord],
+    policy: &ClusterPolicy,
+    generated_at: chrono::DateTime<Utc>,
+) -> Vec<NodeRecord> {
+    let gateway_id =
+        select_client_gateway(peers, generated_at, policy).map(|gateway| gateway.node_id.clone());
+    let client_routes = if gateway_id.as_ref() == Some(&source.node_id) {
+        Vec::new()
+    } else {
+        peers
+            .iter()
+            .filter(|peer| peer.role.is_client())
+            .filter(|client| acl_filter_peer(source, client, policy).is_some())
+            .filter_map(|client| {
+                gateway_id
+                    .as_ref()
+                    .and_then(|gateway| gateway_route_for_client(gateway, client))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    peers
+        .iter()
+        .filter(|peer| peer.node_id != source.node_id)
+        .filter_map(|peer| {
+            if peer.role.is_client() {
+                if gateway_id.as_ref() != Some(&source.node_id) {
+                    return None;
+                }
+                return acl_filter_peer(source, peer, policy)
+                    .map(|peer| filter_served_endpoint_candidates(peer, generated_at, policy));
+            }
+
+            let mut visible = acl_filter_peer(source, peer, policy)?;
+            if gateway_id.as_ref() == Some(&visible.node_id) && visible.node_id != source.node_id {
+                let mut routes = visible
+                    .routes
+                    .drain(..)
+                    .map(|route| (route.cidr, route))
+                    .collect::<BTreeMap<_, _>>();
+                for route in &client_routes {
+                    insert_preferred_gateway_route(&mut routes, route.clone());
+                }
+                visible.routes = routes.into_values().collect();
+            }
+            Some(filter_served_endpoint_candidates(
+                visible,
+                generated_at,
+                policy,
+            ))
+        })
+        .collect()
+}
+
+fn select_client_gateway<'a>(
+    nodes: &'a [NodeRecord],
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> Option<&'a NodeRecord> {
+    nodes
+        .iter()
+        .filter(|node| !node.role.is_client())
+        .filter_map(|node| {
+            client_gateway_candidate_score(node, now, policy).map(|candidate_score| {
+                (
+                    node.role.as_str() != "gateway",
+                    candidate_score,
+                    node.node_id.as_str(),
+                    node,
+                )
+            })
+        })
+        .min_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(right.2))
+        })
+        .map(|(_, _, _, node)| node)
+}
+
+fn client_gateway_candidate_score(
+    node: &NodeRecord,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> Option<(u8, u32, u16, String)> {
+    node.endpoint_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.node_id == node.node_id
+                && candidate.validate_kind_address().is_ok()
+                && endpoint_addr_is_usable(candidate.addr)
+                && endpoint_candidate_is_fresh(
+                    candidate,
+                    now,
+                    policy.endpoint_candidate_ttl_seconds,
+                )
+        })
+        .filter_map(|candidate| {
+            let rank = match candidate.kind {
+                EndpointCandidateKind::Ipv6 => 0,
+                EndpointCandidateKind::PublicUdp => 1,
+                EndpointCandidateKind::StunReflexive => 2,
+                EndpointCandidateKind::LocalUdp | EndpointCandidateKind::Relay => return None,
+            };
+            Some((
+                rank,
+                candidate.cost,
+                u16::MAX.saturating_sub(candidate.priority),
+                candidate.addr.to_string(),
+            ))
+        })
+        .min()
+}
+
+fn projected_gateway_host_route(gateway: &NodeRecord, target: &NodeRecord) -> Option<Route> {
+    Some(Route {
+        id: format!("client-via-{}", target.node_id),
+        cidr: vpn_host_cidr(&target.vpn_ip)?,
+        advertised_by: gateway.node_id.clone(),
+        via: Some(gateway.node_id.clone()),
+        metric: 10,
+        tags: target.tags.clone(),
+    })
+}
+
+fn gateway_route_for_client(gateway_id: &NodeId, client: &NodeRecord) -> Option<Route> {
+    Some(Route {
+        id: format!("client-{}", client.node_id),
+        cidr: vpn_host_cidr(&client.vpn_ip)?,
+        advertised_by: gateway_id.clone(),
+        via: Some(gateway_id.clone()),
+        metric: 10,
+        tags: client.tags.clone(),
+    })
+}
+
+fn vpn_host_cidr(vpn_ip: &VpnIp) -> Option<IpNet> {
+    match vpn_ip.0 {
+        IpAddr::V4(ip) => Ipv4Net::new(ip, 32).ok().map(IpNet::V4),
+        IpAddr::V6(ip) => Ipv6Net::new(ip, 128).ok().map(IpNet::V6),
+    }
+}
+
+fn insert_preferred_gateway_route(routes: &mut BTreeMap<IpNet, Route>, route: Route) {
+    let replace = routes.get(&route.cidr).is_none_or(|current| {
+        (route.metric, route.id.as_str()) < (current.metric, current.id.as_str())
+    });
+    if replace {
+        routes.insert(route.cidr, route);
     }
 }
 
@@ -3324,8 +3745,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
-        HeartbeatRequest, RegisterNodeRequest, RemoveNodeRequest, RevokeTokenRequest,
-        RotateWireGuardKeyRequest,
+        ClientControlRequest, ClientRequestKind, HeartbeatRequest, RegisterClientRequest,
+        RegisterNodeRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
@@ -4343,6 +4764,140 @@ mod tests {
         assert_eq!(second.node.vpn_ip, first.node.vpn_ip);
         assert_eq!(second.node.endpoint_candidates, request.candidates);
         assert_eq!(plane.peer_map_for(&request.node_id).await?.peers.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_client_is_hidden_and_routes_only_through_the_selected_gateway(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-client");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 96, 0, 0), 29)?,
+            ),
+            store,
+        );
+
+        let mut gateway_claims = claims(cluster_id.clone());
+        gateway_claims.role = Role::gateway();
+        let mut gateway_registration = registration_request("client-gateway");
+        gateway_registration.candidates = vec![candidate("client-gateway")];
+        let gateway = plane
+            .register_with_claims(gateway_claims, gateway_registration)
+            .await?
+            .node;
+        let worker = plane
+            .register_with_claims(
+                claims(cluster_id.clone()),
+                registration_request("client-worker"),
+            )
+            .await?
+            .node;
+
+        let client_identity = identity_for_node("mac-client");
+        let mut client_claims = claims(cluster_id);
+        client_claims.role = Role::client();
+        client_claims.tags.clear();
+        client_claims.policy.allowed_tags.clear();
+        let registration = plane
+            .register_client_with_claims(
+                client_claims,
+                RegisterClientRequest {
+                    client_id: client_identity.node_id(),
+                    identity_public_key: client_identity.public_key_b64(),
+                    wireguard_public_key: wireguard_public_key_for_node("mac-client"),
+                },
+            )
+            .await?;
+        let client = registration.client;
+        let worker_cidr: IpNet = format!("{}/32", worker.vpn_ip).parse()?;
+        let client_cidr: IpNet = format!("{}/32", client.vpn_ip).parse()?;
+
+        assert_eq!(registration.peer_map.peers.len(), 1);
+        assert_eq!(registration.peer_map.peers[0].node_id, gateway.node_id);
+        assert!(registration.peer_map.peers[0]
+            .routes
+            .iter()
+            .any(|route| route.cidr == worker_cidr));
+
+        let listed_nodes = plane.list_nodes().await?;
+        assert_eq!(listed_nodes.len(), 2);
+        assert!(listed_nodes.iter().all(|node| !node.role.is_client()));
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.node_count, 2);
+        assert_eq!(metrics.client_count, 1);
+        assert_eq!(metrics.vpn_pool_allocated_count, 3);
+
+        let gateway_map = plane.peer_map_for(&gateway.node_id).await?;
+        assert!(gateway_map
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == client.node_id));
+        let worker_map = plane.peer_map_for(&worker.node_id).await?;
+        assert!(worker_map
+            .peers
+            .iter()
+            .all(|peer| peer.node_id != client.node_id));
+        assert!(worker_map.peers.iter().any(|peer| {
+            peer.node_id == gateway.node_id
+                && peer.routes.iter().any(|route| {
+                    route.cidr == client_cidr
+                        && route.advertised_by == gateway.node_id
+                        && route.via.as_ref() == Some(&gateway.node_id)
+                })
+        }));
+
+        assert!(matches!(
+            plane.paths_for(&client.node_id).await,
+            Err(ControlPlaneError::NodeUpdateRejected { .. })
+        ));
+        assert!(matches!(
+            plane
+                .rotate_wireguard_key(signed_wireguard_key_rotation(
+                    "mac-client",
+                    client.wireguard_public_key.clone(),
+                    wireguard_public_key_for_node("mac-client-rotated"),
+                ))
+                .await,
+            Err(ControlPlaneError::NodeUpdateRejected { .. })
+        ));
+
+        let mut query = ClientControlRequest {
+            client_id: client.node_id.clone(),
+            request_signature: None,
+        };
+        query.request_signature = Some(client_identity.sign_client_control_request(
+            &query,
+            ClientRequestKind::PeerMap,
+            Utc::now(),
+        ));
+        plane
+            .authenticate_client_request(&query, ClientRequestKind::PeerMap, Utc::now())
+            .await?;
+        assert!(matches!(
+            plane
+                .authenticate_client_request(&query, ClientRequestKind::PeerMap, Utc::now())
+                .await,
+            Err(ControlPlaneError::NodeRequestReplay(_))
+        ));
+
+        let mut removal = ClientControlRequest {
+            client_id: client.node_id.clone(),
+            request_signature: None,
+        };
+        removal.request_signature = Some(client_identity.sign_client_control_request(
+            &removal,
+            ClientRequestKind::Remove,
+            Utc::now(),
+        ));
+        let removed = plane.remove_client(removal).await?;
+        assert_eq!(removed.client.node_id, client.node_id);
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.node_count, 2);
+        assert_eq!(metrics.client_count, 0);
+        assert_eq!(metrics.vpn_pool_allocated_count, 2);
         Ok(())
     }
 

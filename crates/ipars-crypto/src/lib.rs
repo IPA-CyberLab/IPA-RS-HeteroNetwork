@@ -3,7 +3,8 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ipars_types::api::{
-    AuthenticatedSignalPathRequest, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+    AuthenticatedSignalPathRequest, ClientControlRequest, ClientRequestKind,
+    ClientRequestSignature, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
     HeartbeatRequest, NodeApiRequestSignature, NodeRequestSignature, RemoveNodeRequest,
     RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
     SignalNodeUpsertRequest, SignalPathRequest,
@@ -172,6 +173,22 @@ impl IdentityKeyPair {
         let payload =
             serde_json::to_vec(&request.signature_payload(kind, signed_at, nonce.clone()))?;
         Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    pub fn sign_client_control_request(
+        &self,
+        request: &ClientControlRequest,
+        kind: ClientRequestKind,
+        signed_at: DateTime<Utc>,
+    ) -> ClientRequestSignature {
+        let nonce = random_node_api_request_nonce();
+        let payload = request.signature_payload(kind, signed_at, &nonce);
+        let signature = self.signing_key.sign(&payload);
+        ClientRequestSignature {
+            signed_at,
+            nonce,
+            signature: encode_bytes(&signature.to_bytes()),
+        }
     }
 
     pub fn sign_signal_path_request(
@@ -380,6 +397,25 @@ pub fn verify_control_plane_node_query_signature(
     verify_node_api_payload(&payload, request_signature, node_public_key_b64)
 }
 
+pub fn verify_client_control_request_signature(
+    request: &ClientControlRequest,
+    kind: ClientRequestKind,
+    client_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let request_signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    validate_node_api_request_nonce(&request_signature.nonce)?;
+    let payload =
+        request.signature_payload(kind, request_signature.signed_at, &request_signature.nonce);
+    verify_ed25519_payload(
+        &payload,
+        request_signature.signature_bytes()?,
+        client_public_key_b64,
+    )
+}
+
 pub fn verify_signal_path_signature(
     request: &AuthenticatedSignalPathRequest,
     node_public_key_b64: &str,
@@ -510,7 +546,8 @@ mod tests {
 
     use chrono::Duration;
     use ipars_types::api::{
-        AuthenticatedSignalPathRequest, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+        AuthenticatedSignalPathRequest, ClientControlRequest, ClientRequestKind,
+        ClientRequestSignature, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
         HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
         SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
     };
@@ -521,6 +558,52 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn client_control_signature_has_a_cross_language_stable_payload() {
+        let identity = IdentityKeyPair::from_signing_bytes([7_u8; 32]);
+        let signed_at = DateTime::parse_from_rfc3339("2026-07-20T12:34:56Z")
+            .unwrap_or_else(|error| panic!("fixed timestamp should parse: {error}"))
+            .with_timezone(&Utc);
+        let nonce = URL_SAFE_NO_PAD.encode([3_u8; NODE_API_REQUEST_NONCE_BYTES]);
+        let mut request = ClientControlRequest {
+            client_id: identity.node_id(),
+            request_signature: None,
+        };
+        let payload = request.signature_payload(ClientRequestKind::PeerMap, signed_at, &nonce);
+        let signature = identity.signing_key.sign(&payload);
+        let signature = encode_bytes(&signature.to_bytes());
+        request.request_signature = Some(ClientRequestSignature {
+            signed_at,
+            nonce,
+            signature: signature.clone(),
+        });
+
+        assert_eq!(
+            request.client_id.as_str(),
+            "node-fe812c12f3ab4ce6ac5db69ac352f906"
+        );
+        assert_eq!(
+            payload,
+            b"heteronetwork-client-request-v1\npeer_map\nnode-fe812c12f3ab4ce6ac5db69ac352f906\n1784550896\nAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD\n"
+        );
+        assert_eq!(
+            signature,
+            "34UsDq5YNr83tomJ2N2o3cgPcaPIihje5uO+OjPp3Ad9DIZJs9Tiu6Dek8OWMkNKPbf+5+ythYm1WTkQWVlGBg=="
+        );
+        assert!(verify_client_control_request_signature(
+            &request,
+            ClientRequestKind::PeerMap,
+            &identity.public_key_b64(),
+        )
+        .is_ok());
+        assert!(verify_client_control_request_signature(
+            &request,
+            ClientRequestKind::Remove,
+            &identity.public_key_b64(),
+        )
+        .is_err());
+    }
 
     #[test]
     fn signed_join_token_round_trips() -> Result<(), CryptoError> {

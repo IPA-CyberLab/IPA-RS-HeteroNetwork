@@ -22,10 +22,11 @@ use ipars_control_plane::{
 };
 use ipars_crypto::IdentityKeyPair;
 use ipars_types::api::{
-    ControlPlaneMetricsResponse, ControlPlaneNodeOverview, ControlPlaneNodeQueryKind,
-    ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse, ControlPlanePathsResponse,
-    ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, PeerMap,
-    RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+    ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse, ControlPlaneNodeOverview,
+    ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse,
+    ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
+    JoinClientRequest, JoinNodeRequest, PeerMap, RegisterClientResponse, RegisterNodeResponse,
+    RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
     RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
@@ -329,6 +330,9 @@ where
     let protocol = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/join", post(join::<S, L>))
+        .route("/v1/clients/join", post(join_client::<S, L>))
+        .route("/v1/clients/peers/query", post(client_peers::<S, L>))
+        .route("/v1/clients/{client_id}", delete(remove_client::<S, L>))
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
         .route("/v1/peers/query", post(peers::<S, L>))
         .route("/v1/paths/query", post(paths::<S, L>))
@@ -363,6 +367,11 @@ where
         .route(
             "/v1/admin/enrollment",
             post(admin_create_node_enrollment::<S, L>)
+                .layer(DefaultBodyLimit::max(MAX_NODE_ENROLLMENT_REQUEST_BYTES)),
+        )
+        .route(
+            "/v1/admin/client-enrollment",
+            post(admin_create_client_enrollment::<S, L>)
                 .layer(DefaultBodyLimit::max(MAX_NODE_ENROLLMENT_REQUEST_BYTES)),
         )
         .route(
@@ -768,6 +777,7 @@ impl WebUiAuthConfig {
             logout_endpoint: Some(self.logout_endpoint.clone()),
             login_endpoint: self.public_url.as_ref().map(|_| "/ui/login".to_string()),
             node_enrollment_enabled: false,
+            client_enrollment_enabled: false,
         }
     }
 }
@@ -894,6 +904,7 @@ struct WebUiPublicConfig {
     logout_endpoint: Option<String>,
     login_endpoint: Option<String>,
     node_enrollment_enabled: bool,
+    client_enrollment_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -1194,9 +1205,11 @@ where
             logout_endpoint: None,
             login_endpoint: None,
             node_enrollment_enabled: false,
+            client_enrollment_enabled: false,
         });
     config.operator_token_enabled = state.operator_api_bearer_token.is_some();
     config.node_enrollment_enabled = state.node_enrollment.is_some();
+    config.client_enrollment_enabled = state.node_enrollment.is_some();
     Json(config)
 }
 
@@ -1234,6 +1247,19 @@ struct AdminNodeEnrollmentResponse {
     install_script: String,
     binary_sha256: String,
     architecture: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminClientEnrollmentRequest {
+    expires_in_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminClientEnrollmentResponse {
+    token: SignedJoinToken,
+    expires_at: DateTime<Utc>,
+    enrollment_uri: String,
 }
 
 fn default_node_enrollment_role() -> String {
@@ -1381,6 +1407,84 @@ where
     Ok(response)
 }
 
+async fn admin_create_client_enrollment<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<AdminClientEnrollmentRequest>,
+) -> Result<Response, NodeEnrollmentApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let enrollment = state.node_enrollment.as_deref().ok_or_else(|| {
+        NodeEnrollmentApiError::unavailable("client enrollment is not configured")
+    })?;
+    if !(MIN_NODE_ENROLLMENT_TTL_SECONDS..=enrollment.max_ttl_seconds)
+        .contains(&request.expires_in_seconds)
+    {
+        return Err(NodeEnrollmentApiError::bad_request(format!(
+            "client enrollment token lifetime must be between {MIN_NODE_ENROLLMENT_TTL_SECONDS} and {} seconds",
+            enrollment.max_ttl_seconds
+        )));
+    }
+    state
+        .plane
+        .require_client_gateway()
+        .await
+        .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
+    let directory = state
+        .plane
+        .service_directory()
+        .await
+        .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
+    require_ha_client_enrollment_directory(&directory)?;
+
+    let now = Utc::now();
+    let expires_at = now
+        .checked_add_signed(ChronoDuration::seconds(request.expires_in_seconds as i64))
+        .ok_or_else(|| NodeEnrollmentApiError::bad_request("token expiration is out of range"))?;
+    let claims = JoinTokenClaims {
+        cluster_id: state.plane.config().cluster_id.clone(),
+        bootstrap_endpoints: directory.bootstrap_endpoints,
+        expires_at,
+        not_before: now - ChronoDuration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
+        role: Role::client(),
+        tags: BTreeSet::new(),
+        issuer: enrollment.issuer.node_id(),
+        key_id: enrollment.key_id.clone(),
+        policy: TokenPolicy {
+            allow_join: true,
+            allow_relay: false,
+            allowed_routes: Vec::new(),
+            allowed_tags: BTreeSet::new(),
+            max_token_uses: Some(1),
+        },
+        nonce: format!("client-enroll-{}", random_oidc_value(24)),
+    };
+    let token = enrollment
+        .issuer
+        .sign_join_token(claims)
+        .map_err(|error| NodeEnrollmentApiError::bad_request(error.to_string()))?;
+    state
+        .join_service
+        .issue_join_token(&token, now)
+        .await
+        .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
+    let token_json = serde_json::to_vec(&token)
+        .map_err(|error| NodeEnrollmentApiError::bad_request(error.to_string()))?;
+    let enrollment_uri = format!(
+        "heteronetwork://enroll?token={}",
+        URL_SAFE_NO_PAD.encode(token_json)
+    );
+    let mut response = Json(AdminClientEnrollmentResponse {
+        token,
+        expires_at,
+        enrollment_uri,
+    })
+    .into_response();
+    apply_node_enrollment_security_headers(&mut response);
+    Ok(response)
+}
+
 fn node_enrollment_max_uses(
     request: &AdminNodeEnrollmentRequest,
 ) -> Result<u32, NodeEnrollmentApiError> {
@@ -1433,6 +1537,24 @@ fn require_ha_node_enrollment_directory(
             missing.join(", ")
         )))
     }
+}
+
+fn require_ha_client_enrollment_directory(
+    directory: &ipars_types::ServiceDirectory,
+) -> Result<(), NodeEnrollmentApiError> {
+    let count = directory
+        .bootstrap_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+        .filter_map(|endpoint| ipars_types::canonical_bootstrap_endpoint_url(&endpoint.url))
+        .collect::<BTreeSet<_>>()
+        .len();
+    if count < 2 {
+        return Err(NodeEnrollmentApiError::unavailable(
+            "client enrollment requires at least two active control-plane endpoints",
+        ));
+    }
+    Ok(())
 }
 
 fn service_instance_count(
@@ -2044,6 +2166,59 @@ where
     Ok((StatusCode::CREATED, Json(response)))
 }
 
+async fn join_client<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<JoinClientRequest>,
+) -> Result<(StatusCode, Json<RegisterClientResponse>), ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let response = state
+        .join_service
+        .join_client(request.token, request.registration, Utc::now())
+        .await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn client_peers<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<ClientControlRequest>,
+) -> Result<Json<PeerMap>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    state
+        .plane
+        .authenticate_client_request(&request, ClientRequestKind::PeerMap, Utc::now())
+        .await?;
+    Ok(Json(state.plane.peer_map_for(&request.client_id).await?))
+}
+
+async fn remove_client<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path(client_id): Path<String>,
+    Json(request): Json<ClientControlRequest>,
+) -> Result<Json<RemoveClientResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let path_client_id = NodeId::from_string(client_id);
+    if request.client_id != path_client_id {
+        return Err(ControlPlaneError::NodeUpdateRejected {
+            node_id: request.client_id.clone(),
+            reason: format!(
+                "path client ID {path_client_id} does not match request client ID {}",
+                request.client_id
+            ),
+        }
+        .into());
+    }
+    Ok(Json(state.plane.remove_client(request).await?))
+}
+
 async fn revoke_token<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Json(request): Json<RevokeTokenRequest>,
@@ -2202,6 +2377,16 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
         &mut body,
         "ipars_control_plane_nodes{{cluster_id=\"{cluster_id}\"}} {}",
         metrics.node_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_clients Number of registered control-only VPN clients."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_clients gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_clients{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.client_count
     );
     prometheus_line!(
         &mut body,
@@ -2625,12 +2810,13 @@ mod tests {
     };
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
-        ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-        ControlPlaneOverviewResponse, ControlPlanePathsResponse, ControlPlanePolicyResponse,
-        HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
-        RegisterNodeResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
-        RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
-        SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
+        ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse,
+        ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse,
+        ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
+        JoinClientRequest, JoinNodeRequest, RegisterClientRequest, RegisterClientResponse,
+        RegisterNodeRequest, RegisterNodeResponse, RemoveClientResponse, RemoveNodeRequest,
+        RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
+        RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
@@ -2922,6 +3108,14 @@ mod tests {
                 ))
                 .await?;
         }
+        let mut gateway_claims = claims(cluster_id.clone(), issuer.node_id(), key_id.clone());
+        gateway_claims.role = Role::gateway();
+        let mut gateway_registration = registration("mac-client-gateway");
+        gateway_registration.candidates = vec![candidate("mac-client-gateway")];
+        let gateway = plane
+            .register_with_claims(gateway_claims, gateway_registration)
+            .await?
+            .node;
 
         let mut key_ring = IssuerKeyRing::default();
         key_ring.insert_node_enrollment_key(
@@ -3123,6 +3317,7 @@ mod tests {
             .await?;
         assert_eq!(second_join.status(), StatusCode::FORBIDDEN);
         let exhausted_artifact = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/install/linux-amd64.sh")
@@ -3131,6 +3326,160 @@ mod tests {
             )
             .await?;
         assert_eq!(exhausted_artifact.status(), StatusCode::UNAUTHORIZED);
+
+        let client_enrollment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/client-enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(r#"{"expires_in_seconds":3600}"#))?,
+            )
+            .await?;
+        assert_eq!(client_enrollment.status(), StatusCode::OK);
+        let client_enrollment_body =
+            axum::body::to_bytes(client_enrollment.into_body(), usize::MAX).await?;
+        let client_enrollment_body: Value = serde_json::from_slice(&client_enrollment_body)?;
+        assert!(client_enrollment_body["enrollment_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("heteronetwork://enroll?token=")));
+        let client_token: SignedJoinToken =
+            serde_json::from_value(client_enrollment_body["token"].clone())?;
+        assert!(client_token.claims.role.is_client());
+        assert!(!client_token.claims.policy.allow_relay);
+        assert!(client_token.claims.policy.allowed_routes.is_empty());
+
+        let wrong_endpoint = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/join")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&JoinNodeRequest {
+                        token: client_token.clone(),
+                        registration: registration("wrong-client-endpoint"),
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(wrong_endpoint.status(), StatusCode::FORBIDDEN);
+
+        let client_identity = identity_for_node("native-mac-client");
+        let client_join = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/clients/join")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&JoinClientRequest {
+                        token: client_token,
+                        registration: RegisterClientRequest {
+                            client_id: client_identity.node_id(),
+                            identity_public_key: client_identity.public_key_b64(),
+                            wireguard_public_key: wireguard_public_key_for_node(
+                                "native-mac-client",
+                            ),
+                        },
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(client_join.status(), StatusCode::CREATED);
+        let client_join_body = axum::body::to_bytes(client_join.into_body(), usize::MAX).await?;
+        let client_join: RegisterClientResponse = serde_json::from_slice(&client_join_body)?;
+        assert!(client_join.client.role.is_client());
+        assert_eq!(client_join.peer_map.peers.len(), 1);
+        assert_eq!(client_join.peer_map.peers[0].node_id, gateway.node_id);
+
+        let mut query = ClientControlRequest {
+            client_id: client_join.client.node_id.clone(),
+            request_signature: None,
+        };
+        query.request_signature = Some(client_identity.sign_client_control_request(
+            &query,
+            ClientRequestKind::PeerMap,
+            Utc::now(),
+        ));
+        let peer_map = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/clients/peers/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&query)?))?,
+            )
+            .await?;
+        assert_eq!(peer_map.status(), StatusCode::OK);
+        let peer_map_body = axum::body::to_bytes(peer_map.into_body(), usize::MAX).await?;
+        let peer_map: PeerMap = serde_json::from_slice(&peer_map_body)?;
+        assert_eq!(peer_map.peers.len(), 1);
+        assert_eq!(peer_map.peers[0].node_id, gateway.node_id);
+
+        let admin_nodes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/nodes")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(admin_nodes.status(), StatusCode::OK);
+        let admin_nodes = axum::body::to_bytes(admin_nodes.into_body(), usize::MAX).await?;
+        let admin_nodes: Value = serde_json::from_slice(&admin_nodes)?;
+        assert!(admin_nodes.as_array().is_some_and(|nodes| nodes
+            .iter()
+            .all(|entry| { entry["node"]["role"].as_str() != Some("client") })));
+
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let metrics = axum::body::to_bytes(metrics.into_body(), usize::MAX).await?;
+        let metrics: ControlPlaneMetricsResponse = serde_json::from_slice(&metrics)?;
+        assert_eq!(metrics.client_count, 1);
+        assert_eq!(metrics.node_count, 2);
+
+        let mut removal = ClientControlRequest {
+            client_id: client_join.client.node_id.clone(),
+            request_signature: None,
+        };
+        removal.request_signature = Some(client_identity.sign_client_control_request(
+            &removal,
+            ClientRequestKind::Remove,
+            Utc::now(),
+        ));
+        let removal_response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/clients/{}", removal.client_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&removal)?))?,
+            )
+            .await?;
+        assert_eq!(removal_response.status(), StatusCode::OK);
+        let removal_body = axum::body::to_bytes(removal_response.into_body(), usize::MAX).await?;
+        let removed: RemoveClientResponse = serde_json::from_slice(&removal_body)?;
+        assert_eq!(removed.client.node_id, client_join.client.node_id);
         std::fs::remove_file(binary_path)?;
         Ok(())
     }

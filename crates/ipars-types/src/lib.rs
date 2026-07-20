@@ -104,6 +104,18 @@ impl Role {
         Self::from_string("edge")
     }
 
+    pub fn gateway() -> Self {
+        Self::from_string("gateway")
+    }
+
+    pub fn client() -> Self {
+        Self::from_string("client")
+    }
+
+    pub fn is_client(&self) -> bool {
+        self.as_str() == "client"
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -1707,6 +1719,88 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RegisterClientRequest {
+        pub client_id: NodeId,
+        pub identity_public_key: String,
+        pub wireguard_public_key: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct JoinClientRequest {
+        pub token: SignedJoinToken,
+        pub registration: RegisterClientRequest,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RegisterClientResponse {
+        pub client: NodeRecord,
+        pub peer_map: PeerMap,
+        pub cluster_policy: ClusterPolicy,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ClientRequestKind {
+        PeerMap,
+        Remove,
+    }
+
+    impl ClientRequestKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::PeerMap => "peer_map",
+                Self::Remove => "remove",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ClientRequestSignature {
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
+        pub signature: String,
+    }
+
+    impl ClientRequestSignature {
+        pub fn signature_bytes(
+            &self,
+        ) -> Result<[u8; ED25519_SIGNATURE_BYTES], Ed25519SignatureValidationError> {
+            decode_ed25519_signature(&self.signature)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ClientControlRequest {
+        pub client_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_signature: Option<ClientRequestSignature>,
+    }
+
+    impl ClientControlRequest {
+        pub fn signature_payload(
+            &self,
+            kind: ClientRequestKind,
+            signed_at: DateTime<Utc>,
+            nonce: &str,
+        ) -> Vec<u8> {
+            format!(
+                "heteronetwork-client-request-v1\n{}\n{}\n{}\n{}\n",
+                kind.as_str(),
+                self.client_id,
+                signed_at.timestamp(),
+                nonce
+            )
+            .into_bytes()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RemoveClientResponse {
+        pub client: NodeRecord,
+        pub removed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PeerMap {
         pub cluster_id: ClusterId,
         pub peers: Vec<NodeRecord>,
@@ -2003,6 +2097,8 @@ pub mod api {
     pub struct ControlPlaneMetricsResponse {
         pub cluster_id: ClusterId,
         pub node_count: usize,
+        #[serde(default)]
+        pub client_count: usize,
         pub relay_candidate_count: usize,
         #[serde(default)]
         pub active_service_instance_count: usize,

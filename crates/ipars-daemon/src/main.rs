@@ -18094,6 +18094,7 @@ mod tests {
         let metrics = ControlPlaneMetricsResponse {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_count: 2,
+            client_count: 0,
             relay_candidate_count: 1,
             active_service_instance_count: 2,
             active_control_plane_count: 2,

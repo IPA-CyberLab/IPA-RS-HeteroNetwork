@@ -12328,6 +12328,7 @@ fi
         ControlPlaneMetricsResponse {
             cluster_id: ClusterId::from_string("load-summary-test"),
             node_count: healthy_node_count + degraded_node_count + unhealthy_node_count,
+            client_count: 0,
             relay_candidate_count,
             active_service_instance_count: 0,
             active_control_plane_count: 0,
