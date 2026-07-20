@@ -109,7 +109,7 @@ jobs:
 
       - name: Generate Xcode project
         working-directory: clients/macos
-        run: xcodegen generate
+        run: ./scripts/bootstrap.sh
 
       - name: Resolve pinned WireGuardKit package
         working-directory: clients/macos

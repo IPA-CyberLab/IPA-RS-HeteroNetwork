@@ -15,3 +15,4 @@ clients/macos/HeteroNetwork.xcodeproj/
 clients/macos/Config/App-Info.plist
 clients/macos/Config/PacketTunnel-Info.plist
 clients/macos/.derived-data/
+clients/macos/.build/

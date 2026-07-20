@@ -18,9 +18,14 @@ node inventory.
 
 ```bash
 cd clients/macos
-xcodegen generate
+./scripts/bootstrap.sh
 open HeteroNetwork.xcodeproj
 ```
+
+`bootstrap.sh` fetches the official WireGuardKit source at the pinned commit
+into the ignored `.build` directory and corrects its inconsistent Swift tools
+manifest declaration before generating the project. It refuses a checkout at
+any other revision.
 
 Set the same Apple development team on `HeteroNetwork`,
 `HeteroNetworkPacketTunnel`, and `HeteroNetworkCore`. The bundle IDs, App Group,

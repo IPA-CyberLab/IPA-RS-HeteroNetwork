@@ -9,8 +9,7 @@ options:
 
 packages:
   WireGuardKit:
-    url: https://git.zx2c4.com/wireguard-apple
-    revision: 2fec12a6e1f6e3460b6ee483aa00ad29cddadab1
+    path: .build/wireguard-apple
 
 settings:
   base:
@@ -44,7 +43,7 @@ targets:
       toolPath: /usr/bin/make
       arguments: $(ACTION)
       passSettings: true
-      workingDirectory: ${BUILD_DIR%Build/*}SourcePackages/checkouts/wireguard-apple/Sources/WireGuardKitGo
+      workingDirectory: $(PROJECT_DIR)/.build/wireguard-apple/Sources/WireGuardKitGo
 
   HeteroNetworkPacketTunnel:
     type: app-extension
