@@ -2019,6 +2019,7 @@ impl AgentRuntime {
 
     fn request_lazy_connect_sync(&self) {
         self.request_peer_map_sync();
+        self.request_heartbeat_report();
         self.signal_path_notify.notify_one();
     }
 
@@ -2529,6 +2530,13 @@ impl AgentRuntime {
             .read()
             .await
             .recent_local_activity(peer, now)
+    }
+
+    pub async fn recent_local_peer_activities(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<(NodeId, DateTime<Utc>, bool)> {
+        self.lazy_connect.read().await.recent_local_activities(now)
     }
 
     pub async fn replace_internal_packet_flow_udp_ports(&self, ports: BTreeSet<u16>) {
@@ -6148,6 +6156,19 @@ impl LazyConnectManager {
                 (idle_for < Duration::from_secs(self.policy.idle_timeout_seconds))
                     .then_some(*last_used)
             })
+    }
+
+    pub fn recent_local_activities(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<(NodeId, DateTime<Utc>, bool)> {
+        self.local_last_used
+            .keys()
+            .filter_map(|peer| {
+                self.recent_local_activity(peer, now)
+                    .map(|observed_at| (peer.clone(), observed_at, self.is_pinned(peer)))
+            })
+            .collect()
     }
 
     pub fn pin_peer(&mut self, peer: NodeId) {
@@ -10696,11 +10717,17 @@ mod tests {
             .await;
 
         let peer_map_sync = runtime.peer_map_sync_notifier();
+        let heartbeat_report = runtime.heartbeat_report_notifier();
         let vpn_ip_match = runtime
             .record_packet_flow_activity(peer_a.vpn_ip.0, Utc::now(), false)
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_a_id.clone()))?;
         tokio::time::timeout(std::time::Duration::from_secs(1), peer_map_sync.notified()).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            heartbeat_report.notified(),
+        )
+        .await?;
         assert_eq!(vpn_ip_match.peer, peer_a_id);
         assert_eq!(vpn_ip_match.kind, AgentPacketFlowMatchKind::PeerVpnIp);
         assert_eq!(vpn_ip_match.route, None);

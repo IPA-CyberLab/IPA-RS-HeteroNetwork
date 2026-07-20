@@ -59,6 +59,7 @@ const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
 const NODE_ENROLLMENT_ARCH: &str = "linux-amd64";
+const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS: u64 = 20;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -2411,13 +2412,30 @@ where
 
 async fn heartbeat<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
+    Query(query): Query<HeartbeatQuery>,
     Json(request): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    Ok(Json(state.plane.heartbeat(request).await?))
+    let wait = Duration::from_secs(
+        query
+            .wait_seconds
+            .min(MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS),
+    );
+    Ok(Json(
+        state
+            .plane
+            .heartbeat_with_connection_intent_wait(request, wait)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatQuery {
+    #[serde(default)]
+    wait_seconds: u64,
 }
 
 async fn rotate_wireguard_key<S, L>(

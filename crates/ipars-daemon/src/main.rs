@@ -172,6 +172,7 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const RELAY_NODE_ID_STATE_WAIT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
 const DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -12089,6 +12090,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
     } = config;
     let heartbeat_report_notify = runtime.heartbeat_report_notifier();
     loop {
+        let cycle_started = tokio::time::Instant::now();
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
         let routes = heartbeat_routes(route_reporter.as_ref()).await;
@@ -12116,7 +12118,21 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                     control_plane_urls.clone()
                 }
             };
-        match send_heartbeat_to_control_planes(&client, &active_control_plane_urls, request).await {
+        let send = send_heartbeat_to_control_planes(
+            &client,
+            &active_control_plane_urls,
+            request,
+            interval.min(MAX_HEARTBEAT_CONNECTION_INTENT_WAIT),
+        );
+        tokio::pin!(send);
+        let response = tokio::select! {
+            response = &mut send => response,
+            _ = heartbeat_report_notify.notified() => {
+                tracing::debug!("restarting in-flight heartbeat after runtime state changed");
+                continue;
+            }
+        };
+        match response {
             Ok(response) => {
                 if let Err(error) = persist_agent_service_directory(
                     runtime.as_ref(),
@@ -12154,8 +12170,9 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 "failed to report agent heartbeat; will retry"
             ),
         }
+        let remaining = interval.saturating_sub(cycle_started.elapsed());
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(remaining) => {}
             _ = heartbeat_report_notify.notified() => {}
         }
     }
@@ -12165,6 +12182,7 @@ async fn send_heartbeat_to_control_planes(
     client: &reqwest::Client,
     control_plane_urls: &[String],
     request: HeartbeatRequest,
+    connection_intent_wait: Duration,
 ) -> anyhow::Result<HeartbeatResponse> {
     anyhow::ensure!(
         !control_plane_urls.is_empty(),
@@ -12172,7 +12190,14 @@ async fn send_heartbeat_to_control_planes(
     );
     let mut failures = Vec::new();
     for control_plane_url in control_plane_urls {
-        match send_heartbeat(client, control_plane_url, request.clone()).await {
+        match send_heartbeat(
+            client,
+            control_plane_url,
+            request.clone(),
+            connection_intent_wait,
+        )
+        .await
+        {
             Ok(response) => return Ok(response),
             Err(error) => failures.push(format!("{}: {error:#}", heartbeat_url(control_plane_url))),
         }
@@ -12187,9 +12212,11 @@ async fn send_heartbeat(
     client: &reqwest::Client,
     control_plane_url: &str,
     request: HeartbeatRequest,
+    connection_intent_wait: Duration,
 ) -> anyhow::Result<HeartbeatResponse> {
     let response = client
         .post(heartbeat_url(control_plane_url))
+        .query(&[("wait_seconds", connection_intent_wait.as_secs())])
         .json(&request)
         .send()
         .await
@@ -12210,11 +12237,10 @@ async fn heartbeat_request(
     relay_capability: Option<RelayCapability>,
     routes: Option<Vec<Route>>,
 ) -> anyhow::Result<HeartbeatRequest> {
-    runtime
-        .refresh_candidate_observations(chrono::Utc::now())
-        .await;
+    let now = chrono::Utc::now();
+    runtime.refresh_candidate_observations(now).await;
     let status = runtime.status().await;
-    let path_state = runtime.path_state().await;
+    let path_state = heartbeat_path_state(runtime, now).await;
     let health = agent_health_from_status(&status, "agent heartbeat");
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
@@ -12232,6 +12258,84 @@ async fn heartbeat_request(
             .context("failed to sign agent heartbeat request")?,
     );
     Ok(request)
+}
+
+async fn heartbeat_path_state(
+    runtime: &AgentRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<PathRecord> {
+    let mut paths = runtime.path_state().await;
+    let current_candidates_by_peer = runtime
+        .peer_map_snapshot()
+        .await
+        .ok()
+        .map(|peer_map| {
+            peer_map
+                .peers
+                .into_iter()
+                .map(|peer| (peer.node_id, peer.endpoint_candidates))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let activities = runtime.recent_local_peer_activities(now).await;
+    let activity_by_peer = activities
+        .iter()
+        .map(|(peer, observed_at, _)| (peer.clone(), *observed_at))
+        .collect::<BTreeMap<_, _>>();
+    let mut represented_peers = BTreeSet::new();
+    let mut refreshed_selected_candidates = 0_usize;
+    for path in &mut paths {
+        represented_peers.insert(path.key.remote.clone());
+        if let (Some(selected), Some(current_candidates)) = (
+            path.selected_candidate.as_mut(),
+            current_candidates_by_peer.get(&path.key.remote),
+        ) {
+            let current = current_candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.node_id == path.key.remote
+                        && candidate.kind == selected.kind
+                        && candidate.addr == selected.addr
+                })
+                .max_by_key(|candidate| candidate.observed_at);
+            if let Some(current) =
+                current.filter(|current| current.observed_at > selected.observed_at)
+            {
+                *selected = current.clone();
+                refreshed_selected_candidates += 1;
+            }
+        }
+        set_lazy_connect_local_activity_reason(
+            path,
+            activity_by_peer.get(&path.key.remote).copied(),
+        );
+    }
+    if refreshed_selected_candidates > 0 {
+        tracing::debug!(
+            refreshed_selected_candidates,
+            "refreshed heartbeat path candidates from the latest peer map"
+        );
+    }
+
+    let local_node = runtime.state().node_id.clone();
+    for (peer, observed_at, pinned) in activities {
+        if represented_peers.contains(&peer) {
+            continue;
+        }
+        let mut path = PathRecord {
+            key: ipars_types::PeerPathKey::new(local_node.clone(), peer),
+            selected_state: PathState::Unreachable,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore::calculate(PathState::Unreachable, &PathMetrics::default(), true, 0),
+            updated_at: observed_at,
+            pinned,
+        };
+        set_lazy_connect_local_activity_reason(&mut path, Some(observed_at));
+        paths.push(path);
+    }
+    paths.sort_by(|left, right| left.key.remote.cmp(&right.key.remote));
+    paths
 }
 
 fn start_signal_registration(
@@ -18468,6 +18572,7 @@ mod tests {
             &reqwest::Client::new(),
             &[unavailable_url.clone(), available_url],
             request,
+            Duration::ZERO,
         )
         .await?;
         assert_eq!(received.bootstrap_endpoints, discovered);
@@ -18493,6 +18598,50 @@ mod tests {
 
         available_task.abort();
         let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_refreshes_selected_candidate_from_latest_peer_map() -> anyhow::Result<()> {
+        let now = Utc::now();
+        let state = AgentNodeState::generate(now);
+        let local_node = state.node_id.clone();
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let mut current_candidate = candidate("peer-a", EndpointCandidateKind::StunReflexive, 20);
+        current_candidate.observed_at = now;
+        let mut stale_candidate = current_candidate.clone();
+        stale_candidate.observed_at = now - ChronoDuration::seconds(121);
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_node, NodeId::from_string("peer-a")),
+                selected_state: PathState::DirectNatTraversal,
+                selected_candidate: Some(stale_candidate),
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::DirectNatTraversal,
+                    &PathMetrics::default(),
+                    true,
+                    current_candidate.cost,
+                ),
+                updated_at: now,
+                pinned: false,
+            })
+            .await?;
+        let mut peer = node_record("peer-a");
+        peer.endpoint_candidates = vec![current_candidate.clone()];
+        runtime
+            .record_peer_map_snapshot(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
+                generated_at: now,
+            })
+            .await;
+
+        let paths = heartbeat_path_state(&runtime, now).await;
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].selected_candidate, Some(current_candidate));
         Ok(())
     }
 
@@ -33344,6 +33493,10 @@ exec sleep 60
             updated_at: Utc::now(),
             pinned: false,
         };
+        let local_activity_at = Utc::now();
+        runtime
+            .record_peer_activity(path.key.remote.clone(), local_activity_at, false)
+            .await;
         runtime.upsert_path_state(path.clone()).await?;
 
         let stale_observed_at = Utc::now() - chrono::Duration::seconds(300);
@@ -33383,7 +33536,49 @@ exec sleep 60
         assert!(request.candidates[0].observed_at > stale_observed_at);
         assert!(request.relay_capability.is_none());
         assert_eq!(request.routes, Some(vec![advertised_route]));
-        assert_eq!(request.path_state, vec![path]);
+        assert_eq!(request.path_state.len(), 1);
+        assert_eq!(request.path_state[0].key, path.key);
+        assert!(request.path_state[0].score.reasons.iter().any(|reason| {
+            reason
+                == &format!(
+                    "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+                    local_activity_at.timestamp_millis()
+                )
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_reports_activity_before_path_negotiation() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = NodeId::from_string("peer-without-path");
+        let observed_at = Utc::now();
+        runtime
+            .record_peer_activity(peer.clone(), observed_at, false)
+            .await;
+        assert!(runtime.path_state().await.is_empty());
+
+        let request =
+            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+
+        assert_eq!(request.path_state.len(), 1);
+        let path = &request.path_state[0];
+        assert_eq!(path.key.local, runtime.state().node_id);
+        assert_eq!(path.key.remote, peer);
+        assert_eq!(path.selected_state, PathState::Unreachable);
+        assert_eq!(path.selected_candidate, None);
+        assert_eq!(path.relay_node, None);
+        assert_eq!(path.updated_at, observed_at);
+        assert!(path.score.reasons.iter().any(|reason| {
+            reason
+                == &format!(
+                    "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+                    observed_at.timestamp_millis()
+                )
+        }));
         Ok(())
     }
 
