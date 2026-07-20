@@ -288,7 +288,24 @@
     "Enrollment token issued.": "登録トークンを発行しました。",
     "Expiration must be between 1 and 30 days.": "有効期限は 1 日から 30 日の範囲で指定してください。",
     "Maximum uses must be between 2 and 1000.": "最大利用回数は 2 回から 1000 回の範囲で指定してください。",
-    "Copy failed": "コピーに失敗しました"
+    "Copy failed": "コピーに失敗しました",
+    "Linux node": "Linux ノード",
+    "macOS client": "macOS クライアント",
+    "Add a macOS client": "macOS クライアントを追加",
+    "Generate a one-use enrollment link for the native HeteroNetwork app.": "HeteroNetwork ネイティブアプリ用の単回登録リンクを生成します。",
+    "1. Token lifetime": "1. トークン有効期間",
+    "The client token can be used once and cannot advertise routes or relay traffic.": "クライアントトークンは 1 回だけ使用でき、ルートやリレートラフィックを広報できません。",
+    "2. Generate enrollment link": "2. 登録リンクを生成",
+    "Generate macOS link": "macOS リンクを生成",
+    "Enrollment link": "登録リンク",
+    "Open this link on the Mac where HeteroNetwork is installed.": "HeteroNetwork をインストールした Mac でこのリンクを開いてください。",
+    "Copy link": "リンクをコピー",
+    "Open HeteroNetwork": "HeteroNetwork を開く",
+    "Platform": "プラットフォーム",
+    "Link copied.": "リンクをコピーしました。",
+    "macOS enrollment token issued.": "macOS 登録トークンを発行しました。",
+    "Device type": "デバイスタイプ",
+    "Issue a one-use link for the native macOS client.": "macOS ネイティブクライアント用の単回リンクを発行します。"
   };
 
   var state = {
@@ -306,11 +323,13 @@
     locale: document.documentElement.lang === "ja" ? "ja" : "en",
     theme: document.documentElement.dataset.theme === "dark" ? "dark" : "light",
     enrollment: {
+      mode: "linux",
       role: "edge",
       tags: "",
       allowRelay: false,
       reusable: false,
       expirationDays: 7,
+      clientExpirationDays: 1,
       maxUses: 10,
       result: null,
       generating: false
@@ -778,7 +797,7 @@
       state.config = config;
       $("oidc-login").hidden = !config.auth_enabled;
       $("token-form").hidden = !config.operator_token_enabled;
-      $("enrollment-nav").hidden = !config.node_enrollment_enabled;
+      $("enrollment-nav").hidden = !config.node_enrollment_enabled && !config.client_enrollment_enabled;
       updateAuthConfigText();
     });
   }
@@ -1103,7 +1122,18 @@
       + field + '" ' + (checked ? "checked" : "") + '><span class="switch"></span></span></label>';
   }
 
-  function renderEnrollmentResult(result) {
+  function renderEnrollmentModeSwitch(enrollment) {
+    var modes = [];
+    if (state.config.node_enrollment_enabled) {
+      modes.push('<button class="segmented-option ' + (enrollment.mode === "linux" ? "active" : "") + '" data-enrollment-mode="linux" type="button">' + icon("server") + '<span>Linux node</span></button>');
+    }
+    if (state.config.client_enrollment_enabled) {
+      modes.push('<button class="segmented-option ' + (enrollment.mode === "macos" ? "active" : "") + '" data-enrollment-mode="macos" type="button">' + icon("shield-check") + '<span>macOS client</span></button>');
+    }
+    return '<div class="segmented-control enrollment-mode" role="group" aria-label="Device type">' + modes.join("") + '</div>';
+  }
+
+  function renderLinuxEnrollmentResult(result) {
     var tokenJson = JSON.stringify(result.token);
     return '<section class="section-panel enrollment-result"><div class="section-header"><div><h2>' + icon("circle-check")
       + '<span>Install command</span></h2><p>Run this command as a user with sudo access on the new Linux server.</p></div><span class="status-pill healthy">Ready</span></div>'
@@ -1114,11 +1144,18 @@
       + '<details class="token-details"><summary>Enrollment token</summary><div class="token-detail-body"><p>Treat this token as a secret. It is not stored by this browser.</p><pre>' + escapeHtml(tokenJson) + '</pre><button class="button button-secondary button-small" data-copy-enrollment="token" type="button">' + icon("copy") + '<span>Copy token</span></button></div></details></div></section>';
   }
 
-  function renderEnrollment() {
-    if (!state.config || !state.config.node_enrollment_enabled) {
-      return emptyState("Enrollment is not enabled on this control plane.", "", "key");
-    }
-    var enrollment = state.enrollment;
+  function renderClientEnrollmentResult(result) {
+    var tokenJson = JSON.stringify(result.token);
+    return '<section class="section-panel enrollment-result"><div class="section-header"><div><h2>' + icon("circle-check")
+      + '<span>Enrollment link</span></h2><p>Open this link on the Mac where HeteroNetwork is installed.</p></div><span class="status-pill healthy">Ready</span></div>'
+      + '<div class="section-body"><div class="secret-notice">' + icon("key") + '<span>Treat this token as a secret. It is not stored by this browser.</span></div>'
+      + '<div class="command-block enrollment-link-block"><code>' + escapeHtml(result.enrollment_uri) + '</code><button class="icon-button command-copy" data-copy-enrollment="link" type="button" aria-label="Copy link" title="Copy link">' + icon("copy") + '</button></div>'
+      + '<div class="enrollment-result-meta"><div><span>Expires</span><strong>' + escapeHtml(formatTime(result.expires_at)) + '</strong></div><div><span>Uses</span><strong>1</strong></div><div><span>Platform</span><strong>macOS</strong></div></div>'
+      + '<div class="enrollment-actions"><a class="button button-primary" href="' + escapeHtml(result.enrollment_uri) + '">' + icon("external-link") + '<span>Open HeteroNetwork</span></a><button class="button button-secondary" data-copy-enrollment="link" type="button">' + icon("copy") + '<span>Copy link</span></button><button class="button button-secondary" id="reset-enrollment" type="button"><span>Create another</span></button></div>'
+      + '<details class="token-details"><summary>Enrollment token</summary><div class="token-detail-body"><p>Treat this token as a secret. It is not stored by this browser.</p><pre>' + escapeHtml(tokenJson) + '</pre><button class="button button-secondary button-small" data-copy-enrollment="token" type="button">' + icon("copy") + '<span>Copy token</span></button></div></details></div></section>';
+  }
+
+  function renderLinuxEnrollment(enrollment) {
     var reusableUses = enrollment.reusable
       ? '<div class="form-field"><label for="enrollment-max-uses">Maximum uses</label><input id="enrollment-max-uses" data-enrollment-field="maxUses" type="number" min="2" max="1000" value="' + escapeHtml(enrollment.maxUses) + '"></div>'
       : '';
@@ -1128,8 +1165,29 @@
       + enrollmentToggle("reusable", "Reusable", "Allow more than one device to use this token.", enrollment.reusable)
       + '<div class="form-grid enrollment-form-grid"><div class="form-field"><label for="enrollment-expiration">Expiration (days)</label><input id="enrollment-expiration" data-enrollment-field="expirationDays" type="number" min="1" max="30" value="' + escapeHtml(enrollment.expirationDays) + '"></div>' + reusableUses + '</div></div></div>'
       + '<div class="enrollment-step enrollment-generate-step"><div class="step-marker">3</div><div class="step-content"><div class="step-heading"><h2>3. Generate install script</h2><p>The command installs the signed Linux amd64 agent, enrolls once, removes the token, and starts systemd.</p></div><button class="button button-primary" id="generate-enrollment" type="button" ' + (enrollment.generating ? "disabled" : "") + '>' + icon(enrollment.generating ? "refresh-cw" : "terminal") + '<span>' + (enrollment.generating ? "Generating..." : "Generate install script") + '</span></button></div></div></section>';
-    return '<div class="enrollment-page"><div class="enrollment-intro"><span class="eyebrow">HETERONETWORK</span><h2>Add a Linux server</h2><p>Generate a secure install command for a new HeteroNetwork node.</p></div>'
-      + form + (enrollment.result ? renderEnrollmentResult(enrollment.result) : "") + '</div>';
+    return '<div class="enrollment-intro"><span class="eyebrow">HETERONETWORK</span><h2>Add a Linux server</h2><p>Generate a secure install command for a new HeteroNetwork node.</p></div>'
+      + renderEnrollmentModeSwitch(enrollment) + form
+      + (enrollment.result ? renderLinuxEnrollmentResult(enrollment.result) : "");
+  }
+
+  function renderClientEnrollment(enrollment) {
+    var form = '<section class="section-panel enrollment-wizard"><div class="enrollment-step"><div class="step-marker">1</div><div class="step-content"><div class="step-heading"><h2>1. Token lifetime</h2><p>The client token can be used once and cannot advertise routes or relay traffic.</p></div><div class="form-grid enrollment-form-grid"><div class="form-field"><label for="client-enrollment-expiration">Expiration (days)</label><input id="client-enrollment-expiration" data-enrollment-field="clientExpirationDays" type="number" min="1" max="30" value="' + escapeHtml(enrollment.clientExpirationDays) + '"></div></div></div></div>'
+      + '<div class="enrollment-step enrollment-generate-step"><div class="step-marker">2</div><div class="step-content"><div class="step-heading"><h2>2. Generate enrollment link</h2></div><button class="button button-primary" id="generate-enrollment" type="button" ' + (enrollment.generating ? "disabled" : "") + '>' + icon(enrollment.generating ? "refresh-cw" : "external-link") + '<span>' + (enrollment.generating ? "Generating..." : "Generate macOS link") + '</span></button></div></div></section>';
+    return '<div class="enrollment-intro"><span class="eyebrow">HETERONETWORK</span><h2>Add a macOS client</h2><p>Generate a one-use enrollment link for the native HeteroNetwork app.</p></div>'
+      + renderEnrollmentModeSwitch(enrollment) + form
+      + (enrollment.result ? renderClientEnrollmentResult(enrollment.result) : "");
+  }
+
+  function renderEnrollment() {
+    if (!state.config || (!state.config.node_enrollment_enabled && !state.config.client_enrollment_enabled)) {
+      return emptyState("Enrollment is not enabled on this control plane.", "", "key");
+    }
+    var enrollment = state.enrollment;
+    if (enrollment.mode === "macos" && !state.config.client_enrollment_enabled) enrollment.mode = "linux";
+    if (enrollment.mode === "linux" && !state.config.node_enrollment_enabled) enrollment.mode = "macos";
+    return '<div class="enrollment-page">' + (enrollment.mode === "macos"
+      ? renderClientEnrollment(enrollment)
+      : renderLinuxEnrollment(enrollment)) + '</div>';
   }
 
   function updateEnrollmentField(input) {
@@ -1146,32 +1204,36 @@
 
   function issueEnrollment() {
     var enrollment = state.enrollment;
-    var days = Math.floor(Number(enrollment.expirationDays));
+    var days = Math.floor(Number(enrollment.mode === "macos" ? enrollment.clientExpirationDays : enrollment.expirationDays));
     var maxUses = Math.floor(Number(enrollment.maxUses));
     if (!Number.isFinite(days) || days < 1 || days > 30) {
       toast("Expiration must be between 1 and 30 days.", "error");
       return Promise.resolve();
     }
-    if (enrollment.reusable && (!Number.isFinite(maxUses) || maxUses < 2 || maxUses > 1000)) {
+    if (enrollment.mode === "linux" && enrollment.reusable && (!Number.isFinite(maxUses) || maxUses < 2 || maxUses > 1000)) {
       toast("Maximum uses must be between 2 and 1000.", "error");
       return Promise.resolve();
     }
     enrollment.generating = true;
     enrollment.result = null;
     renderView();
-    return api("/v1/admin/enrollment", {
+    var path = enrollment.mode === "macos" ? "/v1/admin/client-enrollment" : "/v1/admin/enrollment";
+    var body = enrollment.mode === "macos" ? {
+      expires_in_seconds: days * 24 * 60 * 60
+    } : {
+      expires_in_seconds: days * 24 * 60 * 60,
+      role: enrollment.role,
+      tags: csvValues(enrollment.tags),
+      allow_relay: enrollment.allowRelay,
+      reusable: enrollment.reusable,
+      max_uses: enrollment.reusable ? maxUses : 1
+    };
+    return api(path, {
       method: "POST",
-      body: JSON.stringify({
-        expires_in_seconds: days * 24 * 60 * 60,
-        role: enrollment.role,
-        tags: csvValues(enrollment.tags),
-        allow_relay: enrollment.allowRelay,
-        reusable: enrollment.reusable,
-        max_uses: enrollment.reusable ? maxUses : 1
-      })
+      body: JSON.stringify(body)
     }).then(function (result) {
       enrollment.result = result;
-      toast("Enrollment token issued.");
+      toast(enrollment.mode === "macos" ? "macOS enrollment token issued." : "Enrollment token issued.");
     }).catch(function (error) {
       toast(error.message, "error");
       setStatus(error.message, true);
@@ -1198,9 +1260,10 @@
   function copyEnrollment(kind) {
     var result = state.enrollment.result;
     if (!result) return;
-    var value = kind === "token" ? JSON.stringify(result.token) : result.install_command;
+    var value = kind === "token" ? JSON.stringify(result.token)
+      : kind === "link" ? result.enrollment_uri : result.install_command;
     copyText(value).then(function () {
-      toast(kind === "token" ? "Token copied." : "Command copied.");
+      toast(kind === "token" ? "Token copied." : kind === "link" ? "Link copied." : "Command copied.");
     }).catch(function (error) { toast(error.message, "error"); });
   }
 
@@ -1229,6 +1292,9 @@
       acl: ["Access control", "Runtime connectivity policy and rules."],
       enrollment: ["Add device", "Issue a short-lived token and install a node with one command."]
     }[state.activeView];
+    if (state.activeView === "enrollment" && state.enrollment.mode === "macos") {
+      metadata = ["Add device", "Issue a one-use link for the native macOS client."];
+    }
     $("view-title").textContent = t(metadata[0]);
     $("view-subtitle").textContent = t(metadata[1]);
     $("breadcrumb-current").textContent = t(metadata[0]);
@@ -1457,6 +1523,13 @@
   });
 
   document.addEventListener("click", function (event) {
+    var enrollmentMode = event.target.closest("[data-enrollment-mode]");
+    if (enrollmentMode) {
+      state.enrollment.mode = enrollmentMode.dataset.enrollmentMode;
+      state.enrollment.result = null;
+      renderView();
+      return;
+    }
     var nav = event.target.closest("[data-view]");
     if (nav) {
       state.activeView = nav.dataset.view;

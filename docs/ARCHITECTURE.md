@@ -39,6 +39,30 @@ Token ledger use is recorded in durable state before registration is accepted. D
 
 During registration, the control plane validates that the submitted identity public key is valid Ed25519 key material, requires the submitted node ID to match the ID derived from that key, validates the submitted WireGuard public key as base64-encoded 32-byte key material, and rejects endpoint candidates or advertised routes that belong to a different node ID. After registration, agents sign heartbeat updates, node-removal requests, and WireGuard key-rotation requests with their node identity key. The agent rotation endpoint generates the next WireGuard keypair locally, submits the signed previous-to-next public-key transition to the control plane, persists the accepted private key in the owner-only agent state file, and updates the running state used by status, registration refreshes, and heartbeat reports. The control plane verifies signatures against the registered node identity public key, rejects missing, invalid, stale, or replayed heartbeat signatures, stores the accepted signature timestamp as the node health freshness time, only accepts endpoint candidates, advertised route updates, or path-state updates that belong to the reporting node, checks heartbeat route updates against the stored token route policy before replacing a node's route set, only removes a node when the request is signed by that node identity, and only rotates a WireGuard key when the signed previous key still matches the durable node record. This keeps health, relay-capacity, candidate, route, lease-removal, data-plane key, and pair-scoped path-state updates bound to the node that owns the registered identity.
 
+## Control-Only Clients
+
+The native macOS app joins the overlay through a separate control-client
+protocol. A client token has role `client`, one use, no tags, no route grants,
+and no relay permission. `/v1/join` rejects that role; clients can register only
+through `POST /v1/clients/join`. Subsequent peer-map reads and removal use a
+client-specific Ed25519 signature over the operation, client ID, Unix timestamp,
+and random 192-bit nonce. Client identities cannot call node heartbeat, Signal
+membership, node path, node removal, or node WireGuard-key-rotation APIs.
+
+Clients are allocation participants but not infrastructure nodes. Their VPN IP
+and public keys are durable so the overlay can route replies, while normal node
+inventory, overview payloads, and node-count metrics filter them out. A separate
+client metric records their allocation count.
+
+The control plane selects one reachable gateway deterministically, preferring a
+node with role `gateway` and then IPv6, public UDP, or STUN-reflexive candidates.
+The client receives exactly that WireGuard peer. Its allowed IPs contain the
+gateway VPN host route plus the infrastructure VPN host routes and advertised
+CIDRs projected onto that gateway. The selected gateway receives clients as
+direct WireGuard peers; every other node receives each client `/32` or `/128`
+through the same gateway. Clients never become mesh peers, route providers,
+relays, Signal members, or transit nodes.
+
 ## Control Plane HA
 
 The control plane is designed for multiple public nodes. Durable state lives in PostgreSQL in production and SQLite in tests/dev. Ephemeral session state is separated from durable cluster state:

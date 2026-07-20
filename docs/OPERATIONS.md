@@ -143,6 +143,36 @@ rejects an existing state path instead of silently replacing another node
 identity; use a new state path for a new node. `--dry-run` validates the token
 and bootstrap selection but does not write state.
 
+### Join macOS clients
+
+Before issuing a client link, register at least one Linux node with role
+`gateway` and a fresh reachable IPv6, public UDP, or STUN-reflexive WireGuard
+candidate. The gateway must forward overlay traffic. Persist IPv4 forwarding on
+the gateway, then apply the equivalent IPv6 setting if the overlay uses IPv6:
+
+```bash
+sudo install -m 0644 /dev/stdin /etc/sysctl.d/99-heteronetwork-client-gateway.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+sudo sysctl --system
+```
+
+Allow forwarding from the managed WireGuard interface back to that interface
+and to each advertised destination according to the host firewall policy. The
+selected gateway terminates the client's only WireGuard peer and forwards to
+the mesh; other nodes route the client host prefix back through that gateway.
+Do not advertise a default route solely for client access.
+
+Enable the dedicated enrollment signer as described under Web Management UI,
+keep at least two Control Plane endpoints active, then select **Add device** ->
+**macOS client** in the Web UI. Open the returned `heteronetwork://` link on a
+Mac with the native app installed. The token is single-use. The app installs a
+signed Network Extension profile, refreshes the gateway map immediately before
+connecting, and stores private key material in the shared device-only Keychain.
+Control-only clients are intentionally absent from the normal node table; use
+`ipars_control_plane_clients` or `client_count` to observe their allocation.
+
 The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/heteronetwork/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
 
 Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.

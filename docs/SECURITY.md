@@ -43,6 +43,23 @@ trusted entry. The packaged systemd unit obtains the enrollment signer through
 `LoadCredential=` from a root-only credential store; sibling Signal, STUN, and
 Relay services do not receive the service-scoped read-only copy.
 
+The same signer can issue a distinct macOS client token only through the
+authenticated client-enrollment endpoint. Server-side issuer policy forces role
+`client`, one use, no tags, no allowed routes, no relay permission, at least two
+active Control Plane endpoints, and a currently reachable gateway. A client
+token is rejected by the normal node join endpoint without consuming it. The
+dedicated client join endpoint rejects all non-client tokens.
+
+After enrollment, the macOS app keeps its Ed25519 identity and WireGuard private
+key in a device-only shared Keychain item available to the containing app and
+packet-tunnel extension. Enrollment tokens are not persisted. Peer-map refresh
+and removal requests carry bounded-fresh operation-specific Ed25519 signatures
+and random nonces. The packet tunnel accepts exactly one gateway peer and
+rejects default routes, malformed CIDRs, local or relay endpoint candidates,
+and invalid WireGuard keys before starting WireGuardKit. This client identity is
+explicitly denied access to heartbeat, Signal, path-reporting, normal removal,
+and node key-rotation operations.
+
 Enrollment issuance is an authenticated `/v1/admin/*` operation and inserts the
 signed definition into the shared token ledger before returning it. Installer
 and binary routes require the same signed token and confirm that the ledger
