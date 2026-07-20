@@ -32,7 +32,7 @@ use ipars_types::{
     TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
     JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_PATH_SCORE_REASONS,
+    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_PATH_SCORE_REASONS,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -1081,16 +1081,45 @@ where
         self.service_directory_at(Utc::now()).await
     }
 
+    pub async fn enrollment_service_directory(
+        &self,
+        max_staleness: Duration,
+    ) -> Result<ServiceDirectory, ControlPlaneError> {
+        if max_staleness > Duration::from_secs(MAX_JOIN_TOKEN_TTL_SECONDS as u64) {
+            return Err(ControlPlaneError::Store(format!(
+                "enrollment service staleness exceeds {MAX_JOIN_TOKEN_TTL_SECONDS} seconds"
+            )));
+        }
+        let max_staleness = chrono::Duration::from_std(max_staleness).map_err(|error| {
+            ControlPlaneError::Store(format!(
+                "invalid enrollment service staleness duration: {error}"
+            ))
+        })?;
+        let now = Utc::now();
+        let lease_cutoff = now.checked_sub_signed(max_staleness).ok_or_else(|| {
+            ControlPlaneError::Store("enrollment service staleness is out of range".to_string())
+        })?;
+        self.service_directory_since(now, lease_cutoff).await
+    }
+
     async fn service_directory_at(
         &self,
         now: chrono::DateTime<Utc>,
+    ) -> Result<ServiceDirectory, ControlPlaneError> {
+        self.service_directory_since(now, now).await
+    }
+
+    async fn service_directory_since(
+        &self,
+        now: chrono::DateTime<Utc>,
+        lease_cutoff: chrono::DateTime<Utc>,
     ) -> Result<ServiceDirectory, ControlPlaneError> {
         let mut instances = self
             .store
             .list_service_instances(&self.config.cluster_id)
             .await?
             .into_iter()
-            .filter(|instance| instance.lease_expires_at > now)
+            .filter(|instance| instance.lease_expires_at > lease_cutoff)
             .collect::<Vec<_>>();
         instances.sort_by(|left, right| {
             right
@@ -4480,6 +4509,69 @@ mod tests {
         assert_eq!(metrics.active_control_plane_count, 2);
         assert_eq!(metrics.active_signal_count, 1);
         assert!(!metrics.ha_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enrollment_service_directory_keeps_only_recently_expired_instances(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-enrollment-directory");
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            Arc::new(InMemoryStore::default()),
+        );
+        let now = Utc::now();
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "public-a",
+                "public-a.example",
+                now - Duration::seconds(90),
+                now - Duration::seconds(60),
+            ))
+            .await?;
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "public-b",
+                "public-b.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
+
+        let active = plane.service_directory().await?;
+        assert_eq!(active.instances.len(), 1);
+        assert_eq!(active.instances[0].instance_id, "public-b");
+
+        let enrollment = plane
+            .enrollment_service_directory(std::time::Duration::from_secs(5 * 60))
+            .await?;
+        assert_eq!(
+            enrollment
+                .instances
+                .iter()
+                .map(|instance| instance.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["public-a", "public-b"]
+        );
+        assert_eq!(enrollment.bootstrap_endpoints.len(), 8);
+
+        let expired = plane
+            .enrollment_service_directory(std::time::Duration::from_secs(30))
+            .await?;
+        assert_eq!(expired.instances.len(), 1);
+        assert_eq!(expired.instances[0].instance_id, "public-b");
+
+        assert!(plane
+            .enrollment_service_directory(std::time::Duration::from_secs(
+                MAX_JOIN_TOKEN_TTL_SECONDS as u64 + 1,
+            ))
+            .await
+            .is_err());
         Ok(())
     }
 
