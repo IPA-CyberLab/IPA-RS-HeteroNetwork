@@ -2532,6 +2532,13 @@ impl AgentRuntime {
             .recent_local_activity(peer, now)
     }
 
+    pub async fn recent_local_peer_activities(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<(NodeId, DateTime<Utc>, bool)> {
+        self.lazy_connect.read().await.recent_local_activities(now)
+    }
+
     pub async fn replace_internal_packet_flow_udp_ports(&self, ports: BTreeSet<u16>) {
         *self.internal_packet_flow_udp_ports.write().await = ports;
     }
@@ -6149,6 +6156,19 @@ impl LazyConnectManager {
                 (idle_for < Duration::from_secs(self.policy.idle_timeout_seconds))
                     .then_some(*last_used)
             })
+    }
+
+    pub fn recent_local_activities(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<(NodeId, DateTime<Utc>, bool)> {
+        self.local_last_used
+            .keys()
+            .filter_map(|peer| {
+                self.recent_local_activity(peer, now)
+                    .map(|observed_at| (peer.clone(), observed_at, self.is_pinned(peer)))
+            })
+            .collect()
     }
 
     pub fn pin_peer(&mut self, peer: NodeId) {

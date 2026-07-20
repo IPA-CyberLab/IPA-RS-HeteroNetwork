@@ -12240,15 +12240,7 @@ async fn heartbeat_request(
     let now = chrono::Utc::now();
     runtime.refresh_candidate_observations(now).await;
     let status = runtime.status().await;
-    let mut path_state = runtime.path_state().await;
-    for path in &mut path_state {
-        set_lazy_connect_local_activity_reason(
-            path,
-            runtime
-                .recent_local_peer_activity(&path.key.remote, now)
-                .await,
-        );
-    }
+    let path_state = heartbeat_path_state(runtime, now).await;
     let health = agent_health_from_status(&status, "agent heartbeat");
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
@@ -12266,6 +12258,46 @@ async fn heartbeat_request(
             .context("failed to sign agent heartbeat request")?,
     );
     Ok(request)
+}
+
+async fn heartbeat_path_state(
+    runtime: &AgentRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<PathRecord> {
+    let mut paths = runtime.path_state().await;
+    let activities = runtime.recent_local_peer_activities(now).await;
+    let activity_by_peer = activities
+        .iter()
+        .map(|(peer, observed_at, _)| (peer.clone(), *observed_at))
+        .collect::<BTreeMap<_, _>>();
+    let mut represented_peers = BTreeSet::new();
+    for path in &mut paths {
+        represented_peers.insert(path.key.remote.clone());
+        set_lazy_connect_local_activity_reason(
+            path,
+            activity_by_peer.get(&path.key.remote).copied(),
+        );
+    }
+
+    let local_node = runtime.state().node_id.clone();
+    for (peer, observed_at, pinned) in activities {
+        if represented_peers.contains(&peer) {
+            continue;
+        }
+        let mut path = PathRecord {
+            key: ipars_types::PeerPathKey::new(local_node.clone(), peer),
+            selected_state: PathState::Unreachable,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore::calculate(PathState::Unreachable, &PathMetrics::default(), true, 0),
+            updated_at: observed_at,
+            pinned,
+        };
+        set_lazy_connect_local_activity_reason(&mut path, Some(observed_at));
+        paths.push(path);
+    }
+    paths.sort_by(|left, right| left.key.remote.cmp(&right.key.remote));
+    paths
 }
 
 fn start_signal_registration(
@@ -33429,6 +33461,40 @@ exec sleep 60
                 == &format!(
                     "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
                     local_activity_at.timestamp_millis()
+                )
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_reports_activity_before_path_negotiation() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = NodeId::from_string("peer-without-path");
+        let observed_at = Utc::now();
+        runtime
+            .record_peer_activity(peer.clone(), observed_at, false)
+            .await;
+        assert!(runtime.path_state().await.is_empty());
+
+        let request =
+            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+
+        assert_eq!(request.path_state.len(), 1);
+        let path = &request.path_state[0];
+        assert_eq!(path.key.local, runtime.state().node_id);
+        assert_eq!(path.key.remote, peer);
+        assert_eq!(path.selected_state, PathState::Unreachable);
+        assert_eq!(path.selected_candidate, None);
+        assert_eq!(path.relay_node, None);
+        assert_eq!(path.updated_at, observed_at);
+        assert!(path.score.reasons.iter().any(|reason| {
+            reason
+                == &format!(
+                    "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+                    observed_at.timestamp_millis()
                 )
         }));
         Ok(())
