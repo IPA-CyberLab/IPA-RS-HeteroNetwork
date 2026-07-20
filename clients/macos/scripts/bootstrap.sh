@@ -35,14 +35,11 @@ git -C "$checkout_dir" show "$revision:Package.swift" \
   | sed '1s/swift-tools-version:5.3/swift-tools-version:5.5/' \
   > "$checkout_dir/Package.swift"
 
-# Xcode 16 requires modular headers to import BSD aliases explicitly. The
-# upstream header already imports stdint through key.h, so use equivalent
-# fixed-width types without changing the control-socket struct layout.
+# Xcode 16 requires modular headers to import BSD aliases explicitly. Keep the
+# original spellings so Clang sees the same definitions as sys/kern_control.h.
 git -C "$checkout_dir" show "$revision:Sources/WireGuardKitC/WireGuardKitC.h" \
-  | sed \
-      -e 's/u_int32_t/uint32_t/g' \
-      -e 's/u_int16_t/uint16_t/g' \
-      -e 's/u_char/uint8_t/g' \
+  | sed '/#include "x25519.h"/a\
+#include <sys/types.h>' \
   > "$checkout_dir/Sources/WireGuardKitC/WireGuardKitC.h"
 
 cd "$project_dir"
