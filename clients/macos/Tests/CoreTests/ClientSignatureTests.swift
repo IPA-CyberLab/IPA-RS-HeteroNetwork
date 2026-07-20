@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 @testable import HeteroNetworkCore
 
@@ -18,9 +19,19 @@ final class ClientSignatureTests: XCTestCase {
         )
 
         XCTAssertEqual(signature.nonce, "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD")
-        XCTAssertEqual(
-            signature.signature,
-            "34UsDq5YNr83tomJ2N2o3cgPcaPIihje5uO+OjPp3Ad9DIZJs9Tiu6Dek8OWMkNKPbf+5+ythYm1WTkQWVlGBg=="
+        let payload = Data(
+            "heteronetwork-client-request-v1\npeer_map\nnode-fe812c12f3ab4ce6ac5db69ac352f906\n1784550896\nAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD\n".utf8
         )
+        let publicKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: 7, count: 32)
+        ).publicKey
+        let swiftSignature = try XCTUnwrap(Data(base64Encoded: signature.signature))
+        let rustSignature = try XCTUnwrap(Data(
+            base64Encoded: "34UsDq5YNr83tomJ2N2o3cgPcaPIihje5uO+OjPp3Ad9DIZJs9Tiu6Dek8OWMkNKPbf+5+ythYm1WTkQWVlGBg=="
+        ))
+
+        // CryptoKit randomizes Ed25519 signing, so verify both implementations.
+        XCTAssertTrue(publicKey.isValidSignature(swiftSignature, for: payload))
+        XCTAssertTrue(publicKey.isValidSignature(rustSignature, for: payload))
     }
 }
