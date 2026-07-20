@@ -17,9 +17,9 @@ use ipars_types::api::{
     ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse,
     ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
     ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
-    PathStateCount, PeerMap, RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest,
-    RegisterNodeResponse, RelayMap, RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse,
-    RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    PathStateCount, PeerConnectionIntent, PeerMap, RegisterClientRequest, RegisterClientResponse,
+    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RemoveClientResponse, RemoveNodeRequest,
+    RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
     SignalNodeUpsertRequest,
 };
 use ipars_types::{
@@ -30,8 +30,9 @@ use ipars_types::{
     NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Role, Route, ServiceDirectory,
     ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord,
     TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_PATH_SCORE_REASONS,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -45,7 +46,6 @@ const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
     PathState::Relay,
     PathState::Unreachable,
 ];
-const MAX_PATH_SCORE_REASONS: usize = 16;
 const MAX_PATH_SCORE_REASON_BYTES: usize = 256;
 const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
@@ -1917,13 +1917,43 @@ where
             .await?;
 
         let directory = self.service_directory_at(now).await?;
+        let connection_intents = self.connection_intents_for(&request_node_id, now).await?;
 
         Ok(HeartbeatResponse {
             accepted: true,
             policy_version: 0,
             peer_delta_available: false,
             bootstrap_endpoints: directory.bootstrap_endpoints,
+            connection_intents,
         })
+    }
+
+    async fn connection_intents_for(
+        &self,
+        node_id: &NodeId,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<PeerConnectionIntent>, ControlPlaneError> {
+        let idle_timeout_seconds = self.policy_snapshot()?.idle_timeout_seconds;
+        let mut intents = self
+            .paths_for(node_id)
+            .await?
+            .paths
+            .into_iter()
+            .filter(|path| path.key.remote == *node_id)
+            .filter(|path| path_is_fresh(path, now, idle_timeout_seconds))
+            .filter_map(|path| {
+                let observed_at = lazy_connect_local_activity_at(&path).ok().flatten()?;
+                timestamp_is_fresh(observed_at, now, idle_timeout_seconds).then_some(
+                    PeerConnectionIntent {
+                        peer: path.key.local,
+                        observed_at,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        intents.sort_by(|left, right| left.peer.cmp(&right.peer));
+        intents.dedup_by(|left, right| left.peer == right.peer);
+        Ok(intents)
     }
 
     pub async fn rotate_wireguard_key(
@@ -2171,6 +2201,26 @@ where
                     reason,
                 }
             })?;
+            if let Some(observed_at) = lazy_connect_local_activity_at(path).map_err(|reason| {
+                ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                }
+            })? {
+                if !timestamp_not_after_skew(
+                    observed_at,
+                    now,
+                    self.config.heartbeat_signature_max_age,
+                ) {
+                    return Err(ControlPlaneError::NodeUpdateRejected {
+                        node_id: request.node_id.clone(),
+                        reason: format!(
+                            "path {} -> {} lazy-connect activity {} is too far in the future",
+                            path.key.local, path.key.remote, observed_at
+                        ),
+                    });
+                }
+            }
             if path.key.local != request.node_id {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
@@ -3091,6 +3141,50 @@ fn path_is_fresh(path: &PathRecord, now: chrono::DateTime<Utc>, ttl_seconds: u64
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
+}
+
+fn timestamp_is_fresh(
+    timestamp: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    match now.signed_duration_since(timestamp).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
+}
+
+fn lazy_connect_local_activity_at(
+    path: &PathRecord,
+) -> Result<Option<chrono::DateTime<Utc>>, String> {
+    let mut activity_at = None;
+    for reason in &path.score.reasons {
+        let Some(raw_timestamp) = reason.strip_prefix(LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX)
+        else {
+            continue;
+        };
+        if activity_at.is_some() {
+            return Err(format!(
+                "path {} -> {} has multiple lazy-connect activity reasons",
+                path.key.local, path.key.remote
+            ));
+        }
+        let timestamp_millis = raw_timestamp.parse::<i64>().map_err(|_| {
+            format!(
+                "path {} -> {} has an invalid lazy-connect activity timestamp",
+                path.key.local, path.key.remote
+            )
+        })?;
+        activity_at = Some(
+            chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_millis).ok_or_else(|| {
+                format!(
+                    "path {} -> {} has an out-of-range lazy-connect activity timestamp",
+                    path.key.local, path.key.remote
+                )
+            })?,
+        );
+    }
+    Ok(activity_at)
 }
 
 fn nat_classification_is_fresh(
@@ -5594,6 +5688,86 @@ mod tests {
         assert_eq!(metrics.peer_map_route_candidate_count, 6);
         assert_eq!(metrics.peer_map_route_visible_count, 3);
         assert_eq!(metrics.peer_map_route_acl_denied_count, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_intents_include_only_fresh_incoming_local_activity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = ControlPlaneConfig::new(
+            ClusterId::from_string("cluster-a"),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.idle_timeout_seconds = 10;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        store.insert_node(node_record("source")).await?;
+        store.insert_node(node_record("target")).await?;
+        store.insert_node(node_record("stale-source")).await?;
+        store.insert_node(node_record("remote-only-source")).await?;
+        let now = Utc::now();
+        let fresh_activity_at =
+            chrono::DateTime::<Utc>::from_timestamp_millis(now.timestamp_millis())
+                .ok_or("current test timestamp should fit in milliseconds")?;
+        let stale_activity_at = fresh_activity_at - Duration::seconds(11);
+
+        let mut fresh = path("source", "target");
+        fresh.updated_at = now;
+        fresh.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            fresh_activity_at.timestamp_millis()
+        ));
+        store.upsert_path(fresh).await?;
+        let mut stale = path("stale-source", "target");
+        stale.updated_at = now;
+        stale.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            stale_activity_at.timestamp_millis()
+        ));
+        store.upsert_path(stale).await?;
+        store
+            .upsert_path(path("remote-only-source", "target"))
+            .await?;
+
+        let intents = plane
+            .connection_intents_for(&node_id("target"), now)
+            .await?;
+
+        assert_eq!(
+            intents,
+            vec![PeerConnectionIntent {
+                peer: node_id("source"),
+                observed_at: fresh_activity_at,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_connect_activity_reason_requires_one_valid_timestamp(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut record = path("source", "target");
+        assert_eq!(lazy_connect_local_activity_at(&record)?, None);
+
+        record.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}invalid"
+        ));
+        assert!(lazy_connect_local_activity_at(&record).is_err());
+
+        let observed_at = chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_123)
+            .ok_or("test timestamp should be representable")?;
+        record.score.reasons.clear();
+        record.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            observed_at.timestamp_millis()
+        ));
+        assert_eq!(lazy_connect_local_activity_at(&record)?, Some(observed_at));
+
+        record.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            observed_at.timestamp_millis()
+        ));
+        assert!(lazy_connect_local_activity_at(&record).is_err());
         Ok(())
     }
 

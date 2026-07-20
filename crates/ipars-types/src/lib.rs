@@ -998,6 +998,10 @@ pub struct PathRecord {
     pub pinned: bool,
 }
 
+pub const LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX: &str =
+    "lazy_connect_local_activity_at_unix_ms=";
+pub const MAX_PATH_SCORE_REASONS: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathChangeKind {
@@ -2047,12 +2051,20 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PeerConnectionIntent {
+        pub peer: NodeId,
+        pub observed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct HeartbeatResponse {
         pub accepted: bool,
         pub policy_version: u64,
         pub peer_delta_available: bool,
         #[serde(default)]
         pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
+        #[serde(default)]
+        pub connection_intents: Vec<PeerConnectionIntent>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2664,10 +2676,11 @@ pub mod api {
         LinkLocal,
         NoOverlayMatch,
         InconsistentTransportMetadata,
+        InternalControlTraffic,
     }
 
     impl AgentPacketFlowDropReason {
-        pub const ALL: [Self; 7] = [
+        pub const ALL: [Self; 8] = [
             Self::Unspecified,
             Self::Loopback,
             Self::Multicast,
@@ -2675,6 +2688,7 @@ pub mod api {
             Self::LinkLocal,
             Self::NoOverlayMatch,
             Self::InconsistentTransportMetadata,
+            Self::InternalControlTraffic,
         ];
 
         pub const fn as_str(self) -> &'static str {
@@ -2686,6 +2700,7 @@ pub mod api {
                 Self::LinkLocal => "link_local",
                 Self::NoOverlayMatch => "no_overlay_match",
                 Self::InconsistentTransportMetadata => "inconsistent_transport_metadata",
+                Self::InternalControlTraffic => "internal_control_traffic",
             }
         }
     }

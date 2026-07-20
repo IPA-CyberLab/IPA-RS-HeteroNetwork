@@ -31,8 +31,8 @@ use ipars_types::api::{
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
-    BootstrapEndpointKind, ClusterPolicy, JoinTokenClaims, KeyId, NodeId, PathRecord, PathState,
-    Role, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
+    BootstrapEndpoint, BootstrapEndpointKind, ClusterPolicy, JoinTokenClaims, KeyId, NodeId,
+    PathRecord, PathState, Role, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
     JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
@@ -1360,9 +1360,10 @@ where
     let expires_at = now
         .checked_add_signed(ChronoDuration::seconds(request.expires_in_seconds as i64))
         .ok_or_else(|| NodeEnrollmentApiError::bad_request("token expiration is out of range"))?;
+    let bootstrap_endpoints = directory.bootstrap_endpoints;
     let claims = JoinTokenClaims {
         cluster_id: state.plane.config().cluster_id.clone(),
-        bootstrap_endpoints: directory.bootstrap_endpoints,
+        bootstrap_endpoints: bootstrap_endpoints.clone(),
         expires_at,
         not_before: now - ChronoDuration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
         role,
@@ -1388,11 +1389,10 @@ where
         .await
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     let encoded_token = encode_node_enrollment_authorization(&token)?;
-    let install_script = node_enrollment_install_script(enrollment, &encoded_token);
-    let install_command = format!(
-        "curl -fsS -H 'Authorization: {NODE_ENROLLMENT_AUTH_SCHEME} {encoded_token}' '{}/v1/install/linux-amd64.sh' | sudo sh",
-        enrollment.install_base_url
-    );
+    let install_script =
+        node_enrollment_install_script(enrollment, &encoded_token, &bootstrap_endpoints);
+    let install_command =
+        node_enrollment_install_command(enrollment, &encoded_token, &bootstrap_endpoints);
     let payload = AdminNodeEnrollmentResponse {
         token,
         expires_at,
@@ -1703,7 +1703,11 @@ where
     let enrollment = authorize_node_enrollment(&state, &headers).await?;
     let token = decode_node_enrollment_authorization(&headers)?;
     let encoded_token = encode_node_enrollment_authorization(&token)?;
-    let script = node_enrollment_install_script(&enrollment, &encoded_token);
+    let script = node_enrollment_install_script(
+        &enrollment,
+        &encoded_token,
+        &token.claims.bootstrap_endpoints,
+    );
     let mut response = (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
         script,
@@ -1771,6 +1775,7 @@ fn apply_node_enrollment_security_headers(response: &mut Response) {
 fn node_enrollment_install_script(
     enrollment: &NodeEnrollmentConfig,
     encoded_token: &str,
+    bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> String {
     const TEMPLATE: &str = r#"#!/bin/sh
 set -eu
@@ -1821,10 +1826,22 @@ tmp_dir=$(mktemp -d /var/lib/heteronetwork/install.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 auth='__AUTH__'
 binary="$tmp_dir/iparsd"
-curl -fsS -H "Authorization: HeteroNetworkJoin $auth" '__BASE__/v1/install/iparsd-linux-amd64' -o "$binary"
-actual_sha=$(sha256sum "$binary" | awk '{print $1}')
-if [ "$actual_sha" != '__SHA256__' ]; then
-  echo "HeteroNetwork binary checksum verification failed" >&2
+download_bases='__DOWNLOAD_BASES__'
+downloaded=
+for encoded_base in $download_bases; do
+  base=$(printf '%s' "$encoded_base" | base64 -d) || continue
+  rm -f "$binary"
+  if curl -fsS -H "Authorization: HeteroNetworkJoin $auth" \
+    "$base/v1/install/iparsd-linux-amd64" -o "$binary"; then
+    actual_sha=$(sha256sum "$binary" | awk '{print $1}')
+    if [ "$actual_sha" = '__SHA256__' ]; then
+      downloaded=1
+      break
+    fi
+  fi
+done
+if [ -z "$downloaded" ]; then
+  echo "HeteroNetwork binary download failed on every control-plane endpoint" >&2
   exit 1
 fi
 chmod 0755 "$binary"
@@ -1845,7 +1862,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink
+ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
 Restart=on-failure
 RestartSec=5s
 StateDirectory=heteronetwork
@@ -1874,10 +1891,50 @@ systemctl daemon-reload
 systemctl enable --now heteronetwork-agent.service
 echo "HeteroNetwork node enrolled and started"
 "#;
+    let download_bases = node_enrollment_download_bases(enrollment, bootstrap_endpoints)
+        .into_iter()
+        .map(|base| STANDARD.encode(base.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(" ");
     TEMPLATE
         .replace("__AUTH__", encoded_token)
-        .replace("__BASE__", &enrollment.install_base_url)
+        .replace("__DOWNLOAD_BASES__", &download_bases)
         .replace("__SHA256__", &enrollment.binary_sha256)
+}
+
+fn node_enrollment_install_command(
+    enrollment: &NodeEnrollmentConfig,
+    encoded_token: &str,
+    bootstrap_endpoints: &[BootstrapEndpoint],
+) -> String {
+    let script_bases = node_enrollment_download_bases(enrollment, bootstrap_endpoints)
+        .into_iter()
+        .map(|base| STANDARD.encode(base.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "sh -c 'set -eu; tmp=$(mktemp); trap \"rm -f \\\"$tmp\\\"\" EXIT HUP INT TERM; auth=\"{encoded_token}\"; for encoded_base in {script_bases}; do base=$(printf \"%s\" \"$encoded_base\" | base64 -d) || continue; if curl -fsS -H \"Authorization: {NODE_ENROLLMENT_AUTH_SCHEME} $auth\" \"$base/v1/install/linux-amd64.sh\" -o \"$tmp\"; then sudo sh \"$tmp\"; exit; fi; done; echo \"HeteroNetwork installer download failed on every control-plane endpoint\" >&2; exit 1'"
+    )
+}
+
+fn node_enrollment_download_bases(
+    enrollment: &NodeEnrollmentConfig,
+    bootstrap_endpoints: &[BootstrapEndpoint],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut bases = Vec::new();
+    for base in std::iter::once(enrollment.install_base_url.as_ref()).chain(
+        bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.as_str()),
+    ) {
+        let base = base.trim_end_matches('/').to_string();
+        if seen.insert(base.clone()) {
+            bases.push(base);
+        }
+    }
+    bases
 }
 
 async fn admin_node_snapshot<S>(
@@ -3214,6 +3271,29 @@ mod tests {
         assert_eq!(response_body["max_uses"], 1);
         assert_eq!(response_body["architecture"], NODE_ENROLLMENT_ARCH);
         assert_eq!(response_body["binary_sha256"], expected_sha256);
+        let install_command = response_body["install_command"]
+            .as_str()
+            .ok_or("node enrollment response omitted the install command")?;
+        let generated_script = response_body["install_script"]
+            .as_str()
+            .ok_or("node enrollment response omitted the install script")?;
+        for expected_base in [
+            "http://127.0.0.1:8443",
+            "https://public-a.example:8443",
+            "https://public-b.example:8443",
+        ] {
+            let encoded_base = STANDARD.encode(expected_base.as_bytes());
+            assert!(install_command.contains(&encoded_base));
+            assert!(generated_script.contains(&encoded_base));
+        }
+        let command_syntax = std::process::Command::new("sh")
+            .args(["-n", "-c", install_command])
+            .output()?;
+        assert!(
+            command_syntax.status.success(),
+            "generated install command is not valid POSIX shell: {}",
+            String::from_utf8_lossy(&command_syntax.stderr)
+        );
         let token: SignedJoinToken = serde_json::from_value(response_body["token"].clone())?;
         assert_eq!(token.claims.bootstrap_endpoints.len(), 8);
         assert_eq!(token.claims.policy.max_token_uses, Some(1));
@@ -3251,6 +3331,8 @@ mod tests {
                 .to_vec(),
         )?;
         assert!(script.contains("--enroll-only"));
+        assert!(script.contains("--packet-flow-detector conntrack-netlink-events"));
+        assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
         assert!(script.contains(&expected_sha256));
         assert!(script.contains(&encoded_token));
         assert!(!script.contains(&issuer_private_key));

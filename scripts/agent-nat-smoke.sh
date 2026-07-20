@@ -74,10 +74,11 @@ root_public_ip="198.18.100.1"
 nat_public_octet_base=$((20 + (suffix % 100) * 2))
 nat_a_public_ip="198.18.100.${nat_public_octet_base}"
 nat_b_public_ip="198.18.100.$((nat_public_octet_base + 1))"
-nat_a_gateway="10.250.0.1"
-nat_a_agent_ip="10.250.0.2"
-nat_b_gateway="10.251.0.1"
-nat_b_agent_ip="10.251.0.2"
+# Keep the synthetic underlays outside the default 10.250.0.0/16 VPN pool.
+nat_a_gateway="10.252.0.1"
+nat_a_agent_ip="10.252.0.2"
+nat_b_gateway="10.253.0.1"
+nat_b_agent_ip="10.253.0.2"
 
 nat_a_root_public_if="ipap${suffix}"
 nat_a_public_if="ipnp${suffix}"
@@ -464,6 +465,8 @@ start_agent() {
     --peer-probe-sample-count 3 \
     --peer-probe-response-timeout-millis 500 \
     --peer-probe-sample-interval-millis 100 \
+    --packet-flow-detector conntrack-netlink-events \
+    --packet-flow-poll-interval-seconds 1 \
     >"$log_path" 2>&1 &
   local pid=$!
   agent_pids+=("$pid")

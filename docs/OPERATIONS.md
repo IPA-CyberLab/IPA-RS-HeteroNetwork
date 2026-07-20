@@ -14,7 +14,7 @@ ipars init \
   --issuer-private-key-path ./issuer.key \
   --issuer-key-id root \
   --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token \
-  --allowed-route 100.64.0.0/10 \
+  --allowed-route 10.250.0.0/16 \
   --allow-relay \
   --unlimited-uses \
   --spawn-daemons \
@@ -62,7 +62,7 @@ ipars token create \
   --control-plane-operator-api-bearer-token-path ./control-plane-operator-api.token \
   --issuer-private-key-path ./issuer.key \
   --issuer-key-id root \
-  --allowed-route 100.64.0.0/10 \
+  --allowed-route 10.250.0.0/16 \
   --allow-relay \
   --unlimited-uses
 ```
@@ -73,9 +73,44 @@ The Web UI workflow performs the same HA directory check, signs and records the
 token in the shared ledger, and returns a Linux x86_64 install command. The
 generated installer checks root/systemd prerequisites, downloads the pinned
 daemon through the still-active token, verifies SHA-256, enrolls once into an
-owner-only state file, deletes the token, and enables the Agent service. A
+owner-only state file, deletes the token, and enables the Agent service with an
+event-driven conntrack detector that activates lazy peers on first traffic. A
 single-use token cannot download the artifact again after its successful join;
 expired, revoked, exhausted, or unknown tokens are rejected.
+
+An idle ACL-visible peer remains installed in WireGuard as a passive receive
+peer with its overlay `/32` AllowedIP and host route, a loopback discard hold
+endpoint, and no keepalive. The host route selects the overlay source address
+for the first socket, and the local hold endpoint keeps that socket retryable
+without sending a handshake outside the host. On activation the Agent replaces
+the passive peer at the selected real endpoint, resetting any hold-endpoint
+handshake timer. The initiating Agent publishes
+the actual local packet-activity timestamp as a bounded marker in its signed
+path snapshot; any healthy Control Plane instance returns a fresh marker as an
+intent to the target Agent, which immediately wakes its Signal and peer-map
+loops. This reciprocal activation allows the first one-sided flow to establish
+a path without keeping an all-to-all set of active sessions. The intent expires
+with the cluster lazy-connect idle timeout, a repeated or remote intent is never
+republished as new local activity, and the Agent excludes its configured UDP
+peer-probe port from packet-flow activation.
+Conntrack-backed detectors use only the initiating/original tuple, so inbound
+reply tuples do not wake an otherwise idle peer.
+Tailscale routing-bypass traffic marked `0x80000/0xff0000` is likewise counted
+as `internal_control_traffic` and cannot trigger a path. The event detector also
+uses `NETLINK_SOCK_DIAG` to recognize marked UDP source sockets when their
+locally NATed conntrack entry itself remains unmarked.
+Once an initiator establishes the authenticated WireGuard receive path, its
+first valid wake-intent peer-probe request wakes a passive target without
+waiting for the next heartbeat. The Agent emits wake intent only for recent
+local application activity, sends it after a short endpoint-application bound,
+and does not wait for pre-existing handshake evidence. Quality-only probes and
+probes from a remotely activated peer do not extend either peer's idle timeout.
+
+The generated Agent service uses conntrack NEW/UPDATE events plus a one-second
+bounded counter reconciliation. Event delivery handles new flows immediately;
+the counter pass catches traffic on a conntrack entry that existed before an
+Agent restart. Its first snapshot is baseline-only, so an unchanged stale entry
+does not wake a peer.
 
 Before declaring failover ready, verify both public APIs report two active instances and `ipars_control_plane_ha_ready 1`. Stop `ipars-public-node.target` on one host, wait one lease TTL, and verify the survivor reports one instance, existing WireGuard traffic continues, and a fresh Agent can register using the previously minted HA token. Restart the target and require HA readiness to return to `1`.
 
@@ -183,7 +218,10 @@ initial STUN probe before configuring the WireGuard interface, then configures
 the interface to listen on that same port. For example, use
 `--stun-bind 0.0.0.0:51820 --wireguard-listen-port 51820`. This preserves the
 local-port relationship needed by port-preserving NATs; relay fallback remains
-required where direct traversal is not possible.
+required where direct traversal is not possible. On restart, the Agent restores
+the accepted candidates persisted in its registered-node state before
+heartbeat and Signal registration, even when the surviving kernel WireGuard
+interface already owns the shared port and the startup STUN bind cannot run.
 
 With the default token or explicit STUN bootstrap, the Agent runs NAT discovery
 before registration and refreshes it every
