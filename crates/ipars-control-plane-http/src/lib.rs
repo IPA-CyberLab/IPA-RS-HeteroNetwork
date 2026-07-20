@@ -1845,7 +1845,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink
+ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
 Restart=on-failure
 RestartSec=5s
 StateDirectory=heteronetwork
@@ -3251,6 +3251,8 @@ mod tests {
                 .to_vec(),
         )?;
         assert!(script.contains("--enroll-only"));
+        assert!(script.contains("--packet-flow-detector conntrack-netlink-events"));
+        assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
         assert!(script.contains(&expected_sha256));
         assert!(script.contains(&encoded_token));
         assert!(!script.contains(&issuer_private_key));

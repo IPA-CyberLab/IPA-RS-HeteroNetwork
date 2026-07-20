@@ -165,7 +165,9 @@ public or wildcard address. It accepts only exact fixed-width versioned request
 packets from VPN source IPs present in the current peer map, returns one
 same-size packet, and rate-limits each peer. Responses echo a random 128-bit
 challenge and sequence number, so off-path packets cannot satisfy a sample and
-the protocol has no amplification factor. Unknown sources, malformed packets,
+the protocol has no amplification factor. A bounded protocol flag distinguishes
+quality-only requests from wake intent; only wake intent from an authenticated
+peer can transition a passive path to active. Unknown sources, malformed packets,
 rate-limit drops, and send failures have separate metrics.
 
 WireGuard cryptokey routing authenticates the overlay source address before the

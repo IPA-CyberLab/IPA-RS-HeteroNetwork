@@ -41,8 +41,8 @@ use ipars_types::{
     validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
     NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
-    PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, VpnIp,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, TransportProtocol,
+    VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -76,6 +76,7 @@ const MAX_LINUX_COMMAND_STDIN_BYTES: usize = 64 * 1024;
 const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
 const DIRECT_PATH_PROBE_KEEPALIVE_SECONDS: u16 = 1;
+const PASSIVE_WIREGUARD_HOLD_ENDPOINT: &str = "127.0.0.1:9";
 
 mod peer_probe;
 
@@ -579,6 +580,8 @@ pub struct AgentRuntime {
     local_advertised_routes: tokio::sync::RwLock<Vec<Route>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     peer_map_sync_notify: Arc<tokio::sync::Notify>,
+    heartbeat_report_notify: Arc<tokio::sync::Notify>,
+    signal_path_notify: Arc<tokio::sync::Notify>,
     wireguard_endpoint_update: tokio::sync::Mutex<()>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
@@ -591,6 +594,7 @@ pub struct AgentRuntime {
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
     userspace_wireguard_process: tokio::sync::RwLock<Option<AgentManagedProcessStatus>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
+    internal_packet_flow_udp_ports: tokio::sync::RwLock<BTreeSet<u16>>,
     relay_admission_attempt_count: AtomicU64,
     relay_admission_success_count: AtomicU64,
     relay_admission_failure_count: AtomicU64,
@@ -627,6 +631,7 @@ pub struct AgentRuntime {
     packet_flow_filtered_link_local_count: AtomicU64,
     packet_flow_filtered_no_overlay_match_count: AtomicU64,
     packet_flow_filtered_inconsistent_transport_metadata_count: AtomicU64,
+    packet_flow_filtered_internal_control_traffic_count: AtomicU64,
     packet_flow_classification_unknown_count: AtomicU64,
     packet_flow_classification_opening_count: AtomicU64,
     packet_flow_classification_unreplied_count: AtomicU64,
@@ -1353,14 +1358,27 @@ pub fn merge_bootstrap_endpoint_sets(
 
 impl AgentRuntime {
     pub fn new(state: AgentNodeState, policy: ClusterPolicy) -> Self {
+        let restored_candidates = state
+            .registered_node
+            .as_ref()
+            .map(|node| {
+                node.endpoint_candidates
+                    .iter()
+                    .filter(|candidate| candidate.node_id == state.node_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             state: RwLock::new(state),
             stun_refresh: tokio::sync::Mutex::new(()),
-            candidates: tokio::sync::RwLock::new(Vec::new()),
+            candidates: tokio::sync::RwLock::new(restored_candidates),
             nat_classification: tokio::sync::RwLock::new(None),
             local_advertised_routes: tokio::sync::RwLock::new(Vec::new()),
             latest_peer_map: tokio::sync::RwLock::new(None),
             peer_map_sync_notify: Arc::new(tokio::sync::Notify::new()),
+            heartbeat_report_notify: Arc::new(tokio::sync::Notify::new()),
+            signal_path_notify: Arc::new(tokio::sync::Notify::new()),
             wireguard_endpoint_update: tokio::sync::Mutex::new(()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -1373,6 +1391,7 @@ impl AgentRuntime {
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
             userspace_wireguard_process: tokio::sync::RwLock::new(None),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
+            internal_packet_flow_udp_ports: tokio::sync::RwLock::new(BTreeSet::new()),
             relay_admission_attempt_count: AtomicU64::new(0),
             relay_admission_success_count: AtomicU64::new(0),
             relay_admission_failure_count: AtomicU64::new(0),
@@ -1410,6 +1429,7 @@ impl AgentRuntime {
             packet_flow_filtered_link_local_count: AtomicU64::new(0),
             packet_flow_filtered_no_overlay_match_count: AtomicU64::new(0),
             packet_flow_filtered_inconsistent_transport_metadata_count: AtomicU64::new(0),
+            packet_flow_filtered_internal_control_traffic_count: AtomicU64::new(0),
             packet_flow_classification_unknown_count: AtomicU64::new(0),
             packet_flow_classification_opening_count: AtomicU64::new(0),
             packet_flow_classification_unreplied_count: AtomicU64::new(0),
@@ -1982,8 +2002,25 @@ impl AgentRuntime {
         self.peer_map_sync_notify.clone()
     }
 
+    pub fn heartbeat_report_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.heartbeat_report_notify.clone()
+    }
+
+    pub fn signal_path_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.signal_path_notify.clone()
+    }
+
     fn request_peer_map_sync(&self) {
         self.peer_map_sync_notify.notify_one();
+    }
+
+    fn request_lazy_connect_sync(&self) {
+        self.request_peer_map_sync();
+        self.signal_path_notify.notify_one();
+    }
+
+    fn request_heartbeat_report(&self) {
+        self.heartbeat_report_notify.notify_one();
     }
 
     pub async fn peer_quality_probe_targets(&self) -> Vec<PeerQualityProbeTarget> {
@@ -2002,7 +2039,15 @@ impl AgentRuntime {
             if path.selected_state == PathState::Unreachable {
                 continue;
             }
-            targets.push(PeerQualityProbeTarget { peer, path });
+            let wake_passive_peer = self
+                .recent_local_peer_activity(&peer.node_id, Utc::now())
+                .await
+                .is_some();
+            targets.push(PeerQualityProbeTarget {
+                peer,
+                path,
+                wake_passive_peer,
+            });
         }
         targets
     }
@@ -2234,7 +2279,9 @@ impl AgentRuntime {
                 .await
                 .pin_peer(record.key.remote.clone());
         }
-        if let Some(event) = path_change_event(previous.as_ref(), &record) {
+        let path_changed = path_change_event(previous.as_ref(), &record);
+        let should_report_path_change = path_changed.is_some();
+        if let Some(event) = path_changed {
             let mut events = self.path_change_events.write().await;
             if events.len() >= MAX_PATH_CHANGE_EVENTS {
                 events.pop_front();
@@ -2247,6 +2294,9 @@ impl AgentRuntime {
         }
         if selected_state != PathState::Relay {
             self.remove_relay_session(&remote).await;
+        }
+        if should_report_path_change {
+            self.request_heartbeat_report();
         }
         Ok(())
     }
@@ -2438,7 +2488,57 @@ impl AgentRuntime {
         if pin {
             lazy_connect.pin_peer(peer.clone());
         }
-        lazy_connect.is_pinned(&peer)
+        let pinned = lazy_connect.is_pinned(&peer);
+        drop(lazy_connect);
+        self.request_lazy_connect_sync();
+        pinned
+    }
+
+    pub async fn record_remote_peer_activity(&self, peer: NodeId, observed_at: DateTime<Utc>) {
+        let mut lazy_connect = self.lazy_connect.write().await;
+        let changed = lazy_connect.record_remote_activity(peer, observed_at);
+        drop(lazy_connect);
+        if changed {
+            self.request_lazy_connect_sync();
+        }
+    }
+
+    pub async fn wake_passive_peer_from_probe(
+        &self,
+        peer: NodeId,
+        observed_at: DateTime<Utc>,
+    ) -> bool {
+        let mut lazy_connect = self.lazy_connect.write().await;
+        let changed = lazy_connect.record_remote_activity_if_idle(peer, observed_at);
+        drop(lazy_connect);
+        if changed {
+            self.request_lazy_connect_sync();
+        }
+        changed
+    }
+
+    pub async fn recent_local_peer_activity(
+        &self,
+        peer: &NodeId,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.lazy_connect
+            .read()
+            .await
+            .recent_local_activity(peer, now)
+    }
+
+    pub async fn replace_internal_packet_flow_udp_ports(&self, ports: BTreeSet<u16>) {
+        *self.internal_packet_flow_udp_ports.write().await = ports;
+    }
+
+    pub async fn has_packet_flow_destination_match(&self, destinations: &[IpAddr]) -> bool {
+        let lazy_connect = self.lazy_connect.read().await;
+        destinations.iter().any(|destination| {
+            lazy_connect
+                .resolve_packet_flow_destination(*destination)
+                .is_some()
+        })
     }
 
     pub async fn record_packet_flow_activity(
@@ -2479,6 +2579,19 @@ impl AgentRuntime {
             .fetch_add(1, Ordering::Relaxed);
         self.packet_flow_application_counter(observation.application())
             .fetch_add(1, Ordering::Relaxed);
+        if observation.protocol == Some(TransportProtocol::Udp) {
+            let internal_ports = self.internal_packet_flow_udp_ports.read().await;
+            if observation
+                .source_port
+                .into_iter()
+                .chain(observation.destination_port)
+                .any(|port| internal_ports.contains(&port))
+            {
+                drop(internal_ports);
+                self.record_packet_flow_filtered(AgentPacketFlowDropReason::InternalControlTraffic);
+                return None;
+            }
+        }
         let mut lazy_connect = self.lazy_connect.write().await;
         let Some(mut matched) = lazy_connect.resolve_packet_flow_destination(destination) else {
             self.packet_flow_unmatched_count
@@ -2492,6 +2605,8 @@ impl AgentRuntime {
         }
         matched.pinned = lazy_connect.is_pinned(&matched.peer);
         self.packet_flow_match_count.fetch_add(1, Ordering::Relaxed);
+        drop(lazy_connect);
+        self.request_lazy_connect_sync();
         Some(matched)
     }
 
@@ -2540,6 +2655,9 @@ impl AgentRuntime {
             }
             AgentPacketFlowDropReason::InconsistentTransportMetadata => {
                 &self.packet_flow_filtered_inconsistent_transport_metadata_count
+            }
+            AgentPacketFlowDropReason::InternalControlTraffic => {
+                &self.packet_flow_filtered_internal_control_traffic_count
             }
         }
     }
@@ -5323,6 +5441,7 @@ pub struct PeerMapApplier<W, R> {
     apply_lock: tokio::sync::Mutex<()>,
     applied_peers: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
     applied_routes: tokio::sync::RwLock<BTreeMap<NodeId, Vec<Route>>>,
+    applied_active_peers: tokio::sync::RwLock<BTreeSet<NodeId>>,
 }
 
 impl<W, R> PeerMapApplier<W, R>
@@ -5341,6 +5460,7 @@ where
             apply_lock: tokio::sync::Mutex::new(()),
             applied_peers: tokio::sync::RwLock::new(BTreeMap::new()),
             applied_routes: tokio::sync::RwLock::new(BTreeMap::new()),
+            applied_active_peers: tokio::sync::RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -5385,6 +5505,11 @@ where
             .iter()
             .map(|peer| peer.node_id.clone())
             .collect::<BTreeSet<_>>();
+        let peer_map_public_keys = peer_map
+            .peers
+            .iter()
+            .map(|peer| (peer.node_id.clone(), peer.wireguard_public_key.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut peers_to_remove = BTreeSet::new();
         if let Some(runtime) = &self.lazy_runtime {
             peers_to_remove.extend(runtime.take_idle_peers_to_close(now).await);
@@ -5398,22 +5523,41 @@ where
                 .collect::<Vec<_>>()
         };
         peers_to_remove.extend(stale_peers);
+        let changed_key_peers = {
+            let applied_peers = self.applied_peers.read().await;
+            applied_peers
+                .iter()
+                .filter(|(peer, public_key)| {
+                    peer_map_public_keys
+                        .get(*peer)
+                        .is_some_and(|desired| desired != *public_key)
+                })
+                .map(|(peer, _)| peer.clone())
+                .collect::<Vec<_>>()
+        };
+        peers_to_remove.extend(changed_key_peers);
 
-        let mut desired_peers = Vec::new();
+        let mut desired_active_peers = Vec::new();
+        let mut desired_passive_peers = Vec::new();
         for peer in &peer_map.peers {
             if let Some(runtime) = &self.lazy_runtime {
                 if !runtime.should_connect_peer(peer).await {
+                    desired_passive_peers.push(peer);
                     continue;
                 }
             }
-            desired_peers.push(peer);
+            desired_active_peers.push(peer);
         }
+        let desired_active_peer_ids = desired_active_peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut desired_public_keys = BTreeSet::new();
         let local_public_key = self
             .lazy_runtime
             .as_ref()
             .map(|runtime| runtime.state().wireguard_public_key_b64);
-        for peer in &desired_peers {
+        for peer in &peer_map.peers {
             if self.wireguard_peer_inventory.is_some() {
                 validate_wireguard_public_key(&peer.wireguard_public_key)?;
                 if local_public_key.as_deref() == Some(peer.wireguard_public_key.as_str()) {
@@ -5424,7 +5568,7 @@ where
                 }
                 if !desired_public_keys.insert(peer.wireguard_public_key.clone()) {
                     return Err(AgentError::WireGuard(format!(
-                        "peer map assigns WireGuard public key {} to multiple active peers",
+                        "peer map assigns WireGuard public key {} to multiple peers",
                         peer.wireguard_public_key
                     )));
                 }
@@ -5447,16 +5591,20 @@ where
             None => BTreeSet::new(),
         };
         let selected_advertised_routes =
-            select_peer_advertised_routes(&desired_peers, &local_route_cidrs);
+            select_peer_advertised_routes(&desired_active_peers, &local_route_cidrs);
         let mut desired_peer_routes = BTreeMap::new();
         let mut routes = Vec::new();
-        for peer in &desired_peers {
+        for peer in &peer_map.peers {
             let peer_routes = peer_routes_for_record(
                 peer,
-                selected_advertised_routes
-                    .get(&peer.node_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
+                if desired_active_peer_ids.contains(&peer.node_id) {
+                    selected_advertised_routes
+                        .get(&peer.node_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                } else {
+                    &[]
+                },
             )?;
             routes.extend(peer_routes.iter().cloned());
             desired_peer_routes.insert(peer.node_id.clone(), peer_routes);
@@ -5522,10 +5670,11 @@ where
             }
             self.applied_peers.write().await.remove(&peer);
             self.applied_routes.write().await.remove(&peer);
+            self.applied_active_peers.write().await.remove(&peer);
             peers_removed += 1;
         }
 
-        if let Some(actual_public_keys) = actual_public_keys {
+        if let Some(actual_public_keys) = actual_public_keys.as_ref() {
             for public_key in actual_public_keys
                 .iter()
                 .filter(|public_key| !desired_public_keys.contains(*public_key))
@@ -5537,12 +5686,87 @@ where
         }
         let mut peers_applied = 0;
 
-        for peer in desired_peers {
+        for peer in desired_passive_peers {
+            let already_passive = {
+                let applied_peers = self.applied_peers.read().await;
+                applied_peers.get(&peer.node_id) == Some(&peer.wireguard_public_key)
+                    && !self
+                        .applied_active_peers
+                        .read()
+                        .await
+                        .contains(&peer.node_id)
+            };
+            if already_passive {
+                continue;
+            }
+
+            if actual_public_keys.as_ref().is_some_and(|public_keys| {
+                public_keys.contains(&peer.wireguard_public_key)
+                    && !removed_public_keys.contains(&peer.wireguard_public_key)
+            }) {
+                self.wireguard
+                    .remove_peer_by_public_key(&peer.wireguard_public_key)
+                    .await?;
+                removed_public_keys.insert(peer.wireguard_public_key.clone());
+                peers_removed += 1;
+            }
+
+            self.wireguard
+                .upsert_peer(WireGuardPeerConfig {
+                    peer: peer.node_id.clone(),
+                    public_key: peer.wireguard_public_key.clone(),
+                    endpoint: Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT.to_string()),
+                    allowed_ips: vec![peer_overlay_cidr(&peer.vpn_ip)],
+                    persistent_keepalive_seconds: None,
+                })
+                .await?;
+            self.applied_peers
+                .write()
+                .await
+                .insert(peer.node_id.clone(), peer.wireguard_public_key.clone());
+            self.applied_active_peers
+                .write()
+                .await
+                .remove(&peer.node_id);
+            peers_applied += 1;
+        }
+
+        for peer in desired_active_peers {
             let _endpoint_update_guard = if let Some(runtime) = self.lazy_runtime.as_ref() {
                 Some(runtime.wireguard_endpoint_update_guard().await)
             } else {
                 None
             };
+            let was_passive = {
+                let applied_peers = self.applied_peers.read().await;
+                applied_peers.get(&peer.node_id) == Some(&peer.wireguard_public_key)
+                    && !self
+                        .applied_active_peers
+                        .read()
+                        .await
+                        .contains(&peer.node_id)
+            };
+            if was_passive {
+                let removed = match actual_public_keys.as_ref() {
+                    Some(public_keys) if public_keys.contains(&peer.wireguard_public_key) => {
+                        self.wireguard
+                            .remove_peer_by_public_key(&peer.wireguard_public_key)
+                            .await?;
+                        true
+                    }
+                    Some(_) => false,
+                    None => {
+                        self.wireguard.remove_peer(&peer.node_id).await?;
+                        true
+                    }
+                };
+                self.applied_peers.write().await.remove(&peer.node_id);
+                self.applied_active_peers
+                    .write()
+                    .await
+                    .remove(&peer.node_id);
+                peers_removed += usize::from(removed);
+            }
             let desired_routes =
                 desired_peer_routes
                     .get(&peer.node_id)
@@ -5612,6 +5836,7 @@ where
             self.route_manager.apply_routes(desired_route_plan).await?;
         }
         *self.applied_routes.write().await = desired_peer_routes;
+        *self.applied_active_peers.write().await = desired_active_peer_ids;
 
         if let Some(runtime) = &self.lazy_runtime {
             runtime.record_peer_map_snapshot(peer_map).await;
@@ -5825,6 +6050,7 @@ pub struct LazyConnectManager {
     pins: BTreeSet<NodeId>,
     observed_pins: BTreeSet<NodeId>,
     last_used: BTreeMap<NodeId, DateTime<Utc>>,
+    local_last_used: BTreeMap<NodeId, DateTime<Utc>>,
     peer_vpn_ips: BTreeMap<IpAddr, NodeId>,
     advertised_routes: BTreeMap<NodeId, Vec<ipnet::IpNet>>,
 }
@@ -5836,13 +6062,40 @@ impl LazyConnectManager {
             pins: BTreeSet::new(),
             observed_pins: BTreeSet::new(),
             last_used: BTreeMap::new(),
+            local_last_used: BTreeMap::new(),
             peer_vpn_ips: BTreeMap::new(),
             advertised_routes: BTreeMap::new(),
         }
     }
 
     pub fn record_activity(&mut self, peer: NodeId, at: DateTime<Utc>) {
-        self.last_used.insert(peer, at);
+        let _ = insert_latest_activity(&mut self.last_used, peer.clone(), at);
+        let _ = insert_latest_activity(&mut self.local_last_used, peer, at);
+    }
+
+    pub fn record_remote_activity(&mut self, peer: NodeId, at: DateTime<Utc>) -> bool {
+        insert_latest_activity(&mut self.last_used, peer, at)
+    }
+
+    pub fn record_remote_activity_if_idle(&mut self, peer: NodeId, at: DateTime<Utc>) -> bool {
+        if self.is_pinned(&peer) || self.last_used.contains_key(&peer) {
+            return false;
+        }
+        insert_latest_activity(&mut self.last_used, peer, at)
+    }
+
+    pub fn recent_local_activity(
+        &self,
+        peer: &NodeId,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let last_used = self.local_last_used.get(peer)?;
+        now.signed_duration_since(*last_used)
+            .to_std()
+            .map_or(Some(*last_used), |idle_for| {
+                (idle_for < Duration::from_secs(self.policy.idle_timeout_seconds))
+                    .then_some(*last_used)
+            })
     }
 
     pub fn pin_peer(&mut self, peer: NodeId) {
@@ -5940,6 +6193,7 @@ impl LazyConnectManager {
 
     pub fn remove_activity(&mut self, peer: &NodeId) {
         self.last_used.remove(peer);
+        self.local_last_used.remove(peer);
     }
 
     fn remove_observed_peer(&mut self, peer: &NodeId) {
@@ -5956,6 +6210,24 @@ impl LazyConnectManager {
             .retain(|observed_peer, _| peers.contains(observed_peer));
         self.observed_pins
             .retain(|observed_peer| peers.contains(observed_peer));
+    }
+}
+
+fn insert_latest_activity(
+    activity: &mut BTreeMap<NodeId, DateTime<Utc>>,
+    peer: NodeId,
+    at: DateTime<Utc>,
+) -> bool {
+    match activity.entry(peer) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(at);
+            true
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) if at > *entry.get() => {
+            entry.insert(at);
+            true
+        }
+        std::collections::btree_map::Entry::Occupied(_) => false,
     }
 }
 
@@ -6790,6 +7062,107 @@ mod tests {
     }
 
     #[test]
+    fn remote_lazy_activity_does_not_become_a_local_connection_intent() {
+        let mut manager = LazyConnectManager::new(ClusterPolicy {
+            idle_timeout_seconds: 10,
+            ..ClusterPolicy::default()
+        });
+        let peer_id = NodeId::from_string("peer-a");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        let now = Utc::now();
+
+        assert!(manager.record_remote_activity(peer_id.clone(), now));
+        assert!(!manager.record_remote_activity(peer_id.clone(), now));
+        assert!(manager.should_connect_peer(&peer));
+        assert_eq!(manager.recent_local_activity(&peer_id, now), None);
+
+        manager.record_activity(peer_id.clone(), now);
+        assert_eq!(manager.recent_local_activity(&peer_id, now), Some(now));
+        assert_eq!(
+            manager.recent_local_activity(&peer_id, now + ChronoDuration::seconds(10)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_remote_lazy_activity_does_not_wake_signal_loop() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let observed_at = Utc::now();
+        let signal_notify = runtime.signal_path_notifier();
+
+        runtime
+            .record_remote_peer_activity(peer_id.clone(), observed_at)
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal_notify.notified())
+                .await
+                .is_ok()
+        );
+
+        runtime
+            .record_remote_peer_activity(peer_id.clone(), observed_at)
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), signal_notify.notified())
+                .await
+                .is_err()
+        );
+
+        runtime
+            .record_remote_peer_activity(peer_id, observed_at + ChronoDuration::milliseconds(1))
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal_notify.notified())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_probe_wakes_only_a_passive_peer() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let first_observed_at = Utc::now();
+
+        assert!(
+            runtime
+                .wake_passive_peer_from_probe(peer_id.clone(), first_observed_at)
+                .await
+        );
+        assert!(
+            !runtime
+                .wake_passive_peer_from_probe(
+                    peer_id.clone(),
+                    first_observed_at + ChronoDuration::seconds(30),
+                )
+                .await
+        );
+        assert_eq!(
+            runtime.lazy_connect.read().await.last_used.get(&peer_id),
+            Some(&first_observed_at)
+        );
+        assert_eq!(
+            runtime
+                .recent_local_peer_activity(&peer_id, first_observed_at)
+                .await,
+            None
+        );
+    }
+
+    #[test]
     fn lazy_manager_pins_default_important_peer_classes() {
         let mut manager = LazyConnectManager::new(ClusterPolicy::default());
         let mut control_plane = peer_record(
@@ -7251,9 +7624,27 @@ mod tests {
         first.key.local = local.clone();
         let mut latest = path("peer-a", PathState::DirectPublic, 115.0);
         latest.key.local = local;
+        let heartbeat_notify = runtime.heartbeat_report_notifier();
         runtime.upsert_path_state(first.clone()).await?;
-        runtime.upsert_path_state(first.clone()).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), heartbeat_notify.notified())
+                .await
+                .is_ok()
+        );
+        let mut refreshed = first.clone();
+        refreshed.updated_at += ChronoDuration::seconds(1);
+        runtime.upsert_path_state(refreshed).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
+                .await
+                .is_err()
+        );
         runtime.upsert_path_state(latest.clone()).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), heartbeat_notify.notified())
+                .await
+                .is_ok()
+        );
 
         let events = runtime.path_change_events().await;
         assert_eq!(events.len(), 2);
@@ -8960,7 +9351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_map_applier_rejects_duplicate_active_wireguard_keys_before_mutation(
+    async fn peer_map_applier_rejects_duplicate_wireguard_keys_before_mutation(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let shared_key = WireGuardKeyPair::generate().public_key_b64;
         let peers = vec![
@@ -9001,7 +9392,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(AgentError::WireGuard(message))
-                if message.contains("to multiple active peers")
+                if message.contains("to multiple peers")
         ));
         assert!(runner.commands().await.is_empty());
         Ok(())
@@ -10018,42 +10409,170 @@ mod tests {
         assert_eq!(
             first,
             PeerMapApplySummary {
-                peers_applied: 2,
+                peers_applied: 3,
                 peers_removed: 0,
-                routes_applied: 2,
+                routes_applied: 3,
                 routes_removed: 0,
             }
         );
         let wireguard_peers = applier.wireguard.peers.read().await;
         assert!(wireguard_peers.contains_key(&active_peer_id));
-        assert!(!wireguard_peers.contains_key(&inactive_peer_id));
+        let inactive_config = &wireguard_peers[&inactive_peer_id];
+        assert_eq!(
+            inactive_config.endpoint.as_deref(),
+            Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT)
+        );
+        assert_eq!(inactive_config.persistent_keepalive_seconds, None);
+        assert_eq!(inactive_config.allowed_ips, vec!["100.64.0.11/32"]);
         assert!(wireguard_peers.contains_key(&pinned_peer_id));
         drop(wireguard_peers);
         assert_eq!(runtime.peer_map_snapshot().await?, peer_map);
 
-        runtime
-            .record_peer_activity(
-                active_peer_id.clone(),
-                Utc::now() - ChronoDuration::seconds(30),
-                false,
-            )
-            .await;
+        {
+            let stale_at = Utc::now() - ChronoDuration::seconds(30);
+            let mut lazy_connect = runtime.lazy_connect.write().await;
+            lazy_connect
+                .last_used
+                .insert(active_peer_id.clone(), stale_at);
+            lazy_connect
+                .local_last_used
+                .insert(active_peer_id.clone(), stale_at);
+        }
         let second = applier.apply_peer_map(peer_map).await?;
 
         assert_eq!(
             second,
             PeerMapApplySummary {
-                peers_applied: 1,
+                peers_applied: 2,
                 peers_removed: 1,
-                routes_applied: 1,
+                routes_applied: 3,
                 routes_removed: 1,
             }
         );
         let wireguard_peers = applier.wireguard.peers.read().await;
-        assert!(!wireguard_peers.contains_key(&active_peer_id));
-        assert!(!wireguard_peers.contains_key(&inactive_peer_id));
+        let inactive_active_config = &wireguard_peers[&active_peer_id];
+        assert_eq!(
+            inactive_active_config.endpoint.as_deref(),
+            Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT)
+        );
+        assert_eq!(inactive_active_config.persistent_keepalive_seconds, None);
+        assert!(wireguard_peers.contains_key(&inactive_peer_id));
         assert!(wireguard_peers.contains_key(&pinned_peer_id));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_resets_passive_handshake_when_activating(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let peer_id = NodeId::from_string("peer-on-demand");
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)),
+            "wg-on-demand",
+            vec![EndpointCandidate {
+                node_id: peer_id.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([203, 0, 113, 20], 51_820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            }],
+            Vec::new(),
+        );
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![peer],
+            bootstrap_endpoints: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        )
+        .with_lazy_connect_runtime(runtime.clone());
+
+        let passive = applier.apply_peer_map(peer_map.clone()).await?;
+        assert_eq!(passive.peers_applied, 1);
+        assert_eq!(passive.peers_removed, 0);
+        assert_eq!(passive.routes_applied, 1);
+        assert_eq!(
+            applier.wireguard.peers.read().await[&peer_id]
+                .endpoint
+                .as_deref(),
+            Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT)
+        );
+
+        runtime
+            .record_peer_activity(peer_id.clone(), Utc::now(), false)
+            .await;
+        let active = applier.apply_peer_map(peer_map).await?;
+
+        assert_eq!(active.peers_applied, 1);
+        assert_eq!(active.peers_removed, 1);
+        assert_eq!(active.routes_applied, 1);
+        assert_eq!(
+            applier.wireguard.peers.read().await[&peer_id]
+                .endpoint
+                .as_deref(),
+            Some("203.0.113.20:51820")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn internal_udp_control_flow_does_not_activate_lazy_peer() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer = peer_record(
+            NodeId::from_string("peer-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            "wg-peer-a",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&peer))
+            .await;
+        runtime
+            .replace_internal_packet_flow_udp_ports(BTreeSet::from([DEFAULT_PEER_PROBE_PORT]))
+            .await;
+
+        let matched = runtime
+            .record_packet_flow_observation(
+                peer.vpn_ip.0,
+                AgentPacketFlowObservation {
+                    protocol: Some(TransportProtocol::Udp),
+                    source_port: Some(49_152),
+                    destination_port: Some(DEFAULT_PEER_PROBE_PORT),
+                    ..Default::default()
+                },
+                Utc::now(),
+                false,
+            )
+            .await;
+
+        assert_eq!(matched, None);
+        assert!(!runtime.should_connect_peer(&peer).await);
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.packet_flow_observation_count, 1);
+        assert_eq!(metrics.packet_flow_match_count, 0);
+        assert_eq!(metrics.packet_flow_filtered_count, 1);
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| entry.reason == AgentPacketFlowDropReason::InternalControlTraffic)
+                .map(|entry| entry.count),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -10105,10 +10624,12 @@ mod tests {
             .observe_peer_map_for_lazy_connect(&[peer_a.clone(), peer_b.clone(), peer_c])
             .await;
 
+        let peer_map_sync = runtime.peer_map_sync_notifier();
         let vpn_ip_match = runtime
             .record_packet_flow_activity(peer_a.vpn_ip.0, Utc::now(), false)
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_a_id.clone()))?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer_map_sync.notified()).await?;
         assert_eq!(vpn_ip_match.peer, peer_a_id);
         assert_eq!(vpn_ip_match.kind, AgentPacketFlowMatchKind::PeerVpnIp);
         assert_eq!(vpn_ip_match.route, None);
@@ -12367,6 +12888,37 @@ mod tests {
         };
 
         runtime.replace_candidates(vec![candidate.clone()]).await;
+
+        let status = runtime.status().await;
+        assert_eq!(status.candidate_count, 1);
+        assert_eq!(status.candidates, vec![candidate]);
+    }
+
+    #[tokio::test]
+    async fn runtime_restores_registered_endpoint_candidates_after_restart() {
+        let mut state = AgentNodeState::generate(Utc::now());
+        let observed_at = Utc::now() - ChronoDuration::seconds(300);
+        let candidate = EndpointCandidate {
+            node_id: state.node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([198, 51, 100, 10], 51_820)),
+            observed_at,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        };
+        let mut node = peer_record(
+            state.node_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 1)),
+            &state.wireguard_public_key_b64,
+            vec![candidate.clone()],
+            Vec::new(),
+        );
+        node.identity_public_key = state.identity_public_key_b64.clone();
+        state.vpn_ip = Some(node.vpn_ip);
+        state.registered_node = Some(node);
+
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
 
         let status = runtime.status().await;
         assert_eq!(status.candidate_count, 1);

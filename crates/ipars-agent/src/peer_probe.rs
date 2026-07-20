@@ -22,6 +22,7 @@ const PEER_PROBE_VERSION: u8 = 1;
 const PEER_PROBE_NONCE_LEN: usize = 16;
 const PEER_PROBE_MAX_DISCARDED_DATAGRAMS_PER_SAMPLE: usize = 128;
 const PEER_PROBE_RATE_WINDOW: Duration = Duration::from_secs(1);
+const PEER_PROBE_WAKE_RESPONSE_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerProbeConfig {
@@ -83,6 +84,7 @@ impl PeerProbeConfig {
 pub struct PeerQualityProbeTarget {
     pub peer: NodeRecord,
     pub path: PathRecord,
+    pub wake_passive_peer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +211,21 @@ impl UdpPeerProbe {
     }
 
     pub async fn measure(&self, target_vpn_ip: VpnIp) -> Result<PeerProbeMeasurement, AgentError> {
+        self.measure_with_wake_intent(target_vpn_ip, false).await
+    }
+
+    pub async fn wake_and_measure(
+        &self,
+        target_vpn_ip: VpnIp,
+    ) -> Result<PeerProbeMeasurement, AgentError> {
+        self.measure_with_wake_intent(target_vpn_ip, true).await
+    }
+
+    async fn measure_with_wake_intent(
+        &self,
+        target_vpn_ip: VpnIp,
+        wake_passive_peer: bool,
+    ) -> Result<PeerProbeMeasurement, AgentError> {
         if target_vpn_ip == self.local_vpn_ip {
             return Err(AgentError::PeerProbe(
                 "peer probe target must differ from the local VPN IP".to_string(),
@@ -232,6 +249,7 @@ impl UdpPeerProbe {
         for sequence in 0..u32::from(self.config.sample_count) {
             let request = PeerProbePacket {
                 kind: PeerProbePacketKind::Request,
+                wake_passive_peer,
                 nonce,
                 sequence,
             };
@@ -242,6 +260,7 @@ impl UdpPeerProbe {
                     target,
                     nonce,
                     sequence,
+                    wake_passive_peer,
                     self.config.response_timeout,
                 )
                 .await?
@@ -267,6 +286,7 @@ async fn receive_matching_response(
     target: SocketAddr,
     nonce: [u8; PEER_PROBE_NONCE_LEN],
     sequence: u32,
+    wake_passive_peer: bool,
     timeout: Duration,
 ) -> Result<bool, AgentError> {
     let deadline = Instant::now() + timeout;
@@ -291,6 +311,7 @@ async fn receive_matching_response(
         let matches = source == target
             && PeerProbePacket::decode(&buffer[..length]).is_some_and(|packet| {
                 packet.kind == PeerProbePacketKind::Response
+                    && packet.wake_passive_peer == wake_passive_peer
                     && packet.nonce == nonce
                     && packet.sequence == sequence
             });
@@ -348,11 +369,21 @@ impl UdpPeerProbeResponder {
                 now.duration_since(limit.window_started) < PEER_PROBE_RATE_WINDOW
             });
             let limit = rate_limits
-                .entry(peer)
+                .entry(peer.clone())
                 .or_insert_with(|| PeerProbeRateWindow::new(now));
             if !limit.allow(now, self.config.max_requests_per_second_per_peer) {
                 runtime.record_peer_probe_responder_rate_limited();
                 continue;
+            }
+            let woke_passive_peer = if request.wake_passive_peer {
+                runtime.wake_passive_peer_from_probe(peer, Utc::now()).await
+            } else {
+                false
+            };
+            if woke_passive_peer {
+                // Give the notified peer-map reconciler time to install the
+                // return route before the first response leaves this socket.
+                tokio::time::sleep(PEER_PROBE_WAKE_RESPONSE_DELAY).await;
             }
             let response = PeerProbePacket {
                 kind: PeerProbePacketKind::Response,
@@ -439,6 +470,7 @@ enum PeerProbePacketKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerProbePacket {
     kind: PeerProbePacketKind,
+    wake_passive_peer: bool,
     nonce: [u8; PEER_PROBE_NONCE_LEN],
     sequence: u32,
 }
@@ -449,6 +481,7 @@ impl PeerProbePacket {
         packet[..PEER_PROBE_MAGIC.len()].copy_from_slice(&PEER_PROBE_MAGIC);
         packet[8] = PEER_PROBE_VERSION;
         packet[9] = self.kind as u8;
+        packet[10] = u8::from(self.wake_passive_peer);
         packet[12..28].copy_from_slice(&self.nonce);
         packet[28..32].copy_from_slice(&self.sequence.to_be_bytes());
         packet
@@ -458,7 +491,6 @@ impl PeerProbePacket {
         if packet.len() != PEER_PROBE_PACKET_LEN
             || packet[..8] != PEER_PROBE_MAGIC
             || packet[8] != PEER_PROBE_VERSION
-            || packet[10] != 0
             || packet[11] != 0
         {
             return None;
@@ -468,8 +500,14 @@ impl PeerProbePacket {
             2 => PeerProbePacketKind::Response,
             _ => return None,
         };
+        let wake_passive_peer = match packet[10] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         Some(Self {
             kind,
+            wake_passive_peer,
             nonce: packet[12..28].try_into().ok()?,
             sequence: u32::from_be_bytes(packet[28..32].try_into().ok()?),
         })
@@ -576,6 +614,7 @@ mod tests {
     fn fixed_width_probe_packet_round_trips_and_rejects_malformed_input() {
         let packet = PeerProbePacket {
             kind: PeerProbePacketKind::Request,
+            wake_passive_peer: true,
             nonce: [7; PEER_PROBE_NONCE_LEN],
             sequence: 42,
         };
@@ -584,7 +623,7 @@ mod tests {
         assert_eq!(PeerProbePacket::decode(&encoded), Some(packet));
 
         let mut malformed = encoded;
-        malformed[10] = 1;
+        malformed[10] = 2;
         assert_eq!(PeerProbePacket::decode(&malformed), None);
         assert_eq!(PeerProbePacket::decode(&encoded[..31]), None);
         let mut unknown_kind = encoded;
@@ -631,10 +670,11 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ipars_types::ClusterPolicy::default(),
         ));
+        let peer = peer_record(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
         runtime
             .record_peer_map_snapshot(PeerMap {
                 cluster_id: ClusterId::new(),
-                peers: vec![peer_record(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)))],
+                peers: vec![peer.clone()],
                 bootstrap_endpoints: Vec::new(),
                 generated_at: Utc::now(),
             })
@@ -645,12 +685,62 @@ mod tests {
         let probe =
             UdpPeerProbe::new(VpnIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))), None, config)?;
 
-        let measurement = probe
+        let routine_measurement = probe
             .measure(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .await?;
+        assert_eq!(routine_measurement.sample_count(), 3);
+        assert_eq!(routine_measurement.successful_sample_count(), 3);
+        assert!(!runtime.should_connect_peer(&peer).await);
+
+        let measurement = probe
+            .wake_and_measure(VpnIp(IpAddr::V4(Ipv4Addr::LOCALHOST)))
             .await?;
         responder_task.abort();
         assert_eq!(measurement.sample_count(), 3);
         assert_eq!(measurement.successful_sample_count(), 3);
+        assert!(runtime.should_connect_peer(&peer).await);
+        assert_eq!(
+            runtime
+                .recent_local_peer_activity(&peer.node_id, Utc::now())
+                .await,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_local_activity_marks_quality_probes_as_wake_intent() -> Result<(), AgentError> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        let runtime = AgentRuntime::new(state, ipars_types::ClusterPolicy::default());
+        let peer = peer_record(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)));
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::new(),
+            peers: vec![peer.clone()],
+            bootstrap_endpoints: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        runtime
+            .observe_peer_map_for_lazy_connect(&peer_map.peers)
+            .await;
+        runtime.record_peer_map_snapshot(peer_map).await;
+        let mut selected_path = path(PathState::DirectPublic);
+        selected_path.key = PeerPathKey::new(local_node, peer.node_id.clone());
+        runtime.upsert_path_state(selected_path).await?;
+
+        runtime
+            .record_remote_peer_activity(peer.node_id.clone(), Utc::now())
+            .await;
+        let remote_targets = runtime.peer_quality_probe_targets().await;
+        assert_eq!(remote_targets.len(), 1);
+        assert!(!remote_targets[0].wake_passive_peer);
+
+        runtime
+            .record_peer_activity(peer.node_id, Utc::now(), false)
+            .await;
+        let local_targets = runtime.peer_quality_probe_targets().await;
+        assert_eq!(local_targets.len(), 1);
+        assert!(local_targets[0].wake_passive_peer);
         Ok(())
     }
 
@@ -667,6 +757,7 @@ mod tests {
         let target = PeerQualityProbeTarget {
             peer: peer.clone(),
             path: selected_path.clone(),
+            wake_passive_peer: false,
         };
         let measurement = PeerProbeMeasurement::from_round_trip_times(
             3,

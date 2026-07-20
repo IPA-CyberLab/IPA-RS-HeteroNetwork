@@ -99,10 +99,11 @@ use ipars_types::{
     AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
     HealthState, KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
     PathRecord, PathScore, PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken,
-    TokenLedgerMetrics, TransportProtocol, VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    TokenLedgerMetrics, TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_PATH_SCORE_REASONS,
 };
 use netlink_sys::{
-    protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE},
+    protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG},
     Socket, SocketAddr as NetlinkSocketAddr,
 };
 use opentelemetry::global;
@@ -174,6 +175,7 @@ const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
 const DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECT_PATH_ENDPOINT_APPLY_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
@@ -432,7 +434,7 @@ struct ControlPlaneArgs {
     web_oidc_scopes: String,
     #[arg(long, env = "HETERONETWORK_CLUSTER_ID")]
     cluster_id: String,
-    #[arg(long, env = "HETERONETWORK_VPN_POOL", default_value = "100.64.0.0/10")]
+    #[arg(long, env = "HETERONETWORK_VPN_POOL", default_value = "10.250.0.0/16")]
     vpn_pool: ipnet::Ipv4Net,
     #[arg(
         long,
@@ -7859,6 +7861,11 @@ async fn run_agent(
     let store = FileAgentStateStore::new(args.state_path.clone());
     let state = store.load_or_create(chrono::Utc::now())?;
     let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+    if !args.disable_peer_probe {
+        runtime
+            .replace_internal_packet_flow_udp_ports(BTreeSet::from([args.peer_probe_port]))
+            .await;
+    }
     let persisted_registered_node = runtime.state().registered_node.clone();
     let persisted_bootstrap_endpoints = runtime.state().bootstrap_endpoints.clone();
     let relay_capability_reporter = agent_relay_capability_reporter(&args)?;
@@ -12080,6 +12087,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
         relay_capability_reporter,
         route_reporter,
     } = config;
+    let heartbeat_report_notify = runtime.heartbeat_report_notifier();
     loop {
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
@@ -12127,10 +12135,17 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                         }
                     }
                 }
+                let connection_intent_count = response.connection_intents.len();
+                for intent in response.connection_intents {
+                    runtime
+                        .record_remote_peer_activity(intent.peer, intent.observed_at)
+                        .await;
+                }
                 tracing::info!(
                     accepted = response.accepted,
                     policy_version = response.policy_version,
                     peer_delta_available = response.peer_delta_available,
+                    connection_intents = connection_intent_count,
                     "reported agent heartbeat"
                 );
             }
@@ -12139,7 +12154,10 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 "failed to report agent heartbeat; will retry"
             ),
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = heartbeat_report_notify.notified() => {}
+        }
     }
 }
 
@@ -12697,7 +12715,16 @@ async fn direct_path_overlay_probe_confirmed(
         .relay_forwarder_metrics_for_peer(peer)
         .await
         .or_else(|| relay_forwarder_metrics.cloned());
-    match data_plane_probe.measure(peer_vpn_ip).await {
+    let wake_passive_peer = runtime
+        .recent_local_peer_activity(peer, chrono::Utc::now())
+        .await
+        .is_some();
+    let measurement = if wake_passive_peer {
+        data_plane_probe.wake_and_measure(peer_vpn_ip).await
+    } else {
+        data_plane_probe.measure(peer_vpn_ip).await
+    };
+    match measurement {
         Ok(measurement) => {
             let successful_samples = measurement.successful_sample_count();
             let relay_metrics_after = runtime.relay_forwarder_metrics_for_peer(peer).await;
@@ -12943,6 +12970,7 @@ async fn run_signal_path_negotiation_loop(
     hole_puncher: UdpHolePuncher,
     options: SignalPathNegotiationOptions,
 ) {
+    let signal_path_notify = runtime.signal_path_notifier();
     loop {
         let active_control_plane_urls = runtime_control_plane_urls(
             runtime.as_ref(),
@@ -12969,7 +12997,10 @@ async fn run_signal_path_negotiation_loop(
         {
             tracing::warn!(%error, "failed to negotiate signal paths; will retry");
         }
-        tokio::time::sleep(options.interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(options.interval) => {}
+            _ = signal_path_notify.notified() => {}
+        }
     }
 }
 
@@ -13205,7 +13236,7 @@ async fn negotiate_signal_paths(
                                 candidate,
                                 options
                                     .direct_path_probe_timeout
-                                    .min(Duration::from_secs(5)),
+                                    .min(DIRECT_PATH_ENDPOINT_APPLY_WAIT),
                             )
                             .await;
                         }
@@ -13493,9 +13524,35 @@ async fn negotiate_signal_paths(
             )
             .await;
         }
+        set_lazy_connect_local_activity_reason(
+            &mut record,
+            runtime
+                .recent_local_peer_activity(&peer.node_id, chrono::Utc::now())
+                .await,
+        );
         runtime.upsert_path_state(record).await?;
     }
     Ok(())
+}
+
+fn set_lazy_connect_local_activity_reason(
+    record: &mut PathRecord,
+    observed_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    record
+        .score
+        .reasons
+        .retain(|reason| !reason.starts_with(LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX));
+    if let Some(observed_at) = observed_at {
+        record
+            .score
+            .reasons
+            .truncate(MAX_PATH_SCORE_REASONS.saturating_sub(1));
+        record.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            observed_at.timestamp_millis()
+        ));
+    }
 }
 
 async fn prepare_direct_nat_traversal(
@@ -14873,7 +14930,12 @@ async fn run_peer_quality_probe_round(
             let runtime = runtime.clone();
             let probe = probe.clone();
             async move {
-                match probe.measure(target.peer.vpn_ip).await {
+                let measurement = if target.wake_passive_peer {
+                    probe.wake_and_measure(target.peer.vpn_ip).await
+                } else {
+                    probe.measure(target.peer.vpn_ip).await
+                };
+                match measurement {
                     Ok(measurement) => match runtime
                         .record_peer_probe_measurement(&target, &measurement, chrono::Utc::now())
                         .await
@@ -15011,6 +15073,7 @@ fn start_conntrack_netlink_event_packet_flow_detector(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut deduper = PacketFlowDeduper::new(dedup_ttl);
+        let mut snapshot_tracker = ConntrackSnapshotTracker::default();
         loop {
             match open_conntrack_netlink_event_socket() {
                 Ok(socket) => {
@@ -15019,6 +15082,7 @@ fn start_conntrack_netlink_event_packet_flow_detector(
                         &socket,
                         idle_poll_interval,
                         &mut deduper,
+                        &mut snapshot_tracker,
                         limits,
                         pin,
                     )
@@ -15375,6 +15439,7 @@ struct PacketFlowFingerprint {
     application: AgentPacketFlowApplication,
     conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
     tcp_state: Option<AgentPacketFlowTcpState>,
+    conntrack_mark: Option<u32>,
 }
 
 impl From<&PacketFlowRecord> for PacketFlowFingerprint {
@@ -15388,6 +15453,7 @@ impl From<&PacketFlowRecord> for PacketFlowFingerprint {
             application: flow.observation.application(),
             conntrack_status: flow.observation.conntrack_status.clone(),
             tcp_state: flow.observation.tcp_state,
+            conntrack_mark: flow.conntrack_mark,
         }
     }
 }
@@ -15409,38 +15475,328 @@ fn transport_protocol_number(protocol: TransportProtocol) -> u8 {
 
 async fn run_conntrack_netlink_event_detector_once(
     runtime: &AgentRuntime,
-    socket: &Socket,
+    socket: &AsyncFd<Socket>,
     idle_poll_interval: Duration,
     deduper: &mut PacketFlowDeduper,
+    snapshot_tracker: &mut ConntrackSnapshotTracker,
     limits: ConntrackNetlinkReadLimits,
     pin: bool,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
+    reconcile_conntrack_netlink_event_snapshot(runtime, deduper, snapshot_tracker, limits, pin)
+        .await?;
+    let mut reconciliation = tokio::time::interval(idle_poll_interval);
+    reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    reconciliation.reset();
     loop {
-        let mut recorded_any = false;
-        while let Some(flows) =
-            read_conntrack_netlink_event_packet_flows(socket, &mut buffer, limits)?
-        {
-            recorded_any = true;
-            let (flows, duplicate_count) = deduper.retain_new(flows);
-            record_packet_flow_duplicate_suppressions(
-                runtime,
-                duplicate_count,
-                AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents,
-            );
-            let matched_count =
-                record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events")
-                    .await;
-            if matched_count > 0 {
-                tracing::info!(
-                    matched = matched_count,
-                    "recorded packet-flow lazy-connect activity from conntrack netlink events"
-                );
+        tokio::select! {
+            readiness = socket.readable() => {
+                let mut readiness = readiness.context("failed to wait for conntrack netlink event readiness")?;
+                let mut event_flows = Vec::new();
+                loop {
+                    if event_flows.len() >= limits.max_flows {
+                        break;
+                    }
+                    let Some(flows) = read_conntrack_netlink_event_packet_flows(
+                        socket.get_ref(),
+                        &mut buffer,
+                        limits,
+                    )? else {
+                        readiness.clear_ready();
+                        break;
+                    };
+                    let remaining = limits.max_flows.saturating_sub(event_flows.len());
+                    event_flows.extend(flows.into_iter().take(remaining));
+                }
+                if conntrack_event_flows_need_internal_socket_lookup(runtime, &event_flows).await {
+                    let internal_udp_ports =
+                        read_internal_marked_udp_socket_ports(limits.max_flows).await?;
+                    mark_conntrack_event_flows_from_internal_udp_sockets(
+                        &mut event_flows,
+                        &internal_udp_ports,
+                    );
+                }
+                record_conntrack_netlink_event_flows(
+                    runtime,
+                    deduper,
+                    event_flows,
+                    pin,
+                    false,
+                )
+                .await;
+            }
+            _ = reconciliation.tick() => {
+                reconcile_conntrack_netlink_event_snapshot(
+                    runtime,
+                    deduper,
+                    snapshot_tracker,
+                    limits,
+                    pin,
+                )
+                .await?;
             }
         }
-        if !recorded_any {
-            tokio::time::sleep(idle_poll_interval).await;
+    }
+}
+
+async fn conntrack_event_flows_need_internal_socket_lookup(
+    runtime: &AgentRuntime,
+    flows: &[PacketFlowRecord],
+) -> bool {
+    let destinations = flows
+        .iter()
+        .filter(|flow| {
+            flow.conntrack_mark.is_none()
+                && flow.observation.protocol == Some(TransportProtocol::Udp)
+                && flow.observation.source_port.is_some()
+        })
+        .map(|flow| flow.destination)
+        .collect::<Vec<_>>();
+    !destinations.is_empty()
+        && runtime
+            .has_packet_flow_destination_match(&destinations)
+            .await
+}
+
+fn mark_conntrack_event_flows_from_internal_udp_sockets(
+    event_flows: &mut [PacketFlowRecord],
+    internal_udp_ports: &BTreeSet<u16>,
+) {
+    for flow in event_flows {
+        if flow.conntrack_mark.is_none()
+            && flow.observation.protocol == Some(TransportProtocol::Udp)
+            && flow
+                .observation
+                .source_port
+                .is_some_and(|port| internal_udp_ports.contains(&port))
+        {
+            flow.conntrack_mark = Some(TAILSCALE_BYPASS_MARK);
         }
+    }
+}
+
+async fn read_internal_marked_udp_socket_ports(
+    max_sockets: usize,
+) -> anyhow::Result<BTreeSet<u16>> {
+    tokio::task::spawn_blocking(move || read_internal_marked_udp_socket_ports_blocking(max_sockets))
+        .await
+        .context("marked UDP socket diagnostics task failed")?
+}
+
+fn read_internal_marked_udp_socket_ports_blocking(
+    max_sockets: usize,
+) -> anyhow::Result<BTreeSet<u16>> {
+    anyhow::ensure!(
+        max_sockets > 0,
+        "UDP socket diagnostic limit must be positive"
+    );
+    let mut ports = BTreeSet::new();
+    let mut inspected = 0_usize;
+    for (sequence_number, family) in [(1_u32, AF_INET), (2_u32, AF_INET6)] {
+        let remaining = max_sockets.saturating_sub(inspected);
+        anyhow::ensure!(
+            remaining > 0,
+            "UDP socket diagnostics exceeded {max_sockets} sockets"
+        );
+        let result =
+            read_internal_marked_udp_socket_ports_for_family(sequence_number, family, remaining)?;
+        inspected = inspected.saturating_add(result.inspected);
+        ports.extend(result.ports);
+    }
+    Ok(ports)
+}
+
+fn read_internal_marked_udp_socket_ports_for_family(
+    sequence_number: u32,
+    family: u8,
+    max_sockets: usize,
+) -> anyhow::Result<InetDiagDatagram> {
+    let mut socket =
+        Socket::new(NETLINK_SOCK_DIAG).context("failed to open NETLINK_SOCK_DIAG socket")?;
+    socket
+        .bind(&NetlinkSocketAddr::new(0, 0))
+        .context("failed to bind NETLINK_SOCK_DIAG socket")?;
+    socket
+        .connect(&NetlinkSocketAddr::new(0, 0))
+        .context("failed to connect NETLINK_SOCK_DIAG socket to kernel")?;
+
+    let request = inet_diag_udp_dump_request(sequence_number, family);
+    let sent = socket
+        .send(&request, 0)
+        .context("failed to send UDP socket diagnostic request")?;
+    anyhow::ensure!(
+        sent == request.len(),
+        "short UDP socket diagnostic request write: sent {sent} of {} bytes",
+        request.len()
+    );
+
+    let mut combined = InetDiagDatagram::default();
+    let mut buffer = vec![0_u8; CONNTRACK_NETLINK_RECV_BUFFER_BYTES];
+    loop {
+        let received = socket
+            .recv(&mut &mut buffer[..], 0)
+            .context("failed to receive UDP socket diagnostic response")?;
+        let remaining = max_sockets.saturating_sub(combined.inspected);
+        if remaining == 0 {
+            anyhow::bail!("UDP socket diagnostics exceeded {max_sockets} sockets");
+        }
+        let result = parse_inet_diag_marked_udp_ports(&buffer[..received], remaining)?;
+        combined.inspected = combined.inspected.saturating_add(result.inspected);
+        combined.ports.extend(result.ports);
+        if result.truncated {
+            anyhow::bail!("UDP socket diagnostics exceeded {max_sockets} sockets");
+        }
+        if result.done {
+            combined.done = true;
+            return Ok(combined);
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InetDiagDatagram {
+    ports: BTreeSet<u16>,
+    inspected: usize,
+    done: bool,
+    truncated: bool,
+}
+
+fn inet_diag_udp_dump_request(sequence_number: u32, family: u8) -> Vec<u8> {
+    let message_len = NLMSG_HDR_LEN + INET_DIAG_REQ_V2_LEN;
+    let mut request = Vec::with_capacity(message_len);
+    push_u32_ne(&mut request, message_len as u32);
+    push_u16_ne(&mut request, SOCK_DIAG_BY_FAMILY);
+    push_u16_ne(&mut request, NLM_F_REQUEST | NLM_F_DUMP);
+    push_u32_ne(&mut request, sequence_number);
+    push_u32_ne(&mut request, 0);
+    request.push(family);
+    request.push(IPPROTO_UDP);
+    request.push(0);
+    request.push(0);
+    push_u32_ne(&mut request, u32::MAX);
+    request.resize(message_len, 0);
+    request
+}
+
+fn parse_inet_diag_marked_udp_ports(
+    datagram: &[u8],
+    max_sockets: usize,
+) -> anyhow::Result<InetDiagDatagram> {
+    let mut result = InetDiagDatagram::default();
+    let mut offset = 0_usize;
+    while offset < datagram.len() {
+        let remaining = &datagram[offset..];
+        if remaining.len() < NLMSG_HDR_LEN {
+            if remaining.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            anyhow::bail!(
+                "truncated UDP socket diagnostic netlink header: {} trailing bytes",
+                remaining.len()
+            );
+        }
+        let message_len = read_u32_ne(remaining, 0)? as usize;
+        if message_len == 0 {
+            if remaining.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            anyhow::bail!("UDP socket diagnostic netlink message has zero length");
+        }
+        anyhow::ensure!(
+            message_len >= NLMSG_HDR_LEN,
+            "UDP socket diagnostic netlink message is too short: {message_len} bytes"
+        );
+        let message_end = offset
+            .checked_add(message_len)
+            .context("UDP socket diagnostic netlink message length overflow")?;
+        anyhow::ensure!(
+            message_end <= datagram.len(),
+            "UDP socket diagnostic netlink message length {message_len} exceeds datagram remainder {}",
+            remaining.len()
+        );
+
+        let message_type = read_u16_ne(remaining, 4)?;
+        let payload = &datagram[offset + NLMSG_HDR_LEN..message_end];
+        match message_type {
+            NLMSG_DONE => result.done = true,
+            NLMSG_ERROR => handle_netlink_error(payload)?,
+            SOCK_DIAG_BY_FAMILY => {
+                if result.inspected >= max_sockets {
+                    result.truncated = true;
+                    break;
+                }
+                result.inspected += 1;
+                anyhow::ensure!(
+                    payload.len() >= INET_DIAG_MSG_LEN,
+                    "truncated UDP socket diagnostic payload: {} bytes",
+                    payload.len()
+                );
+                let source_port = u16::from_be_bytes(payload[4..6].try_into()?);
+                for attribute in netlink_attributes(&payload[INET_DIAG_MSG_LEN..])? {
+                    if attribute.kind != INET_DIAG_MARK {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        attribute.value.len() == 4,
+                        "invalid UDP socket diagnostic mark length: {}",
+                        attribute.value.len()
+                    );
+                    let mark = u32::from_ne_bytes(attribute.value.try_into()?);
+                    if source_port != 0 && conntrack_mark_is_internal_control_traffic(mark) {
+                        result.ports.insert(source_port);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let aligned_len = align_to_4(message_len);
+        let next_offset = offset
+            .checked_add(aligned_len)
+            .context("UDP socket diagnostic aligned message length overflow")?;
+        offset = if next_offset > datagram.len() {
+            message_end
+        } else {
+            next_offset
+        };
+    }
+    Ok(result)
+}
+
+async fn reconcile_conntrack_netlink_event_snapshot(
+    runtime: &AgentRuntime,
+    deduper: &mut PacketFlowDeduper,
+    snapshot_tracker: &mut ConntrackSnapshotTracker,
+    limits: ConntrackNetlinkReadLimits,
+    pin: bool,
+) -> anyhow::Result<()> {
+    let flows = read_conntrack_netlink_packet_flows(limits).await?;
+    let changed = snapshot_tracker.retain_changed(flows);
+    record_conntrack_netlink_event_flows(runtime, deduper, changed, pin, true).await;
+    Ok(())
+}
+
+async fn record_conntrack_netlink_event_flows(
+    runtime: &AgentRuntime,
+    deduper: &mut PacketFlowDeduper,
+    flows: Vec<PacketFlowRecord>,
+    pin: bool,
+    reconciled: bool,
+) {
+    let (flows, duplicate_count) = deduper.retain_new(flows);
+    record_packet_flow_duplicate_suppressions(
+        runtime,
+        duplicate_count,
+        AgentPacketFlowDuplicateSource::ConntrackNetlinkEvents,
+    );
+    let matched_count =
+        record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events").await;
+    if matched_count > 0 {
+        tracing::info!(
+            matched = matched_count,
+            reconciled,
+            "recorded packet-flow lazy-connect activity from conntrack netlink events"
+        );
     }
 }
 
@@ -15453,6 +15809,19 @@ async fn record_packet_flow_observations(
     let now = chrono::Utc::now();
     let mut matched_count = 0_usize;
     for flow in flows {
+        if flow
+            .conntrack_mark
+            .is_some_and(conntrack_mark_is_internal_control_traffic)
+        {
+            runtime.record_packet_flow_filtered(AgentPacketFlowDropReason::InternalControlTraffic);
+            tracing::debug!(
+                destination = %flow.destination,
+                conntrack_mark = ?flow.conntrack_mark,
+                source,
+                "ignored marked internal packet-flow observation"
+            );
+            continue;
+        }
         if let Some(reason) = packet_flow_destination_drop_reason(flow.destination) {
             runtime.record_packet_flow_filtered(reason);
             tracing::debug!(
@@ -15718,6 +16087,68 @@ struct EbpfJsonlReadCursor {
 struct PacketFlowRecord {
     destination: IpAddr,
     observation: AgentPacketFlowObservation,
+    conntrack_mark: Option<u32>,
+    conntrack_counters: Option<ConntrackFlowCounters>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ConntrackFlowCounters {
+    packets: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct ConntrackSnapshotTracker {
+    initialized: bool,
+    previous: BTreeMap<PacketFlowFingerprint, ConntrackFlowCounters>,
+}
+
+impl ConntrackSnapshotTracker {
+    fn retain_changed(&mut self, flows: Vec<PacketFlowRecord>) -> Vec<PacketFlowRecord> {
+        let mut current =
+            BTreeMap::<PacketFlowFingerprint, (ConntrackFlowCounters, PacketFlowRecord)>::new();
+        for flow in flows {
+            let Some(counters) = flow.conntrack_counters else {
+                continue;
+            };
+            let fingerprint = PacketFlowFingerprint::from(&flow);
+            match current.entry(fingerprint) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((counters, flow));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry)
+                    if counters > entry.get().0 =>
+                {
+                    entry.insert((counters, flow));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+
+        let mut changed = Vec::new();
+        let mut next = BTreeMap::new();
+        for (fingerprint, (counters, flow)) in current {
+            if self.initialized
+                && self
+                    .previous
+                    .get(&fingerprint)
+                    .is_none_or(|previous| previous != &counters)
+            {
+                changed.push(flow);
+            }
+            next.insert(fingerprint, counters);
+        }
+        self.initialized = true;
+        self.previous = next;
+        changed
+    }
+}
+
+const TAILSCALE_BYPASS_MARK: u32 = 0x0008_0000;
+const TAILSCALE_MARK_MASK: u32 = 0x00ff_0000;
+
+fn conntrack_mark_is_internal_control_traffic(mark: u32) -> bool {
+    mark & TAILSCALE_MARK_MASK == TAILSCALE_BYPASS_MARK
 }
 
 fn drain_ebpf_ringbuf_packet_flows(
@@ -15763,6 +16194,8 @@ fn parse_ebpf_ringbuf_packet_flow_event(bytes: &[u8]) -> anyhow::Result<PacketFl
             conntrack_status,
             tcp_state,
         },
+        conntrack_mark: None,
+        conntrack_counters: None,
     })
 }
 
@@ -15937,7 +16370,7 @@ fn dump_conntrack_netlink_packet_flows(
     }
 }
 
-fn open_conntrack_netlink_event_socket() -> anyhow::Result<Socket> {
+fn open_conntrack_netlink_event_socket() -> anyhow::Result<AsyncFd<Socket>> {
     let mut socket =
         Socket::new(NETLINK_NETFILTER).context("failed to open NETLINK_NETFILTER socket")?;
     socket
@@ -15949,7 +16382,7 @@ fn open_conntrack_netlink_event_socket() -> anyhow::Result<Socket> {
     socket
         .set_non_blocking(true)
         .context("failed to set NETLINK_NETFILTER event socket nonblocking")?;
-    Ok(socket)
+    AsyncFd::new(socket).context("failed to register NETLINK_NETFILTER event socket with tokio")
 }
 
 fn read_conntrack_netlink_event_packet_flows(
@@ -15985,15 +16418,27 @@ const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_DUMP: u16 = 0x300;
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
+const INET_DIAG_REQ_V2_LEN: usize = 56;
+const INET_DIAG_MSG_LEN: usize = 72;
+const INET_DIAG_MARK: u16 = 15;
+const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
+const IPPROTO_UDP: u8 = 17;
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
 const NFNLGRP_CONNTRACK_NEW: u32 = 1;
 const NFNLGRP_CONNTRACK_UPDATE: u32 = 2;
 const IPCTNL_MSG_CT_GET: u16 = 1;
 const NFNETLINK_V0: u8 = 0;
 const CTA_TUPLE_ORIG: u16 = 1;
+#[cfg(test)]
 const CTA_TUPLE_REPLY: u16 = 2;
 const CTA_STATUS: u16 = 3;
 const CTA_PROTOINFO: u16 = 4;
+const CTA_MARK: u16 = 8;
+const CTA_COUNTERS_ORIG: u16 = 9;
+#[cfg(test)]
+const CTA_COUNTERS_REPLY: u16 = 10;
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_TUPLE_PROTO: u16 = 2;
 const CTA_IP_V4_SRC: u16 = 1;
@@ -16003,6 +16448,10 @@ const CTA_IP_V6_DST: u16 = 4;
 const CTA_PROTO_NUM: u16 = 1;
 const CTA_PROTO_SRC_PORT: u16 = 2;
 const CTA_PROTO_DST_PORT: u16 = 3;
+const CTA_COUNTERS_PACKETS: u16 = 1;
+const CTA_COUNTERS_BYTES: u16 = 2;
+const CTA_COUNTERS32_PACKETS: u16 = 3;
+const CTA_COUNTERS32_BYTES: u16 = 4;
 const CTA_PROTOINFO_TCP: u16 = 1;
 const CTA_PROTOINFO_TCP_STATE: u16 = 1;
 const NLA_TYPE_MASK: u16 = 0x3fff;
@@ -16139,6 +16588,8 @@ fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlow
     let attributes = netlink_attributes(&payload[NFGENMSG_LEN..])?;
     let mut conntrack_status = Vec::new();
     let mut tcp_state = None;
+    let mut conntrack_mark = None;
+    let mut conntrack_counters = None;
     for attribute in &attributes {
         match attribute.kind {
             CTA_STATUS => {
@@ -16147,26 +16598,84 @@ fn parse_ctnetlink_packet_flows(payload: &[u8]) -> anyhow::Result<Vec<PacketFlow
             CTA_PROTOINFO => {
                 tcp_state = parse_conntrack_protoinfo_tcp_state(attribute.value)?;
             }
+            CTA_MARK => {
+                anyhow::ensure!(
+                    attribute.value.len() == 4,
+                    "invalid conntrack netlink mark attribute length: {}",
+                    attribute.value.len()
+                );
+                conntrack_mark = Some(u32::from_be_bytes(attribute.value.try_into()?));
+            }
+            CTA_COUNTERS_ORIG => {
+                conntrack_counters = parse_conntrack_netlink_counters(attribute.value)?;
+            }
             _ => {}
         }
     }
 
     let mut flows = Vec::new();
     for attribute in attributes {
+        if attribute.kind == CTA_TUPLE_ORIG {
+            if let Some(flow) = parse_conntrack_tuple_packet_flow(
+                attribute.value,
+                &conntrack_status,
+                tcp_state,
+                conntrack_mark,
+                conntrack_counters,
+            )? {
+                flows.push(flow);
+            }
+        }
+    }
+    Ok(flows)
+}
+
+fn parse_conntrack_netlink_counters(
+    payload: &[u8],
+) -> anyhow::Result<Option<ConntrackFlowCounters>> {
+    let mut packets = None;
+    let mut bytes = None;
+    for attribute in netlink_attributes(payload)? {
         match attribute.kind {
-            CTA_TUPLE_ORIG | CTA_TUPLE_REPLY => {
-                if let Some(flow) = parse_conntrack_tuple_packet_flow(
-                    attribute.value,
-                    &conntrack_status,
-                    tcp_state,
-                )? {
-                    flows.push(flow);
-                }
+            CTA_COUNTERS_PACKETS => {
+                anyhow::ensure!(
+                    attribute.value.len() == 8,
+                    "invalid conntrack netlink packet counter length: {}",
+                    attribute.value.len()
+                );
+                packets = Some(u64::from_be_bytes(attribute.value.try_into()?));
+            }
+            CTA_COUNTERS_BYTES => {
+                anyhow::ensure!(
+                    attribute.value.len() == 8,
+                    "invalid conntrack netlink byte counter length: {}",
+                    attribute.value.len()
+                );
+                bytes = Some(u64::from_be_bytes(attribute.value.try_into()?));
+            }
+            CTA_COUNTERS32_PACKETS => {
+                anyhow::ensure!(
+                    attribute.value.len() == 4,
+                    "invalid conntrack netlink 32-bit packet counter length: {}",
+                    attribute.value.len()
+                );
+                packets = Some(u64::from(u32::from_be_bytes(attribute.value.try_into()?)));
+            }
+            CTA_COUNTERS32_BYTES => {
+                anyhow::ensure!(
+                    attribute.value.len() == 4,
+                    "invalid conntrack netlink 32-bit byte counter length: {}",
+                    attribute.value.len()
+                );
+                bytes = Some(u64::from(u32::from_be_bytes(attribute.value.try_into()?)));
             }
             _ => {}
         }
     }
-    Ok(flows)
+    Ok(match (packets, bytes) {
+        (Some(packets), Some(bytes)) => Some(ConntrackFlowCounters { packets, bytes }),
+        _ => None,
+    })
 }
 
 fn parse_conntrack_netlink_status(
@@ -16231,10 +16740,14 @@ fn parse_conntrack_tuple_packet_flow(
     payload: &[u8],
     conntrack_status: &[AgentPacketFlowConntrackStatus],
     tcp_state: Option<AgentPacketFlowTcpState>,
+    conntrack_mark: Option<u32>,
+    conntrack_counters: Option<ConntrackFlowCounters>,
 ) -> anyhow::Result<Option<PacketFlowRecord>> {
     let mut tuple = ConntrackTupleFields {
         conntrack_status: conntrack_status.to_vec(),
         tcp_state,
+        conntrack_mark,
+        conntrack_counters,
         ..Default::default()
     };
     for attribute in netlink_attributes(payload)? {
@@ -16256,6 +16769,8 @@ struct ConntrackTupleFields {
     destination_port: Option<u16>,
     conntrack_status: Vec<AgentPacketFlowConntrackStatus>,
     tcp_state: Option<AgentPacketFlowTcpState>,
+    conntrack_mark: Option<u32>,
+    conntrack_counters: Option<ConntrackFlowCounters>,
 }
 
 impl ConntrackTupleFields {
@@ -16273,6 +16788,8 @@ impl ConntrackTupleFields {
                 conntrack_status: self.conntrack_status,
                 tcp_state: self.tcp_state,
             },
+            conntrack_mark: self.conntrack_mark,
+            conntrack_counters: self.conntrack_counters,
         })
     }
 }
@@ -16628,6 +17145,8 @@ fn parse_ebpf_jsonl_packet_flow_line(
     Ok(PacketFlowRecord {
         destination: event.destination,
         observation: event.observation,
+        conntrack_mark: None,
+        conntrack_counters: None,
     })
 }
 
@@ -16680,26 +17199,22 @@ fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
     let tcp_state = line
         .split_whitespace()
         .find_map(tcp_state_from_conntrack_token);
-    let mut flows = Vec::new();
+    let conntrack_mark = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("mark="))
+        .and_then(|value| value.parse::<u32>().ok());
     let mut tuple = ConntrackTupleFields {
         protocol,
-        conntrack_status: conntrack_status.clone(),
+        conntrack_status,
         tcp_state,
+        conntrack_mark,
         ..ConntrackTupleFields::default()
     };
 
     for field in line.split_whitespace() {
         if let Some(value) = field.strip_prefix("src=") {
             if tuple.source.is_some() || tuple.destination.is_some() {
-                if let Some(flow) = tuple.into_packet_flow() {
-                    flows.push(flow);
-                }
-                tuple = ConntrackTupleFields {
-                    protocol,
-                    conntrack_status: conntrack_status.clone(),
-                    tcp_state,
-                    ..ConntrackTupleFields::default()
-                };
+                break;
             }
             tuple.source = value.parse::<IpAddr>().ok();
         } else if let Some(value) = field.strip_prefix("dst=") {
@@ -16711,10 +17226,7 @@ fn parse_conntrack_line_packet_flows(line: &str) -> Vec<PacketFlowRecord> {
         }
     }
 
-    if let Some(flow) = tuple.into_packet_flow() {
-        flows.push(flow);
-    }
-    flows
+    tuple.into_packet_flow().into_iter().collect()
 }
 
 fn transport_protocol_from_conntrack_token(token: &str) -> Option<TransportProtocol> {
@@ -17936,6 +18448,7 @@ mod tests {
             policy_version: 1,
             peer_delta_available: false,
             bootstrap_endpoints: discovered.clone(),
+            connection_intents: Vec::new(),
         };
         let (available_url, available_task) = spawn_test_http_service(Router::new().route(
             "/v1/heartbeat",
@@ -18504,6 +19017,7 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(args.vpn_pool, "10.250.0.0/16".parse()?);
         Ok(())
     }
 
@@ -23142,9 +23656,9 @@ mod tests {
     }
 
     #[test]
-    fn conntrack_parser_extracts_destination_ips() -> anyhow::Result<()> {
+    fn conntrack_parser_extracts_only_initiating_tuple_destinations() -> anyhow::Result<()> {
         let contents = "\
-ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport=51820 src=100.64.0.11 dst=192.0.2.10 sport=51820 dport=54321 [ASSURED]
+ipv4 2 tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=100.64.0.11 sport=54321 dport=51820 src=100.64.0.11 dst=192.0.2.10 sport=51820 dport=54321 [ASSURED] mark=524288
 ipv6 10 udp 17 29 src=2001:db8::1 dst=fd00::42 sport=50000 dport=51820 [UNREPLIED] src=fd00::42 dst=2001:db8::1 sport=51820 dport=50000
 invalid no-destination-here
 ";
@@ -23155,10 +23669,8 @@ invalid no-destination-here
             .collect::<BTreeSet<_>>();
 
         assert!(destinations.contains(&"100.64.0.11".parse()?));
-        assert!(destinations.contains(&"192.0.2.10".parse()?));
         assert!(destinations.contains(&"fd00::42".parse()?));
-        assert!(destinations.contains(&"2001:db8::1".parse()?));
-        assert_eq!(destinations.len(), 4);
+        assert_eq!(destinations.len(), 2);
         let first_destination: IpAddr = "100.64.0.11".parse()?;
         let first = flows
             .iter()
@@ -23168,6 +23680,7 @@ invalid no-destination-here
         assert_eq!(first.observation.protocol, Some(TransportProtocol::Tcp));
         assert_eq!(first.observation.source_port, Some(54321));
         assert_eq!(first.observation.destination_port, Some(51820));
+        assert_eq!(first.conntrack_mark, Some(TAILSCALE_BYPASS_MARK));
         assert_eq!(
             first.observation.conntrack_status,
             vec![AgentPacketFlowConntrackStatus::Assured]
@@ -23220,7 +23733,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         )?;
         assert_eq!(flows.len(), 2);
         assert_eq!(flows[0].destination, "100.64.0.11".parse::<IpAddr>()?);
-        assert_eq!(flows[1].destination, "192.0.2.10".parse::<IpAddr>()?);
+        assert_eq!(flows[1].destination, "100.64.0.12".parse::<IpAddr>()?);
         Ok(())
     }
 
@@ -23332,15 +23845,23 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 tcp_state: Some(AgentPacketFlowTcpState::SynSent),
                 ..AgentPacketFlowObservation::default()
             },
+            conntrack_mark: None,
+            conntrack_counters: None,
         };
         let mut established = base.clone();
         established.observation.conntrack_status = vec![AgentPacketFlowConntrackStatus::Assured];
         established.observation.tcp_state = Some(AgentPacketFlowTcpState::Established);
+        let mut marked = base.clone();
+        marked.conntrack_mark = Some(TAILSCALE_BYPASS_MARK);
 
         let mut deduper = PacketFlowDeduper::new(Some(Duration::from_secs(60)));
-        let (retained, duplicates) =
-            deduper.retain_new(vec![base.clone(), base.clone(), established.clone()]);
-        assert_eq!(retained, vec![base.clone(), established.clone()]);
+        let (retained, duplicates) = deduper.retain_new(vec![
+            base.clone(),
+            base.clone(),
+            established.clone(),
+            marked.clone(),
+        ]);
+        assert_eq!(retained, vec![base.clone(), established.clone(), marked]);
         assert_eq!(duplicates, 1);
 
         let (retained, duplicates) = deduper.retain_new(vec![base, established]);
@@ -23351,9 +23872,80 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let (retained, duplicates) = disabled.retain_new(vec![PacketFlowRecord {
             destination: "100.64.0.12".parse()?,
             observation: AgentPacketFlowObservation::default(),
+            conntrack_mark: None,
+            conntrack_counters: None,
         }]);
         assert_eq!(retained.len(), 1);
         assert_eq!(duplicates, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn conntrack_event_internal_socket_ports_mark_only_matching_udp_sources() -> anyhow::Result<()>
+    {
+        let event = PacketFlowRecord {
+            destination: "10.250.0.2".parse()?,
+            observation: AgentPacketFlowObservation {
+                source: Some("10.10.10.102".parse()?),
+                protocol: Some(TransportProtocol::Udp),
+                source_port: Some(41_641),
+                destination_port: Some(41_641),
+                conntrack_status: vec![AgentPacketFlowConntrackStatus::Unreplied],
+                ..AgentPacketFlowObservation::default()
+            },
+            conntrack_mark: None,
+            conntrack_counters: None,
+        };
+        let mut unrelated = event.clone();
+        unrelated.observation.source_port = Some(41_642);
+        let mut tcp = event.clone();
+        tcp.observation.protocol = Some(TransportProtocol::Tcp);
+        let mut already_marked = event.clone();
+        already_marked.conntrack_mark = Some(7);
+        let mut events = vec![event, unrelated, tcp, already_marked];
+
+        mark_conntrack_event_flows_from_internal_udp_sockets(
+            &mut events,
+            &BTreeSet::from([41_641]),
+        );
+
+        assert_eq!(events[0].conntrack_mark, Some(TAILSCALE_BYPASS_MARK));
+        assert_eq!(events[1].conntrack_mark, None);
+        assert_eq!(events[2].conntrack_mark, None);
+        assert_eq!(events[3].conntrack_mark, Some(7));
+        Ok(())
+    }
+
+    #[test]
+    fn inet_diag_parser_extracts_internal_marked_udp_source_ports() -> anyhow::Result<()> {
+        let request = inet_diag_udp_dump_request(42, AF_INET);
+        assert_eq!(request.len(), NLMSG_HDR_LEN + INET_DIAG_REQ_V2_LEN);
+        assert_eq!(read_u16_ne(&request, 4)?, SOCK_DIAG_BY_FAMILY);
+        assert_eq!(read_u32_ne(&request, 8)?, 42);
+        assert_eq!(request[NLMSG_HDR_LEN], AF_INET);
+        assert_eq!(request[NLMSG_HDR_LEN + 1], IPPROTO_UDP);
+
+        let mut marked_payload = vec![0_u8; INET_DIAG_MSG_LEN];
+        marked_payload[0] = AF_INET;
+        marked_payload[4..6].copy_from_slice(&41_641_u16.to_be_bytes());
+        marked_payload.extend(test_nla(
+            INET_DIAG_MARK,
+            &TAILSCALE_BYPASS_MARK.to_ne_bytes(),
+        ));
+        let mut ordinary_payload = vec![0_u8; INET_DIAG_MSG_LEN];
+        ordinary_payload[0] = AF_INET;
+        ordinary_payload[4..6].copy_from_slice(&52_000_u16.to_be_bytes());
+        ordinary_payload.extend(test_nla(INET_DIAG_MARK, &0_u32.to_ne_bytes()));
+        let mut datagram = test_netlink_message(SOCK_DIAG_BY_FAMILY, &marked_payload);
+        datagram.extend(test_netlink_message(SOCK_DIAG_BY_FAMILY, &ordinary_payload));
+        datagram.extend(test_netlink_message(NLMSG_DONE, &[]));
+
+        let parsed = parse_inet_diag_marked_udp_ports(&datagram, 10)?;
+
+        assert_eq!(parsed.ports, BTreeSet::from([41_641]));
+        assert_eq!(parsed.inspected, 2);
+        assert!(parsed.done);
+        assert!(!parsed.truncated);
         Ok(())
     }
 
@@ -23368,6 +23960,8 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 destination_port: Some(15_432),
                 ..AgentPacketFlowObservation::default()
             },
+            conntrack_mark: None,
+            conntrack_counters: None,
         };
         let mut classified = base.clone();
         classified.observation.application = Some(AgentPacketFlowApplication::Postgres);
@@ -23389,10 +23983,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         let first = PacketFlowRecord {
             destination: "100.64.0.11".parse()?,
             observation: AgentPacketFlowObservation::default(),
+            conntrack_mark: None,
+            conntrack_counters: None,
         };
         let second = PacketFlowRecord {
             destination: "100.64.0.12".parse()?,
             observation: AgentPacketFlowObservation::default(),
+            conntrack_mark: None,
+            conntrack_counters: None,
         };
         let mut deduper = PacketFlowDeduper::with_max_entries(Some(Duration::from_secs(60)), 1);
 
@@ -23422,6 +24020,46 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(retained, vec![first]);
         assert_eq!(duplicates, 1);
         assert_eq!(deduper.seen.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn conntrack_snapshot_tracker_ignores_baseline_and_emits_counter_changes() -> anyhow::Result<()>
+    {
+        let baseline = PacketFlowRecord {
+            destination: "10.250.0.2".parse()?,
+            observation: AgentPacketFlowObservation {
+                source: Some("10.250.0.1".parse()?),
+                protocol: Some(TransportProtocol::Icmp),
+                ..AgentPacketFlowObservation::default()
+            },
+            conntrack_mark: None,
+            conntrack_counters: Some(ConntrackFlowCounters {
+                packets: 10,
+                bytes: 840,
+            }),
+        };
+        let mut tracker = ConntrackSnapshotTracker::default();
+
+        assert!(tracker.retain_changed(vec![baseline.clone()]).is_empty());
+        assert!(tracker.retain_changed(vec![baseline.clone()]).is_empty());
+
+        let mut advanced = baseline.clone();
+        advanced.conntrack_counters = Some(ConntrackFlowCounters {
+            packets: 11,
+            bytes: 924,
+        });
+        assert_eq!(
+            tracker.retain_changed(vec![advanced.clone()]),
+            vec![advanced]
+        );
+
+        let mut newly_seen = baseline;
+        newly_seen.destination = "10.250.0.3".parse()?;
+        assert_eq!(
+            tracker.retain_changed(vec![newly_seen.clone()]),
+            vec![newly_seen]
+        );
         Ok(())
     }
 
@@ -23485,14 +24123,26 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             PacketFlowRecord {
                 destination: "224.0.0.1".parse()?,
                 observation: AgentPacketFlowObservation::default(),
+                conntrack_mark: None,
+                conntrack_counters: None,
             },
             PacketFlowRecord {
                 destination: "255.255.255.255".parse()?,
                 observation: AgentPacketFlowObservation::default(),
+                conntrack_mark: None,
+                conntrack_counters: None,
             },
             PacketFlowRecord {
                 destination: "10.42.7.25".parse()?,
                 observation: AgentPacketFlowObservation::default(),
+                conntrack_mark: None,
+                conntrack_counters: None,
+            },
+            PacketFlowRecord {
+                destination: "10.42.7.26".parse()?,
+                observation: AgentPacketFlowObservation::default(),
+                conntrack_mark: Some(TAILSCALE_BYPASS_MARK),
+                conntrack_counters: None,
             },
         ];
 
@@ -23504,7 +24154,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(metrics.packet_flow_observation_count, 1);
         assert_eq!(metrics.packet_flow_match_count, 1);
         assert_eq!(metrics.packet_flow_unmatched_count, 0);
-        assert_eq!(metrics.packet_flow_filtered_count, 2);
+        assert_eq!(metrics.packet_flow_filtered_count, 3);
         assert_eq!(
             metrics
                 .packet_flow_filtered_reason_counts
@@ -23518,6 +24168,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
                 .packet_flow_filtered_reason_counts
                 .iter()
                 .find(|entry| entry.reason == AgentPacketFlowDropReason::Broadcast)
+                .map(|entry| entry.count),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .packet_flow_filtered_reason_counts
+                .iter()
+                .find(|entry| { entry.reason == AgentPacketFlowDropReason::InternalControlTraffic })
                 .map(|entry| entry.count),
             Some(1)
         );
@@ -23574,7 +24232,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
     }
 
     #[test]
-    fn conntrack_netlink_parser_extracts_orig_and_reply_flow_metadata() -> anyhow::Result<()> {
+    fn conntrack_netlink_parser_extracts_only_initiating_tuple_metadata() -> anyhow::Result<()> {
         let ipv4_source = Ipv4Addr::new(192, 0, 2, 10);
         let ipv4_destination = Ipv4Addr::new(100, 64, 0, 42);
         let ipv6_source = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
@@ -23626,6 +24284,23 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             .concat(),
         );
         let status = test_nla(CTA_STATUS, &(IPS_SEEN_REPLY | IPS_ASSURED).to_be_bytes());
+        let mark = test_nla(CTA_MARK, &TAILSCALE_BYPASS_MARK.to_be_bytes());
+        let orig_counters = test_nla(
+            CTA_COUNTERS_ORIG | TEST_NLA_F_NESTED,
+            &[
+                test_nla(CTA_COUNTERS_PACKETS, &7_u64.to_be_bytes()),
+                test_nla(CTA_COUNTERS_BYTES, &700_u64.to_be_bytes()),
+            ]
+            .concat(),
+        );
+        let reply_counters = test_nla(
+            CTA_COUNTERS_REPLY | TEST_NLA_F_NESTED,
+            &[
+                test_nla(CTA_COUNTERS_PACKETS, &9_u64.to_be_bytes()),
+                test_nla(CTA_COUNTERS_BYTES, &900_u64.to_be_bytes()),
+            ]
+            .concat(),
+        );
         let protoinfo = test_nla(
             CTA_PROTOINFO | TEST_NLA_F_NESTED,
             &test_nla(
@@ -23635,6 +24310,9 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         );
         let mut payload = vec![0, NFNETLINK_V0, 0, 0];
         payload.extend(status);
+        payload.extend(mark);
+        payload.extend(orig_counters);
+        payload.extend(reply_counters);
         payload.extend(protoinfo);
         payload.extend(orig_tuple);
         payload.extend(reply_tuple);
@@ -23655,10 +24333,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert!(result.done);
         assert_eq!(
             destinations,
-            BTreeSet::from([
-                IpAddr::from(ipv4_destination),
-                IpAddr::from(ipv6_destination)
-            ])
+            BTreeSet::from([IpAddr::from(ipv4_destination)])
         );
         let orig = result
             .flows
@@ -23669,6 +24344,14 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
         assert_eq!(orig.observation.protocol, Some(TransportProtocol::Tcp));
         assert_eq!(orig.observation.source_port, Some(50_000));
         assert_eq!(orig.observation.destination_port, Some(51_820));
+        assert_eq!(orig.conntrack_mark, Some(TAILSCALE_BYPASS_MARK));
+        assert_eq!(
+            orig.conntrack_counters,
+            Some(ConntrackFlowCounters {
+                packets: 7,
+                bytes: 700,
+            })
+        );
         assert_eq!(
             orig.observation.conntrack_status,
             vec![AgentPacketFlowConntrackStatus::Assured]
@@ -23677,19 +24360,10 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             orig.observation.tcp_state,
             Some(AgentPacketFlowTcpState::Established)
         );
-        let reply = result
+        assert!(!result
             .flows
             .iter()
-            .find(|flow| flow.destination == IpAddr::from(ipv6_destination))
-            .context("missing reply flow")?;
-        assert_eq!(
-            reply.observation.conntrack_status,
-            vec![AgentPacketFlowConntrackStatus::Assured]
-        );
-        assert_eq!(
-            reply.observation.tcp_state,
-            Some(AgentPacketFlowTcpState::Established)
-        );
+            .any(|flow| flow.destination == IpAddr::from(ipv6_destination)));
         Ok(())
     }
 
@@ -23705,16 +24379,21 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             ),
         );
         let second_tuple = test_nla(
-            CTA_TUPLE_REPLY | TEST_NLA_F_NESTED,
+            CTA_TUPLE_ORIG | TEST_NLA_F_NESTED,
             &test_nla(
                 CTA_TUPLE_IP | TEST_NLA_F_NESTED,
                 &test_nla(CTA_IP_V4_DST, &second_destination.octets()),
             ),
         );
-        let mut payload = vec![0, NFNETLINK_V0, 0, 0];
-        payload.extend(first_tuple);
-        payload.extend(second_tuple);
-        let mut datagram = test_netlink_message(ctnetlink_message_type(0), &payload);
+        let mut first_payload = vec![0, NFNETLINK_V0, 0, 0];
+        first_payload.extend(first_tuple);
+        let mut second_payload = vec![0, NFNETLINK_V0, 0, 0];
+        second_payload.extend(second_tuple);
+        let mut datagram = test_netlink_message(ctnetlink_message_type(0), &first_payload);
+        datagram.extend(test_netlink_message(
+            ctnetlink_message_type(0),
+            &second_payload,
+        ));
         datagram.extend(test_netlink_message(NLMSG_DONE, &[]));
 
         let result = parse_conntrack_netlink_datagram_packet_flows(&datagram, 1)?;
@@ -31058,6 +31737,54 @@ exec sleep 60
         }];
 
         assert_eq!(relay_admission_request(&status, &peer_record), None);
+    }
+
+    #[test]
+    fn lazy_connect_activity_reason_is_bounded_and_reversible() {
+        let mut record = PathRecord {
+            key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
+            selected_state: PathState::Unreachable,
+            selected_candidate: None,
+            relay_node: None,
+            score: PathScore {
+                value: -1000.0,
+                reasons: (0..MAX_PATH_SCORE_REASONS)
+                    .map(|index| format!("reason-{index}"))
+                    .collect(),
+            },
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        let observed_at = Utc::now();
+        let expected_reason = format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            observed_at.timestamp_millis()
+        );
+        set_lazy_connect_local_activity_reason(&mut record, Some(observed_at));
+        set_lazy_connect_local_activity_reason(&mut record, Some(observed_at));
+
+        assert_eq!(record.score.reasons.len(), MAX_PATH_SCORE_REASONS);
+        assert_eq!(
+            record.score.reasons.last().map(String::as_str),
+            Some(expected_reason.as_str())
+        );
+        assert_eq!(
+            record
+                .score
+                .reasons
+                .iter()
+                .filter(|reason| { reason.starts_with(LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX) })
+                .count(),
+            1
+        );
+
+        set_lazy_connect_local_activity_reason(&mut record, None);
+        assert!(!record
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with(LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX)));
     }
 
     #[test]
