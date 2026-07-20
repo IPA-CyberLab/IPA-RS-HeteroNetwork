@@ -64,6 +64,8 @@ pub struct RelaySession {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub bytes_forwarded: u64,
+    left_addr_learned: bool,
+    right_addr_learned: bool,
     window_started_at: DateTime<Utc>,
     window_bytes: u64,
     max_bytes_per_second: u64,
@@ -301,12 +303,16 @@ impl RelayTable {
             (session.left == admission.left && session.right == admission.right)
                 || (session.left == admission.right && session.right == admission.left)
         }) {
-            if existing.left == admission.left {
-                existing.left_addr = admission.left_addr;
-                existing.right_addr = admission.right_addr;
+            let (left_addr, right_addr) = if existing.left == admission.left {
+                (admission.left_addr, admission.right_addr)
             } else {
-                existing.left_addr = admission.right_addr;
-                existing.right_addr = admission.left_addr;
+                (admission.right_addr, admission.left_addr)
+            };
+            if !existing.left_addr_learned {
+                existing.left_addr = left_addr;
+            }
+            if !existing.right_addr_learned {
+                existing.right_addr = right_addr;
             }
             existing.expires_at = expires_at;
             existing.max_bytes_per_second = megabits_to_bytes_per_second(capability.max_mbps);
@@ -331,6 +337,8 @@ impl RelayTable {
                 created_at: now,
                 expires_at,
                 bytes_forwarded: 0,
+                left_addr_learned: false,
+                right_addr_learned: false,
                 window_started_at: now,
                 window_bytes: 0,
                 max_bytes_per_second: megabits_to_bytes_per_second(capability.max_mbps),
@@ -451,12 +459,14 @@ impl RelayTable {
                 if source == &session.left && destination == &session.right =>
             {
                 session.left_addr = source_addr;
+                session.left_addr_learned = true;
                 session.right_addr
             }
             (Some(source), Some(destination))
                 if source == &session.right && destination == &session.left =>
             {
                 session.right_addr = source_addr;
+                session.right_addr_learned = true;
                 session.left_addr
             }
             (Some(_), Some(_)) => return Err(RelayError::UnknownSession),
@@ -1731,6 +1741,83 @@ mod tests {
             b"left-after-announcement".len() as u64
         );
         assert_eq!(metrics.datagrams_forwarded, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_readmission_preserves_announced_forwarder_addresses() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let admitted_left_addr = SocketAddr::from(([198, 51, 100, 10], 40000));
+        let admitted_right_addr = SocketAddr::from(([198, 51, 100, 20], 40000));
+        let learned_left_addr = SocketAddr::from(([198, 51, 100, 10], 41000));
+        let learned_right_addr = SocketAddr::from(([198, 51, 100, 20], 42000));
+        let stale_left_addr = SocketAddr::from(([198, 51, 100, 10], 43000));
+        let refreshed_right_addr = SocketAddr::from(([198, 51, 100, 20], 44000));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            admitted_left_addr,
+            admitted_right_addr,
+            "left-secret".to_string(),
+        )?;
+
+        let left_announcement = encode_relay_endpoint_announcement(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+        )?;
+        table.forward_datagram_for_addr(learned_left_addr, &left_announcement)?;
+
+        let renewed = table.admit_with_token(
+            &capability,
+            right.clone(),
+            left.clone(),
+            refreshed_right_addr,
+            stale_left_addr,
+            "right-secret".to_string(),
+        )?;
+        assert_eq!(renewed.session_id, credentials.session_id);
+        assert_eq!(renewed.session_token, credentials.session_token);
+
+        let left_before_right_announcement = encode_relay_datagram_with_route(
+            renewed.session_id.as_str(),
+            &renewed.session_token,
+            &left,
+            &right,
+            b"before-right-announcement",
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_left_addr, &left_before_right_announcement)?;
+        assert_eq!(target, refreshed_right_addr);
+        assert_eq!(payload, b"before-right-announcement");
+
+        let right_announcement = encode_relay_endpoint_announcement(
+            renewed.session_id.as_str(),
+            &renewed.session_token,
+            &right,
+            &left,
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_right_addr, &right_announcement)?;
+        assert_eq!(target, learned_left_addr);
+        assert!(payload.is_empty());
+
+        let left_payload = encode_relay_datagram_with_route(
+            renewed.session_id.as_str(),
+            &renewed.session_token,
+            &left,
+            &right,
+            b"after-readmission",
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_left_addr, &left_payload)?;
+        assert_eq!(target, learned_right_addr);
+        assert_eq!(payload, b"after-readmission");
         Ok(())
     }
 
