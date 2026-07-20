@@ -2019,6 +2019,7 @@ impl AgentRuntime {
 
     fn request_lazy_connect_sync(&self) {
         self.request_peer_map_sync();
+        self.request_heartbeat_report();
         self.signal_path_notify.notify_one();
     }
 
@@ -10696,11 +10697,17 @@ mod tests {
             .await;
 
         let peer_map_sync = runtime.peer_map_sync_notifier();
+        let heartbeat_report = runtime.heartbeat_report_notifier();
         let vpn_ip_match = runtime
             .record_packet_flow_activity(peer_a.vpn_ip.0, Utc::now(), false)
             .await
             .ok_or_else(|| AgentError::MissingPeer(peer_a_id.clone()))?;
         tokio::time::timeout(std::time::Duration::from_secs(1), peer_map_sync.notified()).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            heartbeat_report.notified(),
+        )
+        .await?;
         assert_eq!(vpn_ip_match.peer, peer_a_id);
         assert_eq!(vpn_ip_match.kind, AgentPacketFlowMatchKind::PeerVpnIp);
         assert_eq!(vpn_ip_match.route, None);

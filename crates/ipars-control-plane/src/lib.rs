@@ -37,7 +37,9 @@ use ipars_types::{
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
+
+const CONNECTION_INTENT_WAIT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
     PathState::DirectPublic,
@@ -990,6 +992,7 @@ pub struct ControlPlane<S> {
     accepted_node_query_nonces: Mutex<BTreeMap<(NodeId, String), chrono::DateTime<Utc>>>,
     operation_metrics: ControlPlaneOperationMetrics,
     admin_path_pins: RwLock<BTreeMap<(NodeId, NodeId), bool>>,
+    connection_intent_notifiers: Mutex<BTreeMap<NodeId, Arc<Notify>>>,
 }
 
 #[derive(Debug, Default)]
@@ -1053,6 +1056,7 @@ where
             operation_metrics: ControlPlaneOperationMetrics::default(),
             cluster_policy: StdRwLock::new(cluster_policy),
             admin_path_pins: RwLock::new(BTreeMap::new()),
+            connection_intent_notifiers: Mutex::new(BTreeMap::new()),
             config,
             store,
         }
@@ -1916,6 +1920,16 @@ where
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
         }
+        let idle_timeout_seconds = self.policy_snapshot()?.idle_timeout_seconds;
+        let connection_intent_targets = request
+            .path_state
+            .iter()
+            .filter_map(|path| {
+                let observed_at = lazy_connect_local_activity_at(path).ok().flatten()?;
+                timestamp_is_fresh(observed_at, now, idle_timeout_seconds)
+                    .then_some(path.key.remote.clone())
+            })
+            .collect::<BTreeSet<_>>();
         let request_node_id = request.node_id.clone();
         let relay_capability = request
             .relay_capability
@@ -1945,6 +1959,9 @@ where
             })
             .await?;
 
+        self.notify_connection_intent_waiters(&connection_intent_targets)
+            .await;
+
         let directory = self.service_directory_at(now).await?;
         let connection_intents = self.connection_intents_for(&request_node_id, now).await?;
 
@@ -1955,6 +1972,62 @@ where
             bootstrap_endpoints: directory.bootstrap_endpoints,
             connection_intents,
         })
+    }
+
+    pub async fn heartbeat_with_connection_intent_wait(
+        &self,
+        request: HeartbeatRequest,
+        wait: Duration,
+    ) -> Result<HeartbeatResponse, ControlPlaneError> {
+        if wait.is_zero() {
+            return self.heartbeat(request).await;
+        }
+
+        let node_id = request.node_id.clone();
+        let notifier = self.connection_intent_notifier(&node_id).await;
+        let mut response = self.heartbeat(request).await?;
+        if !response.connection_intents.is_empty() {
+            return Ok(response);
+        }
+
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(response);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::select! {
+                _ = notifier.notified() => {}
+                _ = tokio::time::sleep(remaining.min(CONNECTION_INTENT_WAIT_FALLBACK_POLL_INTERVAL)) => {}
+            }
+
+            let intents = self.connection_intents_for(&node_id, Utc::now()).await?;
+            if !intents.is_empty() {
+                response.connection_intents = intents;
+                return Ok(response);
+            }
+        }
+    }
+
+    async fn connection_intent_notifier(&self, node_id: &NodeId) -> Arc<Notify> {
+        let mut notifiers = self.connection_intent_notifiers.lock().await;
+        notifiers
+            .entry(node_id.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    async fn notify_connection_intent_waiters(&self, targets: &BTreeSet<NodeId>) {
+        if targets.is_empty() {
+            return;
+        }
+        let notifiers = self.connection_intent_notifiers.lock().await;
+        for target in targets {
+            if let Some(notifier) = notifiers.get(target) {
+                notifier.notify_one();
+            }
+        }
     }
 
     async fn connection_intents_for(
@@ -5832,6 +5905,87 @@ mod tests {
                 observed_at: fresh_activity_at,
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_heartbeat_wakes_when_peer_reports_local_activity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.idle_timeout_seconds = 10;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = Arc::new(ControlPlane::new(config, store));
+        plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("source"))
+            .await?;
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("target"))
+            .await?;
+
+        let health = |at| NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: at,
+            latency_ms: None,
+            relay_load: None,
+            message: None,
+        };
+        let target_reported_at = Utc::now();
+        let target_request = signed_heartbeat_at(
+            "target",
+            HeartbeatRequest {
+                node_id: node_id("target"),
+                health: health(target_reported_at),
+                candidates: Vec::new(),
+                nat_classification: None,
+                relay_capability: None,
+                routes: None,
+                path_state: Vec::new(),
+                node_signature: None,
+            },
+            target_reported_at,
+        );
+        let waiting_plane = plane.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_plane
+                .heartbeat_with_connection_intent_wait(
+                    target_request,
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let source_reported_at = Utc::now();
+        let mut source_path = path("source", "target");
+        source_path.updated_at = source_reported_at;
+        source_path.score.reasons.push(format!(
+            "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+            source_reported_at.timestamp_millis()
+        ));
+        plane
+            .heartbeat(signed_heartbeat_at(
+                "source",
+                HeartbeatRequest {
+                    node_id: node_id("source"),
+                    health: health(source_reported_at),
+                    candidates: Vec::new(),
+                    nat_classification: None,
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![source_path],
+                    node_signature: None,
+                },
+                source_reported_at,
+            ))
+            .await?;
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await???;
+        assert_eq!(response.connection_intents.len(), 1);
+        assert_eq!(response.connection_intents[0].peer, node_id("source"));
         Ok(())
     }
 

@@ -172,6 +172,7 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const RELAY_NODE_ID_STATE_WAIT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
 const DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -12089,6 +12090,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
     } = config;
     let heartbeat_report_notify = runtime.heartbeat_report_notifier();
     loop {
+        let cycle_started = tokio::time::Instant::now();
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
         let routes = heartbeat_routes(route_reporter.as_ref()).await;
@@ -12116,7 +12118,21 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                     control_plane_urls.clone()
                 }
             };
-        match send_heartbeat_to_control_planes(&client, &active_control_plane_urls, request).await {
+        let send = send_heartbeat_to_control_planes(
+            &client,
+            &active_control_plane_urls,
+            request,
+            interval.min(MAX_HEARTBEAT_CONNECTION_INTENT_WAIT),
+        );
+        tokio::pin!(send);
+        let response = tokio::select! {
+            response = &mut send => response,
+            _ = heartbeat_report_notify.notified() => {
+                tracing::debug!("restarting in-flight heartbeat after runtime state changed");
+                continue;
+            }
+        };
+        match response {
             Ok(response) => {
                 if let Err(error) = persist_agent_service_directory(
                     runtime.as_ref(),
@@ -12154,8 +12170,9 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 "failed to report agent heartbeat; will retry"
             ),
         }
+        let remaining = interval.saturating_sub(cycle_started.elapsed());
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(remaining) => {}
             _ = heartbeat_report_notify.notified() => {}
         }
     }
@@ -12165,6 +12182,7 @@ async fn send_heartbeat_to_control_planes(
     client: &reqwest::Client,
     control_plane_urls: &[String],
     request: HeartbeatRequest,
+    connection_intent_wait: Duration,
 ) -> anyhow::Result<HeartbeatResponse> {
     anyhow::ensure!(
         !control_plane_urls.is_empty(),
@@ -12172,7 +12190,14 @@ async fn send_heartbeat_to_control_planes(
     );
     let mut failures = Vec::new();
     for control_plane_url in control_plane_urls {
-        match send_heartbeat(client, control_plane_url, request.clone()).await {
+        match send_heartbeat(
+            client,
+            control_plane_url,
+            request.clone(),
+            connection_intent_wait,
+        )
+        .await
+        {
             Ok(response) => return Ok(response),
             Err(error) => failures.push(format!("{}: {error:#}", heartbeat_url(control_plane_url))),
         }
@@ -12187,9 +12212,11 @@ async fn send_heartbeat(
     client: &reqwest::Client,
     control_plane_url: &str,
     request: HeartbeatRequest,
+    connection_intent_wait: Duration,
 ) -> anyhow::Result<HeartbeatResponse> {
     let response = client
         .post(heartbeat_url(control_plane_url))
+        .query(&[("wait_seconds", connection_intent_wait.as_secs())])
         .json(&request)
         .send()
         .await
@@ -12210,11 +12237,18 @@ async fn heartbeat_request(
     relay_capability: Option<RelayCapability>,
     routes: Option<Vec<Route>>,
 ) -> anyhow::Result<HeartbeatRequest> {
-    runtime
-        .refresh_candidate_observations(chrono::Utc::now())
-        .await;
+    let now = chrono::Utc::now();
+    runtime.refresh_candidate_observations(now).await;
     let status = runtime.status().await;
-    let path_state = runtime.path_state().await;
+    let mut path_state = runtime.path_state().await;
+    for path in &mut path_state {
+        set_lazy_connect_local_activity_reason(
+            path,
+            runtime
+                .recent_local_peer_activity(&path.key.remote, now)
+                .await,
+        );
+    }
     let health = agent_health_from_status(&status, "agent heartbeat");
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
@@ -18468,6 +18502,7 @@ mod tests {
             &reqwest::Client::new(),
             &[unavailable_url.clone(), available_url],
             request,
+            Duration::ZERO,
         )
         .await?;
         assert_eq!(received.bootstrap_endpoints, discovered);
@@ -33344,6 +33379,10 @@ exec sleep 60
             updated_at: Utc::now(),
             pinned: false,
         };
+        let local_activity_at = Utc::now();
+        runtime
+            .record_peer_activity(path.key.remote.clone(), local_activity_at, false)
+            .await;
         runtime.upsert_path_state(path.clone()).await?;
 
         let stale_observed_at = Utc::now() - chrono::Duration::seconds(300);
@@ -33383,7 +33422,15 @@ exec sleep 60
         assert!(request.candidates[0].observed_at > stale_observed_at);
         assert!(request.relay_capability.is_none());
         assert_eq!(request.routes, Some(vec![advertised_route]));
-        assert_eq!(request.path_state, vec![path]);
+        assert_eq!(request.path_state.len(), 1);
+        assert_eq!(request.path_state[0].key, path.key);
+        assert!(request.path_state[0].score.reasons.iter().any(|reason| {
+            reason
+                == &format!(
+                    "{LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX}{}",
+                    local_activity_at.timestamp_millis()
+                )
+        }));
         Ok(())
     }
 
