@@ -45,6 +45,7 @@ use ipars_types::{
     VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -77,6 +78,8 @@ const MAX_FORWARDER_UDP_PAYLOAD_BYTES: usize = 65_507;
 const MAX_AGENT_STATE_FILE_BYTES: u64 = 1024 * 1024;
 const DIRECT_PATH_PROBE_KEEPALIVE_SECONDS: u16 = 1;
 const PASSIVE_WIREGUARD_HOLD_ENDPOINT: &str = "127.0.0.1:9";
+const PASSIVE_WIREGUARD_PUBLIC_KEY_DOMAIN: &[u8] =
+    b"HeteroNetwork passive WireGuard quarantine key v1\0";
 
 mod peer_probe;
 
@@ -3445,6 +3448,22 @@ fn validate_wireguard_public_key(value: &str) -> Result<(), AgentError> {
     Ok(())
 }
 
+fn passive_wireguard_public_key(advertised_public_key: &str) -> Result<String, AgentError> {
+    for counter in 0..=u8::MAX {
+        let mut digest = Sha256::new();
+        digest.update(PASSIVE_WIREGUARD_PUBLIC_KEY_DOMAIN);
+        digest.update(advertised_public_key.as_bytes());
+        digest.update([counter]);
+        let candidate = encode_bytes(&digest.finalize());
+        if candidate != advertised_public_key && validate_wireguard_public_key(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(AgentError::WireGuard(
+        "failed to derive a valid passive WireGuard quarantine public key".to_string(),
+    ))
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinuxCommand {
     pub program: String,
@@ -5552,7 +5571,7 @@ where
             .iter()
             .map(|peer| peer.node_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut desired_public_keys = BTreeSet::new();
+        let mut advertised_public_keys = BTreeSet::new();
         let local_public_key = self
             .lazy_runtime
             .as_ref()
@@ -5566,15 +5585,32 @@ where
                         peer.node_id
                     )));
                 }
-                if !desired_public_keys.insert(peer.wireguard_public_key.clone()) {
+                if !advertised_public_keys.insert(peer.wireguard_public_key.clone()) {
                     return Err(AgentError::WireGuard(format!(
                         "peer map assigns WireGuard public key {} to multiple peers",
                         peer.wireguard_public_key
                     )));
                 }
             } else {
-                desired_public_keys.insert(peer.wireguard_public_key.clone());
+                advertised_public_keys.insert(peer.wireguard_public_key.clone());
             }
+        }
+        let mut passive_public_keys = BTreeMap::new();
+        let mut desired_public_keys = desired_active_peers
+            .iter()
+            .map(|peer| peer.wireguard_public_key.clone())
+            .collect::<BTreeSet<_>>();
+        for peer in &desired_passive_peers {
+            let passive_public_key = passive_wireguard_public_key(&peer.wireguard_public_key)?;
+            if local_public_key.as_deref() == Some(passive_public_key.as_str())
+                || !desired_public_keys.insert(passive_public_key.clone())
+            {
+                return Err(AgentError::WireGuard(format!(
+                    "passive WireGuard quarantine public key collision for peer {}",
+                    peer.node_id
+                )));
+            }
+            passive_public_keys.insert(peer.node_id.clone(), passive_public_key);
         }
         let actual_public_keys = match &self.wireguard_peer_inventory {
             Some(inventory) => Some(inventory.public_keys().await?),
@@ -5639,6 +5675,11 @@ where
             let Some(applied_public_key) = applied_public_key else {
                 continue;
             };
+            let configured_public_key = if self.applied_active_peers.read().await.contains(&peer) {
+                applied_public_key.clone()
+            } else {
+                passive_wireguard_public_key(&applied_public_key)?
+            };
             let routes_to_remove = self
                 .applied_routes
                 .read()
@@ -5659,11 +5700,11 @@ where
                 self.applied_routes.write().await.remove(&peer);
             }
             match &actual_public_keys {
-                Some(actual_public_keys) if actual_public_keys.contains(&applied_public_key) => {
+                Some(actual_public_keys) if actual_public_keys.contains(&configured_public_key) => {
                     self.wireguard
-                        .remove_peer_by_public_key(&applied_public_key)
+                        .remove_peer_by_public_key(&configured_public_key)
                         .await?;
-                    removed_public_keys.insert(applied_public_key);
+                    removed_public_keys.insert(configured_public_key);
                 }
                 Some(_) => {}
                 None => self.wireguard.remove_peer(&peer).await?,
@@ -5675,18 +5716,33 @@ where
         }
 
         if let Some(actual_public_keys) = actual_public_keys.as_ref() {
-            for public_key in actual_public_keys
+            let unexpected_public_keys = actual_public_keys
                 .iter()
                 .filter(|public_key| !desired_public_keys.contains(*public_key))
                 .filter(|public_key| !removed_public_keys.contains(*public_key))
-            {
-                self.wireguard.remove_peer_by_public_key(public_key).await?;
+                .cloned()
+                .collect::<Vec<_>>();
+            for public_key in unexpected_public_keys {
+                self.wireguard
+                    .remove_peer_by_public_key(&public_key)
+                    .await?;
+                removed_public_keys.insert(public_key);
                 peers_removed += 1;
             }
         }
         let mut peers_applied = 0;
 
         for peer in desired_passive_peers {
+            let passive_public_key =
+                passive_public_keys
+                    .get(&peer.node_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AgentError::WireGuard(format!(
+                            "missing passive WireGuard quarantine key for peer {}",
+                            peer.node_id
+                        ))
+                    })?;
             let already_passive = {
                 let applied_peers = self.applied_peers.read().await;
                 applied_peers.get(&peer.node_id) == Some(&peer.wireguard_public_key)
@@ -5695,26 +5751,18 @@ where
                         .read()
                         .await
                         .contains(&peer.node_id)
+                    && actual_public_keys
+                        .as_ref()
+                        .is_none_or(|public_keys| public_keys.contains(&passive_public_key))
             };
             if already_passive {
                 continue;
             }
 
-            if actual_public_keys.as_ref().is_some_and(|public_keys| {
-                public_keys.contains(&peer.wireguard_public_key)
-                    && !removed_public_keys.contains(&peer.wireguard_public_key)
-            }) {
-                self.wireguard
-                    .remove_peer_by_public_key(&peer.wireguard_public_key)
-                    .await?;
-                removed_public_keys.insert(peer.wireguard_public_key.clone());
-                peers_removed += 1;
-            }
-
             self.wireguard
                 .upsert_peer(WireGuardPeerConfig {
                     peer: peer.node_id.clone(),
-                    public_key: peer.wireguard_public_key.clone(),
+                    public_key: passive_public_key,
                     endpoint: Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT.to_string()),
                     allowed_ips: vec![peer_overlay_cidr(&peer.vpn_ip)],
                     persistent_keepalive_seconds: None,
@@ -5747,10 +5795,14 @@ where
                         .contains(&peer.node_id)
             };
             if was_passive {
+                let passive_public_key = passive_wireguard_public_key(&peer.wireguard_public_key)?;
                 let removed = match actual_public_keys.as_ref() {
-                    Some(public_keys) if public_keys.contains(&peer.wireguard_public_key) => {
+                    Some(public_keys)
+                        if public_keys.contains(&passive_public_key)
+                            && !removed_public_keys.contains(&passive_public_key) =>
+                    {
                         self.wireguard
-                            .remove_peer_by_public_key(&peer.wireguard_public_key)
+                            .remove_peer_by_public_key(&passive_public_key)
                             .await?;
                         true
                     }
@@ -8994,6 +9046,19 @@ mod tests {
     }
 
     #[test]
+    fn passive_wireguard_public_keys_are_valid_distinct_and_stable() -> Result<(), AgentError> {
+        let first = WireGuardKeyPair::generate().public_key_b64;
+        let second = WireGuardKeyPair::generate().public_key_b64;
+        let first_passive = passive_wireguard_public_key(&first)?;
+
+        validate_wireguard_public_key(&first_passive)?;
+        assert_ne!(first_passive, first);
+        assert_eq!(first_passive, passive_wireguard_public_key(&first)?);
+        assert_ne!(first_passive, passive_wireguard_public_key(&second)?);
+        Ok(())
+    }
+
+    #[test]
     fn command_wireguard_telemetry_parser_aggregates_bounded_field_outputs(
     ) -> Result<(), AgentError> {
         let first_key = encode_bytes(&[7; 32]);
@@ -10424,6 +10489,8 @@ mod tests {
         );
         assert_eq!(inactive_config.persistent_keepalive_seconds, None);
         assert_eq!(inactive_config.allowed_ips, vec!["100.64.0.11/32"]);
+        assert_ne!(inactive_config.public_key, "wg-inactive");
+        validate_wireguard_public_key(&inactive_config.public_key)?;
         assert!(wireguard_peers.contains_key(&pinned_peer_id));
         drop(wireguard_peers);
         assert_eq!(runtime.peer_map_snapshot().await?, peer_map);
@@ -10456,6 +10523,8 @@ mod tests {
             Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT)
         );
         assert_eq!(inactive_active_config.persistent_keepalive_seconds, None);
+        assert_ne!(inactive_active_config.public_key, "wg-active");
+        validate_wireguard_public_key(&inactive_active_config.public_key)?;
         assert!(wireguard_peers.contains_key(&inactive_peer_id));
         assert!(wireguard_peers.contains_key(&pinned_peer_id));
         Ok(())
@@ -10501,12 +10570,13 @@ mod tests {
         assert_eq!(passive.peers_applied, 1);
         assert_eq!(passive.peers_removed, 0);
         assert_eq!(passive.routes_applied, 1);
+        let passive_config = applier.wireguard.peers.read().await[&peer_id].clone();
         assert_eq!(
-            applier.wireguard.peers.read().await[&peer_id]
-                .endpoint
-                .as_deref(),
+            passive_config.endpoint.as_deref(),
             Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT)
         );
+        assert_ne!(passive_config.public_key, "wg-on-demand");
+        validate_wireguard_public_key(&passive_config.public_key)?;
 
         runtime
             .record_peer_activity(peer_id.clone(), Utc::now(), false)
@@ -10516,12 +10586,13 @@ mod tests {
         assert_eq!(active.peers_applied, 1);
         assert_eq!(active.peers_removed, 1);
         assert_eq!(active.routes_applied, 1);
+        let wireguard_peers = applier.wireguard.peers.read().await;
+        let active_config = &wireguard_peers[&peer_id];
         assert_eq!(
-            applier.wireguard.peers.read().await[&peer_id]
-                .endpoint
-                .as_deref(),
+            active_config.endpoint.as_deref(),
             Some("203.0.113.20:51820")
         );
+        assert_eq!(active_config.public_key, "wg-on-demand");
         Ok(())
     }
 
