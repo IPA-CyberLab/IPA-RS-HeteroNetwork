@@ -187,6 +187,7 @@ defaults
     log global
     mode tcp
     option tcplog
+    option dontlog-normal
     option redispatch
     retries 2
     timeout connect 500ms
@@ -791,6 +792,7 @@ self_test() {
   local rendered bundle
   rendered="$(render_haproxy_config)"
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
+  grep -Fq 'option dontlog-normal' <<<"$rendered"
   grep -Fq 'option redispatch' <<<"$rendered"
   grep -Fq 'retries 2' <<<"$rendered"
   grep -Fq 'timeout connect 500ms' <<<"$rendered"

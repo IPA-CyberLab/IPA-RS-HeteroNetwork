@@ -22,6 +22,8 @@ etcd member. Loss of one node preserves the etcd quorum and leaves two API
 servers available. Each HAProxy uses its local API server as the primary and
 keeps both remote API servers as health-checked backups. Failed connections are
 redispatched, and an unreachable backend is removed after one bounded check.
+HAProxy logs failures and backend transitions without synchronously journaling
+every successful API connection on the etcd hosts.
 
 Finalization also runs three CoreDNS replicas with required hostname
 anti-affinity. DNS therefore remains available when any one control-plane node
