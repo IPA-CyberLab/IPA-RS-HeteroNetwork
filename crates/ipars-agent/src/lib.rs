@@ -40,7 +40,7 @@ use ipars_types::{
     canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
-    NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
+    NatConnectivityState, NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
     PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, TransportProtocol,
     VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
@@ -1729,6 +1729,48 @@ impl AgentRuntime {
     ) -> Result<NatClassification, AgentError> {
         self.classify_nat_internal(local_bind, stun_servers, false)
             .await
+    }
+
+    /// Rebuilds the advertised endpoint after an ephemeral STUN probe proves
+    /// that the host itself owns a globally routable address. NAT mappings are
+    /// deliberately excluded because their external port cannot be inferred.
+    pub async fn refresh_public_candidates_for_listen_port(
+        &self,
+        classification: &NatClassification,
+        listen_port: u16,
+    ) -> bool {
+        if listen_port == 0
+            || classification.connectivity_state != NatConnectivityState::Public
+            || !classification.public_state_is_supported()
+        {
+            return false;
+        }
+
+        let node_id = self.state().node_id;
+        let addr = SocketAddr::new(classification.local_addr.ip(), listen_port);
+        let observed_at = classification.assessed_at;
+        self.replace_stun_candidates(vec![
+            EndpointCandidate {
+                node_id: node_id.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr,
+                observed_at,
+                priority: 80,
+                cost: 20,
+                source: CandidateSource::StunProbe,
+            },
+            EndpointCandidate {
+                node_id,
+                kind: EndpointCandidateKind::LocalUdp,
+                addr,
+                observed_at,
+                priority: 70,
+                cost: 30,
+                source: CandidateSource::StunProbe,
+            },
+        ])
+        .await;
+        true
     }
 
     async fn classify_nat_internal(
@@ -12996,6 +13038,57 @@ mod tests {
             observed_at,
         });
         assert_eq!(private_candidate.kind, EndpointCandidateKind::StunReflexive);
+    }
+
+    #[tokio::test]
+    async fn runtime_rebuilds_fixed_port_candidate_only_for_public_no_nat_classification() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let assessed_at = Utc::now();
+        let public_probe_addr = SocketAddr::from(([8, 8, 8, 8], 40_000));
+        let public_classification = NatClassification::from_observations(
+            public_probe_addr,
+            vec![NatProbeObservation {
+                local_addr: public_probe_addr,
+                stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: public_probe_addr,
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+
+        assert!(
+            runtime
+                .refresh_public_candidates_for_listen_port(&public_classification, 51_820)
+                .await
+        );
+        let public_candidates = runtime.status().await.candidates;
+        assert_eq!(public_candidates.len(), 2);
+        assert_eq!(public_candidates[0].kind, EndpointCandidateKind::PublicUdp);
+        assert_eq!(
+            public_candidates[0].addr,
+            SocketAddr::from(([8, 8, 8, 8], 51_820))
+        );
+
+        let private_probe_addr = SocketAddr::from(([100, 100, 20, 30], 40_000));
+        let private_classification = NatClassification::from_observations(
+            private_probe_addr,
+            vec![NatProbeObservation {
+                local_addr: private_probe_addr,
+                stun_server: SocketAddr::from(([100, 100, 20, 40], 3478)),
+                reflexive_addr: private_probe_addr,
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+        assert!(
+            !runtime
+                .refresh_public_candidates_for_listen_port(&private_classification, 51_820)
+                .await
+        );
+        assert_eq!(runtime.status().await.candidates, public_candidates);
     }
 
     #[tokio::test]

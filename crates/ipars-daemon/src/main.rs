@@ -61,7 +61,7 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_signal_http::{SignalNodeAuthenticationError, SignalNodeAuthenticator};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::{
-    BindingStunServer, Rfc5780StunServer, StunServerMetricsSnapshot, StunServerStats,
+    BindingStunServer, Rfc5780StunServer, StunError, StunServerMetricsSnapshot, StunServerStats,
 };
 #[cfg(test)]
 use ipars_types::api::SignalNodeAuthenticationResponse;
@@ -7902,9 +7902,13 @@ async fn run_agent(
     )
     .await?;
     if !stun_servers.is_empty() {
-        if let Err(error) = runtime
-            .classify_nat(args.stun_bind, stun_servers.clone())
-            .await
+        if let Err(error) = classify_agent_startup_nat(
+            runtime.as_ref(),
+            args.stun_bind,
+            args.wireguard_listen_port,
+            &stun_servers,
+        )
+        .await
         {
             tracing::warn!(
                 %error,
@@ -8633,6 +8637,41 @@ fn validate_userspace_wireguard_spawn_command(command: &LinuxCommand) -> anyhow:
         );
     }
     Ok(())
+}
+
+async fn classify_agent_startup_nat(
+    runtime: &AgentRuntime,
+    stun_bind: SocketAddr,
+    wireguard_listen_port: u16,
+    stun_servers: &[SocketAddr],
+) -> Result<(), AgentError> {
+    match runtime.classify_nat(stun_bind, stun_servers.to_vec()).await {
+        Ok(_) => Ok(()),
+        Err(error) if agent_stun_bind_address_in_use(&error) => {
+            let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
+            tracing::info!(
+                %stun_bind,
+                %probe_bind,
+                "STUN listen port is already owned by WireGuard; retrying public-address discovery with an ephemeral port"
+            );
+            let classification = runtime
+                .classify_nat_without_candidate_refresh(probe_bind, stun_servers.to_vec())
+                .await?;
+            runtime
+                .refresh_public_candidates_for_listen_port(&classification, wireguard_listen_port)
+                .await;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn agent_stun_bind_address_in_use(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Stun(StunError::Socket(error))
+            if error.kind() == std::io::ErrorKind::AddrInUse
+    )
 }
 
 fn runtime_command_path_to_string(path: &Path, label: &str) -> anyhow::Result<String> {
@@ -12077,11 +12116,20 @@ fn start_nat_discovery(
                 .classify_nat_without_candidate_refresh(probe_bind, stun_servers.clone())
                 .await
             {
-                Ok(classification) => tracing::info!(
-                    strategy = ?classification.strategy,
-                    confidence = classification.confidence,
-                    "refreshed agent NAT discovery"
-                ),
+                Ok(classification) => {
+                    let public_candidate_refreshed = runtime
+                        .refresh_public_candidates_for_listen_port(
+                            &classification,
+                            stun_bind.port(),
+                        )
+                        .await;
+                    tracing::info!(
+                        strategy = ?classification.strategy,
+                        confidence = classification.confidence,
+                        public_candidate_refreshed,
+                        "refreshed agent NAT discovery"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     %error,
                     "periodic STUN NAT discovery failed; retaining the last classification"
@@ -35487,6 +35535,36 @@ exec sleep 60
 
         assert_eq!(args.public_stun_urls, DEFAULT_PUBLIC_STUN_URLS);
         assert!(!args.disable_public_stun_fallback);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_startup_nat_retries_with_ephemeral_port_when_wireguard_owns_bind(
+    ) -> anyhow::Result<()> {
+        let occupied_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let occupied_addr = occupied_socket.local_addr()?;
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move { server.serve_once().await });
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        classify_agent_startup_nat(
+            &runtime,
+            occupied_addr,
+            occupied_addr.port(),
+            &[server_addr],
+        )
+        .await?;
+        server_task.await??;
+
+        let status = runtime.status().await;
+        assert!(status.nat_classification.is_some());
+        assert!(status.candidates.is_empty());
+        drop(occupied_socket);
         Ok(())
     }
 
