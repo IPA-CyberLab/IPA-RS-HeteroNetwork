@@ -52,6 +52,11 @@ const SIGNAL_PLAN_ONE_SIDED_ADDRESS_PORT_DEPENDENT_NAT_TEST_NAME: &str =
     "udp_hole_puncher_does_not_traverse_signal_plan_one_sided_address_port_dependent_snat_network_namespaces";
 const NAT_PUNCH_ATTEMPTS: usize = 20;
 
+// These addresses only exist inside isolated network namespaces. They must
+// still classify as globally routable so the signal path matches real STUN
+// reflexive candidates instead of accepting private or benchmarking ranges.
+const SIMULATED_PUBLIC_PREFIX: [u8; 2] = [203, 1];
+
 #[tokio::test]
 async fn udp_hole_puncher_sends_signal_payload_between_network_namespaces(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -215,14 +220,14 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         ],
     )?;
 
-    configure_namespace_interface(&namespace_a, &veth_a, "10.240.2.1/30")?;
-    configure_namespace_interface(&namespace_b, &veth_b, "10.240.2.2/30")?;
+    configure_namespace_interface(&namespace_a, &veth_a, "203.1.2.1/30")?;
+    configure_namespace_interface(&namespace_b, &veth_b, "203.1.2.2/30")?;
 
     let plan_json = signal_plan_json(
         "node-a",
-        "10.240.2.1:40111".parse()?,
+        "203.1.2.1:40111".parse()?,
         "node-b",
-        "10.240.2.2:40112".parse()?,
+        "203.1.2.2:40112".parse()?,
     )
     .await?;
     let ready_a = temp_file(format!("ipars-hps-ready-a-{suffix}"));
@@ -232,7 +237,7 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         &namespace_a,
         [
             ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "receiver"),
-            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.1:40111"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "203.1.2.1:40111"),
             ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-b"),
             (
                 "HETERONETWORK_HOLE_PUNCH_READY_FILE",
@@ -245,7 +250,7 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         &namespace_b,
         [
             ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "receiver"),
-            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.2:40112"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "203.1.2.2:40112"),
             ("HETERONETWORK_HOLE_PUNCH_EXPECT_LOCAL", "node-a"),
             (
                 "HETERONETWORK_HOLE_PUNCH_READY_FILE",
@@ -262,7 +267,7 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         [
             ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
             ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-a"),
-            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.1:0"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "203.1.2.1:0"),
             ("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
         ],
     )?;
@@ -272,7 +277,7 @@ async fn udp_hole_puncher_uses_signal_plan_between_network_namespaces(
         [
             ("HETERONETWORK_HOLE_PUNCH_CHILD_ROLE", "signal-plan-puncher"),
             ("HETERONETWORK_HOLE_PUNCH_LOCAL_NODE", "node-b"),
-            ("HETERONETWORK_HOLE_PUNCH_BIND", "10.240.2.2:0"),
+            ("HETERONETWORK_HOLE_PUNCH_BIND", "203.1.2.2:0"),
             ("HETERONETWORK_HOLE_PUNCH_PLAN_JSON", plan_json.as_str()),
         ],
     )?;
@@ -323,12 +328,12 @@ async fn udp_hole_puncher_uses_signal_plan_across_endpoint_independent_snat_netw
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_reflexive_port,
         ),
     )
@@ -378,12 +383,12 @@ async fn udp_hole_puncher_uses_signal_plan_across_fixed_port_snat_network_namesp
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_reflexive_port,
         ),
     )
@@ -433,12 +438,12 @@ async fn udp_hole_puncher_uses_signal_plan_across_mixed_port_snat_network_namesp
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_reflexive_port,
         ),
     )
@@ -488,12 +493,12 @@ async fn udp_hole_puncher_does_not_traverse_signal_plan_address_port_dependent_s
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_reflexive_port,
         ),
     )
@@ -543,12 +548,12 @@ async fn udp_hole_puncher_does_not_traverse_signal_plan_asymmetric_address_port_
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_reflexive_port,
         ),
     )
@@ -598,12 +603,12 @@ async fn udp_hole_puncher_uses_signal_plan_across_one_sided_public_peer_snat_net
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_bind_port,
         ),
     )
@@ -652,12 +657,12 @@ async fn udp_hole_puncher_uses_signal_plan_across_one_sided_port_preserving_publ
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_bind_port,
         ),
     )
@@ -706,12 +711,12 @@ async fn udp_hole_puncher_does_not_traverse_signal_plan_one_sided_address_port_d
     let plan_json = signal_plan_json(
         "node-a",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 1)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 1)),
             topology.left_reflexive_port,
         ),
         "node-b",
         SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(198, 18, topology.public_third_octet, 2)),
+            IpAddr::V4(simulated_public_ipv4(topology.public_third_octet, 2)),
             topology.right_bind_port,
         ),
     )
@@ -1087,8 +1092,8 @@ fn run_two_sided_snat_hole_punch_topology_with_plan(
     let left_gateway = format!("10.{}.0.1", topology.private_second_octet);
     let right_ip = format!("10.{}.1.2", topology.private_second_octet);
     let right_gateway = format!("10.{}.1.1", topology.private_second_octet);
-    let left_public_ip = format!("198.18.{}.1", topology.public_third_octet);
-    let right_public_ip = format!("198.18.{}.2", topology.public_third_octet);
+    let left_public_ip = simulated_public_ipv4(topology.public_third_octet, 1).to_string();
+    let right_public_ip = simulated_public_ipv4(topology.public_third_octet, 2).to_string();
 
     configure_namespace_interface(&left_namespace, &left_if, &format!("{left_ip}/30"))?;
     configure_namespace_interface(
@@ -1334,8 +1339,8 @@ fn run_one_sided_snat_hole_punch_topology_with_plan(
 
     let left_ip = format!("10.{}.0.2", topology.private_second_octet);
     let left_gateway = format!("10.{}.0.1", topology.private_second_octet);
-    let left_public_ip = format!("198.18.{}.1", topology.public_third_octet);
-    let right_public_ip = format!("198.18.{}.2", topology.public_third_octet);
+    let left_public_ip = simulated_public_ipv4(topology.public_third_octet, 1).to_string();
+    let right_public_ip = simulated_public_ipv4(topology.public_third_octet, 2).to_string();
 
     configure_namespace_interface(&left_namespace, &left_if, &format!("{left_ip}/30"))?;
     configure_namespace_interface(
@@ -1735,6 +1740,15 @@ fn reflexive_candidate_addr(node_id: &str, addr: SocketAddr) -> EndpointCandidat
         cost: 10,
         source: CandidateSource::StunProbe,
     }
+}
+
+fn simulated_public_ipv4(third_octet: u8, host_octet: u8) -> Ipv4Addr {
+    Ipv4Addr::new(
+        SIMULATED_PUBLIC_PREFIX[0],
+        SIMULATED_PUBLIC_PREFIX[1],
+        third_octet,
+        host_octet,
+    )
 }
 
 fn configure_namespace_interface(
