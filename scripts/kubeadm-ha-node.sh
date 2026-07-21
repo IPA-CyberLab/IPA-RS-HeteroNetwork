@@ -187,7 +187,10 @@ defaults
     log global
     mode tcp
     option tcplog
-    timeout connect 2s
+    option redispatch
+    retries 2
+    timeout connect 500ms
+    timeout check 500ms
     timeout client 1m
     timeout server 1m
 
@@ -197,7 +200,7 @@ frontend kubernetes_api
 
 backend kubernetes_control_planes
     option tcp-check
-    default-server check inter 1s fall 2 rise 1
+    default-server check inter 500ms fastinter 200ms downinter 1s fall 1 rise 2 on-marked-down shutdown-sessions
 EOF
   local backend
   local index=0
@@ -786,6 +789,11 @@ self_test() {
   local rendered bundle
   rendered="$(render_haproxy_config)"
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
+  grep -Fq 'option redispatch' <<<"$rendered"
+  grep -Fq 'retries 2' <<<"$rendered"
+  grep -Fq 'timeout connect 500ms' <<<"$rendered"
+  grep -Fq 'timeout check 500ms' <<<"$rendered"
+  grep -Fq 'fall 1 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
   rendered="$(render_init_config v1.36.1)"
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
