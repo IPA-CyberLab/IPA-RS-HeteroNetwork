@@ -22,6 +22,11 @@ etcd member. Loss of one node preserves the etcd quorum and leaves two API
 servers available. A local HAProxy removes an unhealthy backend after two
 failed one-second checks.
 
+Finalization also runs three CoreDNS replicas with required hostname
+anti-affinity. DNS therefore remains available when any one control-plane node
+is unavailable, including when the initial node fails after the other nodes
+join.
+
 Flannel VXLAN uses `heteronetwork0` explicitly. Flannel derives its MTU from the
 underlay interface. With the default HeteroNetwork MTU of 1420, the expected Pod
 MTU is 1370 after the 50-byte IPv4 VXLAN overhead.
@@ -95,8 +100,9 @@ Keep an authenticated shell open through HeteroNetwork before disabling any
 bootstrap transport. Stop Tailscale on the private nodes and repeat
 `verify-cluster`. Then stop kubelet and containerd on one control-plane node.
 The remaining local HAProxy instances must continue serving `kubectl`, etcd
-must retain two healthy members, and cross-node traffic between the surviving
-nodes must continue. Restore both services before testing another node.
+must retain two healthy members, CoreDNS must retain two replicas, and
+cross-node traffic between the surviving nodes must continue. Restore both
+services before testing another node.
 
 Do not stop two stacked-etcd members at once. A three-member etcd cluster only
 tolerates one failed member.

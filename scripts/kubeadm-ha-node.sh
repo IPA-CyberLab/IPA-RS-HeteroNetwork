@@ -627,6 +627,42 @@ install_flannel() {
   kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout=5m
 }
 
+configure_coredns_ha() {
+  local replicas
+  replicas="$(backend_addresses | wc -l | tr -d ' ')"
+  kubectl -n kube-system patch deployment coredns --type=merge --patch "$(cat <<EOF
+{
+  "spec": {
+    "replicas": ${replicas},
+    "template": {
+      "spec": {
+        "affinity": {
+          "podAntiAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": [
+              {
+                "labelSelector": {
+                  "matchExpressions": [
+                    {
+                      "key": "k8s-app",
+                      "operator": "In",
+                      "values": ["kube-dns"]
+                    }
+                  ]
+                },
+                "topologyKey": "kubernetes.io/hostname"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+)" >/dev/null
+  kubectl -n kube-system rollout status deployment/coredns --timeout=5m
+}
+
 finalize_cluster() {
   require_root
   validate_common_config
@@ -634,7 +670,7 @@ finalize_cluster() {
   export KUBECONFIG=/etc/kubernetes/admin.conf
   kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
   kubectl wait --for=condition=Ready nodes --all --timeout=10m
-  kubectl -n kube-system rollout status deployment/coredns --timeout=5m
+  configure_coredns_ha
 }
 
 verify_host() {
@@ -660,16 +696,20 @@ verify_cluster() {
   require_command jq
   export KUBECONFIG=/etc/kubernetes/admin.conf
 
-  local expected_nodes actual_nodes ready_nodes control_planes flannel_pods
+  local expected_nodes actual_nodes ready_nodes control_planes flannel_pods coredns_pods coredns_nodes
   expected_nodes="$(backend_addresses | wc -l | tr -d ' ')"
   actual_nodes="$(kubectl get nodes -o json | jq '.items | length')"
   ready_nodes="$(kubectl get nodes -o json | jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   control_planes="$(kubectl -n kube-system get pods -l component=kube-apiserver -o json | jq '[.items[] | select(.status.phase == "Running")] | length')"
   flannel_pods="$(kubectl -n kube-flannel get pods -l app=flannel -o json | jq '[.items[] | select(.status.phase == "Running")] | length')"
+  coredns_pods="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')"
+  coredns_nodes="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] | unique | length')"
   [[ "$actual_nodes" == "$expected_nodes" ]] || die "expected $expected_nodes nodes, found $actual_nodes"
   [[ "$ready_nodes" == "$expected_nodes" ]] || die "expected $expected_nodes Ready nodes, found $ready_nodes"
   [[ "$control_planes" == "$expected_nodes" ]] || die "expected $expected_nodes API servers, found $control_planes"
   [[ "$flannel_pods" == "$expected_nodes" ]] || die "expected $expected_nodes Flannel pods, found $flannel_pods"
+  [[ "$coredns_pods" == "$expected_nodes" ]] || die "expected $expected_nodes Ready CoreDNS pods, found $coredns_pods"
+  [[ "$coredns_nodes" == "$expected_nodes" ]] || die "CoreDNS pods are not spread across all $expected_nodes nodes"
 
   local namespace="heteronetwork-underlay-e2e"
   kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
