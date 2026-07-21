@@ -4062,10 +4062,10 @@ mod tests {
             ControlPlaneHttpState::new(plane, join_service)
                 .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
         );
-        let public_endpoint = SocketAddr::from(([203, 0, 113, 10], 40_000));
-        let nat_endpoint = SocketAddr::from(([203, 0, 113, 11], 40_001));
-        let relay_endpoint_a = SocketAddr::from(([203, 0, 113, 12], 40_002));
-        let relay_endpoint_b = SocketAddr::from(([203, 0, 113, 13], 40_003));
+        let public_endpoint = SocketAddr::from(([8, 8, 8, 10], 40_000));
+        let nat_endpoint = SocketAddr::from(([8, 8, 8, 11], 40_001));
+        let relay_endpoint_a = SocketAddr::from(([8, 8, 8, 12], 40_002));
+        let relay_endpoint_b = SocketAddr::from(([8, 8, 8, 13], 40_003));
         let classifications = [
             (
                 "node-public",

@@ -1094,7 +1094,11 @@ mod tests {
         EndpointCandidate {
             node_id: NodeId::from_string(node_id),
             kind,
-            addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            addr: if kind == EndpointCandidateKind::PublicUdp {
+                SocketAddr::from(([8, 8, 8, 10], 51820))
+            } else {
+                SocketAddr::from(([203, 0, 113, 10], 51820))
+            },
             observed_at: Utc::now(),
             priority: 100,
             cost: 10,

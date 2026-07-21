@@ -88,11 +88,13 @@
     "Runtime connectivity policy and rules.": "実行時の接続ポリシーとルールです。",
     "Issue a short-lived token and install a node with one command.": "短期トークンを発行し、1 コマンドでノードを追加します。",
     "Public": "公開",
+    "Private": "プライベート",
     "NAT": "NAT",
     "Double NAT": "二重 NAT",
     "Relay only": "リレーのみ",
     "Not detected": "未検出",
     "Direct public endpoint": "直接到達可能な公開エンドポイント",
+    "Private or shared address": "プライベートまたは共有アドレス",
     "Direct Public": "公開直接接続",
     "Direct Ipv6": "IPv6 直接接続",
     "Direct Nat Traversal": "NAT トラバーサル直接接続",
@@ -558,18 +560,25 @@
     var explicit = String(profile.connectivity_state || "").toLowerCase();
     var mapping = String(profile.mapping_behavior || "").toLowerCase();
     var strategy = String(profile.strategy || "").toLowerCase();
-    var hasDoubleNat = explicit === "double_nat";
-    var relayOnly = explicit === "relay_only" || strategy === "relay_preferred";
-    var publicNode = explicit === "public" || mapping === "no_nat";
     var natNode = ["endpoint_independent", "address_dependent", "address_and_port_dependent"].indexOf(mapping) !== -1;
     var candidates = Array.isArray(node.endpoint_candidates) ? node.endpoint_candidates : [];
     var hasPublicCandidate = candidates.some(function (candidate) {
       var kind = String(candidate && candidate.kind || "").toLowerCase();
-      return kind.indexOf("public") !== -1 || kind.indexOf("stun_reflexive") !== -1;
+      return kind === "public_udp";
     });
-    var state = hasDoubleNat ? "double_nat" : relayOnly ? "relay_only" : publicNode || (!hasProfile && hasPublicCandidate) ? "public" : natNode ? "nat" : "unknown";
+    var explicitStates = ["public", "private", "nat", "double_nat", "relay_only"];
+    var state = explicitStates.indexOf(explicit) !== -1
+      ? explicit
+      : !hasProfile && hasPublicCandidate
+        ? "public"
+        : strategy === "relay_preferred"
+          ? "relay_only"
+          : natNode
+            ? "nat"
+            : "unknown";
     var labels = {
       public: "Public",
+      private: "Private",
       nat: "NAT",
       double_nat: "Double NAT",
       relay_only: "Relay only",
@@ -577,6 +586,7 @@
     };
     var details = {
       public: "Direct public endpoint",
+      private: "Private or shared address",
       nat: strategy === "relay_preferred" ? "NAT, relay preferred" : "NAT traversal available",
       double_nat: "Multiple NAT layers detected",
       relay_only: "Direct traversal unavailable",
@@ -618,7 +628,7 @@
     var visiblePaths = paths.slice(0, 16);
     var nodeMarkup = visibleNodes.length ? visibleNodes.map(topologyNode).join("") : emptyState("No devices registered", "Connect a device to map network reachability.", "network");
     var pathMarkup = visiblePaths.length ? visiblePaths.map(topologyLink).join("") : '<div class="topology-empty">No path reports yet.</div>';
-    return '<section class="section-panel topology-panel"><div class="section-header"><div><h2>Connectivity map</h2><p>Detected NAT posture and selected peer paths</p></div><div class="topology-legend"><span><i class="legend-dot public"></i>Public</span><span><i class="legend-dot nat"></i>NAT</span><span><i class="legend-dot double-nat"></i>Double NAT</span><span><i class="legend-dot relay-only"></i>Relay only</span></div></div><div class="topology-body"><div class="topology-nodes">' + nodeMarkup + '</div><div class="topology-links">' + pathMarkup + '</div></div>'
+    return '<section class="section-panel topology-panel"><div class="section-header"><div><h2>Connectivity map</h2><p>Detected NAT posture and selected peer paths</p></div><div class="topology-legend"><span><i class="legend-dot public"></i>Public</span><span><i class="legend-dot private"></i>Private</span><span><i class="legend-dot nat"></i>NAT</span><span><i class="legend-dot double-nat"></i>Double NAT</span><span><i class="legend-dot relay-only"></i>Relay only</span></div></div><div class="topology-body"><div class="topology-nodes">' + nodeMarkup + '</div><div class="topology-links">' + pathMarkup + '</div></div>'
       + (nodes.length > visibleNodes.length || paths.length > visiblePaths.length ? '<div class="topology-footnote">Showing ' + visibleNodes.length + ' of ' + nodes.length + ' devices and ' + visiblePaths.length + ' of ' + paths.length + ' paths.</div>' : '') + '</section>';
   }
 

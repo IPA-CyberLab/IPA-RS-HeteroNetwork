@@ -2518,6 +2518,13 @@ html[data-theme="dark"] .status-pill.info {
   color: var(--green);
 }
 
+.legend-dot.private,
+.topology-private .topology-node-icon,
+.topology-state.topology-private {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .legend-dot.nat,
 .topology-nat .topology-node-icon,
 .topology-state.topology-nat {

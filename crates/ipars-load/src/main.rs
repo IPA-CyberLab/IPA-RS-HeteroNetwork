@@ -8262,6 +8262,10 @@ fn endpoint_candidates(index: usize, scenario: Scenario) -> Vec<EndpointCandidat
 fn endpoint_candidate_addr(kind: EndpointCandidateKind, index: usize) -> SocketAddr {
     let port = 30_000 + (index % 30_000) as u16;
     match kind {
+        EndpointCandidateKind::PublicUdp => SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, (index % 250 + 1) as u8)),
+            port,
+        ),
         EndpointCandidateKind::Ipv6 => SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(
                 0x2001,

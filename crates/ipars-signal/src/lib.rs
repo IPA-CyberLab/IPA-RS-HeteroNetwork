@@ -1172,6 +1172,12 @@ fn validate_nat_classification(
     classification: &NatClassification,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), SignalError> {
+    if !classification.public_state_is_supported() {
+        return Err(SignalError::NatClassificationInvalid {
+            node_id: node_id.clone(),
+            reason: "public state requires matching globally routable no-NAT observations",
+        });
+    }
     validate_nat_addr(
         node_id,
         classification.local_addr,
@@ -1838,7 +1844,7 @@ mod tests {
         EndpointCandidate {
             node_id: NodeId::from_string("node-a"),
             kind,
-            addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            addr: SocketAddr::from(([8, 8, 8, 10], 51820)),
             observed_at: Utc::now(),
             priority: 100,
             cost: 10,
@@ -3892,6 +3898,28 @@ mod tests {
                 .await,
             Err(SignalError::NatClassificationInvalid {
                 reason: "NAT filtering response origin is unusable",
+                ..
+            })
+        ));
+
+        let private_addr = SocketAddr::from(([100, 100, 20, 30], 51_820));
+        let mut forged_public = NatClassification::from_observations(
+            private_addr,
+            vec![NatProbeObservation {
+                local_addr: private_addr,
+                stun_server: SocketAddr::from(([100, 100, 20, 40], 3478)),
+                reflexive_addr: private_addr,
+                observed_at: Utc::now(),
+            }],
+            Utc::now(),
+        );
+        forged_public.connectivity_state = NatConnectivityState::Public;
+        assert!(matches!(
+            registry
+                .upsert_node_with_nat(source(Vec::new()), Some(forged_public))
+                .await,
+            Err(SignalError::NatClassificationInvalid {
+                reason: "public state requires matching globally routable no-NAT observations",
                 ..
             })
         ));

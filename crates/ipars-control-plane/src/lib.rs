@@ -3701,6 +3701,12 @@ fn validate_nat_classification_shape(
     now: chrono::DateTime<Utc>,
     max_timestamp_skew: Duration,
 ) -> Result<(), String> {
+    if !classification.public_state_is_supported() {
+        return Err(
+            "NAT classification public state requires matching globally routable no-NAT observations"
+                .to_string(),
+        );
+    }
     let validate_addr = |addr: std::net::SocketAddr, label: &str| {
         endpoint_addr_is_usable(addr)
             .then_some(())
@@ -3954,9 +3960,10 @@ mod tests {
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
-        EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NodeHealth, PathMetrics,
-        PathRecord, PathScore, PathState, PeerPathKey, RelayCapability, Role, Tag, TokenPolicy,
-        TransportProtocol, MAX_JOIN_TOKEN_IDENTIFIER_BYTES,
+        EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NatConnectivityState,
+        NatProbeObservation, NodeHealth, PathMetrics, PathRecord, PathScore, PathState,
+        PeerPathKey, RelayCapability, Role, Tag, TokenPolicy, TransportProtocol,
+        MAX_JOIN_TOKEN_IDENTIFIER_BYTES,
     };
 
     use super::*;
@@ -4400,6 +4407,34 @@ mod tests {
         let mut candidate = candidate(node_id);
         candidate.observed_at = Utc::now() - Duration::seconds(60);
         candidate
+    }
+
+    #[test]
+    fn nat_classification_shape_rejects_forged_private_public_state() {
+        let now = Utc::now();
+        let private_addr = std::net::SocketAddr::from(([100, 100, 20, 30], 51_820));
+        let mut classification = NatClassification::from_observations(
+            private_addr,
+            vec![NatProbeObservation {
+                local_addr: private_addr,
+                stun_server: std::net::SocketAddr::from(([100, 100, 20, 40], 3478)),
+                reflexive_addr: private_addr,
+                observed_at: now,
+            }],
+            now,
+        );
+        classification.connectivity_state = NatConnectivityState::Public;
+
+        assert!(matches!(
+            validate_nat_classification_shape(
+                &node_id("node-a"),
+                &classification,
+                now,
+                std::time::Duration::from_secs(5),
+            ),
+            Err(error)
+                if error.contains("requires matching globally routable no-NAT observations")
+        ));
     }
 
     fn path(local: &str, remote: &str) -> PathRecord {

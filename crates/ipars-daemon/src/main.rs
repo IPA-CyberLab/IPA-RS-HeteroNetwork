@@ -61,7 +61,7 @@ use ipars_signal_http::{router as signal_router, SignalHttpState};
 use ipars_signal_http::{SignalNodeAuthenticationError, SignalNodeAuthenticator};
 use ipars_store::{PostgresControlPlaneStore, SqliteControlPlaneStore};
 use ipars_stun::{
-    BindingStunServer, Rfc5780StunServer, StunServerMetricsSnapshot, StunServerStats,
+    BindingStunServer, Rfc5780StunServer, StunError, StunServerMetricsSnapshot, StunServerStats,
 };
 #[cfg(test)]
 use ipars_types::api::SignalNodeAuthenticationResponse;
@@ -95,12 +95,13 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_TIME_WAIT, PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, http_url_is_usable_endpoint, validate_join_token_bootstrap_endpoints,
-    AclRule, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
-    HealthState, KeyId, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
-    PathRecord, PathScore, PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken,
-    TokenLedgerMetrics, TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_PATH_SCORE_REASONS,
+    endpoint_addr_is_usable, http_url_is_usable_endpoint, socket_addr_is_globally_routable,
+    validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
+    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
+    NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
+    Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
+    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_PATH_SCORE_REASONS,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG},
@@ -130,6 +131,10 @@ const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_STUN_SERVERS: usize = MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND;
+const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
+    "udp://stun.cloudflare.com:3478",
+    "udp://stun.cloudflare.com:53",
+];
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
@@ -727,6 +732,19 @@ struct AgentArgs {
         value_delimiter = ','
     )]
     stun_servers: Vec<SocketAddr>,
+    #[arg(
+        long = "public-stun-url",
+        env = "HETERONETWORK_AGENT_PUBLIC_STUN_URL",
+        value_delimiter = ',',
+        default_values = DEFAULT_PUBLIC_STUN_URLS
+    )]
+    public_stun_urls: Vec<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_DISABLE_PUBLIC_STUN_FALLBACK",
+        default_value_t = false
+    )]
+    disable_public_stun_fallback: bool,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_STUN_BIND",
@@ -7884,9 +7902,13 @@ async fn run_agent(
     )
     .await?;
     if !stun_servers.is_empty() {
-        if let Err(error) = runtime
-            .classify_nat(args.stun_bind, stun_servers.clone())
-            .await
+        if let Err(error) = classify_agent_startup_nat(
+            runtime.as_ref(),
+            args.stun_bind,
+            args.wireguard_listen_port,
+            &stun_servers,
+        )
+        .await
         {
             tracing::warn!(
                 %error,
@@ -8615,6 +8637,41 @@ fn validate_userspace_wireguard_spawn_command(command: &LinuxCommand) -> anyhow:
         );
     }
     Ok(())
+}
+
+async fn classify_agent_startup_nat(
+    runtime: &AgentRuntime,
+    stun_bind: SocketAddr,
+    wireguard_listen_port: u16,
+    stun_servers: &[SocketAddr],
+) -> Result<(), AgentError> {
+    match runtime.classify_nat(stun_bind, stun_servers.to_vec()).await {
+        Ok(_) => Ok(()),
+        Err(error) if agent_stun_bind_address_in_use(&error) => {
+            let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
+            tracing::info!(
+                %stun_bind,
+                %probe_bind,
+                "STUN listen port is already owned by WireGuard; retrying public-address discovery with an ephemeral port"
+            );
+            let classification = runtime
+                .classify_nat_without_candidate_refresh(probe_bind, stun_servers.to_vec())
+                .await?;
+            runtime
+                .refresh_public_candidates_for_listen_port(&classification, wireguard_listen_port)
+                .await;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn agent_stun_bind_address_in_use(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::Stun(StunError::Socket(error))
+            if error.kind() == std::io::ErrorKind::AddrInUse
+    )
 }
 
 fn runtime_command_path_to_string(path: &Path, label: &str) -> anyhow::Result<String> {
@@ -12059,11 +12116,20 @@ fn start_nat_discovery(
                 .classify_nat_without_candidate_refresh(probe_bind, stun_servers.clone())
                 .await
             {
-                Ok(classification) => tracing::info!(
-                    strategy = ?classification.strategy,
-                    confidence = classification.confidence,
-                    "refreshed agent NAT discovery"
-                ),
+                Ok(classification) => {
+                    let public_candidate_refreshed = runtime
+                        .refresh_public_candidates_for_listen_port(
+                            &classification,
+                            stun_bind.port(),
+                        )
+                        .await;
+                    tracing::info!(
+                        strategy = ?classification.strategy,
+                        confidence = classification.confidence,
+                        public_candidate_refreshed,
+                        "refreshed agent NAT discovery"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     %error,
                     "periodic STUN NAT discovery failed; retaining the last classification"
@@ -17775,18 +17841,18 @@ async fn agent_stun_servers_with_persisted(
     token: Option<&SignedJoinToken>,
     persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<SocketAddr>> {
-    let mut servers = Vec::new();
+    let mut explicit_servers = Vec::new();
     for server in &args.stun_servers {
         if !endpoint_addr_is_usable(*server) {
             anyhow::bail!(
                 "--stun-server must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
             );
         }
-        servers.push(*server);
+        explicit_servers.push(*server);
     }
-    servers = dedupe_socket_addrs_preserve_order(servers);
+    explicit_servers = dedupe_socket_addrs_preserve_order(explicit_servers);
     anyhow::ensure!(
-        servers.len() <= MAX_AGENT_STUN_SERVERS,
+        explicit_servers.len() <= MAX_AGENT_STUN_SERVERS,
         "--stun-server may contain at most {MAX_AGENT_STUN_SERVERS} unique socket addresses"
     );
     if let Some(token) = token {
@@ -17797,13 +17863,14 @@ async fn agent_stun_servers_with_persisted(
     let token_bootstrap_endpoints = token
         .map(|token| token.claims.bootstrap_endpoints.as_slice())
         .unwrap_or_default();
+    let mut bootstrap_servers = Vec::new();
     let mut bootstrap_failures = Vec::new();
     for endpoint in persisted_bootstrap_endpoints
         .iter()
         .chain(token_bootstrap_endpoints.iter())
         .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
     {
-        if servers.len() == MAX_AGENT_STUN_SERVERS {
+        if bootstrap_servers.len() == MAX_AGENT_STUN_SERVERS {
             break;
         }
         let resolved =
@@ -17815,35 +17882,107 @@ async fn agent_stun_servers_with_persisted(
                 }
             };
         for addr in resolved {
-            if !servers.contains(&addr) {
-                servers.push(addr);
-                if servers.len() == MAX_AGENT_STUN_SERVERS {
+            if !bootstrap_servers.contains(&addr) {
+                bootstrap_servers.push(addr);
+                if bootstrap_servers.len() == MAX_AGENT_STUN_SERVERS {
                     break;
                 }
             }
         }
     }
-    if servers.is_empty() && !bootstrap_failures.is_empty() {
+
+    if !explicit_servers.is_empty() {
+        explicit_servers.extend(bootstrap_servers);
+        explicit_servers = dedupe_socket_addrs_preserve_order(explicit_servers);
+        explicit_servers.truncate(MAX_AGENT_STUN_SERVERS);
+        for failure in bootstrap_failures {
+            tracing::warn!(%failure, "ignored unavailable STUN bootstrap endpoint");
+        }
+        return Ok(explicit_servers);
+    }
+
+    let public_bootstrap_servers = bootstrap_servers
+        .iter()
+        .copied()
+        .filter(|server| socket_addr_is_globally_routable(*server))
+        .collect::<Vec<_>>();
+    if !public_bootstrap_servers.is_empty() {
+        for failure in bootstrap_failures {
+            tracing::warn!(%failure, "ignored unavailable STUN bootstrap endpoint");
+        }
+        return Ok(public_bootstrap_servers);
+    }
+
+    let mut public_fallback_servers = Vec::new();
+    if !args.disable_public_stun_fallback {
+        anyhow::ensure!(
+            args.public_stun_urls.len() <= MAX_AGENT_STUN_SERVERS,
+            "--public-stun-url may contain at most {MAX_AGENT_STUN_SERVERS} URLs"
+        );
+        for endpoint in &args.public_stun_urls {
+            parse_udp_bootstrap_url(endpoint, "public STUN fallback")?;
+            match resolve_udp_bootstrap_socket_addrs(endpoint, "public STUN fallback").await {
+                Ok(resolved) => {
+                    let mut resolved_global = false;
+                    for addr in resolved
+                        .into_iter()
+                        .filter(|addr| socket_addr_is_globally_routable(*addr))
+                    {
+                        resolved_global = true;
+                        if !public_fallback_servers.contains(&addr) {
+                            public_fallback_servers.push(addr);
+                            if public_fallback_servers.len() == MAX_AGENT_STUN_SERVERS {
+                                break;
+                            }
+                        }
+                    }
+                    if !resolved_global {
+                        tracing::warn!(
+                            endpoint,
+                            "ignored public STUN fallback that resolved only to non-global addresses"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    endpoint,
+                    %error,
+                    "public STUN fallback resolution failed"
+                ),
+            }
+            if public_fallback_servers.len() == MAX_AGENT_STUN_SERVERS {
+                break;
+            }
+        }
+    }
+    if !public_fallback_servers.is_empty() {
+        tracing::info!(
+            stun_servers = public_fallback_servers.len(),
+            "using public STUN fallback because the service directory has no globally routable STUN endpoint"
+        );
+        return Ok(public_fallback_servers);
+    }
+
+    if !bootstrap_servers.is_empty() {
+        tracing::warn!(
+            stun_servers = bootstrap_servers.len(),
+            "using private STUN endpoints for local-path discovery; they cannot establish public Internet reachability"
+        );
+        return Ok(bootstrap_servers);
+    }
+    if !bootstrap_failures.is_empty() {
         anyhow::bail!(
             "all STUN bootstrap endpoints failed: {}",
             bootstrap_failures.join("; ")
         );
     }
-    for failure in bootstrap_failures {
-        tracing::warn!(%failure, "ignored unavailable STUN bootstrap endpoint");
-    }
-    Ok(servers)
+    Ok(Vec::new())
 }
 
 async fn resolve_udp_bootstrap_socket_addrs(
     url: &str,
     name: &str,
 ) -> anyhow::Result<Vec<SocketAddr>> {
-    let parsed =
-        reqwest::Url::parse(url).with_context(|| format!("{name} must be an absolute URL"))?;
-    if parsed.scheme() != "udp" {
-        anyhow::bail!("{name} must use udp");
-    }
+    let parsed = parse_udp_bootstrap_url(url, name)?;
     let host = parsed
         .host_str()
         .with_context(|| format!("{name} must include a host"))?;
@@ -17875,6 +18014,30 @@ async fn resolve_udp_bootstrap_socket_addrs(
         addrs.truncate(MAX_AGENT_STUN_SERVERS);
     }
     Ok(addrs)
+}
+
+fn parse_udp_bootstrap_url(url: &str, name: &str) -> anyhow::Result<reqwest::Url> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("{name} must be an absolute URL"))?;
+    if parsed.scheme() != "udp" {
+        anyhow::bail!("{name} must use udp");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        anyhow::bail!("{name} must not include userinfo, path, query, or fragment components");
+    }
+    parsed
+        .host_str()
+        .with_context(|| format!("{name} must include a host"))?;
+    let port = parsed
+        .port()
+        .with_context(|| format!("{name} must include a port"))?;
+    anyhow::ensure!(port != 0, "{name} must use a nonzero port");
+    Ok(parsed)
 }
 
 fn dedupe_socket_addrs_preserve_order(
@@ -17958,7 +18121,7 @@ mod tests {
         EndpointCandidate {
             node_id: NodeId::from_string(node_id),
             kind,
-            addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+            addr: SocketAddr::from(([8, 8, 8, 10], 51820)),
             observed_at: Utc::now(),
             priority: 100,
             cost,
@@ -35258,13 +35421,13 @@ exec sleep 60
             anyhow::bail!("expected agent command");
         };
         let persisted = vec![BootstrapEndpoint {
-            url: "udp://203.0.113.10:3478".to_string(),
+            url: "udp://8.8.8.10:3478".to_string(),
             kind: BootstrapEndpointKind::Stun,
         }];
 
         assert_eq!(
             agent_stun_servers_with_persisted(&args, None, &persisted).await?,
-            vec![SocketAddr::from(([203, 0, 113, 10], 3478))]
+            vec![SocketAddr::from(([8, 8, 8, 10], 3478))]
         );
         Ok(())
     }
@@ -35277,19 +35440,19 @@ exec sleep 60
             anyhow::bail!("expected agent command");
         };
         let token = token_with_bootstrap(vec![BootstrapEndpoint {
-            url: "udp://203.0.113.10:3478".to_string(),
+            url: "udp://8.8.8.10:3478".to_string(),
             kind: BootstrapEndpointKind::Stun,
         }]);
         let persisted = vec![BootstrapEndpoint {
-            url: "udp://203.0.113.11:3478".to_string(),
+            url: "udp://8.8.8.11:3478".to_string(),
             kind: BootstrapEndpointKind::Stun,
         }];
 
         assert_eq!(
             agent_stun_servers_with_persisted(&args, Some(&token), &persisted).await?,
             vec![
-                SocketAddr::from(([203, 0, 113, 11], 3478)),
-                SocketAddr::from(([203, 0, 113, 10], 3478)),
+                SocketAddr::from(([8, 8, 8, 11], 3478)),
+                SocketAddr::from(([8, 8, 8, 10], 3478)),
             ]
         );
         Ok(())
@@ -35307,15 +35470,116 @@ exec sleep 60
                 kind: BootstrapEndpointKind::Stun,
             },
             BootstrapEndpoint {
-                url: "udp://203.0.113.11:3478".to_string(),
+                url: "udp://8.8.8.11:3478".to_string(),
                 kind: BootstrapEndpointKind::Stun,
             },
         ]);
 
         assert_eq!(
             agent_stun_servers(&args, Some(&token)).await?,
-            vec![SocketAddr::from(([203, 0, 113, 11], 3478))]
+            vec![SocketAddr::from(([8, 8, 8, 11], 3478))]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_do_not_mix_private_and_public_discovery_paths() -> anyhow::Result<()>
+    {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "udp://100.100.20.30:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+            BootstrapEndpoint {
+                url: "udp://1.1.1.1:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+        ]);
+
+        assert_eq!(
+            agent_stun_servers(&args, Some(&token)).await?,
+            vec![SocketAddr::from(([1, 1, 1, 1], 3478))]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_stun_servers_can_disable_public_fallback_for_private_labs() -> anyhow::Result<()>
+    {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--disable-public-stun-fallback"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "udp://100.100.20.30:3478".to_string(),
+            kind: BootstrapEndpointKind::Stun,
+        }]);
+
+        assert_eq!(
+            agent_stun_servers(&args, Some(&token)).await?,
+            vec![SocketAddr::from(([100, 100, 20, 30], 3478))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_defaults_to_documented_public_stun_fallbacks() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+
+        assert_eq!(args.public_stun_urls, DEFAULT_PUBLIC_STUN_URLS);
+        assert!(!args.disable_public_stun_fallback);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_startup_nat_retries_with_ephemeral_port_when_wireguard_owns_bind(
+    ) -> anyhow::Result<()> {
+        let occupied_socket =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let occupied_addr = occupied_socket.local_addr()?;
+        let server = BindingStunServer::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move { server.serve_once().await });
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        classify_agent_startup_nat(
+            &runtime,
+            occupied_addr,
+            occupied_addr.port(),
+            &[server_addr],
+        )
+        .await?;
+        server_task.await??;
+
+        let status = runtime.status().await;
+        assert!(status.nat_classification.is_some());
+        assert!(status.candidates.is_empty());
+        drop(occupied_socket);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_unsafe_public_stun_fallback_urls() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(mut args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        args.public_stun_urls = vec!["udp://user@1.1.1.1:3478".to_string()];
+
+        assert!(matches!(
+            agent_stun_servers(&args, None).await,
+            Err(error) if error.to_string().contains("must not include userinfo")
+        ));
         Ok(())
     }
 

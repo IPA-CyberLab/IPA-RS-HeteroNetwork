@@ -394,6 +394,9 @@ pub struct EndpointCandidate {
 impl EndpointCandidate {
     pub fn validate_kind_address(&self) -> Result<(), &'static str> {
         match self.kind {
+            EndpointCandidateKind::PublicUdp if !socket_addr_is_globally_routable(self.addr) => {
+                Err("public UDP candidates must use a globally routable address")
+            }
             EndpointCandidateKind::Ipv6 if !self.addr.is_ipv6() => {
                 Err("IPv6 candidates must use an IPv6 socket address")
             }
@@ -411,6 +414,67 @@ pub fn endpoint_addr_is_usable(addr: SocketAddr) -> bool {
         IpAddr::V4(ip) => !ip.is_broadcast(),
         IpAddr::V6(_) => true,
     }
+}
+
+/// Returns whether an address can identify an Internet-routable endpoint.
+///
+/// This is intentionally stricter than `endpoint_addr_is_usable`: private,
+/// shared/CGNAT, documentation, benchmarking, and other special-purpose
+/// ranges remain valid local or test endpoints but must never become public
+/// candidates.
+pub fn ip_addr_is_globally_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ipv4_addr_is_globally_routable(ip),
+        IpAddr::V6(ip) => ipv6_addr_is_globally_routable(ip),
+    }
+}
+
+pub fn socket_addr_is_globally_routable(addr: SocketAddr) -> bool {
+    addr.port() != 0 && ip_addr_is_globally_routable(addr.ip())
+}
+
+fn ipv4_addr_is_globally_routable(ip: Ipv4Addr) -> bool {
+    let [first, second, third, _] = ip.octets();
+    !matches!(
+        (first, second, third),
+        (0, _, _)
+            | (10, _, _)
+            | (100, 64..=127, _)
+            | (127, _, _)
+            | (169, 254, _)
+            | (172, 16..=31, _)
+            | (192, 0, 0)
+            | (192, 0, 2)
+            | (192, 88, 99)
+            | (192, 168, _)
+            | (198, 18..=19, _)
+            | (198, 51, 100)
+            | (203, 0, 113)
+            | (224..=255, _, _)
+    )
+}
+
+fn ipv6_addr_is_globally_routable(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return ipv4_addr_is_globally_routable(mapped);
+    }
+    let segments = ip.segments();
+    if segments[0] & 0xe000 != 0x2000 {
+        return false;
+    }
+    if segments[0] == 0x2001 && segments[1] < 0x0200 {
+        return false;
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return false;
+    }
+    if segments[0] == 0x2002 {
+        return false;
+    }
+    if segments[0] == 0x3fff && segments[1] & 0xf000 == 0 {
+        return false;
+    }
+    true
 }
 
 pub fn http_url_is_usable_endpoint(value: &str) -> bool {
@@ -525,6 +589,7 @@ pub enum NatConnectivityState {
     #[default]
     Unknown,
     Public,
+    Private,
     Nat,
     DoubleNat,
     RelayOnly,
@@ -604,6 +669,22 @@ impl NatClassification {
             assessed_at,
         }
     }
+
+    pub fn public_state_is_supported(&self) -> bool {
+        if self.connectivity_state != NatConnectivityState::Public {
+            return true;
+        }
+        self.mapping_behavior == NatMappingBehavior::NoNat
+            && self.strategy == NatTraversalStrategy::DirectCandidate
+            && socket_addr_is_globally_routable(self.local_addr)
+            && self.observed_endpoint == Some(self.local_addr)
+            && !self.observations.is_empty()
+            && self.observations.iter().all(|observation| {
+                observation.local_addr == self.local_addr
+                    && observation.reflexive_addr == self.local_addr
+                    && socket_addr_is_globally_routable(observation.reflexive_addr)
+            })
+    }
 }
 
 fn nat_connectivity_state(
@@ -613,13 +694,31 @@ fn nat_connectivity_state(
     strategy: NatTraversalStrategy,
 ) -> NatConnectivityState {
     if mapping_behavior == NatMappingBehavior::NoNat {
-        return NatConnectivityState::Public;
+        return if socket_addr_is_globally_routable(local_addr)
+            && observations
+                .iter()
+                .all(|observation| socket_addr_is_globally_routable(observation.reflexive_addr))
+        {
+            NatConnectivityState::Public
+        } else {
+            NatConnectivityState::Private
+        };
     }
     if strategy == NatTraversalStrategy::RelayPreferred {
         return NatConnectivityState::RelayOnly;
     }
-    if mapping_behavior == NatMappingBehavior::Unknown || observations.is_empty() {
+    if observations.is_empty() {
         return NatConnectivityState::Unknown;
+    }
+    if mapping_behavior == NatMappingBehavior::Unknown {
+        return if observations.iter().any(|observation| {
+            observation.reflexive_addr != observation.local_addr
+                && socket_addr_is_globally_routable(observation.reflexive_addr)
+        }) {
+            NatConnectivityState::Nat
+        } else {
+            NatConnectivityState::Unknown
+        };
     }
 
     let local_is_private = match local_addr.ip() {
@@ -18219,6 +18318,70 @@ mod tests {
     }
 
     #[test]
+    fn public_udp_candidate_requires_globally_routable_address() {
+        let mut candidate = EndpointCandidate {
+            node_id: NodeId::from_string("node-a"),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: std::net::SocketAddr::from(([100, 100, 20, 30], 51820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        };
+
+        assert_eq!(
+            candidate.validate_kind_address(),
+            Err("public UDP candidates must use a globally routable address")
+        );
+        candidate.addr = std::net::SocketAddr::from(([8, 8, 8, 8], 51820));
+        assert_eq!(candidate.validate_kind_address(), Ok(()));
+    }
+
+    #[test]
+    fn globally_routable_address_check_rejects_special_ranges(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:100.100.20.30",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "ff02::1",
+        ] {
+            let address: IpAddr = address.parse()?;
+            assert!(
+                !ip_addr_is_globally_routable(address),
+                "{address} must not be globally routable"
+            );
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            let address: IpAddr = address.parse()?;
+            assert!(
+                ip_addr_is_globally_routable(address),
+                "{address} must be globally routable"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_addr_usability_rejects_unrouteable_session_endpoints() {
         let unusable = [
             std::net::SocketAddr::from(([203, 0, 113, 10], 0)),
@@ -29217,7 +29380,7 @@ mod tests {
     #[test]
     fn nat_classification_detects_no_nat_when_reflexive_matches_local() {
         let assessed_at = Utc::now();
-        let local_addr = std::net::SocketAddr::from(([192, 0, 2, 10], 50_000));
+        let local_addr = std::net::SocketAddr::from(([8, 8, 8, 8], 50_000));
         let classification = NatClassification::from_observations(
             local_addr,
             vec![NatProbeObservation {
@@ -29243,6 +29406,65 @@ mod tests {
             NatConnectivityState::Public
         );
         assert_eq!(classification.confidence, 1.0);
+        assert!(classification.public_state_is_supported());
+    }
+
+    #[test]
+    fn nat_classification_does_not_promote_private_no_nat_observation() {
+        let assessed_at = Utc::now();
+        for local_addr in [
+            std::net::SocketAddr::from(([192, 168, 10, 20], 50_000)),
+            std::net::SocketAddr::from(([100, 100, 20, 30], 50_000)),
+        ] {
+            let classification = NatClassification::from_observations(
+                local_addr,
+                vec![NatProbeObservation {
+                    local_addr,
+                    stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                    reflexive_addr: local_addr,
+                    observed_at: assessed_at,
+                }],
+                assessed_at,
+            );
+
+            assert_eq!(classification.mapping_behavior, NatMappingBehavior::NoNat);
+            assert_eq!(
+                classification.connectivity_state,
+                NatConnectivityState::Private
+            );
+            assert_eq!(
+                classification.strategy,
+                NatTraversalStrategy::DirectCandidate
+            );
+            assert!(classification.public_state_is_supported());
+
+            let mut forged = classification;
+            forged.connectivity_state = NatConnectivityState::Public;
+            assert!(!forged.public_state_is_supported());
+        }
+    }
+
+    #[test]
+    fn nat_classification_reports_nat_from_one_global_reflexive_observation() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([192, 168, 10, 20], 50_000));
+        let classification = NatClassification::from_observations(
+            local_addr,
+            vec![NatProbeObservation {
+                local_addr,
+                stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: std::net::SocketAddr::from(([8, 8, 8, 8], 40_000)),
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+
+        assert_eq!(classification.mapping_behavior, NatMappingBehavior::Unknown);
+        assert_eq!(classification.connectivity_state, NatConnectivityState::Nat);
+        assert_eq!(
+            classification.strategy,
+            NatTraversalStrategy::InsufficientData
+        );
     }
 
     #[test]
