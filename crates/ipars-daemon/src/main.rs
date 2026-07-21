@@ -8658,7 +8658,10 @@ async fn classify_agent_startup_nat(
                 .classify_nat_without_candidate_refresh(probe_bind, stun_servers.to_vec())
                 .await?;
             runtime
-                .refresh_public_candidates_for_listen_port(&classification, wireguard_listen_port)
+                .refresh_candidates_for_wireguard_listen_port(
+                    &classification,
+                    wireguard_listen_port,
+                )
                 .await;
             Ok(())
         }
@@ -12118,7 +12121,7 @@ fn start_nat_discovery(
             {
                 Ok(classification) => {
                     let public_candidate_refreshed = runtime
-                        .refresh_public_candidates_for_listen_port(
+                        .refresh_candidates_for_wireguard_listen_port(
                             &classification,
                             stun_bind.port(),
                         )

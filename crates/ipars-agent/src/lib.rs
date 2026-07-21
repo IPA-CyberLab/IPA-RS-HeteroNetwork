@@ -37,12 +37,13 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, socket_addr_is_globally_routable,
-    validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
-    CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
-    NatConnectivityState, NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
-    PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, TransportProtocol,
-    VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, private_ip_addrs_share_subnet,
+    socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, BootstrapEndpoint,
+    BootstrapEndpointKind, CandidateSource, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, NatClassification, NatConnectivityState, NatProbeObservation, NodeId,
+    NodeRecord, PathChangeEvent, PathChangeKind, PathQualityObservation, PathRecord, PathScore,
+    PathState, Role, Route, Tag, TransportProtocol, VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1731,46 +1732,77 @@ impl AgentRuntime {
             .await
     }
 
-    /// Rebuilds the advertised endpoint after an ephemeral STUN probe proves
-    /// that the host itself owns a globally routable address. NAT mappings are
-    /// deliberately excluded because their external port cannot be inferred.
-    pub async fn refresh_public_candidates_for_listen_port(
+    /// Reconciles candidates after STUN had to use an ephemeral socket because
+    /// the kernel WireGuard interface already owns the configured listen port.
+    ///
+    /// A globally routable no-NAT address can safely be rebuilt with the real
+    /// WireGuard port. For NAT nodes, retain only a previously learned public
+    /// reflexive mapping whose external address still matches, and rebuild the
+    /// physical-LAN candidate with the real WireGuard port. The ephemeral STUN
+    /// port is never advertised as a WireGuard endpoint.
+    pub async fn refresh_candidates_for_wireguard_listen_port(
         &self,
         classification: &NatClassification,
         listen_port: u16,
     ) -> bool {
-        if listen_port == 0
-            || classification.connectivity_state != NatConnectivityState::Public
-            || !classification.public_state_is_supported()
-        {
+        if listen_port == 0 {
             return false;
         }
 
         let node_id = self.state().node_id;
-        let addr = SocketAddr::new(classification.local_addr.ip(), listen_port);
         let observed_at = classification.assessed_at;
-        self.replace_stun_candidates(vec![
-            EndpointCandidate {
+        let local_addr = SocketAddr::new(classification.local_addr.ip(), listen_port);
+        if !endpoint_addr_is_usable(local_addr) {
+            return false;
+        }
+
+        let is_public = classification.connectivity_state == NatConnectivityState::Public
+            && classification.public_state_is_supported();
+        let mut refreshed = Vec::with_capacity(2);
+        if is_public {
+            refreshed.push(EndpointCandidate {
                 node_id: node_id.clone(),
                 kind: EndpointCandidateKind::PublicUdp,
-                addr,
+                addr: local_addr,
                 observed_at,
                 priority: 80,
                 cost: 20,
                 source: CandidateSource::StunProbe,
-            },
-            EndpointCandidate {
-                node_id,
-                kind: EndpointCandidateKind::LocalUdp,
-                addr,
-                observed_at,
-                priority: 70,
-                cost: 30,
-                source: CandidateSource::StunProbe,
-            },
-        ])
-        .await;
-        true
+            });
+        } else if let Some(observed_endpoint) = classification
+            .observed_endpoint
+            .filter(|addr| socket_addr_is_globally_routable(*addr))
+        {
+            let observed_ip = observed_endpoint.ip();
+            let retained = self
+                .candidates
+                .read()
+                .await
+                .iter()
+                .filter(|candidate| {
+                    candidate.source == CandidateSource::StunProbe
+                        && candidate.kind == EndpointCandidateKind::StunReflexive
+                        && socket_addr_is_globally_routable(candidate.addr)
+                        && candidate.addr.ip() == observed_ip
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            refreshed.extend(retained.into_iter().map(|mut candidate| {
+                candidate.observed_at = observed_at;
+                candidate
+            }));
+        }
+        refreshed.push(EndpointCandidate {
+            node_id,
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: local_addr,
+            observed_at,
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        });
+        self.replace_stun_candidates(refreshed).await;
+        is_public
     }
 
     async fn classify_nat_internal(
@@ -5409,10 +5441,6 @@ pub fn preferred_local_udp_candidate(
     local_candidates: &[EndpointCandidate],
     peer_candidates: &[EndpointCandidate],
 ) -> Option<EndpointCandidate> {
-    if !peer_has_private_reflexive_candidate(peer_candidates) {
-        return None;
-    }
-
     local_candidates
         .iter()
         .filter(|candidate| {
@@ -5423,7 +5451,7 @@ pub fn preferred_local_udp_candidate(
             peer_candidates.iter().any(|peer_candidate| {
                 peer_candidate.kind == EndpointCandidateKind::LocalUdp
                     && endpoint_addr_is_usable(peer_candidate.addr)
-                    && local_addresses_share_subnet(candidate.addr.ip(), peer_candidate.addr.ip())
+                    && private_ip_addrs_share_subnet(candidate.addr.ip(), peer_candidate.addr.ip())
             })
         })
         .min_by(|left, right| {
@@ -5440,10 +5468,6 @@ pub fn preferred_peer_local_udp_candidate(
     local_candidates: &[EndpointCandidate],
     peer_candidates: &[EndpointCandidate],
 ) -> Option<EndpointCandidate> {
-    if !peer_has_private_reflexive_candidate(peer_candidates) {
-        return None;
-    }
-
     peer_candidates
         .iter()
         .filter(|peer_candidate| {
@@ -5454,7 +5478,7 @@ pub fn preferred_peer_local_udp_candidate(
             local_candidates.iter().any(|local_candidate| {
                 local_candidate.kind == EndpointCandidateKind::LocalUdp
                     && endpoint_addr_is_usable(local_candidate.addr)
-                    && local_addresses_share_subnet(
+                    && private_ip_addrs_share_subnet(
                         local_candidate.addr.ip(),
                         peer_candidate.addr.ip(),
                     )
@@ -5466,36 +5490,6 @@ pub fn preferred_peer_local_udp_candidate(
                 .then_with(|| right.priority.cmp(&left.priority))
         })
         .cloned()
-}
-
-fn peer_has_private_reflexive_candidate(peer_candidates: &[EndpointCandidate]) -> bool {
-    peer_candidates.iter().any(|candidate| {
-        candidate.kind == EndpointCandidateKind::StunReflexive
-            && private_or_link_local(candidate.addr.ip())
-    })
-}
-
-fn private_or_link_local(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
-    }
-}
-
-fn local_addresses_share_subnet(left: IpAddr, right: IpAddr) -> bool {
-    match (left, right) {
-        (IpAddr::V4(left), IpAddr::V4(right)) => {
-            private_or_link_local(IpAddr::V4(left))
-                && private_or_link_local(IpAddr::V4(right))
-                && (u32::from(left) & 0xffff_ff00) == (u32::from(right) & 0xffff_ff00)
-        }
-        (IpAddr::V6(left), IpAddr::V6(right)) => {
-            private_or_link_local(IpAddr::V6(left))
-                && private_or_link_local(IpAddr::V6(right))
-                && (u128::from(left) >> 64) == (u128::from(right) >> 64)
-        }
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7490,7 +7484,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_local_udp_candidate_requires_private_reflexive_peer_on_same_subnet() {
+    fn preferred_local_udp_candidate_uses_shared_private_lan_without_reflexive_candidate() {
         let peer_id = NodeId::from_string("peer-a");
         let local_candidates = vec![EndpointCandidate {
             node_id: NodeId::from_string("local"),
@@ -7501,32 +7495,46 @@ mod tests {
             cost: 30,
             source: CandidateSource::StunProbe,
         }];
-        let peer_candidates = vec![
-            EndpointCandidate {
-                node_id: peer_id.clone(),
-                kind: EndpointCandidateKind::StunReflexive,
-                addr: SocketAddr::from(([10, 244, 1, 1], 18_410)),
-                observed_at: Utc::now(),
-                priority: 80,
-                cost: 20,
-                source: CandidateSource::StunProbe,
-            },
-            EndpointCandidate {
-                node_id: peer_id,
-                kind: EndpointCandidateKind::LocalUdp,
-                addr: SocketAddr::from(([172, 18, 0, 2], 51_820)),
-                observed_at: Utc::now(),
-                priority: 70,
-                cost: 30,
-                source: CandidateSource::StunProbe,
-            },
-        ];
+        let peer_candidates = vec![EndpointCandidate {
+            node_id: peer_id,
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([172, 18, 0, 2], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        }];
 
         assert_eq!(
             preferred_local_udp_candidate(&local_candidates, &peer_candidates)
                 .map(|candidate| candidate.addr),
             Some(SocketAddr::from(([172, 18, 0, 3], 51_820)))
         );
+    }
+
+    #[test]
+    fn preferred_local_udp_candidate_excludes_shared_address_overlay() {
+        let local_candidates = vec![EndpointCandidate {
+            node_id: NodeId::from_string("local"),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([100, 100, 20, 30], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        }];
+        let peer_candidates = vec![EndpointCandidate {
+            node_id: NodeId::from_string("peer-a"),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: SocketAddr::from(([100, 100, 20, 40], 51_820)),
+            observed_at: Utc::now(),
+            priority: 70,
+            cost: 30,
+            source: CandidateSource::StunProbe,
+        }];
+
+        assert!(preferred_local_udp_candidate(&local_candidates, &peer_candidates).is_none());
+        assert!(preferred_peer_local_udp_candidate(&local_candidates, &peer_candidates).is_none());
     }
 
     #[test]
@@ -13041,7 +13049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_rebuilds_fixed_port_candidate_only_for_public_no_nat_classification() {
+    async fn runtime_rebuilds_fixed_port_candidates_without_guessing_nat_mapping() {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -13061,7 +13069,7 @@ mod tests {
 
         assert!(
             runtime
-                .refresh_public_candidates_for_listen_port(&public_classification, 51_820)
+                .refresh_candidates_for_wireguard_listen_port(&public_classification, 51_820,)
                 .await
         );
         let public_candidates = runtime.status().await.candidates;
@@ -13083,12 +13091,93 @@ mod tests {
             }],
             assessed_at,
         );
+        let private_runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
         assert!(
-            !runtime
-                .refresh_public_candidates_for_listen_port(&private_classification, 51_820)
+            !private_runtime
+                .refresh_candidates_for_wireguard_listen_port(&private_classification, 51_820,)
                 .await
         );
-        assert_eq!(runtime.status().await.candidates, public_candidates);
+        let private_candidates = private_runtime.status().await.candidates;
+        assert_eq!(private_candidates.len(), 1);
+        assert_eq!(private_candidates[0].kind, EndpointCandidateKind::LocalUdp);
+        assert_eq!(
+            private_candidates[0].addr,
+            SocketAddr::from(([100, 100, 20, 30], 51_820))
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_retains_matching_wireguard_nat_mapping_and_replaces_overlay_candidates() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id;
+        let old_observed_at = Utc::now() - ChronoDuration::minutes(1);
+        let reflexive = EndpointCandidate {
+            node_id: node_id.clone(),
+            kind: EndpointCandidateKind::StunReflexive,
+            addr: SocketAddr::from(([111, 216, 122, 15], 34_037)),
+            observed_at: old_observed_at,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        };
+        runtime
+            .replace_candidates(vec![
+                reflexive.clone(),
+                EndpointCandidate {
+                    node_id: node_id.clone(),
+                    kind: EndpointCandidateKind::StunReflexive,
+                    addr: SocketAddr::from(([100, 89, 33, 61], 51_820)),
+                    observed_at: old_observed_at,
+                    priority: 80,
+                    cost: 20,
+                    source: CandidateSource::StunProbe,
+                },
+                EndpointCandidate {
+                    node_id,
+                    kind: EndpointCandidateKind::LocalUdp,
+                    addr: SocketAddr::from(([100, 89, 33, 61], 51_820)),
+                    observed_at: old_observed_at,
+                    priority: 70,
+                    cost: 30,
+                    source: CandidateSource::StunProbe,
+                },
+            ])
+            .await;
+
+        let assessed_at = Utc::now();
+        let local_probe = SocketAddr::from(([192, 168, 1, 18], 57_405));
+        let classification = NatClassification::from_observations(
+            local_probe,
+            vec![NatProbeObservation {
+                local_addr: local_probe,
+                stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: SocketAddr::from(([111, 216, 122, 15], 57_405)),
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+
+        assert!(
+            !runtime
+                .refresh_candidates_for_wireguard_listen_port(&classification, 51_820)
+                .await
+        );
+        let candidates = runtime.status().await.candidates;
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].kind, EndpointCandidateKind::StunReflexive);
+        assert_eq!(candidates[0].addr, reflexive.addr);
+        assert_eq!(candidates[0].observed_at, assessed_at);
+        assert_eq!(candidates[1].kind, EndpointCandidateKind::LocalUdp);
+        assert_eq!(
+            candidates[1].addr,
+            SocketAddr::from(([192, 168, 1, 18], 51_820))
+        );
     }
 
     #[tokio::test]

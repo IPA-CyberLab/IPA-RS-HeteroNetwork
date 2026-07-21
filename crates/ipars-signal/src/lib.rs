@@ -9,10 +9,10 @@ use ipars_types::api::{
     SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, AclAction, AclRule, ClusterPolicy, EndpointCandidate,
-    EndpointCandidateKind, HealthState, NatClassification, NatTraversalStrategy, NodeHealth,
-    NodeId, NodeRecord, PathMetrics, PathQualityObservation, PathScore, PathState, PeerPathKey,
-    Route, TransportProtocol,
+    endpoint_addr_is_usable, private_ip_addrs_share_subnet, socket_addr_is_globally_routable,
+    AclAction, AclRule, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState,
+    NatClassification, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
+    PathQualityObservation, PathScore, PathState, PeerPathKey, Route, TransportProtocol,
 };
 use ipnet::IpNet;
 use thiserror::Error;
@@ -815,11 +815,17 @@ impl SignalCoordinator {
             fresh_endpoint_candidates(target, now, self.policy.endpoint_candidate_ttl_seconds);
         let source_reflexive = source
             .iter()
-            .find(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
+            .find(|candidate| {
+                candidate.kind == EndpointCandidateKind::StunReflexive
+                    && socket_addr_is_globally_routable(candidate.addr)
+            })
             .cloned();
         let target_reflexive = target
             .iter()
-            .find(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
+            .find(|candidate| {
+                candidate.kind == EndpointCandidateKind::StunReflexive
+                    && socket_addr_is_globally_routable(candidate.addr)
+            })
             .cloned();
 
         HolePunchPlan {
@@ -856,12 +862,20 @@ impl SignalCoordinator {
         }
 
         if self.policy.allow_nat_traversal
-            && source_candidates
-                .iter()
-                .any(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
-            && target_candidates
-                .iter()
-                .any(|candidate| candidate.kind == EndpointCandidateKind::StunReflexive)
+            && local_udp_candidates_share_private_subnet(source_candidates, target_candidates)
+        {
+            return PathState::DirectNatTraversal;
+        }
+
+        if self.policy.allow_nat_traversal
+            && source_candidates.iter().any(|candidate| {
+                candidate.kind == EndpointCandidateKind::StunReflexive
+                    && socket_addr_is_globally_routable(candidate.addr)
+            })
+            && target_candidates.iter().any(|candidate| {
+                candidate.kind == EndpointCandidateKind::StunReflexive
+                    && socket_addr_is_globally_routable(candidate.addr)
+            })
             && nat_classifications_allow_hole_punch(
                 source_nat_classification,
                 target_nat_classification,
@@ -873,6 +887,24 @@ impl SignalCoordinator {
 
         PathState::Unreachable
     }
+}
+
+fn local_udp_candidates_share_private_subnet(
+    source: &[EndpointCandidate],
+    target: &[EndpointCandidate],
+) -> bool {
+    source.iter().any(|source_candidate| {
+        source_candidate.kind == EndpointCandidateKind::LocalUdp
+            && endpoint_addr_is_usable(source_candidate.addr)
+            && target.iter().any(|target_candidate| {
+                target_candidate.kind == EndpointCandidateKind::LocalUdp
+                    && endpoint_addr_is_usable(target_candidate.addr)
+                    && private_ip_addrs_share_subnet(
+                        source_candidate.addr.ip(),
+                        target_candidate.addr.ip(),
+                    )
+            })
+    })
 }
 
 fn validate_path_quality_observation(
@@ -2542,7 +2574,7 @@ mod tests {
         );
         let usable_reflexive = candidate_at(
             EndpointCandidateKind::StunReflexive,
-            SocketAddr::from(([198, 51, 100, 20], 40000)),
+            SocketAddr::from(([8, 8, 8, 20], 40000)),
         );
         let response = coordinator.negotiate(
             SignalPathRequest {
@@ -2564,8 +2596,65 @@ mod tests {
         assert!(plan.source_reflexive.is_none());
         assert_eq!(
             plan.target_reflexive.map(|candidate| candidate.addr),
-            Some(SocketAddr::from(([198, 51, 100, 20], 40000)))
+            Some(SocketAddr::from(([8, 8, 8, 20], 40000)))
         );
+    }
+
+    #[test]
+    fn shared_private_lan_uses_direct_local_candidates() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let source_local = candidate_at(
+            EndpointCandidateKind::LocalUdp,
+            SocketAddr::from(([192, 168, 10, 20], 51_820)),
+        );
+        let target_local = candidate_at(
+            EndpointCandidateKind::LocalUdp,
+            SocketAddr::from(([192, 168, 10, 30], 51_820)),
+        );
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![source_local],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![target_local]),
+            None,
+            &[],
+        );
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+    }
+
+    #[test]
+    fn shared_address_overlay_is_not_used_as_nat_reflexive_path() {
+        let coordinator = SignalCoordinator::new(ClusterPolicy::default());
+        let source_reflexive = candidate_at(
+            EndpointCandidateKind::StunReflexive,
+            SocketAddr::from(([100, 100, 20, 30], 51_820)),
+        );
+        let target_reflexive = candidate_at(
+            EndpointCandidateKind::StunReflexive,
+            SocketAddr::from(([100, 100, 20, 40], 51_820)),
+        );
+        let response = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: vec![source_reflexive.clone()],
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &target(vec![target_reflexive.clone()]),
+            None,
+            &[],
+        );
+        let plan = coordinator.punch_plan(&[source_reflexive], None, &[target_reflexive], None);
+
+        assert_eq!(response.preferred_state, PathState::Unreachable);
+        assert!(plan.source_reflexive.is_none());
+        assert!(plan.target_reflexive.is_none());
     }
 
     #[test]
