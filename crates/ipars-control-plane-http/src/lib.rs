@@ -59,6 +59,10 @@ const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
 const NODE_ENROLLMENT_ARCH: &str = "linux-amd64";
+const KUBERNETES_HA_SETUP_TAG_PREFIX: &str = "kubernetes-ha-";
+const KUBERNETES_HA_CONTROL_PLANE_COUNT: u32 = 3;
+const KUBEADM_HA_NODE_SCRIPT: &str = include_str!("../../../scripts/kubeadm-ha-node.sh");
+const KUBEADM_HA_AUTOPILOT_SCRIPT: &str = include_str!("../../../scripts/kubeadm-ha-autopilot.sh");
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS: u64 = 20;
 
 macro_rules! prometheus_line {
@@ -1237,6 +1241,16 @@ struct AdminNodeEnrollmentRequest {
     #[serde(default)]
     reusable: bool,
     max_uses: Option<u32>,
+    #[serde(default)]
+    setup: NodeEnrollmentSetup,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NodeEnrollmentSetup {
+    #[default]
+    NetworkOnly,
+    KubernetesHaControlPlane,
 }
 
 #[derive(Debug, Serialize)]
@@ -1248,6 +1262,14 @@ struct AdminNodeEnrollmentResponse {
     install_script: String,
     binary_sha256: String,
     architecture: &'static str,
+    setup: NodeEnrollmentSetup,
+}
+
+#[derive(Debug)]
+struct KubernetesHaEnrollmentSetup {
+    cohort_tag: String,
+    expected_control_planes: u32,
+    bundle_bearer_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1325,17 +1347,29 @@ where
             "node role must be edge, worker, or gateway",
         ));
     }
+    let max_uses = node_enrollment_max_uses(&request)?;
+    if request.setup == NodeEnrollmentSetup::KubernetesHaControlPlane
+        && (!request.reusable || max_uses != KUBERNETES_HA_CONTROL_PLANE_COUNT)
+    {
+        return Err(NodeEnrollmentApiError::bad_request(format!(
+            "Kubernetes HA control-plane enrollment must be reusable with exactly {KUBERNETES_HA_CONTROL_PLANE_COUNT} uses"
+        )));
+    }
     if request.tags.len() > MAX_JOIN_TOKEN_TAGS {
         return Err(NodeEnrollmentApiError::bad_request(format!(
             "no more than {MAX_JOIN_TOKEN_TAGS} tags may be requested"
         )));
     }
-    let max_uses = node_enrollment_max_uses(&request)?;
     let mut tags = BTreeSet::new();
     for value in request.tags {
         let value = value.trim();
         validate_enrollment_identifier(value, "node tag")
             .map_err(NodeEnrollmentApiError::bad_request)?;
+        if value.starts_with(KUBERNETES_HA_SETUP_TAG_PREFIX) {
+            return Err(NodeEnrollmentApiError::bad_request(format!(
+                "node tags beginning with {KUBERNETES_HA_SETUP_TAG_PREFIX} are reserved"
+            )));
+        }
         if !tags.insert(Tag::from_string(value)) {
             return Err(NodeEnrollmentApiError::bad_request(format!(
                 "duplicate node tag: {value}"
@@ -1362,6 +1396,16 @@ where
         .checked_add_signed(ChronoDuration::seconds(request.expires_in_seconds as i64))
         .ok_or_else(|| NodeEnrollmentApiError::bad_request("token expiration is out of range"))?;
     let bootstrap_endpoints = directory.bootstrap_endpoints;
+    let nonce = format!("enroll-{}", random_oidc_value(24));
+    if request.setup == NodeEnrollmentSetup::KubernetesHaControlPlane {
+        tags.insert(Tag::kubernetes_control_plane());
+        tags.insert(Tag::from_string(kubernetes_ha_cohort_tag(&nonce)));
+        if tags.len() > MAX_JOIN_TOKEN_TAGS {
+            return Err(NodeEnrollmentApiError::bad_request(format!(
+                "no more than {MAX_JOIN_TOKEN_TAGS} tags, including setup tags, may be requested"
+            )));
+        }
+    }
     let claims = JoinTokenClaims {
         cluster_id: state.plane.config().cluster_id.clone(),
         bootstrap_endpoints: bootstrap_endpoints.clone(),
@@ -1378,7 +1422,7 @@ where
             allowed_tags: tags,
             max_token_uses: Some(max_uses),
         },
-        nonce: format!("enroll-{}", random_oidc_value(24)),
+        nonce,
     };
     let token = enrollment
         .issuer
@@ -1391,7 +1435,7 @@ where
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     let encoded_token = encode_node_enrollment_authorization(&token)?;
     let install_script =
-        node_enrollment_install_script(enrollment, &encoded_token, &bootstrap_endpoints);
+        node_enrollment_install_script(enrollment, &token, &encoded_token, &bootstrap_endpoints);
     let install_command =
         node_enrollment_install_command(enrollment, &encoded_token, &bootstrap_endpoints);
     let payload = AdminNodeEnrollmentResponse {
@@ -1402,6 +1446,7 @@ where
         install_script,
         binary_sha256: enrollment.binary_sha256.to_string(),
         architecture: NODE_ENROLLMENT_ARCH,
+        setup: request.setup,
     };
     let mut response = Json(payload).into_response();
     apply_node_enrollment_security_headers(&mut response);
@@ -1739,6 +1784,7 @@ where
     let encoded_token = encode_node_enrollment_authorization(&token)?;
     let script = node_enrollment_install_script(
         &enrollment,
+        &token,
         &encoded_token,
         &token.claims.bootstrap_endpoints,
     );
@@ -1808,6 +1854,7 @@ fn apply_node_enrollment_security_headers(response: &mut Response) {
 
 fn node_enrollment_install_script(
     enrollment: &NodeEnrollmentConfig,
+    token: &SignedJoinToken,
     encoded_token: &str,
     bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> String {
@@ -1923,6 +1970,7 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now heteronetwork-agent.service
+__SETUP_INSTALL__
 echo "HeteroNetwork node enrolled and started"
 "#;
     let download_bases = node_enrollment_download_bases(enrollment, bootstrap_endpoints)
@@ -1930,10 +1978,105 @@ echo "HeteroNetwork node enrolled and started"
         .map(|base| STANDARD.encode(base.as_bytes()))
         .collect::<Vec<_>>()
         .join(" ");
+    let setup_install = kubernetes_ha_enrollment_setup(token, encoded_token)
+        .map(kubernetes_ha_install_script)
+        .unwrap_or_default();
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
         .replace("__SHA256__", &enrollment.binary_sha256)
+        .replace("__SETUP_INSTALL__", &setup_install)
+}
+
+fn kubernetes_ha_cohort_tag(nonce: &str) -> String {
+    let digest = Sha256::digest(nonce.as_bytes());
+    format!(
+        "{KUBERNETES_HA_SETUP_TAG_PREFIX}{}",
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn kubernetes_ha_enrollment_setup(
+    token: &SignedJoinToken,
+    encoded_token: &str,
+) -> Option<KubernetesHaEnrollmentSetup> {
+    let mut setup_tags = token
+        .claims
+        .tags
+        .iter()
+        .filter(|tag| tag.as_str().starts_with(KUBERNETES_HA_SETUP_TAG_PREFIX));
+    let cohort_tag = setup_tags.next()?.as_str().to_string();
+    if setup_tags.next().is_some()
+        || cohort_tag != kubernetes_ha_cohort_tag(&token.claims.nonce)
+        || token.claims.policy.max_token_uses != Some(KUBERNETES_HA_CONTROL_PLANE_COUNT)
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"heteronetwork-kubernetes-ha-bundle-v1\0");
+    digest.update(encoded_token.as_bytes());
+    let bundle_bearer_token = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(KubernetesHaEnrollmentSetup {
+        cohort_tag,
+        expected_control_planes: KUBERNETES_HA_CONTROL_PLANE_COUNT,
+        bundle_bearer_token,
+    })
+}
+
+fn kubernetes_ha_install_script(setup: KubernetesHaEnrollmentSetup) -> String {
+    let helper = STANDARD.encode(KUBEADM_HA_NODE_SCRIPT.as_bytes());
+    let autopilot = STANDARD.encode(KUBEADM_HA_AUTOPILOT_SCRIPT.as_bytes());
+    format!(
+        r#"install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+install -d -o root -g root -m 0700 /etc/heteronetwork/kubernetes
+printf '%s' '{helper}' | base64 -d >/opt/heteronetwork/libexec/kubeadm-ha-node.sh
+printf '%s' '{autopilot}' | base64 -d >/opt/heteronetwork/libexec/kubeadm-ha-autopilot.sh
+chown root:root /opt/heteronetwork/libexec/kubeadm-ha-node.sh /opt/heteronetwork/libexec/kubeadm-ha-autopilot.sh
+chmod 0755 /opt/heteronetwork/libexec/kubeadm-ha-node.sh /opt/heteronetwork/libexec/kubeadm-ha-autopilot.sh
+cat >/etc/heteronetwork/kubernetes/autopilot.env <<'AUTOPILOT_ENV'
+HETERONETWORK_KUBEADM_COHORT_TAG={cohort_tag}
+HETERONETWORK_KUBEADM_EXPECTED_CONTROL_PLANES={expected_control_planes}
+HETERONETWORK_KUBEADM_BUNDLE_BEARER_TOKEN={bundle_bearer_token}
+AUTOPILOT_ENV
+chown root:root /etc/heteronetwork/kubernetes/autopilot.env
+chmod 0600 /etc/heteronetwork/kubernetes/autopilot.env
+cat >/etc/systemd/system/heteronetwork-kubeadm-autopilot.service <<'AUTOPILOT_UNIT'
+[Unit]
+Description=HeteroNetwork automatic Kubernetes HA control-plane setup
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service
+Requires=heteronetwork-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/heteronetwork/kubernetes/autopilot.env
+ExecStart=/opt/heteronetwork/libexec/kubeadm-ha-autopilot.sh run
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=infinity
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+AUTOPILOT_UNIT
+systemctl daemon-reload
+systemctl enable --now --no-block heteronetwork-kubeadm-autopilot.service
+echo "Automatic three-control-plane Kubernetes HA setup scheduled"
+"#,
+        helper = helper,
+        autopilot = autopilot,
+        cohort_tag = setup.cohort_tag,
+        expected_control_planes = setup.expected_control_planes,
+        bundle_bearer_token = setup.bundle_bearer_token,
+    )
 }
 
 fn node_enrollment_install_command(
@@ -3349,6 +3492,119 @@ mod tests {
         assert_eq!(token.claims.bootstrap_endpoints.len(), 8);
         assert_eq!(token.claims.policy.max_token_uses, Some(1));
         assert!(token.claims.policy.allow_relay);
+        assert_eq!(response_body["setup"], "network_only");
+        assert!(!generated_script.contains("kubeadm-ha-autopilot"));
+
+        let kubernetes_request_body = serde_json::json!({
+            "expires_in_seconds": 86_400,
+            "role": "worker",
+            "tags": ["production"],
+            "allow_relay": true,
+            "reusable": true,
+            "max_uses": KUBERNETES_HA_CONTROL_PLANE_COUNT,
+            "setup": "kubernetes_ha_control_plane"
+        });
+        let kubernetes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&kubernetes_request_body)?))?,
+            )
+            .await?;
+        assert_eq!(kubernetes_response.status(), StatusCode::OK);
+        let kubernetes_response =
+            axum::body::to_bytes(kubernetes_response.into_body(), usize::MAX).await?;
+        let kubernetes_response: Value = serde_json::from_slice(&kubernetes_response)?;
+        assert_eq!(kubernetes_response["setup"], "kubernetes_ha_control_plane");
+        let kubernetes_token: SignedJoinToken =
+            serde_json::from_value(kubernetes_response["token"].clone())?;
+        let cohort_tags = kubernetes_token
+            .claims
+            .tags
+            .iter()
+            .filter(|tag| tag.as_str().starts_with(KUBERNETES_HA_SETUP_TAG_PREFIX))
+            .collect::<Vec<_>>();
+        assert_eq!(cohort_tags.len(), 1);
+        assert!(kubernetes_token
+            .claims
+            .tags
+            .contains(&Tag::kubernetes_control_plane()));
+        assert_eq!(
+            cohort_tags[0].as_str(),
+            kubernetes_ha_cohort_tag(&kubernetes_token.claims.nonce)
+        );
+        let kubernetes_script = kubernetes_response["install_script"]
+            .as_str()
+            .ok_or("Kubernetes enrollment response omitted the install script")?;
+        assert!(kubernetes_script.contains("heteronetwork-kubeadm-autopilot.service"));
+        assert!(!kubernetes_script.contains("KUBERNETES_HA_SETUP_TAG_PREFIX"));
+        let script_syntax = std::process::Command::new("sh")
+            .args(["-n", "-c", kubernetes_script])
+            .output()?;
+        assert!(
+            script_syntax.status.success(),
+            "generated Kubernetes install script is not valid POSIX shell: {}",
+            String::from_utf8_lossy(&script_syntax.stderr)
+        );
+
+        let invalid_kubernetes_request = serde_json::json!({
+            "expires_in_seconds": 86_400,
+            "role": "worker",
+            "tags": [],
+            "allow_relay": true,
+            "reusable": true,
+            "max_uses": 4,
+            "setup": "kubernetes_ha_control_plane"
+        });
+        let invalid_kubernetes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&invalid_kubernetes_request)?))?,
+            )
+            .await?;
+        assert_eq!(
+            invalid_kubernetes_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let reserved_tag_request = serde_json::json!({
+            "expires_in_seconds": 86_400,
+            "role": "edge",
+            "tags": ["kubernetes-ha-0123456789abcdef"],
+            "allow_relay": false,
+            "reusable": false,
+            "max_uses": 1
+        });
+        let reserved_tag_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&reserved_tag_request)?))?,
+            )
+            .await?;
+        assert_eq!(reserved_tag_response.status(), StatusCode::BAD_REQUEST);
 
         let degraded_at = Utc::now();
         let mut expired_public_a =
@@ -3876,6 +4132,7 @@ mod tests {
             allow_relay: false,
             reusable: true,
             max_uses: Some(1),
+            setup: NodeEnrollmentSetup::NetworkOnly,
         };
         assert!(node_enrollment_max_uses(&invalid).is_err());
         let valid = AdminNodeEnrollmentRequest {

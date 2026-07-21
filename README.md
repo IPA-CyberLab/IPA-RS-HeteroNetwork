@@ -85,6 +85,15 @@ node enrollment enabled, **Add device** creates a bounded single-use or reusable
 join token from the live HA service directory and returns a copyable Linux
 install command plus script. The raw token stays only in page memory.
 
+The operator enrollment API also accepts
+`"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
+exactly three uses. The returned command is identical on all three clean
+Ubuntu hosts: it enrolls the Agent, discovers the three-node cohort and VPN
+addresses, elects the first control plane, transfers short-lived kubeadm
+credentials over an authenticated HeteroNetwork-only endpoint, serializes the
+remaining joins, and verifies the resulting stacked-etcd cluster. No per-host
+VPN address, node role, or kubeadm join command is supplied to the hosts.
+
 OIDC is enabled by default with Keycloak:
 
 ```bash

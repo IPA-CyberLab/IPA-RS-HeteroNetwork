@@ -36,13 +36,38 @@ Flannel VXLAN uses `heteronetwork0` explicitly. Flannel derives its MTU from the
 underlay interface. With the default HeteroNetwork MTU of 1420, the expected Pod
 MTU is 1370 after the 50-byte IPv4 VXLAN overhead.
 
-## Enrollment
+## Automatic enrollment and setup
 
-Create separate, single-use HeteroNetwork enrollment tokens for the control
-plane nodes and add the `kubernetes-control-plane` tag. The default cluster
-policy pins that tag, so etcd and API traffic do not depend on a first-packet
-lazy-connect trigger. Do not apply that tag to ordinary workers; worker paths
+Create one reusable enrollment through `POST /v1/admin/enrollment` with the
+following setup fields, then run the returned install command on three clean
+Ubuntu hosts:
+
+```json
+{
+  "expires_in_seconds": 86400,
+  "role": "worker",
+  "tags": [],
+  "allow_relay": true,
+  "reusable": true,
+  "max_uses": 3,
+  "setup": "kubernetes_ha_control_plane"
+}
+```
+
+The same command is used on every host. It automatically adds the pinned
+`kubernetes-control-plane` tag and a unique cohort tag. Once all three Agents
+have enrolled, `heteronetwork-kubeadm-autopilot.service` discovers their VPN
+addresses, orders them deterministically, and runs the preparation,
+initialization, and control-plane joins. The kubeadm join bundle is served only
+on the elected leader's HeteroNetwork address, requires a cohort-specific
+Bearer credential, and is removed after verification. Setup credentials are
+root-readable and deleted on successful completion.
+
+The default cluster policy pins `kubernetes-control-plane`, so etcd and API
+traffic do not depend on a first-packet lazy-connect trigger. Ordinary workers
 remain lazy and do not create an all-to-all idle mesh.
+
+The manual commands below remain available for recovery and custom layouts.
 
 ## Prepare each host
 
