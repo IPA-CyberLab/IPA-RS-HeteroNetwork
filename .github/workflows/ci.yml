@@ -49,6 +49,8 @@ jobs:
         run: |
           bash -n scripts/kubeadm-ha-node.sh
           scripts/kubeadm-ha-node.sh self-test
+          bash -n scripts/kubeadm-ha-autopilot.sh
+          scripts/kubeadm-ha-autopilot.sh self-test
 
       - name: Install minimum supported Rust
         run: rustup toolchain install "$RUST_MSRV_TOOLCHAIN" --profile minimal
