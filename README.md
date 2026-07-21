@@ -2,6 +2,9 @@
 
 Rust implementation of an operations-oriented P2P VPN / overlay network for Linux hosts, Docker environments, Kubernetes node underlays, edge nodes, and large distributed clusters.
 
+For a reproducible three-control-plane kubeadm deployment over the VPN underlay,
+see [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md).
+
 The repository is being built toward a complete system rather than an MVP. The current baseline contains:
 
 - a native SwiftUI macOS menu-bar client with a Network Extension packet tunnel,
