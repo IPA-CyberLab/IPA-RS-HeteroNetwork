@@ -68,12 +68,15 @@ nat_b="heteronetwork-nat-b-${suffix}"
 agent_a="heteronetwork-agent-a-${suffix}"
 agent_b="heteronetwork-agent-b-${suffix}"
 
-root_public_ip="198.18.100.1"
+# The production classifier intentionally rejects RFC 2544 and documentation
+# ranges. These addresses exist only on this temporary isolated bridge, but must
+# still exercise the globally-routable STUN-reflexive path.
+root_public_ip="11.254.100.1"
 # Keep each invocation on a separate public tuple so conntrack state from a
 # previous namespace teardown cannot be reused by the next profile.
 nat_public_octet_base=$((20 + (suffix % 100) * 2))
-nat_a_public_ip="198.18.100.${nat_public_octet_base}"
-nat_b_public_ip="198.18.100.$((nat_public_octet_base + 1))"
+nat_a_public_ip="11.254.100.${nat_public_octet_base}"
+nat_b_public_ip="11.254.100.$((nat_public_octet_base + 1))"
 # Keep the synthetic underlays outside the default 10.250.0.0/16 VPN pool.
 nat_a_gateway="10.252.0.1"
 nat_a_agent_ip="10.252.0.2"
@@ -553,6 +556,8 @@ ping_overlay_pair_once() {
 wait_for_direct_dataplane() {
   local peer_a="$1"
   local peer_b="$2"
+  local expected_state_a="${3:-DIRECT_NAT_TRAVERSAL}"
+  local expected_state_b="${4:-DIRECT_NAT_TRAVERSAL}"
   local consecutive_successes=0
   local iterations=0
   local direct_state_failures=0
@@ -565,7 +570,7 @@ wait_for_direct_dataplane() {
     local state_a="" state_b="" metrics_a="" metrics_b=""
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
-    if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]]; then
+    if [[ "$state_a" == "$expected_state_a" && "$state_b" == "$expected_state_b" ]]; then
       metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
       metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
       if jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
@@ -576,7 +581,7 @@ wait_for_direct_dataplane() {
           state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
           metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
           metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
-          if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
+          if [[ "$state_a" == "$expected_state_a" && "$state_b" == "$expected_state_b" ]] \
             && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
             && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null; then
             consecutive_successes=$((consecutive_successes + 1))
@@ -953,11 +958,16 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port"
   if [[ "$pause_before_direct_seconds" != "0" ]]; then
     sleep "$pause_before_direct_seconds"
   fi
-  wait_for_direct_path "$node_a" "$node_b"
+  expected_state_a=DIRECT_NAT_TRAVERSAL
+  expected_state_b=DIRECT_NAT_TRAVERSAL
+  if is_one_sided_profile; then
+    expected_state_a=DIRECT_PUBLIC
+  fi
+  wait_for_direct_path "$node_a" "$node_b" "$expected_state_a" "$expected_state_b"
   if [[ "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
     sleep "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
   fi
-  wait_for_direct_dataplane "$node_a" "$node_b"
+  wait_for_direct_dataplane "$node_a" "$node_b" "$expected_state_a" "$expected_state_b"
   ip netns exec "$agent_a" wg show heteronetwork0 endpoints \
     | grep -F -- "${nat_b_public_ip}:${nat_b_expected_public_port}" >/dev/null
   ip netns exec "$agent_b" wg show heteronetwork0 endpoints \

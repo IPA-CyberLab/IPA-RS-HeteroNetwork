@@ -207,8 +207,14 @@ else
   echo "skipping WireGuard netns smoke because 'wg' is not available"
 fi
 
-run_cargo_test boringtun-netns HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS \
-  -p ipars-agent --test netns_wireguard_backend
+# BoringTun's in-process event loop can retain teardown work until process
+# exit, so isolate the management and dataplane cases from each other.
+run_cargo_test_serial boringtun-management-netns HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS \
+  -p ipars-agent --test netns_wireguard_backend \
+  boringtun_backend_manages_peer_inside_network_namespace
+run_cargo_test_serial boringtun-dataplane-netns HETERONETWORK_RUN_BORINGTUN_NETNS_TESTS \
+  -p ipars-agent --test netns_wireguard_backend \
+  boringtun_backends_transport_vpn_packets_between_network_namespaces
 
 run_cargo_test_serial hole-punch-netns HETERONETWORK_RUN_HOLE_PUNCH_NETNS_TESTS \
   -p ipars-agent --test netns_hole_punch

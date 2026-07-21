@@ -5071,6 +5071,9 @@ impl DaemonProcessGroup {
         let relay_udp_addr = reserve_udp_addr().await?;
         let stun_addr = reserve_udp_addr().await?;
         let stun_alternate_addr = reserve_udp_addr().await?;
+        let agent_stun_ip = daemon_non_loopback_ipv4_addr().await?;
+        let agent_stun_addrs =
+            reserve_udp_addrs_on(IpAddr::V4(agent_stun_ip), options.agent_processes).await?;
         let control_plane_urls = control_addrs
             .iter()
             .map(|addr| format!("http://{addr}"))
@@ -5295,7 +5298,7 @@ impl DaemonProcessGroup {
         )
         .await?;
 
-        for index in 0..options.agent_processes {
+        for (index, agent_stun_addr) in agent_stun_addrs.into_iter().enumerate() {
             let agent_addr = reserve_tcp_addr().await?;
             let agent_url = format!("http://{agent_addr}");
             let state_path = daemon_agent_state_path(&runtime_dir, index);
@@ -5322,6 +5325,10 @@ impl DaemonProcessGroup {
                 signal_url.clone(),
                 "--stun-server".to_string(),
                 stun_addr.to_string(),
+                "--stun-bind".to_string(),
+                agent_stun_addr.to_string(),
+                "--wireguard-listen-port".to_string(),
+                agent_stun_addr.port().to_string(),
                 "--runtime-backend".to_string(),
                 "dry-run".to_string(),
                 "--skip-runtime-preflight".to_string(),
@@ -6899,6 +6906,33 @@ async fn reserve_tcp_addrs(count: usize) -> anyhow::Result<Vec<SocketAddr>> {
 async fn reserve_udp_addr() -> anyhow::Result<SocketAddr> {
     let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
     Ok(socket.local_addr()?)
+}
+
+async fn reserve_udp_addrs_on(ip: IpAddr, count: usize) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut sockets = Vec::with_capacity(count);
+    let mut addrs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let socket = UdpSocket::bind(SocketAddr::new(ip, 0)).await?;
+        addrs.push(socket.local_addr()?);
+        sockets.push(socket);
+    }
+    Ok(addrs)
+}
+
+async fn daemon_non_loopback_ipv4_addr() -> anyhow::Result<Ipv4Addr> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await?;
+    socket
+        .connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9))
+        .await?;
+    let ip = match socket.local_addr()?.ip() {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => unreachable!("an IPv4 UDP socket returned an IPv6 local address"),
+    };
+    anyhow::ensure!(
+        !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() && !ip.is_broadcast(),
+        "daemon load scenario requires a usable non-loopback IPv4 address, discovered {ip}"
+    );
+    Ok(ip)
 }
 
 fn daemon_sqlite_database_url(path: &Path) -> String {

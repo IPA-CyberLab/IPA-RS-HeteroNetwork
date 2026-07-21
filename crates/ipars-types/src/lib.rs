@@ -433,6 +433,28 @@ pub fn socket_addr_is_globally_routable(addr: SocketAddr) -> bool {
     addr.port() != 0 && ip_addr_is_globally_routable(addr.ip())
 }
 
+/// Returns whether two private addresses are likely reachable on the same LAN.
+///
+/// Endpoint candidates do not carry interface prefix lengths, so discovery uses
+/// the conservative prefixes commonly used by local networks: /24 for IPv4 and
+/// /64 for IPv6. Shared/CGNAT space is deliberately excluded so an overlay such
+/// as Tailscale cannot be mistaken for a physical LAN.
+pub fn private_ip_addrs_share_subnet(left: IpAddr, right: IpAddr) -> bool {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => {
+            (left.is_private() || left.is_link_local())
+                && (right.is_private() || right.is_link_local())
+                && (u32::from(left) & 0xffff_ff00) == (u32::from(right) & 0xffff_ff00)
+        }
+        (IpAddr::V6(left), IpAddr::V6(right)) => {
+            (left.is_unique_local() || left.is_unicast_link_local())
+                && (right.is_unique_local() || right.is_unicast_link_local())
+                && (u128::from(left) >> 64) == (u128::from(right) >> 64)
+        }
+        _ => false,
+    }
+}
+
 fn ipv4_addr_is_globally_routable(ip: Ipv4Addr) -> bool {
     let [first, second, third, _] = ip.octets();
     !matches!(
@@ -18379,6 +18401,22 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn private_subnet_match_excludes_shared_overlay_space() {
+        assert!(private_ip_addrs_share_subnet(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 18)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 24)),
+        ));
+        assert!(!private_ip_addrs_share_subnet(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 18)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 2, 24)),
+        ));
+        assert!(!private_ip_addrs_share_subnet(
+            IpAddr::V4(Ipv4Addr::new(100, 89, 33, 61)),
+            IpAddr::V4(Ipv4Addr::new(100, 89, 33, 62)),
+        ));
     }
 
     #[test]

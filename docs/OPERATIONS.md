@@ -182,6 +182,13 @@ The Web UI shows `Private` rather than `Public` when a no-NAT observation uses
 RFC1918, CGNAT/Tailscale, loopback, link-local, documentation, benchmarking, or
 another special-purpose address.
 
+Self-hosted public STUN services should set
+`HETERONETWORK_STUN_ALTERNATE_LISTEN` and expose both UDP listeners. Agents use
+the RFC 5780 `OTHER-ADDRESS` response to probe the alternate listener with the
+same socket, so one reachable public service is sufficient to classify NAT
+mapping and filtering behavior. Multiple public services remain necessary for
+control-plane and STUN failover.
+
 For one-shot CLI provisioning, persist the generated node credentials before
 starting the Agent daemon:
 

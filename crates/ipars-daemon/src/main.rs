@@ -8658,7 +8658,10 @@ async fn classify_agent_startup_nat(
                 .classify_nat_without_candidate_refresh(probe_bind, stun_servers.to_vec())
                 .await?;
             runtime
-                .refresh_public_candidates_for_listen_port(&classification, wireguard_listen_port)
+                .refresh_candidates_for_wireguard_listen_port(
+                    &classification,
+                    wireguard_listen_port,
+                )
                 .await;
             Ok(())
         }
@@ -12118,7 +12121,7 @@ fn start_nat_discovery(
             {
                 Ok(classification) => {
                     let public_candidate_refreshed = runtime
-                        .refresh_public_candidates_for_listen_port(
+                        .refresh_candidates_for_wireguard_listen_port(
                             &classification,
                             stun_bind.port(),
                         )
@@ -13315,6 +13318,7 @@ async fn negotiate_signal_paths(
                             &status.node_id,
                             &identity,
                             &verification_record,
+                            &status.candidates,
                             hole_puncher,
                         )
                         .await
@@ -13373,6 +13377,7 @@ async fn negotiate_signal_paths(
                         &status.node_id,
                         &identity,
                         &verification_record,
+                        &status.candidates,
                         hole_puncher,
                     )
                     .await
@@ -13731,9 +13736,31 @@ async fn prepare_direct_nat_traversal(
     local_node: &NodeId,
     identity: &IdentityKeyPair,
     direct: &PathRecord,
+    local_candidates: &[EndpointCandidate],
     hole_puncher: &UdpHolePuncher,
 ) -> Result<(), AgentError> {
     if direct.selected_state != PathState::DirectNatTraversal {
+        return Ok(());
+    }
+    if direct
+        .selected_candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.kind == ipars_types::EndpointCandidateKind::LocalUdp)
+    {
+        tracing::debug!(
+            peer = %direct.key.remote,
+            "using shared-LAN endpoint without UDP hole punching"
+        );
+        return Ok(());
+    }
+    if local_candidates.iter().any(|candidate| {
+        candidate.kind == ipars_types::EndpointCandidateKind::PublicUdp
+            && socket_addr_is_globally_routable(candidate.addr)
+    }) {
+        tracing::debug!(
+            peer = %direct.key.remote,
+            "using public WireGuard listener without UDP hole punching"
+        );
         return Ok(());
     }
     let plan = fetch_hole_punch_plan(client, signal_url, &direct.key, identity)
@@ -34628,6 +34655,78 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn shared_lan_path_skips_udp_hole_punch() -> Result<(), AgentError> {
+        let local_node = NodeId::from_string("local");
+        let peer = NodeId::from_string("peer-a");
+        let mut local_candidate = candidate("peer-a", EndpointCandidateKind::LocalUdp, 10);
+        local_candidate.addr = SocketAddr::from(([192, 168, 10, 20], 51_820));
+        let direct = PathRecord {
+            key: PeerPathKey::new(local_node.clone(), peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(local_candidate),
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                0,
+            ),
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        prepare_direct_nat_traversal(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            &local_node,
+            &IdentityKeyPair::generate(),
+            &direct,
+            &[],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_listener_skips_udp_hole_punch() -> Result<(), AgentError> {
+        let local_node = NodeId::from_string("local");
+        let peer = NodeId::from_string("peer-a");
+        let direct = PathRecord {
+            key: PeerPathKey::new(local_node.clone(), peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(candidate(
+                "peer-a",
+                EndpointCandidateKind::StunReflexive,
+                10,
+            )),
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                0,
+            ),
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+        let mut public_candidate = candidate("local", EndpointCandidateKind::PublicUdp, 10);
+        public_candidate.addr = SocketAddr::from(([8, 8, 8, 8], 51_820));
+
+        prepare_direct_nat_traversal(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            &local_node,
+            &IdentityKeyPair::generate(),
+            &direct,
+            &[public_candidate],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_probe_retains_current_direct_path_until_probe_finishes(
     ) -> Result<(), AgentError> {
         let runtime = AgentRuntime::new(
@@ -35563,7 +35662,10 @@ exec sleep 60
 
         let status = runtime.status().await;
         assert!(status.nat_classification.is_some());
-        assert!(status.candidates.is_empty());
+        assert_eq!(status.candidates.len(), 1);
+        assert_eq!(status.candidates[0].kind, EndpointCandidateKind::LocalUdp);
+        assert_eq!(status.candidates[0].addr, occupied_addr);
+        assert_eq!(status.candidates[0].source, CandidateSource::StunProbe);
         drop(occupied_socket);
         Ok(())
     }

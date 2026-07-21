@@ -45,6 +45,11 @@ jobs:
       - name: Run workspace tests
         run: cargo test --locked --workspace
 
+      - name: Validate kubeadm HA automation
+        run: |
+          bash -n scripts/kubeadm-ha-node.sh
+          scripts/kubeadm-ha-node.sh self-test
+
       - name: Install minimum supported Rust
         run: rustup toolchain install "$RUST_MSRV_TOOLCHAIN" --profile minimal
 

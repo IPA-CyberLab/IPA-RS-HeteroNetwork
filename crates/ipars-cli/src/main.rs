@@ -374,7 +374,7 @@ struct InitArgs {
     signal_listen: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:3478")]
     stun_listen: SocketAddr,
-    #[arg(long)]
+    #[arg(long, default_value = DEFAULT_STUN_ALTERNATE_LISTEN)]
     stun_alternate_listen: Option<SocketAddr>,
     #[arg(long, default_value = "0.0.0.0:3479")]
     stun_http_listen: SocketAddr,
@@ -11795,6 +11795,10 @@ mod tests {
             assert_eq!(args.allowed_routes, vec!["10.43.0.0/16".parse()?]);
             assert!(args.allow_relay);
             assert!(args.unlimited_uses);
+            assert_eq!(
+                args.stun_alternate_listen,
+                Some(DEFAULT_STUN_ALTERNATE_LISTEN.parse()?)
+            );
         } else {
             anyhow::bail!("expected init command");
         }
