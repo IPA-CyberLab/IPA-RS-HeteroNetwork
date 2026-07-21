@@ -68,12 +68,15 @@ nat_b="heteronetwork-nat-b-${suffix}"
 agent_a="heteronetwork-agent-a-${suffix}"
 agent_b="heteronetwork-agent-b-${suffix}"
 
-root_public_ip="198.18.100.1"
+# The production classifier intentionally rejects RFC 2544 and documentation
+# ranges. These addresses exist only on this temporary isolated bridge, but must
+# still exercise the globally-routable STUN-reflexive path.
+root_public_ip="11.254.100.1"
 # Keep each invocation on a separate public tuple so conntrack state from a
 # previous namespace teardown cannot be reused by the next profile.
 nat_public_octet_base=$((20 + (suffix % 100) * 2))
-nat_a_public_ip="198.18.100.${nat_public_octet_base}"
-nat_b_public_ip="198.18.100.$((nat_public_octet_base + 1))"
+nat_a_public_ip="11.254.100.${nat_public_octet_base}"
+nat_b_public_ip="11.254.100.$((nat_public_octet_base + 1))"
 # Keep the synthetic underlays outside the default 10.250.0.0/16 VPN pool.
 nat_a_gateway="10.252.0.1"
 nat_a_agent_ip="10.252.0.2"
