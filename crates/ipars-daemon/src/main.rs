@@ -35566,7 +35566,10 @@ exec sleep 60
 
         let status = runtime.status().await;
         assert!(status.nat_classification.is_some());
-        assert!(status.candidates.is_empty());
+        assert_eq!(status.candidates.len(), 1);
+        assert_eq!(status.candidates[0].kind, EndpointCandidateKind::LocalUdp);
+        assert_eq!(status.candidates[0].addr, occupied_addr);
+        assert_eq!(status.candidates[0].source, CandidateSource::StunProbe);
         drop(occupied_socket);
         Ok(())
     }
