@@ -8,6 +8,7 @@ readonly DEFAULT_POD_CIDR="10.244.0.0/16"
 readonly DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 readonly DEFAULT_KUBERNETES_MINOR="v1.36"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/kubernetes"
+readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_MANIFEST_SHA256="d078019743c5e0194ce965125fc80ef00af0c1661ec9e12396311f1cfec860a2"
 readonly FLANNEL_MANIFEST_URL="https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml"
@@ -266,7 +267,11 @@ EOF
   while IFS= read -r backend; do
     printf '  - "%s"\n' "$backend"
   done < <(backend_addresses)
-  cat <<'EOF'
+  cat <<EOF
+controllerManager:
+  extraArgs:
+  - name: "node-monitor-grace-period"
+    value: "${NODE_MONITOR_GRACE_PERIOD}"
 etcd:
   local:
     dataDir: "/var/lib/etcd"
@@ -696,17 +701,19 @@ verify_cluster() {
   require_command jq
   export KUBECONFIG=/etc/kubernetes/admin.conf
 
-  local expected_nodes actual_nodes ready_nodes control_planes flannel_pods coredns_pods coredns_nodes
+  local expected_nodes actual_nodes ready_nodes control_planes controller_managers flannel_pods coredns_pods coredns_nodes
   expected_nodes="$(backend_addresses | wc -l | tr -d ' ')"
   actual_nodes="$(kubectl get nodes -o json | jq '.items | length')"
   ready_nodes="$(kubectl get nodes -o json | jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
   control_planes="$(kubectl -n kube-system get pods -l component=kube-apiserver -o json | jq '[.items[] | select(.status.phase == "Running")] | length')"
+  controller_managers="$(kubectl -n kube-system get pods -l component=kube-controller-manager -o json | jq --arg expected "--node-monitor-grace-period=${NODE_MONITOR_GRACE_PERIOD}" '[.items[] | select(any(.spec.containers[]?.command[]?; . == $expected))] | length')"
   flannel_pods="$(kubectl -n kube-flannel get pods -l app=flannel -o json | jq '[.items[] | select(.status.phase == "Running")] | length')"
   coredns_pods="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')"
   coredns_nodes="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] | unique | length')"
   [[ "$actual_nodes" == "$expected_nodes" ]] || die "expected $expected_nodes nodes, found $actual_nodes"
   [[ "$ready_nodes" == "$expected_nodes" ]] || die "expected $expected_nodes Ready nodes, found $ready_nodes"
   [[ "$control_planes" == "$expected_nodes" ]] || die "expected $expected_nodes API servers, found $control_planes"
+  [[ "$controller_managers" == "$expected_nodes" ]] || die "expected $expected_nodes controller managers with ${NODE_MONITOR_GRACE_PERIOD} node monitoring, found $controller_managers"
   [[ "$flannel_pods" == "$expected_nodes" ]] || die "expected $expected_nodes Flannel pods, found $flannel_pods"
   [[ "$coredns_pods" == "$expected_nodes" ]] || die "expected $expected_nodes Ready CoreDNS pods, found $coredns_pods"
   [[ "$coredns_nodes" == "$expected_nodes" ]] || die "CoreDNS pods are not spread across all $expected_nodes nodes"
@@ -784,6 +791,7 @@ self_test() {
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"
   grep -Fq 'swapBehavior: NoSwap' <<<"$rendered"
+  grep -Fq 'value: "20s"' <<<"$rendered"
 
   bundle="$(mktemp)"
   jq -n \

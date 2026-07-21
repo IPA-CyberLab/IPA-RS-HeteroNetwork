@@ -27,6 +27,11 @@ anti-affinity. DNS therefore remains available when any one control-plane node
 is unavailable, including when the initial node fails after the other nodes
 join.
 
+The controller manager uses a 20-second node-monitor grace period instead of
+the upstream 50-second default. This limits how long a failed node can remain in
+Service endpoint selection while still allowing multiple missed kubelet status
+updates on the WAN underlay.
+
 Flannel VXLAN uses `heteronetwork0` explicitly. Flannel derives its MTU from the
 underlay interface. With the default HeteroNetwork MTU of 1420, the expected Pod
 MTU is 1370 after the 50-byte IPv4 VXLAN overhead.
