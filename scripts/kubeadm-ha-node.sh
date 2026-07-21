@@ -351,7 +351,18 @@ configure_containerd() {
   local temporary
   temporary="$(mktemp)"
   if [[ -s "$config" ]]; then
-    cp "$config" "$temporary"
+    if grep -Eq '^[[:space:]]*SystemdCgroup[[:space:]]*=' "$config"; then
+      cp "$config" "$temporary"
+    else
+      local unknown_config
+      unknown_config="$(sed -E \
+        -e '/^[[:space:]]*(#|$)/d' \
+        -e '/^disabled_plugins[[:space:]]*=[[:space:]]*\["cri"\][[:space:]]*$/d' \
+        "$config")"
+      [[ -z "$unknown_config" ]] \
+        || die "existing containerd config has custom settings but no SystemdCgroup field; inspect ${config}.pre-heteronetwork"
+      containerd config default >"$temporary"
+    fi
   else
     containerd config default >"$temporary"
   fi
@@ -422,7 +433,10 @@ install_kubernetes_packages() {
   require_command apt-get
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y apt-transport-https ca-certificates conntrack containerd curl ethtool gpg haproxy jq openssl socat
+  apt-get install -y apt-transport-https ca-certificates conntrack curl ethtool gpg haproxy jq openssl socat
+  if ! command -v containerd >/dev/null 2>&1; then
+    apt-get install -y containerd
+  fi
 
   install -d -o root -g root -m 0755 /etc/apt/keyrings
   local key keyring

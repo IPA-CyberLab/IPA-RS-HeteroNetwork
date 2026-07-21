@@ -49,9 +49,11 @@ sudo -E scripts/kubeadm-ha-node.sh prepare
 `prepare` installs Kubernetes from the signed `pkgs.k8s.io` v1.36 repository,
 configures containerd with the systemd cgroup driver and CRI enabled, loads
 `overlay` and `br_netfilter`, enables forwarding, and starts the dedicated API
-load balancer. Existing containerd configuration is backed up once before a
-compatible in-place update. The script aborts instead of replacing an unknown
-containerd layout.
+load balancer. An existing Docker-provided containerd is retained. Its minimal
+`disabled_plugins = ["cri"]` configuration is backed up and expanded from that
+installed containerd version's own defaults; custom layouts are updated in
+place only when they already expose `SystemdCgroup`, otherwise the script
+aborts for operator review.
 
 Host swap remains available to non-Pod processes. kubelet uses
 `failSwapOn: false` with `NoSwap`, so Kubernetes workloads cannot consume it.
