@@ -355,10 +355,15 @@ configure_containerd() {
       cp "$config" "$temporary"
     else
       local unknown_config
-      unknown_config="$(sed -E \
-        -e '/^[[:space:]]*(#|$)/d' \
-        -e '/^disabled_plugins[[:space:]]*=[[:space:]]*\["cri"\][[:space:]]*$/d' \
-        "$config")"
+      unknown_config="$(
+        sed -E \
+          -e '/^[[:space:]]*(#|$)/d' \
+          -e 's/^[[:space:]]+//' \
+          -e 's/[[:space:]]+$//' \
+          "$config" \
+          | grep -Ev '^((disabled_plugins[[:space:]]*=[[:space:]]*\["cri"\])|(version[[:space:]]*=[[:space:]]*2)|(\[plugins\])|(\[plugins\."io\.containerd\.grpc\.v1\.cri"\])|(\[plugins\."io\.containerd\.grpc\.v1\.cri"\.cni\])|(bin_dir[[:space:]]*=[[:space:]]*"/usr/lib/cni")|(conf_dir[[:space:]]*=[[:space:]]*"/etc/cni/net\.d")|(\[plugins\."io\.containerd\.internal\.v1\.opt"\])|(path[[:space:]]*=[[:space:]]*"/var/lib/containerd/opt"))$' \
+          || true
+      )"
       [[ -z "$unknown_config" ]] \
         || die "existing containerd config has custom settings but no SystemdCgroup field; inspect ${config}.pre-heteronetwork"
       containerd config default >"$temporary"
