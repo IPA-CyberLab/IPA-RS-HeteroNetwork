@@ -348,7 +348,7 @@ configure_containerd() {
     install -o root -g root -m 0600 "$config" "${config}.pre-heteronetwork"
   fi
 
-  local temporary
+  local temporary pause_image kubernetes_version
   temporary="$(mktemp)"
   if [[ -s "$config" ]]; then
     if grep -Eq '^[[:space:]]*SystemdCgroup[[:space:]]*=' "$config"; then
@@ -373,11 +373,25 @@ configure_containerd() {
   fi
   sed -i -E 's/^(disabled_plugins[[:space:]]*=[[:space:]]*)\["cri"\]/\1[]/' "$temporary"
   sed -i -E 's/^([[:space:]]*SystemdCgroup[[:space:]]*=[[:space:]]*)false/\1true/' "$temporary"
+  sed -i 's#/usr/lib/cni#/opt/cni/bin#g' "$temporary"
+  kubernetes_version="$(kubeadm version -o short)"
+  pause_image="$(kubeadm config images list --kubernetes-version "$kubernetes_version" \
+    | sed -nE '\#/pause:[^[:space:]]+$# {p;q}')"
+  [[ -n "$pause_image" ]] || die "failed to determine the kubeadm pause image"
+  sed -i -E \
+    -e "s#^([[:space:]]*sandbox_image[[:space:]]*=[[:space:]]*)['\"][^'\"]+['\"]#\1\"${pause_image}\"#" \
+    -e "s#^([[:space:]]*sandbox[[:space:]]*=[[:space:]]*)['\"][^'\"]+['\"]#\1\"${pause_image}\"#" \
+    "$temporary"
   grep -Eq '^[[:space:]]*SystemdCgroup[[:space:]]*=[[:space:]]*true' "$temporary" \
     || die "containerd config does not expose a SystemdCgroup setting that can be enabled safely"
+  grep -Eq "^[[:space:]]*bin_dirs?[[:space:]]*=.*['\"]?/opt/cni/bin['\"]?" "$temporary" \
+    || die "containerd CNI plugin path is not /opt/cni/bin"
+  grep -Fq "$pause_image" "$temporary" \
+    || die "containerd sandbox image does not match kubeadm"
   if grep -Eq '^disabled_plugins[[:space:]]*=.*"cri"' "$temporary"; then
     die "containerd CRI remains disabled after configuration"
   fi
+  install -d -o root -g root -m 0755 /opt/cni/bin
   install -o root -g root -m 0644 "$temporary" "$config"
   rm -f "$temporary"
   systemctl enable --now containerd
