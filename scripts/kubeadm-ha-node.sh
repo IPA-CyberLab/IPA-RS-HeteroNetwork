@@ -202,11 +202,13 @@ backend kubernetes_control_planes
     option tcp-check
     default-server check inter 500ms fastinter 200ms downinter 1s fall 1 rise 2 on-marked-down shutdown-sessions
 EOF
-  local backend
+  local backend backup
   local index=0
   while IFS= read -r backend; do
     index=$((index + 1))
-    printf '    server control-plane-%d %s:6443\n' "$index" "$backend"
+    backup=""
+    [[ "$backend" == "$node_ip" ]] || backup=" backup"
+    printf '    server control-plane-%d %s:6443%s\n' "$index" "$backend" "$backup"
   done < <(backend_addresses)
 }
 
@@ -795,6 +797,8 @@ self_test() {
   grep -Fq 'timeout check 500ms' <<<"$rendered"
   grep -Fq 'fall 1 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
+  grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
+  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
   rendered="$(render_init_config v1.36.1)"
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"

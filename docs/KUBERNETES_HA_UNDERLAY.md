@@ -19,8 +19,9 @@ kubelet / kubectl -> 127.0.0.1:7443 -> 10.250.0.1:6443
 
 All three nodes run kube-apiserver, scheduler, controller-manager, and a stacked
 etcd member. Loss of one node preserves the etcd quorum and leaves two API
-servers available. A local HAProxy removes an unhealthy backend after two
-failed one-second checks.
+servers available. Each HAProxy uses its local API server as the primary and
+keeps both remote API servers as health-checked backups. Failed connections are
+redispatched, and an unreachable backend is removed after one bounded check.
 
 Finalization also runs three CoreDNS replicas with required hostname
 anti-affinity. DNS therefore remains available when any one control-plane node
