@@ -71,13 +71,48 @@ impl UdpStunProbe {
     ) -> Result<Vec<NatProbeObservation>, StunError> {
         validate_stun_servers(stun_servers)?;
         let socket = UdpSocket::bind(local_bind).await?;
-        let mut observations = Vec::with_capacity(stun_servers.len());
+        let mut observations = Vec::with_capacity(stun_servers.len().max(2));
+        let mut alternate_servers = Vec::new();
         let mut first_error = None;
         for stun_server in stun_servers {
-            match observe_binding_with_socket(&socket, *stun_server).await {
-                Ok(observation) => observations.push(observation),
+            match observe_binding_details_with_socket(
+                &socket,
+                *stun_server,
+                BindingRequestOptions::default(),
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Some(other_address) = response.other_address.filter(|other_address| {
+                        endpoint_addr_is_usable(*other_address)
+                            && *other_address != *stun_server
+                            && !stun_servers.contains(other_address)
+                    }) {
+                        if !alternate_servers.contains(&other_address) {
+                            alternate_servers.push(other_address);
+                        }
+                    }
+                    observations.push(
+                        binding_observation_from_response(&socket, *stun_server, response).await?,
+                    );
+                }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
+            }
+        }
+
+        // One RFC 5780 service can provide the second destination needed to
+        // distinguish endpoint-independent from destination-dependent mapping.
+        if observations.len() < 2 {
+            for alternate_server in alternate_servers {
+                match observe_binding_with_socket(&socket, alternate_server).await {
+                    Ok(observation) => observations.push(observation),
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+                if observations.len() >= 2 {
+                    break;
+                }
             }
         }
         if observations.is_empty() {
@@ -584,6 +619,14 @@ async fn observe_binding_with_socket(
     let response =
         observe_binding_details_with_socket(socket, stun_server, BindingRequestOptions::default())
             .await?;
+    binding_observation_from_response(socket, stun_server, response).await
+}
+
+async fn binding_observation_from_response(
+    socket: &UdpSocket,
+    stun_server: SocketAddr,
+    response: BindingResponse,
+) -> Result<NatProbeObservation, StunError> {
     Ok(NatProbeObservation {
         local_addr: concrete_local_addr(socket.local_addr()?, stun_server).await?,
         stun_server,
@@ -1325,6 +1368,36 @@ mod tests {
         assert_eq!(observations.len(), 2);
         assert_eq!(observations[0].stun_server, first_server_addr);
         assert_eq!(observations[1].stun_server, second_server_addr);
+        assert_eq!(observations[0].local_addr, observations[1].local_addr);
+        assert_eq!(
+            observations[0].reflexive_addr,
+            observations[1].reflexive_addr
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_probe_uses_rfc5780_other_address_for_second_mapping_observation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = Rfc5780StunServer::bind(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await?;
+        let primary_addr = server.primary_addr()?;
+        let alternate_addr = server.alternate_addr()?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { server.serve(shutdown_rx).await });
+
+        let observations = UdpStunProbe
+            .observe_binding_many(SocketAddr::from(([127, 0, 0, 1], 0)), &[primary_addr])
+            .await?;
+
+        shutdown_tx.send(true)?;
+        server_task.await??;
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].stun_server, primary_addr);
+        assert_eq!(observations[1].stun_server, alternate_addr);
         assert_eq!(observations[0].local_addr, observations[1].local_addr);
         assert_eq!(
             observations[0].reflexive_addr,

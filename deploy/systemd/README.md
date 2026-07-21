@@ -61,6 +61,11 @@ then keeps PKCE verifier/state server-side for the callback, including on lab
 HTTP IP addresses where browser WebCrypto is not available.
 Internet-facing issuer and public URLs must use HTTPS; plain HTTP is accepted
 only for loopback, private, link-local, and CGNAT lab addresses.
+Allow both `HETERONETWORK_STUN_LISTEN` and
+`HETERONETWORK_STUN_ALTERNATE_LISTEN` through the host and upstream UDP
+firewalls. The alternate RFC 5780 listener lets an Agent obtain two mapping
+observations from one public STUN service; separate public nodes are still
+required for service HA.
 
 ```sh
 sudo systemctl daemon-reload
