@@ -573,7 +573,7 @@ mod tests {
             } else {
                 EndpointCandidateKind::StunReflexive
             },
-            addr: SocketAddr::from(([203, 0, 113, 10], 51_820)),
+            addr: SocketAddr::from(([8, 8, 8, 10], 51_820)),
             observed_at: Utc::now(),
             priority: 100,
             cost: 10,

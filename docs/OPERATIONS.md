@@ -129,7 +129,7 @@ ipars token revoke \
 
 The control plane accepts only fresh Ed25519-signed revocations from its configured issuer key ring. Keep overlapping old/new issuer public keys configured until tokens from the old key no longer need revocation. The nonce does not need to have joined before this command: the store persists a tombstone and rejects a later first admission. Redundant Control Planes serialize issue, admission, and revocation for each cluster/nonce with an SQLite writer transaction or PostgreSQL transaction advisory lock. A concurrent join is either recorded before revocation or rejected after it, and `RevokeTokenResponse.record` is absent until full token claims are observed.
 
-Join-token signatures must be canonical standard Base64 encoding of exactly one 64-byte Ed25519 signature, which is 88 encoded bytes including padding. CLI, Agent, verifier, and Control Plane inputs reject malformed, non-canonical, wrong-length, and oversized signature envelopes before issuer lookup or verification. Cluster, issuer, key, role, nonce, claim-tag, and policy-tag identifiers are capped at 255 bytes and must use path-safe ASCII. Claim and policy tag sets are each capped at 64 entries. Policy route allowlists are capped at 256 safe canonical, unique, non-overlapping CIDRs. The validity window must be positive and cannot exceed the 30-day TTL plus the CLI's 5-second `not_before` skew allowance. Bootstrap lists are capped at 32 endpoints total and 8 per service kind; each URL is capped at 2048 bytes and must be an absolute typed endpoint without userinfo, query, fragment, control characters, unusable numeric addresses, or normalized duplicates. Agents also cap the merged explicit and token-derived STUN set at 8 unique usable resolved socket addresses; publish multiple independent endpoints within these bounds for failover.
+Join-token signatures must be canonical standard Base64 encoding of exactly one 64-byte Ed25519 signature, which is 88 encoded bytes including padding. CLI, Agent, verifier, and Control Plane inputs reject malformed, non-canonical, wrong-length, and oversized signature envelopes before issuer lookup or verification. Cluster, issuer, key, role, nonce, claim-tag, and policy-tag identifiers are capped at 255 bytes and must use path-safe ASCII. Claim and policy tag sets are each capped at 64 entries. Policy route allowlists are capped at 256 safe canonical, unique, non-overlapping CIDRs. The validity window must be positive and cannot exceed the 30-day TTL plus the CLI's 5-second `not_before` skew allowance. Bootstrap lists are capped at 32 endpoints total and 8 per service kind; each URL is capped at 2048 bytes and must be an absolute typed endpoint without userinfo, query, fragment, control characters, unusable numeric addresses, or normalized duplicates. Agents cap each selected STUN set at 8 unique usable resolved socket addresses; publish multiple independent globally routable endpoints within these bounds for self-hosted discovery and failover.
 
 The same 88-byte canonical signature envelope applies to heartbeat, WireGuard key rotation, node removal, token revocation, direct Control Plane node queries, and Signal upsert/path/hole-punch requests. A malformed or oversized envelope is rejected as an input-shape error rather than retried as an authentication failure; inspect the service response and correct the producer or transport encoding before retrying.
 
@@ -160,6 +160,27 @@ iparsd agent \
   --runtime-backend linux-command \
   --apply-peer-map
 ```
+
+The Agent prefers globally routable STUN endpoints from its persisted service
+directory and signed token. A directory containing only private or
+`100.64.0.0/10` endpoints cannot reveal the Internet-facing address, so the
+default binary falls back to these configurable public probes:
+
+```bash
+iparsd agent \
+  --public-stun-url udp://stun.cloudflare.com:3478 \
+  --public-stun-url udp://stun.cloudflare.com:53 \
+  --join-token-path /etc/heteronetwork/join.token \
+  --apply-peer-map
+```
+
+Set `HETERONETWORK_AGENT_PUBLIC_STUN_URL` to a comma-separated replacement.
+Use `--disable-public-stun-fallback` only for an offline/private lab; such a
+node can still report local candidates but cannot be classified as public.
+Explicit `--stun-server IP:PORT` values override automatic source selection.
+The Web UI shows `Private` rather than `Public` when a no-NAT observation uses
+RFC1918, CGNAT/Tailscale, loopback, link-local, documentation, benchmarking, or
+another special-purpose address.
 
 For one-shot CLI provisioning, persist the generated node credentials before
 starting the Agent daemon:

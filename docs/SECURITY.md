@@ -144,6 +144,17 @@ STUN JSON and Prometheus metrics use `GET /v1/metrics` and `GET /metrics` only w
 
 Compose mounts a distinct STUN operator secret. This Bearer control protects HTTP observations but does not encrypt them; use TLS for metric traffic outside trusted private transport and keep the credential separate from all node, issuer, relay, and other operator material.
 
+When every directory STUN endpoint is private, the Agent's default public STUN
+fallback sends unauthenticated RFC5389 Binding requests to the configured
+`--public-stun-url` hosts. The request exposes the Agent's source IP and UDP
+port to that STUN provider but carries no join token, node identity, VPN key,
+or application payload. Replace the defaults with organization-operated public
+STUN endpoints when this metadata must remain first-party, or disable the
+fallback for an isolated lab. Control Plane and Signal validation reject a
+`PublicUdp` candidate unless its address is globally routable, so an Agent or
+API client cannot promote RFC1918, CGNAT/Tailscale, loopback, link-local,
+documentation, benchmarking, multicast, or reserved endpoints to public state.
+
 ## Relay Operator API
 
 Relay Prometheus metrics are available through `GET /metrics` only when `iparsd relay --operator-api-bearer-token` or `--operator-api-bearer-token-path` configures a separate 32-512 byte printable non-whitespace ASCII credential. Without one, the route returns 404. With one, missing or rejected credentials return 401 with a Bearer challenge and fixed-bound constant-time comparison. `/healthz` and `/v1/status` remain public orchestration/capability routes; `POST /v1/sessions` retains its independently configured 32-512 byte admission Bearer credential and abuse controls. Relay servers accept that admission credential from `--admission-bearer-token-path`/`HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH`, and Agents accept the same bounded file through `--relay-admission-bearer-token-path`/`HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH`; inline forms remain mutually exclusive compatibility options.

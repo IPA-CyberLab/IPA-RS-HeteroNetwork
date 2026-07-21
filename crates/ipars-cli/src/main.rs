@@ -3919,16 +3919,16 @@ fn path_probe_candidate(
             .candidate_source
             .unwrap_or(CandidateSource::ControlPlane),
     };
-    if let Err(reason) = candidate.validate_kind_address() {
+    if !endpoint_addr_is_usable(candidate.addr) {
         anyhow::bail!(
-            "selected candidate {:?} at {} is invalid: {reason}",
+            "selected candidate {:?} at {} is unusable",
             candidate.kind,
             candidate.addr
         );
     }
-    if !endpoint_addr_is_usable(candidate.addr) {
+    if let Err(reason) = candidate.validate_kind_address() {
         anyhow::bail!(
-            "selected candidate {:?} at {} is unusable",
+            "selected candidate {:?} at {} is invalid: {reason}",
             candidate.kind,
             candidate.addr
         );
@@ -13122,7 +13122,7 @@ fi
             "--candidate-kind",
             "ipv6",
             "--candidate-addr",
-            "198.51.100.10:51820",
+            "8.8.8.10:51820",
         ])?;
         let Command::Path {
             command: PathCommand::Probe(args),
@@ -13256,7 +13256,7 @@ fi
             "--relay-node",
             "relay-a",
             "--candidate-addr",
-            "198.51.100.10:51820",
+            "8.8.8.10:51820",
         ])?;
         let Command::Path {
             command: PathCommand::Probe(relay_candidate_args),
@@ -13281,7 +13281,7 @@ fi
             "--state",
             "unreachable",
             "--candidate-addr",
-            "198.51.100.10:51820",
+            "8.8.8.10:51820",
         ])?;
         let Command::Path {
             command: PathCommand::Probe(unreachable_candidate_args),

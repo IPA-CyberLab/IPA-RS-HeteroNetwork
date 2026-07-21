@@ -37,7 +37,7 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable,
+    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
     NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
@@ -1810,9 +1810,16 @@ impl AgentRuntime {
         &self,
         observation: &NatProbeObservation,
     ) -> EndpointCandidate {
+        let kind = if observation.reflexive_addr == observation.local_addr
+            && socket_addr_is_globally_routable(observation.reflexive_addr)
+        {
+            EndpointCandidateKind::PublicUdp
+        } else {
+            EndpointCandidateKind::StunReflexive
+        };
         EndpointCandidate {
             node_id: self.state().node_id,
-            kind: EndpointCandidateKind::StunReflexive,
+            kind,
             addr: observation.reflexive_addr,
             observed_at: observation.observed_at,
             priority: 80,
@@ -3038,15 +3045,15 @@ fn validate_path_state_shape(
             candidate.node_id, peer
         ));
     }
-    if let Err(reason) = candidate.validate_kind_address() {
-        return Err(format!(
-            "selected candidate {:?} at {} is invalid: {reason}",
-            candidate.kind, candidate.addr
-        ));
-    }
     if !endpoint_addr_is_usable(candidate.addr) {
         return Err(format!(
             "selected candidate {:?} at {} is unusable",
+            candidate.kind, candidate.addr
+        ));
+    }
+    if let Err(reason) = candidate.validate_kind_address() {
+        return Err(format!(
+            "selected candidate {:?} at {} is invalid: {reason}",
             candidate.kind, candidate.addr
         ));
     }
@@ -7821,7 +7828,7 @@ mod tests {
             selected_candidate: Some(EndpointCandidate {
                 node_id: peer_id,
                 kind: EndpointCandidateKind::PublicUdp,
-                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                addr: SocketAddr::from(([8, 8, 8, 10], 51820)),
                 observed_at: Utc::now(),
                 priority: 100,
                 cost: 10,
@@ -9556,7 +9563,7 @@ mod tests {
                 EndpointCandidate {
                     node_id: peer_id.clone(),
                     kind: EndpointCandidateKind::PublicUdp,
-                    addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                    addr: SocketAddr::from(([8, 8, 8, 10], 51820)),
                     observed_at: Utc::now(),
                     priority: 10,
                     cost: 50,
@@ -9591,7 +9598,7 @@ mod tests {
             .ok_or_else(|| AgentError::MissingPeer(peer_id.clone()))?;
         assert_eq!(config.public_key, "wg-peer-public");
         assert_eq!(config.allowed_ips, vec!["100.64.0.2/32", "10.10.0.0/16"]);
-        assert_eq!(config.endpoint.as_deref(), Some("203.0.113.10:51820"));
+        assert_eq!(config.endpoint.as_deref(), Some("8.8.8.10:51820"));
         assert_eq!(config.persistent_keepalive_seconds, Some(25));
         drop(wireguard_peers);
 
@@ -10153,7 +10160,7 @@ mod tests {
             vec![EndpointCandidate {
                 node_id: peer_id.clone(),
                 kind: EndpointCandidateKind::PublicUdp,
-                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                addr: SocketAddr::from(([8, 8, 8, 10], 51820)),
                 observed_at: Utc::now(),
                 priority: 100,
                 cost: 10,
@@ -10189,7 +10196,7 @@ mod tests {
         ));
         let local_id = runtime.state().node_id.clone();
         let peer_id = NodeId::from_string("peer-probe");
-        let direct_endpoint = SocketAddr::from(([203, 0, 113, 10], 51_820));
+        let direct_endpoint = SocketAddr::from(([8, 8, 8, 10], 51_820));
         let forwarder_endpoint = SocketAddr::from(([127, 0, 0, 1], 52_000));
         runtime
             .upsert_path_state(PathRecord {
@@ -10270,7 +10277,7 @@ mod tests {
                 .await
                 .get(&peer_id)
                 .and_then(|config| config.endpoint.as_deref()),
-            Some("203.0.113.10:51820")
+            Some("8.8.8.10:51820")
         );
         assert_eq!(
             applier
@@ -10460,7 +10467,7 @@ mod tests {
             vec![EndpointCandidate {
                 node_id: active_peer_id.clone(),
                 kind: EndpointCandidateKind::PublicUdp,
-                addr: SocketAddr::from(([203, 0, 113, 10], 51820)),
+                addr: SocketAddr::from(([8, 8, 8, 10], 51820)),
                 observed_at: Utc::now(),
                 priority: 100,
                 cost: 10,
@@ -10566,7 +10573,7 @@ mod tests {
             vec![EndpointCandidate {
                 node_id: peer_id.clone(),
                 kind: EndpointCandidateKind::PublicUdp,
-                addr: SocketAddr::from(([203, 0, 113, 20], 51_820)),
+                addr: SocketAddr::from(([8, 8, 8, 20], 51_820)),
                 observed_at: Utc::now(),
                 priority: 100,
                 cost: 10,
@@ -10609,10 +10616,7 @@ mod tests {
         assert_eq!(active.routes_applied, 1);
         let wireguard_peers = applier.wireguard.peers.read().await;
         let active_config = &wireguard_peers[&peer_id];
-        assert_eq!(
-            active_config.endpoint.as_deref(),
-            Some("203.0.113.20:51820")
-        );
+        assert_eq!(active_config.endpoint.as_deref(), Some("8.8.8.20:51820"));
         assert_eq!(active_config.public_key, "wg-on-demand");
         Ok(())
     }
@@ -12966,6 +12970,32 @@ mod tests {
         assert_eq!(candidate.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(runtime.status().await.candidate_count, 2);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_promotes_only_global_no_nat_observations_to_public_candidates() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let observed_at = Utc::now();
+        let public_addr = SocketAddr::from(([8, 8, 8, 8], 51_820));
+        let public_candidate = runtime.stun_candidate_from_observation(&NatProbeObservation {
+            local_addr: public_addr,
+            stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+            reflexive_addr: public_addr,
+            observed_at,
+        });
+        assert_eq!(public_candidate.kind, EndpointCandidateKind::PublicUdp);
+
+        let tailscale_addr = SocketAddr::from(([100, 100, 20, 30], 51_820));
+        let private_candidate = runtime.stun_candidate_from_observation(&NatProbeObservation {
+            local_addr: tailscale_addr,
+            stun_server: SocketAddr::from(([100, 100, 20, 40], 3478)),
+            reflexive_addr: tailscale_addr,
+            observed_at,
+        });
+        assert_eq!(private_candidate.kind, EndpointCandidateKind::StunReflexive);
     }
 
     #[tokio::test]
