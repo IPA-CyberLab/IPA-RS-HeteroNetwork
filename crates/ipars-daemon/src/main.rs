@@ -13739,6 +13739,17 @@ async fn prepare_direct_nat_traversal(
     if direct.selected_state != PathState::DirectNatTraversal {
         return Ok(());
     }
+    if direct
+        .selected_candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.kind == ipars_types::EndpointCandidateKind::LocalUdp)
+    {
+        tracing::debug!(
+            peer = %direct.key.remote,
+            "using shared-LAN endpoint without UDP hole punching"
+        );
+        return Ok(());
+    }
     let plan = fetch_hole_punch_plan(client, signal_url, &direct.key, identity)
         .await
         .map_err(|error| {
@@ -34627,6 +34638,39 @@ exec sleep 60
             .await
             .is_some());
         assert_eq!(runtime.metrics().await.direct_path_probe_confirmed_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_lan_path_skips_udp_hole_punch() -> Result<(), AgentError> {
+        let local_node = NodeId::from_string("local");
+        let peer = NodeId::from_string("peer-a");
+        let mut local_candidate = candidate("peer-a", EndpointCandidateKind::LocalUdp, 10);
+        local_candidate.addr = SocketAddr::from(([192, 168, 10, 20], 51_820));
+        let direct = PathRecord {
+            key: PeerPathKey::new(local_node.clone(), peer),
+            selected_state: PathState::DirectNatTraversal,
+            selected_candidate: Some(local_candidate),
+            relay_node: None,
+            score: PathScore::calculate(
+                PathState::DirectNatTraversal,
+                &PathMetrics::default(),
+                true,
+                0,
+            ),
+            updated_at: Utc::now(),
+            pinned: false,
+        };
+
+        prepare_direct_nat_traversal(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            &local_node,
+            &IdentityKeyPair::generate(),
+            &direct,
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+        )
+        .await?;
         Ok(())
     }
 
