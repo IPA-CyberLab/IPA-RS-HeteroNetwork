@@ -496,9 +496,22 @@ refresh_join_bundle() {
   require_command openssl
   [[ -f /etc/kubernetes/admin.conf ]] || die "this node is not an initialized control plane"
 
-  local token certificate_key ca_hash endpoint bundle temporary
+  local token certificate_key ca_hash endpoint bundle temporary config version upload_output
   token="$(kubeadm token create --ttl 2h)"
-  certificate_key="$(kubeadm init phase upload-certs --upload-certs | tail -n 1 | tr -d '[:space:]')"
+  version="$(installed_kubernetes_version)"
+  [[ -n "$version" ]] || die "failed to determine the installed Kubernetes version"
+  config="$(mktemp)"
+  render_init_config "$version" >"$config"
+  chmod 0600 "$config"
+  if ! upload_output="$(kubeadm init phase upload-certs \
+    --upload-certs \
+    --config "$config" \
+    --kubeconfig /etc/kubernetes/admin.conf)"; then
+    rm -f "$config"
+    die "failed to upload control-plane certificates"
+  fi
+  rm -f "$config"
+  certificate_key="$(tail -n 1 <<<"$upload_output" | tr -d '[:space:]')"
   ca_hash="$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
     | openssl pkey -pubin -outform DER 2>/dev/null \
     | openssl dgst -sha256 -hex \
