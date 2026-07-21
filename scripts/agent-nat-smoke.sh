@@ -556,6 +556,8 @@ ping_overlay_pair_once() {
 wait_for_direct_dataplane() {
   local peer_a="$1"
   local peer_b="$2"
+  local expected_state_a="${3:-DIRECT_NAT_TRAVERSAL}"
+  local expected_state_b="${4:-DIRECT_NAT_TRAVERSAL}"
   local consecutive_successes=0
   local iterations=0
   local direct_state_failures=0
@@ -568,7 +570,7 @@ wait_for_direct_dataplane() {
     local state_a="" state_b="" metrics_a="" metrics_b=""
     state_a="$(path_state "$agent_a" "$peer_b" 2>/dev/null || true)"
     state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
-    if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]]; then
+    if [[ "$state_a" == "$expected_state_a" && "$state_b" == "$expected_state_b" ]]; then
       metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
       metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
       if jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
@@ -579,7 +581,7 @@ wait_for_direct_dataplane() {
           state_b="$(path_state "$agent_b" "$peer_a" 2>/dev/null || true)"
           metrics_a="$(agent_metrics "$agent_a" 2>/dev/null || true)"
           metrics_b="$(agent_metrics "$agent_b" 2>/dev/null || true)"
-          if [[ "$state_a" == "DIRECT_NAT_TRAVERSAL" && "$state_b" == "DIRECT_NAT_TRAVERSAL" ]] \
+          if [[ "$state_a" == "$expected_state_a" && "$state_b" == "$expected_state_b" ]] \
             && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_a" >/dev/null \
             && jq -e '.relay_session_count == 0 and .relay_forwarder_count == 0' <<<"$metrics_b" >/dev/null; then
             consecutive_successes=$((consecutive_successes + 1))
@@ -956,11 +958,16 @@ if [[ "$nat_profile" == "endpoint-independent" || "$nat_profile" == "fixed-port"
   if [[ "$pause_before_direct_seconds" != "0" ]]; then
     sleep "$pause_before_direct_seconds"
   fi
-  wait_for_direct_path "$node_a" "$node_b"
+  expected_state_a=DIRECT_NAT_TRAVERSAL
+  expected_state_b=DIRECT_NAT_TRAVERSAL
+  if is_one_sided_profile; then
+    expected_state_a=DIRECT_PUBLIC
+  fi
+  wait_for_direct_path "$node_a" "$node_b" "$expected_state_a" "$expected_state_b"
   if [[ "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS:-0}" != "0" ]]; then
     sleep "${HETERONETWORK_AGENT_NAT_SMOKE_PAUSE_AFTER_DIRECT_SECONDS}"
   fi
-  wait_for_direct_dataplane "$node_a" "$node_b"
+  wait_for_direct_dataplane "$node_a" "$node_b" "$expected_state_a" "$expected_state_b"
   ip netns exec "$agent_a" wg show heteronetwork0 endpoints \
     | grep -F -- "${nat_b_public_ip}:${nat_b_expected_public_port}" >/dev/null
   ip netns exec "$agent_b" wg show heteronetwork0 endpoints \

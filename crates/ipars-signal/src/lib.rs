@@ -11,8 +11,9 @@ use ipars_types::api::{
 use ipars_types::{
     endpoint_addr_is_usable, private_ip_addrs_share_subnet, socket_addr_is_globally_routable,
     AclAction, AclRule, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState,
-    NatClassification, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics,
-    PathQualityObservation, PathScore, PathState, PeerPathKey, Route, TransportProtocol,
+    NatClassification, NatMappingBehavior, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord,
+    PathMetrics, PathQualityObservation, PathScore, PathState, PeerPathKey, Route,
+    TransportProtocol,
 };
 use ipnet::IpNet;
 use thiserror::Error;
@@ -868,6 +869,17 @@ impl SignalCoordinator {
         }
 
         if self.policy.allow_nat_traversal
+            && public_source_can_reach_port_stable_nat_target(
+                source_candidates,
+                target_candidates,
+                target_nat_classification,
+                self.policy.nat_classification_min_confidence_percent,
+            )
+        {
+            return PathState::DirectNatTraversal;
+        }
+
+        if self.policy.allow_nat_traversal
             && source_candidates.iter().any(|candidate| {
                 candidate.kind == EndpointCandidateKind::StunReflexive
                     && socket_addr_is_globally_routable(candidate.addr)
@@ -887,6 +899,31 @@ impl SignalCoordinator {
 
         PathState::Unreachable
     }
+}
+
+fn public_source_can_reach_port_stable_nat_target(
+    source: &[EndpointCandidate],
+    target: &[EndpointCandidate],
+    target_nat_classification: Option<&NatClassification>,
+    min_confidence_percent: u8,
+) -> bool {
+    let source_is_public = source.iter().any(|candidate| {
+        candidate.kind == EndpointCandidateKind::PublicUdp
+            && socket_addr_is_globally_routable(candidate.addr)
+    });
+    let target_has_reflexive = target.iter().any(|candidate| {
+        candidate.kind == EndpointCandidateKind::StunReflexive
+            && socket_addr_is_globally_routable(candidate.addr)
+    });
+    let target_mapping_is_stable = target_nat_classification.is_some_and(|classification| {
+        nat_classification_meets_confidence(classification, min_confidence_percent)
+            && classification.mapping_behavior == NatMappingBehavior::EndpointIndependent
+    });
+
+    // A public WireGuard listener can learn the NAT peer's endpoint from an
+    // authenticated inbound handshake. Restrictive filtering is acceptable
+    // here because the NAT peer opens that exact public tuple first.
+    source_is_public && target_has_reflexive && target_mapping_is_stable
 }
 
 fn local_udp_candidates_share_private_subnet(
@@ -3115,6 +3152,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_uses_public_listener_for_port_stable_nat_target() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy::default());
+        let source = source(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry.upsert_node(source.clone()).await?;
+        registry
+            .upsert_node_with_nat(
+                target.clone(),
+                Some(endpoint_independent_restricted_filter_nat(0.9)),
+            )
+            .await?;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id.clone(),
+                target: target.node_id.clone(),
+                source_candidates: source.endpoint_candidates.clone(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::DirectNatTraversal);
+        assert_eq!(response.target_candidates, target.endpoint_candidates);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_low_confidence_port_stable_nat_target() -> Result<(), SignalError> {
+        let registry = SignalRegistry::new(ClusterPolicy {
+            nat_classification_min_confidence_percent: 80,
+            ..ClusterPolicy::default()
+        });
+        let source = source(vec![candidate(EndpointCandidateKind::PublicUdp)]);
+        let target = target(vec![candidate(EndpointCandidateKind::StunReflexive)]);
+        registry.upsert_node(source.clone()).await?;
+        registry
+            .upsert_node_with_nat(
+                target.clone(),
+                Some(endpoint_independent_restricted_filter_nat(0.7)),
+            )
+            .await?;
+        registry
+            .upsert_node_with_nat_and_health(relay(), None, Some(healthy_health()))
+            .await?;
+
+        let response = registry
+            .negotiate(SignalPathRequest {
+                source: source.node_id,
+                target: target.node_id,
+                source_candidates: source.endpoint_candidates,
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            })
+            .await?;
+
+        assert_eq!(response.preferred_state, PathState::Relay);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registry_uses_nat_traversal_for_address_dependent_nat() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
         let source = source(vec![candidate(EndpointCandidateKind::StunReflexive)]);
@@ -4100,6 +4201,21 @@ mod tests {
             strategy: NatTraversalStrategy::CoordinatedHolePunch,
             connectivity_state: NatConnectivityState::DoubleNat,
             confidence: 0.85,
+            assessed_at: Utc::now(),
+        }
+    }
+
+    fn endpoint_independent_restricted_filter_nat(confidence: f32) -> NatClassification {
+        NatClassification {
+            local_addr: SocketAddr::from(([10, 0, 0, 10], 50_000)),
+            mapping_behavior: NatMappingBehavior::EndpointIndependent,
+            filtering_behavior: ipars_types::NatFilteringBehavior::AddressAndPortDependent,
+            observed_endpoint: Some(SocketAddr::from(([8, 8, 8, 20], 50_000))),
+            observations: Vec::new(),
+            filtering_observations: Vec::new(),
+            strategy: NatTraversalStrategy::RelayPreferred,
+            connectivity_state: NatConnectivityState::RelayOnly,
+            confidence,
             assessed_at: Utc::now(),
         }
     }
