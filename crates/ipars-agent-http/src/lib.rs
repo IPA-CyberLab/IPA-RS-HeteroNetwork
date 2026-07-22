@@ -39,6 +39,7 @@ const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NODE_INSTALL_PROXY_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
 const PUBLIC_WEB_GATEWAY_HEADER: &str = "x-heteronetwork-gateway-token";
 const MAX_PENDING_DEVICE_LOGINS: usize = 256;
 const MAX_DEVICE_AUTH_RESPONSE_BYTES: u64 = 256 * 1024;
@@ -279,6 +280,7 @@ pub fn router(state: AgentHttpState) -> Router {
             .route("/v1/web-ui/select", post(select_web_ui_endpoint))
             .route("/v1/web-ui/auth/device", post(start_device_login))
             .route("/v1/web-ui/auth/device/poll", post(poll_device_login))
+            .route("/v1/install/{*path}", get(proxy_management_request))
             .route("/v1/admin/{*path}", any(proxy_management_request));
         local_web = if let Some(access) = state.public_web_gateway.clone() {
             local_web.route_layer(middleware::from_fn_with_state(
@@ -814,6 +816,7 @@ async fn require_web_ui_access(
         (&Method::GET, "/v1/web-ui/endpoints") => true,
         (&Method::POST, "/v1/web-ui/auth/device") => true,
         (&Method::POST, "/v1/web-ui/auth/device/poll") => true,
+        (&Method::GET, path) if path.starts_with("/v1/install/") => true,
         (_, path) if path.starts_with("/v1/admin/") => true,
         _ => false,
     };
@@ -1597,16 +1600,18 @@ async fn forward_management_request(
     })?;
     let status = response.status();
     let response_headers = response.headers().clone();
-    let body = read_bounded_response_bytes(
-        response,
-        MAX_CONTROL_PLANE_RESPONSE_BYTES,
-        "management proxy",
-    )
-    .await?;
+    let response_limit = if request.path_and_query.starts_with("/v1/install/") {
+        MAX_NODE_INSTALL_PROXY_RESPONSE_BYTES
+    } else {
+        MAX_CONTROL_PLANE_RESPONSE_BYTES
+    };
+    let body = read_bounded_response_bytes(response, response_limit, "management proxy").await?;
     let mut proxied = Response::new(Body::from(body));
     *proxied.status_mut() = status;
     for name in [
         header::CACHE_CONTROL,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_LENGTH,
         header::CONTENT_TYPE,
         header::ETAG,
         header::LAST_MODIFIED,
@@ -1616,6 +1621,12 @@ async fn forward_management_request(
         if let Some(value) = response_headers.get(&name) {
             proxied.headers_mut().insert(name, value.clone());
         }
+    }
+    if let Some(value) = response_headers.get("x-heteronetwork-sha256") {
+        proxied.headers_mut().insert(
+            HeaderName::from_static("x-heteronetwork-sha256"),
+            value.clone(),
+        );
     }
     proxied.headers_mut().insert(
         HeaderName::from_static("x-heteronetwork-web-ui-endpoint"),
@@ -3544,6 +3555,26 @@ mod tests {
             .into_response()
     }
 
+    async fn web_ui_test_install(
+        State(state): State<WebUiTestBackend>,
+        headers: HeaderMap,
+    ) -> Response {
+        *state.authorization.lock().await = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut response = (state.admin_status, "test-installer").into_response();
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=test-installer"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-heteronetwork-sha256"),
+            HeaderValue::from_static("test-sha256"),
+        );
+        response
+    }
+
     async fn spawn_web_ui_test_backend(
         admin_status: StatusCode,
     ) -> Result<(String, WebUiTestBackend, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
@@ -3563,6 +3594,7 @@ mod tests {
         let app = Router::new()
             .route("/ui/config", get(web_ui_test_config))
             .route("/v1/admin/overview", any(web_ui_test_admin))
+            .route("/v1/install/test", get(web_ui_test_install))
             .route(
                 "/realms/heteronetwork/protocol/openid-connect/auth/device",
                 post(web_ui_test_device_authorization),
@@ -3605,6 +3637,8 @@ mod tests {
     #[tokio::test]
     async fn public_web_gateway_requires_proxy_auth_and_limits_routes(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, backend, backend_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
         let mut node_state = AgentNodeState::generate(Utc::now());
         node_state.bootstrap_endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::WebUi,
@@ -3618,10 +3652,12 @@ mod tests {
             last_error: None,
             updated_at: Utc::now(),
         }));
-        let state = AgentHttpState::new(runtime)
+        let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
             .enable_local_web_ui(true)
             .with_public_web_gateway("gateway-secret".to_string(), status);
-        assert!(web_ui_candidates(&state).is_empty());
+        let candidates = web_ui_candidates(&state);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].url, backend_url);
         let app = router(state);
 
         let missing_token = app
@@ -3674,6 +3710,33 @@ mod tests {
             .await?;
         assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
 
+        let install = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/install/test")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .header(header::AUTHORIZATION, "HeteroNetworkJoin enrollment-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(install.status(), StatusCode::OK);
+        assert_eq!(
+            install.headers().get(header::CONTENT_DISPOSITION),
+            Some(&HeaderValue::from_static(
+                "attachment; filename=test-installer"
+            ))
+        );
+        assert_eq!(
+            install.headers().get("x-heteronetwork-sha256"),
+            Some(&HeaderValue::from_static("test-sha256"))
+        );
+        assert_eq!(
+            backend.authorization.lock().await.as_deref(),
+            Some("HeteroNetworkJoin enrollment-token")
+        );
+
         let loopback_asset = app
             .oneshot(
                 Request::builder()
@@ -3683,6 +3746,7 @@ mod tests {
             )
             .await?;
         assert_eq!(loopback_asset.status(), StatusCode::OK);
+        backend_task.abort();
         Ok(())
     }
 

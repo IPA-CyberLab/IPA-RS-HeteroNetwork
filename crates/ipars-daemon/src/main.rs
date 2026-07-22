@@ -12361,7 +12361,7 @@ fn public_web_gateway_caddyfile(
         let site = site.trim_end_matches('/');
         let _ = writeln!(
             caddyfile,
-            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/admin/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
+            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
         );
     }
     caddyfile
@@ -18687,6 +18687,7 @@ mod tests {
         assert!(public.contains("profile shortlived"));
         assert!(public.contains("X-HeteroNetwork-Gateway-Token secret"));
         assert!(public.contains("/v1/web-ui/auth/device/poll"));
+        assert!(public.contains("/v1/install/*"));
         assert!(public.contains("/v1/admin/*"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));

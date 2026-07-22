@@ -2245,7 +2245,12 @@ fn node_enrollment_download_bases(
     for base in std::iter::once(enrollment.install_base_url.as_ref()).chain(
         bootstrap_endpoints
             .iter()
-            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .filter(|endpoint| {
+                matches!(
+                    endpoint.kind,
+                    BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::WebUi
+                )
+            })
             .map(|endpoint| endpoint.url.as_str()),
     ) {
         let base = base.trim_end_matches('/').to_string();
@@ -3630,6 +3635,52 @@ mod tests {
             lease_expires_at: now + chrono::Duration::minutes(5),
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn node_enrollment_downloads_through_dynamic_web_gateways(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let binary_path = std::env::temp_dir().join(format!(
+            "heteronetwork-enrollment-bases-test-{}",
+            random_oidc_value(12)
+        ));
+        std::fs::write(&binary_path, b"test-binary")?;
+        let enrollment = NodeEnrollmentConfig::new(
+            IdentityKeyPair::generate(),
+            "web-enrollment".to_string(),
+            "https://static.example".to_string(),
+            binary_path.clone(),
+            3600,
+        )?;
+        let endpoints = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://control.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://203.0.113.10".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://signal.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://static.example".to_string(),
+            },
+        ];
+        assert_eq!(
+            node_enrollment_download_bases(&enrollment, &endpoints),
+            vec![
+                "https://static.example".to_string(),
+                "https://control.example:8443".to_string(),
+                "https://203.0.113.10".to_string(),
+            ]
+        );
+        drop(enrollment);
+        std::fs::remove_file(binary_path)?;
+        Ok(())
     }
 
     #[tokio::test]

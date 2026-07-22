@@ -260,8 +260,10 @@ private/stale classification removes it. Inspect the current phase in the Web
 UI endpoint control or with
 `ipars_agent_public_web_gateway_phase{phase="ready"}`. Control Plane
 `ipars_control_plane_active_services{kind="web_ui"}` and the Public nodes view
-show only gateways that passed an external TLS/config probe. Public nodes use
-the shorter of `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` and
+show only gateways that passed an external TLS/config probe. Generated node
+install commands include those active gateways and can fetch the
+join-token-protected script and binary through a surviving gateway. Public
+nodes use the shorter of `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` and
 `HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS`; non-public nodes
 retain the general interval so repeated filtering probes do not destabilize
 active paths. Tune the remaining convergence stages with

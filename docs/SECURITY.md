@@ -172,9 +172,10 @@ Caddy connects to the loopback listener and adds an ephemeral 256-bit proxy
 credential; the Agent additionally requires the current public-IP Host and
 same-origin browser request. Caddy exposes only UI assets, Keycloak device
 authorization, read-only endpoint status, and the authenticated `/v1/admin/*`
-proxy. Agent status, metrics, path controls, and local endpoint mutations are
-not routed publicly. The Control Plane trusts neither an Agent's public claim
-nor a DNS name alone: it accepts only a structurally valid signed no-NAT
+proxy, plus `/v1/install/*` artifacts that retain the Control Plane's signed
+join-token authorization and size bounds. Agent status, metrics, path controls,
+and local endpoint mutations are not routed publicly. The Control Plane trusts
+neither an Agent's public claim nor a DNS name alone: it accepts only a structurally valid signed no-NAT
 classification and publishes the gateway only after a direct HTTPS probe with
 a publicly trusted IP certificate. Keycloak Device Authorization Grant keeps
 dynamic IPs out of redirect URI and CORS wildcard policy.
