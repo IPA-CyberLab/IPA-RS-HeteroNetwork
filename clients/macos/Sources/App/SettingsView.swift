@@ -83,6 +83,12 @@ struct SettingsView: View {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
                     .disabled(model.isBusy || isTransitioning)
+                    Button {
+                        model.openWebUI()
+                    } label: {
+                        Label("Open Web UI", systemImage: "rectangle.connected.to.line.below")
+                    }
+                    .disabled(model.vpnStatus != .connected)
                 }
             }
             Section("Identity") {

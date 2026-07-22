@@ -15,6 +15,13 @@ struct MenuBarContent: View {
                     .foregroundStyle(.secondary)
                 Divider()
                 connectionButton
+                if model.vpnStatus == .connected {
+                    Button {
+                        model.openWebUI()
+                    } label: {
+                        Label("Open Web UI", systemImage: "rectangle.connected.to.line.below")
+                    }
+                }
             }
             Button {
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)

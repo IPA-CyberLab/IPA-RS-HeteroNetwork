@@ -12,7 +12,7 @@ public enum TunnelProfileError: LocalizedError, Equatable {
         switch self {
         case .invalidClientAddress: return "The assigned client VPN address is invalid."
         case .invalidGatewayCount(let count):
-            return "The client peer map must contain exactly one gateway; received \(count)."
+            return "The client peer map must contain at least one gateway; received \(count)."
         case .missingGatewayEndpoint: return "The selected gateway has no usable public endpoint."
         case .invalidGatewayKey: return "The selected gateway WireGuard key is invalid."
         case .invalidRoute(let route): return "The gateway advertised an invalid route: \(route)."
@@ -23,16 +23,17 @@ public enum TunnelProfileError: LocalizedError, Equatable {
 public struct TunnelProfile: Equatable, Sendable {
     public let clientAddress: String
     public let gatewayNodeID: String
+    public let gatewayVPNIP: String
     public let gatewayWireGuardPublicKey: String
     public let gatewayEndpoint: String
     public let allowedIPs: [String]
 
-    public init(session: ClientSession) throws {
+    public init(session: ClientSession, gatewayIndex: Int = 0) throws {
         guard isIPAddress(session.client.vpnIP) else { throw TunnelProfileError.invalidClientAddress }
-        guard session.peerMap.peers.count == 1 else {
+        guard session.peerMap.peers.indices.contains(gatewayIndex) else {
             throw TunnelProfileError.invalidGatewayCount(session.peerMap.peers.count)
         }
-        let gateway = session.peerMap.peers[0]
+        let gateway = session.peerMap.peers[gatewayIndex]
         guard Data(base64Encoded: gateway.wireGuardPublicKey)?.count == 32 else {
             throw TunnelProfileError.invalidGatewayKey
         }
@@ -43,6 +44,7 @@ public struct TunnelProfile: Equatable, Sendable {
         let hostPrefix = session.client.vpnIP.contains(":") ? 128 : 32
         clientAddress = "\(session.client.vpnIP)/\(hostPrefix)"
         gatewayNodeID = gateway.nodeID
+        gatewayVPNIP = gateway.vpnIP
         gatewayWireGuardPublicKey = gateway.wireGuardPublicKey
         gatewayEndpoint = endpoint.address
 

@@ -62,30 +62,52 @@ public enum EnrollmentParser {
             throw EnrollmentError.notYetValid
         }
         guard token.claims.expiresAt > now else { throw EnrollmentError.expired }
-        guard try controlPlaneURLs(from: token).count >= 2 else {
+        guard try managementURLs(from: token).count >= 2 else {
             throw EnrollmentError.insufficientControlPlanes
         }
         return token
     }
 
     public static func controlPlaneURLs(from token: SignedJoinToken) throws -> [URL] {
+        try endpointURLs(from: token.claims.bootstrapEndpoints, kinds: [.controlPlane])
+    }
+
+    public static func managementURLs(from token: SignedJoinToken) throws -> [URL] {
+        try endpointURLs(
+            from: token.claims.bootstrapEndpoints,
+            kinds: [.webUi, .controlPlane]
+        )
+    }
+
+    public static func managementURLs(from endpoints: [BootstrapEndpoint]) -> [URL] {
+        (try? endpointURLs(from: endpoints, kinds: [.webUi, .controlPlane])) ?? []
+    }
+
+    private static func endpointURLs(
+        from endpoints: [BootstrapEndpoint],
+        kinds: [BootstrapEndpointKind]
+    ) throws -> [URL] {
         var seen = Set<String>()
         var urls = [URL]()
-        for endpoint in token.claims.bootstrapEndpoints where endpoint.kind == .controlPlane {
-            guard let url = URL(string: endpoint.url),
-                  let scheme = url.scheme?.lowercased(),
-                  scheme == "https" || scheme == "http",
-                  url.host != nil,
-                  url.user == nil,
-                  url.password == nil,
-                  url.query == nil,
-                  url.fragment == nil
-            else {
-                continue
-            }
-            let canonical = url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            if seen.insert(canonical).inserted {
-                urls.append(url)
+        for kind in kinds {
+            for endpoint in endpoints where endpoint.kind == kind {
+                guard let url = URL(string: endpoint.url),
+                      let scheme = url.scheme?.lowercased(),
+                      scheme == "https" || scheme == "http",
+                      url.host != nil,
+                      url.user == nil,
+                      url.password == nil,
+                      url.query == nil,
+                      url.fragment == nil
+                else {
+                    continue
+                }
+                let canonical = url.absoluteString.trimmingCharacters(
+                    in: CharacterSet(charactersIn: "/")
+                )
+                if seen.insert(canonical).inserted {
+                    urls.append(url)
+                }
             }
         }
         return urls

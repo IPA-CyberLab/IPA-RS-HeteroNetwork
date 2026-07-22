@@ -23,9 +23,9 @@ open HeteroNetwork.xcodeproj
 ```
 
 `bootstrap.sh` fetches the official WireGuardKit source at the pinned commit
-into the ignored `.build` directory and corrects its inconsistent Swift tools
-manifest declaration before generating the project. It refuses a checkout at
-any other revision.
+into the ignored `.build` directory, corrects its inconsistent Swift tools
+manifest declaration, and applies the reviewed split-DNS patch in `patches/`
+before generating the project. It refuses a checkout at any other revision.
 
 Set the same Apple development team on `HeteroNetwork`,
 `HeteroNetworkPacketTunnel`, and `HeteroNetworkCore`. The bundle IDs, App Group,
@@ -41,12 +41,20 @@ Running the packet tunnel on a Mac still requires a signed Network Extension.
 2. Open the returned `heteronetwork://enroll?...` link on the Mac.
 3. Confirm enrollment in HeteroNetwork and approve the VPN configuration prompt.
 4. Select **Connect** from the menu-bar app.
+5. Open `http://console.heteronetwork.internal:9781/ui/` from the app.
 
 The one-use enrollment token remains in memory only. The Ed25519 identity,
 WireGuard private key, assigned VPN address, and current gateway map are stored
 in the shared, device-only Keychain item used by the app and packet-tunnel
 extension.
 
-The client installs only the gateway and projected overlay CIDRs. It refuses
-default routes, local/relay endpoint candidates, multi-peer client maps, and
-invalid WireGuard keys before starting the tunnel.
+The client installs only the active gateway and projected overlay CIDRs. The
+control plane supplies up to four ready gateway candidates, while the packet
+tunnel refreshes its signed peer map every five seconds and updates the running
+WireGuard adapter when the preferred gateway changes. Two failed VPN-local
+health probes also trigger a cached-gateway switch before server-side health
+expiry. Each refresh signs the active gateway ID so the control plane can move
+the client's return routes on every Linux node at the same time. The internal
+console name uses split DNS against the active gateway; unrelated DNS remains
+on the host's normal resolver. The client refuses default routes, local/relay
+endpoint candidates, and invalid WireGuard keys before starting the tunnel.

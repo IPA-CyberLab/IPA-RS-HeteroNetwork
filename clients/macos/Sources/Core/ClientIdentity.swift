@@ -63,6 +63,7 @@ public struct ClientKeyMaterial: Equatable, Sendable {
     public func sign(
         clientID: String,
         kind: ClientRequestKind,
+        activeGatewayNodeID: String? = nil,
         at date: Date = Date(),
         nonce: Data? = nil
     ) throws -> ClientRequestSignature {
@@ -70,7 +71,12 @@ public struct ClientKeyMaterial: Equatable, Sendable {
         guard nonceData.count == 24 else { throw ClientIdentityError.randomGenerationFailed(-1) }
         let nonceValue = nonceData.base64URLEncodedString()
         let timestamp = Int64(date.timeIntervalSince1970.rounded(.down))
-        let payload = "heteronetwork-client-request-v1\n\(kind.rawValue)\n\(clientID)\n\(timestamp)\n\(nonceValue)\n"
+        let payload: String
+        if let activeGatewayNodeID {
+            payload = "heteronetwork-client-request-v2\n\(kind.rawValue)\n\(clientID)\n\(activeGatewayNodeID)\n\(timestamp)\n\(nonceValue)\n"
+        } else {
+            payload = "heteronetwork-client-request-v1\n\(kind.rawValue)\n\(clientID)\n\(timestamp)\n\(nonceValue)\n"
+        }
         let key = try Curve25519.Signing.PrivateKey(rawRepresentation: identityPrivateKey)
         let signature = try key.signature(for: Data(payload.utf8))
         return ClientRequestSignature(

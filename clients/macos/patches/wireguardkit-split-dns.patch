@@ -1,0 +1,17 @@
+diff --git a/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift b/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
+--- a/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
++++ b/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
+@@ -88,7 +88,12 @@ final class PacketTunnelSettingsGenerator {
+             let dnsSettings = NEDNSSettings(servers: dnsServerStrings)
+             dnsSettings.searchDomains = tunnelConfiguration.interface.dnsSearch
+             if !tunnelConfiguration.interface.dns.isEmpty {
+-                dnsSettings.matchDomains = [""] // All DNS queries must first go through the tunnel's DNS
++                if tunnelConfiguration.interface.dnsSearch.isEmpty {
++                    dnsSettings.matchDomains = [""] // All DNS queries must first go through the tunnel's DNS
++                } else {
++                    dnsSettings.matchDomains = tunnelConfiguration.interface.dnsSearch
++                    dnsSettings.matchDomainsNoSearch = true
++                }
+             }
+             networkSettings.dnsSettings = dnsSettings
+         }

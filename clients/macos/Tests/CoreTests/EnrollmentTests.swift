@@ -12,6 +12,11 @@ final class EnrollmentTests: XCTestCase {
 
         XCTAssertEqual(parsed, token)
         XCTAssertEqual(try EnrollmentParser.controlPlaneURLs(from: parsed).count, 2)
+        XCTAssertEqual(try EnrollmentParser.managementURLs(from: parsed).count, 3)
+        XCTAssertEqual(
+            try EnrollmentParser.managementURLs(from: parsed).first?.host,
+            "gateway.example"
+        )
     }
 
     func testRejectsNodeEnrollmentToken() throws {
@@ -47,6 +52,7 @@ final class EnrollmentTests: XCTestCase {
                 bootstrapEndpoints: [
                     BootstrapEndpoint(url: "https://cp-a.example:8443", kind: .controlPlane),
                     BootstrapEndpoint(url: "https://cp-b.example:8443", kind: .controlPlane),
+                    BootstrapEndpoint(url: "https://gateway.example", kind: .webUi),
                 ],
                 expiresAt: now.addingTimeInterval(600),
                 notBefore: now.addingTimeInterval(-5),

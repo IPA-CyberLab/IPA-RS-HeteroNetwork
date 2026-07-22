@@ -54,14 +54,25 @@ and public keys are durable so the overlay can route replies, while normal node
 inventory, overview payloads, and node-count metrics filter them out. A separate
 client metric records their allocation count.
 
-The control plane selects one reachable gateway deterministically, preferring a
-node with role `gateway` and then IPv6, public UDP, or STUN-reflexive candidates.
-The client receives exactly that WireGuard peer. Its allowed IPs contain the
-gateway VPN host route plus the infrastructure VPN host routes and advertised
-CIDRs projected onto that gateway. The selected gateway receives clients as
-direct WireGuard peers; every other node receives each client `/32` or `/128`
-through the same gateway. Clients never become mesh peers, route providers,
-relays, Signal members, or transit nodes.
+The control plane selects up to four healthy reachable gateways
+deterministically, preferring nodes with role `gateway` and then IPv6 or public
+UDP candidates. NAT-only reflexive candidates are intentionally excluded
+because the control-only client does not participate in Signal hole punching.
+The client receives that ordered set but configures only one WireGuard peer. Its
+allowed IPs contain the gateway VPN host route plus the infrastructure VPN host
+routes and advertised CIDRs projected onto that gateway.
+
+Every selected gateway receives clients as direct WireGuard peers so a packet
+tunnel can switch without re-enrollment. The macOS client binds its selected
+gateway to a v2 Ed25519 client-control signature on every peer-map refresh. The
+control plane persists that selection in the shared SQLite or PostgreSQL store,
+returns it first to the client, and projects each client host route onto its own
+active gateway for all other nodes. A changed selection wakes waiting Agent
+heartbeats with `peer_delta_available`, which triggers an immediate peer-map
+refresh instead of waiting for the normal polling interval. Existing v1 clients
+remain accepted and are assigned the deterministic primary gateway. Clients
+never become mesh peers, route providers, relays, Signal members, or transit
+nodes.
 
 ## Control Plane HA
 
