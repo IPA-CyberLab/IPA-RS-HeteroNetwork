@@ -1,13 +1,15 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
@@ -21,12 +23,18 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
     RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{BootstrapEndpointKind, NodeId, PathState};
+use ipars_types::{canonical_bootstrap_endpoint_url, BootstrapEndpointKind, NodeId, PathState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::RwLock;
+use tokio::task::JoinSet;
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
 const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const WEB_UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
+const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -42,6 +50,9 @@ pub struct AgentHttpState {
     control_plane_client: reqwest::Client,
     control_plane_request_timeout: Duration,
     api_bearer_token: Option<Arc<str>>,
+    local_web_ui_enabled: bool,
+    web_ui_selection: Arc<RwLock<Option<String>>>,
+    web_ui_health: Arc<RwLock<BTreeMap<String, bool>>>,
 }
 
 impl AgentHttpState {
@@ -53,6 +64,9 @@ impl AgentHttpState {
             control_plane_client: reqwest::Client::new(),
             control_plane_request_timeout: DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             api_bearer_token: None,
+            local_web_ui_enabled: false,
+            web_ui_selection: Arc::new(RwLock::new(None)),
+            web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -67,6 +81,9 @@ impl AgentHttpState {
             control_plane_client: reqwest::Client::new(),
             control_plane_request_timeout: DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             api_bearer_token: None,
+            local_web_ui_enabled: false,
+            web_ui_selection: Arc::new(RwLock::new(None)),
+            web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -82,6 +99,9 @@ impl AgentHttpState {
             control_plane_client: reqwest::Client::new(),
             control_plane_request_timeout: DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT,
             api_bearer_token: None,
+            local_web_ui_enabled: false,
+            web_ui_selection: Arc::new(RwLock::new(None)),
+            web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -97,6 +117,11 @@ impl AgentHttpState {
 
     pub fn require_api_bearer_token(mut self, token: String) -> Self {
         self.api_bearer_token = Some(Arc::from(token));
+        self
+    }
+
+    pub fn enable_local_web_ui(mut self, enabled: bool) -> Self {
+        self.local_web_ui_enabled = enabled;
         self
     }
 }
@@ -122,10 +147,32 @@ pub fn router(state: AgentHttpState) -> Router {
             require_agent_api_bearer,
         ));
     }
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz))
-        .merge(protected)
-        .with_state(state)
+        .merge(protected);
+    let app = if state.local_web_ui_enabled {
+        let local_web = Router::new()
+            .route("/", get(local_ui_root))
+            .route("/ui", get(local_ui_index))
+            .route("/ui/", get(local_ui_index))
+            .route("/ui/app.js", get(local_ui_app))
+            .route("/ui/theme.js", get(local_ui_theme))
+            .route("/ui/styles.css", get(local_ui_styles))
+            .route("/ui/fonts/noto-sans-jp-ui.ttf", get(local_ui_japanese_font))
+            .route("/ui/config", get(local_ui_config))
+            .route(
+                "/v1/web-ui/endpoints",
+                get(web_ui_endpoints).delete(remove_web_ui_endpoint),
+            )
+            .route("/v1/web-ui/bootstrap", post(bootstrap_web_ui_endpoint))
+            .route("/v1/web-ui/select", post(select_web_ui_endpoint))
+            .route("/v1/admin/{*path}", any(proxy_management_request))
+            .route_layer(middleware::from_fn(require_loopback_web_ui_host));
+        app.merge(local_web)
+    } else {
+        app
+    };
+    app.with_state(state)
 }
 
 async fn require_agent_api_bearer(
@@ -177,6 +224,846 @@ fn agent_api_token_matches(expected: &str, provided: &str) -> bool {
 
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+#[derive(Debug, Clone)]
+struct WebUiCandidate {
+    url: String,
+    source: &'static str,
+    trusted_directory: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WebUiEndpointStatus {
+    url: String,
+    source: &'static str,
+    trusted_directory: bool,
+    reachable: bool,
+    selected: bool,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebUiEndpointsResponse {
+    selected_url: Option<String>,
+    endpoints: Vec<WebUiEndpointStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebUiEndpointRequest {
+    endpoint: String,
+}
+
+async fn require_loopback_web_ui_host(request: Request, next: Next) -> Response {
+    let Some(host) = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return local_web_ui_rejection("Host header is required");
+    };
+    let Ok(host_url) = reqwest::Url::parse(&format!("http://{host}")) else {
+        return local_web_ui_rejection("Host header is invalid");
+    };
+    if !url_host_is_loopback(&host_url) {
+        return local_web_ui_rejection("local Web UI only accepts loopback hosts");
+    }
+    if request
+        .headers()
+        .get(HeaderName::from_static("sec-fetch-site"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return local_web_ui_rejection("cross-site local Web UI requests are rejected");
+    }
+    if let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let Ok(origin_url) = reqwest::Url::parse(origin) else {
+            return local_web_ui_rejection("Origin header is invalid");
+        };
+        if origin_url.origin() != host_url.origin() {
+            return local_web_ui_rejection("cross-origin local Web UI requests are rejected");
+        }
+    }
+    next.run(request).await
+}
+
+fn local_web_ui_rejection(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: message.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn url_host_is_loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => parse_url_ip_addr(host).is_some_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
+fn parse_url_ip_addr(host: &str) -> Option<IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
+    let runtime_state = state.runtime.state();
+    let mut candidates = Vec::new();
+    for endpoint in runtime_state
+        .bootstrap_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
+    {
+        candidates.push(WebUiCandidate {
+            url: endpoint.url.clone(),
+            source: "service_directory",
+            trusted_directory: true,
+        });
+    }
+    for url in &runtime_state.web_ui_seed_urls {
+        candidates.push(WebUiCandidate {
+            url: url.clone(),
+            source: "manual_seed",
+            trusted_directory: false,
+        });
+    }
+    for endpoint in runtime_state
+        .bootstrap_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+    {
+        candidates.push(WebUiCandidate {
+            url: endpoint.url.clone(),
+            source: "control_plane_directory",
+            trusted_directory: true,
+        });
+    }
+    for url in &state.control_plane_urls {
+        candidates.push(WebUiCandidate {
+            url: url.clone(),
+            source: "control_plane_runtime",
+            trusted_directory: true,
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            candidate.url = normalize_web_ui_base_url(&candidate.url).ok()?;
+            seen.insert(candidate.url.clone()).then_some(candidate)
+        })
+        .collect()
+}
+
+fn normalize_web_ui_base_url(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() || input.len() > 2048 || input.chars().any(char::is_control) {
+        return Err("endpoint must be a non-empty URL of at most 2048 bytes".to_string());
+    }
+    let absolute = if input.contains("://") {
+        input.to_string()
+    } else {
+        let probe = reqwest::Url::parse(&format!("http://{input}"))
+            .map_err(|_| "endpoint is not a valid IP address or URL".to_string())?;
+        let scheme = if url_host_allows_plain_http(&probe) {
+            "http"
+        } else {
+            "https"
+        };
+        format!("{scheme}://{input}")
+    };
+    let mut parsed = reqwest::Url::parse(&absolute)
+        .map_err(|_| "endpoint is not a valid absolute URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.port() == Some(0)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "endpoint must be an HTTP(S) origin without userinfo, query, or fragment".to_string(),
+        );
+    }
+    if !url_host_is_usable(&parsed) {
+        return Err("endpoint uses an unusable IP address or port".to_string());
+    }
+    if parsed.scheme() == "http" && !url_host_allows_plain_http(&parsed) {
+        return Err(
+            "plain HTTP is only allowed for loopback, private, link-local, or CGNAT addresses"
+                .to_string(),
+        );
+    }
+    if !matches!(parsed.path(), "" | "/" | "/ui" | "/ui/") {
+        return Err("endpoint path must be / or /ui/".to_string());
+    }
+    parsed.set_path("");
+    canonical_bootstrap_endpoint_url(parsed.as_str())
+        .ok_or_else(|| "endpoint is not a valid absolute URL".to_string())
+}
+
+fn url_host_allows_plain_http(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Some(ip) = parse_url_ip_addr(host) else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(ip) => ipv4_allows_plain_http(ip),
+        IpAddr::V6(ip) => ipv6_allows_plain_http(ip),
+    }
+}
+
+fn url_host_is_usable(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let Some(ip) = parse_url_ip_addr(host) else {
+        return true;
+    };
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::new(255, 255, 255, 255)
+        }
+        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
+    }
+}
+
+fn ipv4_allows_plain_http(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+}
+
+fn ipv6_allows_plain_http(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    ip.is_loopback() || (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80
+}
+
+async fn fetch_web_ui_config(
+    client: &reqwest::Client,
+    candidate: &WebUiCandidate,
+    expected_cluster_id: Option<&str>,
+) -> Result<Value, String> {
+    let response = client
+        .get(format!("{}/ui/config", candidate.url))
+        .header(header::ACCEPT, "application/json")
+        .timeout(WEB_UI_PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| format!("connection failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("UI config returned HTTP {}", response.status()));
+    }
+    let config = read_bounded_json_response::<Value>(
+        response,
+        MAX_WEB_UI_CONFIG_BYTES,
+        "web UI configuration",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if !config.is_object() || config.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return Err("endpoint does not expose an enabled HeteroNetwork Web UI".to_string());
+    }
+    if let Some(expected_cluster_id) = expected_cluster_id {
+        match config.get("cluster_id").and_then(Value::as_str) {
+            Some(cluster_id) if cluster_id == expected_cluster_id => {}
+            Some(_) => {
+                return Err("endpoint belongs to a different HeteroNetwork cluster".to_string())
+            }
+            None if !candidate.trusted_directory => {
+                return Err(
+                    "manual endpoint does not report its HeteroNetwork cluster ID".to_string(),
+                )
+            }
+            None => {}
+        }
+    }
+    Ok(config)
+}
+
+fn expected_web_ui_cluster_id(state: &AgentHttpState) -> Option<String> {
+    state
+        .runtime
+        .state()
+        .registered_node
+        .map(|node| node.cluster_id.as_str().to_string())
+}
+
+async fn set_selected_web_ui(state: &AgentHttpState, url: Option<String>) {
+    *state.web_ui_selection.write().await = url;
+}
+
+async fn record_web_ui_health(state: &AgentHttpState, url: String, reachable: bool) {
+    state.web_ui_health.write().await.insert(url, reachable);
+}
+
+async fn selected_web_ui_url(state: &AgentHttpState) -> Option<String> {
+    state.web_ui_selection.read().await.clone()
+}
+
+async fn select_healthy_web_ui(
+    state: &AgentHttpState,
+) -> Result<(WebUiCandidate, Value), AgentError> {
+    let candidates = web_ui_candidates(state);
+    let expected_cluster_id = expected_web_ui_cluster_id(state);
+    if candidates.is_empty() {
+        return Err(AgentError::ControlPlaneClient(
+            "no Web UI endpoint is cached; enter an initial IP address or URL".to_string(),
+        ));
+    }
+    let selected = selected_web_ui_url(state).await;
+    if let Some(candidate) = selected.as_deref().and_then(|selected| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.url == selected)
+    }) {
+        if let Ok(config) = fetch_web_ui_config(
+            &state.control_plane_client,
+            candidate,
+            expected_cluster_id.as_deref(),
+        )
+        .await
+        {
+            record_web_ui_health(state, candidate.url.clone(), true).await;
+            set_selected_web_ui(state, Some(candidate.url.clone())).await;
+            return Ok((candidate.clone(), config));
+        }
+    }
+
+    let mut probes = JoinSet::new();
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| Some(candidate.url.as_str()) != selected.as_deref())
+    {
+        let client = state.control_plane_client.clone();
+        let expected_cluster_id = expected_cluster_id.clone();
+        probes.spawn(async move {
+            let result =
+                fetch_web_ui_config(&client, &candidate, expected_cluster_id.as_deref()).await;
+            (candidate, result)
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok((candidate, Ok(config))) => {
+                probes.abort_all();
+                record_web_ui_health(state, candidate.url.clone(), true).await;
+                set_selected_web_ui(state, Some(candidate.url.clone())).await;
+                return Ok((candidate, config));
+            }
+            Ok((candidate, Err(error))) => {
+                record_web_ui_health(state, candidate.url.clone(), false).await;
+                failures.push(format!("{}: {}", candidate.url, truncate_error(&error)))
+            }
+            Err(error) => failures.push(format!("probe task failed: {error}")),
+        }
+    }
+    set_selected_web_ui(state, None).await;
+    Err(AgentError::ControlPlaneClient(format!(
+        "no cached Web UI endpoint is reachable: {}",
+        failures.join("; ")
+    )))
+}
+
+fn truncate_error(error: &str) -> String {
+    error.chars().take(240).collect()
+}
+
+async fn probe_web_ui_endpoints(state: &AgentHttpState) -> WebUiEndpointsResponse {
+    let candidates = web_ui_candidates(state);
+    let expected_cluster_id = expected_web_ui_cluster_id(state);
+    let previous_selected = selected_web_ui_url(state).await;
+    let mut probes = JoinSet::new();
+    for (index, candidate) in candidates.iter().cloned().enumerate() {
+        let client = state.control_plane_client.clone();
+        let expected_cluster_id = expected_cluster_id.clone();
+        probes.spawn(async move {
+            let started_at = Instant::now();
+            let result =
+                fetch_web_ui_config(&client, &candidate, expected_cluster_id.as_deref()).await;
+            (index, candidate, started_at.elapsed(), result)
+        });
+    }
+    let mut results = BTreeMap::new();
+    while let Some(result) = probes.join_next().await {
+        if let Ok((index, candidate, elapsed, probe)) = result {
+            results.insert(index, (candidate, elapsed, probe));
+        }
+    }
+    let selected = previous_selected
+        .filter(|selected| {
+            results
+                .values()
+                .any(|(candidate, _, result)| candidate.url == *selected && result.is_ok())
+        })
+        .or_else(|| {
+            results
+                .values()
+                .find(|(_, _, result)| result.is_ok())
+                .map(|(candidate, _, _)| candidate.url.clone())
+        });
+    *state.web_ui_health.write().await = results
+        .values()
+        .map(|(candidate, _, result)| (candidate.url.clone(), result.is_ok()))
+        .collect();
+    set_selected_web_ui(state, selected.clone()).await;
+    let endpoints = results
+        .into_values()
+        .map(|(candidate, elapsed, result)| WebUiEndpointStatus {
+            selected: selected.as_deref() == Some(candidate.url.as_str()),
+            url: candidate.url,
+            source: candidate.source,
+            trusted_directory: candidate.trusted_directory,
+            reachable: result.is_ok(),
+            latency_ms: result
+                .is_ok()
+                .then_some(elapsed.as_millis().min(u128::from(u64::MAX)) as u64),
+            error: result.err().map(|error| truncate_error(&error)),
+        })
+        .collect();
+    WebUiEndpointsResponse {
+        selected_url: selected,
+        endpoints,
+    }
+}
+
+async fn web_ui_endpoints(State(state): State<AgentHttpState>) -> Json<WebUiEndpointsResponse> {
+    Json(probe_web_ui_endpoints(&state).await)
+}
+
+async fn bootstrap_web_ui_endpoint(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<WebUiEndpointRequest>,
+) -> Result<Json<WebUiEndpointsResponse>, ApiError> {
+    let endpoint = normalize_web_ui_base_url(&request.endpoint).map_err(ApiError::BadRequest)?;
+    let candidate = WebUiCandidate {
+        url: endpoint.clone(),
+        source: "manual_seed",
+        trusted_directory: false,
+    };
+    let expected_cluster_id = expected_web_ui_cluster_id(&state);
+    fetch_web_ui_config(
+        &state.control_plane_client,
+        &candidate,
+        expected_cluster_id.as_deref(),
+    )
+    .await
+    .map_err(|error| ApiError::BadRequest(format!("Web UI endpoint validation failed: {error}")))?;
+    let store = state.state_store.clone().ok_or_else(|| {
+        AgentError::ControlPlaneClient(
+            "agent state store is required to persist Web UI endpoints".to_string(),
+        )
+    })?;
+    if let Some(next_state) = state
+        .runtime
+        .upsert_web_ui_seed_url(endpoint.clone(), chrono::Utc::now())?
+    {
+        store.save(&next_state)?;
+    }
+    set_selected_web_ui(&state, Some(endpoint)).await;
+    Ok(Json(probe_web_ui_endpoints(&state).await))
+}
+
+async fn remove_web_ui_endpoint(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<WebUiEndpointRequest>,
+) -> Result<Json<WebUiEndpointsResponse>, ApiError> {
+    let endpoint = normalize_web_ui_base_url(&request.endpoint).map_err(ApiError::BadRequest)?;
+    let store = state.state_store.clone().ok_or_else(|| {
+        AgentError::ControlPlaneClient(
+            "agent state store is required to persist Web UI endpoints".to_string(),
+        )
+    })?;
+    let Some(next_state) = state
+        .runtime
+        .remove_web_ui_seed_url(&endpoint, chrono::Utc::now())?
+    else {
+        return Err(ApiError::BadRequest(
+            "endpoint is not a removable manual Web UI seed".to_string(),
+        ));
+    };
+    store.save(&next_state)?;
+    if selected_web_ui_url(&state).await.as_deref() == Some(endpoint.as_str()) {
+        set_selected_web_ui(&state, None).await;
+    }
+    Ok(Json(probe_web_ui_endpoints(&state).await))
+}
+
+async fn select_web_ui_endpoint(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<WebUiEndpointRequest>,
+) -> Result<Json<WebUiEndpointsResponse>, ApiError> {
+    let endpoint = normalize_web_ui_base_url(&request.endpoint).map_err(ApiError::BadRequest)?;
+    let candidate = web_ui_candidates(&state)
+        .into_iter()
+        .find(|candidate| candidate.url == endpoint)
+        .ok_or_else(|| {
+            ApiError::BadRequest("endpoint is not in the cached directory".to_string())
+        })?;
+    let expected_cluster_id = expected_web_ui_cluster_id(&state);
+    fetch_web_ui_config(
+        &state.control_plane_client,
+        &candidate,
+        expected_cluster_id.as_deref(),
+    )
+    .await
+    .map_err(|error| ApiError::BadRequest(format!("Web UI endpoint is unreachable: {error}")))?;
+    set_selected_web_ui(&state, Some(endpoint)).await;
+    Ok(Json(probe_web_ui_endpoints(&state).await))
+}
+
+async fn local_ui_root() -> Redirect {
+    Redirect::temporary("/ui/")
+}
+
+async fn local_ui_index(State(state): State<AgentHttpState>) -> Response {
+    let oidc_origin = match select_healthy_web_ui(&state).await {
+        Ok((_, config)) => config
+            .get("token_endpoint")
+            .and_then(Value::as_str)
+            .and_then(http_origin),
+        Err(_) => None,
+    };
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../../webui/index.html"),
+    )
+        .into_response();
+    apply_local_ui_security_headers(&mut response, true, oidc_origin.as_deref());
+    response
+}
+
+async fn local_ui_app() -> Response {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../../webui/app.js"),
+    )
+        .into_response();
+    apply_local_ui_security_headers(&mut response, false, None);
+    response
+}
+
+async fn local_ui_theme() -> Response {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../../webui/theme.js"),
+    )
+        .into_response();
+    apply_local_ui_security_headers(&mut response, false, None);
+    response
+}
+
+async fn local_ui_styles() -> Response {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../../../webui/styles.css"),
+    )
+        .into_response();
+    apply_local_ui_security_headers(&mut response, false, None);
+    response
+}
+
+async fn local_ui_japanese_font() -> Response {
+    let mut response = (
+        [(header::CONTENT_TYPE, "font/ttf")],
+        include_bytes!("../../../webui/noto-sans-jp-ui.ttf").as_slice(),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    response
+}
+
+fn http_origin(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+fn apply_local_ui_security_headers(
+    response: &mut Response,
+    include_policy: bool,
+    oidc_origin: Option<&str>,
+) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    if include_policy {
+        let connect_src = oidc_origin
+            .map(|origin| format!("'self' {origin}"))
+            .unwrap_or_else(|| "'self'".to_string());
+        let policy = format!(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src {connect_src}; font-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        );
+        if let Ok(value) = HeaderValue::from_str(&policy) {
+            headers.insert(HeaderName::from_static("content-security-policy"), value);
+        }
+    }
+}
+
+async fn local_ui_config(State(state): State<AgentHttpState>) -> Json<Value> {
+    match select_healthy_web_ui(&state).await {
+        Ok((candidate, mut config)) => {
+            if let Some(config) = config.as_object_mut() {
+                config.insert("login_endpoint".to_string(), Value::Null);
+                config.insert("local_agent".to_string(), Value::Bool(true));
+                config.insert("bootstrap_required".to_string(), Value::Bool(false));
+                config.insert(
+                    "selected_web_ui_endpoint".to_string(),
+                    Value::String(candidate.url),
+                );
+                config.insert(
+                    "cached_web_ui_endpoint_count".to_string(),
+                    json!(web_ui_candidates(&state).len()),
+                );
+            }
+            Json(config)
+        }
+        Err(error) => Json(json!({
+            "enabled": true,
+            "auth_enabled": false,
+            "operator_token_enabled": false,
+            "provider": null,
+            "issuer_url": null,
+            "client_id": null,
+            "scopes": null,
+            "authorization_endpoint": null,
+            "token_endpoint": null,
+            "logout_endpoint": null,
+            "login_endpoint": null,
+            "node_enrollment_enabled": false,
+            "client_enrollment_enabled": false,
+            "local_agent": true,
+            "bootstrap_required": true,
+            "selected_web_ui_endpoint": null,
+            "cached_web_ui_endpoint_count": web_ui_candidates(&state).len(),
+            "connection_error": truncate_error(&error.to_string())
+        })),
+    }
+}
+
+#[derive(Debug)]
+struct ManagementProxyRequest {
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+async fn proxy_management_request(
+    State(state): State<AgentHttpState>,
+    request: Request,
+) -> Response {
+    let proxy_request = match management_proxy_request(request).await {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let mut candidates = web_ui_candidates(&state);
+    let selected = selected_web_ui_url(&state).await;
+    candidates.sort_by_key(|candidate| {
+        if selected.as_deref() == Some(candidate.url.as_str()) {
+            0
+        } else {
+            1
+        }
+    });
+    if candidates.is_empty() {
+        return ApiError::Agent(AgentError::ControlPlaneClient(
+            "no Web UI endpoint is cached; enter an initial IP address or URL".to_string(),
+        ))
+        .into_response();
+    }
+
+    if matches!(proxy_request.method, Method::GET | Method::HEAD) {
+        let mut failures = Vec::new();
+        for candidate in candidates {
+            match forward_management_request(&state, &candidate, &proxy_request).await {
+                Ok(response) if proxy_status_is_retryable(response.status()) => {
+                    record_web_ui_health(&state, candidate.url.clone(), false).await;
+                    failures.push(format!("{} returned {}", candidate.url, response.status()));
+                }
+                Ok(response) => {
+                    record_web_ui_health(&state, candidate.url.clone(), true).await;
+                    set_selected_web_ui(&state, Some(candidate.url)).await;
+                    return response;
+                }
+                Err(error) => {
+                    record_web_ui_health(&state, candidate.url.clone(), false).await;
+                    failures.push(format!(
+                        "{}: {}",
+                        candidate.url,
+                        truncate_error(&error.to_string())
+                    ));
+                }
+            }
+        }
+        set_selected_web_ui(&state, None).await;
+        return ApiError::Agent(AgentError::ControlPlaneClient(format!(
+            "all cached Web UI endpoints failed: {}",
+            failures.join("; ")
+        )))
+        .into_response();
+    }
+
+    let candidate = match select_healthy_web_ui(&state).await {
+        Ok((candidate, _)) => candidate,
+        Err(error) => return ApiError::Agent(error).into_response(),
+    };
+    match forward_management_request(&state, &candidate, &proxy_request).await {
+        Ok(response) => {
+            record_web_ui_health(&state, candidate.url, true).await;
+            response
+        }
+        Err(error) => {
+            record_web_ui_health(&state, candidate.url, false).await;
+            ApiError::Agent(error).into_response()
+        }
+    }
+}
+
+async fn management_proxy_request(request: Request) -> Result<ManagementProxyRequest, ApiError> {
+    let method = request.method().clone();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let headers = request.headers().clone();
+    let body = to_bytes(request.into_body(), MAX_WEB_UI_PROXY_REQUEST_BYTES)
+        .await
+        .map_err(|_| ApiError::BadRequest("management request body is too large".to_string()))?;
+    Ok(ManagementProxyRequest {
+        method,
+        path_and_query,
+        headers,
+        body: body.to_vec(),
+    })
+}
+
+async fn forward_management_request(
+    state: &AgentHttpState,
+    candidate: &WebUiCandidate,
+    request: &ManagementProxyRequest,
+) -> Result<Response, AgentError> {
+    let url = format!("{}{}", candidate.url, request.path_and_query);
+    let mut builder = state
+        .control_plane_client
+        .request(request.method.clone(), &url)
+        .timeout(state.control_plane_request_timeout)
+        .body(request.body.clone());
+    for name in [
+        header::ACCEPT,
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::IF_MATCH,
+        header::IF_NONE_MATCH,
+    ] {
+        if let Some(value) = request.headers.get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    let response = builder.send().await.map_err(|error| {
+        AgentError::ControlPlaneClient(format!("management proxy request failed: {error}"))
+    })?;
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let body = read_bounded_response_bytes(
+        response,
+        MAX_CONTROL_PLANE_RESPONSE_BYTES,
+        "management proxy",
+    )
+    .await?;
+    let mut proxied = Response::new(Body::from(body));
+    *proxied.status_mut() = status;
+    for name in [
+        header::CACHE_CONTROL,
+        header::CONTENT_TYPE,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::RETRY_AFTER,
+        header::WWW_AUTHENTICATE,
+    ] {
+        if let Some(value) = response_headers.get(&name) {
+            proxied.headers_mut().insert(name, value.clone());
+        }
+    }
+    proxied.headers_mut().insert(
+        HeaderName::from_static("x-heteronetwork-web-ui-endpoint"),
+        HeaderValue::from_str(&candidate.url)
+            .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+    );
+    Ok(proxied)
+}
+
+async fn read_bounded_response_bytes(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Vec<u8>, AgentError> {
+    if let Some(length) = response.content_length() {
+        ensure_http_response_size(length, max_bytes, context)?;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        AgentError::ControlPlaneClient(format!("failed to read {context} response: {error}"))
+    })? {
+        ensure_http_response_size(body.len() as u64 + chunk.len() as u64, max_bytes, context)?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn proxy_status_is_retryable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 async fn status(State(state): State<AgentHttpState>) -> Json<AgentStatusResponse> {
@@ -410,13 +1297,57 @@ async fn metrics(State(state): State<AgentHttpState>) -> Json<AgentMetricsRespon
 
 async fn prometheus_metrics(State(state): State<AgentHttpState>) -> impl IntoResponse {
     let metrics = state.runtime.metrics().await;
+    let mut body = render_prometheus_metrics(&metrics);
+    append_web_ui_prometheus_metrics(&mut body, &state).await;
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_prometheus_metrics(&metrics),
+        body,
     )
+}
+
+async fn append_web_ui_prometheus_metrics(body: &mut String, state: &AgentHttpState) {
+    let node_id = prometheus_label(state.runtime.state().node_id.as_str());
+    let candidates = web_ui_candidates(state);
+    let candidate_urls = candidates
+        .iter()
+        .map(|candidate| candidate.url.as_str())
+        .collect::<BTreeSet<_>>();
+    let health = state.web_ui_health.read().await;
+    let reachable_count = health
+        .iter()
+        .filter(|(url, reachable)| **reachable && candidate_urls.contains(url.as_str()))
+        .count();
+    drop(health);
+    let selected = selected_web_ui_url(state)
+        .await
+        .is_some_and(|url| candidate_urls.contains(url.as_str()));
+    prometheus_line!(
+        body,
+        "# HELP ipars_agent_web_ui_endpoints Cached Web UI endpoints by observed state."
+    );
+    prometheus_line!(body, "# TYPE ipars_agent_web_ui_endpoints gauge");
+    prometheus_line!(
+        body,
+        "ipars_agent_web_ui_endpoints{{node_id=\"{node_id}\",state=\"cached\"}} {}",
+        candidate_urls.len()
+    );
+    prometheus_line!(
+        body,
+        "ipars_agent_web_ui_endpoints{{node_id=\"{node_id}\",state=\"reachable\"}} {reachable_count}"
+    );
+    prometheus_line!(
+        body,
+        "# HELP ipars_agent_web_ui_selected Whether the Agent has selected a reachable Web UI endpoint."
+    );
+    prometheus_line!(body, "# TYPE ipars_agent_web_ui_selected gauge");
+    prometheus_line!(
+        body,
+        "ipars_agent_web_ui_selected{{node_id=\"{node_id}\"}} {}",
+        u8::from(selected)
+    );
 }
 
 async fn path_events(State(state): State<AgentHttpState>) -> Json<AgentPathEventsResponse> {
@@ -1584,6 +2515,7 @@ struct ErrorResponse {
 mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -1912,6 +2844,274 @@ mod tests {
             std::future::pending::<()>().await;
         });
         Ok((format!("http://{addr}"), task))
+    }
+
+    #[derive(Clone)]
+    struct WebUiTestBackend {
+        admin_status: StatusCode,
+        admin_calls: Arc<AtomicUsize>,
+        authorization: Arc<tokio::sync::Mutex<Option<String>>>,
+    }
+
+    async fn web_ui_test_config() -> Json<Value> {
+        Json(json!({
+            "cluster_id": "cluster-a",
+            "enabled": true,
+            "auth_enabled": true,
+            "operator_token_enabled": false,
+            "provider": "keycloak",
+            "issuer_url": "http://127.0.0.1:18080/realms/heteronetwork",
+            "client_id": "heteronetwork-web",
+            "scopes": "openid profile email",
+            "authorization_endpoint": "http://127.0.0.1:18080/realms/heteronetwork/protocol/openid-connect/auth",
+            "token_endpoint": "http://127.0.0.1:18080/realms/heteronetwork/protocol/openid-connect/token",
+            "logout_endpoint": "http://127.0.0.1:18080/realms/heteronetwork/protocol/openid-connect/logout",
+            "login_endpoint": "/ui/login",
+            "node_enrollment_enabled": true,
+            "client_enrollment_enabled": true
+        }))
+    }
+
+    async fn web_ui_test_admin(
+        State(state): State<WebUiTestBackend>,
+        headers: HeaderMap,
+    ) -> Response {
+        state.admin_calls.fetch_add(1, Ordering::SeqCst);
+        *state.authorization.lock().await = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        (
+            state.admin_status,
+            Json(json!({ "backend": state.admin_status.as_u16() })),
+        )
+            .into_response()
+    }
+
+    async fn spawn_web_ui_test_backend(
+        admin_status: StatusCode,
+    ) -> Result<(String, WebUiTestBackend, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let state = WebUiTestBackend {
+            admin_status,
+            admin_calls: Arc::new(AtomicUsize::new(0)),
+            authorization: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let app = Router::new()
+            .route("/ui/config", get(web_ui_test_config))
+            .route("/v1/admin/overview", any(web_ui_test_admin))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{addr}"), state, task))
+    }
+
+    #[test]
+    fn web_ui_endpoint_normalization_requires_tls_for_public_addresses() {
+        assert_eq!(
+            normalize_web_ui_base_url("127.0.0.1:8443"),
+            Ok("http://127.0.0.1:8443".to_string())
+        );
+        assert_eq!(
+            normalize_web_ui_base_url("10.250.0.1/ui/"),
+            Ok("http://10.250.0.1".to_string())
+        );
+        assert_eq!(
+            normalize_web_ui_base_url("console.example/ui"),
+            Ok("https://console.example".to_string())
+        );
+        assert!(normalize_web_ui_base_url("http://203.0.113.10:8443").is_err());
+        assert!(normalize_web_ui_base_url("http://0.0.0.0:8443").is_err());
+        assert!(normalize_web_ui_base_url("http://127.0.0.1:0").is_err());
+        assert!(normalize_web_ui_base_url("https://[ff02::1]:8443").is_err());
+        assert_eq!(
+            normalize_web_ui_base_url("https://203.0.113.10:8443/ui/"),
+            Ok("https://203.0.113.10:8443".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_web_ui_endpoint_must_match_registered_cluster(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let candidate = WebUiCandidate {
+            url: backend_url,
+            source: "manual_seed",
+            trusted_directory: false,
+        };
+        let result =
+            fetch_web_ui_config(&reqwest::Client::new(), &candidate, Some("cluster-b")).await;
+        let error = test_error(result, "cluster mismatch must be rejected");
+        assert!(error.contains("different HeteroNetwork cluster"));
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_web_ui_bootstrap_persists_seed_and_rewrites_oidc_flow(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let state_dir = temp_state_dir("web-ui-bootstrap");
+        let state_path = state_dir.join("state.json");
+        let store = FileAgentStateStore::new(&state_path);
+        let node_state = AgentNodeState::generate(Utc::now());
+        store.save(&node_state)?;
+        let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
+        let app = router(
+            AgentHttpState::with_wireguard_key_rotation(runtime, store.clone(), Vec::new())
+                .enable_local_web_ui(true),
+        );
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/config")
+                    .header(header::HOST, "attacker.example")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/web-ui/bootstrap")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::ORIGIN, "http://127.0.0.1:9780")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "endpoint": backend_url
+                    }))?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(store.load()?.web_ui_seed_urls, vec![backend_url.clone()]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/config")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let config: Value = serde_json::from_slice(&body)?;
+        assert_eq!(config["local_agent"], true);
+        assert_eq!(config["bootstrap_required"], false);
+        assert_eq!(config["selected_web_ui_endpoint"], backend_url);
+        assert!(config["login_endpoint"].is_null());
+
+        backend_task.abort();
+        let _ = std::fs::remove_dir_all(state_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_web_ui_uses_persisted_service_directory_without_runtime_flags(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let mut node_state = AgentNodeState::generate(Utc::now());
+        node_state
+            .bootstrap_endpoints
+            .push(ipars_types::BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: backend_url.clone(),
+            });
+        let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
+        let app = router(AgentHttpState::new(runtime).enable_local_web_ui(true));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/config")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let config: Value = serde_json::from_slice(&body)?;
+        assert_eq!(config["bootstrap_required"], false);
+        assert_eq!(config["selected_web_ui_endpoint"], backend_url);
+
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_web_ui_read_proxy_fails_over_and_preserves_authorization(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (failed_url, failed, failed_task) =
+            spawn_web_ui_test_backend(StatusCode::SERVICE_UNAVAILABLE).await?;
+        let (healthy_url, healthy, healthy_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(
+            AgentHttpState::with_control_plane_urls(
+                runtime,
+                vec![failed_url.clone(), healthy_url.clone()],
+            )
+            .enable_local_web_ui(true),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/overview")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer oidc-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-heteronetwork-web-ui-endpoint")
+                .and_then(|value| value.to_str().ok()),
+            Some(healthy_url.as_str())
+        );
+        assert_eq!(failed.admin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy.admin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            healthy.authorization.lock().await.as_deref(),
+            Some("Bearer oidc-token")
+        );
+
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let metrics = to_bytes(metrics.into_body(), usize::MAX).await?;
+        let metrics = String::from_utf8(metrics.to_vec())?;
+        assert!(metrics.contains("ipars_agent_web_ui_endpoints"));
+        assert!(metrics.contains("state=\"cached\"} 2"));
+        assert!(metrics.contains("state=\"reachable\"} 1"));
+        assert!(metrics.contains("ipars_agent_web_ui_selected"));
+
+        failed_task.abort();
+        healthy_task.abort();
+        Ok(())
     }
 
     #[tokio::test]

@@ -12373,6 +12373,7 @@ fi
             active_signal_count: 0,
             active_stun_count: 0,
             active_relay_count: 0,
+            active_web_ui_count: 0,
             ha_ready: false,
             healthy_node_count,
             degraded_node_count,

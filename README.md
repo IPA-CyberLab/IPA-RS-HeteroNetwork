@@ -85,6 +85,17 @@ node enrollment enabled, **Add device** creates a bounded single-use or reusable
 join token from the live HA service directory and returns a copyable Linux
 install command plus script. The raw token stays only in page memory.
 
+Every Agent bound to the default loopback listener also serves the console at
+`http://127.0.0.1:9780/ui/`. This local origin caches Web UI endpoints from the
+authenticated service directory, checks them concurrently, and proxies
+management reads to another healthy Control Plane when the selected endpoint
+fails. Mutations are sent once to a preflighted endpoint to avoid ambiguous
+double application. If no directory is cached yet, enter one initial IP address
+or URL in the local UI; a validated manual seed is persisted in the owner-only
+Agent state file. Public IP addresses and hostnames require HTTPS with a valid
+certificate, while HTTP is limited to loopback, private, link-local, and CGNAT
+addresses.
+
 The operator enrollment API also accepts
 `"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
 exactly three uses. The returned command is identical on all three clean
@@ -100,13 +111,16 @@ OIDC is enabled by default with Keycloak:
 HETERONETWORK_WEB_AUTH_PROVIDER=keycloak
 HETERONETWORK_WEB_PUBLIC_URL=https://control-plane.example.com
 HETERONETWORK_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/heteronetwork
+HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL=http://keycloak.service.consul:8080/realms/heteronetwork
 HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web
 iparsd control-plane
 ```
 
 Register `https://control-plane.example.com/ui/` as the public client redirect
 URI and enable Authorization Code with PKCE. The Keycloak client must allow the
-control-plane origin as a Web Origin. The default development issuer is
+control-plane origin as a Web Origin. To use the failover-safe local console,
+also register `http://127.0.0.1:9780/ui/` as a redirect URI and
+`http://127.0.0.1:9780` as a Web Origin. The default development issuer is
 `http://localhost:8080/realms/heteronetwork`.
 
 When `HETERONETWORK_WEB_PUBLIC_URL` is set, the Control Plane performs the PKCE token
@@ -115,6 +129,10 @@ exchange through short-lived, single-use server-side state and publishes
 browser WebCrypto is unavailable and also avoids a browser-side token exchange.
 Plain HTTP is accepted only for loopback, private, link-local, and CGNAT
 addresses; Internet-facing issuer and public URLs must use HTTPS.
+`HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL` is optional and affects only
+server-side token exchange and userinfo validation. Set it to a trusted private
+Keycloak route when Control Plane nodes cannot hairpin to the public issuer;
+the browser still receives the public issuer and token endpoints.
 
 To use Amazon Cognito, keep the issuer URL for token validation and set the
 hosted UI domain separately:
@@ -133,6 +151,10 @@ the UI; an existing `HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN` or i
 file-backed variant can also be entered in the UI as an operator-token
 fallback. The OIDC access token is checked server-side through the configured
 provider userinfo endpoint before any `/v1/admin/*` request is handled.
+Each HA Control Plane automatically advertises its
+`HETERONETWORK_WEB_PUBLIC_URL` as a leased `web_ui` service endpoint, so new
+Agents receive the candidate set through normal enrollment and heartbeat
+updates without extra installer flags.
 
 Enable the enrollment workflow with a dedicated owner-only signer that is
 shared by the active Control Plane replicas:

@@ -3655,6 +3655,61 @@ textarea::placeholder {
   font-size: 11px;
 }
 
+.endpoint-control {
+  align-items: center;
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+}
+
+.endpoint-control select {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text-soft);
+  font-size: 11px;
+  height: 34px;
+  max-width: 240px;
+  padding: 0 27px 0 9px;
+  text-overflow: ellipsis;
+  width: 210px;
+}
+
+.endpoint-control select:focus {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 1px;
+}
+
+.bootstrap-form {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+}
+
+.bootstrap-form .button {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 1040px) {
+  .endpoint-control select {
+    max-width: 150px;
+    width: 150px;
+  }
+}
+
+@media (max-width: 780px) {
+  .endpoint-control select {
+    max-width: 108px;
+    width: 108px;
+  }
+
+  .endpoint-control .icon-button,
+  .connection-state {
+    display: none;
+  }
+}
+
 .drawer-backdrop {
   background: rgba(40, 40, 40, 0.48);
 }

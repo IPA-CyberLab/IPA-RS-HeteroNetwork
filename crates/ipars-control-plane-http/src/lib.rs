@@ -457,7 +457,8 @@ pub struct WebUiAuthConfig {
     public_url: Option<String>,
     authorization_endpoint: String,
     token_endpoint: String,
-    userinfo_endpoint: String,
+    backchannel_token_endpoint: String,
+    backchannel_userinfo_endpoint: String,
     logout_endpoint: String,
     client: Client,
     login_states: Arc<Mutex<HashMap<String, OidcLoginState>>>,
@@ -497,12 +498,17 @@ impl WebUiAuthConfig {
         issuer_url: String,
         client_id: String,
         auth_base_url: Option<String>,
+        backchannel_base_url: Option<String>,
         scopes: String,
     ) -> Result<Self, String> {
         let issuer_url = validate_web_auth_base_url(issuer_url, "issuer URL")?;
         let auth_base_url = match auth_base_url {
             Some(value) => validate_web_auth_base_url(value, "OIDC auth base URL")?,
             None => issuer_url.clone(),
+        };
+        let backchannel_base_url = match backchannel_base_url {
+            Some(value) => validate_web_auth_base_url(value, "OIDC backchannel base URL")?,
+            None => auth_base_url.clone(),
         };
         let client_id = client_id.trim().to_string();
         if client_id.is_empty() || client_id.len() > 256 || client_id.chars().any(char::is_control)
@@ -543,7 +549,8 @@ impl WebUiAuthConfig {
             public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
             token_endpoint: endpoint_url(&auth_base_url, token_suffix),
-            userinfo_endpoint: endpoint_url(&auth_base_url, userinfo_suffix),
+            backchannel_token_endpoint: endpoint_url(&backchannel_base_url, token_suffix),
+            backchannel_userinfo_endpoint: endpoint_url(&backchannel_base_url, userinfo_suffix),
             logout_endpoint: endpoint_url(&auth_base_url, logout_suffix),
             client,
             login_states: Arc::new(Mutex::new(HashMap::new())),
@@ -568,7 +575,7 @@ impl WebUiAuthConfig {
         let response = match timeout(
             Duration::from_secs(5),
             self.client
-                .get(&self.userinfo_endpoint)
+                .get(&self.backchannel_userinfo_endpoint)
                 .bearer_auth(token)
                 .send(),
         )
@@ -729,7 +736,7 @@ impl WebUiAuthConfig {
 
         let response = self
             .client
-            .post(&self.token_endpoint)
+            .post(&self.backchannel_token_endpoint)
             .header(header::ACCEPT, "application/json")
             .form(&[
                 ("grant_type", "authorization_code"),
@@ -768,8 +775,9 @@ impl WebUiAuthConfig {
         Ok(tokens.access_token)
     }
 
-    fn public_config(&self) -> WebUiPublicConfig {
+    fn public_config(&self, cluster_id: String) -> WebUiPublicConfig {
         WebUiPublicConfig {
+            cluster_id,
             enabled: true,
             auth_enabled: true,
             operator_token_enabled: false,
@@ -897,6 +905,7 @@ struct OidcTokenResponse {
 
 #[derive(Debug, Serialize)]
 struct WebUiPublicConfig {
+    cluster_id: String,
     enabled: bool,
     auth_enabled: bool,
     operator_token_enabled: bool,
@@ -1193,11 +1202,13 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
+    let cluster_id = state.plane.config().cluster_id.as_str().to_string();
     let mut config = state
         .web_ui_auth
         .as_deref()
-        .map(WebUiAuthConfig::public_config)
+        .map(|auth| auth.public_config(cluster_id.clone()))
         .unwrap_or_else(|| WebUiPublicConfig {
+            cluster_id,
             enabled: state.operator_api_bearer_token.is_some(),
             auth_enabled: false,
             operator_token_enabled: state.operator_api_bearer_token.is_some(),
@@ -2694,6 +2705,7 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
         ("signal", metrics.active_signal_count),
         ("stun", metrics.active_stun_count),
         ("relay", metrics.active_relay_count),
+        ("web_ui", metrics.active_web_ui_count),
     ] {
         prometheus_line!(
             &mut body,
@@ -3096,12 +3108,13 @@ mod tests {
             "http://localhost:8080/realms/heteronetwork".to_string(),
             "heteronetwork-web".to_string(),
             None,
+            None,
             "openid profile email".to_string(),
         ) {
             Ok(config) => config,
             Err(error) => panic!("keycloak config should be valid: {error}"),
         };
-        let keycloak_config = keycloak.public_config();
+        let keycloak_config = keycloak.public_config("cluster-a".to_string());
         assert_eq!(
             keycloak_config.authorization_endpoint.as_deref(),
             Some("http://localhost:8080/realms/heteronetwork/protocol/openid-connect/auth")
@@ -3112,12 +3125,13 @@ mod tests {
             "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example".to_string(),
             "heteronetwork-web".to_string(),
             Some("https://login.example.com".to_string()),
+            None,
             "openid".to_string(),
         ) {
             Ok(config) => config,
             Err(error) => panic!("cognito config should be valid: {error}"),
         };
-        let cognito_config = cognito.public_config();
+        let cognito_config = cognito.public_config("cluster-a".to_string());
         assert_eq!(
             cognito_config.authorization_endpoint.as_deref(),
             Some("https://login.example.com/oauth2/authorize")
@@ -3126,10 +3140,35 @@ mod tests {
             cognito_config.token_endpoint.as_deref(),
             Some("https://login.example.com/oauth2/token")
         );
+        let backchannel = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://idp.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some("http://10.0.0.5:8080/realms/heteronetwork".to_string()),
+            "openid".to_string(),
+        )
+        .unwrap_or_else(|error| panic!("backchannel config should be valid: {error}"));
+        assert_eq!(
+            backchannel
+                .public_config("cluster-a".to_string())
+                .token_endpoint
+                .as_deref(),
+            Some("https://idp.example/realms/heteronetwork/protocol/openid-connect/token")
+        );
+        assert_eq!(
+            backchannel.backchannel_token_endpoint,
+            "http://10.0.0.5:8080/realms/heteronetwork/protocol/openid-connect/token"
+        );
+        assert_eq!(
+            backchannel.backchannel_userinfo_endpoint,
+            "http://10.0.0.5:8080/realms/heteronetwork/protocol/openid-connect/userinfo"
+        );
         assert!(WebUiAuthConfig::new(
             WebAuthProvider::Keycloak,
             "ftp://localhost/realm".to_string(),
             "heteronetwork-web".to_string(),
+            None,
             None,
             "openid".to_string(),
         )
@@ -3138,6 +3177,7 @@ mod tests {
             WebAuthProvider::Keycloak,
             "http://203.0.113.10:8080/realms/ipars".to_string(),
             "ipars-web".to_string(),
+            None,
             None,
             "openid".to_string(),
         )
@@ -3151,6 +3191,7 @@ mod tests {
             "http://localhost:8080/realms/ipars".to_string(),
             "ipars-web".to_string(),
             None,
+            None,
             "openid profile email".to_string(),
         )
         .and_then(|config| config.with_public_url("http://100.64.0.10:8443".to_string()))
@@ -3160,7 +3201,10 @@ mod tests {
             .with_public_url("http://203.0.113.10:8443".to_string())
             .is_err());
         assert_eq!(
-            config.public_config().login_endpoint.as_deref(),
+            config
+                .public_config("cluster-a".to_string())
+                .login_endpoint
+                .as_deref(),
             Some("/ui/login")
         );
 

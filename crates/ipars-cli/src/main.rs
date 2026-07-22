@@ -501,6 +501,8 @@ struct TokenCreateArgs {
     stun_bootstrap_endpoints: Vec<String>,
     #[arg(long = "relay-bootstrap")]
     relay_bootstrap_endpoints: Vec<String>,
+    #[arg(long = "web-ui-bootstrap")]
+    web_ui_bootstrap_endpoints: Vec<String>,
     #[arg(long, env = "HETERONETWORK_SERVICE_DIRECTORY_URL")]
     service_directory_url: Option<String>,
     #[arg(long, default_value_t = false)]
@@ -2041,6 +2043,7 @@ fn prepare_init_relay_agent(
             registered_node: None,
             bootstrap_endpoints: Vec::new(),
             seed_bootstrap_endpoints: Some(Vec::new()),
+            web_ui_seed_urls: Vec::new(),
             created_at: now,
             updated_at: now,
         })
@@ -2599,6 +2602,7 @@ fn persist_joined_agent_state(
         registered_node: Some(response.node.clone()),
         bootstrap_endpoints,
         seed_bootstrap_endpoints: Some(seeds),
+        web_ui_seed_urls: Vec::new(),
         created_at: now,
         updated_at: now,
     };
@@ -2674,12 +2678,14 @@ async fn create_token_with_service_directory(
     let mut signal = Vec::new();
     let mut stun = Vec::new();
     let mut relay = Vec::new();
+    let mut web_ui = Vec::new();
     for endpoint in directory.bootstrap_endpoints {
         match endpoint.kind {
             BootstrapEndpointKind::ControlPlane => control_plane.push(endpoint.url),
             BootstrapEndpointKind::Signal => signal.push(endpoint.url),
             BootstrapEndpointKind::Stun => stun.push(endpoint.url),
             BootstrapEndpointKind::Relay => relay.push(endpoint.url),
+            BootstrapEndpointKind::WebUi => web_ui.push(endpoint.url),
         }
     }
     control_plane.append(&mut args.bootstrap_endpoints);
@@ -2687,10 +2693,12 @@ async fn create_token_with_service_directory(
     signal.append(&mut args.signal_bootstrap_endpoints);
     stun.append(&mut args.stun_bootstrap_endpoints);
     relay.append(&mut args.relay_bootstrap_endpoints);
+    web_ui.append(&mut args.web_ui_bootstrap_endpoints);
     args.bootstrap_endpoints = control_plane;
     args.signal_bootstrap_endpoints = signal;
     args.stun_bootstrap_endpoints = stun;
     args.relay_bootstrap_endpoints = relay;
+    args.web_ui_bootstrap_endpoints = web_ui;
     create_token(args)
 }
 
@@ -2896,6 +2904,13 @@ fn token_create_bootstrap_endpoints(
             "--relay-bootstrap",
         )?);
     }
+    for url in &args.web_ui_bootstrap_endpoints {
+        endpoints.push(validated_bootstrap_endpoint(
+            url,
+            BootstrapEndpointKind::WebUi,
+            "--web-ui-bootstrap",
+        )?);
+    }
     let mut seen = BTreeSet::new();
     endpoints.retain(|endpoint| seen.insert((endpoint.kind, endpoint.url.clone())));
     validate_join_token_bootstrap_endpoints(&endpoints)?;
@@ -2908,7 +2923,9 @@ fn validated_bootstrap_endpoint(
     flag: &str,
 ) -> anyhow::Result<BootstrapEndpoint> {
     match kind {
-        BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::Signal => {
+        BootstrapEndpointKind::ControlPlane
+        | BootstrapEndpointKind::Signal
+        | BootstrapEndpointKind::WebUi => {
             validate_http_bootstrap_url(url, flag)?;
         }
         BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay => {
@@ -11469,6 +11486,7 @@ mod tests {
             signal_bootstrap_endpoints: Vec::new(),
             stun_bootstrap_endpoints: Vec::new(),
             relay_bootstrap_endpoints: Vec::new(),
+            web_ui_bootstrap_endpoints: Vec::new(),
             service_directory_url: None,
             allow_degraded_service_directory: false,
             allow_relay: true,
@@ -11510,6 +11528,7 @@ mod tests {
                 signal_bootstrap_endpoints: Vec::new(),
                 stun_bootstrap_endpoints: Vec::new(),
                 relay_bootstrap_endpoints: Vec::new(),
+                web_ui_bootstrap_endpoints: Vec::new(),
                 service_directory_url: None,
                 allow_degraded_service_directory: false,
                 allow_relay: false,
@@ -11696,6 +11715,7 @@ mod tests {
             signal_bootstrap_endpoints: vec!["https://203.0.113.10:9443".to_string()],
             stun_bootstrap_endpoints: vec!["udp://203.0.113.10:3478".to_string()],
             relay_bootstrap_endpoints: vec!["udp://203.0.113.10:51820".to_string()],
+            web_ui_bootstrap_endpoints: vec!["https://console.example".to_string()],
             service_directory_url: None,
             allow_degraded_service_directory: false,
             allow_relay: false,
@@ -11726,6 +11746,10 @@ mod tests {
                     url: "udp://203.0.113.10:51820".to_string(),
                     kind: BootstrapEndpointKind::Relay,
                 },
+                BootstrapEndpoint {
+                    url: "https://console.example".to_string(),
+                    kind: BootstrapEndpointKind::WebUi,
+                },
             ]
         );
         Ok(())
@@ -11751,6 +11775,7 @@ mod tests {
             signal_bootstrap_endpoints: Vec::new(),
             stun_bootstrap_endpoints: Vec::new(),
             relay_bootstrap_endpoints: Vec::new(),
+            web_ui_bootstrap_endpoints: Vec::new(),
             service_directory_url: None,
             allow_degraded_service_directory: false,
             allow_relay: false,
@@ -11876,6 +11901,7 @@ mod tests {
             signal_bootstrap_endpoints: Vec::new(),
             stun_bootstrap_endpoints: vec!["https://203.0.113.10:3478".to_string()],
             relay_bootstrap_endpoints: Vec::new(),
+            web_ui_bootstrap_endpoints: Vec::new(),
             service_directory_url: None,
             allow_degraded_service_directory: false,
             allow_relay: false,
@@ -11920,6 +11946,7 @@ mod tests {
                 signal_bootstrap_endpoints: Vec::new(),
                 stun_bootstrap_endpoints: Vec::new(),
                 relay_bootstrap_endpoints: Vec::new(),
+                web_ui_bootstrap_endpoints: Vec::new(),
                 service_directory_url: None,
                 allow_degraded_service_directory: false,
                 allow_relay: false,
@@ -11974,6 +12001,7 @@ mod tests {
 
         let udp_zero_port = TokenCreateArgs {
             relay_bootstrap_endpoints: vec!["udp://203.0.113.10:0".to_string()],
+            web_ui_bootstrap_endpoints: Vec::new(),
             ..token_args()
         };
         let Err(error) = token_create_bootstrap_endpoints(&udp_zero_port) else {

@@ -150,6 +150,8 @@ pub struct AgentNodeState {
     pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
     #[serde(default)]
     pub seed_bootstrap_endpoints: Option<Vec<BootstrapEndpoint>>,
+    #[serde(default)]
+    pub web_ui_seed_urls: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -168,6 +170,7 @@ impl AgentNodeState {
             registered_node: None,
             bootstrap_endpoints: Vec::new(),
             seed_bootstrap_endpoints: Some(Vec::new()),
+            web_ui_seed_urls: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -244,6 +247,7 @@ impl AgentNodeState {
                 ));
             }
         }
+        validate_web_ui_seed_urls(&self.web_ui_seed_urls)?;
         if let Some(node) = &self.registered_node {
             if node.node_id != self.node_id {
                 return Err(AgentError::InvalidState(format!(
@@ -1297,6 +1301,23 @@ fn validate_bootstrap_endpoint_set(
     })
 }
 
+fn validate_web_ui_seed_urls(urls: &[String]) -> Result<(), AgentError> {
+    if urls.len() > MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND {
+        return Err(AgentError::InvalidState(format!(
+            "web UI seed URL count exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND}"
+        )));
+    }
+    let endpoints = urls
+        .iter()
+        .cloned()
+        .map(|url| BootstrapEndpoint {
+            kind: BootstrapEndpointKind::WebUi,
+            url,
+        })
+        .collect::<Vec<_>>();
+    validate_bootstrap_endpoint_set(&endpoints, "web UI seed URL set")
+}
+
 pub fn merge_bootstrap_endpoint_sets(
     active: &[BootstrapEndpoint],
     seeds: &[BootstrapEndpoint],
@@ -1588,6 +1609,57 @@ impl AgentRuntime {
         state.bootstrap_endpoints =
             merge_bootstrap_endpoint_sets(&state.bootstrap_endpoints, seeds)?;
         state.seed_bootstrap_endpoints = Some(seeds.to_vec());
+        state.updated_at = updated_at;
+        Ok(Some(state.clone()))
+    }
+
+    pub fn upsert_web_ui_seed_url(
+        &self,
+        url: String,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AgentNodeState>, AgentError> {
+        validate_web_ui_seed_urls(std::slice::from_ref(&url))?;
+        let canonical = canonical_bootstrap_endpoint_url(&url).ok_or_else(|| {
+            AgentError::InvalidState("web UI seed URL is not an absolute URL".to_string())
+        })?;
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.web_ui_seed_urls.iter().any(|existing| {
+            canonical_bootstrap_endpoint_url(existing).as_deref() == Some(canonical.as_str())
+        }) {
+            return Ok(None);
+        }
+        if state.web_ui_seed_urls.len() >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND {
+            return Err(AgentError::InvalidState(format!(
+                "web UI seed URL count exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND}"
+            )));
+        }
+        state.web_ui_seed_urls.push(canonical);
+        state.updated_at = updated_at;
+        Ok(Some(state.clone()))
+    }
+
+    pub fn remove_web_ui_seed_url(
+        &self,
+        url: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AgentNodeState>, AgentError> {
+        let canonical = canonical_bootstrap_endpoint_url(url).ok_or_else(|| {
+            AgentError::InvalidState("web UI seed URL is not an absolute URL".to_string())
+        })?;
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let previous_len = state.web_ui_seed_urls.len();
+        state.web_ui_seed_urls.retain(|existing| {
+            canonical_bootstrap_endpoint_url(existing).as_deref() != Some(canonical.as_str())
+        });
+        if state.web_ui_seed_urls.len() == previous_len {
+            return Ok(None);
+        }
         state.updated_at = updated_at;
         Ok(Some(state.clone()))
     }
@@ -12694,6 +12766,10 @@ mod tests {
                 kind: BootstrapEndpointKind::Signal,
                 url: "https://active.example:9443".to_string(),
             },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://active.example".to_string(),
+            },
         ];
 
         let merged = runtime
@@ -12709,6 +12785,7 @@ mod tests {
                 active[0].clone(),
                 active[1].clone(),
                 active[2].clone(),
+                active[3].clone(),
                 BootstrapEndpoint {
                     kind: BootstrapEndpointKind::Signal,
                     url: "https://seed.example:9443".to_string(),
