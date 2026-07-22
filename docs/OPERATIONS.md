@@ -260,8 +260,11 @@ private/stale classification removes it. Inspect the current phase in the Web
 UI endpoint control or with
 `ipars_agent_public_web_gateway_phase{phase="ready"}`. Control Plane
 `ipars_control_plane_active_services{kind="web_ui"}` and the Public nodes view
-show only gateways that passed an external TLS/config probe. Tune convergence
-with `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS`,
+show only gateways that passed an external TLS/config probe. Public nodes use
+the shorter of `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` and
+`HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS`; non-public nodes
+retain the general interval so repeated filtering probes do not destabilize
+active paths. Tune the remaining convergence stages with
 `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS`, and the
 Control Plane `HETERONETWORK_DYNAMIC_WEB_GATEWAY_*` lease/probe settings.
 
@@ -285,12 +288,14 @@ heartbeat and Signal registration, even when the surviving kernel WireGuard
 interface already owns the shared port and the startup STUN bind cannot run.
 
 With the default token or explicit STUN bootstrap, the Agent runs NAT discovery
-before registration and refreshes it every
-`HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. The signed join and
-heartbeat payloads carry mapping/filtering observations, confidence, traversal
-strategy, and the derived connectivity state (`public`, `nat`, `double_nat`, or
-`relay_only`). Control Plane retains the latest result and the WebConsole reads
-the same state for its node table, drawer, and topology. Run
+before registration and refreshes non-public classifications every
+`HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. A public
+classification is refreshed at the shorter
+`HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS` interval. The signed
+join and heartbeat payloads carry mapping/filtering observations, confidence,
+traversal strategy, and the derived connectivity state (`public`, `nat`,
+`double_nat`, or `relay_only`). Control Plane retains the latest result and the
+WebConsole reads the same state for its node table, drawer, and topology. Run
 `scripts/nat-discovery-smoke.sh` to verify the three-node overview and heartbeat
 update contract without manually assigning NAT labels.
 

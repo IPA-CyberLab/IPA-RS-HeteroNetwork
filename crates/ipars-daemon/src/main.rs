@@ -787,9 +787,15 @@ struct AgentArgs {
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS",
-        default_value_t = 15
+        default_value_t = 60
     )]
     nat_discovery_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS",
+        default_value_t = 15
+    )]
+    public_nat_discovery_interval_seconds: u64,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_NAT_DISCOVERY_FAILURE_THRESHOLD",
@@ -1912,6 +1918,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.nat_discovery_interval_seconds,
         "--nat-discovery-interval-seconds",
     )?;
+    validate_positive_seconds(
+        args.public_nat_discovery_interval_seconds,
+        "--public-nat-discovery-interval-seconds",
+    )?;
     anyhow::ensure!(
         args.nat_discovery_failure_threshold > 0,
         "--nat-discovery-failure-threshold must be greater than zero"
@@ -1936,8 +1946,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         )?;
         anyhow::ensure!(
             args.public_web_gateway_classification_max_age_seconds
-                >= args.nat_discovery_interval_seconds,
-            "--public-web-gateway-classification-max-age-seconds must not be shorter than --nat-discovery-interval-seconds"
+                >= args
+                    .nat_discovery_interval_seconds
+                    .min(args.public_nat_discovery_interval_seconds),
+            "--public-web-gateway-classification-max-age-seconds must not be shorter than the effective public NAT discovery interval"
         );
     }
     if args.apply_peer_map {
@@ -8211,6 +8223,7 @@ async fn run_agent(
             stun_servers.clone(),
             args.stun_bind,
             Duration::from_secs(args.nat_discovery_interval_seconds),
+            Duration::from_secs(args.public_nat_discovery_interval_seconds),
             args.nat_discovery_failure_threshold,
         ));
     }
@@ -12583,12 +12596,24 @@ fn start_nat_discovery(
     stun_servers: Vec<SocketAddr>,
     stun_bind: SocketAddr,
     interval: Duration,
+    public_interval: Duration,
     failure_threshold: u32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut consecutive_failures = 0_u32;
         loop {
-            tokio::time::sleep(interval).await;
+            let currently_public =
+                runtime
+                    .status()
+                    .await
+                    .nat_classification
+                    .is_some_and(|classification| {
+                        classification.connectivity_state == NatConnectivityState::Public
+                            && classification.public_state_is_supported()
+                    });
+            let next_interval =
+                nat_discovery_refresh_interval(currently_public, interval, public_interval);
+            tokio::time::sleep(next_interval).await;
             let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
             match runtime
                 .classify_nat_without_candidate_refresh(probe_bind, stun_servers.clone())
@@ -12627,6 +12652,18 @@ fn start_nat_discovery(
             }
         }
     })
+}
+
+fn nat_discovery_refresh_interval(
+    currently_public: bool,
+    interval: Duration,
+    public_interval: Duration,
+) -> Duration {
+    if currently_public {
+        interval.min(public_interval)
+    } else {
+        interval
+    }
 }
 
 fn start_heartbeat_reporting(config: HeartbeatReporterConfig) -> tokio::task::JoinHandle<()> {
@@ -18611,6 +18648,24 @@ mod tests {
             Ok(_) => panic!("{context}"),
             Err(error) => error,
         }
+    }
+
+    #[test]
+    fn public_nat_discovery_uses_the_shorter_refresh_interval() {
+        let regular = Duration::from_secs(60);
+        let public = Duration::from_secs(15);
+        assert_eq!(
+            nat_discovery_refresh_interval(false, regular, public),
+            regular
+        );
+        assert_eq!(
+            nat_discovery_refresh_interval(true, regular, public),
+            public
+        );
+        assert_eq!(
+            nat_discovery_refresh_interval(true, public, regular),
+            public
+        );
     }
 
     #[test]
@@ -30225,6 +30280,19 @@ exec sleep 60
             (
                 vec!["iparsd", "agent", "--heartbeat-interval-seconds", "0"],
                 "--heartbeat-interval-seconds must be greater than zero",
+            ),
+            (
+                vec!["iparsd", "agent", "--nat-discovery-interval-seconds", "0"],
+                "--nat-discovery-interval-seconds must be greater than zero",
+            ),
+            (
+                vec![
+                    "iparsd",
+                    "agent",
+                    "--public-nat-discovery-interval-seconds",
+                    "0",
+                ],
+                "--public-nat-discovery-interval-seconds must be greater than zero",
             ),
             (
                 vec!["iparsd", "agent", "--runtime-command-timeout-seconds", "0"],
