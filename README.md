@@ -96,6 +96,19 @@ Agent state file. Public IP addresses and hostnames require HTTPS with a valid
 certificate, while HTTP is limited to loopback, private, link-local, and CGNAT
 addresses.
 
+The generated Linux installer also installs a checksum-pinned Caddy gateway in
+standby mode. When periodic STUN classification proves that the node owns a
+globally routable address, the Agent provisions a short-lived ACME IP
+certificate and serves the console at `https://<public-ip>/`. A Control Plane
+publishes that origin as a leased `web_ui` service only after probing it over
+public HTTPS. A private reclassification, stale classification, repeated STUN
+failure, or failed HTTPS probe removes the lease and returns the gateway to
+standby automatically. Public gateway requests can reach only UI assets,
+Keycloak device login, read-only endpoint status, and authenticated management
+proxy routes; the remaining Agent API stays loopback-only. Keycloak device
+authorization avoids dynamic redirect-URI and browser CORS exceptions when a
+node gains or changes its public IP.
+
 The operator enrollment API also accepts
 `"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
 exactly three uses. The returned command is identical on all three clean

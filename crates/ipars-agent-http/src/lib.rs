@@ -1,16 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use ipars_agent::{AgentError, AgentRuntime, FileAgentStateStore};
 use ipars_types::api::{
     packet_flow_destination_drop_reason, AgentManagedProcessState, AgentMetricsResponse,
@@ -24,9 +26,10 @@ use ipars_types::api::{
     RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
 use ipars_types::{canonical_bootstrap_endpoint_url, BootstrapEndpointKind, NodeId, PathState};
+use rand_core::{OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
 const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -35,6 +38,11 @@ const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const PUBLIC_WEB_GATEWAY_HEADER: &str = "x-heteronetwork-gateway-token";
+const MAX_PENDING_DEVICE_LOGINS: usize = 256;
+const MAX_DEVICE_AUTH_RESPONSE_BYTES: u64 = 256 * 1024;
+const MIN_DEVICE_LOGIN_START_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_DEVICE_LOGIN_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -53,6 +61,89 @@ pub struct AgentHttpState {
     local_web_ui_enabled: bool,
     web_ui_selection: Arc<RwLock<Option<String>>>,
     web_ui_health: Arc<RwLock<BTreeMap<String, bool>>>,
+    public_web_gateway: Option<PublicWebGatewayAccess>,
+    device_logins: Arc<Mutex<DeviceLoginState>>,
+}
+
+#[derive(Debug, Default)]
+struct DeviceLoginState {
+    pending: BTreeMap<String, PendingDeviceLogin>,
+    last_started_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct PendingDeviceLogin {
+    device_code: String,
+    token_endpoint: String,
+    client_id: String,
+    expires_at: Instant,
+    next_poll_at: Instant,
+    interval: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicWebGatewayPhase {
+    Disabled,
+    Standby,
+    Provisioning,
+    Ready,
+    Error,
+}
+
+impl PublicWebGatewayPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Standby => "standby",
+            Self::Provisioning => "provisioning",
+            Self::Ready => "ready",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicWebGatewayStatus {
+    pub phase: PublicWebGatewayPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<IpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for PublicWebGatewayStatus {
+    fn default() -> Self {
+        Self {
+            phase: PublicWebGatewayPhase::Disabled,
+            public_ip: None,
+            url: None,
+            last_error: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PublicWebGatewayAccess {
+    token: Arc<str>,
+    status: Arc<StdRwLock<PublicWebGatewayStatus>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublicWebGatewayRequest;
+
+impl std::fmt::Debug for PublicWebGatewayAccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicWebGatewayAccess")
+            .field("token", &"[REDACTED]")
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 impl AgentHttpState {
@@ -67,6 +158,8 @@ impl AgentHttpState {
             local_web_ui_enabled: false,
             web_ui_selection: Arc::new(RwLock::new(None)),
             web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
+            public_web_gateway: None,
+            device_logins: Arc::new(Mutex::new(DeviceLoginState::default())),
         }
     }
 
@@ -84,6 +177,8 @@ impl AgentHttpState {
             local_web_ui_enabled: false,
             web_ui_selection: Arc::new(RwLock::new(None)),
             web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
+            public_web_gateway: None,
+            device_logins: Arc::new(Mutex::new(DeviceLoginState::default())),
         }
     }
 
@@ -102,6 +197,8 @@ impl AgentHttpState {
             local_web_ui_enabled: false,
             web_ui_selection: Arc::new(RwLock::new(None)),
             web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
+            public_web_gateway: None,
+            device_logins: Arc::new(Mutex::new(DeviceLoginState::default())),
         }
     }
 
@@ -122,6 +219,18 @@ impl AgentHttpState {
 
     pub fn enable_local_web_ui(mut self, enabled: bool) -> Self {
         self.local_web_ui_enabled = enabled;
+        self
+    }
+
+    pub fn with_public_web_gateway(
+        mut self,
+        token: String,
+        status: Arc<StdRwLock<PublicWebGatewayStatus>>,
+    ) -> Self {
+        self.public_web_gateway = Some(PublicWebGatewayAccess {
+            token: Arc::from(token),
+            status,
+        });
         self
     }
 }
@@ -151,7 +260,7 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/healthz", get(healthz))
         .merge(protected);
     let app = if state.local_web_ui_enabled {
-        let local_web = Router::new()
+        let mut local_web = Router::new()
             .route("/", get(local_ui_root))
             .route("/ui", get(local_ui_index))
             .route("/ui/", get(local_ui_index))
@@ -166,8 +275,17 @@ pub fn router(state: AgentHttpState) -> Router {
             )
             .route("/v1/web-ui/bootstrap", post(bootstrap_web_ui_endpoint))
             .route("/v1/web-ui/select", post(select_web_ui_endpoint))
-            .route("/v1/admin/{*path}", any(proxy_management_request))
-            .route_layer(middleware::from_fn(require_loopback_web_ui_host));
+            .route("/v1/web-ui/auth/device", post(start_device_login))
+            .route("/v1/web-ui/auth/device/poll", post(poll_device_login))
+            .route("/v1/admin/{*path}", any(proxy_management_request));
+        local_web = if let Some(access) = state.public_web_gateway.clone() {
+            local_web.route_layer(middleware::from_fn_with_state(
+                access,
+                require_web_ui_access,
+            ))
+        } else {
+            local_web.route_layer(middleware::from_fn(require_loopback_web_ui_host))
+        };
         app.merge(local_web)
     } else {
         app
@@ -248,12 +366,327 @@ struct WebUiEndpointStatus {
 struct WebUiEndpointsResponse {
     selected_url: Option<String>,
     endpoints: Vec<WebUiEndpointStatus>,
+    public_gateway: PublicWebGatewayStatus,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WebUiEndpointRequest {
     endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceLoginStartResponse {
+    handle: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceLoginPollRequest {
+    handle: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationProviderResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    #[serde(default = "default_device_login_interval")]
+    interval: u64,
+}
+
+fn default_device_login_interval() -> u64 {
+    5
+}
+
+fn random_device_login_handle() -> String {
+    let mut bytes = [0_u8; 24];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn web_ui_config_string(config: &Value, key: &str) -> Result<String, ApiError> {
+    config
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 4096 && !value.contains(char::is_control)
+        })
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::BadRequest(format!("Web UI configuration does not provide {key}")))
+}
+
+async fn start_device_login(
+    State(state): State<AgentHttpState>,
+    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+) -> Result<Response, ApiError> {
+    let (_, config) = select_healthy_web_ui_with_scope(&state, public_gateway.is_some()).await?;
+    if config.get("provider").and_then(Value::as_str) != Some("keycloak") {
+        return Err(ApiError::BadRequest(
+            "device login requires the Keycloak provider".to_string(),
+        ));
+    }
+    let device_endpoint = web_ui_config_string(&config, "device_authorization_endpoint")?;
+    let token_endpoint = web_ui_config_string(&config, "token_endpoint")?;
+    let client_id = web_ui_config_string(&config, "client_id")?;
+    let scopes = web_ui_config_string(&config, "scopes")?;
+    let device_url = reqwest::Url::parse(&device_endpoint).map_err(|_| {
+        ApiError::BadRequest("device authorization endpoint is invalid".to_string())
+    })?;
+    let token_url = reqwest::Url::parse(&token_endpoint)
+        .map_err(|_| ApiError::BadRequest("OIDC token endpoint is invalid".to_string()))?;
+    if !matches!(device_url.scheme(), "http" | "https")
+        || device_url.origin() != token_url.origin()
+        || device_url.username() != ""
+        || device_url.password().is_some()
+        || token_url.username() != ""
+        || token_url.password().is_some()
+    {
+        return Err(ApiError::BadRequest(
+            "device authorization and token endpoints must be HTTP(S) endpoints on the same origin"
+                .to_string(),
+        ));
+    }
+    let now = Instant::now();
+    {
+        let mut logins = state.device_logins.lock().await;
+        logins.pending.retain(|_, pending| pending.expires_at > now);
+        if logins
+            .last_started_at
+            .is_some_and(|last| now.duration_since(last) < MIN_DEVICE_LOGIN_START_INTERVAL)
+        {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "device login was started too quickly"})),
+            )
+                .into_response());
+        }
+        if logins.pending.len() >= MAX_PENDING_DEVICE_LOGINS {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "too many device logins are pending"})),
+            )
+                .into_response());
+        }
+        logins.last_started_at = Some(now);
+    }
+
+    let response = state
+        .control_plane_client
+        .post(device_url.clone())
+        .header(header::ACCEPT, "application/json")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("scope", scopes.as_str()),
+        ])
+        .timeout(state.control_plane_request_timeout)
+        .send()
+        .await
+        .map_err(|error| {
+            AgentError::ControlPlaneClient(format!(
+                "Keycloak device authorization request failed: {error}"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(AgentError::ControlPlaneClient(format!(
+            "Keycloak device authorization request returned HTTP {}",
+            response.status()
+        ))
+        .into());
+    }
+    let provider: DeviceAuthorizationProviderResponse = read_bounded_json_response(
+        response,
+        MAX_DEVICE_AUTH_RESPONSE_BYTES,
+        "Keycloak device authorization",
+    )
+    .await?;
+    if provider.device_code.is_empty()
+        || provider.device_code.len() > 16 * 1024
+        || provider.user_code.is_empty()
+        || provider.user_code.len() > 256
+        || provider.expires_in < 30
+        || provider.expires_in > MAX_DEVICE_LOGIN_LIFETIME.as_secs()
+        || provider.interval == 0
+        || provider.interval > 30
+    {
+        return Err(AgentError::ControlPlaneClient(
+            "Keycloak returned invalid device authorization parameters".to_string(),
+        )
+        .into());
+    }
+    for verification_url in std::iter::once(provider.verification_uri.as_str())
+        .chain(provider.verification_uri_complete.as_deref())
+    {
+        let parsed = reqwest::Url::parse(verification_url).map_err(|_| {
+            AgentError::ControlPlaneClient(
+                "Keycloak returned an invalid device verification URL".to_string(),
+            )
+        })?;
+        if parsed.origin() != device_url.origin() || parsed.scheme() != device_url.scheme() {
+            return Err(AgentError::ControlPlaneClient(
+                "Keycloak returned a device verification URL on an unexpected origin".to_string(),
+            )
+            .into());
+        }
+    }
+    let handle = random_device_login_handle();
+    let interval = Duration::from_secs(provider.interval);
+    let pending = PendingDeviceLogin {
+        device_code: provider.device_code,
+        token_endpoint,
+        client_id,
+        expires_at: now + Duration::from_secs(provider.expires_in),
+        next_poll_at: now + interval,
+        interval,
+    };
+    state
+        .device_logins
+        .lock()
+        .await
+        .pending
+        .insert(handle.clone(), pending);
+    Ok(Json(DeviceLoginStartResponse {
+        handle,
+        user_code: provider.user_code,
+        verification_uri: provider.verification_uri,
+        verification_uri_complete: provider.verification_uri_complete,
+        expires_in: provider.expires_in,
+        interval: provider.interval,
+    })
+    .into_response())
+}
+
+async fn poll_device_login(
+    State(state): State<AgentHttpState>,
+    Json(request): Json<DeviceLoginPollRequest>,
+) -> Result<Response, ApiError> {
+    if request.handle.is_empty()
+        || request.handle.len() > 128
+        || request.handle.contains(char::is_whitespace)
+    {
+        return Err(ApiError::BadRequest(
+            "device login handle is invalid".to_string(),
+        ));
+    }
+    let now = Instant::now();
+    let mut pending = {
+        let mut logins = state.device_logins.lock().await;
+        logins.pending.retain(|_, pending| pending.expires_at > now);
+        let Some(pending) = logins.pending.remove(&request.handle) else {
+            return Ok((
+                StatusCode::GONE,
+                Json(json!({"error": "device login expired or was not found"})),
+            )
+                .into_response());
+        };
+        pending
+    };
+    if now < pending.next_poll_at {
+        let retry_after = pending.next_poll_at.duration_since(now).as_secs().max(1);
+        state
+            .device_logins
+            .lock()
+            .await
+            .pending
+            .insert(request.handle, pending);
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"status": "pending", "retry_after_seconds": retry_after})),
+        )
+            .into_response());
+    }
+    let response = match state
+        .control_plane_client
+        .post(&pending.token_endpoint)
+        .header(header::ACCEPT, "application/json")
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("client_id", pending.client_id.as_str()),
+            ("device_code", pending.device_code.as_str()),
+        ])
+        .timeout(state.control_plane_request_timeout)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            pending.next_poll_at = Instant::now() + pending.interval;
+            state
+                .device_logins
+                .lock()
+                .await
+                .pending
+                .insert(request.handle, pending);
+            return Err(AgentError::ControlPlaneClient(format!(
+                "Keycloak device token request failed: {error}"
+            ))
+            .into());
+        }
+    };
+    let status = response.status();
+    let body: Value = read_bounded_json_response(
+        response,
+        MAX_DEVICE_AUTH_RESPONSE_BYTES,
+        "Keycloak device token",
+    )
+    .await?;
+    if status.is_success() {
+        let access_token = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
+            .ok_or_else(|| {
+                AgentError::ControlPlaneClient(
+                    "Keycloak device token response omitted the access token".to_string(),
+                )
+            })?;
+        return Ok(
+            Json(json!({"status": "complete", "access_token": access_token})).into_response(),
+        );
+    }
+    let error = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if matches!(error, "authorization_pending" | "slow_down") {
+        if error == "slow_down" {
+            pending.interval = pending.interval.saturating_add(Duration::from_secs(5));
+        }
+        let retry_after = pending.interval.as_secs().max(1);
+        pending.next_poll_at = Instant::now() + pending.interval;
+        if pending.expires_at > pending.next_poll_at {
+            state
+                .device_logins
+                .lock()
+                .await
+                .pending
+                .insert(request.handle, pending);
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"status": "pending", "retry_after_seconds": retry_after})),
+        )
+            .into_response());
+    }
+    let response_status = if matches!(error, "access_denied" | "expired_token") {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    Ok((
+        response_status,
+        Json(json!({"error": "Keycloak device authorization was rejected"})),
+    )
+        .into_response())
 }
 
 async fn require_loopback_web_ui_host(request: Request, next: Next) -> Response {
@@ -293,6 +726,90 @@ async fn require_loopback_web_ui_host(request: Request, next: Next) -> Response 
     next.run(request).await
 }
 
+async fn require_web_ui_access(
+    State(access): State<PublicWebGatewayAccess>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(host) = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return local_web_ui_rejection("Host header is required");
+    };
+    let Ok(http_host_url) = reqwest::Url::parse(&format!("http://{host}")) else {
+        return local_web_ui_rejection("Host header is invalid");
+    };
+    if url_host_is_loopback(&http_host_url) {
+        return require_loopback_web_ui_host(request, next).await;
+    }
+
+    let token_header = HeaderName::from_static(PUBLIC_WEB_GATEWAY_HEADER);
+    let provided = request
+        .headers()
+        .get(&token_header)
+        .and_then(|value| value.to_str().ok());
+    if !provided.is_some_and(|provided| agent_api_token_matches(&access.token, provided)) {
+        return local_web_ui_rejection("public Web UI gateway authentication was rejected");
+    }
+    let gateway = access
+        .status
+        .read()
+        .map(|status| status.clone())
+        .unwrap_or_default();
+    let Some(expected_url) = gateway.url.as_deref() else {
+        return local_web_ui_rejection("public Web UI gateway is not active");
+    };
+    let Ok(expected) = reqwest::Url::parse(expected_url) else {
+        return local_web_ui_rejection("public Web UI gateway state is invalid");
+    };
+    let Ok(actual) = reqwest::Url::parse(&format!("https://{host}/")) else {
+        return local_web_ui_rejection("public Web UI Host header is invalid");
+    };
+    if actual.origin() != expected.origin() {
+        return local_web_ui_rejection(
+            "public Web UI Host header does not match the active gateway",
+        );
+    }
+    if request
+        .headers()
+        .get(HeaderName::from_static("sec-fetch-site"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return local_web_ui_rejection("cross-site public Web UI requests are rejected");
+    }
+    if let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let Ok(origin_url) = reqwest::Url::parse(origin) else {
+            return local_web_ui_rejection("Origin header is invalid");
+        };
+        if origin_url.origin() != expected.origin() {
+            return local_web_ui_rejection("cross-origin public Web UI requests are rejected");
+        }
+    }
+    let path = request.uri().path();
+    let public_route_allowed = match (request.method(), path) {
+        (&Method::GET, "/" | "/ui" | "/ui/") => true,
+        (&Method::GET, path) if path.starts_with("/ui/") => true,
+        (&Method::GET, "/v1/web-ui/endpoints") => true,
+        (&Method::POST, "/v1/web-ui/auth/device") => true,
+        (&Method::POST, "/v1/web-ui/auth/device/poll") => true,
+        (_, path) if path.starts_with("/v1/admin/") => true,
+        _ => false,
+    };
+    if !public_route_allowed {
+        return local_web_ui_rejection("route is only available from the local Agent Web UI");
+    }
+    request.headers_mut().remove(token_header);
+    request.extensions_mut().insert(PublicWebGatewayRequest);
+    next.run(request).await
+}
+
 fn local_web_ui_rejection(message: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -320,6 +837,11 @@ fn parse_url_ip_addr(host: &str) -> Option<IpAddr> {
 
 fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
     let runtime_state = state.runtime.state();
+    let own_public_gateway_url = state
+        .public_web_gateway
+        .as_ref()
+        .and_then(|access| access.status.read().ok()?.url.clone())
+        .and_then(|url| normalize_web_ui_base_url(&url).ok());
     let mut candidates = Vec::new();
     for endpoint in runtime_state
         .bootstrap_endpoints
@@ -363,6 +885,9 @@ fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
         .into_iter()
         .filter_map(|mut candidate| {
             candidate.url = normalize_web_ui_base_url(&candidate.url).ok()?;
+            if own_public_gateway_url.as_deref() == Some(candidate.url.as_str()) {
+                return None;
+            }
             seen.insert(candidate.url.clone()).then_some(candidate)
         })
         .collect()
@@ -525,7 +1050,17 @@ async fn selected_web_ui_url(state: &AgentHttpState) -> Option<String> {
 async fn select_healthy_web_ui(
     state: &AgentHttpState,
 ) -> Result<(WebUiCandidate, Value), AgentError> {
-    let candidates = web_ui_candidates(state);
+    select_healthy_web_ui_with_scope(state, false).await
+}
+
+async fn select_healthy_web_ui_with_scope(
+    state: &AgentHttpState,
+    control_plane_only: bool,
+) -> Result<(WebUiCandidate, Value), AgentError> {
+    let candidates = web_ui_candidates(state)
+        .into_iter()
+        .filter(|candidate| !control_plane_only || candidate.source.starts_with("control_plane_"))
+        .collect::<Vec<_>>();
     let expected_cluster_id = expected_web_ui_cluster_id(state);
     if candidates.is_empty() {
         return Err(AgentError::ControlPlaneClient(
@@ -646,6 +1181,14 @@ async fn probe_web_ui_endpoints(state: &AgentHttpState) -> WebUiEndpointsRespons
     WebUiEndpointsResponse {
         selected_url: selected,
         endpoints,
+        public_gateway: match &state.public_web_gateway {
+            Some(access) => access
+                .status
+                .read()
+                .map(|status| status.clone())
+                .unwrap_or_default(),
+            None => PublicWebGatewayStatus::default(),
+        },
     }
 }
 
@@ -847,11 +1390,27 @@ fn apply_local_ui_security_headers(
     }
 }
 
-async fn local_ui_config(State(state): State<AgentHttpState>) -> Json<Value> {
-    match select_healthy_web_ui(&state).await {
+async fn local_ui_config(
+    State(state): State<AgentHttpState>,
+    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+) -> Json<Value> {
+    match select_healthy_web_ui_with_scope(&state, public_gateway.is_some()).await {
         Ok((candidate, mut config)) => {
             if let Some(config) = config.as_object_mut() {
                 config.insert("login_endpoint".to_string(), Value::Null);
+                if config
+                    .get("device_authorization_endpoint")
+                    .is_some_and(|endpoint| endpoint.is_string())
+                {
+                    config.insert(
+                        "device_login_endpoint".to_string(),
+                        Value::String("/v1/web-ui/auth/device".to_string()),
+                    );
+                    config.insert(
+                        "device_login_poll_endpoint".to_string(),
+                        Value::String("/v1/web-ui/auth/device/poll".to_string()),
+                    );
+                }
                 config.insert("local_agent".to_string(), Value::Bool(true));
                 config.insert("bootstrap_required".to_string(), Value::Bool(false));
                 config.insert(
@@ -874,6 +1433,9 @@ async fn local_ui_config(State(state): State<AgentHttpState>) -> Json<Value> {
             "client_id": null,
             "scopes": null,
             "authorization_endpoint": null,
+            "device_authorization_endpoint": null,
+            "device_login_endpoint": null,
+            "device_login_poll_endpoint": null,
             "token_endpoint": null,
             "logout_endpoint": null,
             "login_endpoint": null,
@@ -900,11 +1462,18 @@ async fn proxy_management_request(
     State(state): State<AgentHttpState>,
     request: Request,
 ) -> Response {
+    let public_gateway = request
+        .extensions()
+        .get::<PublicWebGatewayRequest>()
+        .is_some();
     let proxy_request = match management_proxy_request(request).await {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
-    let mut candidates = web_ui_candidates(&state);
+    let mut candidates = web_ui_candidates(&state)
+        .into_iter()
+        .filter(|candidate| !public_gateway || candidate.source.starts_with("control_plane_"))
+        .collect::<Vec<_>>();
     let selected = selected_web_ui_url(&state).await;
     candidates.sort_by_key(|candidate| {
         if selected.as_deref() == Some(candidate.url.as_str()) {
@@ -951,7 +1520,7 @@ async fn proxy_management_request(
         .into_response();
     }
 
-    let candidate = match select_healthy_web_ui(&state).await {
+    let candidate = match select_healthy_web_ui_with_scope(&state, public_gateway).await {
         Ok((candidate, _)) => candidate,
         Err(error) => return ApiError::Agent(error).into_response(),
     };
@@ -1347,6 +1916,43 @@ async fn append_web_ui_prometheus_metrics(body: &mut String, state: &AgentHttpSt
         body,
         "ipars_agent_web_ui_selected{{node_id=\"{node_id}\"}} {}",
         u8::from(selected)
+    );
+    let gateway = match &state.public_web_gateway {
+        Some(access) => access
+            .status
+            .read()
+            .map(|status| status.clone())
+            .unwrap_or_default(),
+        None => PublicWebGatewayStatus::default(),
+    };
+    prometheus_line!(
+        body,
+        "# HELP ipars_agent_public_web_gateway_phase Current dynamic public Web gateway phase."
+    );
+    prometheus_line!(body, "# TYPE ipars_agent_public_web_gateway_phase gauge");
+    for phase in [
+        PublicWebGatewayPhase::Disabled,
+        PublicWebGatewayPhase::Standby,
+        PublicWebGatewayPhase::Provisioning,
+        PublicWebGatewayPhase::Ready,
+        PublicWebGatewayPhase::Error,
+    ] {
+        prometheus_line!(
+            body,
+            "ipars_agent_public_web_gateway_phase{{node_id=\"{node_id}\",phase=\"{}\"}} {}",
+            phase.as_str(),
+            u8::from(gateway.phase == phase)
+        );
+    }
+    prometheus_line!(
+        body,
+        "# HELP ipars_agent_public_web_gateway_ready Whether the dynamic public Web gateway is externally ready."
+    );
+    prometheus_line!(body, "# TYPE ipars_agent_public_web_gateway_ready gauge");
+    prometheus_line!(
+        body,
+        "ipars_agent_public_web_gateway_ready{{node_id=\"{node_id}\"}} {}",
+        u8::from(gateway.phase == PublicWebGatewayPhase::Ready)
     );
 }
 
@@ -2532,9 +3138,9 @@ mod tests {
         RotateWireGuardKeyResponse,
     };
     use ipars_types::{
-        CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
-        NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, PeerPathKey, Role,
-        Route, TokenPolicy, VpnIp,
+        BootstrapEndpoint, CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate,
+        EndpointCandidateKind, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState,
+        PeerPathKey, Role, Route, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -2851,25 +3457,52 @@ mod tests {
         admin_status: StatusCode,
         admin_calls: Arc<AtomicUsize>,
         authorization: Arc<tokio::sync::Mutex<Option<String>>>,
+        base_url: String,
+        device_token_calls: Arc<AtomicUsize>,
     }
 
-    async fn web_ui_test_config() -> Json<Value> {
+    async fn web_ui_test_config(State(state): State<WebUiTestBackend>) -> Json<Value> {
         Json(json!({
             "cluster_id": "cluster-a",
             "enabled": true,
             "auth_enabled": true,
             "operator_token_enabled": false,
             "provider": "keycloak",
-            "issuer_url": "http://127.0.0.1:18080/realms/heteronetwork",
+            "issuer_url": format!("{}/realms/heteronetwork", state.base_url),
             "client_id": "heteronetwork-web",
             "scopes": "openid profile email",
-            "authorization_endpoint": "http://127.0.0.1:18080/realms/heteronetwork/protocol/openid-connect/auth",
-            "token_endpoint": "http://127.0.0.1:18080/realms/heteronetwork/protocol/openid-connect/token",
-            "logout_endpoint": "http://127.0.0.1:18080/realms/heteronetwork/protocol/openid-connect/logout",
+            "authorization_endpoint": format!("{}/realms/heteronetwork/protocol/openid-connect/auth", state.base_url),
+            "device_authorization_endpoint": format!("{}/realms/heteronetwork/protocol/openid-connect/auth/device", state.base_url),
+            "token_endpoint": format!("{}/realms/heteronetwork/protocol/openid-connect/token", state.base_url),
+            "logout_endpoint": format!("{}/realms/heteronetwork/protocol/openid-connect/logout", state.base_url),
             "login_endpoint": "/ui/login",
             "node_enrollment_enabled": true,
             "client_enrollment_enabled": true
         }))
+    }
+
+    async fn web_ui_test_device_authorization(
+        State(state): State<WebUiTestBackend>,
+    ) -> Json<Value> {
+        Json(json!({
+            "device_code": "device-code",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": format!("{}/verify", state.base_url),
+            "verification_uri_complete": format!("{}/verify?user_code=ABCD-EFGH", state.base_url),
+            "expires_in": 60,
+            "interval": 1
+        }))
+    }
+
+    async fn web_ui_test_device_token(State(state): State<WebUiTestBackend>) -> Response {
+        if state.device_token_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "authorization_pending"})),
+            )
+                .into_response();
+        }
+        Json(json!({"access_token": "device-access-token"})).into_response()
     }
 
     async fn web_ui_test_admin(
@@ -2894,19 +3527,30 @@ mod tests {
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
+        let base_url = format!("http://{addr}");
         let state = WebUiTestBackend {
             admin_status,
             admin_calls: Arc::new(AtomicUsize::new(0)),
             authorization: Arc::new(tokio::sync::Mutex::new(None)),
+            base_url: base_url.clone(),
+            device_token_calls: Arc::new(AtomicUsize::new(0)),
         };
         let app = Router::new()
             .route("/ui/config", get(web_ui_test_config))
             .route("/v1/admin/overview", any(web_ui_test_admin))
+            .route(
+                "/realms/heteronetwork/protocol/openid-connect/auth/device",
+                post(web_ui_test_device_authorization),
+            )
+            .route(
+                "/realms/heteronetwork/protocol/openid-connect/token",
+                post(web_ui_test_device_token),
+            )
             .with_state(state.clone());
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Ok((format!("http://{addr}"), state, task))
+        Ok((base_url, state, task))
     }
 
     #[test]
@@ -2931,6 +3575,90 @@ mod tests {
             normalize_web_ui_base_url("https://203.0.113.10:8443/ui/"),
             Ok("https://203.0.113.10:8443".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn public_web_gateway_requires_proxy_auth_and_limits_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut node_state = AgentNodeState::generate(Utc::now());
+        node_state.bootstrap_endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::WebUi,
+            url: "https://203.0.113.10".to_string(),
+        });
+        let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
+        let status = Arc::new(StdRwLock::new(PublicWebGatewayStatus {
+            phase: PublicWebGatewayPhase::Ready,
+            public_ip: Some("203.0.113.10".parse()?),
+            url: Some("https://203.0.113.10/".to_string()),
+            last_error: None,
+            updated_at: Utc::now(),
+        }));
+        let state = AgentHttpState::new(runtime)
+            .enable_local_web_ui(true)
+            .with_public_web_gateway("gateway-secret".to_string(), status);
+        assert!(web_ui_candidates(&state).is_empty());
+        let app = router(state);
+
+        let missing_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/app.js")
+                    .header(header::HOST, "203.0.113.10")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing_token.status(), StatusCode::FORBIDDEN);
+
+        let public_asset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/app.js")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(public_asset.status(), StatusCode::OK);
+
+        let mutation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/select")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(header::ORIGIN, "https://203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"endpoint":"https://example.com"}"#))?,
+            )
+            .await?;
+        assert_eq!(mutation.status(), StatusCode::FORBIDDEN);
+
+        let wrong_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/app.js")
+                    .header(header::HOST, "203.0.113.11")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+
+        let loopback_asset = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/app.js")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(loopback_asset.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[tokio::test]
@@ -3011,6 +3739,11 @@ mod tests {
         assert_eq!(config["bootstrap_required"], false);
         assert_eq!(config["selected_web_ui_endpoint"], backend_url);
         assert!(config["login_endpoint"].is_null());
+        assert_eq!(config["device_login_endpoint"], "/v1/web-ui/auth/device");
+        assert_eq!(
+            config["device_login_poll_endpoint"],
+            "/v1/web-ui/auth/device/poll"
+        );
 
         backend_task.abort();
         let _ = std::fs::remove_dir_all(state_dir);
@@ -3045,6 +3778,70 @@ mod tests {
         assert_eq!(config["bootstrap_required"], false);
         assert_eq!(config["selected_web_ui_endpoint"], backend_url);
 
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_web_ui_completes_keycloak_device_authorization(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, backend, backend_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(
+            AgentHttpState::with_control_plane_urls(runtime, vec![backend_url])
+                .enable_local_web_ui(true),
+        );
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(start.status(), StatusCode::OK);
+        let start: Value = serde_json::from_slice(&to_bytes(start.into_body(), usize::MAX).await?)?;
+        assert_eq!(start["user_code"], "ABCD-EFGH");
+        let handle = start["handle"]
+            .as_str()
+            .ok_or("device response omitted handle")?;
+
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        let first_poll = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device/poll")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({"handle": handle}))?))?,
+            )
+            .await?;
+        assert_eq!(first_poll.status(), StatusCode::ACCEPTED);
+
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        let second_poll = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device/poll")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({"handle": handle}))?))?,
+            )
+            .await?;
+        assert_eq!(second_poll.status(), StatusCode::OK);
+        let second_poll: Value =
+            serde_json::from_slice(&to_bytes(second_poll.into_body(), usize::MAX).await?)?;
+        assert_eq!(second_poll["access_token"], "device-access-token");
+        assert_eq!(backend.device_token_calls.load(Ordering::SeqCst), 2);
         backend_task.abort();
         Ok(())
     }

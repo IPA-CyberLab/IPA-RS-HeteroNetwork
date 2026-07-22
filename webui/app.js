@@ -74,6 +74,13 @@
     "Sign in to your network": "ネットワークにログイン",
     "Use the configured identity provider to continue.": "設定済みの ID プロバイダーで続行してください。",
     "Sign in with SSO": "SSO でログイン",
+    "Complete sign-in with code": "次のコードでログインを完了してください:",
+    "Device sign-in expired": "デバイスログインの有効期限が切れました",
+    "Device sign-in failed": "デバイスログインに失敗しました",
+    "Gateway ready": "ゲートウェイ稼働中",
+    "Gateway provisioning": "ゲートウェイ準備中",
+    "Gateway standby": "ゲートウェイ待機中",
+    "Gateway error": "ゲートウェイ異常",
     "Operator token": "オペレータートークン",
     "Paste a bearer token": "Bearer トークンを貼り付け",
     "Connect": "接続",
@@ -339,6 +346,7 @@
     webUi: {
       endpoints: [],
       selectedUrl: null,
+      publicGateway: null,
       loading: false
     },
     enrollment: {
@@ -771,8 +779,68 @@
     });
   }
 
+  function deviceLoginPoll(handle, endpoint, delaySeconds, expiresAt) {
+    if (Date.now() >= expiresAt) return Promise.reject(new Error(t("Device sign-in expired")));
+    return new Promise(function (resolve) {
+      setTimeout(resolve, Math.max(1, delaySeconds) * 1000);
+    }).then(function () {
+      return fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ handle: handle })
+      });
+    }).then(async function (response) {
+      var body = {};
+      try { body = await response.json(); } catch (_) { body = {}; }
+      if (response.ok && body.status === "complete" && body.access_token) return body.access_token;
+      if ((response.status === 202 || response.status === 429) && body.status === "pending") {
+        return deviceLoginPoll(handle, endpoint, body.retry_after_seconds || delaySeconds, expiresAt);
+      }
+      throw new Error(body.error || (t("Device sign-in failed") + " (" + response.status + ")"));
+    });
+  }
+
+  function startDeviceLogin() {
+    var authWindow = window.open("about:blank", "heteronetwork-device-login");
+    return fetch(state.config.device_login_endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(async function (response) {
+      var body = {};
+      try { body = await response.json(); } catch (_) { body = {}; }
+      if (!response.ok) throw new Error(body.error || (t("Device sign-in failed") + " (" + response.status + ")"));
+      var verificationUrl = body.verification_uri_complete || body.verification_uri;
+      if (authWindow) {
+        authWindow.opener = null;
+        authWindow.location.replace(verificationUrl);
+      } else {
+        window.open(verificationUrl, "_blank", "noopener,noreferrer");
+      }
+      $("auth-error").textContent = t("Complete sign-in with code") + " " + body.user_code;
+      return deviceLoginPoll(
+        body.handle,
+        state.config.device_login_poll_endpoint,
+        body.interval || 5,
+        Date.now() + Math.max(30, body.expires_in || 600) * 1000
+      );
+    }).then(function (accessToken) {
+      state.token = accessToken;
+      sessionStorage.setItem("heteronetwork_access_token", accessToken);
+      $("auth-error").textContent = "";
+      return loadOverview();
+    }).catch(function (error) {
+      if (authWindow && !authWindow.closed) authWindow.close();
+      throw error;
+    });
+  }
+
   function startLogin() {
-    if (!state.config || !state.config.authorization_endpoint) return Promise.resolve();
+    if (!state.config) return Promise.resolve();
+    if (state.config.device_login_endpoint && state.config.device_login_poll_endpoint) {
+      return startDeviceLogin();
+    }
+    if (!state.config.authorization_endpoint) return Promise.resolve();
     if (state.config.login_endpoint) {
       location.assign(state.config.login_endpoint);
       return Promise.resolve();
@@ -887,6 +955,21 @@
     }).join("") : '<option value="">' + t("Not connected") + "</option>";
     var selected = endpoints.find(function (endpoint) { return endpoint.url === select.value; });
     $("web-ui-endpoint-remove").hidden = !selected || selected.source !== "manual_seed";
+    var gateway = state.webUi.publicGateway;
+    var gatewayState = $("public-gateway-state");
+    gatewayState.hidden = !gateway || gateway.phase === "disabled";
+    if (!gatewayState.hidden) {
+      var gatewayLabels = {
+        ready: "Gateway ready",
+        provisioning: "Gateway provisioning",
+        standby: "Gateway standby",
+        error: "Gateway error"
+      };
+      gatewayState.classList.toggle("online", gateway.phase === "ready");
+      gatewayState.classList.toggle("offline", gateway.phase !== "ready");
+      gatewayState.lastElementChild.textContent = t(gatewayLabels[gateway.phase] || "Gateway standby");
+      gatewayState.title = gateway.last_error || gateway.url || "";
+    }
   }
 
   function loadWebUiEndpoints() {
@@ -896,6 +979,7 @@
     return localWebUiApi("/v1/web-ui/endpoints").then(function (directory) {
       state.webUi.endpoints = directory.endpoints || [];
       state.webUi.selectedUrl = directory.selected_url || null;
+      state.webUi.publicGateway = directory.public_gateway || null;
     }).catch(function (error) {
       $("auth-error").textContent = error.message;
     }).finally(function () {

@@ -76,6 +76,17 @@ Each public Control Plane renews a bounded lease in the shared store for its Con
 
 The public application tier is active-active, not a full mesh between every edge node. Agents negotiate data-plane paths lazily and contact the ordered public service set only when joining, refreshing state, or negotiating a path. `/v1/admin/services`, `ipars_control_plane_ha_ready`, per-service endpoint gauges, and the Web UI show the current lease view. The systemd deployment binds Signal, STUN, and Relay liveness to the local Control Plane so a partially failed host stops renewing its whole-node lease. PostgreSQL remains a separate durability boundary and must be deployed as a managed or quorum-backed HA service; two public application hosts alone cannot safely provide database election quorum.
 
+Web UI ingress is also lease-driven. Every enrolled Agent continually reclassifies
+its NAT state. A fresh, supported no-NAT public classification causes its local
+Caddy sidecar to request a short-lived ACME certificate for the IP address and
+proxy a restricted UI route set to the loopback Agent. The Control Plane derives
+the IP only from the validated signed heartbeat, probes `https://IP/ui/config`
+without redirects or environment proxies, and then creates a 45-second
+`web_ui` lease. Private, stale, or unreachable classifications delete that
+instance immediately; missed heartbeats expire it. Agents exclude their own
+gateway from upstream selection, and public gateway requests use direct Control
+Plane origins so two gateways cannot form a proxy cycle.
+
 Signed heartbeat, Signal registration, and path-negotiation reports refresh the lease timestamps of locally observed STUN candidates while the active WireGuard endpoint remains configured, preventing a healthy agent from disappearing solely because the endpoint-candidate TTL outlasts its one-time startup observation. A restarted Agent restores its own accepted endpoint candidates from the owner-only registered-node state before those loops start, so a pre-existing kernel WireGuard socket cannot leave Signal registration with an empty candidate set when it prevents rebinding the startup STUN socket.
 
 Multi-server STUN probing skips unavailable endpoints while retaining successful observations from the same bound socket, and selects a responding server for filtering probes. Control Plane, Signal, and STUN replicas must use independent failure domains or network namespaces: processes sharing a failed namespace can remain scheduled while every service socket in that namespace is unreachable.

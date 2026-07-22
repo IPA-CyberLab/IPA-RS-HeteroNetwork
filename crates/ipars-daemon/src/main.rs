@@ -9,7 +9,7 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -18,6 +18,8 @@ use axum::Router;
 use aya::maps::{MapData, RingBuf};
 use aya::programs::{CgroupAttachMode as AyaCgroupAttachMode, CgroupSockAddr, SockOps, TracePoint};
 use aya::{Ebpf, EbpfLoader};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use ipars_agent::{
@@ -31,13 +33,16 @@ use ipars_agent::{
     UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerInventorySource,
     WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
 };
-use ipars_agent_http::{router as agent_router, AgentHttpState};
+use ipars_agent_http::{
+    router as agent_router, AgentHttpState, PublicWebGatewayPhase, PublicWebGatewayStatus,
+};
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{
-    router, ControlPlaneHttpState, NodeEnrollmentConfig, WebAuthProvider, WebUiAuthConfig,
+    router, ControlPlaneHttpState, DynamicWebGatewayConfig, NodeEnrollmentConfig, WebAuthProvider,
+    WebUiAuthConfig,
 };
 #[cfg(test)]
 use ipars_crypto::verify_signal_node_upsert_signature;
@@ -97,11 +102,11 @@ use ipars_types::ebpf::{
 use ipars_types::{
     endpoint_addr_is_usable, http_url_is_usable_endpoint, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
-    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
-    NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState, RelayCapability,
-    Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
-    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_PATH_SCORE_REASONS,
+    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatConnectivityState,
+    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
+    PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
+    TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_PATH_SCORE_REASONS,
 };
 use netlink_sys::{
     protocols::{NETLINK_GENERIC, NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG},
@@ -116,6 +121,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource,
 };
+use rand_core::{OsRng, RngCore};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
@@ -407,6 +413,31 @@ struct ControlPlaneArgs {
     web_oidc_client_id: String,
     #[arg(long, env = "HETERONETWORK_WEB_PUBLIC_URL")]
     web_public_url: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_DYNAMIC_WEB_GATEWAY_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    dynamic_web_gateway_enabled: bool,
+    #[arg(
+        long,
+        env = "HETERONETWORK_DYNAMIC_WEB_GATEWAY_PROBE_TIMEOUT_SECONDS",
+        default_value_t = 5
+    )]
+    dynamic_web_gateway_probe_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_DYNAMIC_WEB_GATEWAY_LEASE_TTL_SECONDS",
+        default_value_t = 45
+    )]
+    dynamic_web_gateway_lease_ttl_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_DYNAMIC_WEB_GATEWAY_CLASSIFICATION_MAX_AGE_SECONDS",
+        default_value_t = 45
+    )]
+    dynamic_web_gateway_classification_max_age_seconds: u64,
     #[arg(
         long,
         env = "HETERONETWORK_NODE_ENROLLMENT_ENABLED",
@@ -756,9 +787,45 @@ struct AgentArgs {
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS",
-        default_value_t = 60
+        default_value_t = 15
     )]
     nat_discovery_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_NAT_DISCOVERY_FAILURE_THRESHOLD",
+        default_value_t = 2
+    )]
+    nat_discovery_failure_threshold: u32,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED",
+        default_value_t = true
+    )]
+    public_web_gateway_enabled: bool,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ADMIN_SOCKET",
+        default_value = "/run/heteronetwork-gateway/admin.sock"
+    )]
+    public_web_gateway_admin_socket: PathBuf,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS",
+        default_value_t = 5
+    )]
+    public_web_gateway_reconcile_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_PROBE_TIMEOUT_SECONDS",
+        default_value_t = 10
+    )]
+    public_web_gateway_probe_timeout_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CLASSIFICATION_MAX_AGE_SECONDS",
+        default_value_t = 45
+    )]
+    public_web_gateway_classification_max_age_seconds: u64,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT",
@@ -1845,6 +1912,34 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.nat_discovery_interval_seconds,
         "--nat-discovery-interval-seconds",
     )?;
+    anyhow::ensure!(
+        args.nat_discovery_failure_threshold > 0,
+        "--nat-discovery-failure-threshold must be greater than zero"
+    );
+    if args.public_web_gateway_enabled {
+        anyhow::ensure!(
+            args.public_web_gateway_admin_socket.is_absolute(),
+            "--public-web-gateway-admin-socket must be an absolute path"
+        );
+        validate_positive_seconds(
+            args.public_web_gateway_reconcile_interval_seconds,
+            "--public-web-gateway-reconcile-interval-seconds",
+        )?;
+        validate_bounded_u64(
+            args.public_web_gateway_probe_timeout_seconds,
+            "--public-web-gateway-probe-timeout-seconds",
+            MAX_AGENT_HTTP_TIMEOUT_SECONDS,
+        )?;
+        validate_positive_seconds(
+            args.public_web_gateway_classification_max_age_seconds,
+            "--public-web-gateway-classification-max-age-seconds",
+        )?;
+        anyhow::ensure!(
+            args.public_web_gateway_classification_max_age_seconds
+                >= args.nat_discovery_interval_seconds,
+            "--public-web-gateway-classification-max-age-seconds must not be shorter than --nat-discovery-interval-seconds"
+        );
+    }
     if args.apply_peer_map {
         validate_positive_seconds(
             args.peer_map_poll_interval_seconds,
@@ -4282,6 +4377,18 @@ where
 {
     validate_control_plane_runtime_config(&args)?;
     let service_lease = control_plane_service_lease_config(&args)?;
+    let dynamic_web_gateway = args
+        .dynamic_web_gateway_enabled
+        .then(|| {
+            DynamicWebGatewayConfig::new(
+                Duration::from_secs(args.dynamic_web_gateway_probe_timeout_seconds),
+                Duration::from_secs(args.dynamic_web_gateway_lease_ttl_seconds),
+                Duration::from_secs(args.dynamic_web_gateway_classification_max_age_seconds),
+            )
+        })
+        .transpose()
+        .map_err(anyhow::Error::msg)
+        .context("dynamic Web gateway configuration")?;
     let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
     let node_enrollment = control_plane_node_enrollment_config(&args)?;
     let web_ui_auth = if args.web_ui_enabled {
@@ -4370,6 +4477,9 @@ where
     }
     if let Some(enrollment) = node_enrollment {
         http_state = http_state.enable_node_enrollment(enrollment);
+    }
+    if let Some(dynamic_web_gateway) = dynamic_web_gateway {
+        http_state = http_state.enable_dynamic_web_gateway(dynamic_web_gateway);
     }
     let result = serve_router(args.listen, router(http_state)).await;
     if let Some(task) = service_lease_task {
@@ -4517,6 +4627,29 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
         args.service_lease_renew_interval_seconds < args.service_lease_ttl_seconds,
         "--service-lease-renew-interval-seconds must be less than --service-lease-ttl-seconds"
     );
+    if args.dynamic_web_gateway_enabled {
+        anyhow::ensure!(
+            args.web_ui_enabled,
+            "--dynamic-web-gateway-enabled requires --web-ui-enabled=true"
+        );
+        validate_bounded_u64(
+            args.dynamic_web_gateway_probe_timeout_seconds,
+            "--dynamic-web-gateway-probe-timeout-seconds",
+            MAX_AGENT_HTTP_TIMEOUT_SECONDS,
+        )?;
+        validate_positive_seconds(
+            args.dynamic_web_gateway_lease_ttl_seconds,
+            "--dynamic-web-gateway-lease-ttl-seconds",
+        )?;
+        validate_positive_seconds(
+            args.dynamic_web_gateway_classification_max_age_seconds,
+            "--dynamic-web-gateway-classification-max-age-seconds",
+        )?;
+        anyhow::ensure!(
+            args.dynamic_web_gateway_lease_ttl_seconds <= 300,
+            "--dynamic-web-gateway-lease-ttl-seconds must be at most 300"
+        );
+    }
     if let Some(instance_id) = args.service_instance_id.as_deref() {
         validate_daemon_identifier(instance_id, "--service-instance-id")?;
     }
@@ -8024,12 +8157,61 @@ async fn run_agent(
         start_userspace_wireguard_process(&args, runtime.clone()).await?;
     let relay_forwarder_supervisor = relay_forwarder_supervisor(&args)?;
     let mut background_tasks = Vec::new();
+    let public_web_gateway = if args.public_web_gateway_enabled && args.listen.ip().is_loopback() {
+        let status = Arc::new(StdRwLock::new(PublicWebGatewayStatus {
+            phase: PublicWebGatewayPhase::Standby,
+            ..PublicWebGatewayStatus::default()
+        }));
+        let token = generate_public_web_gateway_token();
+        if let Some(node) = registered_node.as_ref() {
+            background_tasks.push(start_public_web_gateway(
+                runtime.clone(),
+                status.clone(),
+                PublicWebGatewayConfig {
+                    admin_socket: args.public_web_gateway_admin_socket.clone(),
+                    proxy_token: token.clone(),
+                    upstream: args.listen,
+                    cluster_id: node.cluster_id.clone(),
+                    reconcile_interval: Duration::from_secs(
+                        args.public_web_gateway_reconcile_interval_seconds,
+                    ),
+                    probe_timeout: Duration::from_secs(
+                        args.public_web_gateway_probe_timeout_seconds,
+                    ),
+                    classification_max_age: Duration::from_secs(
+                        args.public_web_gateway_classification_max_age_seconds,
+                    ),
+                },
+            )?);
+        } else {
+            set_public_web_gateway_status(
+                &status,
+                PublicWebGatewayPhase::Error,
+                None,
+                None,
+                Some(
+                    "node must be enrolled before its public Web UI can be advertised".to_string(),
+                ),
+            )
+            .await;
+        }
+        Some((token, status))
+    } else {
+        if args.public_web_gateway_enabled {
+            tracing::warn!(
+                listen = %args.listen,
+                "dynamic public Web gateway disabled because the Agent API is not bound to loopback"
+            );
+        }
+        None
+    };
     if !stun_servers.is_empty() {
         background_tasks.push(start_nat_discovery(
             runtime.clone(),
             stun_servers.clone(),
             args.stun_bind,
             Duration::from_secs(args.nat_discovery_interval_seconds),
+            args.nat_discovery_failure_threshold,
         ));
     }
     if otel_metrics_enabled {
@@ -8310,6 +8492,9 @@ async fn run_agent(
         AgentHttpState::with_wireguard_key_rotation(runtime.clone(), store, control_plane_bases)
             .with_control_plane_http_client(http_client, agent_http_request_timeout(&args))
             .enable_local_web_ui(args.listen.ip().is_loopback());
+    if let Some((token, status)) = public_web_gateway {
+        http_state = http_state.with_public_web_gateway(token, status);
+    }
     if !args.listen.ip().is_loopback() {
         tracing::warn!(
             listen = %args.listen,
@@ -12124,13 +12309,284 @@ struct HeartbeatReporterConfig {
     route_reporter: Option<HeartbeatRouteReporter>,
 }
 
+#[derive(Clone)]
+struct PublicWebGatewayConfig {
+    admin_socket: PathBuf,
+    proxy_token: String,
+    upstream: SocketAddr,
+    cluster_id: ClusterId,
+    reconcile_interval: Duration,
+    probe_timeout: Duration,
+    classification_max_age: Duration,
+}
+
+fn generate_public_web_gateway_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn public_web_gateway_url(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("https://{ip}/"),
+        IpAddr::V6(ip) => format!("https://[{ip}]/"),
+    }
+}
+
+fn public_web_gateway_caddyfile(
+    admin_socket: &Path,
+    public_ip: Option<IpAddr>,
+    upstream: SocketAddr,
+    proxy_token: &str,
+) -> String {
+    let mut caddyfile = format!(
+        "{{\n\tadmin unix/{}\n\tpersist_config off\n}}\n",
+        admin_socket.display()
+    );
+    if let Some(public_ip) = public_ip {
+        let site = public_web_gateway_url(public_ip);
+        let site = site.trim_end_matches('/');
+        let _ = writeln!(
+            caddyfile,
+            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/admin/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
+        );
+    }
+    caddyfile
+}
+
+async fn load_public_web_gateway_caddyfile(
+    client: &reqwest::Client,
+    config: &PublicWebGatewayConfig,
+    public_ip: Option<IpAddr>,
+) -> anyhow::Result<()> {
+    let response = client
+        .post("http://localhost/load")
+        .header(reqwest::header::CONTENT_TYPE, "text/caddyfile")
+        .body(public_web_gateway_caddyfile(
+            &config.admin_socket,
+            public_ip,
+            config.upstream,
+            &config.proxy_token,
+        ))
+        .send()
+        .await
+        .context("failed to reach Caddy admin socket")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let detail = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("failed to read Caddy response: {error}"));
+    let detail = detail.replace(&config.proxy_token, "[REDACTED]");
+    anyhow::bail!(
+        "Caddy rejected gateway configuration with {status}: {}",
+        detail.chars().take(512).collect::<String>()
+    )
+}
+
+async fn probe_public_web_gateway(
+    client: &reqwest::Client,
+    url: &str,
+    cluster_id: &ClusterId,
+) -> anyhow::Result<()> {
+    let config_url = format!("{}ui/config", url.trim_end_matches('/').to_string() + "/");
+    let mut response = client
+        .get(config_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .context("public gateway probe failed")?
+        .error_for_status()
+        .context("public gateway probe was rejected")?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > 256 * 1024)
+    {
+        anyhow::bail!("public gateway configuration response is too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read public gateway configuration")?
+    {
+        anyhow::ensure!(
+            bytes.len().saturating_add(chunk.len()) <= 256 * 1024,
+            "public gateway configuration response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .context("public gateway returned invalid configuration JSON")?;
+    anyhow::ensure!(
+        body.get("enabled").and_then(serde_json::Value::as_bool) == Some(true),
+        "public gateway Web UI is disabled"
+    );
+    anyhow::ensure!(
+        body.get("cluster_id").and_then(serde_json::Value::as_str) == Some(cluster_id.as_str()),
+        "public gateway returned a different cluster ID"
+    );
+    Ok(())
+}
+
+async fn set_public_web_gateway_status(
+    status: &Arc<StdRwLock<PublicWebGatewayStatus>>,
+    phase: PublicWebGatewayPhase,
+    public_ip: Option<IpAddr>,
+    url: Option<String>,
+    last_error: Option<String>,
+) {
+    *status
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = PublicWebGatewayStatus {
+        phase,
+        public_ip,
+        url,
+        last_error,
+        updated_at: chrono::Utc::now(),
+    };
+}
+
+async fn desired_public_web_gateway_ip(
+    runtime: &AgentRuntime,
+    max_age: Duration,
+) -> Option<IpAddr> {
+    let classification = runtime.status().await.nat_classification?;
+    if classification.connectivity_state != NatConnectivityState::Public
+        || !classification.public_state_is_supported()
+    {
+        return None;
+    }
+    let age = chrono::Utc::now()
+        .signed_duration_since(classification.assessed_at)
+        .to_std()
+        .ok()?;
+    (age <= max_age).then_some(classification.local_addr.ip())
+}
+
+fn start_public_web_gateway(
+    runtime: Arc<AgentRuntime>,
+    status: Arc<StdRwLock<PublicWebGatewayStatus>>,
+    config: PublicWebGatewayConfig,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let admin_client = reqwest::Client::builder()
+        .unix_socket(config.admin_socket.clone())
+        .timeout(config.probe_timeout)
+        .build()
+        .context("failed to build Caddy admin client")?;
+    let probe_client = reqwest::Client::builder()
+        .connect_timeout(config.probe_timeout)
+        .timeout(config.probe_timeout)
+        .no_proxy()
+        .build()
+        .context("failed to build public Web UI probe client")?;
+    Ok(tokio::spawn(async move {
+        let mut configured_ip = None;
+        let mut configuration_loaded_at = None;
+        let mut gateway_was_ready = false;
+        loop {
+            let desired_ip =
+                desired_public_web_gateway_ip(&runtime, config.classification_max_age).await;
+            let desired_url = desired_ip.map(public_web_gateway_url);
+            if desired_ip != configured_ip {
+                let phase = if desired_ip.is_some() {
+                    PublicWebGatewayPhase::Provisioning
+                } else {
+                    PublicWebGatewayPhase::Standby
+                };
+                set_public_web_gateway_status(
+                    &status,
+                    phase,
+                    desired_ip,
+                    desired_url.clone(),
+                    None,
+                )
+                .await;
+                match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip).await {
+                    Ok(()) => {
+                        configured_ip = desired_ip;
+                        configuration_loaded_at = Some(Instant::now());
+                        gateway_was_ready = false;
+                        tracing::info!(
+                            public_ip = ?desired_ip,
+                            "reconciled public Web UI gateway"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, public_ip = ?desired_ip, "public Web UI gateway reconciliation failed");
+                        set_public_web_gateway_status(
+                            &status,
+                            PublicWebGatewayPhase::Error,
+                            desired_ip,
+                            desired_url.clone(),
+                            Some(error.to_string()),
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            if configured_ip == desired_ip {
+                if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
+                    match probe_public_web_gateway(&probe_client, &url, &config.cluster_id).await {
+                        Ok(()) => {
+                            gateway_was_ready = true;
+                            set_public_web_gateway_status(
+                                &status,
+                                PublicWebGatewayPhase::Ready,
+                                Some(public_ip),
+                                Some(url),
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            let configuration_stale =
+                                configuration_loaded_at.is_some_and(|loaded_at| {
+                                    loaded_at.elapsed() >= Duration::from_secs(60)
+                                });
+                            if gateway_was_ready || configuration_stale {
+                                configured_ip = None;
+                                configuration_loaded_at = None;
+                                gateway_was_ready = false;
+                            }
+                            set_public_web_gateway_status(
+                                &status,
+                                PublicWebGatewayPhase::Error,
+                                Some(public_ip),
+                                Some(url),
+                                Some(error.to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    set_public_web_gateway_status(
+                        &status,
+                        PublicWebGatewayPhase::Standby,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            }
+            tokio::time::sleep(config.reconcile_interval).await;
+        }
+    }))
+}
+
 fn start_nat_discovery(
     runtime: Arc<AgentRuntime>,
     stun_servers: Vec<SocketAddr>,
     stun_bind: SocketAddr,
     interval: Duration,
+    failure_threshold: u32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut consecutive_failures = 0_u32;
         loop {
             tokio::time::sleep(interval).await;
             let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
@@ -12139,6 +12595,7 @@ fn start_nat_discovery(
                 .await
             {
                 Ok(classification) => {
+                    consecutive_failures = 0;
                     let public_candidate_refreshed = runtime
                         .refresh_candidates_for_wireguard_listen_port(
                             &classification,
@@ -12152,10 +12609,21 @@ fn start_nat_discovery(
                         "refreshed agent NAT discovery"
                     );
                 }
-                Err(error) => tracing::warn!(
-                    %error,
-                    "periodic STUN NAT discovery failed; retaining the last classification"
-                ),
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let classification_cleared = if consecutive_failures >= failure_threshold {
+                        runtime.clear_nat_classification().await
+                    } else {
+                        false
+                    };
+                    tracing::warn!(
+                        %error,
+                        consecutive_failures,
+                        failure_threshold,
+                        classification_cleared,
+                        "periodic STUN NAT discovery failed"
+                    );
+                }
             }
         }
     })
@@ -18143,6 +18611,30 @@ mod tests {
             Ok(_) => panic!("{context}"),
             Err(error) => error,
         }
+    }
+
+    #[test]
+    fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
+        let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
+        let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
+        let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret");
+        assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock"));
+        assert!(!standby.contains("reverse_proxy"));
+        assert!(!standby.contains("secret"));
+
+        let public = public_web_gateway_caddyfile(
+            socket,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            upstream,
+            "secret",
+        );
+        assert!(public.contains("https://203.0.113.10"));
+        assert!(public.contains("profile shortlived"));
+        assert!(public.contains("X-HeteroNetwork-Gateway-Token secret"));
+        assert!(public.contains("/v1/web-ui/auth/device/poll"));
+        assert!(public.contains("/v1/admin/*"));
+        assert!(!public.contains("/metrics"));
+        assert!(!public.contains("/v1/status"));
     }
 
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
