@@ -12353,7 +12353,7 @@ fn public_web_gateway_caddyfile(
     proxy_token: &str,
 ) -> String {
     let mut caddyfile = format!(
-        "{{\n\tadmin unix/{}\n\tpersist_config off\n}}\n",
+        "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n}}\n",
         admin_socket.display()
     );
     if let Some(public_ip) = public_ip {
@@ -18673,7 +18673,7 @@ mod tests {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
         let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret");
-        assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock"));
+        assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
         assert!(!standby.contains("secret"));
 
