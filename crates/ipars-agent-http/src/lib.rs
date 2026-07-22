@@ -1110,12 +1110,7 @@ async fn fetch_web_ui_config(
             Some(_) => {
                 return Err("endpoint belongs to a different HeteroNetwork cluster".to_string())
             }
-            None if !candidate.trusted_directory => {
-                return Err(
-                    "manual endpoint does not report its HeteroNetwork cluster ID".to_string(),
-                )
-            }
-            None => {}
+            None => return Err("endpoint does not report its HeteroNetwork cluster ID".to_string()),
         }
     }
     Ok(config)
@@ -3915,6 +3910,28 @@ mod tests {
         let error = test_error(result, "cluster mismatch must be rejected");
         assert!(error.contains("different HeteroNetwork cluster"));
         backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_web_ui_endpoint_must_report_registered_cluster(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let body = r#"{"enabled":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (backend_url, backend_task) = spawn_raw_http_response(response).await?;
+        let candidate = WebUiCandidate {
+            url: backend_url,
+            source: "control_plane_directory",
+            trusted_directory: true,
+        };
+        let result =
+            fetch_web_ui_config(&reqwest::Client::new(), &candidate, Some("cluster-a")).await;
+        let error = test_error(result, "missing cluster ID must be rejected");
+        assert!(error.contains("does not report its HeteroNetwork cluster ID"));
+        backend_task.await??;
         Ok(())
     }
 
