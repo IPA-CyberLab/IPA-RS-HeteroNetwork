@@ -1782,7 +1782,9 @@ impl AgentRuntime {
         let local_candidate = self.local_candidate_from_observation(&observation);
         self.replace_stun_candidates(vec![candidate.clone(), local_candidate])
             .await;
-        *self.nat_classification.write().await = None;
+        if self.nat_classification.write().await.take().is_some() {
+            self.request_heartbeat_report();
+        }
         Ok(candidate)
     }
 
@@ -1926,9 +1928,40 @@ impl AgentRuntime {
                 .collect();
             self.replace_stun_candidates(refreshed_candidates).await;
         }
-        *self.nat_classification.write().await = Some(classification.clone());
+        let changed = {
+            let mut current = self.nat_classification.write().await;
+            let changed = current.as_ref().is_none_or(|previous| {
+                previous.connectivity_state != classification.connectivity_state
+                    || previous.mapping_behavior != classification.mapping_behavior
+                    || previous.filtering_behavior != classification.filtering_behavior
+                    || previous.strategy != classification.strategy
+                    || previous.local_addr.ip() != classification.local_addr.ip()
+                    || previous.observed_endpoint.map(|addr| addr.ip())
+                        != classification.observed_endpoint.map(|addr| addr.ip())
+                    || previous.public_state_is_supported()
+                        != classification.public_state_is_supported()
+            });
+            *current = Some(classification.clone());
+            changed
+        };
+        if changed {
+            self.request_heartbeat_report();
+        }
 
         Ok(classification)
+    }
+
+    pub async fn clear_nat_classification(&self) -> bool {
+        let removed = self.nat_classification.write().await.take().is_some();
+        let mut candidates = self.candidates.write().await;
+        let previous_len = candidates.len();
+        candidates.retain(|candidate| candidate.source != CandidateSource::StunProbe);
+        let candidates_removed = candidates.len() != previous_len;
+        drop(candidates);
+        if removed || candidates_removed {
+            self.request_heartbeat_report();
+        }
+        removed || candidates_removed
     }
 
     async fn replace_stun_candidates(&self, refreshed: Vec<EndpointCandidate>) {

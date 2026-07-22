@@ -167,6 +167,19 @@ The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is
 
 The local console accepts an explicit initial Web UI seed as a trust decision. It rejects credentials, query strings, fragments, unexpected paths, and cleartext public endpoints before persisting the normalized origin in the private Agent state file. Service-directory candidates arrive through authenticated Agent registration and heartbeat flows. Browser PKCE verifier, state, and access-token material remain in `sessionStorage` under the stable loopback origin, so changing the selected Control Plane does not transfer server-local login state or browser credentials between UI nodes.
 
+The optional dynamic public gateway does not change the Agent listener binding.
+Caddy connects to the loopback listener and adds an ephemeral 256-bit proxy
+credential; the Agent additionally requires the current public-IP Host and
+same-origin browser request. Caddy exposes only UI assets, Keycloak device
+authorization, read-only endpoint status, and the authenticated `/v1/admin/*`
+proxy, plus `/v1/install/*` artifacts that retain the Control Plane's signed
+join-token authorization and size bounds. Agent status, metrics, path controls,
+and local endpoint mutations are not routed publicly. The Control Plane trusts
+neither an Agent's public claim nor a DNS name alone: it accepts only a structurally valid signed no-NAT
+classification and publishes the gateway only after a direct HTTPS probe with
+a publicly trusted IP certificate. Keycloak Device Authorization Grant keeps
+dynamic IPs out of redirect URI and CORS wildcard policy.
+
 The daemon bounds token-file reads and compares submitted credentials in constant time over a fixed maximum size. The CLI applies its global `--agent-api-bearer-token` or `--agent-api-bearer-token-path` source to every Agent API read and mutation. Prefer file-backed tokens, keep them separate from signed join tokens, and rotate them through the deployment secret mechanism. The Kubernetes chart uses a distinct Secret key and rejects reuse of the join-token key.
 
 Bearer authentication is an authorization control, not transport encryption. Use TLS before traffic leaves a trusted host or private deployment network.

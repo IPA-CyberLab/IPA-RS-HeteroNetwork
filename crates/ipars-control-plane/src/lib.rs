@@ -201,6 +201,11 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         instance: ServiceInstance,
     ) -> Result<(), ControlPlaneError>;
+    async fn remove_service_instance(
+        &self,
+        cluster_id: &ClusterId,
+        instance_id: &str,
+    ) -> Result<bool, ControlPlaneError>;
     async fn list_service_instances(
         &self,
         cluster_id: &ClusterId,
@@ -478,6 +483,19 @@ impl ControlPlaneStore for InMemoryStore {
             instance,
         );
         Ok(())
+    }
+
+    async fn remove_service_instance(
+        &self,
+        cluster_id: &ClusterId,
+        instance_id: &str,
+    ) -> Result<bool, ControlPlaneError> {
+        Ok(self
+            .service_instances
+            .write()
+            .await
+            .remove(&(cluster_id.clone(), instance_id.to_string()))
+            .is_some())
     }
 
     async fn list_service_instances(
@@ -1079,6 +1097,15 @@ where
     ) -> Result<(), ControlPlaneError> {
         validate_service_instance(&instance, &self.config.cluster_id, Utc::now())?;
         self.store.upsert_service_instance(instance).await
+    }
+
+    pub async fn withdraw_service_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<bool, ControlPlaneError> {
+        self.store
+            .remove_service_instance(&self.config.cluster_id, instance_id)
+            .await
     }
 
     pub async fn service_directory(&self) -> Result<ServiceDirectory, ControlPlaneError> {
@@ -1979,13 +2006,22 @@ where
         request: HeartbeatRequest,
         wait: Duration,
     ) -> Result<HeartbeatResponse, ControlPlaneError> {
-        if wait.is_zero() {
-            return self.heartbeat(request).await;
-        }
-
         let node_id = request.node_id.clone();
-        let notifier = self.connection_intent_notifier(&node_id).await;
-        let mut response = self.heartbeat(request).await?;
+        let response = self.heartbeat(request).await?;
+        self.wait_for_connection_intents(&node_id, response, wait)
+            .await
+    }
+
+    pub async fn wait_for_connection_intents(
+        &self,
+        node_id: &NodeId,
+        mut response: HeartbeatResponse,
+        wait: Duration,
+    ) -> Result<HeartbeatResponse, ControlPlaneError> {
+        if wait.is_zero() {
+            return Ok(response);
+        }
+        let notifier = self.connection_intent_notifier(node_id).await;
         if !response.connection_intents.is_empty() {
             return Ok(response);
         }
@@ -2002,7 +2038,7 @@ where
                 _ = tokio::time::sleep(remaining.min(CONNECTION_INTENT_WAIT_FALLBACK_POLL_INTERVAL)) => {}
             }
 
-            let intents = self.connection_intents_for(&node_id, Utc::now()).await?;
+            let intents = self.connection_intents_for(node_id, Utc::now()).await?;
             if !intents.is_empty() {
                 response.connection_intents = intents;
                 return Ok(response);
@@ -4366,6 +4402,16 @@ mod tests {
             self.inner.upsert_service_instance(instance).await
         }
 
+        async fn remove_service_instance(
+            &self,
+            cluster_id: &ClusterId,
+            instance_id: &str,
+        ) -> Result<bool, ControlPlaneError> {
+            self.inner
+                .remove_service_instance(cluster_id, instance_id)
+                .await
+        }
+
         async fn list_service_instances(
             &self,
             cluster_id: &ClusterId,
@@ -4626,6 +4672,33 @@ mod tests {
         assert_eq!(metrics.active_control_plane_count, 2);
         assert_eq!(metrics.active_signal_count, 1);
         assert!(!metrics.ha_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_instance_withdrawal_removes_active_endpoint_immediately(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-withdrawal");
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            Arc::new(InMemoryStore::default()),
+        );
+        let now = Utc::now();
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "dynamic-web",
+                "public.example",
+                now,
+                now + Duration::seconds(45),
+            ))
+            .await?;
+        assert!(plane.withdraw_service_instance("dynamic-web").await?);
+        assert!(!plane.withdraw_service_instance("dynamic-web").await?);
+        assert!(plane.service_directory().await?.instances.is_empty());
         Ok(())
     }
 

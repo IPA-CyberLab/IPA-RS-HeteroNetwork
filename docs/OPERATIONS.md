@@ -244,10 +244,31 @@ On the default loopback listener, open `http://127.0.0.1:9780/ui/` for the
 failover-capable console. An enrolled Agent learns leased Web UI origins from
 registration and heartbeat responses. On a fresh state file, enter one initial
 IP address or URL in the connection form; the Agent validates `/ui/config`
-before caching it. Configure the Keycloak public client with
-`http://127.0.0.1:9780/ui/` as a redirect URI and
-`http://127.0.0.1:9780` as a Web Origin. The local UI is intentionally disabled
-when the Agent listener is bound to a non-loopback address.
+before caching it. Enable **OAuth 2.0 Device Authorization Grant** on the
+Keycloak public client; Agent-hosted consoles use that flow so neither localhost
+nor changing public IPs need redirect-URI or Web-Origin wildcards. Direct
+Control Plane consoles retain authorization-code PKCE. The local UI is
+intentionally disabled when the Agent listener is bound to a non-loopback
+address.
+
+The generated node installer starts `heteronetwork-gateway.service` with a
+checksum-pinned Caddy 2.11.4 binary. Keep inbound TCP 80 and 443 available on nodes
+that may become public and allow outbound ACME traffic. The service starts with
+no public listener. Fresh public STUN classification causes the Agent to load
+an `https://IP/` configuration through the protected Unix admin socket;
+private/stale classification removes it. Inspect the current phase in the Web
+UI endpoint control or with
+`ipars_agent_public_web_gateway_phase{phase="ready"}`. Control Plane
+`ipars_control_plane_active_services{kind="web_ui"}` and the Public nodes view
+show only gateways that passed an external TLS/config probe. Generated node
+install commands include those active gateways and can fetch the
+join-token-protected script and binary through a surviving gateway. Public
+nodes use the shorter of `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` and
+`HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS`; non-public nodes
+retain the general interval so repeated filtering probes do not destabilize
+active paths. Tune the remaining convergence stages with
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS`, and the
+Control Plane `HETERONETWORK_DYNAMIC_WEB_GATEWAY_*` lease/probe settings.
 
 When a Control Plane cannot reach the public Keycloak address through NAT
 hairpinning, keep `HETERONETWORK_WEB_OIDC_ISSUER_URL` public and set
@@ -269,12 +290,14 @@ heartbeat and Signal registration, even when the surviving kernel WireGuard
 interface already owns the shared port and the startup STUN bind cannot run.
 
 With the default token or explicit STUN bootstrap, the Agent runs NAT discovery
-before registration and refreshes it every
-`HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. The signed join and
-heartbeat payloads carry mapping/filtering observations, confidence, traversal
-strategy, and the derived connectivity state (`public`, `nat`, `double_nat`, or
-`relay_only`). Control Plane retains the latest result and the WebConsole reads
-the same state for its node table, drawer, and topology. Run
+before registration and refreshes non-public classifications every
+`HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. A public
+classification is refreshed at the shorter
+`HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS` interval. The signed
+join and heartbeat payloads carry mapping/filtering observations, confidence,
+traversal strategy, and the derived connectivity state (`public`, `nat`,
+`double_nat`, or `relay_only`). Control Plane retains the latest result and the
+WebConsole reads the same state for its node table, drawer, and topology. Run
 `scripts/nat-discovery-smoke.sh` to verify the three-node overview and heartbeat
 update contract without manually assigning NAT labels.
 

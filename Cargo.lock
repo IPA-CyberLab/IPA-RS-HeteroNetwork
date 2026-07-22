@@ -1215,12 +1215,15 @@ name = "ipars-agent-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "ipars-agent",
  "ipars-types",
+ "rand_core 0.6.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
 ]
@@ -1277,6 +1280,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tracing",
  "url",
 ]
 
@@ -1304,6 +1308,7 @@ dependencies = [
  "async-trait",
  "axum",
  "aya",
+ "base64",
  "chrono",
  "clap",
  "futures-util",
@@ -1327,6 +1332,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rand_core 0.6.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

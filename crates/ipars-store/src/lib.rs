@@ -549,6 +549,21 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         Ok(())
     }
 
+    async fn remove_service_instance(
+        &self,
+        cluster_id: &ClusterId,
+        instance_id: &str,
+    ) -> Result<bool, ControlPlaneError> {
+        let result =
+            sqlx::query("DELETE FROM service_instances WHERE cluster_id = ?1 AND instance_id = ?2")
+                .bind(cluster_id.as_str())
+                .bind(instance_id)
+                .execute(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_service_instances(
         &self,
         cluster_id: &ClusterId,
@@ -1313,6 +1328,21 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .await
         .map_err(sql_error)?;
         Ok(())
+    }
+
+    async fn remove_service_instance(
+        &self,
+        cluster_id: &ClusterId,
+        instance_id: &str,
+    ) -> Result<bool, ControlPlaneError> {
+        let result =
+            sqlx::query("DELETE FROM service_instances WHERE cluster_id = $1 AND instance_id = $2")
+                .bind(cluster_id.as_str())
+                .bind(instance_id)
+                .execute(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_service_instances(
@@ -2087,6 +2117,20 @@ mod tests {
         );
         assert!(store_a
             .list_service_instances(&ClusterId::from_string("other-cluster"))
+            .await?
+            .is_empty());
+        assert!(
+            store_a
+                .remove_service_instance(&cluster_id, "public-a")
+                .await?
+        );
+        assert!(
+            !store_a
+                .remove_service_instance(&cluster_id, "public-a")
+                .await?
+        );
+        assert!(store_b
+            .list_service_instances(&cluster_id)
             .await?
             .is_empty());
 

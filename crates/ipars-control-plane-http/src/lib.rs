@@ -31,8 +31,9 @@ use ipars_types::api::{
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
-    BootstrapEndpoint, BootstrapEndpointKind, ClusterPolicy, JoinTokenClaims, KeyId, NodeId,
-    PathRecord, PathState, Role, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
+    socket_addr_is_globally_routable, BootstrapEndpoint, BootstrapEndpointKind, ClusterPolicy,
+    JoinTokenClaims, KeyId, NatConnectivityState, NodeId, PathRecord, PathState, Role,
+    ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
     JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
@@ -64,6 +65,10 @@ const KUBERNETES_HA_CONTROL_PLANE_COUNT: u32 = 3;
 const KUBEADM_HA_NODE_SCRIPT: &str = include_str!("../../../scripts/kubeadm-ha-node.sh");
 const KUBEADM_HA_AUTOPILOT_SCRIPT: &str = include_str!("../../../scripts/kubeadm-ha-autopilot.sh");
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS: u64 = 20;
+const MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES: u64 = 256 * 1024;
+const NODE_ENROLLMENT_CADDY_VERSION: &str = "2.11.4";
+const NODE_ENROLLMENT_CADDY_SHA256: &str =
+    "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9";
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -283,6 +288,44 @@ pub struct ControlPlaneHttpState<S, L> {
     operator_api_bearer_token: Option<Arc<str>>,
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
     node_enrollment: Option<Arc<NodeEnrollmentConfig>>,
+    dynamic_web_gateway: Option<Arc<DynamicWebGatewayConfig>>,
+}
+
+#[derive(Clone)]
+pub struct DynamicWebGatewayConfig {
+    client: Client,
+    probe_timeout: Duration,
+    lease_ttl: ChronoDuration,
+    classification_max_age: ChronoDuration,
+}
+
+impl DynamicWebGatewayConfig {
+    pub fn new(
+        probe_timeout: Duration,
+        lease_ttl: Duration,
+        classification_max_age: Duration,
+    ) -> Result<Self, String> {
+        if probe_timeout.is_zero() || lease_ttl.is_zero() || classification_max_age.is_zero() {
+            return Err("dynamic Web gateway durations must be greater than zero".to_string());
+        }
+        let lease_ttl = ChronoDuration::from_std(lease_ttl)
+            .map_err(|error| format!("invalid dynamic Web gateway lease TTL: {error}"))?;
+        let classification_max_age = ChronoDuration::from_std(classification_max_age)
+            .map_err(|error| format!("invalid dynamic Web gateway classification age: {error}"))?;
+        let client = Client::builder()
+            .connect_timeout(probe_timeout)
+            .timeout(probe_timeout)
+            .redirect(RedirectPolicy::none())
+            .no_proxy()
+            .build()
+            .map_err(|error| format!("failed to build dynamic Web gateway client: {error}"))?;
+        Ok(Self {
+            client,
+            probe_timeout,
+            lease_ttl,
+            classification_max_age,
+        })
+    }
 }
 
 impl<S, L> Clone for ControlPlaneHttpState<S, L> {
@@ -293,6 +336,7 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
             operator_api_bearer_token: self.operator_api_bearer_token.clone(),
             web_ui_auth: self.web_ui_auth.clone(),
             node_enrollment: self.node_enrollment.clone(),
+            dynamic_web_gateway: self.dynamic_web_gateway.clone(),
         }
     }
 }
@@ -308,6 +352,7 @@ impl<S, L> ControlPlaneHttpState<S, L> {
             operator_api_bearer_token: None,
             web_ui_auth: None,
             node_enrollment: None,
+            dynamic_web_gateway: None,
         }
     }
 
@@ -323,6 +368,11 @@ impl<S, L> ControlPlaneHttpState<S, L> {
 
     pub fn enable_node_enrollment(mut self, config: NodeEnrollmentConfig) -> Self {
         self.node_enrollment = Some(Arc::new(config));
+        self
+    }
+
+    pub fn enable_dynamic_web_gateway(mut self, config: DynamicWebGatewayConfig) -> Self {
+        self.dynamic_web_gateway = Some(Arc::new(config));
         self
     }
 }
@@ -456,6 +506,7 @@ pub struct WebUiAuthConfig {
     scopes: String,
     public_url: Option<String>,
     authorization_endpoint: String,
+    device_authorization_endpoint: Option<String>,
     token_endpoint: String,
     backchannel_token_endpoint: String,
     backchannel_userinfo_endpoint: String,
@@ -521,15 +572,23 @@ impl WebUiAuthConfig {
                 "OIDC scopes must be non-empty and contain no control characters".to_string(),
             );
         }
-        let (authorization_suffix, token_suffix, userinfo_suffix, logout_suffix) = match provider {
+        let (
+            authorization_suffix,
+            device_authorization_suffix,
+            token_suffix,
+            userinfo_suffix,
+            logout_suffix,
+        ) = match provider {
             WebAuthProvider::Keycloak => (
                 "/protocol/openid-connect/auth",
+                Some("/protocol/openid-connect/auth/device"),
                 "/protocol/openid-connect/token",
                 "/protocol/openid-connect/userinfo",
                 "/protocol/openid-connect/logout",
             ),
             WebAuthProvider::Cognito => (
                 "/oauth2/authorize",
+                None,
                 "/oauth2/token",
                 "/oauth2/userInfo",
                 "/logout",
@@ -548,6 +607,8 @@ impl WebUiAuthConfig {
             scopes,
             public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
+            device_authorization_endpoint: device_authorization_suffix
+                .map(|suffix| endpoint_url(&auth_base_url, suffix)),
             token_endpoint: endpoint_url(&auth_base_url, token_suffix),
             backchannel_token_endpoint: endpoint_url(&backchannel_base_url, token_suffix),
             backchannel_userinfo_endpoint: endpoint_url(&backchannel_base_url, userinfo_suffix),
@@ -786,6 +847,7 @@ impl WebUiAuthConfig {
             client_id: Some(self.client_id.clone()),
             scopes: Some(self.scopes.clone()),
             authorization_endpoint: Some(self.authorization_endpoint.clone()),
+            device_authorization_endpoint: self.device_authorization_endpoint.clone(),
             token_endpoint: Some(self.token_endpoint.clone()),
             logout_endpoint: Some(self.logout_endpoint.clone()),
             login_endpoint: self.public_url.as_ref().map(|_| "/ui/login".to_string()),
@@ -914,6 +976,7 @@ struct WebUiPublicConfig {
     client_id: Option<String>,
     scopes: Option<String>,
     authorization_endpoint: Option<String>,
+    device_authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
     logout_endpoint: Option<String>,
     login_endpoint: Option<String>,
@@ -1217,6 +1280,7 @@ where
             client_id: None,
             scopes: None,
             authorization_endpoint: None,
+            device_authorization_endpoint: None,
             token_endpoint: None,
             logout_endpoint: None,
             login_endpoint: None,
@@ -1888,22 +1952,22 @@ fi
 install_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl iproute2 wireguard-tools
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates coreutils curl iproute2 tar wireguard-tools
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl iproute wireguard-tools
+    dnf install -y ca-certificates coreutils curl iproute tar wireguard-tools
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl iproute wireguard-tools
+    yum install -y ca-certificates coreutils curl iproute tar wireguard-tools
   elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install ca-certificates curl iproute2 wireguard-tools
+    zypper --non-interactive install ca-certificates coreutils curl iproute2 tar wireguard-tools
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm ca-certificates curl iproute2 wireguard-tools
+    pacman -Sy --noconfirm ca-certificates coreutils curl iproute2 tar wireguard-tools
   else
-    echo "Unsupported package manager; install curl, CA certificates, iproute2, and wireguard-tools" >&2
+    echo "Unsupported package manager; install curl, CA certificates, coreutils, iproute2, tar, and wireguard-tools" >&2
     exit 1
   fi
 }
 
-for command in curl ip wg; do
+for command in base64 curl ip sha256sum tar wg; do
   if ! command -v "$command" >/dev/null 2>&1; then
     install_dependencies
     break
@@ -1940,17 +2004,81 @@ chmod 0755 "$binary"
 install -m 0755 "$binary" /opt/heteronetwork/bin/.iparsd.new
 mv -f /opt/heteronetwork/bin/.iparsd.new /opt/heteronetwork/bin/iparsd
 
+caddy_archive="$tmp_dir/caddy.tar.gz"
+curl --proto '=https' --proto-redir '=https' -fsSL \
+  'https://github.com/caddyserver/caddy/releases/download/v__CADDY_VERSION__/caddy___CADDY_VERSION___linux_amd64.tar.gz' \
+  -o "$caddy_archive"
+caddy_sha=$(sha256sum "$caddy_archive" | awk '{print $1}')
+if [ "$caddy_sha" != '__CADDY_SHA256__' ]; then
+  echo "Caddy download checksum verification failed" >&2
+  exit 1
+fi
+tar -xzf "$caddy_archive" -C "$tmp_dir" caddy
+chmod 0755 "$tmp_dir/caddy"
+install -m 0755 "$tmp_dir/caddy" /opt/heteronetwork/bin/.caddy.new
+mv -f /opt/heteronetwork/bin/.caddy.new /opt/heteronetwork/bin/caddy
+
 token_file="$tmp_dir/join-token.json"
 printf '%s' "$auth" | base64 -d >"$token_file"
 chmod 0600 "$token_file"
 /opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only
 rm -f "$token_file"
 
+install -d -o root -g root -m 0755 /etc/heteronetwork
+cat >/etc/heteronetwork/gateway.Caddyfile <<'CADDYFILE'
+{
+  admin unix//run/heteronetwork-gateway/admin.sock
+  persist_config off
+}
+CADDYFILE
+chown root:root /etc/heteronetwork/gateway.Caddyfile
+chmod 0644 /etc/heteronetwork/gateway.Caddyfile
+
+cat >/etc/systemd/system/heteronetwork-gateway.service <<'GATEWAY_UNIT'
+[Unit]
+Description=HeteroNetwork Dynamic Public Web Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/opt/heteronetwork/bin/caddy run --environ --config /etc/heteronetwork/gateway.Caddyfile --adapter caddyfile
+ExecReload=/opt/heteronetwork/bin/caddy reload --config /etc/heteronetwork/gateway.Caddyfile --adapter caddyfile --address unix//run/heteronetwork-gateway/admin.sock
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5s
+DynamicUser=true
+RuntimeDirectory=heteronetwork-gateway
+RuntimeDirectoryMode=0750
+StateDirectory=heteronetwork-gateway
+StateDirectoryMode=0700
+Environment=XDG_DATA_HOME=/var/lib/heteronetwork-gateway
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+GATEWAY_UNIT
+
 cat >/etc/systemd/system/heteronetwork-agent.service <<'UNIT'
 [Unit]
 Description=HeteroNetwork Agent
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target heteronetwork-gateway.service
+After=network-online.target heteronetwork-gateway.service
 
 [Service]
 Type=simple
@@ -1980,6 +2108,7 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+systemctl enable --now heteronetwork-gateway.service
 systemctl enable --now heteronetwork-agent.service
 __SETUP_INSTALL__
 echo "HeteroNetwork node enrolled and started"
@@ -1996,6 +2125,8 @@ echo "HeteroNetwork node enrolled and started"
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
         .replace("__SHA256__", &enrollment.binary_sha256)
+        .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
+        .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
         .replace("__SETUP_INSTALL__", &setup_install)
 }
 
@@ -2114,7 +2245,12 @@ fn node_enrollment_download_bases(
     for base in std::iter::once(enrollment.install_base_url.as_ref()).chain(
         bootstrap_endpoints
             .iter()
-            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .filter(|endpoint| {
+                matches!(
+                    endpoint.kind,
+                    BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::WebUi
+                )
+            })
             .map(|endpoint| endpoint.url.as_str()),
     ) {
         let base = base.trim_end_matches('/').to_string();
@@ -2564,6 +2700,117 @@ where
     Ok(Json(response))
 }
 
+fn dynamic_web_gateway_instance_id(node_id: &NodeId) -> String {
+    let digest = Sha256::digest(node_id.as_str().as_bytes());
+    format!("agent-web-ui-{digest:x}")
+}
+
+fn dynamic_web_gateway_url(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) => format!("https://{ip}"),
+        std::net::IpAddr::V6(ip) => format!("https://[{ip}]"),
+    }
+}
+
+async fn probe_dynamic_web_gateway(
+    config: &DynamicWebGatewayConfig,
+    url: &str,
+    expected_cluster_id: &str,
+) -> Result<(), String> {
+    let mut response = config
+        .client
+        .get(format!("{url}/ui/config"))
+        .header(header::ACCEPT, "application/json")
+        .timeout(config.probe_timeout)
+        .send()
+        .await
+        .map_err(|error| format!("connection failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("UI config returned HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES)
+    {
+        return Err("UI config response exceeds its size limit".to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to read UI config: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES as usize {
+            return Err("UI config response exceeds its size limit".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("UI config is invalid JSON: {error}"))?;
+    if body.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Err("UI config reports that the Web UI is disabled".to_string());
+    }
+    if body.get("cluster_id").and_then(Value::as_str) != Some(expected_cluster_id) {
+        return Err("UI config belongs to a different cluster".to_string());
+    }
+    Ok(())
+}
+
+async fn reconcile_dynamic_web_gateway<S, L>(
+    state: &ControlPlaneHttpState<S, L>,
+    node_id: &NodeId,
+) -> Result<(), ControlPlaneError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let Some(config) = state.dynamic_web_gateway.as_ref() else {
+        return Ok(());
+    };
+    let instance_id = dynamic_web_gateway_instance_id(node_id);
+    let now = Utc::now();
+    let classification = state.plane.nat_classification_for(node_id).await?;
+    let public_ip = classification.as_ref().and_then(|classification| {
+        let age = now.signed_duration_since(classification.assessed_at);
+        (classification.connectivity_state == NatConnectivityState::Public
+            && classification.public_state_is_supported()
+            && socket_addr_is_globally_routable(classification.local_addr)
+            && age >= ChronoDuration::zero()
+            && age <= config.classification_max_age)
+            .then_some(classification.local_addr.ip())
+    });
+    let Some(public_ip) = public_ip else {
+        state.plane.withdraw_service_instance(&instance_id).await?;
+        return Ok(());
+    };
+    let url = dynamic_web_gateway_url(public_ip);
+    if let Err(error) =
+        probe_dynamic_web_gateway(config, &url, state.plane.config().cluster_id.as_str()).await
+    {
+        state.plane.withdraw_service_instance(&instance_id).await?;
+        tracing::warn!(
+            %node_id,
+            %public_ip,
+            %error,
+            "withdrew unreachable dynamic Web UI gateway"
+        );
+        return Ok(());
+    }
+    state
+        .plane
+        .advertise_service_instance(ServiceInstance {
+            cluster_id: state.plane.config().cluster_id.clone(),
+            instance_id,
+            endpoints: vec![BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url,
+            }],
+            lease_expires_at: now + config.lease_ttl,
+            updated_at: now,
+        })
+        .await
+}
+
 async fn heartbeat<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Query(query): Query<HeartbeatQuery>,
@@ -2573,15 +2820,19 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
+    let node_id = request.node_id.clone();
     let wait = Duration::from_secs(
         query
             .wait_seconds
             .min(MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS),
     );
+    let mut response = state.plane.heartbeat(request).await?;
+    reconcile_dynamic_web_gateway(&state, &node_id).await?;
+    response.bootstrap_endpoints = state.plane.service_directory().await?.bootstrap_endpoints;
     Ok(Json(
         state
             .plane
-            .heartbeat_with_connection_intent_wait(request, wait)
+            .wait_for_connection_intents(&node_id, response, wait)
             .await?,
     ))
 }
@@ -3119,6 +3370,10 @@ mod tests {
             keycloak_config.authorization_endpoint.as_deref(),
             Some("http://localhost:8080/realms/heteronetwork/protocol/openid-connect/auth")
         );
+        assert_eq!(
+            keycloak_config.device_authorization_endpoint.as_deref(),
+            Some("http://localhost:8080/realms/heteronetwork/protocol/openid-connect/auth/device")
+        );
         assert_eq!(keycloak_config.login_endpoint, None);
         let cognito = match WebUiAuthConfig::new(
             WebAuthProvider::Cognito,
@@ -3140,6 +3395,7 @@ mod tests {
             cognito_config.token_endpoint.as_deref(),
             Some("https://login.example.com/oauth2/token")
         );
+        assert_eq!(cognito_config.device_authorization_endpoint, None);
         let backchannel = WebUiAuthConfig::new(
             WebAuthProvider::Keycloak,
             "https://idp.example/realms/heteronetwork".to_string(),
@@ -3379,6 +3635,52 @@ mod tests {
             lease_expires_at: now + chrono::Duration::minutes(5),
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn node_enrollment_downloads_through_dynamic_web_gateways(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let binary_path = std::env::temp_dir().join(format!(
+            "heteronetwork-enrollment-bases-test-{}",
+            random_oidc_value(12)
+        ));
+        std::fs::write(&binary_path, b"test-binary")?;
+        let enrollment = NodeEnrollmentConfig::new(
+            IdentityKeyPair::generate(),
+            "web-enrollment".to_string(),
+            "https://static.example".to_string(),
+            binary_path.clone(),
+            3600,
+        )?;
+        let endpoints = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://control.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://203.0.113.10".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://signal.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://static.example".to_string(),
+            },
+        ];
+        assert_eq!(
+            node_enrollment_download_bases(&enrollment, &endpoints),
+            vec![
+                "https://static.example".to_string(),
+                "https://control.example:8443".to_string(),
+                "https://203.0.113.10".to_string(),
+            ]
+        );
+        drop(enrollment);
+        std::fs::remove_file(binary_path)?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3725,6 +4027,14 @@ mod tests {
         assert!(script.contains("--enroll-only"));
         assert!(script.contains("--packet-flow-detector conntrack-netlink-events"));
         assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
+        assert!(script.contains("heteronetwork-gateway.service"));
+        assert!(script.contains("admin unix//run/heteronetwork-gateway/admin.sock"));
+        assert!(script.contains(&format!(
+            "caddy_{NODE_ENROLLMENT_CADDY_VERSION}_linux_amd64.tar.gz"
+        )));
+        assert!(script.contains(NODE_ENROLLMENT_CADDY_SHA256));
+        assert!(!script.contains("__CADDY_VERSION__"));
+        assert!(!script.contains("__CADDY_SHA256__"));
         assert!(script.contains(&expected_sha256));
         assert!(script.contains(&encoded_token));
         assert!(!script.contains(&issuer_private_key));

@@ -96,6 +96,19 @@ Agent state file. Public IP addresses and hostnames require HTTPS with a valid
 certificate, while HTTP is limited to loopback, private, link-local, and CGNAT
 addresses.
 
+The generated Linux installer also installs a checksum-pinned Caddy gateway in
+standby mode. When periodic STUN classification proves that the node owns a
+globally routable address, the Agent provisions a short-lived ACME IP
+certificate and serves the console at `https://<public-ip>/`. A Control Plane
+publishes that origin as a leased `web_ui` service only after probing it over
+public HTTPS. A private reclassification, stale classification, repeated STUN
+failure, or failed HTTPS probe removes the lease and returns the gateway to
+standby automatically. Public gateway requests can reach only UI assets,
+Keycloak device login, read-only endpoint status, and authenticated management
+proxy routes; the remaining Agent API stays loopback-only. Keycloak device
+authorization avoids dynamic redirect-URI and browser CORS exceptions when a
+node gains or changes its public IP.
+
 The operator enrollment API also accepts
 `"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
 exactly three uses. The returned command is identical on all three clean
@@ -205,7 +218,7 @@ The control-plane NAT discovery contract has a smaller reproducible smoke that r
 scripts/nat-discovery-smoke.sh
 ```
 
-This verifies that the retained classification count, traversal strategy counts, observed endpoint, and node-level overview data update without manual topology labels. The production Agent performs the same classification at startup and every `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. A node is public only when STUN reports a matching globally routable local/reflexive address; private, link-local, documentation, and shared CGNAT/Tailscale addresses are never promoted to public candidates.
+This verifies that the retained classification count, traversal strategy counts, observed endpoint, and node-level overview data update without manual topology labels. The production Agent performs the same classification at startup and every `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. While a node is classified public it uses the shorter `HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS` interval so address loss and replacement converge quickly without making NAT filtering paths flap on repeated RFC 5780 probes. A node is public only when STUN reports a matching globally routable local/reflexive address; private, link-local, documentation, and shared CGNAT/Tailscale addresses are never promoted to public candidates.
 
 Docker Compose smoke coverage is also gated because it requires a Docker daemon with Compose/BuildKit, kernel WireGuard support, and builds the repository image. Its first phase generates a signed join token, verifies the bundled Compose Docker API socket render plus multi-network/rootless capability reset/userspace-WireGuard/relay-forwarder environment rendering, starts PostgreSQL/control-plane/signal/STUN/relay plus two agents with `docker compose up --wait`, and uses agent `dry-run` runtime overrides so management-plane checks do not mutate host routes while validating reciprocal control-plane and agent-local peer maps, packet-flow-triggered lazy-connect path negotiation, agent JSON and Prometheus metrics, peer-activity pinning, signal metrics, and heartbeat propagation of agent path state back to the control plane. Its second phase starts two PostgreSQL-backed Control Planes plus paired Signal/STUN services in separate network namespaces and two `linux-command` Agents in distinct Docker network namespaces. Each Agent discovers only its filtered IPv4/IPv6 workload and route-only bridge CIDRs through the read-only Engine API before joining, then the gate requires separate kernel WireGuard interfaces, reciprocal peer maps and routes, nonzero handshakes and transfer counters, and bidirectional IPv4/IPv6 workload traffic. After stopping the primary Control Plane namespace, it checks the secondary Control Plane, Signal, and STUN endpoints, repeats all traffic checks, and changes a live bridge subnet through surviving heartbeat/peer-map reconciliation. Finally it starts a third Agent for the first time and requires multi-bootstrap STUN discovery, new registration with a distinct VPN IP, Signal registration, heartbeat, automatic peer-map sync, and a fresh identity-signed peer-map query through the surviving Control Plane:
 
