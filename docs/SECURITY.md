@@ -168,7 +168,9 @@ The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is
 The local console accepts an explicit initial Web UI seed as a trust decision. It rejects credentials, query strings, fragments, unexpected paths, and cleartext public endpoints before persisting the normalized origin in the private Agent state file. Service-directory candidates arrive through authenticated Agent registration and heartbeat flows. Browser PKCE verifier, state, and access-token material remain in `sessionStorage` under the stable loopback origin, so changing the selected Control Plane does not transfer server-local login state or browser credentials between UI nodes.
 
 The optional dynamic public gateway does not change the Agent listener binding.
-Caddy connects to the loopback listener and adds an ephemeral 256-bit proxy
+Caddy runs under a dedicated unprivileged account and shares only its `0660`
+Unix admin socket with the Agent through a dedicated supplementary group. It
+connects to the loopback listener and adds an ephemeral 256-bit proxy
 credential; the Agent additionally requires the current public-IP Host and
 same-origin browser request. Caddy exposes only UI assets, Keycloak device
 authorization, read-only endpoint status, and the authenticated `/v1/admin/*`

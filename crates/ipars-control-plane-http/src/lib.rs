@@ -1948,6 +1948,10 @@ if ! command -v systemctl >/dev/null 2>&1; then
   echo "HeteroNetwork requires systemd" >&2
   exit 1
 fi
+if ! command -v systemd-sysusers >/dev/null 2>&1; then
+  echo "HeteroNetwork requires systemd-sysusers" >&2
+  exit 1
+fi
 
 install_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
@@ -2025,9 +2029,14 @@ chmod 0600 "$token_file"
 rm -f "$token_file"
 
 install -d -o root -g root -m 0755 /etc/heteronetwork
+install -d -o root -g root -m 0755 /etc/sysusers.d
+cat >/etc/sysusers.d/heteronetwork-gateway.conf <<'SYSUSERS'
+u heteronetwork-gateway - "HeteroNetwork Dynamic Public Web Gateway" /var/lib/heteronetwork-gateway
+SYSUSERS
+systemd-sysusers /etc/sysusers.d/heteronetwork-gateway.conf
 cat >/etc/heteronetwork/gateway.Caddyfile <<'CADDYFILE'
 {
-  admin unix//run/heteronetwork-gateway/admin.sock
+  admin unix//run/heteronetwork-gateway/admin.sock|0660
   persist_config off
 }
 CADDYFILE
@@ -2042,12 +2051,13 @@ After=network-online.target
 
 [Service]
 Type=notify
+User=heteronetwork-gateway
+Group=heteronetwork-gateway
 ExecStart=/opt/heteronetwork/bin/caddy run --environ --config /etc/heteronetwork/gateway.Caddyfile --adapter caddyfile
 ExecReload=/opt/heteronetwork/bin/caddy reload --config /etc/heteronetwork/gateway.Caddyfile --adapter caddyfile --address unix//run/heteronetwork-gateway/admin.sock
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=5s
-DynamicUser=true
 RuntimeDirectory=heteronetwork-gateway
 RuntimeDirectoryMode=0750
 StateDirectory=heteronetwork-gateway
@@ -2082,6 +2092,7 @@ After=network-online.target heteronetwork-gateway.service
 
 [Service]
 Type=simple
+SupplementaryGroups=heteronetwork-gateway
 ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
 Restart=on-failure
 RestartSec=5s
@@ -4028,7 +4039,10 @@ mod tests {
         assert!(script.contains("--packet-flow-detector conntrack-netlink-events"));
         assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
         assert!(script.contains("heteronetwork-gateway.service"));
-        assert!(script.contains("admin unix//run/heteronetwork-gateway/admin.sock"));
+        assert!(script.contains("systemd-sysusers"));
+        assert!(script.contains("User=heteronetwork-gateway"));
+        assert!(script.contains("SupplementaryGroups=heteronetwork-gateway"));
+        assert!(script.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(script.contains(&format!(
             "caddy_{NODE_ENROLLMENT_CADDY_VERSION}_linux_amd64.tar.gz"
         )));
