@@ -240,6 +240,21 @@ Control-only clients are intentionally absent from the normal node table; use
 
 The Agent API listens on `127.0.0.1:9780` by default. To bind it to a non-loopback address, create a separate owner-only management token and pass `--api-bearer-token-path /etc/heteronetwork/agent-api.token`; startup rejects non-loopback listeners without a valid 32-512 byte printable ASCII token. All `/v1/*` routes and `/metrics` then require `Authorization: Bearer <token>`, while `/healthz` remains available for orchestration probes.
 
+On the default loopback listener, open `http://127.0.0.1:9780/ui/` for the
+failover-capable console. An enrolled Agent learns leased Web UI origins from
+registration and heartbeat responses. On a fresh state file, enter one initial
+IP address or URL in the connection form; the Agent validates `/ui/config`
+before caching it. Configure the Keycloak public client with
+`http://127.0.0.1:9780/ui/` as a redirect URI and
+`http://127.0.0.1:9780` as a Web Origin. The local UI is intentionally disabled
+when the Agent listener is bound to a non-loopback address.
+
+When a Control Plane cannot reach the public Keycloak address through NAT
+hairpinning, keep `HETERONETWORK_WEB_OIDC_ISSUER_URL` public and set
+`HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL` to the trusted private Keycloak
+realm URL. Only server-side token exchange and userinfo validation use this
+backchannel; browsers continue to use the public OIDC endpoints.
+
 Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
 
 For a real `--apply-peer-map` runtime, keep `--stun-bind` and

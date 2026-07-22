@@ -2620,6 +2620,8 @@ where
             service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::Stun);
         let active_relay_count =
             service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::Relay);
+        let active_web_ui_count =
+            service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::WebUi);
         let ha_ready = [
             active_control_plane_count,
             active_signal_count,
@@ -2627,7 +2629,8 @@ where
             active_relay_count,
         ]
         .into_iter()
-        .all(|count| count >= 2);
+        .all(|count| count >= 2)
+            && (active_web_ui_count == 0 || active_web_ui_count >= 2);
         let relay_candidate_count = nodes
             .iter()
             .filter(|node| {
@@ -2686,6 +2689,7 @@ where
             active_signal_count,
             active_stun_count,
             active_relay_count,
+            active_web_ui_count,
             ha_ready,
             healthy_node_count,
             degraded_node_count,
@@ -4204,6 +4208,10 @@ mod tests {
                     kind: BootstrapEndpointKind::Relay,
                     url: format!("udp://{host}:51820"),
                 },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::WebUi,
+                    url: format!("https://{host}"),
+                },
             ],
             lease_expires_at,
             updated_at,
@@ -4552,7 +4560,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["public-a", "public-b"]
         );
-        assert_eq!(directory.bootstrap_endpoints.len(), 8);
+        assert_eq!(directory.bootstrap_endpoints.len(), 10);
         assert!(directory
             .bootstrap_endpoints
             .iter()
@@ -4564,6 +4572,7 @@ mod tests {
         assert_eq!(metrics.active_signal_count, 2);
         assert_eq!(metrics.active_stun_count, 2);
         assert_eq!(metrics.active_relay_count, 2);
+        assert_eq!(metrics.active_web_ui_count, 2);
         assert!(metrics.ha_ready);
 
         let mut duplicate_kind = service_instance(
@@ -4666,7 +4675,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["public-a", "public-b"]
         );
-        assert_eq!(enrollment.bootstrap_endpoints.len(), 8);
+        assert_eq!(enrollment.bootstrap_endpoints.len(), 10);
 
         let expired = plane
             .enrollment_service_directory(std::time::Duration::from_secs(30))

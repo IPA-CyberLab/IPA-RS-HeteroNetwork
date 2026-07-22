@@ -432,6 +432,8 @@ struct ControlPlaneArgs {
     node_enrollment_binary_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
     web_oidc_auth_base_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL")]
+    web_oidc_backchannel_base_url: Option<String>,
     #[arg(
         long,
         env = "HETERONETWORK_WEB_OIDC_SCOPES",
@@ -4291,6 +4293,7 @@ where
             args.web_oidc_issuer_url.clone(),
             args.web_oidc_client_id.clone(),
             args.web_oidc_auth_base_url.clone(),
+            args.web_oidc_backchannel_base_url.clone(),
             args.web_oidc_scopes.clone(),
         )
         .map_err(anyhow::Error::msg)
@@ -4421,6 +4424,14 @@ fn control_plane_service_lease_config(
         (
             BootstrapEndpointKind::Relay,
             args.advertise_relay_url.as_ref(),
+        ),
+        (
+            BootstrapEndpointKind::WebUi,
+            if args.web_ui_enabled && args.service_instance_id.is_some() {
+                args.web_public_url.as_ref()
+            } else {
+                None
+            },
         ),
     ]
     .into_iter()
@@ -5407,6 +5418,7 @@ impl ControlPlaneOtelMetrics {
             ("signal", metrics.active_signal_count),
             ("stun", metrics.active_stun_count),
             ("relay", metrics.active_relay_count),
+            ("web_ui", metrics.active_web_ui_count),
         ] {
             let attrs = [
                 KeyValue::new("cluster_id", cluster_id.clone()),
@@ -8296,7 +8308,14 @@ async fn run_agent(
     tracing::info!(node_id = %runtime.state().node_id, listen = %args.listen, "agent listening");
     let mut http_state =
         AgentHttpState::with_wireguard_key_rotation(runtime.clone(), store, control_plane_bases)
-            .with_control_plane_http_client(http_client, agent_http_request_timeout(&args));
+            .with_control_plane_http_client(http_client, agent_http_request_timeout(&args))
+            .enable_local_web_ui(args.listen.ip().is_loopback());
+    if !args.listen.ip().is_loopback() {
+        tracing::warn!(
+            listen = %args.listen,
+            "local Web UI disabled because the Agent API is not bound to loopback"
+        );
+    }
     if let Some(token) = api_bearer_token {
         http_state = http_state.require_api_bearer_token(token);
     }
@@ -18953,6 +18972,7 @@ mod tests {
             active_signal_count: 2,
             active_stun_count: 2,
             active_relay_count: 2,
+            active_web_ui_count: 2,
             ha_ready: true,
             healthy_node_count: 1,
             degraded_node_count: 1,

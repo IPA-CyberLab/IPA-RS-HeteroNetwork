@@ -175,7 +175,7 @@ pub fn canonical_bootstrap_endpoint_url(url: &str) -> Option<String> {
         .map(|parsed| parsed.as_str().trim_end_matches('/').to_string())
 }
 
-pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS: usize = 32;
+pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS: usize = 40;
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND: usize = 8;
 pub const MAX_JOIN_TOKEN_BOOTSTRAP_URL_BYTES: usize = 2048;
 pub const MAX_JOIN_TOKEN_IDENTIFIER_BYTES: usize = 255;
@@ -195,6 +195,7 @@ pub enum BootstrapEndpointKind {
     Signal,
     Stun,
     Relay,
+    WebUi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +222,7 @@ impl Display for BootstrapEndpointKind {
             Self::Signal => "signal",
             Self::Stun => "stun",
             Self::Relay => "relay",
+            Self::WebUi => "web_ui",
         })
     }
 }
@@ -331,9 +333,9 @@ pub fn validate_join_token_bootstrap_endpoints(
             )));
         }
         let valid = match endpoint.kind {
-            BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::Signal => {
-                http_url_is_usable_endpoint(&endpoint.url)
-            }
+            BootstrapEndpointKind::ControlPlane
+            | BootstrapEndpointKind::Signal
+            | BootstrapEndpointKind::WebUi => http_url_is_usable_endpoint(&endpoint.url),
             BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay => {
                 udp_bootstrap_url_is_usable(&parsed)
             }
@@ -2243,6 +2245,8 @@ pub mod api {
         pub active_stun_count: usize,
         #[serde(default)]
         pub active_relay_count: usize,
+        #[serde(default)]
+        pub active_web_ui_count: usize,
         #[serde(default)]
         pub ha_ready: bool,
         pub healthy_node_count: usize,
@@ -18498,6 +18502,10 @@ mod tests {
                 url: "udp://relay.example:51820".to_string(),
                 kind: BootstrapEndpointKind::Relay,
             },
+            BootstrapEndpoint {
+                url: "https://console.example".to_string(),
+                kind: BootstrapEndpointKind::WebUi,
+            },
         ];
         assert!(validate_join_token_bootstrap_endpoints(&valid).is_ok());
 
@@ -18523,9 +18531,10 @@ mod tests {
             Ok(()) => panic!("total endpoint limit should be enforced"),
             Err(error) => error,
         };
-        assert!(error
-            .reason()
-            .contains("endpoint count 33 exceeds maximum 32"));
+        assert!(error.reason().contains(&format!(
+            "endpoint count {} exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS}",
+            MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS + 1
+        )));
 
         let duplicate = vec![
             BootstrapEndpoint {

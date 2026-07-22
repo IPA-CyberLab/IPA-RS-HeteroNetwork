@@ -160,6 +160,7 @@
     "View all": "すべて表示",
     "Signal": "シグナル",
     "STUN": "STUN",
+    "Web UI": "Web UI",
     "Active": "稼働中",
     "Public instance": "公開インスタンス",
     "Services": "サービス",
@@ -307,7 +308,18 @@
     "Link copied.": "リンクをコピーしました。",
     "macOS enrollment token issued.": "macOS 登録トークンを発行しました。",
     "Device type": "デバイスタイプ",
-    "Issue a one-use link for the native macOS client.": "macOS ネイティブクライアント用の単回リンクを発行します。"
+    "Issue a one-use link for the native macOS client.": "macOS ネイティブクライアント用の単回リンクを発行します。",
+    "Web UI node": "Web UI ノード",
+    "Check Web UI nodes": "Web UI ノードを確認",
+    "Remove Web UI node": "Web UI ノードを削除",
+    "Web UI address": "Web UI アドレス",
+    "IP address or URL": "IP アドレスまたは URL",
+    "Connect to your network": "ネットワークに接続",
+    "Enter the first reachable Web UI IP address or URL.": "最初に到達可能な Web UI の IP アドレスまたは URL を入力してください。",
+    "Reachable": "到達可能",
+    "Unreachable": "到達不可",
+    "Checking": "確認中",
+    "Remove this manually added Web UI endpoint?": "手動追加した Web UI エンドポイントを削除しますか？"
   };
 
   var state = {
@@ -324,6 +336,11 @@
     mobileNavOpen: false,
     locale: document.documentElement.lang === "ja" ? "ja" : "en",
     theme: document.documentElement.dataset.theme === "dark" ? "dark" : "light",
+    webUi: {
+      endpoints: [],
+      selectedUrl: null,
+      loading: false
+    },
     enrollment: {
       mode: "linux",
       role: "edge",
@@ -448,6 +465,13 @@
 
   function updateAuthConfigText() {
     if (!state.config) return;
+    if (state.config.local_agent && state.config.bootstrap_required) {
+      $("auth-title").textContent = t("Connect to your network");
+      $("auth-copy").textContent = t("Enter the first reachable Web UI IP address or URL.");
+      return;
+    }
+    $("auth-title").textContent = t("Sign in to your network");
+    $("auth-copy").textContent = t("Use the configured identity provider to continue.");
     if (state.config.provider) {
       $("oidc-login").querySelector("span:last-child").textContent = translateDynamicText("Sign in with " + pretty(state.config.provider));
     }
@@ -466,6 +490,7 @@
     applyStaticTranslations();
     applyTheme(state.theme, false);
     updateAuthConfigText();
+    if (state.config && state.config.local_agent) renderWebUiEndpoints();
     if (state.overview) {
       $("cluster-name").textContent = state.overview.cluster_id;
       $("sidebar-cluster").textContent = state.overview.cluster_id;
@@ -683,6 +708,11 @@
     if (state.token) headers.set("Authorization", "Bearer " + state.token);
     if (request.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     return fetch(path, Object.assign({}, request, { headers: headers })).then(async function (response) {
+      var routedEndpoint = response.headers.get("X-HeteroNetwork-Web-UI-Endpoint");
+      if (routedEndpoint && state.config && state.config.local_agent) {
+        state.webUi.selectedUrl = routedEndpoint;
+        renderWebUiEndpoints();
+      }
       if (response.status === 401) {
         clearSession();
         showAuth(t("Your session expired. Sign in again."));
@@ -805,10 +835,112 @@
       return response.json();
     }).then(function (config) {
       state.config = config;
-      $("oidc-login").hidden = !config.auth_enabled;
-      $("token-form").hidden = !config.operator_token_enabled;
+      var bootstrapRequired = Boolean(config.local_agent && config.bootstrap_required);
+      $("web-ui-bootstrap-form").hidden = !bootstrapRequired;
+      $("oidc-login").hidden = bootstrapRequired || !config.auth_enabled;
+      $("token-form").hidden = bootstrapRequired || !config.operator_token_enabled;
+      $("web-ui-endpoint-control").hidden = !config.local_agent;
       $("enrollment-nav").hidden = !config.node_enrollment_enabled && !config.client_enrollment_enabled;
+      if (bootstrapRequired && config.connection_error) {
+        $("auth-error").textContent = config.connection_error;
+      }
       updateAuthConfigText();
+      if (config.local_agent) loadWebUiEndpoints();
+    });
+  }
+
+  function localWebUiApi(path, options) {
+    var request = options || {};
+    var headers = new Headers(request.headers || {});
+    headers.set("Accept", "application/json");
+    if (request.body) headers.set("Content-Type", "application/json");
+    return fetch(path, Object.assign({}, request, { headers: headers })).then(async function (response) {
+      if (!response.ok) {
+        var message = response.status + " " + response.statusText;
+        try {
+          var body = await response.json();
+          if (body.error) message = body.error;
+        } catch (_) {
+          // Keep the HTTP status when the Agent did not return JSON.
+        }
+        throw new Error(message);
+      }
+      return response.json();
+    });
+  }
+
+  function renderWebUiEndpoints() {
+    var select = $("web-ui-endpoint-select");
+    var endpoints = state.webUi.endpoints || [];
+    if (state.webUi.loading) {
+      select.innerHTML = '<option value="">' + t("Checking") + "...</option>";
+      select.disabled = true;
+      $("web-ui-endpoint-remove").hidden = true;
+      return;
+    }
+    select.disabled = endpoints.length === 0;
+    select.innerHTML = endpoints.length ? endpoints.map(function (endpoint) {
+      var status = endpoint.reachable ? t("Reachable") : t("Unreachable");
+      return '<option value="' + escapeHtml(endpoint.url) + '"'
+        + (endpoint.url === state.webUi.selectedUrl ? " selected" : "") + ">"
+        + escapeHtml(status + " - " + endpoint.url) + "</option>";
+    }).join("") : '<option value="">' + t("Not connected") + "</option>";
+    var selected = endpoints.find(function (endpoint) { return endpoint.url === select.value; });
+    $("web-ui-endpoint-remove").hidden = !selected || selected.source !== "manual_seed";
+  }
+
+  function loadWebUiEndpoints() {
+    if (!state.config || !state.config.local_agent || state.webUi.loading) return Promise.resolve();
+    state.webUi.loading = true;
+    renderWebUiEndpoints();
+    return localWebUiApi("/v1/web-ui/endpoints").then(function (directory) {
+      state.webUi.endpoints = directory.endpoints || [];
+      state.webUi.selectedUrl = directory.selected_url || null;
+    }).catch(function (error) {
+      $("auth-error").textContent = error.message;
+    }).finally(function () {
+      state.webUi.loading = false;
+      renderWebUiEndpoints();
+    });
+  }
+
+  function bootstrapWebUiEndpoint(endpoint) {
+    var button = $("web-ui-bootstrap-submit");
+    button.disabled = true;
+    $("auth-error").textContent = "";
+    return localWebUiApi("/v1/web-ui/bootstrap", {
+      method: "POST",
+      body: JSON.stringify({ endpoint: endpoint })
+    }).then(function () {
+      location.replace(location.origin + "/ui/");
+    }).catch(function (error) {
+      $("auth-error").textContent = error.message;
+      button.disabled = false;
+    });
+  }
+
+  function selectWebUiEndpoint(endpoint) {
+    return localWebUiApi("/v1/web-ui/select", {
+      method: "POST",
+      body: JSON.stringify({ endpoint: endpoint })
+    }).then(function () {
+      location.reload();
+    }).catch(function (error) {
+      toast(error.message, "error");
+      return loadWebUiEndpoints();
+    });
+  }
+
+  function removeSelectedWebUiEndpoint() {
+    var endpoint = $("web-ui-endpoint-select").value;
+    if (!endpoint || !window.confirm(t("Remove this manually added Web UI endpoint?"))) return;
+    return localWebUiApi("/v1/web-ui/endpoints", {
+      method: "DELETE",
+      body: JSON.stringify({ endpoint: endpoint })
+    }).then(function () {
+      return loadWebUiEndpoints();
+    }).catch(function (error) {
+      toast(error.message, "error");
     });
   }
 
@@ -905,14 +1037,19 @@
     var recentContent = recent.length
       ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Connectivity</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
       : emptyState("No devices registered", "Connect a device to see it here.", "server");
+    var derivedWebUiCount = (directory.instances || []).filter(function (instance) {
+      return (instance.endpoints || []).some(function (endpoint) { return endpoint.kind === "web_ui"; });
+    }).length;
+    var activeWebUiCount = metrics.active_web_ui_count == null ? derivedWebUiCount : metrics.active_web_ui_count;
     var serviceKinds = [
-      ["Control plane", "active_control_plane_count"],
-      ["Signal", "active_signal_count"],
-      ["STUN", "active_stun_count"],
-      ["Relay", "active_relay_count"]
+      ["Control plane", metrics.active_control_plane_count || 0],
+      ["Signal", metrics.active_signal_count || 0],
+      ["STUN", metrics.active_stun_count || 0],
+      ["Relay", metrics.active_relay_count || 0],
+      ["Web UI", activeWebUiCount]
     ];
     var serviceRows = serviceKinds.map(function (entry) {
-      var count = metrics[entry[1]] || 0;
+      var count = entry[1];
       return '<div class="policy-summary-row"><span>' + escapeHtml(entry[0]) + '</span>'
         + statusPill(count >= 2 ? "healthy" : count === 1 ? "degraded" : "unreachable", count + " active")
         + '</div>';
@@ -952,11 +1089,16 @@
     var overview = state.overview;
     var metrics = overview.metrics || {};
     var directory = overview.service_directory || { instances: [], bootstrap_endpoints: [] };
+    var derivedWebUiCount = (directory.instances || []).filter(function (instance) {
+      return (instance.endpoints || []).some(function (endpoint) { return endpoint.kind === "web_ui"; });
+    }).length;
+    var activeWebUiCount = metrics.active_web_ui_count == null ? derivedWebUiCount : metrics.active_web_ui_count;
     var kinds = [
       ["control_plane", "Control plane", metrics.active_control_plane_count || 0],
       ["signal", "Signal", metrics.active_signal_count || 0],
       ["stun", "STUN", metrics.active_stun_count || 0],
-      ["relay", "Relay", metrics.active_relay_count || 0]
+      ["relay", "Relay", metrics.active_relay_count || 0],
+      ["web_ui", "Web UI", activeWebUiCount]
     ];
     var endpointRows = (directory.instances || []).map(function (instance) {
       var endpoints = instance.endpoints || [];
@@ -1508,6 +1650,13 @@
   });
 
   document.addEventListener("change", function (event) {
+    if (event.target.matches("#web-ui-endpoint-select")) {
+      var endpoint = event.target.value;
+      var selected = state.webUi.endpoints.find(function (entry) { return entry.url === endpoint; });
+      $("web-ui-endpoint-remove").hidden = !selected || selected.source !== "manual_seed";
+      if (endpoint && endpoint !== state.webUi.selectedUrl) selectWebUiEndpoint(endpoint);
+      return;
+    }
     if (event.target.matches("#locale-select")) {
       setLocale(event.target.value);
       return;
@@ -1623,6 +1772,14 @@
       applyTheme(state.theme === "dark" ? "light" : "dark", true);
       return;
     }
+    if (event.target.closest("#web-ui-endpoint-refresh")) {
+      loadWebUiEndpoints();
+      return;
+    }
+    if (event.target.closest("#web-ui-endpoint-remove")) {
+      removeSelectedWebUiEndpoint();
+      return;
+    }
   });
 
   document.addEventListener("keydown", function (event) {
@@ -1645,6 +1802,12 @@
     loadOverview();
   });
 
+  $("web-ui-bootstrap-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var endpoint = $("web-ui-bootstrap-endpoint").value.trim();
+    if (endpoint) bootstrapWebUiEndpoint(endpoint);
+  });
+
   $("auth-button").addEventListener("click", function () {
     if (state.token) signOut();
     else showAuth("");
@@ -1661,6 +1824,10 @@
   setInterval(function () {
     if (state.token && !state.loading && !state.policyDirty) loadOverview();
   }, 10000);
+
+  setInterval(function () {
+    if (state.config && state.config.local_agent && !state.webUi.loading) loadWebUiEndpoints();
+  }, 15000);
 
   loadConfig().then(function () {
     return exchangeCode();

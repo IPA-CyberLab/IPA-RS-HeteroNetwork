@@ -29,6 +29,12 @@
           <span id="cluster-name" class="context-value" data-i18n="Not connected">Not connected</span>
         </div>
         <div class="topbar-actions">
+          <div id="web-ui-endpoint-control" class="endpoint-control" hidden>
+            <label class="sr-only" for="web-ui-endpoint-select" data-i18n="Web UI node">Web UI node</label>
+            <select id="web-ui-endpoint-select" aria-label="Web UI node" data-i18n-aria="Web UI node"></select>
+            <button id="web-ui-endpoint-refresh" class="icon-button" type="button" aria-label="Check Web UI nodes" title="Check Web UI nodes" data-i18n-aria="Check Web UI nodes" data-i18n-title="Check Web UI nodes"><span data-icon="refresh-cw"></span></button>
+            <button id="web-ui-endpoint-remove" class="icon-button" type="button" aria-label="Remove Web UI node" title="Remove Web UI node" data-i18n-aria="Remove Web UI node" data-i18n-title="Remove Web UI node" hidden><span data-icon="trash-2"></span></button>
+          </div>
           <span id="connection-state" class="connection-state offline"><span class="status-dot"></span><span data-i18n="Offline">Offline</span></span>
           <span id="refresh-time" class="refresh-time" data-i18n="Not connected">Not connected</span>
           <button id="refresh-button-top" class="icon-button desktop-only" type="button" aria-label="Refresh data" title="Refresh data"><span data-icon="refresh-cw"></span></button>
@@ -83,6 +89,12 @@
               <span class="eyebrow">HETERONETWORK CONSOLE</span>
               <h1 id="auth-title" data-i18n="Sign in to your network">Sign in to your network</h1>
               <p id="auth-copy" data-i18n="Use the configured identity provider to continue.">Use the configured identity provider to continue.</p>
+              <form id="web-ui-bootstrap-form" class="bootstrap-form" hidden>
+                <div class="form-field">
+                  <label for="web-ui-bootstrap-endpoint" data-i18n="Web UI address">Web UI address</label>
+                  <div class="token-row"><input id="web-ui-bootstrap-endpoint" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="IP address or URL" data-i18n-placeholder="IP address or URL"><button id="web-ui-bootstrap-submit" class="button button-primary" type="submit"><span data-icon="network"></span><span data-i18n="Connect">Connect</span></button></div>
+                </div>
+              </form>
               <button id="oidc-login" class="button button-primary button-wide" type="button"><span data-icon="log-in"></span><span data-i18n="Sign in with SSO">Sign in with SSO</span></button>
               <form id="token-form" class="token-form" hidden>
                 <div class="form-field">
