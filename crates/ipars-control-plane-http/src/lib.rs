@@ -2098,8 +2098,8 @@ Restart=on-failure
 RestartSec=5s
 StateDirectory=heteronetwork
 StateDirectoryMode=0700
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectControlGroups=true
@@ -2584,6 +2584,14 @@ where
     let client = state
         .plane
         .authenticate_client_request(&request, ClientRequestKind::PeerMap, Utc::now())
+        .await?;
+    state
+        .plane
+        .update_client_gateway_selection(
+            &client,
+            request.active_gateway_node_id.as_ref(),
+            Utc::now(),
+        )
         .await?;
     let peer_map = state.plane.peer_map_for(&request.client_id).await?;
     let cluster_policy = state.plane.cluster_policy()?;
@@ -3726,6 +3734,8 @@ mod tests {
         gateway_claims.role = Role::gateway();
         let mut gateway_registration = registration("mac-client-gateway");
         gateway_registration.candidates = vec![candidate("mac-client-gateway")];
+        gateway_registration.candidates[0].kind = EndpointCandidateKind::PublicUdp;
+        gateway_registration.candidates[0].addr = "8.8.8.8:51820".parse()?;
         let gateway = plane
             .register_with_claims(gateway_claims, gateway_registration)
             .await?
@@ -4042,6 +4052,9 @@ mod tests {
         assert!(script.contains("systemd-sysusers"));
         assert!(script.contains("User=heteronetwork-gateway"));
         assert!(script.contains("SupplementaryGroups=heteronetwork-gateway"));
+        assert!(
+            script.contains("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE")
+        );
         assert!(script.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(script.contains(&format!(
             "caddy_{NODE_ENROLLMENT_CADDY_VERSION}_linux_amd64.tar.gz"
@@ -4311,6 +4324,7 @@ mod tests {
 
         let mut query = ClientControlRequest {
             client_id: client_join.client.node_id.clone(),
+            active_gateway_node_id: None,
             request_signature: None,
         };
         query.request_signature = Some(client_identity.sign_client_control_request(
@@ -4403,6 +4417,7 @@ mod tests {
 
         let mut removal = ClientControlRequest {
             client_id: client_join.client.node_id.clone(),
+            active_gateway_node_id: None,
             request_signature: None,
         };
         removal.request_signature = Some(client_identity.sign_client_control_request(

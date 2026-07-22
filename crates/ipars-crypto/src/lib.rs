@@ -568,6 +568,7 @@ mod tests {
         let nonce = URL_SAFE_NO_PAD.encode([3_u8; NODE_API_REQUEST_NONCE_BYTES]);
         let mut request = ClientControlRequest {
             client_id: identity.node_id(),
+            active_gateway_node_id: None,
             request_signature: None,
         };
         let payload = request.signature_payload(ClientRequestKind::PeerMap, signed_at, &nonce);
@@ -600,6 +601,35 @@ mod tests {
         assert!(verify_client_control_request_signature(
             &request,
             ClientRequestKind::Remove,
+            &identity.public_key_b64(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn client_gateway_selection_is_bound_to_the_v2_signature() {
+        let identity = IdentityKeyPair::from_signing_bytes([11_u8; 32]);
+        let mut request = ClientControlRequest {
+            client_id: identity.node_id(),
+            active_gateway_node_id: Some(NodeId::from_string("gateway-a")),
+            request_signature: None,
+        };
+        request.request_signature = Some(identity.sign_client_control_request(
+            &request,
+            ClientRequestKind::PeerMap,
+            Utc::now(),
+        ));
+
+        assert!(verify_client_control_request_signature(
+            &request,
+            ClientRequestKind::PeerMap,
+            &identity.public_key_b64(),
+        )
+        .is_ok());
+        request.active_gateway_node_id = Some(NodeId::from_string("gateway-b"));
+        assert!(verify_client_control_request_signature(
+            &request,
+            ClientRequestKind::PeerMap,
             &identity.public_key_b64(),
         )
         .is_err());

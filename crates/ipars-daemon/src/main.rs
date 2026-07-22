@@ -22,6 +22,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
+use hickory_proto::op::{Message as DnsMessage, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use ipars_agent::{
     preferred_peer_local_udp_candidate, AgentError, AgentRuntime, BoringTunWireGuardBackend,
     CommandWireGuardPeerTelemetrySource, FileAgentStateStore, KernelWireGuardBackend,
@@ -34,7 +36,8 @@ use ipars_agent::{
     WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{
-    router as agent_router, AgentHttpState, PublicWebGatewayPhase, PublicWebGatewayStatus,
+    overlay_web_ui_router, router as agent_router, AgentHttpState, PublicWebGatewayPhase,
+    PublicWebGatewayStatus,
 };
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
@@ -126,7 +129,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -141,6 +144,11 @@ const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
     "udp://stun.cloudflare.com:3478",
     "udp://stun.cloudflare.com:53",
 ];
+const OVERLAY_WEB_UI_DNS_NAME: &str = "console.heteronetwork.internal";
+const OVERLAY_SERVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const OVERLAY_DNS_TTL_SECONDS: u32 = 5;
+const MAX_OVERLAY_DNS_MESSAGE_BYTES: usize = 4096;
+const MAX_OVERLAY_DNS_TCP_CONNECTIONS: usize = 64;
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
@@ -832,6 +840,24 @@ struct AgentArgs {
         default_value_t = 45
     )]
     public_web_gateway_classification_max_age_seconds: u64,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_DISABLE_OVERLAY_SERVICES",
+        default_value_t = false
+    )]
+    disable_overlay_services: bool,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_OVERLAY_WEB_UI_PORT",
+        default_value_t = 9781
+    )]
+    overlay_web_ui_port: u16,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_OVERLAY_DNS_PORT",
+        default_value_t = 53
+    )]
+    overlay_dns_port: u16,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT",
@@ -1950,6 +1976,16 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
                     .nat_discovery_interval_seconds
                     .min(args.public_nat_discovery_interval_seconds),
             "--public-web-gateway-classification-max-age-seconds must not be shorter than the effective public NAT discovery interval"
+        );
+    }
+    if !args.disable_overlay_services {
+        anyhow::ensure!(
+            args.overlay_web_ui_port > 0,
+            "--overlay-web-ui-port must be greater than zero"
+        );
+        anyhow::ensure!(
+            args.overlay_dns_port > 0,
+            "--overlay-dns-port must be greater than zero"
         );
     }
     if args.apply_peer_map {
@@ -4802,6 +4838,175 @@ async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
     tracing::info!(%listen, "control-plane listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn start_overlay_web_ui(listen: SocketAddr, app: Router) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match tokio::net::TcpListener::bind(listen).await {
+                Ok(listener) => {
+                    tracing::info!(
+                        %listen,
+                        dns_name = OVERLAY_WEB_UI_DNS_NAME,
+                        "overlay Web UI listening"
+                    );
+                    if let Err(error) = axum::serve(listener, app.clone()).await {
+                        tracing::warn!(%error, %listen, "overlay Web UI listener stopped");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %listen, "overlay Web UI bind failed; retrying");
+                }
+            }
+            tokio::time::sleep(OVERLAY_SERVICE_RETRY_INTERVAL).await;
+        }
+    })
+}
+
+fn start_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = serve_overlay_dns(listen, answer_ip).await {
+                tracing::warn!(%error, %listen, "overlay DNS listener stopped; retrying");
+            }
+            tokio::time::sleep(OVERLAY_SERVICE_RETRY_INTERVAL).await;
+        }
+    })
+}
+
+async fn serve_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> anyhow::Result<()> {
+    let udp = tokio::net::UdpSocket::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind overlay DNS UDP listener at {listen}"))?;
+    let tcp = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind overlay DNS TCP listener at {listen}"))?;
+    tracing::info!(
+        %listen,
+        dns_name = OVERLAY_WEB_UI_DNS_NAME,
+        %answer_ip,
+        "overlay split DNS listening"
+    );
+    tokio::try_join!(
+        serve_overlay_dns_udp(udp, answer_ip),
+        serve_overlay_dns_tcp(tcp, answer_ip)
+    )?;
+    Ok(())
+}
+
+async fn serve_overlay_dns_udp(
+    socket: tokio::net::UdpSocket,
+    answer_ip: IpAddr,
+) -> anyhow::Result<()> {
+    let mut buffer = [0_u8; MAX_OVERLAY_DNS_MESSAGE_BYTES];
+    loop {
+        let (length, peer) = socket.recv_from(&mut buffer).await?;
+        match overlay_dns_response(&buffer[..length], answer_ip) {
+            Ok(response) => {
+                socket.send_to(&response, peer).await?;
+            }
+            Err(error) => {
+                tracing::debug!(%error, %peer, "rejected overlay DNS datagram");
+            }
+        }
+    }
+}
+
+async fn serve_overlay_dns_tcp(
+    listener: tokio::net::TcpListener,
+    answer_ip: IpAddr,
+) -> anyhow::Result<()> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_OVERLAY_DNS_TCP_CONNECTIONS));
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .context("overlay DNS TCP semaphore closed")?;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_overlay_dns_tcp_connection(stream, answer_ip),
+            )
+            .await;
+            if let Ok(Err(error)) = result {
+                tracing::debug!(%error, %peer, "rejected overlay DNS TCP request");
+            }
+        });
+    }
+}
+
+async fn handle_overlay_dns_tcp_connection(
+    mut stream: tokio::net::TcpStream,
+    answer_ip: IpAddr,
+) -> anyhow::Result<()> {
+    let mut length = [0_u8; 2];
+    stream.read_exact(&mut length).await?;
+    let length = usize::from(u16::from_be_bytes(length));
+    anyhow::ensure!(
+        (1..=MAX_OVERLAY_DNS_MESSAGE_BYTES).contains(&length),
+        "overlay DNS TCP request length is invalid"
+    );
+    let mut request = vec![0_u8; length];
+    stream.read_exact(&mut request).await?;
+    let response = overlay_dns_response(&request, answer_ip)?;
+    let response_length =
+        u16::try_from(response.len()).context("overlay DNS response too large")?;
+    stream.write_all(&response_length.to_be_bytes()).await?;
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+fn overlay_dns_response(request: &[u8], answer_ip: IpAddr) -> anyhow::Result<Vec<u8>> {
+    let request = DnsMessage::from_vec(request).context("invalid DNS message")?;
+    let mut response = DnsMessage::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.checking_disabled = request.metadata.checking_disabled;
+    response.metadata.authoritative = true;
+    response.add_queries(request.queries.iter().cloned());
+    if let Some(edns) = request.edns.clone() {
+        response.set_edns(edns);
+    }
+
+    if request.metadata.message_type != MessageType::Query
+        || request.metadata.op_code != OpCode::Query
+    {
+        response.metadata.response_code = ResponseCode::NotImp;
+        return response.to_vec().context("failed to encode DNS response");
+    }
+    let [query] = request.queries.as_slice() else {
+        response.metadata.response_code = ResponseCode::FormErr;
+        return response.to_vec().context("failed to encode DNS response");
+    };
+    if query.query_class != DNSClass::IN {
+        response.metadata.response_code = ResponseCode::Refused;
+        return response.to_vec().context("failed to encode DNS response");
+    }
+    if !query
+        .name
+        .to_ascii()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(OVERLAY_WEB_UI_DNS_NAME)
+    {
+        response.metadata.response_code = ResponseCode::NXDomain;
+        return response.to_vec().context("failed to encode DNS response");
+    }
+
+    let rdata = match (query.query_type, answer_ip) {
+        (RecordType::A | RecordType::ANY, IpAddr::V4(ip)) => Some(RData::A(ip.into())),
+        (RecordType::AAAA | RecordType::ANY, IpAddr::V6(ip)) => Some(RData::AAAA(ip.into())),
+        _ => None,
+    };
+    if let Some(rdata) = rdata {
+        response.add_answer(Record::from_rdata(
+            query.name.clone(),
+            OVERLAY_DNS_TTL_SECONDS,
+            rdata,
+        ));
+    }
+    response.to_vec().context("failed to encode DNS response")
 }
 
 async fn run_signal(
@@ -8516,6 +8721,20 @@ async fn run_agent(
     }
     if let Some(token) = api_bearer_token {
         http_state = http_state.require_api_bearer_token(token);
+    }
+    if args.apply_peer_map && !args.disable_overlay_services {
+        let overlay_ip = runtime_local_vpn_ip(&runtime)?.0;
+        let overlay_web_listen = SocketAddr::new(overlay_ip, args.overlay_web_ui_port);
+        let overlay_dns_listen = SocketAddr::new(overlay_ip, args.overlay_dns_port);
+        background_tasks.push(start_overlay_web_ui(
+            overlay_web_listen,
+            overlay_web_ui_router(
+                http_state.clone(),
+                overlay_web_listen,
+                OVERLAY_WEB_UI_DNS_NAME,
+            ),
+        ));
+        background_tasks.push(start_overlay_dns(overlay_dns_listen, overlay_ip));
     }
     let result = serve_router(args.listen, agent_router(http_state)).await;
     for task in background_tasks {
@@ -12361,7 +12580,7 @@ fn public_web_gateway_caddyfile(
         let site = site.trim_end_matches('/');
         let _ = writeln!(
             caddyfile,
-            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
+            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
         );
     }
     caddyfile
@@ -12785,6 +13004,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                         .record_remote_peer_activity(intent.peer, intent.observed_at)
                         .await;
                 }
+                notify_peer_map_sync_for_heartbeat(runtime.as_ref(), response.peer_delta_available);
                 tracing::info!(
                     accepted = response.accepted,
                     policy_version = response.policy_version,
@@ -12803,6 +13023,12 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
             _ = tokio::time::sleep(remaining) => {}
             _ = heartbeat_report_notify.notified() => {}
         }
+    }
+}
+
+fn notify_peer_map_sync_for_heartbeat(runtime: &AgentRuntime, peer_delta_available: bool) {
+    if peer_delta_available {
+        runtime.peer_map_sync_notifier().notify_one();
     }
 }
 
@@ -18724,8 +18950,40 @@ mod tests {
         assert!(public.contains("/v1/web-ui/auth/device/poll"));
         assert!(public.contains("/v1/install/*"));
         assert!(public.contains("/v1/admin/*"));
+        assert!(public.contains("/v1/clients/peers/query"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
+    }
+
+    #[test]
+    fn overlay_dns_answers_only_the_internal_console_name() -> anyhow::Result<()> {
+        let mut request = DnsMessage::query();
+        request.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii(OVERLAY_WEB_UI_DNS_NAME)?,
+            RecordType::A,
+        ));
+        let response =
+            overlay_dns_response(&request.to_vec()?, IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)))?;
+        let response = DnsMessage::from_vec(&response)?;
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        assert!(matches!(
+            response.answers[0].data,
+            RData::A(value) if value.0 == Ipv4Addr::new(10, 250, 0, 7)
+        ));
+        assert_eq!(response.answers[0].ttl, OVERLAY_DNS_TTL_SECONDS);
+
+        let mut unknown = DnsMessage::query();
+        unknown.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("unknown.heteronetwork.internal")?,
+            RecordType::A,
+        ));
+        let response =
+            overlay_dns_response(&unknown.to_vec()?, IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)))?;
+        let response = DnsMessage::from_vec(&response)?;
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+        assert!(response.answers.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -19407,6 +19665,20 @@ mod tests {
         available_task.abort();
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_peer_delta_wakes_peer_map_sync() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let notifier = runtime.peer_map_sync_notifier();
+        let notified = notifier.notified();
+        notify_peer_map_sync_for_heartbeat(&runtime, true);
+        assert!(tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

@@ -1865,6 +1865,13 @@ pub mod api {
         pub cluster_policy: ClusterPolicy,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ClientGatewaySelection {
+        pub client_id: NodeId,
+        pub gateway_node_id: NodeId,
+        pub selected_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum ClientRequestKind {
@@ -1900,6 +1907,8 @@ pub mod api {
     pub struct ClientControlRequest {
         pub client_id: NodeId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_gateway_node_id: Option<NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request_signature: Option<ClientRequestSignature>,
     }
 
@@ -1910,14 +1919,25 @@ pub mod api {
             signed_at: DateTime<Utc>,
             nonce: &str,
         ) -> Vec<u8> {
-            format!(
-                "heteronetwork-client-request-v1\n{}\n{}\n{}\n{}\n",
-                kind.as_str(),
-                self.client_id,
-                signed_at.timestamp(),
-                nonce
-            )
-            .into_bytes()
+            match &self.active_gateway_node_id {
+                Some(gateway_node_id) => format!(
+                    "heteronetwork-client-request-v2\n{}\n{}\n{}\n{}\n{}\n",
+                    kind.as_str(),
+                    self.client_id,
+                    gateway_node_id,
+                    signed_at.timestamp(),
+                    nonce
+                )
+                .into_bytes(),
+                None => format!(
+                    "heteronetwork-client-request-v1\n{}\n{}\n{}\n{}\n",
+                    kind.as_str(),
+                    self.client_id,
+                    signed_at.timestamp(),
+                    nonce
+                )
+                .into_bytes(),
+            }
         }
     }
 
