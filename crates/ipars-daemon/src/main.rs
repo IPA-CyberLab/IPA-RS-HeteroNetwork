@@ -12479,6 +12479,15 @@ async fn desired_public_web_gateway_ip(
     (age <= max_age).then_some(classification.local_addr.ip())
 }
 
+fn public_web_gateway_probe_failure_requires_unload(
+    gateway_was_ready: bool,
+    configuration_loaded_at: Option<Instant>,
+) -> bool {
+    gateway_was_ready
+        || configuration_loaded_at
+            .is_some_and(|loaded_at| loaded_at.elapsed() >= Duration::from_secs(60))
+}
+
 fn start_public_web_gateway(
     runtime: Arc<AgentRuntime>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
@@ -12556,21 +12565,47 @@ fn start_public_web_gateway(
                             .await;
                         }
                         Err(error) => {
-                            let configuration_stale =
-                                configuration_loaded_at.is_some_and(|loaded_at| {
-                                    loaded_at.elapsed() >= Duration::from_secs(60)
-                                });
-                            if gateway_was_ready || configuration_stale {
-                                configured_ip = None;
-                                configuration_loaded_at = None;
-                                gateway_was_ready = false;
+                            let mut last_error = error.to_string();
+                            if public_web_gateway_probe_failure_requires_unload(
+                                gateway_was_ready,
+                                configuration_loaded_at,
+                            ) {
+                                // Keep configured_ip aligned with Caddy. Otherwise a NAT-state
+                                // change in this window can skip the standby reload entirely.
+                                match load_public_web_gateway_caddyfile(
+                                    &admin_client,
+                                    &config,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        configured_ip = None;
+                                        configuration_loaded_at = None;
+                                        gateway_was_ready = false;
+                                        tracing::warn!(
+                                            public_ip = %public_ip,
+                                            "disabled public Web UI gateway after failed probe"
+                                        );
+                                    }
+                                    Err(unload_error) => {
+                                        last_error = format!(
+                                            "{error}; failed to disable stale public gateway: {unload_error}"
+                                        );
+                                        tracing::warn!(
+                                            %unload_error,
+                                            public_ip = %public_ip,
+                                            "failed to disable public Web UI gateway after failed probe"
+                                        );
+                                    }
+                                }
                             }
                             set_public_web_gateway_status(
                                 &status,
                                 PublicWebGatewayPhase::Error,
                                 Some(public_ip),
                                 Some(url),
-                                Some(error.to_string()),
+                                Some(last_error),
                             )
                             .await;
                         }
@@ -18691,6 +18726,22 @@ mod tests {
         assert!(public.contains("/v1/admin/*"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
+    }
+
+    #[test]
+    fn public_web_gateway_unloads_failed_ready_or_stale_configuration() {
+        assert!(public_web_gateway_probe_failure_requires_unload(true, None));
+        assert!(!public_web_gateway_probe_failure_requires_unload(
+            false, None
+        ));
+        assert!(!public_web_gateway_probe_failure_requires_unload(
+            false,
+            Some(Instant::now())
+        ));
+        assert!(public_web_gateway_probe_failure_requires_unload(
+            false,
+            Some(Instant::now() - Duration::from_secs(61))
+        ));
     }
 
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
