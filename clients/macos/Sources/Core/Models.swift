@@ -5,6 +5,7 @@ public enum BootstrapEndpointKind: String, Codable, Sendable {
     case signal
     case stun
     case relay
+    case webUi = "web_ui"
 }
 
 public struct BootstrapEndpoint: Codable, Equatable, Sendable {
@@ -296,10 +297,22 @@ public struct ClientRequestSignature: Codable, Equatable, Sendable {
 
 public struct ClientControlRequest: Codable, Equatable, Sendable {
     public let clientID: String
+    public let activeGatewayNodeID: String?
     public let requestSignature: ClientRequestSignature
+
+    public init(
+        clientID: String,
+        activeGatewayNodeID: String? = nil,
+        requestSignature: ClientRequestSignature
+    ) {
+        self.clientID = clientID
+        self.activeGatewayNodeID = activeGatewayNodeID
+        self.requestSignature = requestSignature
+    }
 
     enum CodingKeys: String, CodingKey {
         case clientID = "client_id"
+        case activeGatewayNodeID = "active_gateway_node_id"
         case requestSignature = "request_signature"
     }
 }
@@ -318,9 +331,10 @@ public struct ClientSession: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let identityPrivateKey: Data
     public let wireGuardPrivateKey: Data
-    public let controlPlaneURLs: [URL]
+    public var controlPlaneURLs: [URL]
     public let client: NodeRecord
     public var peerMap: PeerMap
+    public var selectedGatewayNodeID: String?
     public let enrolledAt: Date
     public var refreshedAt: Date
 
@@ -338,6 +352,7 @@ public struct ClientSession: Codable, Equatable, Sendable {
         self.controlPlaneURLs = controlPlaneURLs
         self.client = client
         self.peerMap = peerMap
+        selectedGatewayNodeID = peerMap.peers.first?.nodeID
         self.enrolledAt = enrolledAt
         refreshedAt = enrolledAt
     }
@@ -347,6 +362,6 @@ public struct ClientSession: Codable, Equatable, Sendable {
         case identityPrivateKey = "identity_private_key"
         case wireGuardPrivateKey = "wireguard_private_key"
         case controlPlaneURLs = "control_plane_urls"
-        case client, peerMap, enrolledAt, refreshedAt
+        case client, peerMap, selectedGatewayNodeID, enrolledAt, refreshedAt
     }
 }

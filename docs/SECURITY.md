@@ -54,9 +54,16 @@ After enrollment, the macOS app keeps its Ed25519 identity and WireGuard private
 key in a device-only shared Keychain item available to the containing app and
 packet-tunnel extension. Enrollment tokens are not persisted. Peer-map refresh
 and removal requests carry bounded-fresh operation-specific Ed25519 signatures
-and random nonces. The packet tunnel accepts exactly one gateway peer and
-rejects default routes, malformed CIDRs, local or relay endpoint candidates,
-and invalid WireGuard keys before starting WireGuardKit. This client identity is
+and random nonces. The packet tunnel accepts an ordered, bounded gateway set,
+configures only its first member, and refreshes that signed map while connected.
+Gateway changes use the v2 client-control payload, which binds the selected
+gateway ID to the client identity, operation, timestamp, and nonce; changing the
+gateway field invalidates the signature. Legacy v1 requests cannot nominate a
+gateway and therefore remain pinned to the server-selected primary.
+It rejects default routes, malformed CIDRs, local or relay endpoint candidates,
+and invalid WireGuard keys before starting WireGuardKit. The overlay Web UI and
+authoritative split-DNS listeners bind only to the Agent's VPN address; their
+router excludes Agent status, metrics, and mutation APIs. This client identity is
 explicitly denied access to heartbeat, Signal, path-reporting, normal removal,
 and node key-rotation operations.
 

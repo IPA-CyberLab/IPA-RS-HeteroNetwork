@@ -24,7 +24,8 @@ fi
 
 if ! git -C "$checkout_dir" diff --quiet -- . \
   ':(exclude)Package.swift' \
-  ':(exclude)Sources/WireGuardKitC/WireGuardKitC.h'; then
+  ':(exclude)Sources/WireGuardKitC/WireGuardKitC.h' \
+  ':(exclude)Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift'; then
   echo "WireGuardKit checkout contains unexpected local changes" >&2
   exit 1
 fi
@@ -41,6 +42,11 @@ git -C "$checkout_dir" show "$revision:Sources/WireGuardKitC/WireGuardKitC.h" \
   | sed '/#include "x25519.h"/a\
 #include <sys/types.h>' \
   > "$checkout_dir/Sources/WireGuardKitC/WireGuardKitC.h"
+
+git -C "$checkout_dir" show \
+  "$revision:Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift" \
+  > "$checkout_dir/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift"
+git -C "$checkout_dir" apply "$project_dir/patches/wireguardkit-split-dns.patch"
 
 cd "$project_dir"
 xcodegen generate

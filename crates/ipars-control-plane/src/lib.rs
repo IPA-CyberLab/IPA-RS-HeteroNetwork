@@ -14,7 +14,7 @@ use ipars_crypto::{
     verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
-    ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse,
+    ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
     ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
     ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
     PathStateCount, PeerConnectionIntent, PeerMap, RegisterClientRequest, RegisterClientResponse,
@@ -53,6 +53,8 @@ const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
 const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
 const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
+const MAX_CLIENT_GATEWAYS: usize = 4;
+const CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_NODE_ENROLLMENT_TOKEN_USES: u32 = 1_000;
 pub const NODE_ENROLLMENT_ALLOWED_ROLES: [&str; 3] = ["edge", "worker", "gateway"];
 
@@ -210,6 +212,20 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         cluster_id: &ClusterId,
     ) -> Result<Vec<ServiceInstance>, ControlPlaneError>;
+    async fn upsert_client_gateway_selection(
+        &self,
+        selection: ClientGatewaySelection,
+    ) -> Result<(), ControlPlaneError>;
+    async fn remove_client_gateway_selection(
+        &self,
+        client_id: &NodeId,
+    ) -> Result<bool, ControlPlaneError>;
+    async fn list_client_gateway_selections(
+        &self,
+    ) -> Result<BTreeMap<NodeId, ClientGatewaySelection>, ControlPlaneError>;
+    async fn latest_client_gateway_selection_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +280,7 @@ pub struct InMemoryStore {
     nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
     paths: RwLock<Vec<PathRecord>>,
     service_instances: RwLock<BTreeMap<(ClusterId, String), ServiceInstance>>,
+    client_gateway_selections: RwLock<BTreeMap<NodeId, ClientGatewaySelection>>,
 }
 
 #[async_trait]
@@ -294,6 +311,12 @@ impl ControlPlaneStore for InMemoryStore {
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let removed_health = self.health.write().await.remove(node_id).is_some();
         self.nat_classifications.write().await.remove(node_id);
+        self.client_gateway_selections
+            .write()
+            .await
+            .retain(|client_id, selection| {
+                client_id != node_id && &selection.gateway_node_id != node_id
+            });
         let mut removed_path_count = 0;
         self.paths.write().await.retain(|path| {
             let keep = &path.key.local != node_id && &path.key.remote != node_id;
@@ -510,6 +533,47 @@ impl ControlPlaneStore for InMemoryStore {
             .filter(|instance| &instance.cluster_id == cluster_id)
             .cloned()
             .collect())
+    }
+
+    async fn upsert_client_gateway_selection(
+        &self,
+        selection: ClientGatewaySelection,
+    ) -> Result<(), ControlPlaneError> {
+        self.client_gateway_selections
+            .write()
+            .await
+            .insert(selection.client_id.clone(), selection);
+        Ok(())
+    }
+
+    async fn remove_client_gateway_selection(
+        &self,
+        client_id: &NodeId,
+    ) -> Result<bool, ControlPlaneError> {
+        Ok(self
+            .client_gateway_selections
+            .write()
+            .await
+            .remove(client_id)
+            .is_some())
+    }
+
+    async fn list_client_gateway_selections(
+        &self,
+    ) -> Result<BTreeMap<NodeId, ClientGatewaySelection>, ControlPlaneError> {
+        Ok(self.client_gateway_selections.read().await.clone())
+    }
+
+    async fn latest_client_gateway_selection_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError> {
+        Ok(self
+            .client_gateway_selections
+            .read()
+            .await
+            .values()
+            .map(|selection| selection.selected_at)
+            .max())
     }
 }
 
@@ -1220,7 +1284,11 @@ where
     pub async fn require_client_gateway(&self) -> Result<NodeRecord, ControlPlaneError> {
         let now = Utc::now();
         let policy = self.policy_snapshot()?;
-        select_client_gateway(&self.store.list_nodes().await?, now, &policy)
+        let nodes = self.store.list_nodes().await?;
+        let health_by_node = self.health_by_node(&nodes).await?;
+        select_client_gateways(&nodes, &health_by_node, now, &policy)
+            .into_iter()
+            .next()
             .cloned()
             .ok_or_else(|| {
                 ControlPlaneError::Store("no reachable client gateway is registered".to_string())
@@ -1464,11 +1532,16 @@ where
     ) -> Result<RegisterNodeResponse, ControlPlaneError> {
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
+        let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let policy = self.policy_snapshot()?;
         let directory = self.service_directory_at(now).await?;
         let peer_map = self.filtered_peer_map_for_node(
             &node,
             &peers,
+            ClientGatewayRoutingState {
+                health_by_node: &health_by_node,
+                selections: &client_gateway_selections,
+            },
             &policy,
             directory.bootstrap_endpoints,
             now,
@@ -1625,6 +1698,12 @@ where
         kind: ClientRequestKind,
         now: chrono::DateTime<Utc>,
     ) -> Result<NodeRecord, ControlPlaneError> {
+        if kind == ClientRequestKind::Remove && request.active_gateway_node_id.is_some() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.client_id.clone(),
+                reason: "client removal must not select an active gateway".to_string(),
+            });
+        }
         let signature = request
             .request_signature
             .as_ref()
@@ -1679,6 +1758,65 @@ where
         Ok(client)
     }
 
+    pub async fn update_client_gateway_selection(
+        &self,
+        client: &NodeRecord,
+        requested_gateway: Option<&NodeId>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ControlPlaneError> {
+        let peers = self.store.list_nodes().await?;
+        let health_by_node = self.health_by_node(&peers).await?;
+        let policy = self.policy_snapshot()?;
+        let visible_nodes = peers
+            .iter()
+            .filter(|peer| peer.node_id != client.node_id && !peer.role.is_client())
+            .filter_map(|peer| acl_filter_peer(client, peer, &policy))
+            .collect::<Vec<_>>();
+        let gateways = select_client_gateways(&visible_nodes, &health_by_node, now, &policy);
+        let desired_gateway = requested_gateway
+            .filter(|requested| {
+                gateways
+                    .iter()
+                    .any(|gateway| &gateway.node_id == *requested)
+            })
+            .cloned()
+            .or_else(|| gateways.first().map(|gateway| gateway.node_id.clone()));
+        let previous = self
+            .store
+            .list_client_gateway_selections()
+            .await?
+            .remove(&client.node_id);
+        let changed = match desired_gateway {
+            Some(gateway_node_id)
+                if previous
+                    .as_ref()
+                    .map(|selection| &selection.gateway_node_id)
+                    != Some(&gateway_node_id) =>
+            {
+                self.store
+                    .upsert_client_gateway_selection(ClientGatewaySelection {
+                        client_id: client.node_id.clone(),
+                        gateway_node_id,
+                        selected_at: now,
+                    })
+                    .await?;
+                true
+            }
+            Some(_) => false,
+            None if previous.is_some() => {
+                self.store
+                    .remove_client_gateway_selection(&client.node_id)
+                    .await?;
+                true
+            }
+            None => false,
+        };
+        if changed {
+            self.notify_all_connection_intent_waiters().await;
+        }
+        Ok(())
+    }
+
     pub async fn peer_map_for(&self, node_id: &NodeId) -> Result<PeerMap, ControlPlaneError> {
         let source = self
             .store
@@ -1694,10 +1832,16 @@ where
 
         let policy = self.policy_snapshot()?;
         let now = Utc::now();
+        let health_by_node = self.health_by_node(&peers).await?;
+        let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let directory = self.service_directory_at(now).await?;
         Ok(self.filtered_peer_map_for_node(
             &source,
             &peers,
+            ClientGatewayRoutingState {
+                health_by_node: &health_by_node,
+                selections: &client_gateway_selections,
+            },
             &policy,
             directory.bootstrap_endpoints,
             now,
@@ -1991,11 +2135,12 @@ where
 
         let directory = self.service_directory_at(now).await?;
         let connection_intents = self.connection_intents_for(&request_node_id, now).await?;
+        let peer_delta_available = self.client_gateway_selection_changed_recently(now).await?;
 
         Ok(HeartbeatResponse {
             accepted: true,
             policy_version: 0,
-            peer_delta_available: false,
+            peer_delta_available,
             bootstrap_endpoints: directory.bootstrap_endpoints,
             connection_intents,
         })
@@ -2022,9 +2167,10 @@ where
             return Ok(response);
         }
         let notifier = self.connection_intent_notifier(node_id).await;
-        if !response.connection_intents.is_empty() {
+        if response.peer_delta_available || !response.connection_intents.is_empty() {
             return Ok(response);
         }
+        let selection_baseline = self.store.latest_client_gateway_selection_at().await?;
 
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -2036,6 +2182,11 @@ where
             tokio::select! {
                 _ = notifier.notified() => {}
                 _ = tokio::time::sleep(remaining.min(CONNECTION_INTENT_WAIT_FALLBACK_POLL_INTERVAL)) => {}
+            }
+
+            if self.store.latest_client_gateway_selection_at().await? > selection_baseline {
+                response.peer_delta_available = true;
+                return Ok(response);
             }
 
             let intents = self.connection_intents_for(node_id, Utc::now()).await?;
@@ -2064,6 +2215,28 @@ where
                 notifier.notify_one();
             }
         }
+    }
+
+    async fn notify_all_connection_intent_waiters(&self) {
+        let notifiers = self.connection_intent_notifiers.lock().await;
+        for notifier in notifiers.values() {
+            notifier.notify_one();
+        }
+    }
+
+    async fn client_gateway_selection_changed_recently(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool, ControlPlaneError> {
+        Ok(self
+            .store
+            .latest_client_gateway_selection_at()
+            .await?
+            .is_some_and(|changed_at| {
+                now.signed_duration_since(changed_at)
+                    .to_std()
+                    .map_or(true, |age| age <= CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW)
+            }))
     }
 
     async fn connection_intents_for(
@@ -2131,11 +2304,16 @@ where
             .await?;
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
+        let client_gateway_selections = self.store.list_client_gateway_selections().await?;
         let policy = self.policy_snapshot()?;
         let directory = self.service_directory_at(rotated_at).await?;
         let peer_map = self.filtered_peer_map_for_node(
             &updated_node,
             &peers,
+            ClientGatewayRoutingState {
+                health_by_node: &health_by_node,
+                selections: &client_gateway_selections,
+            },
             &policy,
             directory.bootstrap_endpoints,
             rotated_at,
@@ -2784,14 +2962,29 @@ where
         &self,
         source: &NodeRecord,
         peers: &[NodeRecord],
+        gateway_routing: ClientGatewayRoutingState<'_>,
         policy: &ClusterPolicy,
         bootstrap_endpoints: Vec<BootstrapEndpoint>,
         generated_at: chrono::DateTime<Utc>,
     ) -> PeerMap {
         let visible_peers = if source.role.is_client() {
-            client_gateway_peer_map(source, peers, policy, generated_at)
+            client_gateway_peer_map(
+                source,
+                peers,
+                gateway_routing.health_by_node,
+                gateway_routing.selections,
+                policy,
+                generated_at,
+            )
         } else {
-            node_peer_map_with_clients(source, peers, policy, generated_at)
+            node_peer_map_with_clients(
+                source,
+                peers,
+                gateway_routing.health_by_node,
+                gateway_routing.selections,
+                policy,
+                generated_at,
+            )
         };
         PeerMap {
             cluster_id: self.config.cluster_id.clone(),
@@ -2835,9 +3028,17 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+struct ClientGatewayRoutingState<'a> {
+    health_by_node: &'a BTreeMap<NodeId, NodeHealth>,
+    selections: &'a BTreeMap<NodeId, ClientGatewaySelection>,
+}
+
 fn client_gateway_peer_map(
     source: &NodeRecord,
     peers: &[NodeRecord],
+    health_by_node: &BTreeMap<NodeId, NodeHealth>,
+    client_gateway_selections: &BTreeMap<NodeId, ClientGatewaySelection>,
     policy: &ClusterPolicy,
     generated_at: chrono::DateTime<Utc>,
 ) -> Vec<NodeRecord> {
@@ -2846,9 +3047,27 @@ fn client_gateway_peer_map(
         .filter(|peer| peer.node_id != source.node_id && !peer.role.is_client())
         .filter_map(|peer| acl_filter_peer(source, peer, policy))
         .collect::<Vec<_>>();
-    let Some(gateway) = select_client_gateway(&visible_nodes, generated_at, policy) else {
-        return Vec::new();
-    };
+    let mut gateways = select_client_gateways(&visible_nodes, health_by_node, generated_at, policy);
+    if let Some(selected) = client_gateway_selections.get(&source.node_id) {
+        if let Some(index) = gateways
+            .iter()
+            .position(|gateway| gateway.node_id == selected.gateway_node_id)
+        {
+            gateways.rotate_left(index);
+        }
+    }
+    gateways
+        .into_iter()
+        .map(|gateway| project_client_gateway(gateway, &visible_nodes, generated_at, policy))
+        .collect()
+}
+
+fn project_client_gateway(
+    gateway: &NodeRecord,
+    visible_nodes: &[NodeRecord],
+    generated_at: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> NodeRecord {
     let gateway_id = gateway.node_id.clone();
     let mut projected_gateway = gateway.clone();
     let mut routes = projected_gateway
@@ -2857,7 +3076,7 @@ fn client_gateway_peer_map(
         .map(|route| (route.cidr, route))
         .collect::<BTreeMap<_, _>>();
 
-    for node in &visible_nodes {
+    for node in visible_nodes {
         if node.node_id == gateway_id {
             continue;
         }
@@ -2879,34 +3098,46 @@ fn client_gateway_peer_map(
         }
     }
     projected_gateway.routes = routes.into_values().collect();
-    vec![filter_served_endpoint_candidates(
-        projected_gateway,
-        generated_at,
-        policy,
-    )]
+    filter_served_endpoint_candidates(projected_gateway, generated_at, policy)
 }
 
 fn node_peer_map_with_clients(
     source: &NodeRecord,
     peers: &[NodeRecord],
+    health_by_node: &BTreeMap<NodeId, NodeHealth>,
+    client_gateway_selections: &BTreeMap<NodeId, ClientGatewaySelection>,
     policy: &ClusterPolicy,
     generated_at: chrono::DateTime<Utc>,
 ) -> Vec<NodeRecord> {
-    let gateway_id =
-        select_client_gateway(peers, generated_at, policy).map(|gateway| gateway.node_id.clone());
-    let client_routes = if gateway_id.as_ref() == Some(&source.node_id) {
-        Vec::new()
+    let gateway_ids = select_client_gateways(peers, health_by_node, generated_at, policy)
+        .into_iter()
+        .map(|gateway| gateway.node_id.clone())
+        .collect::<Vec<_>>();
+    let source_is_gateway = gateway_ids.contains(&source.node_id);
+    let client_routes_by_gateway = if source_is_gateway {
+        BTreeMap::new()
     } else {
-        peers
+        let mut routes = BTreeMap::<NodeId, Vec<Route>>::new();
+        for client in peers
             .iter()
             .filter(|peer| peer.role.is_client())
             .filter(|client| acl_filter_peer(source, client, policy).is_some())
-            .filter_map(|client| {
-                gateway_id
-                    .as_ref()
-                    .and_then(|gateway| gateway_route_for_client(gateway, client))
-            })
-            .collect::<Vec<_>>()
+        {
+            let selected_gateway = client_gateway_selections
+                .get(&client.node_id)
+                .map(|selection| &selection.gateway_node_id)
+                .filter(|gateway| gateway_ids.contains(gateway))
+                .or_else(|| gateway_ids.first());
+            if let Some(route) =
+                selected_gateway.and_then(|gateway| gateway_route_for_client(gateway, client))
+            {
+                routes
+                    .entry(route.advertised_by.clone())
+                    .or_default()
+                    .push(route);
+            }
+        }
+        routes
     };
 
     peers
@@ -2914,7 +3145,7 @@ fn node_peer_map_with_clients(
         .filter(|peer| peer.node_id != source.node_id)
         .filter_map(|peer| {
             if peer.role.is_client() {
-                if gateway_id.as_ref() != Some(&source.node_id) {
+                if !source_is_gateway {
                     return None;
                 }
                 return acl_filter_peer(source, peer, policy)
@@ -2922,13 +3153,13 @@ fn node_peer_map_with_clients(
             }
 
             let mut visible = acl_filter_peer(source, peer, policy)?;
-            if gateway_id.as_ref() == Some(&visible.node_id) && visible.node_id != source.node_id {
+            if let Some(client_routes) = client_routes_by_gateway.get(&visible.node_id) {
                 let mut routes = visible
                     .routes
                     .drain(..)
                     .map(|route| (route.cidr, route))
                     .collect::<BTreeMap<_, _>>();
-                for route in &client_routes {
+                for route in client_routes {
                     insert_preferred_gateway_route(&mut routes, route.clone());
                 }
                 visible.routes = routes.into_values().collect();
@@ -2942,14 +3173,16 @@ fn node_peer_map_with_clients(
         .collect()
 }
 
-fn select_client_gateway<'a>(
+fn select_client_gateways<'a>(
     nodes: &'a [NodeRecord],
+    health_by_node: &BTreeMap<NodeId, NodeHealth>,
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
-) -> Option<&'a NodeRecord> {
-    nodes
+) -> Vec<&'a NodeRecord> {
+    let mut candidates = nodes
         .iter()
         .filter(|node| !node.role.is_client())
+        .filter(|node| client_gateway_health_allows(health_by_node.get(&node.node_id), now, policy))
         .filter_map(|node| {
             client_gateway_candidate_score(node, now, policy).map(|candidate_score| {
                 (
@@ -2960,13 +3193,33 @@ fn select_client_gateway<'a>(
                 )
             })
         })
-        .min_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.cmp(right.2))
-        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(right.2))
+    });
+    candidates
+        .into_iter()
+        .take(MAX_CLIENT_GATEWAYS)
         .map(|(_, _, _, node)| node)
+        .collect()
+}
+
+fn client_gateway_health_allows(
+    health: Option<&NodeHealth>,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> bool {
+    let Some(health) = health else {
+        return true;
+    };
+    health.state == HealthState::Healthy
+        && match now.signed_duration_since(health.last_seen_at).to_std() {
+            Ok(age) => age <= Duration::from_secs(policy.relay_health_ttl_seconds),
+            Err(_) => true,
+        }
 }
 
 fn client_gateway_candidate_score(
@@ -2990,8 +3243,9 @@ fn client_gateway_candidate_score(
             let rank = match candidate.kind {
                 EndpointCandidateKind::Ipv6 => 0,
                 EndpointCandidateKind::PublicUdp => 1,
-                EndpointCandidateKind::StunReflexive => 2,
-                EndpointCandidateKind::LocalUdp | EndpointCandidateKind::Relay => return None,
+                EndpointCandidateKind::StunReflexive
+                | EndpointCandidateKind::LocalUdp
+                | EndpointCandidateKind::Relay => return None,
             };
             Some((
                 rank,
@@ -4418,6 +4672,32 @@ mod tests {
         ) -> Result<Vec<ServiceInstance>, ControlPlaneError> {
             self.inner.list_service_instances(cluster_id).await
         }
+
+        async fn upsert_client_gateway_selection(
+            &self,
+            selection: ClientGatewaySelection,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.upsert_client_gateway_selection(selection).await
+        }
+
+        async fn remove_client_gateway_selection(
+            &self,
+            client_id: &NodeId,
+        ) -> Result<bool, ControlPlaneError> {
+            self.inner.remove_client_gateway_selection(client_id).await
+        }
+
+        async fn list_client_gateway_selections(
+            &self,
+        ) -> Result<BTreeMap<NodeId, ClientGatewaySelection>, ControlPlaneError> {
+            self.inner.list_client_gateway_selections().await
+        }
+
+        async fn latest_client_gateway_selection_at(
+            &self,
+        ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError> {
+            self.inner.latest_client_gateway_selection_at().await
+        }
     }
 
     fn route(id: &str, cidr: &str, advertised_by: &str) -> Result<Route, ipnet::AddrParseError> {
@@ -5152,7 +5432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_client_is_hidden_and_routes_only_through_the_selected_gateway(
+    async fn control_client_receives_ready_gateway_failover_without_joining_the_mesh(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-client");
         let store = Arc::new(InMemoryStore::default());
@@ -5161,15 +5441,29 @@ mod tests {
                 cluster_id.clone(),
                 Ipv4Net::new(Ipv4Addr::new(100, 96, 0, 0), 29)?,
             ),
-            store,
+            store.clone(),
         );
 
         let mut gateway_claims = claims(cluster_id.clone());
         gateway_claims.role = Role::gateway();
         let mut gateway_registration = registration_request("client-gateway");
         gateway_registration.candidates = vec![candidate("client-gateway")];
+        gateway_registration.candidates[0].kind = EndpointCandidateKind::PublicUdp;
+        gateway_registration.candidates[0].addr = "8.8.8.8:51820".parse()?;
+        gateway_registration.candidates[0].cost = 1;
         let gateway = plane
             .register_with_claims(gateway_claims, gateway_registration)
+            .await?
+            .node;
+        let mut backup_claims = claims(cluster_id.clone());
+        backup_claims.role = Role::gateway();
+        let mut backup_registration = registration_request("client-gateway-backup");
+        backup_registration.candidates = vec![candidate("client-gateway-backup")];
+        backup_registration.candidates[0].kind = EndpointCandidateKind::PublicUdp;
+        backup_registration.candidates[0].addr = "8.8.4.4:51820".parse()?;
+        backup_registration.candidates[0].cost = 20;
+        let backup_gateway = plane
+            .register_with_claims(backup_claims, backup_registration)
             .await?
             .node;
         let worker = plane
@@ -5242,23 +5536,29 @@ mod tests {
         let worker_cidr: IpNet = format!("{}/32", worker.vpn_ip).parse()?;
         let client_cidr: IpNet = format!("{}/32", client.vpn_ip).parse()?;
 
-        assert_eq!(registration.peer_map.peers.len(), 1);
+        assert_eq!(registration.peer_map.peers.len(), 2);
         assert_eq!(registration.peer_map.peers[0].node_id, gateway.node_id);
-        assert!(registration.peer_map.peers[0]
-            .routes
+        assert!(registration
+            .peer_map
+            .peers
             .iter()
-            .any(|route| route.cidr == worker_cidr));
+            .all(|gateway| gateway.routes.iter().any(|route| route.cidr == worker_cidr)));
 
         let listed_nodes = plane.list_nodes().await?;
-        assert_eq!(listed_nodes.len(), 2);
+        assert_eq!(listed_nodes.len(), 3);
         assert!(listed_nodes.iter().all(|node| !node.role.is_client()));
         let metrics = plane.metrics().await?;
-        assert_eq!(metrics.node_count, 2);
+        assert_eq!(metrics.node_count, 3);
         assert_eq!(metrics.client_count, 1);
-        assert_eq!(metrics.vpn_pool_allocated_count, 3);
+        assert_eq!(metrics.vpn_pool_allocated_count, 4);
 
         let gateway_map = plane.peer_map_for(&gateway.node_id).await?;
         assert!(gateway_map
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == client.node_id));
+        let backup_gateway_map = plane.peer_map_for(&backup_gateway.node_id).await?;
+        assert!(backup_gateway_map
             .peers
             .iter()
             .any(|peer| peer.node_id == client.node_id));
@@ -5276,6 +5576,75 @@ mod tests {
                 })
         }));
 
+        let mut query = ClientControlRequest {
+            client_id: client.node_id.clone(),
+            active_gateway_node_id: Some(backup_gateway.node_id.clone()),
+            request_signature: None,
+        };
+        query.request_signature = Some(client_identity.sign_client_control_request(
+            &query,
+            ClientRequestKind::PeerMap,
+            Utc::now(),
+        ));
+        let authenticated = plane
+            .authenticate_client_request(&query, ClientRequestKind::PeerMap, Utc::now())
+            .await?;
+        let waiting_heartbeat = plane.wait_for_connection_intents(
+            &worker.node_id,
+            HeartbeatResponse {
+                accepted: true,
+                policy_version: 0,
+                peer_delta_available: false,
+                bootstrap_endpoints: Vec::new(),
+                connection_intents: Vec::new(),
+            },
+            std::time::Duration::from_secs(2),
+        );
+        let selection_update = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            plane
+                .update_client_gateway_selection(
+                    &authenticated,
+                    query.active_gateway_node_id.as_ref(),
+                    Utc::now(),
+                )
+                .await
+        };
+        let (heartbeat, selection_update) = tokio::join!(waiting_heartbeat, selection_update);
+        selection_update?;
+        assert!(heartbeat?.peer_delta_available);
+        let selected_backup = plane.peer_map_for(&client.node_id).await?;
+        assert_eq!(selected_backup.peers[0].node_id, backup_gateway.node_id);
+        let worker_after_client_switch = plane.peer_map_for(&worker.node_id).await?;
+        assert!(worker_after_client_switch.peers.iter().any(|peer| {
+            peer.node_id == backup_gateway.node_id
+                && peer.routes.iter().any(|route| {
+                    route.cidr == client_cidr
+                        && route.advertised_by == backup_gateway.node_id
+                        && route.via.as_ref() == Some(&backup_gateway.node_id)
+                })
+        }));
+        assert!(worker_after_client_switch.peers.iter().all(|peer| {
+            peer.node_id != gateway.node_id
+                || peer.routes.iter().all(|route| route.cidr != client_cidr)
+        }));
+
+        store
+            .upsert_health(
+                gateway.node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Unhealthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: Some("test failure".to_string()),
+                },
+            )
+            .await?;
+        let failed_over = plane.peer_map_for(&client.node_id).await?;
+        assert_eq!(failed_over.peers.len(), 1);
+        assert_eq!(failed_over.peers[0].node_id, backup_gateway.node_id);
+
         assert!(matches!(
             plane.paths_for(&client.node_id).await,
             Err(ControlPlaneError::NodeUpdateRejected { .. })
@@ -5291,18 +5660,6 @@ mod tests {
             Err(ControlPlaneError::NodeUpdateRejected { .. })
         ));
 
-        let mut query = ClientControlRequest {
-            client_id: client.node_id.clone(),
-            request_signature: None,
-        };
-        query.request_signature = Some(client_identity.sign_client_control_request(
-            &query,
-            ClientRequestKind::PeerMap,
-            Utc::now(),
-        ));
-        plane
-            .authenticate_client_request(&query, ClientRequestKind::PeerMap, Utc::now())
-            .await?;
         assert!(matches!(
             plane
                 .authenticate_client_request(&query, ClientRequestKind::PeerMap, Utc::now())
@@ -5312,6 +5669,7 @@ mod tests {
 
         let mut removal = ClientControlRequest {
             client_id: client.node_id.clone(),
+            active_gateway_node_id: None,
             request_signature: None,
         };
         removal.request_signature = Some(client_identity.sign_client_control_request(
@@ -5322,9 +5680,9 @@ mod tests {
         let removed = plane.remove_client(removal).await?;
         assert_eq!(removed.client.node_id, client.node_id);
         let metrics = plane.metrics().await?;
-        assert_eq!(metrics.node_count, 2);
+        assert_eq!(metrics.node_count, 3);
         assert_eq!(metrics.client_count, 0);
-        assert_eq!(metrics.vpn_pool_allocated_count, 2);
+        assert_eq!(metrics.vpn_pool_allocated_count, 3);
         Ok(())
     }
 

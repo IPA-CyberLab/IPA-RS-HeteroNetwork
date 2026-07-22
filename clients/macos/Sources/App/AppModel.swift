@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import HeteroNetworkCore
 import NetworkExtension
@@ -29,13 +30,17 @@ final class AppModel: ObservableObject {
                 self?.enrollmentInput = url.absoluteString
             }
             .store(in: &cancellables)
+        Timer.publish(every: 5, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.reloadSessionFromExtension() }
+            .store(in: &cancellables)
         Task { await restore() }
     }
 
     var isConfigured: Bool { session != nil }
 
     var gatewayName: String {
-        session?.peerMap.peers.first?.nodeID ?? "-"
+        session?.selectedGatewayNodeID ?? session?.peerMap.peers.first?.nodeID ?? "-"
     }
 
     func enroll() async {
@@ -78,6 +83,10 @@ final class AppModel: ObservableObject {
 
     func disconnect() {
         tunnelManager.disconnect()
+    }
+
+    func openWebUI() {
+        NSWorkspace.shared.open(HeteroNetworkConstants.overlayWebUIURL)
     }
 
     func refresh() async {
@@ -123,6 +132,24 @@ final class AppModel: ObservableObject {
             if let session, vpnStatus == .invalid {
                 try await tunnelManager.prepare(for: session)
             }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func reloadSessionFromExtension() {
+        guard vpnStatus == .connected || vpnStatus == .reasserting else {
+            return
+        }
+        do {
+            guard let stored = try sessionStore.load() else {
+                return
+            }
+            let current = session
+            guard stored.refreshedAt > (current?.refreshedAt ?? .distantPast)
+                    || stored.selectedGatewayNodeID != current?.selectedGatewayNodeID
+            else { return }
+            session = stored
         } catch {
             lastError = error.localizedDescription
         }

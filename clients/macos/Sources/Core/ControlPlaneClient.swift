@@ -30,8 +30,8 @@ public final class ControlPlaneClient {
             self.session = session
         } else {
             let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 15
-            configuration.timeoutIntervalForResource = 30
+            configuration.timeoutIntervalForRequest = 5
+            configuration.timeoutIntervalForResource = 10
             configuration.waitsForConnectivity = false
             configuration.httpShouldSetCookies = false
             configuration.urlCache = nil
@@ -40,7 +40,7 @@ public final class ControlPlaneClient {
     }
 
     public func join(token: SignedJoinToken, keyMaterial: ClientKeyMaterial) async throws -> ClientSession {
-        let controlPlanes = try EnrollmentParser.controlPlaneURLs(from: token)
+        let controlPlanes = try EnrollmentParser.managementURLs(from: token)
         guard !controlPlanes.isEmpty else { throw ControlPlaneAPIError.noControlPlane }
         let registration = RegisterClientRequest(
             clientID: try keyMaterial.clientID,
@@ -85,7 +85,8 @@ public final class ControlPlaneClient {
         let response = try await clientConfiguration(
             bases: storedSession.controlPlaneURLs,
             clientID: storedSession.client.nodeID,
-            keyMaterial: keyMaterial
+            keyMaterial: keyMaterial,
+            activeGatewayNodeID: storedSession.selectedGatewayNodeID
         )
         let registration = RegisterClientRequest(
             clientID: storedSession.client.nodeID,
@@ -98,6 +99,13 @@ public final class ControlPlaneClient {
         }
         var updated = storedSession
         updated.peerMap = response.peerMap
+        updated.selectedGatewayNodeID = response.peerMap.peers.first?.nodeID
+        updated.controlPlaneURLs = Self.mergedManagementURLs(
+            discovered: EnrollmentParser.managementURLs(
+                from: response.peerMap.bootstrapEndpoints
+            ),
+            existing: storedSession.controlPlaneURLs
+        )
         updated.refreshedAt = Date()
         return updated
     }
@@ -175,7 +183,8 @@ public final class ControlPlaneClient {
     private func clientConfiguration(
         bases: [URL],
         clientID: String,
-        keyMaterial: ClientKeyMaterial
+        keyMaterial: ClientKeyMaterial,
+        activeGatewayNodeID: String? = nil
     ) async throws -> RegisterClientResponse {
         try await performFailover(
             bases: bases,
@@ -184,9 +193,11 @@ public final class ControlPlaneClient {
         ) { _ in
             ClientControlRequest(
                 clientID: clientID,
+                activeGatewayNodeID: activeGatewayNodeID,
                 requestSignature: try keyMaterial.sign(
                     clientID: clientID,
-                    kind: .peerMap
+                    kind: .peerMap,
+                    activeGatewayNodeID: activeGatewayNodeID
                 )
             )
         }
@@ -232,5 +243,15 @@ public final class ControlPlaneClient {
             }
         }
         return String(decoding: data.prefix(512), as: UTF8.self)
+    }
+
+    private static func mergedManagementURLs(discovered: [URL], existing: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return (discovered + existing).filter { url in
+            let canonical = url.absoluteString.trimmingCharacters(
+                in: CharacterSet(charactersIn: "/")
+            )
+            return seen.insert(canonical).inserted
+        }
     }
 }

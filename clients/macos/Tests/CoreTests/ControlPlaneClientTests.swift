@@ -25,6 +25,7 @@ final class ControlPlaneClientTests: XCTestCase {
             peers: [gatewayRecord(now: now)],
             bootstrapEndpoints: [
                 BootstrapEndpoint(url: "https://cp.example:8443", kind: .controlPlane),
+                BootstrapEndpoint(url: "https://next-gateway.example", kind: .webUi),
             ],
             generatedAt: now
         )
@@ -33,9 +34,12 @@ final class ControlPlaneClientTests: XCTestCase {
 
         let lock = NSLock()
         var paths = [String]()
+        var hosts = [String]()
+        var selectedGateways = [String]()
         StubURLProtocol.handler = { request in
             lock.lock()
             paths.append(request.url?.path ?? "")
+            hosts.append(request.url?.host ?? "")
             lock.unlock()
             if request.url?.path == "/v1/clients/join" {
                 throw URLError(.networkConnectionLost)
@@ -43,6 +47,12 @@ final class ControlPlaneClientTests: XCTestCase {
             guard request.url?.path == "/v1/clients/peers/query" else {
                 throw URLError(.badURL)
             }
+            let requestObject = try JSONSerialization.jsonObject(
+                with: try requestBody(request)
+            ) as? [String: Any]
+            lock.lock()
+            selectedGateways.append(requestObject?["active_gateway_node_id"] as? String ?? "-")
+            lock.unlock()
             let http = HTTPURLResponse(
                 url: try XCTUnwrap(request.url),
                 statusCode: 200,
@@ -57,13 +67,30 @@ final class ControlPlaneClientTests: XCTestCase {
         configuration.protocolClasses = [StubURLProtocol.self]
         let controlPlane = ControlPlaneClient(session: URLSession(configuration: configuration))
         let session = try await controlPlane.join(token: token(now: now), keyMaterial: keyMaterial)
+        let refreshed = try await controlPlane.refresh(session)
 
         XCTAssertEqual(session.client, clientRecord)
         XCTAssertEqual(session.peerMap, peerMap)
+        XCTAssertEqual(refreshed.controlPlaneURLs.first?.host, "next-gateway.example")
         lock.lock()
         let requestedPaths = paths
+        let requestedHosts = hosts
+        let requestedGateways = selectedGateways
         lock.unlock()
-        XCTAssertEqual(requestedPaths, ["/v1/clients/join", "/v1/clients/peers/query"])
+        XCTAssertEqual(
+            requestedPaths,
+            [
+                "/v1/clients/join",
+                "/v1/clients/join",
+                "/v1/clients/peers/query",
+                "/v1/clients/peers/query",
+            ]
+        )
+        XCTAssertEqual(
+            requestedHosts,
+            ["gateway.example", "cp.example", "gateway.example", "gateway.example"]
+        )
+        XCTAssertEqual(requestedGateways, ["-", "node-gateway"])
     }
 
     private func token(now: Date) -> SignedJoinToken {
@@ -72,6 +99,7 @@ final class ControlPlaneClientTests: XCTestCase {
                 clusterID: "cluster-a",
                 bootstrapEndpoints: [
                     BootstrapEndpoint(url: "https://cp.example:8443", kind: .controlPlane),
+                    BootstrapEndpoint(url: "https://gateway.example", kind: .webUi),
                 ],
                 expiresAt: now.addingTimeInterval(600),
                 notBefore: now.addingTimeInterval(-5),
@@ -105,6 +133,27 @@ final class ControlPlaneClientTests: XCTestCase {
             routes: [],
             registeredAt: now
         )
+    }
+}
+
+private func requestBody(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody {
+        return body
+    }
+    let stream = try XCTUnwrap(request.httpBodyStream)
+    stream.open()
+    defer { stream.close() }
+    var body = Data()
+    var buffer = [UInt8](repeating: 0, count: 4_096)
+    while true {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count < 0 {
+            throw stream.streamError ?? URLError(.cannotDecodeRawData)
+        }
+        if count == 0 {
+            return body
+        }
+        body.append(contentsOf: buffer.prefix(count))
     }
 }
 

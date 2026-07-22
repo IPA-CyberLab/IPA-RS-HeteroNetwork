@@ -9,7 +9,7 @@ use axum::extract::{Extension, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -139,6 +139,11 @@ struct PublicWebGatewayAccess {
 #[derive(Debug, Clone, Copy)]
 struct PublicWebGatewayRequest;
 
+#[derive(Debug, Clone)]
+struct OverlayWebUiAccess {
+    origins: Arc<[String]>,
+}
+
 impl std::fmt::Debug for PublicWebGatewayAccess {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -263,25 +268,10 @@ pub fn router(state: AgentHttpState) -> Router {
         .route("/healthz", get(healthz))
         .merge(protected);
     let app = if state.local_web_ui_enabled {
-        let mut local_web = Router::new()
-            .route("/", get(local_ui_root))
-            .route("/ui", get(local_ui_index))
-            .route("/ui/", get(local_ui_index))
-            .route("/ui/app.js", get(local_ui_app))
-            .route("/ui/theme.js", get(local_ui_theme))
-            .route("/ui/styles.css", get(local_ui_styles))
-            .route("/ui/fonts/noto-sans-jp-ui.ttf", get(local_ui_japanese_font))
-            .route("/ui/config", get(local_ui_config))
-            .route(
-                "/v1/web-ui/endpoints",
-                get(web_ui_endpoints).delete(remove_web_ui_endpoint),
-            )
+        let mut local_web = gateway_web_ui_routes()
+            .route("/v1/web-ui/endpoints", delete(remove_web_ui_endpoint))
             .route("/v1/web-ui/bootstrap", post(bootstrap_web_ui_endpoint))
-            .route("/v1/web-ui/select", post(select_web_ui_endpoint))
-            .route("/v1/web-ui/auth/device", post(start_device_login))
-            .route("/v1/web-ui/auth/device/poll", post(poll_device_login))
-            .route("/v1/install/{*path}", get(proxy_management_request))
-            .route("/v1/admin/{*path}", any(proxy_management_request));
+            .route("/v1/web-ui/select", post(select_web_ui_endpoint));
         local_web = if let Some(access) = state.public_web_gateway.clone() {
             local_web.route_layer(middleware::from_fn_with_state(
                 access,
@@ -295,6 +285,47 @@ pub fn router(state: AgentHttpState) -> Router {
         app
     };
     app.with_state(state)
+}
+
+fn gateway_web_ui_routes() -> Router<AgentHttpState> {
+    Router::new()
+        .route("/", get(local_ui_root))
+        .route("/ui", get(local_ui_index))
+        .route("/ui/", get(local_ui_index))
+        .route("/ui/app.js", get(local_ui_app))
+        .route("/ui/theme.js", get(local_ui_theme))
+        .route("/ui/styles.css", get(local_ui_styles))
+        .route("/ui/fonts/noto-sans-jp-ui.ttf", get(local_ui_japanese_font))
+        .route("/ui/config", get(local_ui_config))
+        .route("/v1/web-ui/healthz", get(healthz))
+        .route("/v1/web-ui/endpoints", get(web_ui_endpoints))
+        .route("/v1/web-ui/auth/device", post(start_device_login))
+        .route("/v1/web-ui/auth/device/poll", post(poll_device_login))
+        .route("/v1/install/{*path}", get(proxy_management_request))
+        .route("/v1/admin/{*path}", any(proxy_management_request))
+        .route("/v1/clients/join", post(proxy_management_request))
+        .route("/v1/clients/peers/query", post(proxy_management_request))
+        .route("/v1/clients/{client_id}", delete(proxy_management_request))
+}
+
+pub fn overlay_web_ui_router(
+    state: AgentHttpState,
+    listen: std::net::SocketAddr,
+    dns_name: &str,
+) -> Router {
+    let ip_origin = match listen.ip() {
+        IpAddr::V4(ip) => format!("http://{ip}:{}", listen.port()),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{}", listen.port()),
+    };
+    let dns_origin = format!("http://{dns_name}:{}", listen.port());
+    gateway_web_ui_routes()
+        .route_layer(middleware::from_fn_with_state(
+            OverlayWebUiAccess {
+                origins: Arc::from([ip_origin, dns_origin]),
+            },
+            require_overlay_web_ui_access,
+        ))
+        .with_state(state)
 }
 
 async fn require_agent_api_bearer(
@@ -818,12 +849,57 @@ async fn require_web_ui_access(
         (&Method::POST, "/v1/web-ui/auth/device/poll") => true,
         (&Method::GET, path) if path.starts_with("/v1/install/") => true,
         (_, path) if path.starts_with("/v1/admin/") => true,
+        (&Method::POST, "/v1/clients/join" | "/v1/clients/peers/query") => true,
+        (&Method::DELETE, path) if path.starts_with("/v1/clients/") => true,
         _ => false,
     };
     if !public_route_allowed {
         return local_web_ui_rejection("route is only available from the local Agent Web UI");
     }
     request.headers_mut().remove(token_header);
+    request.extensions_mut().insert(PublicWebGatewayRequest);
+    next.run(request).await
+}
+
+async fn require_overlay_web_ui_access(
+    State(access): State<OverlayWebUiAccess>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Some(host) = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return local_web_ui_rejection("Host header is required");
+    };
+    let Ok(actual) = reqwest::Url::parse(&format!("http://{host}/")) else {
+        return local_web_ui_rejection("overlay Web UI Host header is invalid");
+    };
+    let actual_origin = actual.origin().ascii_serialization();
+    if !access.origins.iter().any(|origin| origin == &actual_origin) {
+        return local_web_ui_rejection("overlay Web UI Host header was rejected");
+    }
+    if request
+        .headers()
+        .get(HeaderName::from_static("sec-fetch-site"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return local_web_ui_rejection("cross-site overlay Web UI requests are rejected");
+    }
+    if let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let Ok(origin_url) = reqwest::Url::parse(origin) else {
+            return local_web_ui_rejection("Origin header is invalid");
+        };
+        if origin_url.origin().ascii_serialization() != actual_origin {
+            return local_web_ui_rejection("cross-origin overlay Web UI requests are rejected");
+        }
+    }
     request.extensions_mut().insert(PublicWebGatewayRequest);
     next.run(request).await
 }
@@ -3595,6 +3671,7 @@ mod tests {
             .route("/ui/config", get(web_ui_test_config))
             .route("/v1/admin/overview", any(web_ui_test_admin))
             .route("/v1/install/test", get(web_ui_test_install))
+            .route("/v1/clients/peers/query", post(web_ui_test_admin))
             .route(
                 "/realms/heteronetwork/protocol/openid-connect/auth/device",
                 post(web_ui_test_device_authorization),
@@ -3737,6 +3814,20 @@ mod tests {
             Some("HeteroNetworkJoin enrollment-token")
         );
 
+        let client_query = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/clients/peers/query")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(client_query.status(), StatusCode::OK);
+
         let loopback_asset = app
             .oneshot(
                 Request::builder()
@@ -3746,6 +3837,66 @@ mod tests {
             )
             .await?;
         assert_eq!(loopback_asset.status(), StatusCode::OK);
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_web_ui_accepts_only_the_vpn_ip_and_internal_name(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url]);
+        let listen: std::net::SocketAddr = "10.250.0.1:9781".parse()?;
+        let app = overlay_web_ui_router(state, listen, "console.heteronetwork.internal");
+
+        for host in ["10.250.0.1:9781", "console.heteronetwork.internal:9781"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/ui/app.js")
+                        .header(header::HOST, host)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/web-ui/healthz")
+                    .header(header::HOST, "10.250.0.1:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let wrong_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/app.js")
+                    .header(header::HOST, "10.250.0.2:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+
+        let agent_api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .header(header::HOST, "10.250.0.1:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(agent_api.status(), StatusCode::NOT_FOUND);
         backend_task.abort();
         Ok(())
     }

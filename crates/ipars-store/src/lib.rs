@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ipars_control_plane::{
     ensure_token_definition_matches, ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate,
     RemovedNode, TokenLedger,
 };
+use ipars_types::api::ClientGatewaySelection;
 use ipars_types::{
     ClusterId, EndpointCandidate, NatClassification, NodeHealth, NodeId, NodeRecord, PathRecord,
     RelayCapability, Route, ServiceInstance, TokenLedgerMetrics, TokenLedgerRecord,
@@ -126,6 +128,18 @@ impl SqliteControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS client_gateway_selections (
+                    client_id TEXT PRIMARY KEY NOT NULL,
+                    gateway_node_id TEXT NOT NULL,
+                    selected_at_millis INTEGER NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
         Ok(())
     }
 }
@@ -184,6 +198,13 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        sqlx::query(
+            "DELETE FROM client_gateway_selections WHERE client_id = ?1 OR gateway_node_id = ?1",
+        )
+        .bind(node_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
         let path_result =
             sqlx::query("DELETE FROM paths WHERE local_node_id = ?1 OR remote_node_id = ?1")
                 .bind(node_id.as_str())
@@ -579,6 +600,72 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         .map(row_to_service_instance)
         .collect()
     }
+
+    async fn upsert_client_gateway_selection(
+        &self,
+        selection: ClientGatewaySelection,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO client_gateway_selections
+                (client_id, gateway_node_id, selected_at_millis)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(client_id) DO UPDATE SET
+                gateway_node_id = excluded.gateway_node_id,
+                selected_at_millis = excluded.selected_at_millis
+            "#,
+        )
+        .bind(selection.client_id.as_str())
+        .bind(selection.gateway_node_id.as_str())
+        .bind(selection.selected_at.timestamp_millis())
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn remove_client_gateway_selection(
+        &self,
+        client_id: &NodeId,
+    ) -> Result<bool, ControlPlaneError> {
+        let result = sqlx::query("DELETE FROM client_gateway_selections WHERE client_id = ?1")
+            .bind(client_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_client_gateway_selections(
+        &self,
+    ) -> Result<BTreeMap<NodeId, ClientGatewaySelection>, ControlPlaneError> {
+        let mut selections = BTreeMap::new();
+        for row in sqlx::query(
+            "SELECT client_id, gateway_node_id, selected_at_millis FROM client_gateway_selections ORDER BY client_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sql_error)?
+        {
+            let selection = row_to_client_gateway_selection(row)?;
+            selections.insert(selection.client_id.clone(), selection);
+        }
+        Ok(selections)
+    }
+
+    async fn latest_client_gateway_selection_at(
+        &self,
+    ) -> Result<Option<DateTime<Utc>>, ControlPlaneError> {
+        let row = sqlx::query(
+            "SELECT MAX(selected_at_millis) AS selected_at_millis FROM client_gateway_selections",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        row.get::<Option<i64>, _>("selected_at_millis")
+            .map(sqlite_selection_timestamp)
+            .transpose()
+    }
 }
 
 #[async_trait]
@@ -911,6 +998,18 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS client_gateway_selections (
+                    client_id TEXT PRIMARY KEY NOT NULL,
+                    gateway_node_id TEXT NOT NULL,
+                    selected_at TIMESTAMPTZ NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
@@ -970,6 +1069,13 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        sqlx::query(
+            "DELETE FROM client_gateway_selections WHERE client_id = $1 OR gateway_node_id = $1",
+        )
+        .bind(node_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
         let path_result =
             sqlx::query("DELETE FROM paths WHERE local_node_id = $1 OR remote_node_id = $1")
                 .bind(node_id.as_str())
@@ -1360,6 +1466,68 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .map(pg_row_to_service_instance)
         .collect()
     }
+
+    async fn upsert_client_gateway_selection(
+        &self,
+        selection: ClientGatewaySelection,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO client_gateway_selections (client_id, gateway_node_id, selected_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT(client_id) DO UPDATE SET
+                gateway_node_id = excluded.gateway_node_id,
+                selected_at = excluded.selected_at
+            "#,
+        )
+        .bind(selection.client_id.as_str())
+        .bind(selection.gateway_node_id.as_str())
+        .bind(selection.selected_at)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn remove_client_gateway_selection(
+        &self,
+        client_id: &NodeId,
+    ) -> Result<bool, ControlPlaneError> {
+        let result = sqlx::query("DELETE FROM client_gateway_selections WHERE client_id = $1")
+            .bind(client_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_client_gateway_selections(
+        &self,
+    ) -> Result<BTreeMap<NodeId, ClientGatewaySelection>, ControlPlaneError> {
+        let mut selections = BTreeMap::new();
+        for row in sqlx::query(
+            "SELECT client_id, gateway_node_id, selected_at FROM client_gateway_selections ORDER BY client_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sql_error)?
+        {
+            let selection = pg_row_to_client_gateway_selection(row);
+            selections.insert(selection.client_id.clone(), selection);
+        }
+        Ok(selections)
+    }
+
+    async fn latest_client_gateway_selection_at(
+        &self,
+    ) -> Result<Option<DateTime<Utc>>, ControlPlaneError> {
+        let row =
+            sqlx::query("SELECT MAX(selected_at) AS selected_at FROM client_gateway_selections")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(sql_error)?;
+        Ok(row.get("selected_at"))
+    }
 }
 
 #[async_trait]
@@ -1616,6 +1784,22 @@ fn row_to_service_instance(
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_client_gateway_selection(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ClientGatewaySelection, ControlPlaneError> {
+    Ok(ClientGatewaySelection {
+        client_id: NodeId::from_string(row.get::<String, _>("client_id")),
+        gateway_node_id: NodeId::from_string(row.get::<String, _>("gateway_node_id")),
+        selected_at: sqlite_selection_timestamp(row.get("selected_at_millis"))?,
+    })
+}
+
+fn sqlite_selection_timestamp(millis: i64) -> Result<DateTime<Utc>, ControlPlaneError> {
+    DateTime::from_timestamp_millis(millis).ok_or_else(|| {
+        ControlPlaneError::Store("stored client gateway selection timestamp is invalid".to_string())
+    })
+}
+
 fn pg_row_to_node(row: sqlx::postgres::PgRow) -> Result<NodeRecord, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
@@ -1655,6 +1839,14 @@ fn pg_row_to_service_instance(
 ) -> Result<ServiceInstance, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_client_gateway_selection(row: sqlx::postgres::PgRow) -> ClientGatewaySelection {
+    ClientGatewaySelection {
+        client_id: NodeId::from_string(row.get::<String, _>("client_id")),
+        gateway_node_id: NodeId::from_string(row.get::<String, _>("gateway_node_id")),
+        selected_at: row.get("selected_at"),
+    }
 }
 
 async fn update_sqlite_token(
@@ -2039,6 +2231,28 @@ mod tests {
         );
         assert_eq!(store.list_nat_classifications().await?.len(), 1);
 
+        let selection_time =
+            DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")?.with_timezone(&Utc);
+        let selection = ClientGatewaySelection {
+            client_id: local.node_id.clone(),
+            gateway_node_id: remote.node_id.clone(),
+            selected_at: selection_time,
+        };
+        store
+            .upsert_client_gateway_selection(selection.clone())
+            .await?;
+        assert_eq!(
+            store
+                .list_client_gateway_selections()
+                .await?
+                .get(&local.node_id),
+            Some(&selection)
+        );
+        assert_eq!(
+            store.latest_client_gateway_selection_at().await?,
+            Some(selection_time)
+        );
+
         let removed = store.remove_node(&local.node_id).await?;
         assert_eq!(removed.node.node_id, local.node_id);
         assert_eq!(removed.removed_path_count, 1);
@@ -2046,6 +2260,7 @@ mod tests {
         assert_eq!(store.get_node(&local.node_id).await?, None);
         assert_eq!(store.get_health(&local.node_id).await?, None);
         assert_eq!(store.get_nat_classification(&local.node_id).await?, None);
+        assert!(store.list_client_gateway_selections().await?.is_empty());
         assert!(store.list_paths_for(&remote.node_id).await?.is_empty());
         assert!(matches!(
             store.remove_node(&local.node_id).await,

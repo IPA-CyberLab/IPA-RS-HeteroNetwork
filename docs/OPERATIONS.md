@@ -211,9 +211,10 @@ and bootstrap selection but does not write state.
 ### Join macOS clients
 
 Before issuing a client link, register at least one Linux node with role
-`gateway` and a fresh reachable IPv6, public UDP, or STUN-reflexive WireGuard
-candidate. The gateway must forward overlay traffic. Persist IPv4 forwarding on
-the gateway, then apply the equivalent IPv6 setting if the overlay uses IPv6:
+`gateway` and a fresh reachable IPv6 or public UDP WireGuard
+candidate. Two such nodes provide gateway failover. The gateway must forward
+overlay traffic. Persist IPv4 forwarding on each possible gateway, then apply
+the equivalent IPv6 setting if the overlay uses IPv6:
 
 ```bash
 sudo install -m 0644 /dev/stdin /etc/sysctl.d/99-heteronetwork-client-gateway.conf <<'EOF'
@@ -225,16 +226,26 @@ sudo sysctl --system
 
 Allow forwarding from the managed WireGuard interface back to that interface
 and to each advertised destination according to the host firewall policy. The
-selected gateway terminates the client's only WireGuard peer and forwards to
-the mesh; other nodes route the client host prefix back through that gateway.
-Do not advertise a default route solely for client access.
+selected gateways receive the client's WireGuard peer configuration. Only the
+preferred gateway is active on the Mac; other nodes route the client host prefix
+back through that gateway. Do not advertise a default route solely for client
+access.
 
 Enable the dedicated enrollment signer as described under Web Management UI,
 keep at least two Control Plane endpoints active, then select **Add device** ->
 **macOS client** in the Web UI. Open the returned `heteronetwork://` link on a
 Mac with the native app installed. The token is single-use. The app installs a
-signed Network Extension profile, refreshes the gateway map immediately before
-connecting, and stores private key material in the shared device-only Keychain.
+signed Network Extension profile, refreshes the gateway map every five seconds
+while connected, updates WireGuardKit in place when gateway health or public
+reachability changes, and switches to a cached standby after two failed
+VPN-local health probes. The extension then reports the active gateway in its
+signed peer-map request. The shared control-plane store changes every node's
+return route for that client and wakes long-polling Agent heartbeats so they
+apply the new map without waiting for the 30-second background poll. It stores
+private key material in the shared device-only Keychain. The active gateway
+serves the authenticated console only on its VPN address at
+`http://console.heteronetwork.internal:9781/ui/`; split DNS sends only
+`console.heteronetwork.internal` queries into the tunnel.
 Control-only clients are intentionally absent from the normal node table; use
 `ipars_control_plane_clients` or `client_count` to observe their allocation.
 

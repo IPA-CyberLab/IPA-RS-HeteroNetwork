@@ -8,6 +8,7 @@ final class TunnelProfileTests: XCTestCase {
         let profile = try TunnelProfile(session: session)
 
         XCTAssertEqual(profile.clientAddress, "100.96.0.4/32")
+        XCTAssertEqual(profile.gatewayVPNIP, "100.96.0.1")
         XCTAssertEqual(profile.gatewayEndpoint, "[2001:db8::10]:51820")
         XCTAssertEqual(profile.allowedIPs, ["100.96.0.1/32", "100.96.0.3/32", "10.42.0.0/16"])
     }
@@ -18,7 +19,7 @@ final class TunnelProfileTests: XCTestCase {
         }
     }
 
-    func testRejectsMultipleGatewayPeers() {
+    func testUsesTheFirstOfMultipleOrderedGateways() throws {
         var session = makeSession(routes: [])
         let gateway = session.peerMap.peers[0]
         session.peerMap = PeerMap(
@@ -28,8 +29,21 @@ final class TunnelProfileTests: XCTestCase {
             generatedAt: session.peerMap.generatedAt
         )
 
+        let profile = try TunnelProfile(session: session)
+        XCTAssertEqual(profile.gatewayNodeID, gateway.nodeID)
+    }
+
+    func testRejectsMissingGateway() {
+        var session = makeSession(routes: [])
+        session.peerMap = PeerMap(
+            clusterID: session.peerMap.clusterID,
+            peers: [],
+            bootstrapEndpoints: session.peerMap.bootstrapEndpoints,
+            generatedAt: session.peerMap.generatedAt
+        )
+
         XCTAssertThrowsError(try TunnelProfile(session: session)) { error in
-            XCTAssertEqual(error as? TunnelProfileError, .invalidGatewayCount(2))
+            XCTAssertEqual(error as? TunnelProfileError, .invalidGatewayCount(0))
         }
     }
 

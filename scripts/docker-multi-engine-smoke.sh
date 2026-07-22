@@ -92,6 +92,10 @@ require_command "$dockerd_bin"
 require_command "$containerd_bin"
 require_command curl
 
+cd "$repo_root"
+"$cargo_bin" test --locked -p ipars-daemon --all-features \
+  docker_api_discovery_supports_multiple_real_docker_engines_and_churn --no-run
+
 wait_for_containerd() {
   local socket_path="$1"
   local pid="$2"
@@ -207,7 +211,6 @@ wait_for_engine "$engine_b_port" "$engine_b_log"
 docker_engine "$engine_a_port" network create --driver bridge --subnet 172.31.10.0/24 "$engine_a_network" >/dev/null
 docker_engine "$engine_b_port" network create --driver bridge --subnet 172.31.20.0/24 "$engine_b_network" >/dev/null
 
-cd "$repo_root"
 (
   set +e
   env \
