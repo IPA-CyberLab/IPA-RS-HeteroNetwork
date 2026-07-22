@@ -29,6 +29,7 @@ use ipars_types::{canonical_bootstrap_endpoint_url, BootstrapEndpointKind, NodeI
 use rand_core::{OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
@@ -74,6 +75,7 @@ struct DeviceLoginState {
 #[derive(Debug)]
 struct PendingDeviceLogin {
     device_code: String,
+    code_verifier: String,
     token_endpoint: String,
     client_id: String,
     expires_at: Instant,
@@ -414,6 +416,14 @@ fn random_device_login_handle() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn device_login_pkce() -> (String, String) {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
 fn web_ui_config_string(config: &Value, key: &str) -> Result<String, ApiError> {
     config
         .get(key)
@@ -480,6 +490,7 @@ async fn start_device_login(
         logins.last_started_at = Some(now);
     }
 
+    let (code_verifier, code_challenge) = device_login_pkce();
     let response = state
         .control_plane_client
         .post(device_url.clone())
@@ -487,6 +498,8 @@ async fn start_device_login(
         .form(&[
             ("client_id", client_id.as_str()),
             ("scope", scopes.as_str()),
+            ("code_challenge", code_challenge.as_str()),
+            ("code_challenge_method", "S256"),
         ])
         .timeout(state.control_plane_request_timeout)
         .send()
@@ -542,6 +555,7 @@ async fn start_device_login(
     let interval = Duration::from_secs(provider.interval);
     let pending = PendingDeviceLogin {
         device_code: provider.device_code,
+        code_verifier,
         token_endpoint,
         client_id,
         expires_at: now + Duration::from_secs(provider.expires_in),
@@ -612,6 +626,7 @@ async fn poll_device_login(
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ("client_id", pending.client_id.as_str()),
             ("device_code", pending.device_code.as_str()),
+            ("code_verifier", pending.code_verifier.as_str()),
         ])
         .timeout(state.control_plane_request_timeout)
         .send()
@@ -3458,7 +3473,9 @@ mod tests {
         admin_calls: Arc<AtomicUsize>,
         authorization: Arc<tokio::sync::Mutex<Option<String>>>,
         base_url: String,
+        device_authorization_form: Arc<tokio::sync::Mutex<Option<BTreeMap<String, String>>>>,
         device_token_calls: Arc<AtomicUsize>,
+        device_token_forms: Arc<tokio::sync::Mutex<Vec<BTreeMap<String, String>>>>,
     }
 
     async fn web_ui_test_config(State(state): State<WebUiTestBackend>) -> Json<Value> {
@@ -3483,7 +3500,9 @@ mod tests {
 
     async fn web_ui_test_device_authorization(
         State(state): State<WebUiTestBackend>,
+        axum::extract::Form(form): axum::extract::Form<BTreeMap<String, String>>,
     ) -> Json<Value> {
+        *state.device_authorization_form.lock().await = Some(form);
         Json(json!({
             "device_code": "device-code",
             "user_code": "ABCD-EFGH",
@@ -3494,7 +3513,11 @@ mod tests {
         }))
     }
 
-    async fn web_ui_test_device_token(State(state): State<WebUiTestBackend>) -> Response {
+    async fn web_ui_test_device_token(
+        State(state): State<WebUiTestBackend>,
+        axum::extract::Form(form): axum::extract::Form<BTreeMap<String, String>>,
+    ) -> Response {
+        state.device_token_forms.lock().await.push(form);
         if state.device_token_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             return (
                 StatusCode::BAD_REQUEST,
@@ -3533,7 +3556,9 @@ mod tests {
             admin_calls: Arc::new(AtomicUsize::new(0)),
             authorization: Arc::new(tokio::sync::Mutex::new(None)),
             base_url: base_url.clone(),
+            device_authorization_form: Arc::new(tokio::sync::Mutex::new(None)),
             device_token_calls: Arc::new(AtomicUsize::new(0)),
+            device_token_forms: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let app = Router::new()
             .route("/ui/config", get(web_ui_test_config))
@@ -3808,6 +3833,22 @@ mod tests {
         assert_eq!(start.status(), StatusCode::OK);
         let start: Value = serde_json::from_slice(&to_bytes(start.into_body(), usize::MAX).await?)?;
         assert_eq!(start["user_code"], "ABCD-EFGH");
+        let authorization_form = backend
+            .device_authorization_form
+            .lock()
+            .await
+            .clone()
+            .ok_or("device authorization form was not captured")?;
+        assert_eq!(
+            authorization_form
+                .get("code_challenge_method")
+                .map(String::as_str),
+            Some("S256")
+        );
+        let code_challenge = authorization_form
+            .get("code_challenge")
+            .cloned()
+            .ok_or("device authorization omitted PKCE challenge")?;
         let handle = start["handle"]
             .as_str()
             .ok_or("device response omitted handle")?;
@@ -3842,6 +3883,16 @@ mod tests {
             serde_json::from_slice(&to_bytes(second_poll.into_body(), usize::MAX).await?)?;
         assert_eq!(second_poll["access_token"], "device-access-token");
         assert_eq!(backend.device_token_calls.load(Ordering::SeqCst), 2);
+        let token_forms = backend.device_token_forms.lock().await;
+        assert_eq!(token_forms.len(), 2);
+        let code_verifier = token_forms[0]
+            .get("code_verifier")
+            .ok_or("device token request omitted PKCE verifier")?;
+        assert_eq!(token_forms[1].get("code_verifier"), Some(code_verifier));
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())),
+            code_challenge
+        );
         backend_task.abort();
         Ok(())
     }
