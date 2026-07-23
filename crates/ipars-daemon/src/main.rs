@@ -477,6 +477,12 @@ struct ControlPlaneArgs {
     web_oidc_backchannel_base_url: Option<String>,
     #[arg(
         long,
+        env = "HETERONETWORK_WEB_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS",
+        value_delimiter = ','
+    )]
+    web_oidc_backchannel_fallback_base_urls: Vec<String>,
+    #[arg(
+        long,
         env = "HETERONETWORK_WEB_OIDC_SCOPES",
         default_value = "openid profile email"
     )]
@@ -834,6 +840,10 @@ struct AgentArgs {
         default_value = "/run/heteronetwork-gateway/admin.sock"
     )]
     public_web_gateway_admin_socket: PathBuf,
+    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM")]
+    public_web_gateway_oidc_upstream: Option<SocketAddr>,
+    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH")]
+    public_web_gateway_oidc_probe_path: Option<String>,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS",
@@ -1969,6 +1979,32 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.public_web_gateway_admin_socket.is_absolute(),
             "--public-web-gateway-admin-socket must be an absolute path"
         );
+        match (
+            args.public_web_gateway_oidc_upstream,
+            args.public_web_gateway_oidc_probe_path.as_deref(),
+        ) {
+            (Some(upstream), Some(probe_path)) => {
+                anyhow::ensure!(
+                    upstream.ip().is_loopback() && upstream.port() > 0,
+                    "--public-web-gateway-oidc-upstream must be a loopback address with a nonzero port"
+                );
+                anyhow::ensure!(
+                    probe_path.starts_with("/realms/")
+                        && probe_path.ends_with("/.well-known/openid-configuration")
+                        && probe_path.len() <= 1024
+                        && !probe_path.contains(['?', '#'])
+                        && !probe_path.chars().any(char::is_control),
+                    "--public-web-gateway-oidc-probe-path must be a bounded Keycloak realm discovery path"
+                );
+            }
+            (Some(_), None) => anyhow::bail!(
+                "--public-web-gateway-oidc-upstream requires --public-web-gateway-oidc-probe-path"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "--public-web-gateway-oidc-probe-path requires --public-web-gateway-oidc-upstream"
+            ),
+            (None, None) => {}
+        }
         validate_positive_seconds(
             args.public_web_gateway_reconcile_interval_seconds,
             "--public-web-gateway-reconcile-interval-seconds",
@@ -1988,6 +2024,12 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
                     .nat_discovery_interval_seconds
                     .min(args.public_nat_discovery_interval_seconds),
             "--public-web-gateway-classification-max-age-seconds must not be shorter than the effective public NAT discovery interval"
+        );
+    } else {
+        anyhow::ensure!(
+            args.public_web_gateway_oidc_upstream.is_none()
+                && args.public_web_gateway_oidc_probe_path.is_none(),
+            "public Web gateway OIDC options require --public-web-gateway-enabled=true"
         );
     }
     if !args.disable_overlay_services {
@@ -4471,6 +4513,12 @@ where
                 .context("web UI public URL configuration")?,
             None => auth,
         };
+        let auth = auth
+            .with_backchannel_fallback_base_urls(
+                args.web_oidc_backchannel_fallback_base_urls.clone(),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("web UI OIDC fallback configuration")?;
         Some(auth)
     } else {
         None
@@ -4593,14 +4641,6 @@ fn control_plane_service_lease_config(
         (
             BootstrapEndpointKind::Relay,
             args.advertise_relay_url.as_ref(),
-        ),
-        (
-            BootstrapEndpointKind::WebUi,
-            if args.web_ui_enabled && args.service_instance_id.is_some() {
-                args.web_public_url.as_ref()
-            } else {
-                None
-            },
         ),
     ]
     .into_iter()
@@ -8399,6 +8439,8 @@ async fn run_agent(
                     admin_socket: args.public_web_gateway_admin_socket.clone(),
                     proxy_token: token.clone(),
                     upstream: args.listen,
+                    oidc_upstream: args.public_web_gateway_oidc_upstream,
+                    oidc_probe_path: args.public_web_gateway_oidc_probe_path.clone(),
                     cluster_id: node.cluster_id.clone(),
                     reconcile_interval: Duration::from_secs(
                         args.public_web_gateway_reconcile_interval_seconds,
@@ -12562,6 +12604,8 @@ struct PublicWebGatewayConfig {
     admin_socket: PathBuf,
     proxy_token: String,
     upstream: SocketAddr,
+    oidc_upstream: Option<SocketAddr>,
+    oidc_probe_path: Option<String>,
     cluster_id: ClusterId,
     reconcile_interval: Duration,
     probe_timeout: Duration,
@@ -12586,6 +12630,7 @@ fn public_web_gateway_caddyfile(
     public_ip: Option<IpAddr>,
     upstream: SocketAddr,
     proxy_token: &str,
+    oidc_upstream: Option<SocketAddr>,
 ) -> String {
     let mut caddyfile = format!(
         "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n}}\n",
@@ -12596,7 +12641,17 @@ fn public_web_gateway_caddyfile(
         let site = site.trim_end_matches('/');
         let _ = writeln!(
             caddyfile,
-            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
+            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}"
+        );
+        if let Some(oidc_upstream) = oidc_upstream {
+            let _ = writeln!(
+                caddyfile,
+                "\t@oidc path /realms/* /resources/* /robots.txt\n\thandle @oidc {{\n\t\treverse_proxy http://{oidc_upstream} {{\n\t\t\theader_up Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t\theader_up X-Forwarded-Port 443\n\t\t}}\n\t}}"
+            );
+        }
+        let _ = writeln!(
+            caddyfile,
+            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
         );
     }
     caddyfile
@@ -12615,6 +12670,7 @@ async fn load_public_web_gateway_caddyfile(
             public_ip,
             config.upstream,
             &config.proxy_token,
+            config.oidc_upstream,
         ))
         .send()
         .await
@@ -12638,6 +12694,7 @@ async fn probe_public_web_gateway(
     client: &reqwest::Client,
     url: &str,
     cluster_id: &ClusterId,
+    oidc_probe_path: Option<&str>,
 ) -> anyhow::Result<()> {
     let config_url = format!("{}ui/config", url.trim_end_matches('/').to_string() + "/");
     let mut response = client
@@ -12676,6 +12733,47 @@ async fn probe_public_web_gateway(
         body.get("cluster_id").and_then(serde_json::Value::as_str) == Some(cluster_id.as_str()),
         "public gateway returned a different cluster ID"
     );
+    if let Some(probe_path) = oidc_probe_path {
+        let discovery_url = format!("{}{}", url.trim_end_matches('/'), probe_path);
+        let response = client
+            .get(discovery_url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .context("public gateway OIDC probe failed")?
+            .error_for_status()
+            .context("public gateway OIDC probe was rejected")?;
+        anyhow::ensure!(
+            !response
+                .content_length()
+                .is_some_and(|length| length > 256 * 1024),
+            "public gateway OIDC discovery response is too large"
+        );
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read public gateway OIDC discovery response")?;
+        anyhow::ensure!(
+            bytes.len() <= 256 * 1024,
+            "public gateway OIDC discovery response is too large"
+        );
+        let body = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .context("public gateway OIDC discovery response is invalid")?;
+        let issuer = body
+            .get("issuer")
+            .and_then(serde_json::Value::as_str)
+            .context("public gateway OIDC discovery response omitted issuer")?;
+        let gateway_origin = reqwest::Url::parse(url)
+            .context("public gateway URL is invalid")?
+            .origin();
+        let issuer_origin = reqwest::Url::parse(issuer)
+            .context("public gateway OIDC issuer is invalid")?
+            .origin();
+        anyhow::ensure!(
+            issuer_origin == gateway_origin,
+            "public gateway OIDC issuer uses a different origin"
+        );
+    }
     Ok(())
 }
 
@@ -12787,7 +12885,14 @@ fn start_public_web_gateway(
 
             if configured_ip == desired_ip {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
-                    match probe_public_web_gateway(&probe_client, &url, &config.cluster_id).await {
+                    match probe_public_web_gateway(
+                        &probe_client,
+                        &url,
+                        &config.cluster_id,
+                        config.oidc_probe_path.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             gateway_was_ready = true;
                             set_public_web_gateway_status(
@@ -12987,14 +13092,9 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
             request,
             interval.min(MAX_HEARTBEAT_CONNECTION_INTENT_WAIT),
         );
-        tokio::pin!(send);
-        let response = tokio::select! {
-            response = &mut send => response,
-            _ = heartbeat_report_notify.notified() => {
-                tracing::debug!("restarting in-flight heartbeat after runtime state changed");
-                continue;
-            }
-        };
+        // Runtime churn must not starve the heartbeat long poll. A pending
+        // notification is consumed below and starts the next cycle immediately.
+        let response = send.await;
         match response {
             Ok(response) => {
                 if let Err(error) = persist_agent_service_directory(
@@ -15767,9 +15867,22 @@ async fn send_signal_path_request(
         .json(&request)
         .send()
         .await
-        .context("failed to send signal path negotiation")?
-        .error_for_status()
-        .context("signal service rejected path negotiation")?;
+        .context("failed to send signal path negotiation")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = read_bounded_agent_response_body(
+            response,
+            MAX_AGENT_ERROR_RESPONSE_BYTES,
+            "signal path negotiation error",
+        )
+        .await?;
+        let reason = serde_json::from_slice::<AgentApiErrorResponse>(&body)
+            .ok()
+            .map(|response| response.error)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| "signal service returned no structured error reason".to_string());
+        anyhow::bail!("signal service rejected path negotiation with HTTP {status}: {reason}");
+    }
     read_bounded_agent_json_response(
         response,
         MAX_AGENT_SIGNAL_RESPONSE_BYTES,
@@ -19064,7 +19177,7 @@ mod tests {
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
-        let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret");
+        let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret", None);
         assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
         assert!(!standby.contains("secret"));
@@ -19074,6 +19187,7 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
             upstream,
             "secret",
+            Some(SocketAddr::from(([127, 0, 0, 1], 18080))),
         );
         assert!(public.contains("https://203.0.113.10"));
         assert!(public.contains("profile shortlived"));
@@ -19082,6 +19196,9 @@ mod tests {
         assert!(public.contains("/v1/install/*"));
         assert!(public.contains("/v1/admin/*"));
         assert!(public.contains("/v1/clients/peers/query"));
+        assert!(public.contains("@oidc path /realms/* /resources/* /robots.txt"));
+        assert!(public.contains("reverse_proxy http://127.0.0.1:18080"));
+        assert!(public.contains("header_up X-Forwarded-Proto https"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
     }
@@ -36947,6 +37064,44 @@ exec sleep 60
         assert_eq!(selected_signal, base);
         assert_eq!(response.key, PeerPathKey::new(source, target));
         assert_eq!(registry.metrics().await.path_negotiation_count, 1);
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_path_request_reports_structured_rejection_reason() -> anyhow::Result<()> {
+        let (base, task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": "path observation does not match the requested peer"
+                    })),
+                )
+            }),
+        ))
+        .await?;
+        let identity = IdentityKeyPair::generate();
+        let request = authenticated_signal_path_request(
+            &identity,
+            SignalPathRequest {
+                source: NodeId::from_string("node-a"),
+                target: NodeId::from_string("node-b"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            None,
+        )?;
+
+        let error = send_signal_path_request(&reqwest::Client::new(), &base, request)
+            .await
+            .expect_err("signal rejection should fail");
+
+        assert!(error
+            .to_string()
+            .contains("path observation does not match the requested peer"));
         task.abort();
         Ok(())
     }

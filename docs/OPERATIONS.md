@@ -284,11 +284,60 @@ active paths. Tune the remaining convergence stages with
 `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS`, and the
 Control Plane `HETERONETWORK_DYNAMIC_WEB_GATEWAY_*` lease/probe settings.
 
+To colocate a Keycloak replica behind the same dynamic IP certificate, bind
+Keycloak only on loopback and set both
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM=127.0.0.1:18080` and
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH=/realms/heteronetwork/.well-known/openid-configuration`.
+The gateway exposes only `/realms/*`, `/resources/*`, and `/robots.txt`,
+overwrites the forwarded host and scheme, and withdraws its Web UI lease if
+either the UI or OIDC discovery probe fails. The public Agent response rewrites
+Keycloak endpoint origins to the current gateway IP while preserving realm
+paths. Control Plane reachability checks follow that discovery URL and verify
+the returned issuer before renewing the gateway lease.
+
+Install each Keycloak replica with `scripts/keycloak-ha-node.sh install` after
+`heteronetwork-db-proxy.service` is active. The script pins the Keycloak archive
+checksum, binds application HTTP to loopback, uses the HeteroNetwork address for
+JGroups, and stores runtime secrets in owner-restricted files. Its private
+HAProxy listener accepts only RFC1918 or CGNAT addresses:
+
+```bash
+sudo env \
+  HETERONETWORK_KEYCLOAK_ARCHIVE=/secure/keycloak.tar.gz \
+  HETERONETWORK_KEYCLOAK_CLUSTER_BIND_ADDRESS=10.250.0.10 \
+  HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES=10.250.0.10,100.64.0.10 \
+  HETERONETWORK_KEYCLOAK_DB_PASSWORD_FILE=/secure/db.password \
+  HETERONETWORK_KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD_FILE=/secure/admin.password \
+  scripts/keycloak-ha-node.sh install
+```
+
+Use unique bind addresses on each replica. `install-backchannel` validates and
+reloads HAProxy without rebuilding Keycloak. Keep at least two replicas active
+and place their private realm URLs in the primary and fallback Control Plane
+settings.
+
 When a Control Plane cannot reach the public Keycloak address through NAT
 hairpinning, keep `HETERONETWORK_WEB_OIDC_ISSUER_URL` public and set
 `HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL` to the trusted private Keycloak
 realm URL. Only server-side token exchange and userinfo validation use this
 backchannel; browsers continue to use the public OIDC endpoints.
+Use the comma-separated
+`HETERONETWORK_WEB_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS` for additional replicas;
+network and server failures are retried in order. Agent-hosted device login
+also learns all reachable Control Plane OIDC origins and retains alternate
+token endpoints for an in-progress login. A Keycloak JWT issued through another
+public gateway selects its signed issuer host on the private backchannel only
+when scheme, realm path, and port match the configured issuer. Keycloak still
+performs the authoritative token validation.
+
+Keycloak data is stored in the three-member PostgreSQL/Patroni service installed
+by `scripts/postgres-ha-node.sh`; Keycloak cache replication is not the durable
+data source. Keep three DCS/database members, synchronous mode, and a local
+`heteronetwork-db-proxy.service` on every Keycloak and Control Plane host. A
+database leader loss should promote a synchronous replica, briefly reconnect
+Keycloak's connection pool, and let the old leader rejoin as a replica on the
+new timeline. Validate a maintenance window by checking one primary and two
+running replicas through Patroni before and after stopping a single member.
 
 Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
 

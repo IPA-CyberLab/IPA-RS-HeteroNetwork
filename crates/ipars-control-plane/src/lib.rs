@@ -2841,10 +2841,10 @@ where
             active_signal_count,
             active_stun_count,
             active_relay_count,
+            active_web_ui_count,
         ]
         .into_iter()
-        .all(|count| count >= 2)
-            && (active_web_ui_count == 0 || active_web_ui_count >= 2);
+        .all(|count| count >= 2);
         let relay_candidate_count = nodes
             .iter()
             .filter(|node| {

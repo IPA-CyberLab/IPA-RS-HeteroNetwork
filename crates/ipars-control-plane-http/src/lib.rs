@@ -508,8 +508,9 @@ pub struct WebUiAuthConfig {
     authorization_endpoint: String,
     device_authorization_endpoint: Option<String>,
     token_endpoint: String,
-    backchannel_token_endpoint: String,
-    backchannel_userinfo_endpoint: String,
+    backchannel_token_endpoints: Vec<String>,
+    backchannel_userinfo_endpoints: Vec<String>,
+    backchannel_host: header::HeaderValue,
     logout_endpoint: String,
     client: Client,
     login_states: Arc<Mutex<HashMap<String, OidcLoginState>>>,
@@ -553,6 +554,7 @@ impl WebUiAuthConfig {
         scopes: String,
     ) -> Result<Self, String> {
         let issuer_url = validate_web_auth_base_url(issuer_url, "issuer URL")?;
+        let backchannel_host = web_auth_host_header(&issuer_url, "issuer URL")?;
         let auth_base_url = match auth_base_url {
             Some(value) => validate_web_auth_base_url(value, "OIDC auth base URL")?,
             None => issuer_url.clone(),
@@ -610,8 +612,12 @@ impl WebUiAuthConfig {
             device_authorization_endpoint: device_authorization_suffix
                 .map(|suffix| endpoint_url(&auth_base_url, suffix)),
             token_endpoint: endpoint_url(&auth_base_url, token_suffix),
-            backchannel_token_endpoint: endpoint_url(&backchannel_base_url, token_suffix),
-            backchannel_userinfo_endpoint: endpoint_url(&backchannel_base_url, userinfo_suffix),
+            backchannel_token_endpoints: vec![endpoint_url(&backchannel_base_url, token_suffix)],
+            backchannel_userinfo_endpoints: vec![endpoint_url(
+                &backchannel_base_url,
+                userinfo_suffix,
+            )],
+            backchannel_host,
             logout_endpoint: endpoint_url(&auth_base_url, logout_suffix),
             client,
             login_states: Arc::new(Mutex::new(HashMap::new())),
@@ -629,36 +635,99 @@ impl WebUiAuthConfig {
         Ok(self)
     }
 
+    pub fn with_backchannel_fallback_base_urls(
+        mut self,
+        fallback_base_urls: Vec<String>,
+    ) -> Result<Self, String> {
+        let (token_suffix, userinfo_suffix) = match self.provider {
+            WebAuthProvider::Keycloak => (
+                "/protocol/openid-connect/token",
+                "/protocol/openid-connect/userinfo",
+            ),
+            WebAuthProvider::Cognito => ("/oauth2/token", "/oauth2/userInfo"),
+        };
+        for base_url in fallback_base_urls {
+            let base_url =
+                validate_web_auth_base_url(base_url, "OIDC backchannel fallback base URL")?;
+            let token_endpoint = endpoint_url(&base_url, token_suffix);
+            let userinfo_endpoint = endpoint_url(&base_url, userinfo_suffix);
+            if !self
+                .backchannel_token_endpoints
+                .iter()
+                .any(|endpoint| endpoint == &token_endpoint)
+            {
+                self.backchannel_token_endpoints.push(token_endpoint);
+                self.backchannel_userinfo_endpoints.push(userinfo_endpoint);
+            }
+        }
+        Ok(self)
+    }
+
     pub async fn validate_access_token(&self, token: &str) -> bool {
         if token.is_empty() || token.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES * 16 {
             return false;
         }
-        let response = match timeout(
-            Duration::from_secs(5),
-            self.client
-                .get(&self.backchannel_userinfo_endpoint)
-                .bearer_auth(token)
-                .send(),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            _ => return false,
-        };
-        if !response.status().is_success() {
+        let Some(backchannel_host) = self.access_token_backchannel_host(token) else {
             return false;
-        }
-        let body = match bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES).await {
-            Ok(body) => body,
-            Err(_) => return false,
         };
-        match serde_json::from_slice::<Value>(&body) {
-            Ok(claims) => claims
-                .get("sub")
-                .and_then(Value::as_str)
-                .is_some_and(|subject| !subject.is_empty()),
-            Err(_) => false,
+        for endpoint in &self.backchannel_userinfo_endpoints {
+            let response = match timeout(
+                Duration::from_secs(5),
+                self.client
+                    .get(endpoint)
+                    .header(header::HOST, backchannel_host.clone())
+                    .bearer_auth(token)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                _ => continue,
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            let body =
+                match bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES).await {
+                    Ok(body) => body,
+                    Err(_) => continue,
+                };
+            if serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|claims| {
+                    claims
+                        .get("sub")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|subject| !subject.is_empty())
+            {
+                return true;
+            }
         }
+        false
+    }
+
+    fn access_token_backchannel_host(&self, token: &str) -> Option<header::HeaderValue> {
+        let Some(issuer) = unverified_jwt_issuer(token) else {
+            return Some(self.backchannel_host.clone());
+        };
+        let issuer = validate_web_auth_base_url(issuer, "access token issuer").ok()?;
+        let configured = Url::parse(&self.issuer_url).ok()?;
+        let candidate = Url::parse(&issuer).ok()?;
+        let accepted = match self.provider {
+            WebAuthProvider::Keycloak => {
+                configured.scheme() == candidate.scheme()
+                    && configured.path().trim_end_matches('/')
+                        == candidate.path().trim_end_matches('/')
+                    && configured.port_or_known_default() == candidate.port_or_known_default()
+            }
+            WebAuthProvider::Cognito => {
+                configured.as_str().trim_end_matches('/')
+                    == candidate.as_str().trim_end_matches('/')
+            }
+        };
+        accepted.then(|| web_auth_host_header(&issuer, "access token issuer").ok())?
     }
 
     async fn begin_login(&self) -> Result<OidcLoginStart, WebAuthFlowError> {
@@ -795,31 +864,52 @@ impl WebUiAuthConfig {
                 WebAuthFlowError::new(StatusCode::BAD_REQUEST, "OIDC callback is missing a code")
             })?;
 
-        let response = self
-            .client
-            .post(&self.backchannel_token_endpoint)
-            .header(header::ACCEPT, "application/json")
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("client_id", self.client_id.as_str()),
-                ("code", code),
-                ("redirect_uri", login.redirect_uri.as_str()),
-                ("code_verifier", login.verifier.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|error| {
-                WebAuthFlowError::new(
-                    StatusCode::BAD_GATEWAY,
-                    format!("OIDC token exchange failed: {error}"),
-                )
-            })?;
-        if !response.status().is_success() {
+        let mut failures = Vec::new();
+        let mut token_response = None;
+        for endpoint in &self.backchannel_token_endpoints {
+            let response = match self
+                .client
+                .post(endpoint)
+                .header(header::HOST, self.backchannel_host.clone())
+                .header(header::ACCEPT, "application/json")
+                .form(&[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", self.client_id.as_str()),
+                    ("code", code),
+                    ("redirect_uri", login.redirect_uri.as_str()),
+                    ("code_verifier", login.verifier.as_str()),
+                ])
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{endpoint}: {error}"));
+                    continue;
+                }
+            };
+            if response.status().is_success() {
+                token_response = Some(response);
+                break;
+            }
+            if response.status().is_server_error() {
+                failures.push(format!("{endpoint}: HTTP {}", response.status()));
+                continue;
+            }
             return Err(WebAuthFlowError::new(
                 StatusCode::UNAUTHORIZED,
                 format!("OIDC token exchange failed ({})", response.status()),
             ));
         }
+        let response = token_response.ok_or_else(|| {
+            WebAuthFlowError::new(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "OIDC token exchange failed on every backchannel: {}",
+                    failures.join("; ")
+                ),
+            )
+        })?;
         let body = bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES).await?;
         let tokens: OidcTokenResponse = serde_json::from_slice(&body).map_err(|error| {
             WebAuthFlowError::new(
@@ -879,6 +969,22 @@ fn validate_web_auth_base_url(value: String, name: &str) -> Result<String, Strin
     Ok(value)
 }
 
+fn web_auth_host_header(value: &str, name: &str) -> Result<header::HeaderValue, String> {
+    let parsed = Url::parse(value).map_err(|error| format!("{name} is invalid: {error}"))?;
+    let host = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.to_string(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
+        None => return Err(format!("{name} does not contain a host")),
+    };
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    header::HeaderValue::from_str(&authority)
+        .map_err(|_| format!("{name} host is not valid for an HTTP Host header"))
+}
+
 fn web_auth_plain_http_host_allowed(url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
@@ -919,6 +1025,23 @@ fn random_oidc_value(byte_count: usize) -> String {
     let mut bytes = vec![0_u8; byte_count];
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn unverified_jwt_issuer(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() || payload.is_empty() {
+        return None;
+    }
+    let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .filter(|issuer| !issuer.is_empty())
+        .map(str::to_string)
 }
 
 async fn bounded_response_body(
@@ -2732,6 +2855,42 @@ fn dynamic_web_gateway_url(ip: std::net::IpAddr) -> String {
     }
 }
 
+fn dynamic_web_gateway_oidc_discovery(
+    body: &Value,
+    gateway_url: &str,
+) -> Result<Option<(String, String)>, String> {
+    if body.get("auth_enabled").and_then(Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    if body.get("provider").and_then(Value::as_str) != Some("keycloak") {
+        return Ok(None);
+    }
+    let issuer = body
+        .get("issuer_url")
+        .and_then(Value::as_str)
+        .filter(|issuer| !issuer.is_empty())
+        .ok_or_else(|| "UI config omitted the OIDC issuer".to_string())?;
+    let gateway = Url::parse(gateway_url)
+        .map_err(|error| format!("dynamic Web gateway URL is invalid: {error}"))?;
+    let mut discovery =
+        Url::parse(issuer).map_err(|error| format!("UI config OIDC issuer is invalid: {error}"))?;
+    if discovery.origin() != gateway.origin() {
+        return Err("UI config OIDC issuer uses a different origin".to_string());
+    }
+    if discovery.query().is_some() || discovery.fragment().is_some() {
+        return Err("UI config OIDC issuer must not contain a query or fragment".to_string());
+    }
+    let path = format!(
+        "{}/.well-known/openid-configuration",
+        discovery.path().trim_end_matches('/')
+    );
+    discovery.set_path(&path);
+    Ok(Some((
+        issuer.trim_end_matches('/').to_string(),
+        discovery.to_string(),
+    )))
+}
+
 async fn probe_dynamic_web_gateway(
     config: &DynamicWebGatewayConfig,
     url: &str,
@@ -2772,6 +2931,51 @@ async fn probe_dynamic_web_gateway(
     }
     if body.get("cluster_id").and_then(Value::as_str) != Some(expected_cluster_id) {
         return Err("UI config belongs to a different cluster".to_string());
+    }
+    if let Some((expected_issuer, discovery_url)) = dynamic_web_gateway_oidc_discovery(&body, url)?
+    {
+        let mut response = config
+            .client
+            .get(discovery_url)
+            .header(header::ACCEPT, "application/json")
+            .timeout(config.probe_timeout)
+            .send()
+            .await
+            .map_err(|error| format!("OIDC discovery connection failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "OIDC discovery returned HTTP {}",
+                response.status()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES)
+        {
+            return Err("OIDC discovery response exceeds its size limit".to_string());
+        }
+        let mut discovery_body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("failed to read OIDC discovery response: {error}"))?
+        {
+            if discovery_body.len().saturating_add(chunk.len())
+                > MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES as usize
+            {
+                return Err("OIDC discovery response exceeds its size limit".to_string());
+            }
+            discovery_body.extend_from_slice(&chunk);
+        }
+        let discovery: Value = serde_json::from_slice(&discovery_body)
+            .map_err(|error| format!("OIDC discovery response is invalid JSON: {error}"))?;
+        let issuer = discovery
+            .get("issuer")
+            .and_then(Value::as_str)
+            .map(|issuer| issuer.trim_end_matches('/'));
+        if issuer != Some(expected_issuer.as_str()) {
+            return Err("OIDC discovery returned a different issuer".to_string());
+        }
     }
     Ok(())
 }
@@ -3424,6 +3628,12 @@ mod tests {
             Some("http://10.0.0.5:8080/realms/heteronetwork".to_string()),
             "openid".to_string(),
         )
+        .and_then(|config| {
+            config.with_backchannel_fallback_base_urls(vec![
+                "https://idp-b.example/realms/heteronetwork".to_string(),
+                "http://10.0.0.5:8080/realms/heteronetwork".to_string(),
+            ])
+        })
         .unwrap_or_else(|error| panic!("backchannel config should be valid: {error}"));
         assert_eq!(
             backchannel
@@ -3433,12 +3643,18 @@ mod tests {
             Some("https://idp.example/realms/heteronetwork/protocol/openid-connect/token")
         );
         assert_eq!(
-            backchannel.backchannel_token_endpoint,
-            "http://10.0.0.5:8080/realms/heteronetwork/protocol/openid-connect/token"
+            backchannel.backchannel_token_endpoints,
+            vec![
+                "http://10.0.0.5:8080/realms/heteronetwork/protocol/openid-connect/token",
+                "https://idp-b.example/realms/heteronetwork/protocol/openid-connect/token",
+            ]
         );
         assert_eq!(
-            backchannel.backchannel_userinfo_endpoint,
-            "http://10.0.0.5:8080/realms/heteronetwork/protocol/openid-connect/userinfo"
+            backchannel.backchannel_userinfo_endpoints,
+            vec![
+                "http://10.0.0.5:8080/realms/heteronetwork/protocol/openid-connect/userinfo",
+                "https://idp-b.example/realms/heteronetwork/protocol/openid-connect/userinfo",
+            ]
         );
         assert!(WebUiAuthConfig::new(
             WebAuthProvider::Keycloak,
@@ -3458,6 +3674,114 @@ mod tests {
             "openid".to_string(),
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn oidc_backchannel_fallback_preserves_issuer_host(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let primary_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let primary_address = primary_listener.local_addr()?;
+        let primary_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/realms/heteronetwork/protocol/openid-connect/userinfo",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            );
+            let _ = axum::serve(primary_listener, app).await;
+        });
+        let fallback_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let fallback_address = fallback_listener.local_addr()?;
+        let fallback_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/realms/heteronetwork/protocol/openid-connect/userinfo",
+                get(|headers: HeaderMap| async move {
+                    if matches!(
+                        headers
+                            .get(header::HOST)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("issuer.example" | "203.0.113.52")
+                    ) {
+                        (StatusCode::OK, Json(serde_json::json!({"sub": "user-a"}))).into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            );
+            let _ = axum::serve(fallback_listener, app).await;
+        });
+        let config = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{primary_address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?
+        .with_backchannel_fallback_base_urls(vec![format!(
+            "http://{fallback_address}/realms/heteronetwork"
+        )])?;
+
+        assert!(config.validate_access_token("access-token").await);
+        let dynamic_issuer_token = format!(
+            "e30.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+                "iss": "https://203.0.113.52/realms/heteronetwork"
+            }))?)
+        );
+        assert!(config.validate_access_token(&dynamic_issuer_token).await);
+        let foreign_realm_token = format!(
+            "e30.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({
+                "iss": "https://203.0.113.52/realms/other"
+            }))?)
+        );
+        assert!(!config.validate_access_token(&foreign_realm_token).await);
+        primary_task.abort();
+        fallback_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_web_gateway_oidc_probe_stays_on_the_gateway_origin() {
+        let authenticated = serde_json::json!({
+            "auth_enabled": true,
+            "provider": "keycloak",
+            "issuer_url": "https://203.0.113.10/realms/kakurizai/"
+        });
+        assert_eq!(
+            dynamic_web_gateway_oidc_discovery(&authenticated, "https://203.0.113.10"),
+            Ok(Some((
+                "https://203.0.113.10/realms/kakurizai".to_string(),
+                "https://203.0.113.10/realms/kakurizai/.well-known/openid-configuration"
+                    .to_string(),
+            )))
+        );
+
+        let foreign_issuer = serde_json::json!({
+            "auth_enabled": true,
+            "provider": "keycloak",
+            "issuer_url": "https://idp.example/realms/kakurizai"
+        });
+        assert!(
+            dynamic_web_gateway_oidc_discovery(&foreign_issuer, "https://203.0.113.10").is_err()
+        );
+
+        let unauthenticated = serde_json::json!({"auth_enabled": false});
+        assert_eq!(
+            dynamic_web_gateway_oidc_discovery(&unauthenticated, "https://203.0.113.10"),
+            Ok(None)
+        );
+
+        let external_provider = serde_json::json!({
+            "auth_enabled": true,
+            "provider": "cognito",
+            "issuer_url": "https://cognito-idp.example/pool"
+        });
+        assert_eq!(
+            dynamic_web_gateway_oidc_discovery(&external_provider, "https://203.0.113.10"),
+            Ok(None)
+        );
     }
 
     #[tokio::test]

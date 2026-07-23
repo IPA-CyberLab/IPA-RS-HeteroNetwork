@@ -77,7 +77,7 @@ struct DeviceLoginState {
 struct PendingDeviceLogin {
     device_code: String,
     code_verifier: String,
-    token_endpoint: String,
+    token_endpoints: Vec<DeviceLoginTokenEndpoint>,
     client_id: String,
     expires_at: Instant,
     next_poll_at: Instant,
@@ -439,6 +439,21 @@ struct DeviceAuthorizationProviderResponse {
     interval: u64,
 }
 
+#[derive(Debug, Clone)]
+struct DeviceLoginProvider {
+    device_url: reqwest::Url,
+    token_url: reqwest::Url,
+    host_header: HeaderValue,
+    client_id: String,
+    scopes: String,
+}
+
+#[derive(Debug)]
+struct DeviceLoginTokenEndpoint {
+    url: String,
+    host_header: HeaderValue,
+}
+
 fn default_device_login_interval() -> u64 {
     5
 }
@@ -457,36 +472,24 @@ fn device_login_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-fn web_ui_config_string(config: &Value, key: &str) -> Result<String, ApiError> {
-    config
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| {
-            !value.is_empty() && value.len() <= 4096 && !value.contains(char::is_control)
-        })
-        .map(str::to_string)
-        .ok_or_else(|| ApiError::BadRequest(format!("Web UI configuration does not provide {key}")))
-}
-
-async fn start_device_login(
-    State(state): State<AgentHttpState>,
-    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
-) -> Result<Response, ApiError> {
-    let (_, config) = select_healthy_web_ui_with_scope(&state, public_gateway.is_some()).await?;
+fn device_login_provider(config: &Value) -> Result<DeviceLoginProvider, String> {
     if config.get("provider").and_then(Value::as_str) != Some("keycloak") {
-        return Err(ApiError::BadRequest(
-            "device login requires the Keycloak provider".to_string(),
-        ));
+        return Err("Web UI endpoint does not use Keycloak".to_string());
     }
-    let device_endpoint = web_ui_config_string(&config, "device_authorization_endpoint")?;
-    let token_endpoint = web_ui_config_string(&config, "token_endpoint")?;
-    let client_id = web_ui_config_string(&config, "client_id")?;
-    let scopes = web_ui_config_string(&config, "scopes")?;
-    let device_url = reqwest::Url::parse(&device_endpoint).map_err(|_| {
-        ApiError::BadRequest("device authorization endpoint is invalid".to_string())
-    })?;
-    let token_url = reqwest::Url::parse(&token_endpoint)
-        .map_err(|_| ApiError::BadRequest("OIDC token endpoint is invalid".to_string()))?;
+    let value = |key: &str| {
+        config
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 4096 && !value.contains(char::is_control)
+            })
+            .map(str::to_string)
+            .ok_or_else(|| format!("Web UI configuration does not provide {key}"))
+    };
+    let device_url = reqwest::Url::parse(&value("device_authorization_endpoint")?)
+        .map_err(|_| "device authorization endpoint is invalid".to_string())?;
+    let token_url = reqwest::Url::parse(&value("token_endpoint")?)
+        .map_err(|_| "OIDC token endpoint is invalid".to_string())?;
     if !matches!(device_url.scheme(), "http" | "https")
         || device_url.origin() != token_url.origin()
         || device_url.username() != ""
@@ -494,11 +497,105 @@ async fn start_device_login(
         || token_url.username() != ""
         || token_url.password().is_some()
     {
-        return Err(ApiError::BadRequest(
+        return Err(
             "device authorization and token endpoints must be HTTP(S) endpoints on the same origin"
                 .to_string(),
-        ));
+        );
     }
+    let host_header = oidc_host_header(&token_url)?;
+    Ok(DeviceLoginProvider {
+        device_url,
+        token_url,
+        host_header,
+        client_id: value("client_id")?,
+        scopes: value("scopes")?,
+    })
+}
+
+fn oidc_host_header(url: &reqwest::Url) -> Result<HeaderValue, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "OIDC endpoint does not contain a host".to_string())?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    HeaderValue::from_str(&authority)
+        .map_err(|_| "OIDC endpoint host is not valid for an HTTP Host header".to_string())
+}
+
+async fn device_login_providers(
+    state: &AgentHttpState,
+    control_plane_only: bool,
+) -> Result<Vec<DeviceLoginProvider>, ApiError> {
+    let mut candidates = web_ui_candidates(state)
+        .into_iter()
+        .filter(|candidate| !control_plane_only || candidate.source.starts_with("control_plane_"))
+        .collect::<Vec<_>>();
+    let selected = selected_web_ui_url(state).await;
+    candidates.sort_by_key(|candidate| {
+        if selected.as_deref() == Some(candidate.url.as_str()) {
+            0
+        } else {
+            1
+        }
+    });
+    let expected_cluster_id = expected_web_ui_cluster_id(state);
+    let mut providers = Vec::new();
+    let mut failures = Vec::new();
+    let mut selected_candidate = None;
+    for candidate in candidates {
+        let config = match fetch_web_ui_config(
+            &state.control_plane_client,
+            &candidate,
+            expected_cluster_id.as_deref(),
+        )
+        .await
+        {
+            Ok(config) => {
+                record_web_ui_health(state, candidate.url.clone(), true).await;
+                config
+            }
+            Err(error) => {
+                record_web_ui_health(state, candidate.url.clone(), false).await;
+                failures.push(format!("{}: {}", candidate.url, truncate_error(&error)));
+                continue;
+            }
+        };
+        match device_login_provider(&config) {
+            Ok(provider)
+                if !providers.iter().any(|existing: &DeviceLoginProvider| {
+                    existing.device_url == provider.device_url
+                }) =>
+            {
+                selected_candidate.get_or_insert(candidate.url);
+                providers.push(provider);
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("{}: {}", candidate.url, truncate_error(&error))),
+        }
+    }
+    if providers.is_empty() {
+        return Err(AgentError::ControlPlaneClient(format!(
+            "no reachable Keycloak device authorization endpoint: {}",
+            failures.join("; ")
+        ))
+        .into());
+    }
+    set_selected_web_ui(state, selected_candidate).await;
+    Ok(providers)
+}
+
+async fn start_device_login(
+    State(state): State<AgentHttpState>,
+    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+) -> Result<Response, ApiError> {
+    let providers = device_login_providers(&state, public_gateway.is_some()).await?;
     let now = Instant::now();
     {
         let mut logins = state.device_logins.lock().await;
@@ -524,31 +621,54 @@ async fn start_device_login(
     }
 
     let (code_verifier, code_challenge) = device_login_pkce();
-    let response = state
-        .control_plane_client
-        .post(device_url.clone())
-        .header(header::ACCEPT, "application/json")
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("scope", scopes.as_str()),
-            ("code_challenge", code_challenge.as_str()),
-            ("code_challenge_method", "S256"),
-        ])
-        .timeout(state.control_plane_request_timeout)
-        .send()
-        .await
-        .map_err(|error| {
-            AgentError::ControlPlaneClient(format!(
-                "Keycloak device authorization request failed: {error}"
-            ))
-        })?;
-    if !response.status().is_success() {
+    let mut failures = Vec::new();
+    let mut started = None;
+    for candidate in &providers {
+        let response = match state
+            .control_plane_client
+            .post(candidate.device_url.clone())
+            .header(header::HOST, candidate.host_header.clone())
+            .header(header::ACCEPT, "application/json")
+            .form(&[
+                ("client_id", candidate.client_id.as_str()),
+                ("scope", candidate.scopes.as_str()),
+                ("code_challenge", code_challenge.as_str()),
+                ("code_challenge_method", "S256"),
+            ])
+            .timeout(state.control_plane_request_timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{}: {error}", candidate.device_url));
+                continue;
+            }
+        };
+        if response.status().is_success() {
+            started = Some((candidate.clone(), response));
+            break;
+        }
+        if response.status().is_server_error() {
+            failures.push(format!(
+                "{}: HTTP {}",
+                candidate.device_url,
+                response.status()
+            ));
+            continue;
+        }
         return Err(AgentError::ControlPlaneClient(format!(
             "Keycloak device authorization request returned HTTP {}",
             response.status()
         ))
         .into());
     }
+    let (selected_provider, response) = started.ok_or_else(|| {
+        AgentError::ControlPlaneClient(format!(
+            "Keycloak device authorization failed on every endpoint: {}",
+            failures.join("; ")
+        ))
+    })?;
     let provider: DeviceAuthorizationProviderResponse = read_bounded_json_response(
         response,
         MAX_DEVICE_AUTH_RESPONSE_BYTES,
@@ -577,11 +697,31 @@ async fn start_device_login(
                 "Keycloak returned an invalid device verification URL".to_string(),
             )
         })?;
-        if parsed.origin() != device_url.origin() || parsed.scheme() != device_url.scheme() {
+        if parsed.origin() != selected_provider.device_url.origin()
+            || parsed.scheme() != selected_provider.device_url.scheme()
+        {
             return Err(AgentError::ControlPlaneClient(
                 "Keycloak returned a device verification URL on an unexpected origin".to_string(),
             )
             .into());
+        }
+    }
+    let mut token_endpoints = vec![DeviceLoginTokenEndpoint {
+        url: selected_provider.token_url.to_string(),
+        host_header: selected_provider.host_header.clone(),
+    }];
+    for candidate in providers {
+        let endpoint = candidate.token_url.to_string();
+        if candidate.client_id == selected_provider.client_id
+            && candidate.token_url.path() == selected_provider.token_url.path()
+            && !token_endpoints
+                .iter()
+                .any(|existing| existing.url == endpoint)
+        {
+            token_endpoints.push(DeviceLoginTokenEndpoint {
+                url: endpoint,
+                host_header: selected_provider.host_header.clone(),
+            });
         }
     }
     let handle = random_device_login_handle();
@@ -589,8 +729,8 @@ async fn start_device_login(
     let pending = PendingDeviceLogin {
         device_code: provider.device_code,
         code_verifier,
-        token_endpoint,
-        client_id,
+        token_endpoints,
+        client_id: selected_provider.client_id,
         expires_at: now + Duration::from_secs(provider.expires_in),
         next_poll_at: now + interval,
         interval,
@@ -651,35 +791,54 @@ async fn poll_device_login(
         )
             .into_response());
     }
-    let response = match state
-        .control_plane_client
-        .post(&pending.token_endpoint)
-        .header(header::ACCEPT, "application/json")
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("client_id", pending.client_id.as_str()),
-            ("device_code", pending.device_code.as_str()),
-            ("code_verifier", pending.code_verifier.as_str()),
-        ])
-        .timeout(state.control_plane_request_timeout)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            pending.next_poll_at = Instant::now() + pending.interval;
-            state
-                .device_logins
-                .lock()
-                .await
-                .pending
-                .insert(request.handle, pending);
-            return Err(AgentError::ControlPlaneClient(format!(
-                "Keycloak device token request failed: {error}"
-            ))
-            .into());
+    let mut failures = Vec::new();
+    let mut token_response = None;
+    for (index, endpoint) in pending.token_endpoints.iter().enumerate() {
+        let response = match state
+            .control_plane_client
+            .post(&endpoint.url)
+            .header(header::HOST, endpoint.host_header.clone())
+            .header(header::ACCEPT, "application/json")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", pending.client_id.as_str()),
+                ("device_code", pending.device_code.as_str()),
+                ("code_verifier", pending.code_verifier.as_str()),
+            ])
+            .timeout(state.control_plane_request_timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{}: {error}", endpoint.url));
+                continue;
+            }
+        };
+        if response.status().is_server_error() {
+            failures.push(format!("{}: HTTP {}", endpoint.url, response.status()));
+            continue;
         }
+        token_response = Some((index, response));
+        break;
+    }
+    let Some((selected_endpoint, response)) = token_response else {
+        pending.next_poll_at = Instant::now() + pending.interval;
+        state
+            .device_logins
+            .lock()
+            .await
+            .pending
+            .insert(request.handle, pending);
+        return Err(AgentError::ControlPlaneClient(format!(
+            "Keycloak device token request failed on every endpoint: {}",
+            failures.join("; ")
+        ))
+        .into());
     };
+    if selected_endpoint > 0 {
+        pending.token_endpoints.rotate_left(selected_endpoint);
+    }
     let status = response.status();
     let body: Value = read_bounded_json_response(
         response,
@@ -1483,8 +1642,45 @@ async fn local_ui_config(
     State(state): State<AgentHttpState>,
     public_gateway: Option<Extension<PublicWebGatewayRequest>>,
 ) -> Json<Value> {
-    match select_healthy_web_ui_with_scope(&state, public_gateway.is_some()).await {
+    let is_public_gateway = public_gateway.is_some();
+    match select_healthy_web_ui_with_scope(&state, is_public_gateway).await {
         Ok((candidate, mut config)) => {
+            if is_public_gateway {
+                let public_url = state
+                    .public_web_gateway
+                    .as_ref()
+                    .and_then(|access| access.status.read().ok()?.url.clone());
+                let rewrite_result = public_url
+                    .ok_or_else(|| "public Web UI gateway is not active".to_string())
+                    .and_then(|public_url| {
+                        rewrite_keycloak_config_for_public_gateway(&mut config, &public_url)
+                    });
+                if let Err(error) = rewrite_result {
+                    return Json(json!({
+                        "enabled": false,
+                        "auth_enabled": false,
+                        "operator_token_enabled": false,
+                        "provider": null,
+                        "issuer_url": null,
+                        "client_id": null,
+                        "scopes": null,
+                        "authorization_endpoint": null,
+                        "device_authorization_endpoint": null,
+                        "device_login_endpoint": null,
+                        "device_login_poll_endpoint": null,
+                        "token_endpoint": null,
+                        "logout_endpoint": null,
+                        "login_endpoint": null,
+                        "node_enrollment_enabled": false,
+                        "client_enrollment_enabled": false,
+                        "local_agent": true,
+                        "bootstrap_required": true,
+                        "selected_web_ui_endpoint": null,
+                        "cached_web_ui_endpoint_count": web_ui_candidates(&state).len(),
+                        "connection_error": truncate_error(&error)
+                    }));
+                }
+            }
             if let Some(config) = config.as_object_mut() {
                 config.insert("login_endpoint".to_string(), Value::Null);
                 if config
@@ -1537,6 +1733,50 @@ async fn local_ui_config(
             "connection_error": truncate_error(&error.to_string())
         })),
     }
+}
+
+fn rewrite_keycloak_config_for_public_gateway(
+    config: &mut Value,
+    public_url: &str,
+) -> Result<(), String> {
+    if config.get("provider").and_then(Value::as_str) != Some("keycloak") {
+        return Ok(());
+    }
+    let public_url = reqwest::Url::parse(public_url)
+        .map_err(|error| format!("public Web UI gateway URL is invalid: {error}"))?;
+    let public_host = public_url
+        .host_str()
+        .ok_or_else(|| "public Web UI gateway URL omitted its host".to_string())?;
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| "Web UI configuration is not an object".to_string())?;
+    for field in [
+        "issuer_url",
+        "authorization_endpoint",
+        "device_authorization_endpoint",
+        "token_endpoint",
+        "logout_endpoint",
+    ] {
+        let Some(value) = object.get_mut(field) else {
+            continue;
+        };
+        let Some(endpoint) = value.as_str() else {
+            continue;
+        };
+        let mut endpoint = reqwest::Url::parse(endpoint)
+            .map_err(|error| format!("Keycloak {field} is invalid: {error}"))?;
+        endpoint
+            .set_scheme(public_url.scheme())
+            .map_err(|_| format!("cannot rewrite Keycloak {field} scheme"))?;
+        endpoint
+            .set_host(Some(public_host))
+            .map_err(|error| format!("cannot rewrite Keycloak {field} host: {error}"))?;
+        endpoint
+            .set_port(public_url.port())
+            .map_err(|_| format!("cannot rewrite Keycloak {field} port"))?;
+        *value = Value::String(endpoint.to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3754,6 +3994,29 @@ mod tests {
             )
             .await?;
         assert_eq!(public_asset.status(), StatusCode::OK);
+
+        let public_config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/config")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(public_config.status(), StatusCode::OK);
+        let public_config: Value = serde_json::from_slice(
+            &axum::body::to_bytes(public_config.into_body(), usize::MAX).await?,
+        )?;
+        assert_eq!(
+            public_config.get("issuer_url").and_then(Value::as_str),
+            Some("https://203.0.113.10/realms/heteronetwork")
+        );
+        assert_eq!(
+            public_config.get("token_endpoint").and_then(Value::as_str),
+            Some("https://203.0.113.10/realms/heteronetwork/protocol/openid-connect/token")
+        );
 
         let mutation = app
             .clone()

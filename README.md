@@ -112,6 +112,25 @@ proxy routes; the remaining Agent API stays loopback-only. Keycloak device
 authorization avoids dynamic redirect-URI and browser CORS exceptions when a
 node gains or changes its public IP.
 
+A colocated Keycloak replica can be published through the same IP certificate
+by setting
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM=127.0.0.1:18080` and a
+realm discovery path in
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH`. Only Keycloak realm
+and static-resource paths are exposed. The gateway lease is withdrawn if
+either the UI or OIDC discovery probe fails. The Agent rewrites Keycloak URLs
+in its public `/ui/config` response to the active gateway origin, so a gateway
+can use any healthy Control Plane without returning another node's issuer.
+
+`scripts/keycloak-ha-node.sh` installs a native Keycloak replica backed by the
+shared PostgreSQL HA service and a private HAProxy backchannel. Set
+`HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES` to a comma-separated list
+of the node's HeteroNetwork and management-network addresses when Control
+Planes use both paths. Public addresses are rejected. Run `install` for the
+initial node setup or `install-backchannel` to reconcile only HAProxy. Deploy at
+least two Keycloak replicas and configure both private realm URLs through the
+Control Plane backchannel variables below.
+
 The operator enrollment API also accepts
 `"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
 exactly three uses. The returned command is identical on all three clean
@@ -128,6 +147,7 @@ HETERONETWORK_WEB_AUTH_PROVIDER=keycloak
 HETERONETWORK_WEB_PUBLIC_URL=https://control-plane.example.com
 HETERONETWORK_WEB_OIDC_ISSUER_URL=https://sso.example.com/realms/heteronetwork
 HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL=http://keycloak.service.consul:8080/realms/heteronetwork
+HETERONETWORK_WEB_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS=http://keycloak-b.service.consul:8080/realms/heteronetwork
 HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web
 iparsd control-plane
 ```
@@ -149,6 +169,12 @@ addresses; Internet-facing issuer and public URLs must use HTTPS.
 server-side token exchange and userinfo validation. Set it to a trusted private
 Keycloak route when Control Plane nodes cannot hairpin to the public issuer;
 the browser still receives the public issuer and token endpoints.
+For Keycloak, an access token issued through another dynamic public gateway is
+accepted when its signed issuer uses the same scheme, realm path, and port as
+the configured issuer. The token's issuer host is forwarded only to the private
+Keycloak backchannel for provider validation, allowing every Control Plane to
+validate tokens from newly advertised public gateway IPs without a static host
+list.
 
 To use Amazon Cognito, keep the issuer URL for token validation and set the
 hosted UI domain separately:
@@ -167,10 +193,11 @@ the UI; an existing `HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN` or i
 file-backed variant can also be entered in the UI as an operator-token
 fallback. The OIDC access token is checked server-side through the configured
 provider userinfo endpoint before any `/v1/admin/*` request is handled.
-Each HA Control Plane automatically advertises its
-`HETERONETWORK_WEB_PUBLIC_URL` as a leased `web_ui` service endpoint, so new
-Agents receive the candidate set through normal enrollment and heartbeat
-updates without extra installer flags.
+`HETERONETWORK_WEB_PUBLIC_URL` defines that Control Plane's callback origin but
+is not advertised as an HA endpoint without an external reachability check.
+Dynamic public gateways publish short leases only after their Agent verifies
+the public TLS UI and, when configured, the OIDC discovery endpoint. New Agents
+receive that verified candidate set through enrollment and heartbeat updates.
 
 Enable the enrollment workflow with a dedicated owner-only signer that is
 shared by the active Control Plane replicas:

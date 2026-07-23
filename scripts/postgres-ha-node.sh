@@ -26,6 +26,7 @@ client_listen_address="${HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS:-}"
 members="${HETERONETWORK_DB_MEMBERS:-}"
 proxy_backends="${HETERONETWORK_DB_PROXY_BACKENDS:-$members}"
 client_cidrs="${HETERONETWORK_DB_CLIENT_CIDRS:-}"
+extra_hba_entries="${HETERONETWORK_DB_EXTRA_HBA_ENTRIES:-}"
 service_name="${HETERONETWORK_DB_SERVICE_NAME:-$DEFAULT_SERVICE_NAME}"
 state_dir="${HETERONETWORK_DB_STATE_DIR:-$DEFAULT_STATE_DIR}"
 data_dir="${HETERONETWORK_DB_DATA_DIR:-$DEFAULT_DATA_DIR}"
@@ -70,6 +71,8 @@ Optional environment:
   HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS
                                      Optional private management address used by remote proxies
   HETERONETWORK_DB_CLIENT_CIDRS    Additional comma-separated application source CIDRs
+  HETERONETWORK_DB_EXTRA_HBA_ENTRIES
+                                     Comma-separated database:user:CIDR access rules
   HETERONETWORK_DB_CLIENT_CA_PATH  Default: /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
   HETERONETWORK_DB_SERVICE_NAME    Default: postgres.heteronetwork.internal
   HETERONETWORK_DB_POSTGRES_PORT   Default: 55432
@@ -165,6 +168,38 @@ validate_cidr() {
   ((10#$prefix <= 32)) || die "invalid IPv4 CIDR prefix: $value"
 }
 
+validate_sql_identifier() {
+  local value="$1"
+  [[ ${#value} -le 63 && "$value" =~ ^[a-z_][a-z0-9_]*$ ]] \
+    || die "invalid lowercase PostgreSQL identifier: $value"
+}
+
+extra_hba_rows() {
+  [[ -n "$extra_hba_entries" ]] || return 0
+  local -a entries
+  local entry database user cidr remainder
+  local -A seen=()
+  IFS=, read -r -a entries <<<"$extra_hba_entries"
+  for entry in "${entries[@]}"; do
+    [[ "$entry" == "${entry//[[:space:]]/}" ]] \
+      || die "extra HBA entries must not contain whitespace"
+    database="${entry%%:*}"
+    remainder="${entry#*:}"
+    [[ "$remainder" != "$entry" ]] \
+      || die "extra HBA entry must use database:user:CIDR: $entry"
+    user="${remainder%%:*}"
+    cidr="${remainder#*:}"
+    [[ "$cidr" != "$remainder" && "$cidr" != *:* ]] \
+      || die "extra HBA entry must use database:user:CIDR: $entry"
+    validate_sql_identifier "$database"
+    validate_sql_identifier "$user"
+    validate_cidr "$cidr"
+    [[ -z "${seen[$entry]:-}" ]] || continue
+    seen[$entry]=1
+    printf '%s %s %s\n' "$database" "$user" "$cidr"
+  done
+}
+
 application_cidrs() {
   local -A seen=()
   local name address cidr
@@ -208,6 +243,7 @@ validate_common_config() {
   [[ "$postgres_major" =~ ^[0-9]{2}$ ]] || die "PostgreSQL major must be a two-digit version"
   member_rows >/dev/null
   application_cidrs >/dev/null
+  extra_hba_rows >/dev/null
 }
 
 validate_node_config() {
@@ -376,20 +412,15 @@ bootstrap:
     - data-checksums
   post_bootstrap: /opt/heteronetwork/postgres-ha/bootstrap-database
   pg_hba:
-    - local all all peer
 EOF
-  while read -r name address; do
-    printf '    - hostssl replication replicator %s/32 scram-sha-256\n' "$address"
-    printf '    - hostssl all postgres %s/32 scram-sha-256\n' "$address"
-    printf '    - hostssl all rewind %s/32 scram-sha-256\n' "$address"
-  done < <(member_rows)
-  local cidr
-  while read -r cidr; do
-    printf '    - hostssl heteronetwork heteronetwork %s scram-sha-256\n' "$cidr"
-  done < <(application_cidrs)
+  render_pg_hba_entries "    "
   cat <<EOF
 
 postgresql:
+  pg_hba:
+EOF
+  render_pg_hba_entries "    "
+  cat <<EOF
   listen: ${node_address}${client_listen_address:+,${client_listen_address}}:${postgres_port}
   connect_address: ${node_address}:${postgres_port}
   data_dir: ${data_dir}/postgres
@@ -421,6 +452,26 @@ tags:
   clonefrom: true
   failover_priority: 1
 EOF
+}
+
+render_pg_hba_entries() {
+  local indent="$1"
+  printf '%s- local all all peer\n' "$indent"
+  local name address
+  while read -r name address; do
+    printf '%s- hostssl replication replicator %s/32 scram-sha-256\n' "$indent" "$address"
+    printf '%s- hostssl all postgres %s/32 scram-sha-256\n' "$indent" "$address"
+    printf '%s- hostssl all rewind %s/32 scram-sha-256\n' "$indent" "$address"
+  done < <(member_rows)
+  local cidr
+  while read -r cidr; do
+    printf '%s- hostssl heteronetwork heteronetwork %s scram-sha-256\n' "$indent" "$cidr"
+  done < <(application_cidrs)
+  local database user
+  while read -r database user cidr; do
+    printf '%s- hostssl %s %s %s scram-sha-256\n' \
+      "$indent" "$database" "$user" "$cidr"
+  done < <(extra_hba_rows)
 }
 
 render_haproxy_config() {
@@ -926,6 +977,7 @@ self_test() {
   local original_node_name="$node_name"
   local original_node_address="$node_address"
   local original_client_listen_address="$client_listen_address"
+  local original_extra_hba_entries="$extra_hba_entries"
   local original_bundle_dir="$bundle_dir"
   local test_dir
   test_dir="$(mktemp -d /tmp/heteronetwork-postgres-ha-test.XXXXXX)"
@@ -936,6 +988,7 @@ self_test() {
   node_name="db-a"
   node_address="10.250.0.1"
   client_listen_address="100.64.0.1"
+  extra_hba_entries="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   bundle_dir="$test_dir/bundle"
   install -d -m 0700 "$bundle_dir/secrets"
   local secret
@@ -951,6 +1004,8 @@ self_test() {
   render_haproxy_config >"$test_dir/haproxy.cfg"
   grep -Fq 'synchronous_mode_strict: true' "$test_dir/patroni.yml"
   grep -Fq 'listen: 10.250.0.1,100.64.0.1:55432' "$test_dir/patroni.yml"
+  [[ "$(grep -c 'hostssl keycloak keycloak 10.250.0.[45]/32 scram-sha-256' \
+    "$test_dir/patroni.yml")" == "4" ]]
   grep -Fq '10.250.0.3:12380' "$test_dir/etcd.yml"
   grep -Fq 'bind 100.64.0.1:18008' "$test_dir/haproxy.cfg"
   [[ "$(grep -c '^    server db-' "$test_dir/haproxy.cfg")" == "3" ]]
@@ -974,6 +1029,7 @@ self_test() {
   node_name="$original_node_name"
   node_address="$original_node_address"
   client_listen_address="$original_client_listen_address"
+  extra_hba_entries="$original_extra_hba_entries"
   bundle_dir="$original_bundle_dir"
   rm -rf "$test_dir"
   trap - RETURN
