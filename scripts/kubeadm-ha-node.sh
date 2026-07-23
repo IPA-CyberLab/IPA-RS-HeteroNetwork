@@ -242,6 +242,73 @@ After=network-online.target heteronetwork-agent.service heteronetwork-kube-apise
 EOF
 }
 
+render_containerd_apparmor_profile() {
+  cat <<'EOF'
+# Managed by HeteroNetwork for containerd versions older than 1.7.32.
+abi <abi/3.0>,
+#include <tunables/global>
+
+profile cri-containerd.apparmor.d flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  # Host runtime processes and container processes may signal the container.
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  signal (send,receive) peer=cri-containerd.apparmor.d,
+
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/mem rwklx,
+  deny @{PROC}/kmem rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace,tracedby,read,readby) peer=cri-containerd.apparmor.d,
+}
+EOF
+}
+
+configure_containerd_apparmor() {
+  [[ -d /sys/kernel/security/apparmor ]] || return
+  command -v apparmor_parser >/dev/null 2>&1 || return
+  [[ -f /etc/apparmor.d/abi/3.0 ]] || return
+  require_command dpkg
+
+  local containerd_version
+  containerd_version="$(containerd --version | awk 'NR == 1 {print $3}')"
+  containerd_version="${containerd_version#v}"
+  [[ "$containerd_version" =~ ^[0-9]+(\.[0-9]+){1,2}([~+.-].*)?$ ]] \
+    || die "unable to parse the installed containerd version"
+  if dpkg --compare-versions "$containerd_version" ge 1.7.32; then
+    return
+  fi
+
+  local profile=/etc/apparmor.d/cri-containerd.apparmor.d
+  render_containerd_apparmor_profile | install_from_stdin "$profile" 0644
+  apparmor_parser -Kr "$profile"
+  grep -Fq 'cri-containerd.apparmor.d (enforce)' /sys/kernel/security/apparmor/profiles \
+    || die "containerd AppArmor profile did not enter enforce mode"
+}
+
 render_init_config() {
   local kubernetes_version="$1"
   cat <<EOF
@@ -405,6 +472,7 @@ configure_containerd() {
   install -d -o root -g root -m 0755 /opt/cni/bin
   install -o root -g root -m 0644 "$temporary" "$config"
   rm -f "$temporary"
+  configure_containerd_apparmor
   systemctl enable --now containerd
   systemctl restart containerd
   systemctl is-active --quiet containerd || die "containerd did not become active"
@@ -741,7 +809,25 @@ spec:
         app: network-probe
     spec:
       containers:
-      - command: ["sh", "-c", "trap : TERM INT; while true; do sleep 3600; done"]
+      - command:
+        - sh
+        - -ec
+        - |
+          rm -f /tmp/heteronetwork-runtime.log
+          syslogd -L -O /tmp/heteronetwork-runtime.log
+          for attempt in $(seq 1 50); do
+            [ -S /dev/log ] && break
+            sleep 0.1
+          done
+          [ -S /dev/log ]
+          logger -t heteronetwork-runtime ready
+          for attempt in $(seq 1 50); do
+            grep -Fq "heteronetwork-runtime" /tmp/heteronetwork-runtime.log 2>/dev/null && break
+            sleep 0.1
+          done
+          grep -Fq "heteronetwork-runtime" /tmp/heteronetwork-runtime.log
+          trap : TERM INT
+          while true; do sleep 3600; done
         image: busybox:1.37.0
         imagePullPolicy: IfNotPresent
         name: probe
@@ -806,6 +892,11 @@ self_test() {
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"
   grep -Fq 'swapBehavior: NoSwap' <<<"$rendered"
   grep -Fq 'value: "20s"' <<<"$rendered"
+  rendered="$(render_containerd_apparmor_profile)"
+  grep -Fq 'abi <abi/3.0>,' <<<"$rendered"
+  grep -Fq 'profile cri-containerd.apparmor.d flags=(attach_disconnected,mediate_deleted)' <<<"$rendered"
+  grep -Fq 'network,' <<<"$rendered"
+  grep -Fq 'deny mount,' <<<"$rendered"
 
   bundle="$(mktemp)"
   jq -n \
