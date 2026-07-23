@@ -17,6 +17,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var activeProfile: TunnelProfile?
     private var profileActivatedAt = Date.distantPast
     private var consecutiveProbeFailures = 0
+    private var loggedHealthyRuntimeState = false
     private var failedGatewayUntil = [String: Date]()
     private var refreshTask: Task<Void, Never>?
 
@@ -40,6 +41,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self?.activeProfile = profile
                     self?.profileActivatedAt = Date()
                     self?.consecutiveProbeFailures = 0
+                    self?.loggedHealthyRuntimeState = false
                     self?.logRuntimeState(for: profile, context: "started")
                     self?.startRefreshLoop()
                 }
@@ -59,6 +61,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         refreshTask = nil
         activeProfile = nil
         consecutiveProbeFailures = 0
+        loggedHealthyRuntimeState = false
         failedGatewayUntil.removeAll()
         adapter.stop { [weak self] error in
             if let error {
@@ -166,6 +169,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let activeProfile else { return }
         if await probeGateway(activeProfile) {
             consecutiveProbeFailures = 0
+            if !loggedHealthyRuntimeState {
+                loggedHealthyRuntimeState = true
+                logRuntimeState(for: activeProfile, context: "health probe succeeded")
+            }
             return
         }
         guard Date().timeIntervalSince(profileActivatedAt) >= 10 else { return }
@@ -217,6 +224,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         activeProfile = preferred
         profileActivatedAt = now
         consecutiveProbeFailures = 0
+        loggedHealthyRuntimeState = false
         logger.notice(
             "WireGuard gateway changed to \(preferred.gatewayNodeID, privacy: .public)"
         )
@@ -253,6 +261,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func probeGateway(_ profile: TunnelProfile) async -> Bool {
+        guard await probeWebUI(profile) else { return false }
+        return await probeDNS(profile)
+    }
+
+    private func probeWebUI(_ profile: TunnelProfile) async -> Bool {
         let hostHeader = profile.gatewayVPNIP.contains(":")
             ? "[\(profile.gatewayVPNIP)]"
             : profile.gatewayVPNIP
@@ -282,6 +295,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func probeDNS(_ profile: TunnelProfile) async -> Bool {
+        let queryID = UInt16.random(in: UInt16.min...UInt16.max)
+        let session = createUDPSessionThroughTunnel(
+            to: NWHostEndpoint(hostname: profile.gatewayVPNIP, port: "53"),
+            from: nil
+        )
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                TunnelDNSHealthProbe(
+                    session: session,
+                    request: OverlayDNSHealthProbe.query(id: queryID),
+                    queryID: queryID,
+                    completion: { continuation.resume(returning: $0) }
+                ).start()
+            }
+        } onCancel: {
+            session.cancel()
+        }
+    }
+
     private func updateAdapter(_ configuration: TunnelConfiguration) async throws {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, Error>) in
@@ -293,6 +326,66 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
+    }
+}
+
+private final class TunnelDNSHealthProbe {
+    private let session: NWUDPSession
+    private let request: Data
+    private let queryID: UInt16
+    private let lock = NSLock()
+    private var completion: ((Bool) -> Void)?
+    private var timeout: DispatchWorkItem?
+
+    init(
+        session: NWUDPSession,
+        request: Data,
+        queryID: UInt16,
+        completion: @escaping (Bool) -> Void
+    ) {
+        self.session = session
+        self.request = request
+        self.queryID = queryID
+        self.completion = completion
+    }
+
+    func start() {
+        let timeout = DispatchWorkItem { [self] in finish(false) }
+        lock.lock()
+        self.timeout = timeout
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + 3,
+            execute: timeout
+        )
+        session.setReadHandler({ [self] datagrams, error in
+            guard error == nil, let response = datagrams?.first else {
+                finish(false)
+                return
+            }
+            finish(OverlayDNSHealthProbe.isHealthyResponse(response, queryID: queryID))
+        }, maxDatagrams: 1)
+        session.writeDatagram(request) { [self] error in
+            if error != nil {
+                finish(false)
+            }
+        }
+    }
+
+    private func finish(_ result: Bool) {
+        lock.lock()
+        guard let completion else {
+            lock.unlock()
+            return
+        }
+        self.completion = nil
+        let timeout = self.timeout
+        self.timeout = nil
+        lock.unlock()
+
+        timeout?.cancel()
+        session.cancel()
+        completion(result)
     }
 }
 
