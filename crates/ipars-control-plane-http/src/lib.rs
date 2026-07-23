@@ -2119,8 +2119,9 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now heteronetwork-gateway.service
-systemctl enable --now heteronetwork-agent.service
+systemctl enable heteronetwork-gateway.service heteronetwork-agent.service
+systemctl restart heteronetwork-gateway.service
+systemctl restart heteronetwork-agent.service
 __SETUP_INSTALL__
 echo "HeteroNetwork node enrolled and started"
 "#;
@@ -3861,6 +3862,8 @@ mod tests {
         assert!(token.claims.policy.allow_relay);
         assert_eq!(response_body["setup"], "network_only");
         assert!(!generated_script.contains("kubeadm-ha-autopilot"));
+        assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
+        assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
 
         let kubernetes_request_body = serde_json::json!({
             "expires_in_seconds": 86_400,

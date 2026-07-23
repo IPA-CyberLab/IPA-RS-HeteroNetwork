@@ -164,6 +164,7 @@ const MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK: usize = 64;
 const MAX_DOCKER_API_SUBNET_BYTES: usize = 128;
 const MAX_DOCKER_API_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_AGENT_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -12541,6 +12542,11 @@ struct HeartbeatReporterConfig {
     route_reporter: Option<HeartbeatRouteReporter>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentApiErrorResponse {
+    error: String,
+}
+
 #[derive(Clone)]
 struct PublicWebGatewayConfig {
     admin_socket: PathBuf,
@@ -13074,9 +13080,22 @@ async fn send_heartbeat(
         .json(&request)
         .send()
         .await
-        .context("failed to send heartbeat request")?
-        .error_for_status()
-        .context("control plane rejected heartbeat request")?;
+        .context("failed to send heartbeat request")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = read_bounded_agent_response_body(
+            response,
+            MAX_AGENT_ERROR_RESPONSE_BYTES,
+            "control-plane heartbeat error",
+        )
+        .await?;
+        let reason = serde_json::from_slice::<AgentApiErrorResponse>(&body)
+            .ok()
+            .map(|response| response.error)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| "control plane returned no structured error reason".to_string());
+        anyhow::bail!("control plane rejected heartbeat request with HTTP {status}: {reason}");
+    }
     read_bounded_agent_json_response(
         response,
         MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
@@ -13119,18 +13138,36 @@ async fn heartbeat_path_state(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<PathRecord> {
     let mut paths = runtime.path_state().await;
-    let current_candidates_by_peer = runtime
-        .peer_map_snapshot()
-        .await
-        .ok()
+    let policy = runtime.cluster_policy_snapshot().await;
+    let peer_map = runtime.peer_map_snapshot().await.ok();
+    let fresh_peer_map = peer_map.as_ref().filter(|peer_map| {
+        heartbeat_timestamp_is_fresh(peer_map.generated_at, now, policy.path_state_ttl_seconds)
+    });
+    let current_peer_ids = fresh_peer_map.map(|peer_map| {
+        peer_map
+            .peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>()
+    });
+    let current_candidates_by_peer = fresh_peer_map
         .map(|peer_map| {
             peer_map
                 .peers
-                .into_iter()
-                .map(|peer| (peer.node_id, peer.endpoint_candidates))
+                .iter()
+                .map(|peer| (peer.node_id.clone(), peer.endpoint_candidates.clone()))
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let peer_map_is_stale = peer_map.is_some() && fresh_peer_map.is_none();
+    let original_path_count = paths.len();
+    paths.retain(|path| {
+        !peer_map_is_stale
+            && heartbeat_timestamp_is_fresh(path.updated_at, now, policy.path_state_ttl_seconds)
+            && current_peer_ids
+                .as_ref()
+                .map_or(true, |peers| peers.contains(&path.key.remote))
+    });
     let activities = runtime.recent_local_peer_activities(now).await;
     let activity_by_peer = activities
         .iter()
@@ -13164,6 +13201,23 @@ async fn heartbeat_path_state(
             activity_by_peer.get(&path.key.remote).copied(),
         );
     }
+    paths.retain(|path| {
+        path.selected_candidate.as_ref().map_or(true, |candidate| {
+            heartbeat_timestamp_is_fresh(
+                candidate.observed_at,
+                now,
+                policy.endpoint_candidate_ttl_seconds,
+            )
+        })
+    });
+    let pruned_path_count = original_path_count.saturating_sub(paths.len());
+    if pruned_path_count > 0 {
+        tracing::debug!(
+            pruned_path_count,
+            peer_map_is_stale,
+            "omitted stale heartbeat path state"
+        );
+    }
     if refreshed_selected_candidates > 0 {
         tracing::debug!(
             refreshed_selected_candidates,
@@ -13173,7 +13227,12 @@ async fn heartbeat_path_state(
 
     let local_node = runtime.state().node_id.clone();
     for (peer, observed_at, pinned) in activities {
-        if represented_peers.contains(&peer) {
+        if represented_peers.contains(&peer)
+            || peer_map_is_stale
+            || current_peer_ids
+                .as_ref()
+                .is_some_and(|peers| !peers.contains(&peer))
+        {
             continue;
         }
         let mut path = PathRecord {
@@ -13190,6 +13249,17 @@ async fn heartbeat_path_state(
     }
     paths.sort_by(|left, right| left.key.remote.cmp(&right.key.remote));
     paths
+}
+
+fn heartbeat_timestamp_is_fresh(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    match now.signed_duration_since(timestamp).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
 }
 
 fn start_signal_registration(
@@ -15010,13 +15080,22 @@ fn ensure_agent_join_token_size(size: u64, context: &str) -> anyhow::Result<()> 
 }
 
 async fn read_bounded_agent_json_response<Response>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: u64,
     context: &str,
 ) -> anyhow::Result<Response>
 where
     Response: DeserializeOwned,
 {
+    let body = read_bounded_agent_response_body(response, max_bytes, context).await?;
+    serde_json::from_slice(&body).with_context(|| format!("failed to decode {context} response"))
+}
+
+async fn read_bounded_agent_response_body(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> anyhow::Result<Vec<u8>> {
     if let Some(length) = response.content_length() {
         ensure_agent_http_response_size(length, max_bytes, context)?;
     }
@@ -15030,7 +15109,7 @@ where
         ensure_agent_http_response_size(next_len, max_bytes, context)?;
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).with_context(|| format!("failed to decode {context} response"))
+    Ok(body)
 }
 
 fn ensure_agent_http_response_size(size: u64, max_bytes: u64, context: &str) -> anyhow::Result<()> {
@@ -19527,6 +19606,35 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .context("timed out waiting for oversized bounded JSON test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejection_reports_control_plane_reason() -> anyhow::Result<()> {
+        let reason = "node update rejected: selected endpoint candidate is stale";
+        let body = serde_json::json!({ "error": reason }).to_string();
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let request =
+            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+
+        let error = test_error(
+            send_heartbeat(&reqwest::Client::new(), &url, request, Duration::ZERO).await,
+            "rejected heartbeat should return an error",
+        );
+
+        assert!(error.to_string().contains(reason));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for heartbeat rejection test server")???;
         Ok(())
     }
 
@@ -34639,6 +34747,85 @@ exec sleep 60
                     local_activity_at.timestamp_millis()
                 )
         }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_omits_path_with_stale_selected_candidate() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id.clone();
+        let peer = NodeId::from_string("stale-peer");
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(node_id, peer.clone()),
+                selected_state: PathState::DirectPublic,
+                selected_candidate: Some(EndpointCandidate {
+                    node_id: peer,
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([1, 1, 1, 1], 51_820)),
+                    observed_at: Utc::now() - chrono::Duration::minutes(5),
+                    priority: 80,
+                    cost: 20,
+                    source: CandidateSource::StunProbe,
+                }),
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::DirectPublic,
+                    &PathMetrics::default(),
+                    false,
+                    20,
+                ),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+
+        let request =
+            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+
+        assert!(request.path_state.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_omits_path_for_peer_absent_from_current_map() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let node_id = runtime.state().node_id.clone();
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(node_id, NodeId::from_string("removed-peer")),
+                selected_state: PathState::Unreachable,
+                selected_candidate: None,
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::Unreachable,
+                    &PathMetrics::default(),
+                    false,
+                    0,
+                ),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+        runtime
+            .record_peer_map_snapshot(PeerMap {
+                cluster_id: ClusterId::from_string("heartbeat-cluster"),
+                peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await;
+
+        let request =
+            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+
+        assert!(request.path_state.is_empty());
         Ok(())
     }
 

@@ -2725,6 +2725,10 @@ impl AgentRuntime {
         self.lazy_connect.read().await.recent_local_activities(now)
     }
 
+    pub async fn cluster_policy_snapshot(&self) -> ClusterPolicy {
+        self.lazy_connect.read().await.policy.clone()
+    }
+
     pub async fn replace_internal_packet_flow_udp_ports(&self, ports: BTreeSet<u16>) {
         *self.internal_packet_flow_udp_ports.write().await = ports;
     }
