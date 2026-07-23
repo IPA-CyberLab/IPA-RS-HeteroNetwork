@@ -38,6 +38,7 @@ targets:
     platform: macOS
     settings:
       base:
+        PATH: "$(PROJECT_DIR)/.build/toolchain/go1.20.14/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         SDKROOT: macosx
     legacy:
       toolPath: /usr/bin/make
@@ -65,6 +66,16 @@ targets:
         HeteroNetworkKeychainAccessGroup: $(AppIdentifierPrefix)jp.go.ipa.cyberlab.heteronetwork.shared
     entitlements:
       path: Config/PacketTunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - group.jp.go.ipa.cyberlab.heteronetwork
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)jp.go.ipa.cyberlab.heteronetwork.shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.go.ipa.cyberlab.heteronetwork.PacketTunnel
@@ -88,11 +99,21 @@ targets:
         LSUIElement: true
         CFBundleURLTypes:
           - CFBundleURLName: jp.go.ipa.cyberlab.heteronetwork.enrollment
+            CFBundleTypeRole: Editor
             CFBundleURLSchemes:
               - heteronetwork
         HeteroNetworkKeychainAccessGroup: $(AppIdentifierPrefix)jp.go.ipa.cyberlab.heteronetwork.shared
     entitlements:
       path: Config/App.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - group.jp.go.ipa.cyberlab.heteronetwork
+        com.apple.security.network.client: true
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)jp.go.ipa.cyberlab.heteronetwork.shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.go.ipa.cyberlab.heteronetwork

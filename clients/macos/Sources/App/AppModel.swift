@@ -23,13 +23,6 @@ final class AppModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] status in self?.vpnStatus = status }
             .store(in: &cancellables)
-        NotificationCenter.default.publisher(for: .heteroNetworkEnrollmentURL)
-            .compactMap { $0.object as? URL }
-            .receive(on: RunLoop.main)
-            .sink { [weak self] url in
-                self?.enrollmentInput = url.absoluteString
-            }
-            .store(in: &cancellables)
         Timer.publish(every: 5, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in self?.reloadSessionFromExtension() }
@@ -154,10 +147,6 @@ final class AppModel: ObservableObject {
             lastError = error.localizedDescription
         }
     }
-}
-
-extension Notification.Name {
-    static let heteroNetworkEnrollmentURL = Notification.Name("HeteroNetworkEnrollmentURL")
 }
 
 extension NEVPNStatus {

@@ -59,6 +59,8 @@ public struct JoinTokenClaims: Codable, Equatable, Sendable {
     public let keyID: String
     public let policy: TokenPolicy
     public let nonce: String
+    private let encodedExpiresAt: String
+    private let encodedNotBefore: String
 
     public init(
         clusterID: String,
@@ -82,6 +84,55 @@ public struct JoinTokenClaims: Codable, Equatable, Sendable {
         self.keyID = keyID
         self.policy = policy
         self.nonce = nonce
+        encodedExpiresAt = HeteroNetworkCoding.rfc3339String(from: expiresAt)
+        encodedNotBefore = HeteroNetworkCoding.rfc3339String(from: notBefore)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        clusterID = try container.decode(String.self, forKey: .clusterID)
+        bootstrapEndpoints = try container.decode(
+            [BootstrapEndpoint].self,
+            forKey: .bootstrapEndpoints
+        )
+        encodedExpiresAt = try container.decode(String.self, forKey: .expiresAt)
+        encodedNotBefore = try container.decode(String.self, forKey: .notBefore)
+        guard let decodedExpiresAt = HeteroNetworkCoding.date(fromRFC3339: encodedExpiresAt) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .expiresAt,
+                in: container,
+                debugDescription: "Invalid RFC 3339 timestamp: \(encodedExpiresAt)"
+            )
+        }
+        guard let decodedNotBefore = HeteroNetworkCoding.date(fromRFC3339: encodedNotBefore) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .notBefore,
+                in: container,
+                debugDescription: "Invalid RFC 3339 timestamp: \(encodedNotBefore)"
+            )
+        }
+        expiresAt = decodedExpiresAt
+        notBefore = decodedNotBefore
+        role = try container.decode(String.self, forKey: .role)
+        tags = try container.decode([String].self, forKey: .tags)
+        issuer = try container.decode(String.self, forKey: .issuer)
+        keyID = try container.decode(String.self, forKey: .keyID)
+        policy = try container.decode(TokenPolicy.self, forKey: .policy)
+        nonce = try container.decode(String.self, forKey: .nonce)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(clusterID, forKey: .clusterID)
+        try container.encode(bootstrapEndpoints, forKey: .bootstrapEndpoints)
+        try container.encode(encodedExpiresAt, forKey: .expiresAt)
+        try container.encode(encodedNotBefore, forKey: .notBefore)
+        try container.encode(role, forKey: .role)
+        try container.encode(tags, forKey: .tags)
+        try container.encode(issuer, forKey: .issuer)
+        try container.encode(keyID, forKey: .keyID)
+        try container.encode(policy, forKey: .policy)
+        try container.encode(nonce, forKey: .nonce)
     }
 
     enum CodingKeys: String, CodingKey {

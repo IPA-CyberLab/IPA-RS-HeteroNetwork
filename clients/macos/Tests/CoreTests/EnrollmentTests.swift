@@ -19,6 +19,58 @@ final class EnrollmentTests: XCTestCase {
         )
     }
 
+    func testPreservesSignedTokenTimestampPrecisionWhenReencodingJoinRequest() throws {
+        let rawToken = #"""
+        {
+          "claims": {
+            "cluster_id": "cluster-a",
+            "bootstrap_endpoints": [
+              {"url": "https://gateway.example", "kind": "web_ui"},
+              {"url": "https://cp.example:8443", "kind": "control_plane"}
+            ],
+            "expires_at": "2026-07-21T12:34:56.846167233Z",
+            "not_before": "2026-07-20T12:34:51.123456789Z",
+            "role": "client",
+            "tags": [],
+            "issuer": "node-issuer",
+            "key_id": "client-enrollment",
+            "policy": {
+              "allow_join": true,
+              "allow_relay": false,
+              "allowed_routes": [],
+              "allowed_tags": [],
+              "max_token_uses": 1
+            },
+            "nonce": "client-enroll-precision-test"
+          },
+          "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+        """#
+        let tokenData = try XCTUnwrap(rawToken.data(using: .utf8))
+        let uri = "heteronetwork://enroll?token=\(tokenData.base64URLEncodedString())"
+        let token = try EnrollmentParser.parse(
+            uri,
+            now: Date(timeIntervalSince1970: 1_784_550_896)
+        )
+        let request = JoinClientRequest(
+            token: token,
+            registration: RegisterClientRequest(
+                clientID: "node-client",
+                identityPublicKey: "identity-public-key",
+                wireGuardPublicKey: "wireguard-public-key"
+            )
+        )
+
+        let encoded = try HeteroNetworkCoding.makeEncoder().encode(request)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        let tokenObject = try XCTUnwrap(object["token"] as? [String: Any])
+        let claims = try XCTUnwrap(tokenObject["claims"] as? [String: Any])
+        XCTAssertEqual(claims["expires_at"] as? String, "2026-07-21T12:34:56.846167233Z")
+        XCTAssertEqual(claims["not_before"] as? String, "2026-07-20T12:34:51.123456789Z")
+    }
+
     func testRejectsNodeEnrollmentToken() throws {
         let now = Date(timeIntervalSince1970: 1_784_550_896)
         let client = makeToken(now: now)

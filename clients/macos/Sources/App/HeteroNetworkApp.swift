@@ -1,33 +1,57 @@
 import AppKit
+import os
 import SwiftUI
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let model = AppModel()
+
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "HeteroNetwork",
+        category: "Application"
+    )
+
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let enrollmentURL = urls.first(where: { $0.scheme == "heteronetwork" }) else { return }
-        DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .heteroNetworkEnrollmentURL, object: enrollmentURL)
-            application.activate(ignoringOtherApps: true)
-            application.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-        }
+        handleEnrollmentURL(enrollmentURL)
+        application.activate(ignoringOtherApps: true)
+    }
+
+    func handleEnrollmentURL(_ enrollmentURL: URL) {
+        guard enrollmentURL.scheme == "heteronetwork" else { return }
+        logger.info("Received an enrollment URL")
+        model.enrollmentInput = enrollmentURL.absoluteString
     }
 }
 
 @main
 struct HeteroNetworkApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var model = AppModel()
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarContent(model: model)
+            MenuBarContent(model: appDelegate.model)
         } label: {
-            Image(systemName: model.vpnStatus.symbolName)
-                .accessibilityLabel("HeteroNetwork")
+            MenuBarStatusLabel(model: appDelegate.model)
         }
         .menuBarExtraStyle(.window)
 
-        Settings {
-            SettingsView(model: model)
+        Window("HeteroNetwork", id: "settings") {
+            SettingsView(model: appDelegate.model)
+                .onOpenURL { url in
+                    appDelegate.handleEnrollmentURL(url)
+                }
         }
+        .handlesExternalEvents(matching: ["enroll"])
+        .windowResizability(.contentSize)
+    }
+}
+
+private struct MenuBarStatusLabel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Image(systemName: model.vpnStatus.symbolName)
+            .accessibilityLabel(model.vpnStatus.displayName)
     }
 }

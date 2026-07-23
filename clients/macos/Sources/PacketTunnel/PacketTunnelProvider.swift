@@ -40,6 +40,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self?.activeProfile = profile
                     self?.profileActivatedAt = Date()
                     self?.consecutiveProbeFailures = 0
+                    self?.logRuntimeState(for: profile, context: "started")
                     self?.startRefreshLoop()
                 }
                 completionHandler(error)
@@ -176,6 +177,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             HeteroNetworkConstants.gatewayFailureCooldown
         )
         consecutiveProbeFailures = 0
+        logRuntimeState(for: activeProfile, context: "health probe failed")
         logger.warning(
             "Gateway \(activeProfile.gatewayNodeID, privacy: .public) failed its VPN health probe"
         )
@@ -217,6 +219,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         consecutiveProbeFailures = 0
         logger.notice(
             "WireGuard gateway changed to \(preferred.gatewayNodeID, privacy: .public)"
+        )
+        logRuntimeState(for: preferred, context: "gateway changed")
+    }
+
+    private func logRuntimeState(for profile: TunnelProfile, context: String) {
+        adapter.getRuntimeConfiguration { [weak self] configuration in
+            guard let self else { return }
+            let values = Self.safeRuntimeValues(from: configuration)
+            self.logger.notice(
+                "WireGuard \(context, privacy: .public): gateway=\(profile.gatewayNodeID, privacy: .public) endpoint=\(profile.gatewayEndpoint, privacy: .public) handshake=\(values.handshake, privacy: .public) rx=\(values.receivedBytes, privacy: .public) tx=\(values.sentBytes, privacy: .public)"
+            )
+        }
+    }
+
+    private static func safeRuntimeValues(
+        from configuration: String?
+    ) -> (handshake: String, receivedBytes: String, sentBytes: String) {
+        var values = [String: String]()
+        for line in configuration?.split(separator: "\n") ?? [] {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0])
+            if ["last_handshake_time_sec", "rx_bytes", "tx_bytes"].contains(key) {
+                values[key] = String(parts[1])
+            }
+        }
+        return (
+            values["last_handshake_time_sec"] ?? "0",
+            values["rx_bytes"] ?? "0",
+            values["tx_bytes"] ?? "0"
         )
     }
 

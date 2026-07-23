@@ -6,9 +6,7 @@ public enum HeteroNetworkCoding {
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
             let value = try container.decode(String.self)
-            if let date = internetDateFormatter(fractionalSeconds: true).date(from: value)
-                ?? internetDateFormatter(fractionalSeconds: false).date(from: value)
-            {
+            if let date = date(fromRFC3339: value) {
                 return date
             }
             throw DecodingError.dataCorruptedError(
@@ -23,9 +21,18 @@ public enum HeteroNetworkCoding {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom { date, encoder in
             var container = encoder.singleValueContainer()
-            try container.encode(internetDateFormatter(fractionalSeconds: false).string(from: date))
+            try container.encode(rfc3339String(from: date))
         }
         return encoder
+    }
+
+    static func date(fromRFC3339 value: String) -> Date? {
+        internetDateFormatter(fractionalSeconds: true).date(from: value)
+            ?? internetDateFormatter(fractionalSeconds: false).date(from: value)
+    }
+
+    static func rfc3339String(from date: Date) -> String {
+        internetDateFormatter(fractionalSeconds: false).string(from: date)
     }
 
     private static func internetDateFormatter(fractionalSeconds: Bool) -> ISO8601DateFormatter {
