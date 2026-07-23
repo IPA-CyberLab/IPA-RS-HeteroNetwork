@@ -6345,7 +6345,10 @@ impl LazyConnectManager {
             self.advertised_routes.insert(peer.node_id.clone(), routes);
         }
 
-        if self.is_pinned_by_policy(&peer.role, &peer.tags) || has_owned_routes {
+        if peer.role.is_client()
+            || self.is_pinned_by_policy(&peer.role, &peer.tags)
+            || has_owned_routes
+        {
             self.observed_pins.insert(peer.node_id.clone());
         }
     }
@@ -7386,6 +7389,14 @@ mod tests {
     #[test]
     fn lazy_manager_pins_default_important_peer_classes() {
         let mut manager = LazyConnectManager::new(ClusterPolicy::default());
+        let mut client = peer_record(
+            NodeId::from_string("client-a"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 19)),
+            "wg-client",
+            Vec::new(),
+            Vec::new(),
+        );
+        client.role = Role::client();
         let mut control_plane = peer_record(
             NodeId::from_string("control-plane-a"),
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)),
@@ -7437,6 +7448,7 @@ mod tests {
         );
 
         for peer in [
+            &client,
             &control_plane,
             &route_provider,
             &kubernetes_control_plane,
@@ -7446,12 +7458,13 @@ mod tests {
             manager.observe_peer(peer, &BTreeSet::new());
         }
 
+        assert!(manager.should_connect_peer(&client));
         assert!(manager.should_connect_peer(&control_plane));
         assert!(manager.should_connect_peer(&route_provider));
         assert!(manager.should_connect_peer(&kubernetes_control_plane));
         assert!(!manager.should_connect_peer(&relay));
         assert!(!manager.should_connect_peer(&ordinary));
-        assert_eq!(manager.metrics().pinned_peer_count, 3);
+        assert_eq!(manager.metrics().pinned_peer_count, 4);
     }
 
     #[test]
@@ -10773,6 +10786,47 @@ mod tests {
         let active_config = &wireguard_peers[&peer_id];
         assert_eq!(active_config.endpoint.as_deref(), Some("8.8.8.20:51820"));
         assert_eq!(active_config.public_key, "wg-on-demand");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_applier_keeps_inbound_clients_ready_without_an_endpoint(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let client_id = NodeId::from_string("mac-client");
+        let mut client = peer_record(
+            client_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 30)),
+            "wg-mac-client",
+            Vec::new(),
+            Vec::new(),
+        );
+        client.role = Role::client();
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![client],
+            bootstrap_endpoints: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            MemoryWireGuardBackend::default(),
+            RecordingRouteManager::default(),
+        )
+        .with_lazy_connect_runtime(runtime);
+
+        let summary = applier.apply_peer_map(peer_map).await?;
+
+        assert_eq!(summary.peers_applied, 1);
+        let wireguard_peers = applier.wireguard.peers.read().await;
+        let client_config = &wireguard_peers[&client_id];
+        assert_eq!(client_config.public_key, "wg-mac-client");
+        assert_eq!(client_config.endpoint, None);
+        assert_eq!(client_config.persistent_keepalive_seconds, None);
+        assert_eq!(client_config.allowed_ips, vec!["100.64.0.30/32"]);
         Ok(())
     }
 
