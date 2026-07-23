@@ -14,16 +14,18 @@ network capabilities.
 ## Prerequisites
 
 - Two or more independently reachable public hosts.
-- One PostgreSQL endpoint shared by every Control Plane.
+- Three mutually reachable private PostgreSQL members, deployed with
+  [`scripts/postgres-ha-node.sh`](../../scripts/postgres-ha-node.sh), or an
+  equivalent managed synchronous HA service.
 - An external load balancer or multiple DNS records when a stable UI hostname
   must survive a public-node outage.
 - Keycloak with each public `/ui/` URL registered as a valid redirect URI and
   Web Origin.
 
-The application tier is active-active with two public nodes. PostgreSQL must
-itself use a managed HA service or a quorum deployment in a separate failure
-domain. Two application hosts alone cannot provide split-brain-safe database
-quorum.
+The application tier is active-active with two public nodes. PostgreSQL uses
+three private failure domains and does not require a public IP. The packaged HA
+deployment is documented in
+[`docs/POSTGRES_HA.md`](../../docs/POSTGRES_HA.md).
 
 ## Install one node
 
@@ -56,6 +58,10 @@ verifier-constrained to `edge`, `worker`, or
 counts, the configured TTL ceiling, and at least two active Control Plane,
 Signal, and STUN endpoints. Relay-enabled tokens also require two Relay
 endpoints.
+Install the local database proxy and place its complete TLS-verifying
+PostgreSQL URL in `/etc/credstore/database-url`, owned by `root:root` with mode
+`0400`. The unit imports that URL as a separate systemd credential, keeping the
+database password out of the shared environment file and process arguments.
 Set `HETERONETWORK_WEB_PUBLIC_URL` to that node's externally used origin. The daemon
 then keeps PKCE verifier/state server-side for the callback, including on lab
 HTTP IP addresses where browser WebCrypto is not available.

@@ -220,6 +220,7 @@ const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID: &str = "node-enrollment-issuer.key";
+const DATABASE_URL_CREDENTIAL_ID: &str = "database-url";
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
 const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
@@ -502,8 +503,18 @@ struct ControlPlaneArgs {
         default_value_t = 600
     )]
     path_state_ttl_seconds: u64,
-    #[arg(long, env = "HETERONETWORK_DATABASE_URL")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_DATABASE_URL",
+        conflicts_with = "database_url_path"
+    )]
     database_url: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_DATABASE_URL_PATH",
+        conflicts_with = "database_url"
+    )]
+    database_url_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_SERVICE_INSTANCE_ID")]
     service_instance_id: Option<String>,
     #[arg(long, env = "HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL")]
@@ -4367,10 +4378,10 @@ async fn run_control_plane(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
-    match database_kind(args.database_url.as_deref()) {
+    let database_url = control_plane_database_url(&args)?;
+    match database_kind(database_url.as_deref()) {
         DatabaseKind::Postgres => {
-            let database_url = args
-                .database_url
+            let database_url = database_url
                 .as_deref()
                 .context("postgres database URL is required")?;
             let store = Arc::new(PostgresControlPlaneStore::connect(database_url).await?);
@@ -4384,8 +4395,7 @@ async fn run_control_plane(
             .await
         }
         DatabaseKind::Sqlite => {
-            let database_url = args
-                .database_url
+            let database_url = database_url
                 .as_deref()
                 .context("sqlite database URL is required")?;
             let store = Arc::new(SqliteControlPlaneStore::connect(database_url).await?);
@@ -13166,7 +13176,7 @@ async fn heartbeat_path_state(
             && heartbeat_timestamp_is_fresh(path.updated_at, now, policy.path_state_ttl_seconds)
             && current_peer_ids
                 .as_ref()
-                .map_or(true, |peers| peers.contains(&path.key.remote))
+                .is_none_or(|peers| peers.contains(&path.key.remote))
     });
     let activities = runtime.recent_local_peer_activities(now).await;
     let activity_by_peer = activities
@@ -13202,7 +13212,7 @@ async fn heartbeat_path_state(
         );
     }
     paths.retain(|path| {
-        path.selected_candidate.as_ref().map_or(true, |candidate| {
+        path.selected_candidate.as_ref().is_none_or(|candidate| {
             heartbeat_timestamp_is_fresh(
                 candidate.observed_at,
                 now,
@@ -18951,6 +18961,48 @@ enum DatabaseKind {
     Sqlite,
 }
 
+fn control_plane_database_url(args: &ControlPlaneArgs) -> anyhow::Result<Option<String>> {
+    database_url_from_sources(
+        args.database_url.as_deref(),
+        args.database_url_path.as_deref(),
+        std::env::var_os("CREDENTIALS_DIRECTORY")
+            .filter(|directory| !directory.is_empty())
+            .as_deref()
+            .map(Path::new),
+    )
+}
+
+fn database_url_from_sources(
+    inline: Option<&str>,
+    path: Option<&Path>,
+    credential_directory: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        inline.is_none() || path.is_none(),
+        "database URL and database URL path are mutually exclusive"
+    );
+    if let Some(database_url) = inline {
+        return Ok(Some(database_url.to_string()));
+    }
+    if let Some(path) = path {
+        return read_bounded_secret_file(
+            path,
+            "database URL",
+            SecretFilePermissionPolicy::OwnerOnly,
+        )
+        .map(Some);
+    }
+    let Some(path) =
+        credential_directory.map(|directory| directory.join(DATABASE_URL_CREDENTIAL_ID))
+    else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_systemd_credential_file(&path, "database URL").map(Some)
+}
+
 fn database_kind(database_url: Option<&str>) -> DatabaseKind {
     match database_url {
         Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => {
@@ -21720,6 +21772,35 @@ mod tests {
             database_kind(Some("postgresql://ipars@localhost/ipars")),
             DatabaseKind::Postgres
         );
+    }
+
+    #[test]
+    fn database_url_sources_support_owner_only_files() -> anyhow::Result<()> {
+        let dir = unique_test_dir("database-url")?;
+        let path = dir.join("database-url");
+        let database_url =
+            "postgresql://heteronetwork:secret@db.internal/heteronetwork?sslmode=verify-full";
+        write_private_test_secret(&path, format!("{database_url}\n"))?;
+
+        assert_eq!(
+            database_url_from_sources(None, Some(&path), None)?.as_deref(),
+            Some(database_url)
+        );
+        assert_eq!(
+            database_url_from_sources(Some(database_url), None, None)?.as_deref(),
+            Some(database_url)
+        );
+        assert!(
+            database_url_from_sources(Some(database_url), Some(&path), None)
+                .is_err_and(|error| error.to_string().contains("mutually exclusive"))
+        );
+        assert_eq!(
+            database_url_from_sources(None, None, Some(&dir.join("missing")))?,
+            None
+        );
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

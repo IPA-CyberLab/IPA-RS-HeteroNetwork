@@ -52,7 +52,7 @@ requires authenticated management access
 and two distinct active URLs for Control Plane, Signal, and STUN, plus two Relay
 URLs when relay permission is requested.
 
-The four local services form one advertised failure domain. The packaged Control Plane unit is bound to Signal, STUN, and Relay, so stopping or losing any of them stops the local lease renewal. A failed instance disappears from `/v1/admin/services` after `HETERONETWORK_SERVICE_LEASE_TTL_SECONDS`. Use a managed HA PostgreSQL service or a quorum deployment outside the two application failure domains; a single database on either public host makes whole-host failover asymmetric.
+The four local services form one advertised failure domain. The packaged Control Plane unit is bound to Signal, STUN, and Relay, so stopping or losing any of them stops the local lease renewal. A failed instance disappears from `/v1/admin/services` after `HETERONETWORK_SERVICE_LEASE_TTL_SECONDS`. Deploy the three-member private PostgreSQL quorum described in [`POSTGRES_HA.md`](POSTGRES_HA.md); a single database on either public host makes whole-host failover asymmetric.
 
 Mint join tokens from the active directory instead of manually copying endpoint lists:
 
