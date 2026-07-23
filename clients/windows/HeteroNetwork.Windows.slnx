@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/HeteroNetwork.Core/HeteroNetwork.Core.csproj" />
+  <Project Path="src/HeteroNetwork.App/HeteroNetwork.App.csproj" />
+  <Project Path="tests/HeteroNetwork.Core.Tests/HeteroNetwork.Core.Tests.csproj" />
+</Solution>

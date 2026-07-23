@@ -43,7 +43,7 @@ trusted entry. The packaged systemd unit obtains the enrollment signer through
 `LoadCredential=` from a root-only credential store; sibling Signal, STUN, and
 Relay services do not receive the service-scoped read-only copy.
 
-The same signer can issue a distinct macOS client token only through the
+The same signer can issue a distinct desktop client token only through the
 authenticated client-enrollment endpoint. Server-side issuer policy forces role
 `client`, one use, no tags, no allowed routes, no relay permission, at least two
 active Control Plane endpoints, and a currently reachable gateway. A client
@@ -52,7 +52,12 @@ dedicated client join endpoint rejects all non-client tokens.
 
 After enrollment, the macOS app keeps its Ed25519 identity and WireGuard private
 key in a device-only shared Keychain item available to the containing app and
-packet-tunnel extension. Enrollment tokens are not persisted. Peer-map refresh
+packet-tunnel extension. The Windows app keeps the same material in a
+current-user DPAPI blob and hands only a machine-DPAPI-protected configuration
+to its pinned, embedded official WireGuard tunnel service. The signed
+WireGuardNT library is verified during the build; no external WireGuard
+installation is trusted or invoked. Enrollment tokens are not persisted.
+Peer-map refresh
 and removal requests carry bounded-fresh operation-specific Ed25519 signatures
 and random nonces. The packet tunnel accepts an ordered, bounded gateway set,
 configures only its first member, and refreshes that signed map while connected.
@@ -61,7 +66,10 @@ gateway ID to the client identity, operation, timestamp, and nonce; changing the
 gateway field invalidates the signature. Legacy v1 requests cannot nominate a
 gateway and therefore remain pinned to the server-selected primary.
 It rejects default routes, malformed CIDRs, local or relay endpoint candidates,
-and invalid WireGuard keys before starting WireGuardKit. The overlay Web UI and
+and invalid WireGuard keys before starting WireGuardKit or changing Windows
+networking. On Windows, an NRPT rule directs only
+`console.heteronetwork.internal` to the active gateway and is removed with the
+tunnel. The overlay Web UI and
 authoritative split-DNS listeners bind only to the Agent's VPN address; their
 router excludes Agent status, metrics, and mutation APIs. This client identity is
 explicitly denied access to heartbeat, Signal, path-reporting, normal removal,

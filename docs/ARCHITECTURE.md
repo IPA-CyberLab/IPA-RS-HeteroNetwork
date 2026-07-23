@@ -41,7 +41,7 @@ During registration, the control plane validates that the submitted identity pub
 
 ## Control-Only Clients
 
-The native macOS app joins the overlay through a separate control-client
+The native macOS and Windows apps join the overlay through a separate control-client
 protocol. A client token has role `client`, one use, no tags, no route grants,
 and no relay permission. `/v1/join` rejects that role; clients can register only
 through `POST /v1/clients/join`. Subsequent peer-map reads and removal use a
@@ -63,7 +63,7 @@ allowed IPs contain the gateway VPN host route plus the infrastructure VPN host
 routes and advertised CIDRs projected onto that gateway.
 
 Every selected gateway receives clients as direct WireGuard peers so a packet
-tunnel can switch without re-enrollment. The macOS client binds its selected
+tunnel can switch without re-enrollment. Each desktop client binds its selected
 gateway to a v2 Ed25519 client-control signature on every peer-map refresh. The
 control plane persists that selection in the shared SQLite or PostgreSQL store,
 returns it first to the client, and projects each client host route onto its own

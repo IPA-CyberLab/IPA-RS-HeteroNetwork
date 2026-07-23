@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <AssemblyName>HeteroNetwork</AssemblyName>
+    <RootNamespace>HeteroNetwork.App</RootNamespace>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\HeteroNetwork.Core\HeteroNetwork.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\.build\native\win-x64\tunnel.dll"
+             Link="tunnel.dll"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\.build\native\win-x64\wireguard.dll"
+             Link="wireguard.dll"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\.build\native\win-x64\WIREGUARD-WINDOWS-COPYING.txt"
+             Link="WIREGUARD-WINDOWS-COPYING.txt"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\.build\native\win-x64\WIREGUARD-NT-LICENSE.txt"
+             Link="WIREGUARD-NT-LICENSE.txt"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="RequireEmbeddedWireGuard" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('..\..\.build\native\win-x64\tunnel.dll')"
+           Text="The embedded WireGuard runtime is missing. Run clients/windows/bootstrap-wireguard.ps1." />
+    <Error Condition="!Exists('..\..\.build\native\win-x64\wireguard.dll')"
+           Text="The embedded WireGuard runtime is missing. Run clients/windows/bootstrap-wireguard.ps1." />
+  </Target>
+</Project>

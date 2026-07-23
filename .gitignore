@@ -18,3 +18,7 @@ clients/macos/Config/PacketTunnel-Info.plist
 clients/macos/.derived-data/
 clients/macos/.test-derived-data/
 clients/macos/.build/
+clients/windows/**/bin/
+clients/windows/**/obj/
+clients/windows/artifacts/
+clients/windows/.build/

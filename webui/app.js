@@ -300,22 +300,22 @@
     "Maximum uses must be between 2 and 1000.": "最大利用回数は 2 回から 1000 回の範囲で指定してください。",
     "Copy failed": "コピーに失敗しました",
     "Linux node": "Linux ノード",
-    "macOS client": "macOS クライアント",
-    "Add a macOS client": "macOS クライアントを追加",
+    "Desktop client": "デスクトップクライアント",
+    "Add a desktop client": "デスクトップクライアントを追加",
     "Generate a one-use enrollment link for the native HeteroNetwork app.": "HeteroNetwork ネイティブアプリ用の単回登録リンクを生成します。",
     "1. Token lifetime": "1. トークン有効期間",
     "The client token can be used once and cannot advertise routes or relay traffic.": "クライアントトークンは 1 回だけ使用でき、ルートやリレートラフィックを広報できません。",
     "2. Generate enrollment link": "2. 登録リンクを生成",
-    "Generate macOS link": "macOS リンクを生成",
+    "Generate desktop link": "デスクトップリンクを生成",
     "Enrollment link": "登録リンク",
-    "Open this link on the Mac where HeteroNetwork is installed.": "HeteroNetwork をインストールした Mac でこのリンクを開いてください。",
+    "Open this link on the Mac or Windows PC where HeteroNetwork is installed.": "HeteroNetwork をインストールした Mac または Windows PC でこのリンクを開いてください。",
     "Copy link": "リンクをコピー",
     "Open HeteroNetwork": "HeteroNetwork を開く",
     "Platform": "プラットフォーム",
     "Link copied.": "リンクをコピーしました。",
-    "macOS enrollment token issued.": "macOS 登録トークンを発行しました。",
+    "Desktop enrollment token issued.": "デスクトップ登録トークンを発行しました。",
     "Device type": "デバイスタイプ",
-    "Issue a one-use link for the native macOS client.": "macOS ネイティブクライアント用の単回リンクを発行します。",
+    "Issue a one-use link for the native desktop clients.": "ネイティブデスクトップクライアント用の単回リンクを発行します。",
     "Web UI node": "Web UI ノード",
     "Check Web UI nodes": "Web UI ノードを確認",
     "Remove Web UI node": "Web UI ノードを削除",
@@ -1364,7 +1364,7 @@
       modes.push('<button class="segmented-option ' + (enrollment.mode === "linux" ? "active" : "") + '" data-enrollment-mode="linux" type="button">' + icon("server") + '<span>Linux node</span></button>');
     }
     if (state.config.client_enrollment_enabled) {
-      modes.push('<button class="segmented-option ' + (enrollment.mode === "macos" ? "active" : "") + '" data-enrollment-mode="macos" type="button">' + icon("shield-check") + '<span>macOS client</span></button>');
+      modes.push('<button class="segmented-option ' + (enrollment.mode === "macos" ? "active" : "") + '" data-enrollment-mode="macos" type="button">' + icon("shield-check") + '<span>Desktop client</span></button>');
     }
     return '<div class="segmented-control enrollment-mode" role="group" aria-label="Device type">' + modes.join("") + '</div>';
   }
@@ -1383,10 +1383,10 @@
   function renderClientEnrollmentResult(result) {
     var tokenJson = JSON.stringify(result.token);
     return '<section class="section-panel enrollment-result"><div class="section-header"><div><h2>' + icon("circle-check")
-      + '<span>Enrollment link</span></h2><p>Open this link on the Mac where HeteroNetwork is installed.</p></div><span class="status-pill healthy">Ready</span></div>'
+      + '<span>Enrollment link</span></h2><p>Open this link on the Mac or Windows PC where HeteroNetwork is installed.</p></div><span class="status-pill healthy">Ready</span></div>'
       + '<div class="section-body"><div class="secret-notice">' + icon("key") + '<span>Treat this token as a secret. It is not stored by this browser.</span></div>'
       + '<div class="command-block enrollment-link-block"><code>' + escapeHtml(result.enrollment_uri) + '</code><button class="icon-button command-copy" data-copy-enrollment="link" type="button" aria-label="Copy link" title="Copy link">' + icon("copy") + '</button></div>'
-      + '<div class="enrollment-result-meta"><div><span>Expires</span><strong>' + escapeHtml(formatTime(result.expires_at)) + '</strong></div><div><span>Uses</span><strong>1</strong></div><div><span>Platform</span><strong>macOS</strong></div></div>'
+      + '<div class="enrollment-result-meta"><div><span>Expires</span><strong>' + escapeHtml(formatTime(result.expires_at)) + '</strong></div><div><span>Uses</span><strong>1</strong></div><div><span>Platform</span><strong>macOS / Windows</strong></div></div>'
       + '<div class="enrollment-actions"><a class="button button-primary" href="' + escapeHtml(result.enrollment_uri) + '">' + icon("external-link") + '<span>Open HeteroNetwork</span></a><button class="button button-secondary" data-copy-enrollment="link" type="button">' + icon("copy") + '<span>Copy link</span></button><button class="button button-secondary" id="reset-enrollment" type="button"><span>Create another</span></button></div>'
       + '<details class="token-details"><summary>Enrollment token</summary><div class="token-detail-body"><p>Treat this token as a secret. It is not stored by this browser.</p><pre>' + escapeHtml(tokenJson) + '</pre><button class="button button-secondary button-small" data-copy-enrollment="token" type="button">' + icon("copy") + '<span>Copy token</span></button></div></details></div></section>';
   }
@@ -1408,8 +1408,8 @@
 
   function renderClientEnrollment(enrollment) {
     var form = '<section class="section-panel enrollment-wizard"><div class="enrollment-step"><div class="step-marker">1</div><div class="step-content"><div class="step-heading"><h2>1. Token lifetime</h2><p>The client token can be used once and cannot advertise routes or relay traffic.</p></div><div class="form-grid enrollment-form-grid"><div class="form-field"><label for="client-enrollment-expiration">Expiration (days)</label><input id="client-enrollment-expiration" data-enrollment-field="clientExpirationDays" type="number" min="1" max="30" value="' + escapeHtml(enrollment.clientExpirationDays) + '"></div></div></div></div>'
-      + '<div class="enrollment-step enrollment-generate-step"><div class="step-marker">2</div><div class="step-content"><div class="step-heading"><h2>2. Generate enrollment link</h2></div><button class="button button-primary" id="generate-enrollment" type="button" ' + (enrollment.generating ? "disabled" : "") + '>' + icon(enrollment.generating ? "refresh-cw" : "external-link") + '<span>' + (enrollment.generating ? "Generating..." : "Generate macOS link") + '</span></button></div></div></section>';
-    return '<div class="enrollment-intro"><span class="eyebrow">HETERONETWORK</span><h2>Add a macOS client</h2><p>Generate a one-use enrollment link for the native HeteroNetwork app.</p></div>'
+      + '<div class="enrollment-step enrollment-generate-step"><div class="step-marker">2</div><div class="step-content"><div class="step-heading"><h2>2. Generate enrollment link</h2></div><button class="button button-primary" id="generate-enrollment" type="button" ' + (enrollment.generating ? "disabled" : "") + '>' + icon(enrollment.generating ? "refresh-cw" : "external-link") + '<span>' + (enrollment.generating ? "Generating..." : "Generate desktop link") + '</span></button></div></div></section>';
+    return '<div class="enrollment-intro"><span class="eyebrow">HETERONETWORK</span><h2>Add a desktop client</h2><p>Generate a one-use enrollment link for the native HeteroNetwork app.</p></div>'
       + renderEnrollmentModeSwitch(enrollment) + form
       + (enrollment.result ? renderClientEnrollmentResult(enrollment.result) : "");
   }
@@ -1469,7 +1469,7 @@
       body: JSON.stringify(body)
     }).then(function (result) {
       enrollment.result = result;
-      toast(enrollment.mode === "macos" ? "macOS enrollment token issued." : "Enrollment token issued.");
+      toast(enrollment.mode === "macos" ? "Desktop enrollment token issued." : "Enrollment token issued.");
     }).catch(function (error) {
       toast(error.message, "error");
       setStatus(error.message, true);
@@ -1529,7 +1529,7 @@
       enrollment: ["Add device", "Issue a short-lived token and install a node with one command."]
     }[state.activeView];
     if (state.activeView === "enrollment" && state.enrollment.mode === "macos") {
-      metadata = ["Add device", "Issue a one-use link for the native macOS client."];
+      metadata = ["Add device", "Issue a one-use link for the native desktop clients."];
     }
     $("view-title").textContent = t(metadata[0]);
     $("view-subtitle").textContent = t(metadata[1]);

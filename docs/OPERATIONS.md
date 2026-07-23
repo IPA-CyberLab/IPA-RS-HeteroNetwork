@@ -208,7 +208,7 @@ rejects an existing state path instead of silently replacing another node
 identity; use a new state path for a new node. `--dry-run` validates the token
 and bootstrap selection but does not write state.
 
-### Join macOS clients
+### Join desktop clients
 
 Before issuing a client link, register at least one Linux node with role
 `gateway` and a fresh reachable IPv6 or public UDP WireGuard
@@ -227,22 +227,25 @@ sudo sysctl --system
 Allow forwarding from the managed WireGuard interface back to that interface
 and to each advertised destination according to the host firewall policy. The
 selected gateways receive the client's WireGuard peer configuration. Only the
-preferred gateway is active on the Mac; other nodes route the client host prefix
+preferred gateway is active on the desktop client; other nodes route the client host prefix
 back through that gateway. Do not advertise a default route solely for client
 access.
 
 Enable the dedicated enrollment signer as described under Web Management UI,
 keep at least two Control Plane endpoints active, then select **Add device** ->
-**macOS client** in the Web UI. Open the returned `heteronetwork://` link on a
-Mac with the native app installed. The token is single-use. The app installs a
-signed Network Extension profile, refreshes the gateway map every five seconds
-while connected, updates WireGuardKit in place when gateway health or public
-reachability changes, and switches to a cached standby after two failed
-VPN-local health probes. The extension then reports the active gateway in its
-signed peer-map request. The shared control-plane store changes every node's
+**Desktop client** in the Web UI. Open the returned `heteronetwork://` link on a
+Mac or Windows PC with the native app installed. The token is single-use. The
+macOS app installs a signed Network Extension profile; the Windows app includes
+the pinned official WireGuard embeddable service and WireGuardNT runtime, and
+requests administrator approval when its profile changes. No separate
+WireGuard installation is required. Both refresh the gateway map every five seconds while
+connected and switch to a cached standby after two failed VPN-local health
+probes. The active gateway is reported in the signed peer-map request. The
+shared control-plane store changes every node's
 return route for that client and wakes long-polling Agent heartbeats so they
-apply the new map without waiting for the 30-second background poll. It stores
-private key material in the shared device-only Keychain. The active gateway
+apply the new map without waiting for the 30-second background poll. Private
+key material is stored in the shared device-only Keychain on macOS or a
+current-user DPAPI blob on Windows. The active gateway
 serves the authenticated console only on its VPN address at
 `http://console.heteronetwork.internal:9781/ui/`; split DNS sends only
 `console.heteronetwork.internal` queries into the tunnel.

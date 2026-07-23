@@ -7,9 +7,12 @@ see [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md).
 
 The repository is being built toward a complete system rather than an MVP. The current baseline contains:
 
-- a native SwiftUI macOS menu-bar client with a Network Extension packet tunnel,
-  shared-Keychain identity storage, signed control-plane refresh/removal, and a
-  gateway-only WireGuard peer map; see [`clients/macos`](clients/macos/README.md)
+- native desktop clients: a SwiftUI macOS menu-bar app backed by a Network
+  Extension and a WPF Windows task-tray app with the official WireGuard
+  embeddable tunnel service and WireGuardNT runtime built in. Both use protected identity storage, signed control-plane
+  refresh/removal, and a gateway-only WireGuard peer map; see
+  [`clients/macos`](clients/macos/README.md) and
+  [`clients/windows`](clients/windows/README.md)
 - a Rust workspace split by control plane, signal, relay, STUN, agent, route manager, crypto, shared types, and CLI boundaries
 - typed node, peer, path, relay, token, policy, ACL, route, and health models
 - signed join token creation and verification with shared signer/verifier/CLI/Agent/Control Plane envelope and claim-shape validation: the Ed25519 signature must be canonical standard Base64 of exactly 64 decoded bytes (88 encoded bytes), identifiers are path-safe and capped at 255 bytes, claim and policy tags are capped at 64 entries, policy routes are capped at 256 safe canonical non-overlapping CIDRs, validity is capped at a 30-day TTL plus 5-second `not_before` skew window, and typed bootstrap lists are capped at 32 endpoints total, 8 per service kind, and 2048 bytes per URL
