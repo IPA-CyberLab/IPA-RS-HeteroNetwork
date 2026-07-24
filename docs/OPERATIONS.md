@@ -336,6 +336,17 @@ beside the dynamic IP console, so no host-wide DNAT to a dedicated proxy VM is
 required. Both options must be supplied together; ordinary nodes leave them
 unset and retain no fixed Control Plane role.
 
+Colocated public Signal and Relay services can use the dynamic IP console's
+existing HTTPS listener instead of separate externally exposed HTTP ports. Set
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM` to the private Signal
+listener and
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RELAY_ADMISSION_UPSTREAM` to the private
+Relay HTTP listener. The gateway exposes only Signal's node registration/path
+negotiation endpoints and Relay's authenticated session-admission endpoint.
+Advertise the resulting `https://PUBLIC_IP` origin as the Signal and Relay
+admission base URL. Private nodes then receive a usable TLS bootstrap route from
+the standard enrollment script without host-specific port forwarding.
+
 Install each Keycloak replica with `scripts/keycloak-ha-node.sh install` after
 `heteronetwork-db-proxy.service` is active. The script pins the Keycloak archive
 checksum, binds application HTTP to loopback, uses the HeteroNetwork address for

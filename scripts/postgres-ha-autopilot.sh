@@ -121,7 +121,7 @@ write_eligible_snapshot() {
     <<<"$status")" || return 1
   candidates="$(mktemp "$state_dir/eligible-candidates.XXXXXX")"
   temporary="$(mktemp "$state_dir/eligible.XXXXXX")"
-  {
+  if ! {
     printf '%s\t%s\n' "$local_ip" "$local_node_id"
     jq -r '
       .peers[]
@@ -130,19 +130,32 @@ write_eligible_snapshot() {
       | [.vpn_ip, .node_id]
       | @tsv
     ' <<<"$peers"
-  } | LC_ALL=C sort -V -u >"$candidates"
+  } | LC_ALL=C sort -V -u >"$candidates"; then
+    rm -f "$candidates" "$temporary"
+    return 1
+  fi
 
   while IFS=$'\t' read -r ip node_id; do
     if [[ "$ip" == "$local_ip" ]] || peer_autopilot_is_ready "$ip"; then
       printf '%s\t%s\n' "$ip" "$node_id" >>"$temporary"
     fi
   done <"$candidates"
-  install -o root -g root -m 0600 "$temporary" "$eligible_path"
+  if ! install -o root -g root -m 0600 "$temporary" "$eligible_path"; then
+    rm -f "$candidates" "$temporary"
+    return 1
+  fi
   rm -f "$candidates" "$temporary"
 }
 
 eligible_count() {
-  wc -l <"$eligible_path" | tr -d ' '
+  local count
+  if [[ ! -f "$eligible_path" ]]; then
+    printf '0\n'
+    return
+  fi
+  count="$(wc -l <"$eligible_path" | tr -d '[:space:]')" || count=0
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  printf '%s\n' "$count"
 }
 
 initial_coordinator_ip() {
@@ -654,7 +667,10 @@ reconcile_once() {
     return
   fi
   start_bundle_server "$local_ip"
-  write_eligible_snapshot
+  if ! write_eligible_snapshot; then
+    log "waiting for the local peer map"
+    return
+  fi
   download_best_bundle
 
   if [[ ! -d "$bundle_dir" ]]; then
@@ -707,9 +723,7 @@ run_autopilot() {
   exec 9>"$state_dir/autopilot.lock"
   flock -n 9 || die "another database autopilot process is active"
   while true; do
-    if ! reconcile_once; then
-      log "reconciliation failed; retrying"
-    fi
+    reconcile_once
     sleep "$reconcile_interval_seconds"
   done
 }
@@ -738,6 +752,7 @@ self_test() {
     die "legacy database guard remained active without a service"
   fi
   eligible_path="$temporary/eligible.tsv"
+  [[ "$(eligible_count)" == "0" ]]
   printf '10.250.0.10\tnode-c\n10.250.0.2\tnode-a\n10.250.0.3\tnode-b\n' \
     | LC_ALL=C sort -V >"$eligible_path"
   [[ "$(initial_coordinator_ip)" == "10.250.0.2" ]]

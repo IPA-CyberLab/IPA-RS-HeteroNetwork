@@ -858,6 +858,13 @@ struct AgentArgs {
         env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM"
     )]
     public_web_gateway_control_plane_upstream: Option<SocketAddr>,
+    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM")]
+    public_web_gateway_signal_upstream: Option<SocketAddr>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RELAY_ADMISSION_UPSTREAM"
+    )]
+    public_web_gateway_relay_admission_upstream: Option<SocketAddr>,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS",
@@ -2057,6 +2064,25 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             ),
             (None, None) => {}
         }
+        for (upstream, option) in [
+            (
+                args.public_web_gateway_signal_upstream,
+                "--public-web-gateway-signal-upstream",
+            ),
+            (
+                args.public_web_gateway_relay_admission_upstream,
+                "--public-web-gateway-relay-admission-upstream",
+            ),
+        ] {
+            if let Some(upstream) = upstream {
+                anyhow::ensure!(
+                    !upstream.ip().is_unspecified()
+                        && !upstream.ip().is_multicast()
+                        && upstream.port() > 0,
+                    "{option} must be a usable address with a nonzero port"
+                );
+            }
+        }
         validate_positive_seconds(
             args.public_web_gateway_reconcile_interval_seconds,
             "--public-web-gateway-reconcile-interval-seconds",
@@ -2083,7 +2109,9 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
                 && args.public_web_gateway_oidc_probe_path.is_none()
                 && args.public_web_gateway_oidc_host.is_none()
                 && args.public_web_gateway_control_plane_host.is_none()
-                && args.public_web_gateway_control_plane_upstream.is_none(),
+                && args.public_web_gateway_control_plane_upstream.is_none()
+                && args.public_web_gateway_signal_upstream.is_none()
+                && args.public_web_gateway_relay_admission_upstream.is_none(),
             "public Web gateway proxy options require --public-web-gateway-enabled=true"
         );
     }
@@ -8504,6 +8532,8 @@ async fn run_agent(
                     oidc_host: args.public_web_gateway_oidc_host.clone(),
                     control_plane_host: args.public_web_gateway_control_plane_host.clone(),
                     control_plane_upstream: args.public_web_gateway_control_plane_upstream,
+                    signal_upstream: args.public_web_gateway_signal_upstream,
+                    relay_admission_upstream: args.public_web_gateway_relay_admission_upstream,
                     cluster_id: node.cluster_id.clone(),
                     reconcile_interval: Duration::from_secs(
                         args.public_web_gateway_reconcile_interval_seconds,
@@ -12676,6 +12706,8 @@ struct PublicWebGatewayConfig {
     oidc_host: Option<String>,
     control_plane_host: Option<String>,
     control_plane_upstream: Option<SocketAddr>,
+    signal_upstream: Option<SocketAddr>,
+    relay_admission_upstream: Option<SocketAddr>,
     cluster_id: ClusterId,
     reconcile_interval: Duration,
     probe_timeout: Duration,
@@ -12720,17 +12752,12 @@ fn valid_public_gateway_dns_hostname(host: &str) -> bool {
 }
 
 fn public_web_gateway_caddyfile(
-    admin_socket: &Path,
+    config: &PublicWebGatewayConfig,
     public_ip: Option<IpAddr>,
-    upstream: SocketAddr,
-    proxy_token: &str,
-    oidc_upstream: Option<SocketAddr>,
-    oidc_host: Option<&str>,
-    control_plane_proxy: Option<(&str, SocketAddr)>,
 ) -> String {
     let mut caddyfile = format!(
         "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n}}\n",
-        admin_socket.display()
+        config.admin_socket.display()
     );
     if let Some(public_ip) = public_ip {
         let site = public_web_gateway_url(public_ip);
@@ -12739,23 +12766,42 @@ fn public_web_gateway_caddyfile(
             caddyfile,
             "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}"
         );
-        if let Some(oidc_upstream) = oidc_upstream {
+        if let Some(oidc_upstream) = config.oidc_upstream {
             let _ = writeln!(
                 caddyfile,
                 "\t@oidc path /realms/* /resources/* /robots.txt\n\thandle @oidc {{\n\t\treverse_proxy http://{oidc_upstream} {{\n\t\t\theader_up Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t\theader_up X-Forwarded-Port 443\n\t\t}}\n\t}}"
             );
         }
+        if let Some(signal_upstream) = config.signal_upstream {
+            let _ = writeln!(
+                caddyfile,
+                "\t@signal path /v1/nodes/* /v1/paths/negotiate /v1/hole-punch\n\thandle @signal {{\n\t\treverse_proxy http://{signal_upstream}\n\t}}"
+            );
+        }
+        if let Some(relay_admission_upstream) = config.relay_admission_upstream {
+            let _ = writeln!(
+                caddyfile,
+                "\t@relay_admission path /v1/sessions\n\thandle @relay_admission {{\n\t\treverse_proxy http://{relay_admission_upstream}\n\t}}"
+            );
+        }
         let _ = writeln!(
             caddyfile,
-            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
+            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}",
+            config.upstream, config.proxy_token
         );
-        if let (Some(oidc_upstream), Some(host)) = (oidc_upstream, oidc_host) {
+        if let (Some(oidc_upstream), Some(host)) =
+            (config.oidc_upstream, config.oidc_host.as_deref())
+        {
             let _ = writeln!(
                 caddyfile,
                 "\nhttps://{host} {{\n\tbind {public_ip}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@oidc path /realms/* /resources/* /robots.txt\n\thandle @oidc {{\n\t\treverse_proxy http://{oidc_upstream} {{\n\t\t\theader_up Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t\theader_up X-Forwarded-Port 443\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
             );
         }
-        if let Some((host, control_plane_upstream)) = control_plane_proxy {
+        if let Some((host, control_plane_upstream)) = config
+            .control_plane_host
+            .as_deref()
+            .zip(config.control_plane_upstream)
+        {
             let _ = writeln!(
                 caddyfile,
                 "\nhttps://{host} {{\n\tbind {public_ip}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\treverse_proxy http://{control_plane_upstream}\n}}"
@@ -12773,18 +12819,7 @@ async fn load_public_web_gateway_caddyfile(
     let response = client
         .post("http://localhost/load")
         .header(reqwest::header::CONTENT_TYPE, "text/caddyfile")
-        .body(public_web_gateway_caddyfile(
-            &config.admin_socket,
-            public_ip,
-            config.upstream,
-            &config.proxy_token,
-            config.oidc_upstream,
-            config.oidc_host.as_deref(),
-            config
-                .control_plane_host
-                .as_deref()
-                .zip(config.control_plane_upstream),
-        ))
+        .body(public_web_gateway_caddyfile(config, public_ip))
         .send()
         .await
         .context("failed to reach Caddy admin socket")?;
@@ -19249,24 +19284,35 @@ mod tests {
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
-        let standby =
-            public_web_gateway_caddyfile(socket, None, upstream, "secret", None, None, None);
+        let mut config = PublicWebGatewayConfig {
+            admin_socket: socket.to_path_buf(),
+            proxy_token: "secret".to_string(),
+            upstream,
+            oidc_upstream: None,
+            oidc_probe_path: None,
+            oidc_host: None,
+            control_plane_host: None,
+            control_plane_upstream: None,
+            signal_upstream: None,
+            relay_admission_upstream: None,
+            cluster_id: ClusterId::from_string("cluster-test"),
+            reconcile_interval: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(5),
+            classification_max_age: Duration::from_secs(45),
+        };
+        let standby = public_web_gateway_caddyfile(&config, None);
         assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
         assert!(!standby.contains("secret"));
 
-        let public = public_web_gateway_caddyfile(
-            socket,
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
-            upstream,
-            "secret",
-            Some(SocketAddr::from(([127, 0, 0, 1], 18080))),
-            Some("idp.203-0-113-10.sslip.io"),
-            Some((
-                "hn.203-0-113-10.sslip.io",
-                SocketAddr::from(([10, 0, 0, 10], 18088)),
-            )),
-        );
+        config.oidc_upstream = Some(SocketAddr::from(([127, 0, 0, 1], 18080)));
+        config.oidc_host = Some("idp.203-0-113-10.sslip.io".to_string());
+        config.control_plane_host = Some("hn.203-0-113-10.sslip.io".to_string());
+        config.control_plane_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18088)));
+        config.signal_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18443)));
+        config.relay_admission_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18447)));
+        let public =
+            public_web_gateway_caddyfile(&config, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
         assert!(public.contains("https://203.0.113.10"));
         assert!(public.contains("profile shortlived"));
         assert!(public.contains("X-HeteroNetwork-Gateway-Token secret"));
@@ -19280,6 +19326,10 @@ mod tests {
         assert!(public.contains("https://idp.203-0-113-10.sslip.io"));
         assert!(public.contains("https://hn.203-0-113-10.sslip.io"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18088"));
+        assert!(public.contains("@signal path /v1/nodes/* /v1/paths/negotiate /v1/hole-punch"));
+        assert!(public.contains("reverse_proxy http://10.0.0.10:18443"));
+        assert!(public.contains("@relay_admission path /v1/sessions"));
+        assert!(public.contains("reverse_proxy http://10.0.0.10:18447"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
     }
