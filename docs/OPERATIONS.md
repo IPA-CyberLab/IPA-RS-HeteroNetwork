@@ -316,6 +316,60 @@ reloads HAProxy without rebuilding Keycloak. Keep at least two replicas active
 and place their private realm URLs in the primary and fallback Control Plane
 settings.
 
+### Restrict GitHub sign-in to one account
+
+Register a private GitHub App with no repository, organization, account, or
+webhook permissions. The authenticated `GET /user` endpoint exposes the durable
+numeric user ID and login without additional GitHub App permissions. Configure
+every public Keycloak origin as a callback:
+
+```text
+https://public-a.example/realms/heteronetwork/broker/github/endpoint
+https://public-b.example/realms/heteronetwork/broker/github/endpoint
+```
+
+For a one-time registration, run the manifest helper on a trusted operator-only
+address. It binds only the requested address, validates the expected GitHub App
+owner, writes only the client ID and secret into an owner-only directory, and
+exits after the callback. Complete the browser flow within one hour:
+
+```bash
+sudo install -d -o root -g root -m 0700 /var/lib/heteronetwork-github-bootstrap
+sudo scripts/github-app-manifest-server.py \
+  --listen 100.64.0.10:39090 \
+  --public-base-url http://100.64.0.10:39090 \
+  --output-dir /var/lib/heteronetwork-github-bootstrap \
+  --expected-owner github-login \
+  --homepage-url https://public-a.example \
+  --keycloak-realm heteronetwork \
+  --callback-url https://public-a.example/realms/heteronetwork/broker/github/endpoint \
+  --callback-url https://public-b.example/realms/heteronetwork/broker/github/endpoint
+```
+
+Install the resulting files at
+`/etc/heteronetwork/keycloak/github-client.id` and
+`/etc/heteronetwork/keycloak/github-client.secret` with mode `0600` on each
+Keycloak host. Reconcile the provider once against the shared Keycloak database,
+then verify through every replica:
+
+```bash
+sudo env \
+  HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN=github-login \
+  HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID=12345678 \
+  scripts/keycloak-github-idp.sh configure
+
+sudo env \
+  HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN=github-login \
+  HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID=12345678 \
+  scripts/keycloak-github-idp.sh verify
+```
+
+The reconciliation uses the generic OAuth v2 provider so a private email
+permission is not required. It prelinks the immutable GitHub user ID to one
+enabled realm user, removes links from every other realm user, and assigns a
+first-broker-login flow that always denies unlinked identities. Destroy the
+one-time bootstrap directory after both replicas pass verification.
+
 When a Control Plane cannot reach the public Keycloak address through NAT
 hairpinning, keep `HETERONETWORK_WEB_OIDC_ISSUER_URL` public and set
 `HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL` to the trusted private Keycloak

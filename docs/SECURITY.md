@@ -176,6 +176,24 @@ Relay Prometheus metrics are available through `GET /metrics` only when `iparsd 
 
 Compose mounts the Relay operator credential from a dedicated secret. Do not reuse the relay admission token: metric scrapers do not need session-admission authority, and admission clients do not need detailed counters.
 
+## External GitHub Identity
+
+The optional GitHub sign-in integration uses a private GitHub App with no
+requested API or webhook permissions. Keycloak fetches only the authenticated
+public profile and treats the numeric GitHub user ID, not the mutable login or
+email address, as the external subject. The allowed identity is prelinked to one
+enabled realm user. A dedicated first-broker-login flow denies every identity
+that lacks that pre-existing link, and reconciliation removes the provider link
+from all other realm users.
+
+The GitHub login allowlist is an authentication restriction, not an
+administrative role grant. Keep Keycloak role mappings explicit. Store the
+GitHub client secret in a root-only file on each Keycloak replica, never in
+service arguments or repository configuration. Run the manifest registration
+helper only on a trusted operator network, limit its lifetime, verify the
+expected personal-account owner, and destroy its output after distributing and
+verifying the credentials.
+
 ## Agent Management API
 
 The Agent HTTP listener defaults to `127.0.0.1:9780`. A non-loopback listener is rejected at startup unless `--api-bearer-token` or `--api-bearer-token-path` supplies a separate 32-512 byte printable non-whitespace ASCII token. When configured, Bearer authentication covers the Agent management `/v1/*` routes and `/metrics`; only `/healthz` remains public for liveness and readiness probes. The loopback-only console routes (`/ui/*`, `/v1/web-ui/*`, and the `/v1/admin/*` reverse proxy) are disabled entirely on a non-loopback Agent listener. They enforce a loopback Host, reject cross-origin and cross-site browser requests, use JSON-only mutations, and preserve Control Plane OIDC or operator-token authorization on proxied management requests.
