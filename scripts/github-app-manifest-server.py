@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import html
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -23,6 +24,20 @@ CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 CLIENT_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9._-]{20,512}$")
 MANIFEST_CODE_PATTERN = re.compile(r"^[A-Fa-f0-9]{40}$")
 KEYCLOAK_REALM_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+TRUSTED_HTTP_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
 
 
 def parse_listen(value: str) -> tuple[str, int]:
@@ -53,8 +68,19 @@ def validate_http_url(value: str, *, allow_http: bool) -> str:
 
 
 def validate_callback_url(value: str, keycloak_realm: str) -> str:
-    value = validate_http_url(value, allow_http=False)
+    value = validate_http_url(value, allow_http=True)
     parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme == "http":
+        try:
+            address = ipaddress.ip_address(parsed.hostname or "")
+        except ValueError as error:
+            raise ValueError(
+                "HTTP callback URLs must use a trusted private IP address"
+            ) from error
+        if not any(address in network for network in TRUSTED_HTTP_NETWORKS):
+            raise ValueError(
+                "HTTP callback URLs must use loopback, private, CGNAT, or link-local IPs"
+            )
     if not KEYCLOAK_REALM_PATTERN.fullmatch(keycloak_realm):
         raise ValueError("Keycloak realm must be a 1-63 character safe identifier")
     expected_suffix = f"/realms/{keycloak_realm}/broker/github/endpoint"
@@ -85,8 +111,8 @@ def build_manifest(
     callbacks = [
         validate_callback_url(value, keycloak_realm) for value in callback_urls
     ]
-    if len(callbacks) != 2 or len(set(callbacks)) != 2:
-        raise ValueError("exactly two distinct Keycloak callback URLs are required")
+    if not 1 <= len(callbacks) <= 10 or len(set(callbacks)) != len(callbacks):
+        raise ValueError("1-10 distinct Keycloak callback URLs are required")
     return {
         "name": app_name,
         "url": homepage_url,
@@ -345,6 +371,25 @@ def run_self_test() -> None:
         sanitized_request_path("/callback/private?code=secret&state=secret")
         == "/callback/<redacted>"
     )
+    private_manifest = build_manifest(
+        app_name="KakuriZai Login",
+        homepage_url="https://github.com/IPA-CyberLab/IPA-RS-KakuriZai",
+        redirect_url="http://100.105.153.15:39091/callback/test",
+        keycloak_realm="kakurizai",
+        callback_urls=[
+            "http://100.105.153.15:18080/realms/kakurizai/broker/github/endpoint"
+        ],
+    )
+    assert len(private_manifest["callback_urls"]) == 1
+    try:
+        validate_callback_url(
+            "http://8.8.8.8/realms/kakurizai/broker/github/endpoint",
+            "kakurizai",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("public HTTP callback URL was accepted")
     with tempfile.TemporaryDirectory() as temp_dir:
         output_dir = Path(temp_dir) / "output"
         status = persist_app_credentials(
@@ -386,8 +431,8 @@ def main() -> int:
         return 0
     if args.listen is None or args.public_base_url is None or args.output_dir is None:
         raise SystemExit("--listen, --public-base-url, and --output-dir are required")
-    if len(args.callback_url) != 2:
-        raise SystemExit("--callback-url must be supplied exactly twice")
+    if not 1 <= len(args.callback_url) <= 10:
+        raise SystemExit("--callback-url must be supplied 1-10 times")
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", args.expected_owner):
         raise SystemExit("--expected-owner must be a valid GitHub login")
 

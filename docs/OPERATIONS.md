@@ -321,7 +321,7 @@ settings.
 Register a private GitHub App with no repository, organization, account, or
 webhook permissions. The authenticated `GET /user` endpoint exposes the durable
 numeric user ID and login without additional GitHub App permissions. Configure
-every public Keycloak origin as a callback:
+each Keycloak origin as one of the app's 1-10 callbacks:
 
 ```text
 https://public-a.example/realms/heteronetwork/broker/github/endpoint
@@ -368,7 +368,10 @@ The reconciliation uses the generic OAuth v2 provider so a private email
 permission is not required. It prelinks the immutable GitHub user ID to one
 enabled realm user, removes links from every other realm user, and assigns a
 first-broker-login flow that always denies unlinked identities. Destroy the
-one-time bootstrap directory after both replicas pass verification.
+one-time bootstrap directory after every replica passes verification. Callback
+URLs on public addresses must use HTTPS. The helper permits HTTP only for a
+literal loopback, RFC1918, CGNAT, or link-local address on a trusted operator
+network.
 
 When a Control Plane cannot reach the public Keycloak address through NAT
 hairpinning, keep `HETERONETWORK_WEB_OIDC_ISSUER_URL` public and set
