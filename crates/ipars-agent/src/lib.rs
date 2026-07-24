@@ -8091,7 +8091,7 @@ mod tests {
         lease_refreshed
             .selected_candidate
             .as_mut()
-            .expect("test candidate")
+            .ok_or_else(|| AgentError::PathStateRejected("test candidate is missing".to_owned()))?
             .observed_at += ChronoDuration::seconds(30);
         lease_refreshed.updated_at += ChronoDuration::seconds(30);
         runtime.upsert_path_state(lease_refreshed.clone()).await?;
@@ -8115,7 +8115,7 @@ mod tests {
         endpoint_changed
             .selected_candidate
             .as_mut()
-            .expect("test candidate")
+            .ok_or_else(|| AgentError::PathStateRejected("test candidate is missing".to_owned()))?
             .addr = SocketAddr::from(([8, 8, 4, 4], 51820));
         endpoint_changed.updated_at += ChronoDuration::seconds(1);
         runtime.upsert_path_state(endpoint_changed).await?;

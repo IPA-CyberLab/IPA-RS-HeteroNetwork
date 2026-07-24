@@ -531,6 +531,8 @@ struct ControlPlaneArgs {
     advertise_stun_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_ADVERTISE_RELAY_URL")]
     advertise_relay_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_ADVERTISE_WEB_UI_URL")]
+    advertise_web_ui_url: Option<String>,
     #[arg(
         long,
         env = "HETERONETWORK_SERVICE_LEASE_TTL_SECONDS",
@@ -4695,6 +4697,10 @@ fn control_plane_service_lease_config(
         (
             BootstrapEndpointKind::Relay,
             args.advertise_relay_url.as_ref(),
+        ),
+        (
+            BootstrapEndpointKind::WebUi,
+            args.advertise_web_ui_url.as_ref(),
         ),
     ]
     .into_iter()
@@ -12851,9 +12857,9 @@ async fn probe_public_web_gateway(
             .error_for_status()
             .context("public gateway OIDC probe was rejected")?;
         anyhow::ensure!(
-            !response
+            response
                 .content_length()
-                .is_some_and(|length| length > 256 * 1024),
+                .is_none_or(|length| length <= 256 * 1024),
             "public gateway OIDC discovery response is too large"
         );
         let bytes = response
@@ -37175,9 +37181,10 @@ exec sleep 60
             None,
         )?;
 
-        let error = send_signal_path_request(&reqwest::Client::new(), &base, request)
-            .await
-            .expect_err("signal rejection should fail");
+        let error = match send_signal_path_request(&reqwest::Client::new(), &base, request).await {
+            Ok(_) => anyhow::bail!("signal rejection unexpectedly succeeded"),
+            Err(error) => error,
+        };
 
         assert!(error
             .to_string()

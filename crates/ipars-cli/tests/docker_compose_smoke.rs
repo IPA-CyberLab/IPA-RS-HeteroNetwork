@@ -1079,7 +1079,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
                 .get("bootstrap_endpoints")
                 .and_then(Value::as_array)
                 .context("service directory bootstrap_endpoints must be an array")?;
-            anyhow::ensure!(endpoints.len() == 8, "expected eight distinct HA endpoints");
+            anyhow::ensure!(endpoints.len() == 10, "expected ten distinct HA endpoints");
             Ok(())
         },
     )?;
@@ -1094,7 +1094,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             ensure_json_u64_at_least(value, "active_control_plane_count", 2)?;
             ensure_json_u64_at_least(value, "active_signal_count", 2)?;
             ensure_json_u64_at_least(value, "active_stun_count", 2)?;
-            ensure_json_u64_at_least(value, "active_relay_count", 2)
+            ensure_json_u64_at_least(value, "active_relay_count", 2)?;
+            ensure_json_u64_at_least(value, "active_web_ui_count", 2)
         },
     )?;
     let bootstrap_ip = compose_service_ipv4(&compose, "control-plane")?;
@@ -1431,7 +1432,8 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             ensure_json_u64_equals(value, "active_control_plane_count", 1)?;
             ensure_json_u64_equals(value, "active_signal_count", 1)?;
             ensure_json_u64_equals(value, "active_stun_count", 1)?;
-            ensure_json_u64_equals(value, "active_relay_count", 1)
+            ensure_json_u64_equals(value, "active_relay_count", 1)?;
+            ensure_json_u64_equals(value, "active_web_ui_count", 1)
         },
     )?;
 

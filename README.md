@@ -21,7 +21,7 @@ The repository is being built toward a complete system rather than an MVP. The c
 - pair-scoped path state and scoring primitives
 - control-plane registration/IP-allocation service that skips already assigned VPN IPs and retries after durable-store insert races
 - SQLite and PostgreSQL control-plane store implementations with typed node-ID/VPN-IP uniqueness guards and transaction-locked PostgreSQL schema initialization for concurrent HA startup
-- PostgreSQL-backed public-service leases that aggregate active Control Plane, Signal, STUN, and Relay endpoints from every public node, expire failed instances, and expose HA readiness through the operator API, Prometheus, OTLP, and the Web UI
+- PostgreSQL-backed public-service leases that aggregate active Control Plane, Signal, STUN, Relay, and Web UI endpoints from every public node, expire failed instances, and expose HA readiness through the operator API, Prometheus, OTLP, and the Web UI
 - signed control-plane node removal that reclaims durable VPN IP leases and clears stale health/path state
 - token ledger primitives and control-plane revocation API with durable pre-use revocation tombstones, full-claims nonce collision detection for new records, and transaction-serialized first admission, max-use consumption, and revocation
 - control-plane join service that verifies signed tokens, issuer keys, cluster/time validity, token-ledger admission, CIDR-containing route policy, relay-capability policy, WireGuard public-key format, identity-derived node IDs, and candidate/route ownership before registration
