@@ -846,6 +846,16 @@ struct AgentArgs {
     public_web_gateway_oidc_probe_path: Option<String>,
     #[arg(
         long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_HOST"
+    )]
+    public_web_gateway_control_plane_host: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM"
+    )]
+    public_web_gateway_control_plane_upstream: Option<SocketAddr>,
+    #[arg(
+        long,
         env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS",
         default_value_t = 5
     )]
@@ -2005,6 +2015,30 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             ),
             (None, None) => {}
         }
+        match (
+            args.public_web_gateway_control_plane_host.as_deref(),
+            args.public_web_gateway_control_plane_upstream,
+        ) {
+            (Some(host), Some(upstream)) => {
+                anyhow::ensure!(
+                    valid_public_gateway_dns_hostname(host),
+                    "--public-web-gateway-control-plane-host must be a valid ASCII DNS hostname"
+                );
+                anyhow::ensure!(
+                    !upstream.ip().is_unspecified()
+                        && !upstream.ip().is_multicast()
+                        && upstream.port() > 0,
+                    "--public-web-gateway-control-plane-upstream must be a usable address with a nonzero port"
+                );
+            }
+            (Some(_), None) => anyhow::bail!(
+                "--public-web-gateway-control-plane-host requires --public-web-gateway-control-plane-upstream"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "--public-web-gateway-control-plane-upstream requires --public-web-gateway-control-plane-host"
+            ),
+            (None, None) => {}
+        }
         validate_positive_seconds(
             args.public_web_gateway_reconcile_interval_seconds,
             "--public-web-gateway-reconcile-interval-seconds",
@@ -2028,8 +2062,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     } else {
         anyhow::ensure!(
             args.public_web_gateway_oidc_upstream.is_none()
-                && args.public_web_gateway_oidc_probe_path.is_none(),
-            "public Web gateway OIDC options require --public-web-gateway-enabled=true"
+                && args.public_web_gateway_oidc_probe_path.is_none()
+                && args.public_web_gateway_control_plane_host.is_none()
+                && args.public_web_gateway_control_plane_upstream.is_none(),
+            "public Web gateway proxy options require --public-web-gateway-enabled=true"
         );
     }
     if !args.disable_overlay_services {
@@ -8441,6 +8477,8 @@ async fn run_agent(
                     upstream: args.listen,
                     oidc_upstream: args.public_web_gateway_oidc_upstream,
                     oidc_probe_path: args.public_web_gateway_oidc_probe_path.clone(),
+                    control_plane_host: args.public_web_gateway_control_plane_host.clone(),
+                    control_plane_upstream: args.public_web_gateway_control_plane_upstream,
                     cluster_id: node.cluster_id.clone(),
                     reconcile_interval: Duration::from_secs(
                         args.public_web_gateway_reconcile_interval_seconds,
@@ -12610,6 +12648,8 @@ struct PublicWebGatewayConfig {
     upstream: SocketAddr,
     oidc_upstream: Option<SocketAddr>,
     oidc_probe_path: Option<String>,
+    control_plane_host: Option<String>,
+    control_plane_upstream: Option<SocketAddr>,
     cluster_id: ClusterId,
     reconcile_interval: Duration,
     probe_timeout: Duration,
@@ -12629,12 +12669,37 @@ fn public_web_gateway_url(ip: IpAddr) -> String {
     }
 }
 
+fn valid_public_gateway_dns_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.is_ascii()
+        && !host.ends_with('.')
+        && host.parse::<IpAddr>().is_err()
+        && host.split('.').count() >= 2
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 fn public_web_gateway_caddyfile(
     admin_socket: &Path,
     public_ip: Option<IpAddr>,
     upstream: SocketAddr,
     proxy_token: &str,
     oidc_upstream: Option<SocketAddr>,
+    control_plane_proxy: Option<(&str, SocketAddr)>,
 ) -> String {
     let mut caddyfile = format!(
         "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n}}\n",
@@ -12657,6 +12722,12 @@ fn public_web_gateway_caddyfile(
             caddyfile,
             "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
         );
+        if let Some((host, control_plane_upstream)) = control_plane_proxy {
+            let _ = writeln!(
+                caddyfile,
+                "\nhttps://{host} {{\n\tbind {public_ip}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\treverse_proxy http://{control_plane_upstream}\n}}"
+            );
+        }
     }
     caddyfile
 }
@@ -12675,6 +12746,10 @@ async fn load_public_web_gateway_caddyfile(
             config.upstream,
             &config.proxy_token,
             config.oidc_upstream,
+            config
+                .control_plane_host
+                .as_deref()
+                .zip(config.control_plane_upstream),
         ))
         .send()
         .await
@@ -19140,7 +19215,7 @@ mod tests {
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
-        let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret", None);
+        let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret", None, None);
         assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
         assert!(!standby.contains("secret"));
@@ -19151,6 +19226,10 @@ mod tests {
             upstream,
             "secret",
             Some(SocketAddr::from(([127, 0, 0, 1], 18080))),
+            Some((
+                "hn.203-0-113-10.sslip.io",
+                SocketAddr::from(([10, 0, 0, 10], 18088)),
+            )),
         );
         assert!(public.contains("https://203.0.113.10"));
         assert!(public.contains("profile shortlived"));
@@ -19162,8 +19241,31 @@ mod tests {
         assert!(public.contains("@oidc path /realms/* /resources/* /robots.txt"));
         assert!(public.contains("reverse_proxy http://127.0.0.1:18080"));
         assert!(public.contains("header_up X-Forwarded-Proto https"));
+        assert!(public.contains("https://hn.203-0-113-10.sslip.io"));
+        assert!(public.contains("reverse_proxy http://10.0.0.10:18088"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
+    }
+
+    #[test]
+    fn public_gateway_control_plane_host_requires_dns_name() {
+        assert!(valid_public_gateway_dns_hostname(
+            "hn.203-0-113-10.sslip.io"
+        ));
+        for invalid in [
+            "",
+            "localhost",
+            "203.0.113.10",
+            "-bad.example",
+            "bad-.example",
+            "bad_name.example",
+            "user@example.com",
+            "example.com:443",
+            "example.com/path",
+            "example.com.",
+        ] {
+            assert!(!valid_public_gateway_dns_hostname(invalid), "{invalid}");
+        }
     }
 
     #[test]

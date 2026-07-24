@@ -308,6 +308,15 @@ and token polling still fail over across those provider origins. This lets the
 same dormant Gateway runtime run on every node without assigning a permanent
 identity-provider role to every node that temporarily gains a public address.
 
+If a public node also runs a Control Plane virtual host on the same TCP 443
+address, set
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_HOST` to its DNS hostname
+and `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM` to the local
+HTTP listener. The Agent renders that exact hostname as a second Caddy site
+beside the dynamic IP console, so no host-wide DNAT to a dedicated proxy VM is
+required. Both options must be supplied together; ordinary nodes leave them
+unset and retain no fixed Control Plane role.
+
 Install each Keycloak replica with `scripts/keycloak-ha-node.sh install` after
 `heteronetwork-db-proxy.service` is active. The script pins the Keycloak archive
 checksum, binds application HTTP to loopback, uses the HeteroNetwork address for

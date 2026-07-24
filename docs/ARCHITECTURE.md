@@ -112,7 +112,10 @@ their own gateway from upstream selection, and public gateway requests use
 direct Control Plane origins so two gateways cannot form a proxy cycle. Enrollment commands
 include active `web_ui` leases as artifact-download fallbacks, allowing a new
 node to fetch the token-protected installer and binary through any surviving
-public gateway.
+public gateway. A node that separately hosts a Control Plane can opt into an
+exact DNS virtual host on the same Caddy listener; that explicit application
+role is independent of automatic public-IP classification and is absent from
+ordinary node installations.
 
 Signed heartbeat, Signal registration, and path-negotiation reports refresh the lease timestamps of locally observed STUN candidates while the active WireGuard endpoint remains configured, preventing a healthy agent from disappearing solely because the endpoint-candidate TTL outlasts its one-time startup observation. A restarted Agent restores its own accepted endpoint candidates from the owner-only registered-node state before those loops start, so a pre-existing kernel WireGuard socket cannot leave Signal registration with an empty candidate set when it prevents rebinding the startup STUN socket.
 
