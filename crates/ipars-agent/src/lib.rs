@@ -2204,8 +2204,12 @@ impl AgentRuntime {
     }
 
     fn request_lazy_connect_sync(&self) {
-        self.request_peer_map_sync();
+        self.request_lazy_connect_path_sync();
         self.request_heartbeat_report();
+    }
+
+    fn request_lazy_connect_path_sync(&self) {
+        self.request_peer_map_sync();
         self.signal_path_notify.notify_one();
     }
 
@@ -2689,7 +2693,7 @@ impl AgentRuntime {
         let changed = lazy_connect.record_remote_activity(peer, observed_at);
         drop(lazy_connect);
         if changed {
-            self.request_lazy_connect_sync();
+            self.request_lazy_connect_path_sync();
         }
     }
 
@@ -2702,7 +2706,7 @@ impl AgentRuntime {
         let changed = lazy_connect.record_remote_activity_if_idle(peer, observed_at);
         drop(lazy_connect);
         if changed {
-            self.request_lazy_connect_sync();
+            self.request_lazy_connect_path_sync();
         }
         changed
     }
@@ -7327,6 +7331,7 @@ mod tests {
         let peer_id = NodeId::from_string("peer-a");
         let observed_at = Utc::now();
         let signal_notify = runtime.signal_path_notifier();
+        let heartbeat_notify = runtime.heartbeat_report_notifier();
 
         runtime
             .record_remote_peer_activity(peer_id.clone(), observed_at)
@@ -7335,6 +7340,11 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), signal_notify.notified())
                 .await
                 .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
+                .await
+                .is_err()
         );
 
         runtime
@@ -7353,6 +7363,11 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), signal_notify.notified())
                 .await
                 .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
+                .await
+                .is_err()
         );
     }
 

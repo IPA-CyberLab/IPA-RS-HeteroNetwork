@@ -12816,15 +12816,6 @@ async fn desired_public_web_gateway_ip(
     (age <= max_age).then_some(classification.local_addr.ip())
 }
 
-fn public_web_gateway_probe_failure_requires_unload(
-    gateway_was_ready: bool,
-    configuration_loaded_at: Option<Instant>,
-) -> bool {
-    gateway_was_ready
-        || configuration_loaded_at
-            .is_some_and(|loaded_at| loaded_at.elapsed() >= Duration::from_secs(60))
-}
-
 fn start_public_web_gateway(
     runtime: Arc<AgentRuntime>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
@@ -12843,8 +12834,6 @@ fn start_public_web_gateway(
         .context("failed to build public Web UI probe client")?;
     Ok(tokio::spawn(async move {
         let mut configured_ip = None;
-        let mut configuration_loaded_at = None;
-        let mut gateway_was_ready = false;
         loop {
             let desired_ip =
                 desired_public_web_gateway_ip(&runtime, config.classification_max_age).await;
@@ -12866,8 +12855,6 @@ fn start_public_web_gateway(
                 match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip).await {
                     Ok(()) => {
                         configured_ip = desired_ip;
-                        configuration_loaded_at = Some(Instant::now());
-                        gateway_was_ready = false;
                         tracing::info!(
                             public_ip = ?desired_ip,
                             "reconciled public Web UI gateway"
@@ -12898,7 +12885,6 @@ fn start_public_web_gateway(
                     .await
                     {
                         Ok(()) => {
-                            gateway_was_ready = true;
                             set_public_web_gateway_status(
                                 &status,
                                 PublicWebGatewayPhase::Ready,
@@ -12909,47 +12895,20 @@ fn start_public_web_gateway(
                             .await;
                         }
                         Err(error) => {
-                            let mut last_error = error.to_string();
-                            if public_web_gateway_probe_failure_requires_unload(
-                                gateway_was_ready,
-                                configuration_loaded_at,
-                            ) {
-                                // Keep configured_ip aligned with Caddy. Otherwise a NAT-state
-                                // change in this window can skip the standby reload entirely.
-                                match load_public_web_gateway_caddyfile(
-                                    &admin_client,
-                                    &config,
-                                    None,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        configured_ip = None;
-                                        configuration_loaded_at = None;
-                                        gateway_was_ready = false;
-                                        tracing::warn!(
-                                            public_ip = %public_ip,
-                                            "disabled public Web UI gateway after failed probe"
-                                        );
-                                    }
-                                    Err(unload_error) => {
-                                        last_error = format!(
-                                            "{error}; failed to disable stale public gateway: {unload_error}"
-                                        );
-                                        tracing::warn!(
-                                            %unload_error,
-                                            public_ip = %public_ip,
-                                            "failed to disable public Web UI gateway after failed probe"
-                                        );
-                                    }
-                                }
-                            }
+                            // A failed readiness probe can be caused by certificate issuance or a
+                            // transient upstream failure. Keep serving while the NAT classifier
+                            // still owns this public IP; the desired-IP transition unloads Caddy.
+                            tracing::warn!(
+                                %error,
+                                public_ip = %public_ip,
+                                "public Web UI gateway readiness probe failed"
+                            );
                             set_public_web_gateway_status(
                                 &status,
                                 PublicWebGatewayPhase::Error,
                                 Some(public_ip),
                                 Some(url),
-                                Some(last_error),
+                                Some(error.to_string()),
                             )
                             .await;
                         }
@@ -19236,22 +19195,6 @@ mod tests {
         assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
         assert!(response.answers.is_empty());
         Ok(())
-    }
-
-    #[test]
-    fn public_web_gateway_unloads_failed_ready_or_stale_configuration() {
-        assert!(public_web_gateway_probe_failure_requires_unload(true, None));
-        assert!(!public_web_gateway_probe_failure_requires_unload(
-            false, None
-        ));
-        assert!(!public_web_gateway_probe_failure_requires_unload(
-            false,
-            Some(Instant::now())
-        ));
-        assert!(public_web_gateway_probe_failure_requires_unload(
-            false,
-            Some(Instant::now() - Duration::from_secs(61))
-        ));
     }
 
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {

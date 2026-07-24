@@ -273,8 +273,11 @@ node, so a missing Gateway runtime is detected as installation drift instead of
 silently removing a globally reachable node from the public pool. Fresh public
 STUN classification causes the Agent to load
 an `https://IP/` configuration through the protected Unix admin socket;
-private/stale classification removes it. Inspect the current phase in the Web
-UI endpoint control or with
+private/stale classification removes it. A failed readiness probe leaves that
+configuration loaded while the classification remains fresh so certificate
+issuance and transient upstream failures can recover without listener churn;
+the Control Plane still withholds the `web_ui` lease until its external probe
+passes. Inspect the current phase in the Web UI endpoint control or with
 `ipars_agent_public_web_gateway_phase{phase="ready"}`. Control Plane
 `ipars_control_plane_active_services{kind="web_ui"}` and the Public nodes view
 show only gateways that passed an external TLS/config probe. Generated node

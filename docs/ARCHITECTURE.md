@@ -83,6 +83,11 @@ The control plane is designed for multiple public nodes. Durable state lives in 
 
 An accepted heartbeat is one durable per-node transaction: endpoint candidates, relay capability, optional route replacement, accepted health timestamp, and the reporting node's path snapshot become visible together. Timestamp monotonicity is rechecked after acquiring the per-node serialization point, using the SQLite writer lock or PostgreSQL `FOR UPDATE` row lock. Field-specific re-registration and WireGuard key-rotation writes update only their owned JSON fields, preventing a concurrent heartbeat or lifecycle mutation from replacing unrelated newer node state.
 
+Connection intents returned by a heartbeat wake peer-map and Signal path
+reconciliation but do not trigger another immediate heartbeat. Only local
+activity and locally selected path changes request an early report, preventing
+remote intent timestamps from forming a Control Plane feedback loop.
+
 Each public Control Plane renews a bounded lease in the shared store for its Control Plane, Signal, STUN, and Relay endpoints. Every Control Plane aggregates unexpired leases deterministically and returns the active directory with registration, heartbeat, and peer-map responses. Agents atomically persist that directory, prefer it for later Control Plane and Signal requests and STUN discovery, skip an unavailable STUN DNS/socket endpoint when another one resolves, and retain the original signed token endpoints as last-resort seeds. For Internet NAT discovery, an Agent uses only directory STUN addresses that are globally routable. If the directory contains only private, link-local, documentation, or shared `100.64.0.0/10` addresses, the default Agent resolves the configurable public STUN fallback URLs instead of mixing observations from different routing domains; `--disable-public-stun-fallback` retains private-only lab behavior. Explicit `--stun-server` values remain an operator override. `ipars token create --service-directory-url` reads the operator-authenticated directory and refuses to mint a normal HA token until at least two Control Plane, Signal, and STUN endpoints are active, plus two Relay endpoints when relay use is allowed. This invariant permits a token containing only an initially reachable node to discover the cluster before that node fails, and lets a token minted from the live directory bootstrap directly after the failure.
 
 The public application tier is active-active, not a full mesh between every edge node. Agents negotiate data-plane paths lazily and contact the ordered public service set only when joining, refreshing state, or negotiating a path. `/v1/admin/services`, `ipars_control_plane_ha_ready`, per-service endpoint gauges, and the Web UI show the current lease view. The systemd deployment binds Signal, STUN, and Relay liveness to the local Control Plane so a partially failed host stops renewing its whole-node lease. PostgreSQL remains a separate durability boundary and must be deployed as a managed or quorum-backed HA service; two public application hosts alone cannot safely provide database election quorum.
@@ -94,9 +99,12 @@ proxy a restricted UI route set to the loopback Agent. The Control Plane derives
 the IP only from the validated signed heartbeat, probes `https://IP/ui/config`
 without redirects or environment proxies, and then creates a 45-second
 `web_ui` lease. Private, stale, or unreachable classifications delete that
-instance immediately; missed heartbeats expire it. Agents exclude their own
-gateway from upstream selection, and public gateway requests use direct Control
-Plane origins so two gateways cannot form a proxy cycle. Enrollment commands
+instance immediately; missed heartbeats expire it. A transient readiness
+failure does not unload the local Caddy configuration while the fresh NAT
+classification still owns the public IP, allowing ACME issuance and upstream
+recovery to finish without repeatedly restarting the listener. Agents exclude
+their own gateway from upstream selection, and public gateway requests use
+direct Control Plane origins so two gateways cannot form a proxy cycle. Enrollment commands
 include active `web_ui` leases as artifact-download fallbacks, allowing a new
 node to fetch the token-protected installer and binary through any surviving
 public gateway.
