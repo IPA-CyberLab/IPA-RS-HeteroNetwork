@@ -64,6 +64,9 @@ const KUBERNETES_HA_SETUP_TAG_PREFIX: &str = "kubernetes-ha-";
 const KUBERNETES_HA_CONTROL_PLANE_COUNT: u32 = 3;
 const KUBEADM_HA_NODE_SCRIPT: &str = include_str!("../../../scripts/kubeadm-ha-node.sh");
 const KUBEADM_HA_AUTOPILOT_SCRIPT: &str = include_str!("../../../scripts/kubeadm-ha-autopilot.sh");
+const POSTGRES_HA_NODE_SCRIPT: &str = include_str!("../../../scripts/postgres-ha-node.sh");
+const POSTGRES_HA_AUTOPILOT_SCRIPT: &str =
+    include_str!("../../../scripts/postgres-ha-autopilot.sh");
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS: u64 = 20;
 const MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES: u64 = 256 * 1024;
 const NODE_ENROLLMENT_CADDY_VERSION: &str = "2.11.4";
@@ -2256,6 +2259,7 @@ systemctl daemon-reload
 systemctl enable heteronetwork-gateway.service heteronetwork-agent.service
 systemctl restart heteronetwork-gateway.service
 systemctl restart heteronetwork-agent.service
+__DATABASE_INSTALL__
 __SETUP_INSTALL__
 echo "HeteroNetwork node enrolled and started"
 "#;
@@ -2267,13 +2271,78 @@ echo "HeteroNetwork node enrolled and started"
     let setup_install = kubernetes_ha_enrollment_setup(token, encoded_token)
         .map(kubernetes_ha_install_script)
         .unwrap_or_default();
+    let database_install = postgres_ha_install_script(enrollment, token);
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
         .replace("__SHA256__", &enrollment.binary_sha256)
         .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
         .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
+        .replace("__DATABASE_INSTALL__", &database_install)
         .replace("__SETUP_INSTALL__", &setup_install)
+}
+
+fn postgres_ha_install_script(
+    enrollment: &NodeEnrollmentConfig,
+    token: &SignedJoinToken,
+) -> String {
+    let helper = STANDARD.encode(POSTGRES_HA_NODE_SCRIPT.as_bytes());
+    let autopilot = STANDARD.encode(POSTGRES_HA_AUTOPILOT_SCRIPT.as_bytes());
+    let cluster_id = STANDARD.encode(token.claims.cluster_id.as_str().as_bytes());
+    let mut digest = Sha256::new();
+    digest.update(b"heteronetwork-postgres-ha-autopilot-v1\0");
+    digest.update(enrollment.issuer.signing_key_b64().as_bytes());
+    digest.update(b"\0");
+    digest.update(token.claims.cluster_id.as_str().as_bytes());
+    let bearer_token = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        r#"install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+install -d -o root -g root -m 0700 /etc/heteronetwork/postgres-autopilot
+printf '%s' '{helper}' | base64 -d >/opt/heteronetwork/libexec/postgres-ha-node.sh
+printf '%s' '{autopilot}' | base64 -d >/opt/heteronetwork/libexec/postgres-ha-autopilot.sh
+chown root:root /opt/heteronetwork/libexec/postgres-ha-node.sh /opt/heteronetwork/libexec/postgres-ha-autopilot.sh
+chmod 0755 /opt/heteronetwork/libexec/postgres-ha-node.sh /opt/heteronetwork/libexec/postgres-ha-autopilot.sh
+cat >/etc/heteronetwork/postgres-autopilot/autopilot.env <<'POSTGRES_AUTOPILOT_ENV'
+HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN={bearer_token}
+HETERONETWORK_DB_CLUSTER_ID_B64={cluster_id}
+HETERONETWORK_DB_LOCAL_ROLE={role}
+POSTGRES_AUTOPILOT_ENV
+chown root:root /etc/heteronetwork/postgres-autopilot/autopilot.env
+chmod 0600 /etc/heteronetwork/postgres-autopilot/autopilot.env
+cat >/etc/systemd/system/heteronetwork-postgres-autopilot.service <<'POSTGRES_AUTOPILOT_UNIT'
+[Unit]
+Description=HeteroNetwork automatic PostgreSQL HA placement and reconciliation
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service
+Requires=heteronetwork-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/heteronetwork/postgres-autopilot/autopilot.env
+ExecStart=/opt/heteronetwork/libexec/postgres-ha-autopilot.sh run
+Restart=always
+RestartSec=15s
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+POSTGRES_AUTOPILOT_UNIT
+systemctl daemon-reload
+systemctl enable heteronetwork-postgres-autopilot.service
+systemctl restart --no-block heteronetwork-postgres-autopilot.service
+echo "Automatic PostgreSQL HA placement scheduled"
+"#,
+        helper = helper,
+        autopilot = autopilot,
+        bearer_token = bearer_token,
+        cluster_id = cluster_id,
+        role = token.claims.role.as_str(),
+    )
 }
 
 fn kubernetes_ha_cohort_tag(nonce: &str) -> String {
@@ -4211,6 +4280,10 @@ mod tests {
         assert!(token.claims.policy.allow_relay);
         assert_eq!(response_body["setup"], "network_only");
         assert!(!generated_script.contains("kubeadm-ha-autopilot"));
+        assert!(generated_script.contains("heteronetwork-postgres-autopilot.service"));
+        assert!(generated_script.contains("postgres-ha-node.sh"));
+        assert!(generated_script.contains("postgres-ha-autopilot.sh"));
+        assert!(generated_script.contains("Automatic PostgreSQL HA placement scheduled"));
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
 
@@ -4264,9 +4337,32 @@ mod tests {
             .ok_or("Kubernetes enrollment response omitted the install script")?;
         assert!(kubernetes_script.contains("heteronetwork-kubeadm-autopilot.service"));
         assert!(!kubernetes_script.contains("KUBERNETES_HA_SETUP_TAG_PREFIX"));
-        let script_syntax = std::process::Command::new("sh")
-            .args(["-n", "-c", kubernetes_script])
-            .output()?;
+        let database_bearer = generated_script
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN=")
+            })
+            .ok_or("standard enrollment omitted the database autopilot bearer")?;
+        let kubernetes_database_bearer = kubernetes_script
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN=")
+            })
+            .ok_or("Kubernetes enrollment omitted the database autopilot bearer")?;
+        assert_eq!(database_bearer, kubernetes_database_bearer);
+        assert_eq!(database_bearer.len(), 64);
+        let mut script_shell = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        script_shell
+            .stdin
+            .take()
+            .ok_or("Kubernetes shell syntax checker stdin is unavailable")?
+            .write_all(kubernetes_script.as_bytes())?;
+        let script_syntax = script_shell.wait_with_output()?;
         assert!(
             script_syntax.status.success(),
             "generated Kubernetes install script is not valid POSIX shell: {}",
@@ -4401,6 +4497,10 @@ mod tests {
         assert!(script.contains("--packet-flow-detector conntrack-netlink-events"));
         assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
         assert!(script.contains("heteronetwork-gateway.service"));
+        assert!(script.contains("heteronetwork-postgres-autopilot.service"));
+        assert!(script.contains("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN="));
+        assert!(script.contains("HETERONETWORK_DB_CLUSTER_ID_B64="));
+        assert!(script.contains("HETERONETWORK_DB_LOCAL_ROLE=edge"));
         assert!(script.contains("Requires=heteronetwork-gateway.service"));
         assert!(script.contains("systemd-sysusers"));
         assert!(script.contains("User=heteronetwork-gateway"));

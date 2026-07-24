@@ -134,6 +134,13 @@ initial node setup or `install-backchannel` to reconcile only HAProxy. Deploy at
 least two Keycloak replicas and configure both private realm URLs through the
 Control Plane backchannel variables below.
 
+Every standard Linux enrollment also installs
+`heteronetwork-postgres-autopilot.service`. Once three eligible Linux nodes are
+ready, it creates the PostgreSQL/Patroni cluster automatically, adds every
+additional non-client Linux node as a replica (up to 32), and expands etcd from
+three to five voters through learners. No database bundle or per-host database
+environment is copied by the operator; see [docs/POSTGRES_HA.md](docs/POSTGRES_HA.md).
+
 The operator enrollment API also accepts
 `"setup":"kubernetes_ha_control_plane"` with a reusable token limited to
 exactly three uses. The returned command is identical on all three clean

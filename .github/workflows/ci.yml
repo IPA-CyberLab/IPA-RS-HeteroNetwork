@@ -56,6 +56,8 @@ jobs:
         run: |
           bash -n scripts/postgres-ha-node.sh
           scripts/postgres-ha-node.sh self-test
+          bash -n scripts/postgres-ha-autopilot.sh
+          scripts/postgres-ha-autopilot.sh self-test
 
       - name: Install minimum supported Rust
         run: rustup toolchain install "$RUST_MSRV_TOOLCHAIN" --profile minimal

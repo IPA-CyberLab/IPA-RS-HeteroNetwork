@@ -434,14 +434,14 @@ public gateway selects its signed issuer host on the private backchannel only
 when scheme, realm path, and port match the configured issuer. Keycloak still
 performs the authoritative token validation.
 
-Keycloak data is stored in the three-member PostgreSQL/Patroni service installed
-by `scripts/postgres-ha-node.sh`; Keycloak cache replication is not the durable
-data source. Keep three DCS/database members, synchronous mode, and a local
-`heteronetwork-db-proxy.service` on every Keycloak and Control Plane host. A
-database leader loss should promote a synchronous replica, briefly reconnect
-Keycloak's connection pool, and let the old leader rejoin as a replica on the
-new timeline. Validate a maintenance window by checking one primary and two
-running replicas through Patroni before and after stopping a single member.
+Keycloak data is stored in the PostgreSQL/Patroni service placed by
+`heteronetwork-postgres-autopilot.service`; Keycloak cache replication is not
+the durable data source. Standard Linux enrollment adds every eligible node as
+a PostgreSQL replica (up to 32) and expands the DCS from three to five voters.
+Keep synchronous mode and a local `heteronetwork-db-proxy.service` on every
+Keycloak and Control Plane host. A database leader loss should promote a
+synchronous replica, briefly reconnect Keycloak's connection pool, and let the
+old leader rejoin on the new timeline.
 
 Agent outbound HTTP uses a 5-second connect timeout and a 30-second whole-request timeout by default. Tune them with `--http-connect-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS` and `--http-request-timeout-seconds` / `HETERONETWORK_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS`; both must be 1-3600 seconds and connect must not exceed request. The bounds apply per attempted endpoint to join, heartbeat, peer-map, Signal, Relay, lifecycle, Docker API, and Kubernetes API calls. `ipars docker install --agent-http-*-timeout-seconds` and `ipars k8s install --agent-http-*-timeout-seconds` propagate the same settings into Compose and Helm.
 

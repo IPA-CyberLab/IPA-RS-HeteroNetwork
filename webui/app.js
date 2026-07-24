@@ -277,7 +277,7 @@
     "Expiration (days)": "有効期限 (日)",
     "Maximum uses": "最大利用回数",
     "3. Generate install script": "3. インストールスクリプトを生成",
-    "The command installs the signed Linux amd64 agent, enrolls once, removes the token, and starts systemd.": "署名済み Linux amd64 エージェントを導入し、一度だけ登録してトークンを削除した後、systemd を起動します。",
+    "The command installs the signed Linux amd64 agent, removes the token after enrollment, and automatically schedules the network and database HA services.": "署名済み Linux amd64 エージェントを導入し、登録後にトークンを削除して、ネットワークとデータベースの HA サービスを自動構成します。",
     "Generate install script": "インストールスクリプトを生成",
     "Generating...": "生成中...",
     "Install command": "インストールコマンド",
@@ -1400,7 +1400,7 @@
       + '<div class="enrollment-step"><div class="step-marker">2</div><div class="step-content"><div class="step-heading"><h2>2. Authentication key</h2><p>Limit how long and how many times the enrollment token can be used.</p></div>'
       + enrollmentToggle("reusable", "Reusable", "Allow more than one device to use this token.", enrollment.reusable)
       + '<div class="form-grid enrollment-form-grid"><div class="form-field"><label for="enrollment-expiration">Expiration (days)</label><input id="enrollment-expiration" data-enrollment-field="expirationDays" type="number" min="1" max="30" value="' + escapeHtml(enrollment.expirationDays) + '"></div>' + reusableUses + '</div></div></div>'
-      + '<div class="enrollment-step enrollment-generate-step"><div class="step-marker">3</div><div class="step-content"><div class="step-heading"><h2>3. Generate install script</h2><p>The command installs the signed Linux amd64 agent, enrolls once, removes the token, and starts systemd.</p></div><button class="button button-primary" id="generate-enrollment" type="button" ' + (enrollment.generating ? "disabled" : "") + '>' + icon(enrollment.generating ? "refresh-cw" : "terminal") + '<span>' + (enrollment.generating ? "Generating..." : "Generate install script") + '</span></button></div></div></section>';
+      + '<div class="enrollment-step enrollment-generate-step"><div class="step-marker">3</div><div class="step-content"><div class="step-heading"><h2>3. Generate install script</h2><p>The command installs the signed Linux amd64 agent, removes the token after enrollment, and automatically schedules the network and database HA services.</p></div><button class="button button-primary" id="generate-enrollment" type="button" ' + (enrollment.generating ? "disabled" : "") + '>' + icon(enrollment.generating ? "refresh-cw" : "terminal") + '<span>' + (enrollment.generating ? "Generating..." : "Generate install script") + '</span></button></div></div></section>';
     return '<div class="enrollment-intro"><span class="eyebrow">HETERONETWORK</span><h2>Add a Linux server</h2><p>Generate a secure install command for a new HeteroNetwork node.</p></div>'
       + renderEnrollmentModeSwitch(enrollment) + form
       + (enrollment.result ? renderLinuxEnrollmentResult(enrollment.result) : "");

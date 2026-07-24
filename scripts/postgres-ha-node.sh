@@ -17,6 +17,10 @@ readonly DEFAULT_POSTGRES_MAJOR="17"
 readonly PATRONI_VERSION="4.1.4"
 readonly ETCD_VERSION="v3.6.11"
 readonly ETCD_LINUX_AMD64_SHA256="8756f7a4eaf921668a83de0bf13c0f65cae9186a165696e3ae8396afe6f557ed"
+readonly MIN_DATABASE_MEMBER_COUNT="3"
+readonly MAX_DATABASE_MEMBER_COUNT="32"
+readonly MIN_DCS_MEMBER_COUNT="3"
+readonly MAX_DCS_MEMBER_COUNT="9"
 
 cluster_name="${HETERONETWORK_DB_CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
 interface="${HETERONETWORK_DB_INTERFACE:-$DEFAULT_INTERFACE}"
@@ -24,6 +28,8 @@ node_name="${HETERONETWORK_DB_NODE_NAME:-}"
 node_address="${HETERONETWORK_DB_NODE_ADDRESS:-}"
 client_listen_address="${HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS:-}"
 members="${HETERONETWORK_DB_MEMBERS:-}"
+dcs_members="${HETERONETWORK_DB_DCS_MEMBERS:-$members}"
+dcs_initial_cluster_state="${HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE:-new}"
 proxy_backends="${HETERONETWORK_DB_PROXY_BACKENDS:-$members}"
 client_cidrs="${HETERONETWORK_DB_CLIENT_CIDRS:-}"
 extra_hba_entries="${HETERONETWORK_DB_EXTRA_HBA_ENTRIES:-}"
@@ -40,6 +46,7 @@ dcs_peer_port="${HETERONETWORK_DB_DCS_PEER_PORT:-$DEFAULT_DCS_PEER_PORT}"
 dcs_metrics_port="${HETERONETWORK_DB_DCS_METRICS_PORT:-$DEFAULT_DCS_METRICS_PORT}"
 proxy_port="${HETERONETWORK_DB_PROXY_PORT:-$DEFAULT_PROXY_PORT}"
 postgres_major="${HETERONETWORK_DB_POSTGRES_MAJOR:-$DEFAULT_POSTGRES_MAJOR}"
+topology_revision="${HETERONETWORK_DB_TOPOLOGY_REVISION:-1}"
 
 usage() {
   cat <<'EOF'
@@ -47,14 +54,17 @@ Usage: postgres-ha-node.sh COMMAND [OUTPUT_DIR]
 
 Commands:
   init-bundle OUTPUT_DIR  Create an offline CA, per-node certificates, and cluster secrets
-  install-node            Install this PostgreSQL, Patroni, and independent DCS member
+  extend-bundle DIR       Add certificates and update metadata in an existing private bundle
+  install-node            Install this PostgreSQL/Patroni member and optional DCS voter
+  reconfigure-node        Apply a new member map without replacing PostgreSQL data
+  reconcile-dcs           Add or promote at most one DCS learner
   install-proxy           Install only the local primary-selecting database proxy
-  verify                  Require DCS quorum, one primary, two replicas, and synchronous writes
+  verify                  Require DCS quorum, one primary, all replicas, and synchronous writes
   status                  Print bounded cluster health without printing credentials
   self-test               Run non-privileged config renderer and validation checks
 
 Required environment for init-bundle:
-  HETERONETWORK_DB_MEMBERS       Exactly three name=private-ip entries, comma separated
+  HETERONETWORK_DB_MEMBERS       3-32 name=private-ip entries, comma separated
 
 Required environment for install-node:
   HETERONETWORK_DB_NODE_NAME
@@ -63,11 +73,16 @@ Required environment for install-node:
   HETERONETWORK_DB_BUNDLE_DIR
 
 Required environment for install-proxy:
-  HETERONETWORK_DB_PROXY_BACKENDS  Three name=private-ip entries
+  HETERONETWORK_DB_PROXY_BACKENDS  3-32 name=private-ip entries
   HETERONETWORK_DB_BUNDLE_DIR
 
 Optional environment:
   HETERONETWORK_DB_INTERFACE       Default: heteronetwork0
+  HETERONETWORK_DB_DCS_MEMBERS     Odd 3-9 voter entries; defaults to DB members
+  HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE
+                                     new for a fresh quorum, existing when joining one
+  HETERONETWORK_DB_TOPOLOGY_REVISION
+                                     Monotonic positive integer, default: 1
   HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS
                                      Optional private management address used by remote proxies
   HETERONETWORK_DB_CLIENT_CIDRS    Additional comma-separated application source CIDRs
@@ -81,7 +96,8 @@ Optional environment:
 
 The replication addresses need only be mutually reachable private addresses.
 They must remain available independently of this database's current primary.
-The generated CA private key stays in the offline bundle and is never installed.
+The automatic coordinator replicates the private bundle only among enrolled
+database members. Manual recovery bundles must remain root-only.
 EOF
 }
 
@@ -133,12 +149,20 @@ validate_absolute_path() {
   [[ "$1" == /* ]] || die "path must be absolute: $1"
 }
 
-member_rows() {
-  local input="${1:-$members}"
+member_rows_for() {
+  local input="$1"
+  local label="$2"
+  local minimum="$3"
+  local maximum="$4"
+  local require_odd="$5"
   local -a entries
   local entry name address
   IFS=, read -r -a entries <<<"$input"
-  ((${#entries[@]} == 3)) || die "exactly three database members are required"
+  ((${#entries[@]} >= minimum && ${#entries[@]} <= maximum)) \
+    || die "$label member count must be between $minimum and $maximum"
+  if [[ "$require_odd" == "true" ]]; then
+    ((${#entries[@]} % 2 == 1)) || die "$label member count must be odd"
+  fi
 
   local -A seen_names=()
   local -A seen_addresses=()
@@ -155,6 +179,35 @@ member_rows() {
     seen_addresses[$address]=1
     printf '%s %s\n' "$name" "$address"
   done
+}
+
+member_rows() {
+  member_rows_for "$members" database \
+    "$MIN_DATABASE_MEMBER_COUNT" "$MAX_DATABASE_MEMBER_COUNT" false
+}
+
+dcs_member_rows() {
+  member_rows_for "$dcs_members" DCS \
+    "$MIN_DCS_MEMBER_COUNT" "$MAX_DCS_MEMBER_COUNT" false
+}
+
+proxy_backend_rows() {
+  member_rows_for "$proxy_backends" proxy \
+    "$MIN_DATABASE_MEMBER_COUNT" "$MAX_DATABASE_MEMBER_COUNT" false
+}
+
+database_member_count() {
+  member_rows | wc -l | tr -d ' '
+}
+
+dcs_member_count() {
+  dcs_member_rows | wc -l | tr -d ' '
+}
+
+synchronous_standby_count() {
+  local count
+  count="$(dcs_member_count)"
+  printf '%s' "$(((10#$count - 1) / 2))"
 }
 
 validate_cidr() {
@@ -241,7 +294,26 @@ validate_common_config() {
   validate_port "$dcs_metrics_port"
   validate_port "$proxy_port"
   [[ "$postgres_major" =~ ^[0-9]{2}$ ]] || die "PostgreSQL major must be a two-digit version"
+  [[ "$topology_revision" =~ ^[1-9][0-9]*$ ]] || die "topology revision must be positive"
   member_rows >/dev/null
+  dcs_member_rows >/dev/null
+  [[ "$dcs_initial_cluster_state" == "new" || "$dcs_initial_cluster_state" == "existing" ]] \
+    || die "DCS initial cluster state must be new or existing"
+  if [[ "$dcs_initial_cluster_state" == "new" ]]; then
+    local initial_dcs_count
+    initial_dcs_count="$(dcs_member_count)"
+    ((10#$initial_dcs_count % 2 == 1)) \
+      || die "a fresh DCS member count must be odd"
+  fi
+  local -A database_members=()
+  local name address
+  while read -r name address; do
+    database_members["$name"]="$address"
+  done < <(member_rows)
+  while read -r name address; do
+    [[ "${database_members[$name]:-}" == "$address" ]] \
+      || die "DCS member $name=$address is not present in HETERONETWORK_DB_MEMBERS"
+  done < <(dcs_member_rows)
   application_cidrs >/dev/null
   extra_hba_rows >/dev/null
 }
@@ -271,7 +343,17 @@ validate_proxy_config() {
   validate_common_config
   [[ -n "$bundle_dir" ]] || die "HETERONETWORK_DB_BUNDLE_DIR is required"
   validate_absolute_path "$bundle_dir"
-  member_rows "$proxy_backends" >/dev/null
+  proxy_backend_rows >/dev/null
+}
+
+node_is_dcs_member() {
+  local name address
+  while read -r name address; do
+    if [[ "$name" == "$node_name" && "$address" == "$node_address" ]]; then
+      return 0
+    fi
+  done < <(dcs_member_rows)
+  return 1
 }
 
 ensure_private_source_file() {
@@ -304,7 +386,7 @@ render_etcd_config() {
   while read -r name address; do
     [[ -z "$initial_cluster" ]] || initial_cluster+=","
     initial_cluster+="${name}=https://${address}:${dcs_peer_port}"
-  done < <(member_rows)
+  done < <(dcs_member_rows)
 
   cat <<EOF
 name: ${node_name}
@@ -316,7 +398,7 @@ advertise-client-urls: https://${node_address}:${dcs_client_port}
 listen-metrics-urls: http://127.0.0.1:${dcs_metrics_port}
 initial-cluster: ${initial_cluster}
 initial-cluster-token: ${cluster_name}-postgres-dcs-v1
-initial-cluster-state: new
+initial-cluster-state: ${dcs_initial_cluster_state}
 auto-compaction-mode: periodic
 auto-compaction-retention: 1h
 quota-backend-bytes: 2147483648
@@ -340,10 +422,13 @@ EOF
 
 render_patroni_config() {
   local superuser_password replication_password rewind_password rest_password
+  local synchronous_count replication_capacity
   superuser_password="$(read_cluster_secret superuser)"
   replication_password="$(read_cluster_secret replication)"
   rewind_password="$(read_cluster_secret rewind)"
   rest_password="$(read_cluster_secret rest-api)"
+  synchronous_count="$(synchronous_standby_count)"
+  replication_capacity="$((10#$MAX_DATABASE_MEMBER_COUNT + 4))"
 
   cat <<EOF
 scope: ${cluster_name}
@@ -369,7 +454,7 @@ EOF
   local name address
   while read -r name address; do
     printf '    - %s:%s\n' "$address" "$dcs_client_port"
-  done < <(member_rows)
+  done < <(dcs_member_rows)
   cat <<EOF
   protocol: https
   cacert: ${state_dir}/pki/ca.crt
@@ -388,7 +473,7 @@ bootstrap:
     failsafe_mode: true
     synchronous_mode: true
     synchronous_mode_strict: true
-    synchronous_node_count: 1
+    synchronous_node_count: ${synchronous_count}
     postgresql:
       use_pg_rewind: true
       use_slots: true
@@ -397,8 +482,8 @@ bootstrap:
         synchronous_commit: "on"
         wal_level: replica
         wal_log_hints: "on"
-        max_wal_senders: 10
-        max_replication_slots: 10
+        max_wal_senders: ${replication_capacity}
+        max_replication_slots: ${replication_capacity}
         max_connections: 200
         ssl: "on"
         ssl_min_protocol_version: TLSv1.2
@@ -462,7 +547,9 @@ render_pg_hba_entries() {
     printf '%s- hostssl replication replicator %s/32 scram-sha-256\n' "$indent" "$address"
     printf '%s- hostssl all postgres %s/32 scram-sha-256\n' "$indent" "$address"
     printf '%s- hostssl all rewind %s/32 scram-sha-256\n' "$indent" "$address"
+    printf '%s- hostssl all all %s/32 scram-sha-256\n' "$indent" "$address"
   done < <(member_rows)
+  printf '%s- hostssl all all 127.0.0.1/32 scram-sha-256\n' "$indent"
   local cidr
   while read -r cidr; do
     printf '%s- hostssl heteronetwork heteronetwork %s scram-sha-256\n' "$indent" "$cidr"
@@ -505,7 +592,7 @@ EOF
   while read -r name address; do
     printf '    server %s %s:%s check port %s check-ssl verify required ca-file %s/pki/ca.crt verifyhost %s\n' \
       "$name" "$address" "$postgres_port" "$rest_port" "$state_dir" "$service_name"
-  done < <(member_rows "$proxy_backends")
+  done < <(proxy_backend_rows)
   if [[ -n "$client_listen_address" ]]; then
     cat <<EOF
 
@@ -557,11 +644,18 @@ EOF
 }
 
 render_patroni_service() {
+  local dcs_dependencies=""
+  if node_is_dcs_member; then
+    dcs_dependencies="Wants=network-online.target heteronetwork-db-dcs.service
+After=network-online.target heteronetwork-db-dcs.service"
+  else
+    dcs_dependencies="Wants=network-online.target
+After=network-online.target"
+  fi
   cat <<EOF
 [Unit]
 Description=HeteroNetwork synchronous PostgreSQL member
-Wants=network-online.target heteronetwork-db-dcs.service
-After=network-online.target heteronetwork-db-dcs.service
+${dcs_dependencies}
 
 [Service]
 Type=simple
@@ -646,6 +740,102 @@ ensure_service_hosts_entry() {
   mv "$temporary" /etc/hosts
 }
 
+validate_bundle_authority() {
+  local output="$1"
+  [[ -d "$output" && ! -L "$output" ]] || die "bundle directory is missing or unsafe: $output"
+  ensure_private_source_file "$output/ca/ca.key"
+  [[ -f "$output/ca/ca.crt" && ! -L "$output/ca/ca.crt" ]] \
+    || die "bundle CA certificate is missing: $output/ca/ca.crt"
+  openssl x509 -in "$output/ca/ca.crt" -noout >/dev/null
+  local certificate_public_key private_public_key
+  certificate_public_key="$(
+    openssl x509 -in "$output/ca/ca.crt" -pubkey -noout \
+      | openssl pkey -pubin -outform DER 2>/dev/null \
+      | sha256sum \
+      | awk '{print $1}'
+  )"
+  private_public_key="$(
+    openssl pkey -in "$output/ca/ca.key" -pubout -outform DER 2>/dev/null \
+      | sha256sum \
+      | awk '{print $1}'
+  )"
+  [[ -n "$certificate_public_key" && "$certificate_public_key" == "$private_public_key" ]] \
+    || die "bundle CA private key does not match its certificate"
+}
+
+validate_node_certificate() {
+  local output="$1"
+  local name="$2"
+  local address="$3"
+  local node_dir="$output/nodes/$name"
+  ensure_private_source_file "$node_dir/node.key"
+  [[ -f "$node_dir/node.crt" && ! -L "$node_dir/node.crt" ]] \
+    || die "incomplete certificate bundle for $name"
+  openssl verify -CAfile "$output/ca/ca.crt" "$node_dir/node.crt" >/dev/null
+  openssl x509 -in "$node_dir/node.crt" -noout -ext subjectAltName \
+    | grep -Fq "IP Address:${address}" \
+    || die "existing certificate for $name does not contain $address"
+  local certificate_public_key private_public_key
+  certificate_public_key="$(
+    openssl x509 -in "$node_dir/node.crt" -pubkey -noout \
+      | openssl pkey -pubin -outform DER 2>/dev/null \
+      | sha256sum \
+      | awk '{print $1}'
+  )"
+  private_public_key="$(
+    openssl pkey -in "$node_dir/node.key" -pubout -outform DER 2>/dev/null \
+      | sha256sum \
+      | awk '{print $1}'
+  )"
+  [[ -n "$certificate_public_key" && "$certificate_public_key" == "$private_public_key" ]] \
+    || die "certificate and private key do not match for $name"
+}
+
+issue_node_certificate() {
+  local output="$1"
+  local name="$2"
+  local address="$3"
+  local node_dir="$output/nodes/$name"
+  local extension_file="$node_dir/extensions.cnf"
+  if [[ -e "$node_dir/node.key" || -e "$node_dir/node.crt" ]]; then
+    validate_node_certificate "$output" "$name" "$address"
+    return
+  fi
+
+  install -d -m 0700 "$node_dir"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    -out "$node_dir/node.key"
+  openssl req -new -key "$node_dir/node.key" -out "$node_dir/node.csr" \
+    -subj "/CN=${name}.${service_name}"
+  cat >"$extension_file" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth,clientAuth
+subjectAltName=DNS:${service_name},DNS:${name}.${service_name},IP:${address},IP:127.0.0.1
+EOF
+  openssl x509 -req -in "$node_dir/node.csr" \
+    -CA "$output/ca/ca.crt" -CAkey "$output/ca/ca.key" -CAcreateserial \
+    -out "$node_dir/node.crt" -days 825 -sha256 -extfile "$extension_file"
+  install -m 0644 "$output/ca/ca.crt" "$node_dir/ca.crt"
+  rm -f "$node_dir/node.csr" "$extension_file"
+  chmod 0600 "$node_dir/node.key"
+  chmod 0644 "$node_dir/node.crt" "$node_dir/ca.crt"
+}
+
+write_bundle_manifest() {
+  local output="$1"
+  cat >"$output/manifest.env" <<EOF
+HETERONETWORK_DB_CLUSTER_NAME=${cluster_name}
+HETERONETWORK_DB_MEMBERS=${members}
+HETERONETWORK_DB_DCS_MEMBERS=${dcs_members}
+HETERONETWORK_DB_SERVICE_NAME=${service_name}
+HETERONETWORK_DB_POSTGRES_PORT=${postgres_port}
+HETERONETWORK_DB_REST_PORT=${rest_port}
+HETERONETWORK_DB_TOPOLOGY_REVISION=${topology_revision}
+EOF
+  chmod 0600 "$output/manifest.env"
+}
+
 init_bundle() {
   local output="${1:-}"
   [[ -n "$output" ]] || die "init-bundle requires OUTPUT_DIR"
@@ -672,39 +862,58 @@ init_bundle() {
     chmod 0600 "$output/secrets/${secret}.password"
   done
 
-  local name address node_dir extension_file
+  local name address
   while read -r name address; do
-    node_dir="$output/nodes/$name"
-    install -d -m 0700 "$node_dir"
-    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-      -out "$node_dir/node.key"
-    openssl req -new -key "$node_dir/node.key" -out "$node_dir/node.csr" \
-      -subj "/CN=${name}.${service_name}"
-    extension_file="$node_dir/extensions.cnf"
-    cat >"$extension_file" <<EOF
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature
-extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=DNS:${service_name},DNS:${name}.${service_name},IP:${address},IP:127.0.0.1
-EOF
-    openssl x509 -req -in "$node_dir/node.csr" \
-      -CA "$output/ca/ca.crt" -CAkey "$output/ca/ca.key" -CAcreateserial \
-      -out "$node_dir/node.crt" -days 825 -sha256 -extfile "$extension_file"
-    install -m 0644 "$output/ca/ca.crt" "$node_dir/ca.crt"
-    rm -f "$node_dir/node.csr" "$extension_file"
-    chmod 0600 "$node_dir/node.key"
-    chmod 0644 "$node_dir/node.crt" "$node_dir/ca.crt"
+    issue_node_certificate "$output" "$name" "$address"
   done < <(member_rows)
 
-  cat >"$output/manifest.env" <<EOF
-HETERONETWORK_DB_CLUSTER_NAME=${cluster_name}
-HETERONETWORK_DB_MEMBERS=${members}
-HETERONETWORK_DB_SERVICE_NAME=${service_name}
-HETERONETWORK_DB_POSTGRES_PORT=${postgres_port}
-HETERONETWORK_DB_REST_PORT=${rest_port}
-EOF
-  chmod 0600 "$output/manifest.env"
-  printf 'Created private HA bundle at %s; keep ca/ca.key offline.\n' "$output"
+  write_bundle_manifest "$output"
+  printf 'Created private HA bundle at %s.\n' "$output"
+}
+
+extend_bundle() {
+  local output="${1:-}"
+  [[ -n "$output" ]] || die "extend-bundle requires DIR"
+  [[ "$output" == /* ]] || die "DIR must be absolute"
+  validate_common_config
+  require_command openssl
+  require_command install
+  validate_bundle_authority "$output"
+
+  local original_bundle_dir="$bundle_dir"
+  bundle_dir="$output"
+  local secret
+  for secret in superuser replication rewind application rest-api; do
+    read_cluster_secret "$secret" >/dev/null
+  done
+  local name address
+  while read -r name address; do
+    issue_node_certificate "$output" "$name" "$address"
+  done < <(member_rows)
+  write_bundle_manifest "$output"
+  bundle_dir="$original_bundle_dir"
+  printf 'Extended private HA bundle at %s to topology revision %s.\n' \
+    "$output" "$topology_revision"
+}
+
+validate_bundle() {
+  local output="${1:-$bundle_dir}"
+  [[ -n "$output" ]] || die "validate-bundle requires HETERONETWORK_DB_BUNDLE_DIR or DIR"
+  [[ "$output" == /* ]] || die "bundle DIR must be absolute"
+  validate_common_config
+  require_command openssl
+  validate_bundle_authority "$output"
+  local original_bundle_dir="$bundle_dir"
+  bundle_dir="$output"
+  local secret
+  for secret in superuser replication rewind application rest-api; do
+    read_cluster_secret "$secret" >/dev/null
+  done
+  local name address
+  while read -r name address; do
+    validate_node_certificate "$output" "$name" "$address"
+  done < <(member_rows)
+  bundle_dir="$original_bundle_dir"
 }
 
 install_postgresql_packages() {
@@ -849,10 +1058,12 @@ install_node() {
 
   getent group heteronetwork-db-ha >/dev/null \
     || groupadd --system heteronetwork-db-ha
-  id -u heteronetwork-dcs >/dev/null 2>&1 \
-    || useradd --system --home "$dcs_data_dir" --shell /usr/sbin/nologin \
-      --gid heteronetwork-db-ha heteronetwork-dcs
-  usermod --home "$dcs_data_dir" heteronetwork-dcs
+  if node_is_dcs_member; then
+    id -u heteronetwork-dcs >/dev/null 2>&1 \
+      || useradd --system --home "$dcs_data_dir" --shell /usr/sbin/nologin \
+        --gid heteronetwork-db-ha heteronetwork-dcs
+    usermod --home "$dcs_data_dir" heteronetwork-dcs
+  fi
 
   install_postgresql_packages
   usermod --append --groups heteronetwork-db-ha postgres
@@ -861,25 +1072,37 @@ install_node() {
   install -d -o root -g heteronetwork-db-ha -m 0750 "$state_dir" "$state_dir/pki"
   install -d -o root -g postgres -m 0750 "$state_dir/secrets"
   install -d -o postgres -g postgres -m 0700 "$data_dir" "$data_dir/postgres"
-  install -d -o heteronetwork-dcs -g heteronetwork-db-ha -m 0700 "$dcs_data_dir"
+  if node_is_dcs_member; then
+    install -d -o heteronetwork-dcs -g heteronetwork-db-ha -m 0700 "$dcs_data_dir"
+  fi
   install -d -o postgres -g postgres -m 0755 /run/postgresql
 
-  install_etcd
+  if node_is_dcs_member; then
+    install_etcd
+  fi
   install_patroni
   install_pki_and_secrets
   install_bootstrap_script
 
-  render_etcd_config | install -o root -g heteronetwork-db-ha -m 0640 /dev/stdin "$state_dir/etcd.yml"
+  if node_is_dcs_member; then
+    render_etcd_config \
+      | install -o root -g heteronetwork-db-ha -m 0640 /dev/stdin "$state_dir/etcd.yml"
+  fi
   render_patroni_config | install -o root -g postgres -m 0640 /dev/stdin "$state_dir/patroni.yml"
   render_haproxy_config | install -o root -g haproxy -m 0640 /dev/stdin "$state_dir/haproxy.cfg"
-  render_dcs_service | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db-dcs.service
+  if node_is_dcs_member; then
+    render_dcs_service \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db-dcs.service
+  fi
   render_patroni_service | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db.service
   render_proxy_service | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db-proxy.service
 
   ensure_service_hosts_entry
   /usr/sbin/haproxy -c -f "$state_dir/haproxy.cfg"
   systemctl daemon-reload
-  systemctl enable --now heteronetwork-db-dcs.service
+  if node_is_dcs_member; then
+    systemctl enable --now heteronetwork-db-dcs.service
+  fi
   systemctl enable --now heteronetwork-db.service
   systemctl enable --now heteronetwork-db-proxy.service
 }
@@ -904,13 +1127,170 @@ install_proxy() {
   systemctl enable --now heteronetwork-db-proxy.service
 }
 
+reconfigure_node() {
+  require_root
+  validate_node_config
+  verify_interface_address
+  require_command openssl
+  require_command systemctl
+  if [[ ! -f /etc/systemd/system/heteronetwork-db.service ]]; then
+    install_node
+    return
+  fi
+  [[ -x /opt/heteronetwork/postgres-ha/patroni/bin/patroni ]] \
+    || die "Patroni is not installed on this database member"
+  [[ -x /usr/sbin/haproxy ]] || die "HAProxy is not installed on this database member"
+
+  getent group heteronetwork-db-ha >/dev/null \
+    || groupadd --system heteronetwork-db-ha
+  usermod --append --groups heteronetwork-db-ha postgres
+  usermod --append --groups heteronetwork-db-ha haproxy
+  install -d -o root -g heteronetwork-db-ha -m 0750 "$state_dir" "$state_dir/pki"
+  install -d -o root -g postgres -m 0750 "$state_dir/secrets"
+  install_pki_and_secrets
+  install_bootstrap_script
+
+  if node_is_dcs_member; then
+    id -u heteronetwork-dcs >/dev/null 2>&1 \
+      || useradd --system --home "$dcs_data_dir" --shell /usr/sbin/nologin \
+        --gid heteronetwork-db-ha heteronetwork-dcs
+    usermod --home "$dcs_data_dir" heteronetwork-dcs
+    install -d -o heteronetwork-dcs -g heteronetwork-db-ha -m 0700 "$dcs_data_dir"
+    install_etcd
+    render_etcd_config \
+      | install -o root -g heteronetwork-db-ha -m 0640 /dev/stdin "$state_dir/etcd.yml"
+    render_dcs_service \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db-dcs.service
+  elif [[ -f /etc/systemd/system/heteronetwork-db-dcs.service ]]; then
+    die "automatic DCS voter removal is intentionally refused"
+  fi
+
+  render_patroni_config | install -o root -g postgres -m 0640 /dev/stdin "$state_dir/patroni.yml"
+  render_haproxy_config | install -o root -g haproxy -m 0640 /dev/stdin "$state_dir/haproxy.cfg"
+  render_patroni_service \
+    | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db.service
+  render_proxy_service \
+    | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db-proxy.service
+  ensure_service_hosts_entry
+  /usr/sbin/haproxy -c -f "$state_dir/haproxy.cfg"
+  systemctl daemon-reload
+  if node_is_dcs_member; then
+    systemctl enable --now heteronetwork-db-dcs.service
+  fi
+  systemctl reload-or-restart heteronetwork-db.service
+  systemctl reload-or-restart heteronetwork-db-proxy.service
+}
+
 etcd_endpoints() {
   local output="" name address
   while read -r name address; do
     [[ -z "$output" ]] || output+=","
     output+="https://${address}:${dcs_client_port}"
-  done < <(member_rows)
+  done < <(dcs_member_rows)
   printf '%s' "$output"
+}
+
+dcs_etcdctl() {
+  /opt/heteronetwork/postgres-ha/etcdctl \
+    --endpoints="$(etcd_endpoints)" \
+    --dial-timeout=3s \
+    --command-timeout=10s \
+    --cacert="$bundle_dir/ca/ca.crt" \
+    --cert="$bundle_dir/nodes/$node_name/node.crt" \
+    --key="$bundle_dir/nodes/$node_name/node.key" \
+    "$@"
+}
+
+dcs_member_snapshot() {
+  dcs_etcdctl member list --write-out=json \
+    | python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+for member in document.get("members", []):
+    member_id = member.get("ID")
+    if not isinstance(member_id, int):
+        raise SystemExit("invalid etcd member ID")
+    name = member.get("name", "")
+    urls = member.get("peerURLs", [])
+    learner = member.get("isLearner", False)
+    if not isinstance(name, str) or not isinstance(urls, list) or len(urls) != 1:
+        raise SystemExit("invalid etcd member record")
+    print(f"{member_id:x}\t{name}\t{urls[0]}\t{str(bool(learner)).lower()}")
+'
+}
+
+reconcile_dcs() {
+  require_root
+  validate_node_config
+  require_command python3
+  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
+  validate_bundle_authority "$bundle_dir"
+
+  local snapshot
+  snapshot="$(dcs_member_snapshot)"
+  [[ -n "$snapshot" ]] || die "DCS membership is empty"
+  local id actual_name peer_url learner
+  local desired_name desired_address desired_url found
+  while IFS=$'\t' read -r id actual_name peer_url learner; do
+    found=0
+    while read -r desired_name desired_address; do
+      desired_url="https://${desired_address}:${dcs_peer_port}"
+      if [[ "$peer_url" == "$desired_url" ]]; then
+        [[ -z "$actual_name" || "$actual_name" == "$desired_name" ]] \
+          || die "DCS peer $peer_url is registered as unexpected name $actual_name"
+        found=1
+        break
+      fi
+    done < <(dcs_member_rows)
+    ((found == 1)) || die "DCS contains an unmanaged peer URL: $peer_url"
+  done <<<"$snapshot"
+
+  while IFS=$'\t' read -r id actual_name peer_url learner; do
+    [[ "$learner" == "true" ]] || continue
+    if dcs_etcdctl member promote "$id" >/dev/null 2>&1; then
+      printf 'Promoted DCS learner %s.\n' "${actual_name:-$peer_url}"
+    else
+      printf 'DCS learner %s is not caught up yet.\n' "${actual_name:-$peer_url}"
+    fi
+    return
+  done <<<"$snapshot"
+
+  while read -r desired_name desired_address; do
+    desired_url="https://${desired_address}:${dcs_peer_port}"
+    found=0
+    while IFS=$'\t' read -r id actual_name peer_url learner; do
+      if [[ "$peer_url" == "$desired_url" ]]; then
+        found=1
+        break
+      fi
+    done <<<"$snapshot"
+    if ((found == 0)); then
+      dcs_etcdctl member add "$desired_name" \
+        --peer-urls="$desired_url" \
+        --learner >/dev/null
+      printf 'Added DCS learner %s at %s.\n' "$desired_name" "$desired_address"
+      return
+    fi
+  done < <(dcs_member_rows)
+  printf 'DCS membership already matches the requested topology.\n'
+}
+
+reconcile_patroni_config() {
+  require_root
+  validate_node_config
+  local synchronous_count
+  synchronous_count="$(synchronous_standby_count)"
+  [[ -x /opt/heteronetwork/postgres-ha/patroni/bin/patronictl ]] \
+    || die "patronictl is not installed"
+  env PAGER=cat /opt/heteronetwork/postgres-ha/patroni/bin/patronictl \
+    -c "$state_dir/patroni.yml" \
+    edit-config "$cluster_name" \
+    --set "synchronous_node_count=${synchronous_count}" \
+    --force >/dev/null
+  printf 'Patroni requires %s synchronous standbys for this topology.\n' \
+    "$synchronous_count"
 }
 
 status_cluster() {
@@ -931,6 +1311,12 @@ status_cluster() {
 
 verify_cluster() {
   validate_node_config
+  local expected_members expected_replicas expected_sync expected_dcs
+  expected_members="$(database_member_count)"
+  expected_replicas="$((10#$expected_members - 1))"
+  expected_sync="$(synchronous_standby_count)"
+  expected_dcs="$(dcs_member_count)"
+  ((10#$expected_dcs % 2 == 1)) || die "steady-state DCS member count must be odd"
   local healthy=0 primaries=0 name address status
   while read -r name address; do
     status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -945,19 +1331,25 @@ verify_cluster() {
       "https://${service_name}:${rest_port}/primary")"
     [[ "$status" == "200" ]] && primaries=$((primaries + 1))
   done < <(member_rows)
-  ((healthy == 3)) || die "expected three healthy PostgreSQL members"
+  ((healthy == 10#$expected_members)) \
+    || die "expected $expected_members healthy PostgreSQL members"
   ((primaries == 1)) || die "expected exactly one PostgreSQL primary, found $primaries"
 
   local superuser_password
   superuser_password="$(read_cluster_secret superuser)"
-  local replication
+  local replication streaming_count sync_count
   replication="$(PGPASSWORD="$superuser_password" \
     /usr/lib/postgresql/"$postgres_major"/bin/psql \
       "host=${service_name} port=${proxy_port} dbname=postgres user=postgres sslmode=verify-full sslrootcert=${state_dir}/pki/ca.crt connect_timeout=3" \
       --no-psqlrc --tuples-only --no-align \
       --command="SELECT count(*) FILTER (WHERE state = 'streaming'), count(*) FILTER (WHERE sync_state IN ('sync', 'quorum')) FROM pg_stat_replication")"
-  [[ "$replication" =~ ^2\|[12]$ ]] \
-    || die "expected two streaming replicas and at least one synchronous replica, got: $replication"
+  IFS='|' read -r streaming_count sync_count <<<"$replication"
+  [[ "$streaming_count" =~ ^[0-9]+$ && "$sync_count" =~ ^[0-9]+$ ]] \
+    || die "invalid PostgreSQL replication status: $replication"
+  ((10#$streaming_count == 10#$expected_replicas)) \
+    || die "expected $expected_replicas streaming replicas, got: $replication"
+  ((10#$sync_count >= 10#$expected_sync)) \
+    || die "expected at least $expected_sync synchronous replicas, got: $replication"
 
   local dcs_health
   dcs_health="$(/opt/heteronetwork/postgres-ha/etcdctl \
@@ -966,13 +1358,17 @@ verify_cluster() {
     --cert="$state_dir/pki/node.crt" \
     --key="$state_dir/pki/node.key" \
     endpoint health --cluster 2>&1)"
-  [[ "$(grep -c 'is healthy' <<<"$dcs_health")" == "3" ]] \
-    || die "expected three healthy DCS members"
-  printf 'HA verification passed: 3 DCS members, 1 primary, 2 streaming replicas, synchronous commit active.\n'
+  [[ "$(grep -c 'is healthy' <<<"$dcs_health")" == "$expected_dcs" ]] \
+    || die "expected $expected_dcs healthy DCS members"
+  printf 'HA verification passed: %s DCS members, 1 primary, %s streaming replicas, %s synchronous replicas required.\n' \
+    "$expected_dcs" "$expected_replicas" "$expected_sync"
 }
 
 self_test() {
   local original_members="$members"
+  local original_dcs_members="$dcs_members"
+  local original_dcs_initial_cluster_state="$dcs_initial_cluster_state"
+  local original_topology_revision="$topology_revision"
   local original_proxy_backends="$proxy_backends"
   local original_node_name="$node_name"
   local original_node_address="$node_address"
@@ -983,7 +1379,10 @@ self_test() {
   test_dir="$(mktemp -d /tmp/heteronetwork-postgres-ha-test.XXXXXX)"
   trap '[[ -z "${test_dir:-}" || "$test_dir" != /tmp/heteronetwork-postgres-ha-test.* ]] || rm -rf "$test_dir"' RETURN
 
-  members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3"
+  members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4,db-e=10.250.0.5,db-f=10.250.0.6"
+  dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4,db-e=10.250.0.5"
+  dcs_initial_cluster_state="new"
+  topology_revision="7"
   proxy_backends="$members"
   node_name="db-a"
   node_address="10.250.0.1"
@@ -1003,12 +1402,18 @@ self_test() {
   render_patroni_config >"$test_dir/patroni.yml"
   render_haproxy_config >"$test_dir/haproxy.cfg"
   grep -Fq 'synchronous_mode_strict: true' "$test_dir/patroni.yml"
+  grep -Fq 'synchronous_node_count: 2' "$test_dir/patroni.yml"
+  grep -Fq 'max_wal_senders: 36' "$test_dir/patroni.yml"
+  grep -Fq 'max_replication_slots: 36' "$test_dir/patroni.yml"
   grep -Fq 'listen: 10.250.0.1,100.64.0.1:55432' "$test_dir/patroni.yml"
   [[ "$(grep -c 'hostssl keycloak keycloak 10.250.0.[45]/32 scram-sha-256' \
     "$test_dir/patroni.yml")" == "4" ]]
-  grep -Fq '10.250.0.3:12380' "$test_dir/etcd.yml"
+  grep -Fq '10.250.0.5:12380' "$test_dir/etcd.yml"
+  if grep -Fq '10.250.0.6:12380' "$test_dir/etcd.yml"; then
+    die "non-voter unexpectedly appeared in the DCS configuration"
+  fi
   grep -Fq 'bind 100.64.0.1:18008' "$test_dir/haproxy.cfg"
-  [[ "$(grep -c '^    server db-' "$test_dir/haproxy.cfg")" == "3" ]]
+  [[ "$(grep -c '^    server db-' "$test_dir/haproxy.cfg")" == "6" ]]
   init_bundle "$test_dir/generated-bundle" >/dev/null 2>&1
   openssl x509 -in "$test_dir/generated-bundle/ca/ca.crt" -noout -text \
     | grep -F 'Certificate Sign, CRL Sign' >/dev/null
@@ -1016,15 +1421,52 @@ self_test() {
     | grep -F 'Signature Algorithm: ecdsa-with-SHA256' >/dev/null
   openssl verify \
     -CAfile "$test_dir/generated-bundle/ca/ca.crt" \
-    "$test_dir/generated-bundle/nodes/db-a/node.crt" >/dev/null
+    "$test_dir/generated-bundle/nodes/db-a/node.crt" \
+    "$test_dir/generated-bundle/nodes/db-f/node.crt" >/dev/null
+  grep -Fq 'HETERONETWORK_DB_TOPOLOGY_REVISION=7' \
+    "$test_dir/generated-bundle/manifest.env"
+  members="${members},db-g=10.250.0.7"
+  proxy_backends="$members"
+  topology_revision="8"
+  extend_bundle "$test_dir/generated-bundle" >/dev/null 2>&1
+  openssl verify \
+    -CAfile "$test_dir/generated-bundle/ca/ca.crt" \
+    "$test_dir/generated-bundle/nodes/db-g/node.crt" >/dev/null
+  grep -Fq 'HETERONETWORK_DB_TOPOLOGY_REVISION=8' \
+    "$test_dir/generated-bundle/manifest.env"
+  members="${members%,db-g=10.250.0.7}"
+  proxy_backends="$members"
+  topology_revision="7"
   if (
     members="db-a=10.250.0.1,db-a=10.250.0.2,db-c=10.250.0.3"
     member_rows >/dev/null 2>&1
   ); then
     die "duplicate member self-test unexpectedly succeeded"
   fi
+  if (
+    dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4"
+    dcs_initial_cluster_state="new"
+    validate_common_config >/dev/null 2>&1
+  ); then
+    die "even DCS member count self-test unexpectedly succeeded"
+  fi
+  if (
+    dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-z=10.250.0.99"
+    validate_common_config >/dev/null 2>&1
+  ); then
+    die "DCS member outside the database set self-test unexpectedly succeeded"
+  fi
+  node_name="db-f"
+  node_address="10.250.0.6"
+  render_patroni_service >"$test_dir/non-voter.service"
+  if grep -Fq 'heteronetwork-db-dcs.service' "$test_dir/non-voter.service"; then
+    die "non-voter Patroni service unexpectedly depends on the local DCS service"
+  fi
 
   members="$original_members"
+  dcs_members="$original_dcs_members"
+  dcs_initial_cluster_state="$original_dcs_initial_cluster_state"
+  topology_revision="$original_topology_revision"
   proxy_backends="$original_proxy_backends"
   node_name="$original_node_name"
   node_address="$original_node_address"
@@ -1041,8 +1483,25 @@ case "${1:-}" in
     shift
     init_bundle "${1:-}"
     ;;
+  extend-bundle)
+    shift
+    extend_bundle "${1:-}"
+    ;;
+  validate-bundle)
+    shift
+    validate_bundle "${1:-}"
+    ;;
   install-node)
     install_node
+    ;;
+  reconfigure-node)
+    reconfigure_node
+    ;;
+  reconcile-dcs)
+    reconcile_dcs
+    ;;
+  reconcile-patroni)
+    reconcile_patroni_config
     ;;
   install-proxy)
     install_proxy
