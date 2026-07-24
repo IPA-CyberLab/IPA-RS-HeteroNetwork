@@ -2474,7 +2474,9 @@ impl AgentRuntime {
                 .pin_peer(record.key.remote.clone());
         }
         let path_changed = path_change_event(previous.as_ref(), &record);
-        let should_report_path_change = path_changed.is_some();
+        let should_report_path_change = path_changed
+            .as_ref()
+            .is_some_and(|event| event.kind != PathChangeKind::ScoreChanged);
         if let Some(event) = path_changed {
             let mut events = self.path_change_events.write().await;
             if events.len() >= MAX_PATH_CHANGE_EVENTS {
@@ -3268,7 +3270,12 @@ fn path_change_event(
             PathChangeKind::StateChanged
         }
         Some(previous) if previous.relay_node != current.relay_node => PathChangeKind::RelayChanged,
-        Some(previous) if previous.selected_candidate != current.selected_candidate => {
+        Some(previous)
+            if !selected_candidate_path_identity_eq(
+                previous.selected_candidate.as_ref(),
+                current.selected_candidate.as_ref(),
+            ) =>
+        {
             PathChangeKind::CandidateChanged
         }
         Some(previous) if previous.score != current.score => PathChangeKind::ScoreChanged,
@@ -3288,6 +3295,24 @@ fn path_change_event(
         new_score: current.score.clone(),
         changed_at: current.updated_at,
     })
+}
+
+fn selected_candidate_path_identity_eq(
+    left: Option<&EndpointCandidate>,
+    right: Option<&EndpointCandidate>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.node_id == right.node_id
+                && left.kind == right.kind
+                && left.addr == right.addr
+                && left.priority == right.priority
+                && left.cost == right.cost
+                && left.source == right.source
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8032,6 +8057,75 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn path_lease_and_score_refreshes_do_not_wake_heartbeat() -> Result<(), AgentError> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        let peer = NodeId::from_string("peer-a");
+        let heartbeat_notify = runtime.heartbeat_report_notifier();
+        let mut first = path("peer-a", PathState::DirectNatTraversal, 100.0);
+        first.key.local = local;
+        first.selected_candidate = Some(reflexive_candidate(
+            &peer,
+            SocketAddr::from(([8, 8, 8, 8], 51820)),
+        ));
+
+        runtime.upsert_path_state(first.clone()).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), heartbeat_notify.notified())
+                .await
+                .is_ok()
+        );
+
+        let mut lease_refreshed = first.clone();
+        lease_refreshed
+            .selected_candidate
+            .as_mut()
+            .expect("test candidate")
+            .observed_at += ChronoDuration::seconds(30);
+        lease_refreshed.updated_at += ChronoDuration::seconds(30);
+        runtime.upsert_path_state(lease_refreshed.clone()).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
+                .await
+                .is_err()
+        );
+
+        let mut score_refreshed = lease_refreshed.clone();
+        score_refreshed.score.value = 101.0;
+        score_refreshed.updated_at += ChronoDuration::seconds(1);
+        runtime.upsert_path_state(score_refreshed.clone()).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
+                .await
+                .is_err()
+        );
+
+        let mut endpoint_changed = score_refreshed;
+        endpoint_changed
+            .selected_candidate
+            .as_mut()
+            .expect("test candidate")
+            .addr = SocketAddr::from(([8, 8, 4, 4], 51820));
+        endpoint_changed.updated_at += ChronoDuration::seconds(1);
+        runtime.upsert_path_state(endpoint_changed).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), heartbeat_notify.notified())
+                .await
+                .is_ok()
+        );
+
+        let events = runtime.path_change_events().await;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, PathChangeKind::Created);
+        assert_eq!(events[1].kind, PathChangeKind::ScoreChanged);
+        assert_eq!(events[2].kind, PathChangeKind::CandidateChanged);
         Ok(())
     }
 
