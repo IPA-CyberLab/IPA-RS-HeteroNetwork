@@ -356,11 +356,13 @@ then verify through every replica:
 sudo env \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN=github-login \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID=12345678 \
+  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES=console-admin \
   scripts/keycloak-github-idp.sh configure
 
 sudo env \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN=github-login \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID=12345678 \
+  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES=console-admin \
   scripts/keycloak-github-idp.sh verify
 ```
 
@@ -371,7 +373,9 @@ first-broker-login flow that always denies unlinked identities. Destroy the
 one-time bootstrap directory after every replica passes verification. Callback
 URLs on public addresses must use HTTPS. The helper permits HTTP only for a
 literal loopback, RFC1918, CGNAT, or link-local address on a trusted operator
-network.
+network. `HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES` is an optional
+comma-separated allowlist of existing realm roles to ensure on the linked user;
+it never removes unrelated role assignments.
 
 When a Control Plane cannot reach the public Keycloak address through NAT
 hairpinning, keep `HETERONETWORK_WEB_OIDC_ISSUER_URL` public and set

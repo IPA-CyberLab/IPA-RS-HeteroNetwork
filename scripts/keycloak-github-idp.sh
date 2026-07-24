@@ -20,10 +20,12 @@ github_client_id_file="${HETERONETWORK_KEYCLOAK_GITHUB_CLIENT_ID_FILE:-/etc/hete
 github_client_secret_file="${HETERONETWORK_KEYCLOAK_GITHUB_CLIENT_SECRET_FILE:-/etc/heteronetwork/keycloak/github-client.secret}"
 github_allowed_login="${HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN:-$DEFAULT_ALLOWED_LOGIN}"
 github_allowed_user_id="${HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID:-}"
+github_realm_roles_csv="${HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES:-}"
 idp_alias="${HETERONETWORK_KEYCLOAK_GITHUB_IDP_ALIAS:-$DEFAULT_IDP_ALIAS}"
 flow_alias="${HETERONETWORK_KEYCLOAK_GITHUB_FLOW_ALIAS:-$DEFAULT_FLOW_ALIAS}"
 kcadm_path="${HETERONETWORK_KEYCLOAK_KCADM_PATH:-/opt/heteronetwork/keycloak/bin/kcadm.sh}"
 kcadm_config=""
+declare -a github_realm_roles=()
 
 usage() {
   cat <<'EOF'
@@ -45,6 +47,7 @@ Optional environment:
   HETERONETWORK_KEYCLOAK_GITHUB_CLIENT_ID_FILE
   HETERONETWORK_KEYCLOAK_GITHUB_CLIENT_SECRET_FILE
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN
+  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES
   HETERONETWORK_KEYCLOAK_GITHUB_IDP_ALIAS
   HETERONETWORK_KEYCLOAK_GITHUB_FLOW_ALIAS
   HETERONETWORK_KEYCLOAK_KCADM_PATH
@@ -83,6 +86,24 @@ validate_github_user_id() {
   [[ "$1" =~ ^[1-9][0-9]{0,19}$ ]]
 }
 
+parse_github_realm_roles() {
+  local role
+  local -A seen=()
+  local -a candidates=()
+  github_realm_roles=()
+  [[ -n "$github_realm_roles_csv" ]] || return
+  IFS=, read -r -a candidates <<<"$github_realm_roles_csv"
+  ((${#candidates[@]} <= 64)) \
+    || die "HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES has more than 64 entries"
+  for role in "${candidates[@]}"; do
+    validate_safe_name "$role" "HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES entry"
+    [[ -z "${seen[$role]:-}" ]] \
+      || die "HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES contains a duplicate role"
+    seen["$role"]=1
+    github_realm_roles+=("$role")
+  done
+}
+
 validate_server_url() {
   [[ "$server_url" =~ ^https?://(127\.0\.0\.1|\[::1\]|localhost)(:[0-9]{1,5})?$ ]] \
     || die "HETERONETWORK_KEYCLOAK_SERVER_URL must use a loopback host"
@@ -119,6 +140,7 @@ validate_runtime_config() {
     || die "HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN is not a valid GitHub login"
   validate_github_user_id "$github_allowed_user_id" \
     || die "HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID must be a positive numeric GitHub user ID"
+  parse_github_realm_roles
   [[ -x "$kcadm_path" ]] || die "kcadm is not executable: $kcadm_path"
   validate_secret_file \
     "$admin_password_file" "HETERONETWORK_KEYCLOAK_ADMIN_PASSWORD_FILE"
@@ -221,6 +243,25 @@ ensure_allowed_user() {
     die "multiple realm users have username $github_allowed_login"
   fi
   printf '%s' "$user_id"
+}
+
+ensure_allowed_realm_roles() {
+  local user_id="$1" available current role count representation
+  ((${#github_realm_roles[@]} > 0)) || return
+  available="$(kc get roles -r "$realm")"
+  current="$(kc get "users/$user_id/role-mappings/realm" -r "$realm")"
+  for role in "${github_realm_roles[@]}"; do
+    count="$(jq --arg role "$role" '[.[] | select(.name == $role)] | length' \
+      <<<"$available")"
+    [[ "$count" == "1" ]] || die "required realm role is missing or duplicated: $role"
+    if ! jq -e --arg role "$role" '.[] | select(.name == $role)' \
+      >/dev/null <<<"$current"; then
+      representation="$(jq --arg role "$role" \
+        '[.[] | select(.name == $role) | {id, name}]' <<<"$available")"
+      kc_with_json create "users/$user_id/role-mappings/realm" \
+        "$representation" >/dev/null
+    fi
+  done
 }
 
 render_identity_provider() {
@@ -335,7 +376,7 @@ ensure_allowed_github_link() {
 
 verify_configuration() {
   local expected_client_id providers flows executions users user_id links
-  local all_users linked_count
+  local all_users linked_count realm_roles role
   expected_client_id="$(read_single_line_file \
     "$github_client_id_file" "HETERONETWORK_KEYCLOAK_GITHUB_CLIENT_ID_FILE")"
   providers="$(kc get identity-provider/instances -r "$realm")"
@@ -394,6 +435,15 @@ verify_configuration() {
       .userName == $username
     )' >/dev/null <<<"$links" || die "allowed GitHub identity link is missing"
 
+  if ((${#github_realm_roles[@]} > 0)); then
+    realm_roles="$(kc get "users/$user_id/role-mappings/realm" -r "$realm")"
+    for role in "${github_realm_roles[@]}"; do
+      jq -e --arg role "$role" '.[] | select(.name == $role)' \
+        >/dev/null <<<"$realm_roles" \
+        || die "allowed GitHub realm user is missing required role: $role"
+    done
+  fi
+
   all_users="$(kc get users -r "$realm" \
     -q "max=$((MAX_REALM_USERS + 1))" -q briefRepresentation=true)"
   (($(jq 'length' <<<"$all_users") <= MAX_REALM_USERS)) \
@@ -433,6 +483,7 @@ configure() {
   login_admin
   ensure_deny_flow
   user_id="$(ensure_allowed_user)"
+  ensure_allowed_realm_roles "$user_id"
   ensure_identity_provider
   remove_other_github_links "$user_id"
   ensure_allowed_github_link "$user_id"
@@ -454,6 +505,10 @@ self_test() {
   ! validate_github_login "invalid-" || die "invalid GitHub login was accepted"
   validate_github_user_id "97249122" || die "valid GitHub user ID was rejected"
   ! validate_github_user_id "0" || die "invalid GitHub user ID was accepted"
+  github_realm_roles_csv="kakurizai-admin,kakurizai-operator"
+  parse_github_realm_roles
+  [[ "${github_realm_roles[*]}" == "kakurizai-admin kakurizai-operator" ]] \
+    || die "GitHub realm role parsing failed"
   rendered="$(render_identity_provider "Iv1.0123456789abcdef" \
     "0123456789abcdef0123456789abcdef01234567")"
   jq -e \
