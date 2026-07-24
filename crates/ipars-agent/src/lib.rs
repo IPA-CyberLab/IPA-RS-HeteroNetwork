@@ -2678,13 +2678,17 @@ impl AgentRuntime {
         self.peer_activity_record_count
             .fetch_add(1, Ordering::Relaxed);
         let mut lazy_connect = self.lazy_connect.write().await;
+        let was_active = lazy_connect.last_used.contains_key(&peer);
+        let was_pinned = lazy_connect.is_pinned(&peer);
         lazy_connect.record_activity(peer.clone(), at);
         if pin {
             lazy_connect.pin_peer(peer.clone());
         }
         let pinned = lazy_connect.is_pinned(&peer);
         drop(lazy_connect);
-        self.request_lazy_connect_sync();
+        if !was_active || (pinned && !was_pinned) {
+            self.request_lazy_connect_sync();
+        }
         pinned
     }
 
@@ -7368,6 +7372,77 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_local_activity_coalesces_immediate_sync() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-a");
+        let observed_at = Utc::now();
+        let signal_notify = runtime.signal_path_notifier();
+        let heartbeat_notify = runtime.heartbeat_report_notifier();
+
+        assert!(
+            !runtime
+                .record_peer_activity(peer_id.clone(), observed_at, false)
+                .await
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal_notify.notified())
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), heartbeat_notify.notified())
+                .await
+                .is_ok()
+        );
+
+        let refreshed_at = observed_at + ChronoDuration::milliseconds(1);
+        assert!(
+            !runtime
+                .record_peer_activity(peer_id.clone(), refreshed_at, false)
+                .await
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), signal_notify.notified())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_notify.notified())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .recent_local_peer_activity(&peer_id, refreshed_at)
+                .await,
+            Some(refreshed_at)
+        );
+
+        assert!(
+            runtime
+                .record_peer_activity(
+                    peer_id,
+                    refreshed_at + ChronoDuration::milliseconds(1),
+                    true,
+                )
+                .await
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal_notify.notified())
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), heartbeat_notify.notified())
+                .await
+                .is_ok()
         );
     }
 

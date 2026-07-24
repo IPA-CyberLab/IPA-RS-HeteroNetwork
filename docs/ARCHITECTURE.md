@@ -85,8 +85,11 @@ An accepted heartbeat is one durable per-node transaction: endpoint candidates, 
 
 Connection intents returned by a heartbeat wake peer-map and Signal path
 reconciliation but do not trigger another immediate heartbeat. Only local
-activity and locally selected path changes request an early report, preventing
-remote intent timestamps from forming a Control Plane feedback loop.
+idle-to-active or pin transitions and locally selected path changes request an
+early report. Repeated packets refresh the idle timestamp and are included in
+the next periodic heartbeat without waking another cycle, preventing both
+remote intent timestamps and busy flows from forming a Control Plane feedback
+loop.
 
 Each public Control Plane renews a bounded lease in the shared store for its Control Plane, Signal, STUN, and Relay endpoints. Every Control Plane aggregates unexpired leases deterministically and returns the active directory with registration, heartbeat, and peer-map responses. Agents atomically persist that directory, prefer it for later Control Plane and Signal requests and STUN discovery, skip an unavailable STUN DNS/socket endpoint when another one resolves, and retain the original signed token endpoints as last-resort seeds. For Internet NAT discovery, an Agent uses only directory STUN addresses that are globally routable. If the directory contains only private, link-local, documentation, or shared `100.64.0.0/10` addresses, the default Agent resolves the configurable public STUN fallback URLs instead of mixing observations from different routing domains; `--disable-public-stun-fallback` retains private-only lab behavior. Explicit `--stun-server` values remain an operator override. `ipars token create --service-directory-url` reads the operator-authenticated directory and refuses to mint a normal HA token until at least two Control Plane, Signal, and STUN endpoints are active, plus two Relay endpoints when relay use is allowed. This invariant permits a token containing only an initially reachable node to discover the cluster before that node fails, and lets a token minted from the live directory bootstrap directly after the failure.
 
