@@ -8764,7 +8764,11 @@ async fn run_agent(
             .with_control_plane_http_client(http_client, agent_http_request_timeout(&args))
             .enable_local_web_ui(args.listen.ip().is_loopback());
     if let Some((token, status)) = public_web_gateway {
-        http_state = http_state.with_public_web_gateway(token, status);
+        http_state = http_state.with_public_web_gateway(
+            token,
+            status,
+            args.public_web_gateway_oidc_upstream.is_some(),
+        );
     }
     if !args.listen.ip().is_loopback() {
         tracing::warn!(

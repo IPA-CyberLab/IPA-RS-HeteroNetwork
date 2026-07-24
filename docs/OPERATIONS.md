@@ -268,7 +268,10 @@ address.
 The generated node installer starts `heteronetwork-gateway.service` with a
 checksum-pinned Caddy 2.11.4 binary. Keep inbound TCP 80 and 443 available on nodes
 that may become public and allow outbound ACME traffic. The service starts with
-no public listener. Fresh public STUN classification causes the Agent to load
+no public listener and is a required dependency of the Agent on every installed
+node, so a missing Gateway runtime is detected as installation drift instead of
+silently removing a globally reachable node from the public pool. Fresh public
+STUN classification causes the Agent to load
 an `https://IP/` configuration through the protected Unix admin socket;
 private/stale classification removes it. Inspect the current phase in the Web
 UI endpoint control or with
@@ -294,6 +297,13 @@ either the UI or OIDC discovery probe fails. The public Agent response rewrites
 Keycloak endpoint origins to the current gateway IP while preserving realm
 paths. Control Plane reachability checks follow that discovery URL and verify
 the returned issuer before renewing the gateway lease.
+
+When a node has no local OIDC upstream, its public Web UI keeps the reachable
+Keycloak origins learned from the HA Control Plane directory instead of
+rewriting them to an OIDC route the node does not serve. Device authorization
+and token polling still fail over across those provider origins. This lets the
+same dormant Gateway runtime run on every node without assigning a permanent
+identity-provider role to every node that temporarily gains a public address.
 
 Install each Keycloak replica with `scripts/keycloak-ha-node.sh install` after
 `heteronetwork-db-proxy.service` is active. The script pins the Keycloak archive

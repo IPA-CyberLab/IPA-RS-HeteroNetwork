@@ -2210,7 +2210,8 @@ GATEWAY_UNIT
 cat >/etc/systemd/system/heteronetwork-agent.service <<'UNIT'
 [Unit]
 Description=HeteroNetwork Agent
-Wants=network-online.target heteronetwork-gateway.service
+Wants=network-online.target
+Requires=heteronetwork-gateway.service
 After=network-online.target heteronetwork-gateway.service
 
 [Service]
@@ -4376,6 +4377,7 @@ mod tests {
         assert!(script.contains("--packet-flow-detector conntrack-netlink-events"));
         assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
         assert!(script.contains("heteronetwork-gateway.service"));
+        assert!(script.contains("Requires=heteronetwork-gateway.service"));
         assert!(script.contains("systemd-sysusers"));
         assert!(script.contains("User=heteronetwork-gateway"));
         assert!(script.contains("SupplementaryGroups=heteronetwork-gateway"));

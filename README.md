@@ -120,7 +120,10 @@ realm discovery path in
 and static-resource paths are exposed. The gateway lease is withdrawn if
 either the UI or OIDC discovery probe fails. The Agent rewrites Keycloak URLs
 in its public `/ui/config` response to the active gateway origin, so a gateway
-can use any healthy Control Plane without returning another node's issuer.
+can use any healthy Control Plane without returning another node's issuer. A
+node without a local OIDC upstream keeps the HA directory's reachable Keycloak
+origins instead; it can therefore enter or leave the public Gateway pool
+without being assigned a permanent identity-provider role.
 
 `scripts/keycloak-ha-node.sh` installs a native Keycloak replica backed by the
 shared PostgreSQL HA service and a private HAProxy backchannel. Set

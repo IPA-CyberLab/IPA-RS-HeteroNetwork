@@ -134,6 +134,7 @@ impl Default for PublicWebGatewayStatus {
 struct PublicWebGatewayAccess {
     token: Arc<str>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
+    oidc_proxy_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +151,7 @@ impl std::fmt::Debug for PublicWebGatewayAccess {
             .debug_struct("PublicWebGatewayAccess")
             .field("token", &"[REDACTED]")
             .field("status", &self.status)
+            .field("oidc_proxy_enabled", &self.oidc_proxy_enabled)
             .finish()
     }
 }
@@ -234,10 +236,12 @@ impl AgentHttpState {
         mut self,
         token: String,
         status: Arc<StdRwLock<PublicWebGatewayStatus>>,
+        oidc_proxy_enabled: bool,
     ) -> Self {
         self.public_web_gateway = Some(PublicWebGatewayAccess {
             token: Arc::from(token),
             status,
+            oidc_proxy_enabled,
         });
         self
     }
@@ -1645,7 +1649,12 @@ async fn local_ui_config(
     let is_public_gateway = public_gateway.is_some();
     match select_healthy_web_ui_with_scope(&state, is_public_gateway).await {
         Ok((candidate, mut config)) => {
-            if is_public_gateway {
+            if is_public_gateway
+                && state
+                    .public_web_gateway
+                    .as_ref()
+                    .is_some_and(|access| access.oidc_proxy_enabled)
+            {
                 let public_url = state
                     .public_web_gateway
                     .as_ref()
@@ -3966,7 +3975,7 @@ mod tests {
         }));
         let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
             .enable_local_web_ui(true)
-            .with_public_web_gateway("gateway-secret".to_string(), status);
+            .with_public_web_gateway("gateway-secret".to_string(), status, true);
         let candidates = web_ui_candidates(&state);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].url, backend_url);
@@ -4095,6 +4104,57 @@ mod tests {
             )
             .await?;
         assert_eq!(loopback_asset.status(), StatusCode::OK);
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_gateway_without_oidc_proxy_preserves_provider_origins(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let status = Arc::new(StdRwLock::new(PublicWebGatewayStatus {
+            phase: PublicWebGatewayPhase::Ready,
+            public_ip: Some("203.0.113.10".parse()?),
+            url: Some("https://203.0.113.10/".to_string()),
+            last_error: None,
+            updated_at: Utc::now(),
+        }));
+        let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
+            .enable_local_web_ui(true)
+            .with_public_web_gateway("gateway-secret".to_string(), status, false);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/config")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let config: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        let expected_issuer = format!("{backend_url}/realms/heteronetwork");
+        let expected_token_endpoint =
+            format!("{backend_url}/realms/heteronetwork/protocol/openid-connect/token");
+        assert_eq!(
+            config.get("issuer_url").and_then(Value::as_str),
+            Some(expected_issuer.as_str())
+        );
+        assert_eq!(
+            config.get("token_endpoint").and_then(Value::as_str),
+            Some(expected_token_endpoint.as_str())
+        );
+        assert_eq!(
+            config.get("device_login_endpoint").and_then(Value::as_str),
+            Some("/v1/web-ui/auth/device")
+        );
         backend_task.abort();
         Ok(())
     }
