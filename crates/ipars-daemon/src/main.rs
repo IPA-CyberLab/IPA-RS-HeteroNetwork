@@ -14317,7 +14317,17 @@ async fn negotiate_signal_paths(
             path_observation,
         )?;
         let (signal_url, response) =
-            send_signal_path_request_to_signal_services(client, signal_urls, request).await?;
+            match send_signal_path_request_to_signal_services(client, signal_urls, request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        peer = %peer.node_id,
+                        "failed to negotiate signal path for peer; continuing with remaining peers"
+                    );
+                    continue;
+                }
+            };
         let mut relay_candidates = selected_relay_candidates(&response);
         promote_active_relay_candidate(runtime, &peer.node_id, &mut relay_candidates).await;
         let candidate_record = signal_path_record_with_local_candidates(
@@ -34222,6 +34232,116 @@ exec sleep 60
         assert_eq!(accepted.relay_node, NodeId::from_string("relay-secure"));
         assert_eq!(accepted.session_id, "local:peer-a");
         relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_negotiation_continues_after_one_peer_is_rejected() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let local = runtime.state().node_id;
+        runtime
+            .replace_candidates(vec![EndpointCandidate {
+                node_id: local.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([198, 51, 100, 10], 40_000)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }])
+            .await;
+
+        let mut rejected_peer = node_record("peer-a");
+        rejected_peer.endpoint_candidates =
+            vec![candidate("peer-a", EndpointCandidateKind::PublicUdp, 10)];
+        let mut accepted_peer = node_record("peer-b");
+        accepted_peer.endpoint_candidates =
+            vec![candidate("peer-b", EndpointCandidateKind::PublicUdp, 10)];
+        for peer in [&rejected_peer, &accepted_peer] {
+            runtime
+                .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
+                .await;
+        }
+
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers: vec![rejected_peer.clone(), accepted_peer.clone()],
+            bootstrap_endpoints: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        let (control_plane_base, control_plane_task) =
+            spawn_test_http_service(Router::new().route(
+                "/v1/peers/query",
+                axum::routing::post(move || async move { axum::Json(peer_map.clone()) }),
+            ))
+            .await?;
+        let (signal_base, signal_task) = spawn_test_http_service(Router::new().route(
+            "/v1/paths/negotiate",
+            axum::routing::post(
+                |axum::Json(request): axum::Json<AuthenticatedSignalPathRequest>| async move {
+                    if request.request.target.as_str() == "peer-a" {
+                        return Err((
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({"error": "rejected peer"})),
+                        ));
+                    }
+                    Ok(axum::Json(SignalPathResponse {
+                        key: PeerPathKey::new(
+                            request.request.source,
+                            request.request.target.clone(),
+                        ),
+                        target_candidates: vec![candidate(
+                            request.request.target.as_str(),
+                            EndpointCandidateKind::PublicUdp,
+                            10,
+                        )],
+                        relay_candidates: Vec::new(),
+                        preferred_state: PathState::DirectPublic,
+                        score: PathScore {
+                            value: 100.0,
+                            reasons: Vec::new(),
+                        },
+                    }))
+                },
+            ),
+        ))
+        .await?;
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            &[control_plane_base],
+            &[signal_base],
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &SignalPathNegotiationOptions {
+                relay_forwarder_supervisor: None,
+                relay_admission_bearer_token: None,
+                relay_session_renew_before: Duration::from_secs(30),
+                wireguard_peer_telemetry_source: None,
+                direct_path_data_plane_probe: None,
+                direct_path_probe_timeout: Duration::from_secs(120),
+                direct_handshake_max_age: Duration::from_secs(180),
+                peer_probe_observation_max_age: Duration::from_secs(120),
+                interval: Duration::from_secs(1),
+            },
+        )
+        .await?;
+
+        assert!(runtime
+            .path_record_for_peer(&rejected_peer.node_id)
+            .await
+            .is_none());
+        let accepted = runtime
+            .path_record_for_peer(&accepted_peer.node_id)
+            .await
+            .context("the peer after a rejected peer should still be negotiated")?;
+        assert_eq!(accepted.selected_state, PathState::DirectPublic);
+
+        signal_task.abort();
+        control_plane_task.abort();
         Ok(())
     }
 

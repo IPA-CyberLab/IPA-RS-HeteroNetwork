@@ -106,6 +106,20 @@ local_vpn_ip() {
 }
 
 peer_autopilot_is_ready() {
+  curl -fsS --connect-timeout 2 --max-time 5 \
+    --header "Content-Type: application/json" \
+    --data "$(
+      jq -cn --arg destination "$1" --argjson port "$BUNDLE_PORT" '{
+        destination: $destination,
+        pin: false,
+        protocol: "tcp",
+        destination_port: $port,
+        detector: "postgres-autopilot",
+        application: "http",
+        tcp_state: "syn_sent"
+      }'
+    )" \
+    "$agent_api_url/v1/packet-flow" >/dev/null 2>&1 || true
   curl --config "$curl_config_path" \
     "http://$1:${BUNDLE_PORT}/health" >/dev/null 2>&1
 }
