@@ -19,6 +19,7 @@ bundle_archive="$state_dir/bundle.tar.gz"
 eligible_path="$state_dir/eligible.tsv"
 applied_revision_path="$state_dir/applied-revision"
 curl_config_path="$state_dir/curl.conf"
+legacy_database_service_path="${HETERONETWORK_DB_LEGACY_SERVICE_PATH:-/etc/systemd/system/heteronetwork-db.service}"
 
 log() {
   printf 'heteronetwork-postgres-autopilot: %s\n' "$*"
@@ -85,6 +86,10 @@ EOF
 
 agent_is_ready() {
   curl -fsS --connect-timeout 2 --max-time 5 "$agent_api_url/healthz" >/dev/null 2>&1
+}
+
+unmanaged_legacy_database_exists() {
+  [[ -f "$legacy_database_service_path" && ! -d "$bundle_dir" ]]
 }
 
 read_agent_status() {
@@ -644,6 +649,10 @@ reconcile_as_coordinator() {
 reconcile_once() {
   local local_ip
   local_ip="$(local_vpn_ip)"
+  if unmanaged_legacy_database_exists; then
+    log "existing database is not managed by autopilot; refusing a new bootstrap"
+    return
+  fi
   start_bundle_server "$local_ip"
   write_eligible_snapshot
   download_best_bundle
@@ -716,11 +725,18 @@ self_test() {
   bundle_archive="$state_dir/bundle.tar.gz"
   applied_revision_path="$state_dir/applied-revision"
   install -d -m 0700 "$state_dir"
+  legacy_database_service_path="$temporary/heteronetwork-db.service"
   HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN="$(printf 'a%.0s' {1..64})"
   HETERONETWORK_DB_CLUSTER_ID="cluster-test"
   HETERONETWORK_DB_LOCAL_ROLE="worker"
   reconcile_interval_seconds=30
   validate_config
+  touch "$legacy_database_service_path"
+  unmanaged_legacy_database_exists
+  rm -f "$legacy_database_service_path"
+  if unmanaged_legacy_database_exists; then
+    die "legacy database guard remained active without a service"
+  fi
   eligible_path="$temporary/eligible.tsv"
   printf '10.250.0.10\tnode-c\n10.250.0.2\tnode-a\n10.250.0.3\tnode-b\n' \
     | LC_ALL=C sort -V >"$eligible_path"

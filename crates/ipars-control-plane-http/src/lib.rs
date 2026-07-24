@@ -4339,15 +4339,11 @@ mod tests {
         assert!(!kubernetes_script.contains("KUBERNETES_HA_SETUP_TAG_PREFIX"));
         let database_bearer = generated_script
             .lines()
-            .find_map(|line| {
-                line.strip_prefix("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN=")
-            })
+            .find_map(|line| line.strip_prefix("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN="))
             .ok_or("standard enrollment omitted the database autopilot bearer")?;
         let kubernetes_database_bearer = kubernetes_script
             .lines()
-            .find_map(|line| {
-                line.strip_prefix("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN=")
-            })
+            .find_map(|line| line.strip_prefix("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN="))
             .ok_or("Kubernetes enrollment omitted the database autopilot bearer")?;
         assert_eq!(database_bearer, kubernetes_database_bearer);
         assert_eq!(database_bearer.len(), 64);
