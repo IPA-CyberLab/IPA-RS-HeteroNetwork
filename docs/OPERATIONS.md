@@ -324,7 +324,9 @@ Install each Keycloak replica with `scripts/keycloak-ha-node.sh install` after
 `heteronetwork-db-proxy.service` is active. The script pins the Keycloak archive
 checksum, binds application HTTP to loopback, uses the HeteroNetwork address for
 JGroups, and stores runtime secrets in owner-restricted files. Its private
-HAProxy listener accepts only RFC1918 or CGNAT addresses:
+HAProxy listener stops and starts with the Agent so an overlay restart cannot
+leave the Keycloak backchannel offline. It accepts only RFC1918 or CGNAT
+addresses:
 
 ```bash
 sudo env \

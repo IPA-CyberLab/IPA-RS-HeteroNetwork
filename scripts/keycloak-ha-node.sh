@@ -176,6 +176,7 @@ Description=HeteroNetwork Keycloak private backchannel
 Wants=network-online.target heteronetwork-keycloak.service
 After=network-online.target heteronetwork-agent.service heteronetwork-keycloak.service
 Requires=heteronetwork-agent.service
+PartOf=heteronetwork-agent.service
 
 [Service]
 Type=notify
@@ -203,7 +204,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target heteronetwork-agent.service
 EOF
 }
 
