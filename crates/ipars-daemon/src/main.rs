@@ -4521,7 +4521,8 @@ where
                 Duration::from_secs(args.dynamic_web_gateway_probe_timeout_seconds),
                 Duration::from_secs(args.dynamic_web_gateway_lease_ttl_seconds),
                 Duration::from_secs(args.dynamic_web_gateway_classification_max_age_seconds),
-            )
+            )?
+            .with_trusted_oidc_issuer(args.web_oidc_issuer_url.clone())
         })
         .transpose()
         .map_err(anyhow::Error::msg)

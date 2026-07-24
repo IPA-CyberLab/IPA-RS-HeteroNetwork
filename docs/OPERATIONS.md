@@ -307,6 +307,9 @@ rewriting them to an OIDC route the node does not serve. Device authorization
 and token polling still fail over across those provider origins. This lets the
 same dormant Gateway runtime run on every node without assigning a permanent
 identity-provider role to every node that temporarily gains a public address.
+The Control Plane probes a cross-origin Keycloak issuer only when it exactly
+matches its configured `HETERONETWORK_WEB_OIDC_ISSUER_URL`; arbitrary issuer
+origins reported by a gateway are rejected.
 
 If a public node also runs a Control Plane virtual host on the same TCP 443
 address, set

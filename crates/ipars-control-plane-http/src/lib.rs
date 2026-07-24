@@ -297,6 +297,7 @@ pub struct DynamicWebGatewayConfig {
     probe_timeout: Duration,
     lease_ttl: ChronoDuration,
     classification_max_age: ChronoDuration,
+    trusted_oidc_issuer: Option<String>,
 }
 
 impl DynamicWebGatewayConfig {
@@ -324,7 +325,16 @@ impl DynamicWebGatewayConfig {
             probe_timeout,
             lease_ttl,
             classification_max_age,
+            trusted_oidc_issuer: None,
         })
+    }
+
+    pub fn with_trusted_oidc_issuer(mut self, issuer: String) -> Result<Self, String> {
+        self.trusted_oidc_issuer = Some(validate_web_auth_base_url(
+            issuer,
+            "trusted OIDC issuer URL",
+        )?);
+        Ok(self)
     }
 }
 
@@ -2859,6 +2869,7 @@ fn dynamic_web_gateway_url(ip: std::net::IpAddr) -> String {
 fn dynamic_web_gateway_oidc_discovery(
     body: &Value,
     gateway_url: &str,
+    trusted_oidc_issuer: Option<&str>,
 ) -> Result<Option<(String, String)>, String> {
     if body.get("auth_enabled").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
@@ -2873,10 +2884,11 @@ fn dynamic_web_gateway_oidc_discovery(
         .ok_or_else(|| "UI config omitted the OIDC issuer".to_string())?;
     let gateway = Url::parse(gateway_url)
         .map_err(|error| format!("dynamic Web gateway URL is invalid: {error}"))?;
+    let issuer = issuer.trim_end_matches('/');
     let mut discovery =
         Url::parse(issuer).map_err(|error| format!("UI config OIDC issuer is invalid: {error}"))?;
-    if discovery.origin() != gateway.origin() {
-        return Err("UI config OIDC issuer uses a different origin".to_string());
+    if discovery.origin() != gateway.origin() && trusted_oidc_issuer != Some(issuer) {
+        return Err("UI config OIDC issuer is not trusted by this Control Plane".to_string());
     }
     if discovery.query().is_some() || discovery.fragment().is_some() {
         return Err("UI config OIDC issuer must not contain a query or fragment".to_string());
@@ -2886,10 +2898,7 @@ fn dynamic_web_gateway_oidc_discovery(
         discovery.path().trim_end_matches('/')
     );
     discovery.set_path(&path);
-    Ok(Some((
-        issuer.trim_end_matches('/').to_string(),
-        discovery.to_string(),
-    )))
+    Ok(Some((issuer.to_string(), discovery.to_string())))
 }
 
 async fn probe_dynamic_web_gateway(
@@ -2933,7 +2942,8 @@ async fn probe_dynamic_web_gateway(
     if body.get("cluster_id").and_then(Value::as_str) != Some(expected_cluster_id) {
         return Err("UI config belongs to a different cluster".to_string());
     }
-    if let Some((expected_issuer, discovery_url)) = dynamic_web_gateway_oidc_discovery(&body, url)?
+    if let Some((expected_issuer, discovery_url)) =
+        dynamic_web_gateway_oidc_discovery(&body, url, config.trusted_oidc_issuer.as_deref())?
     {
         let mut response = config
             .client
@@ -3744,14 +3754,14 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_web_gateway_oidc_probe_stays_on_the_gateway_origin() {
+    fn dynamic_web_gateway_oidc_probe_accepts_only_gateway_or_configured_issuer() {
         let authenticated = serde_json::json!({
             "auth_enabled": true,
             "provider": "keycloak",
             "issuer_url": "https://203.0.113.10/realms/kakurizai/"
         });
         assert_eq!(
-            dynamic_web_gateway_oidc_discovery(&authenticated, "https://203.0.113.10"),
+            dynamic_web_gateway_oidc_discovery(&authenticated, "https://203.0.113.10", None),
             Ok(Some((
                 "https://203.0.113.10/realms/kakurizai".to_string(),
                 "https://203.0.113.10/realms/kakurizai/.well-known/openid-configuration"
@@ -3764,13 +3774,27 @@ mod tests {
             "provider": "keycloak",
             "issuer_url": "https://idp.example/realms/kakurizai"
         });
-        assert!(
-            dynamic_web_gateway_oidc_discovery(&foreign_issuer, "https://203.0.113.10").is_err()
+        assert_eq!(
+            dynamic_web_gateway_oidc_discovery(
+                &foreign_issuer,
+                "https://203.0.113.10",
+                Some("https://idp.example/realms/kakurizai"),
+            ),
+            Ok(Some((
+                "https://idp.example/realms/kakurizai".to_string(),
+                "https://idp.example/realms/kakurizai/.well-known/openid-configuration".to_string(),
+            )))
         );
+        assert!(dynamic_web_gateway_oidc_discovery(
+            &foreign_issuer,
+            "https://203.0.113.10",
+            Some("https://other-idp.example/realms/kakurizai"),
+        )
+        .is_err());
 
         let unauthenticated = serde_json::json!({"auth_enabled": false});
         assert_eq!(
-            dynamic_web_gateway_oidc_discovery(&unauthenticated, "https://203.0.113.10"),
+            dynamic_web_gateway_oidc_discovery(&unauthenticated, "https://203.0.113.10", None,),
             Ok(None)
         );
 
@@ -3780,7 +3804,7 @@ mod tests {
             "issuer_url": "https://cognito-idp.example/pool"
         });
         assert_eq!(
-            dynamic_web_gateway_oidc_discovery(&external_provider, "https://203.0.113.10"),
+            dynamic_web_gateway_oidc_discovery(&external_provider, "https://203.0.113.10", None,),
             Ok(None)
         );
     }
