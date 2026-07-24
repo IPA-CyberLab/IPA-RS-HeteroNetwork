@@ -2810,6 +2810,8 @@ impl AgentRuntime {
             self.record_packet_flow_filtered(AgentPacketFlowDropReason::NoOverlayMatch);
             return None;
         };
+        let was_active = lazy_connect.last_used.contains_key(&matched.peer);
+        let was_pinned = lazy_connect.is_pinned(&matched.peer);
         lazy_connect.record_activity(matched.peer.clone(), at);
         if pin {
             lazy_connect.pin_peer(matched.peer.clone());
@@ -2817,7 +2819,9 @@ impl AgentRuntime {
         matched.pinned = lazy_connect.is_pinned(&matched.peer);
         self.packet_flow_match_count.fetch_add(1, Ordering::Relaxed);
         drop(lazy_connect);
-        self.request_lazy_connect_sync();
+        if !was_active || (matched.pinned && !was_pinned) {
+            self.request_lazy_connect_sync();
+        }
         Some(matched)
     }
 
@@ -11135,6 +11139,28 @@ mod tests {
         assert!(!vpn_ip_match.pinned);
         assert!(runtime.should_connect_peer(&peer_a).await);
 
+        let refreshed_at = Utc::now() + ChronoDuration::milliseconds(1);
+        runtime
+            .record_packet_flow_activity(peer_a.vpn_ip.0, refreshed_at, false)
+            .await
+            .ok_or_else(|| AgentError::MissingPeer(peer_a_id.clone()))?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), peer_map_sync.notified())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), heartbeat_report.notified())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .recent_local_peer_activity(&peer_a_id, refreshed_at)
+                .await,
+            Some(refreshed_at)
+        );
+
         let route_match = runtime
             .record_packet_flow_observation(
                 IpAddr::V4(Ipv4Addr::new(10, 42, 7, 25)),
@@ -12065,8 +12091,8 @@ mod tests {
         assert_eq!(metrics.lazy_connect.observed_route_count, 2);
         assert_eq!(metrics.lazy_connect.active_peer_count, 2);
         assert_eq!(metrics.lazy_connect.pinned_peer_count, 2);
-        assert_eq!(metrics.packet_flow_observation_count, 65);
-        assert_eq!(metrics.packet_flow_match_count, 63);
+        assert_eq!(metrics.packet_flow_observation_count, 66);
+        assert_eq!(metrics.packet_flow_match_count, 64);
         assert_eq!(metrics.packet_flow_unmatched_count, 2);
         let classification_count = |classification| {
             metrics
@@ -12078,7 +12104,7 @@ mod tests {
         };
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Unknown),
-            63
+            64
         );
         assert_eq!(
             classification_count(AgentPacketFlowClassification::Established),
@@ -12096,7 +12122,7 @@ mod tests {
                 .map(|entry| entry.count)
                 .unwrap_or(0)
         };
-        assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 3);
+        assert_eq!(application_count(AgentPacketFlowApplication::Unknown), 4);
         assert_eq!(application_count(AgentPacketFlowApplication::Dhcp), 2);
         assert_eq!(application_count(AgentPacketFlowApplication::Ike), 1);
         assert_eq!(application_count(AgentPacketFlowApplication::Ipsec), 3);
