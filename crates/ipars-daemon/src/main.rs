@@ -844,6 +844,8 @@ struct AgentArgs {
     public_web_gateway_oidc_upstream: Option<SocketAddr>,
     #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH")]
     public_web_gateway_oidc_probe_path: Option<String>,
+    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_HOST")]
+    public_web_gateway_oidc_host: Option<String>,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_HOST"
@@ -2015,6 +2017,20 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             ),
             (None, None) => {}
         }
+        if let Some(host) = args.public_web_gateway_oidc_host.as_deref() {
+            anyhow::ensure!(
+                args.public_web_gateway_oidc_upstream.is_some(),
+                "--public-web-gateway-oidc-host requires --public-web-gateway-oidc-upstream"
+            );
+            anyhow::ensure!(
+                valid_public_gateway_dns_hostname(host),
+                "--public-web-gateway-oidc-host must be a valid ASCII DNS hostname"
+            );
+            anyhow::ensure!(
+                args.public_web_gateway_control_plane_host.as_deref() != Some(host),
+                "--public-web-gateway-oidc-host must differ from --public-web-gateway-control-plane-host"
+            );
+        }
         match (
             args.public_web_gateway_control_plane_host.as_deref(),
             args.public_web_gateway_control_plane_upstream,
@@ -2063,6 +2079,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         anyhow::ensure!(
             args.public_web_gateway_oidc_upstream.is_none()
                 && args.public_web_gateway_oidc_probe_path.is_none()
+                && args.public_web_gateway_oidc_host.is_none()
                 && args.public_web_gateway_control_plane_host.is_none()
                 && args.public_web_gateway_control_plane_upstream.is_none(),
             "public Web gateway proxy options require --public-web-gateway-enabled=true"
@@ -8478,6 +8495,7 @@ async fn run_agent(
                     upstream: args.listen,
                     oidc_upstream: args.public_web_gateway_oidc_upstream,
                     oidc_probe_path: args.public_web_gateway_oidc_probe_path.clone(),
+                    oidc_host: args.public_web_gateway_oidc_host.clone(),
                     control_plane_host: args.public_web_gateway_control_plane_host.clone(),
                     control_plane_upstream: args.public_web_gateway_control_plane_upstream,
                     cluster_id: node.cluster_id.clone(),
@@ -12649,6 +12667,7 @@ struct PublicWebGatewayConfig {
     upstream: SocketAddr,
     oidc_upstream: Option<SocketAddr>,
     oidc_probe_path: Option<String>,
+    oidc_host: Option<String>,
     control_plane_host: Option<String>,
     control_plane_upstream: Option<SocketAddr>,
     cluster_id: ClusterId,
@@ -12700,6 +12719,7 @@ fn public_web_gateway_caddyfile(
     upstream: SocketAddr,
     proxy_token: &str,
     oidc_upstream: Option<SocketAddr>,
+    oidc_host: Option<&str>,
     control_plane_proxy: Option<(&str, SocketAddr)>,
 ) -> String {
     let mut caddyfile = format!(
@@ -12723,6 +12743,12 @@ fn public_web_gateway_caddyfile(
             caddyfile,
             "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{upstream} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {proxy_token}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
         );
+        if let (Some(oidc_upstream), Some(host)) = (oidc_upstream, oidc_host) {
+            let _ = writeln!(
+                caddyfile,
+                "\nhttps://{host} {{\n\tbind {public_ip}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@oidc path /realms/* /resources/* /robots.txt\n\thandle @oidc {{\n\t\treverse_proxy http://{oidc_upstream} {{\n\t\t\theader_up Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t\theader_up X-Forwarded-Port 443\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
+            );
+        }
         if let Some((host, control_plane_upstream)) = control_plane_proxy {
             let _ = writeln!(
                 caddyfile,
@@ -12747,6 +12773,7 @@ async fn load_public_web_gateway_caddyfile(
             config.upstream,
             &config.proxy_token,
             config.oidc_upstream,
+            config.oidc_host.as_deref(),
             config
                 .control_plane_host
                 .as_deref()
@@ -19216,7 +19243,8 @@ mod tests {
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
-        let standby = public_web_gateway_caddyfile(socket, None, upstream, "secret", None, None);
+        let standby =
+            public_web_gateway_caddyfile(socket, None, upstream, "secret", None, None, None);
         assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
         assert!(!standby.contains("secret"));
@@ -19227,6 +19255,7 @@ mod tests {
             upstream,
             "secret",
             Some(SocketAddr::from(([127, 0, 0, 1], 18080))),
+            Some("idp.203-0-113-10.sslip.io"),
             Some((
                 "hn.203-0-113-10.sslip.io",
                 SocketAddr::from(([10, 0, 0, 10], 18088)),
@@ -19242,6 +19271,7 @@ mod tests {
         assert!(public.contains("@oidc path /realms/* /resources/* /robots.txt"));
         assert!(public.contains("reverse_proxy http://127.0.0.1:18080"));
         assert!(public.contains("header_up X-Forwarded-Proto https"));
+        assert!(public.contains("https://idp.203-0-113-10.sslip.io"));
         assert!(public.contains("https://hn.203-0-113-10.sslip.io"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18088"));
         assert!(!public.contains("/metrics"));

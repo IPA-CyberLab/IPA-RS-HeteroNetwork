@@ -301,6 +301,22 @@ Keycloak endpoint origins to the current gateway IP while preserving realm
 paths. Control Plane reachability checks follow that discovery URL and verify
 the returned issuer before renewing the gateway lease.
 
+For a gateway without a colocated Keycloak process, install a loopback HA
+upstream across at least two private replicas:
+
+```bash
+sudo env \
+  HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS=10.250.0.4:18080,10.250.0.5:18080 \
+  scripts/keycloak-ha-node.sh install-edge-proxy
+```
+
+Point `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM` at
+`127.0.0.1:18080`. To serve a stable provider hostname on the same dynamic
+listener, set `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_HOST` to that exact
+DNS name. The Caddy route exposes only the bounded Keycloak paths and preserves
+the requested host and HTTPS forwarding headers; the loopback HAProxy accepts
+no public traffic and follows the Agent lifecycle.
+
 When a node has no local OIDC upstream, its public Web UI keeps the reachable
 Keycloak origins learned from the HA Control Plane directory instead of
 rewriting them to an OIDC route the node does not serve. Device authorization

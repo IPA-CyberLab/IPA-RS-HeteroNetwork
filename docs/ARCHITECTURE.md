@@ -114,10 +114,13 @@ include active `web_ui` leases as artifact-download fallbacks, allowing a new
 node to fetch the token-protected installer and binary through any surviving
 public gateway. A Control Plane accepts an external OIDC issuer reported by a
 gateway only when it exactly matches that Control Plane's configured issuer;
-same-origin gateway proxies remain valid. A node that separately hosts a
-Control Plane can opt into an exact DNS virtual host on the same Caddy listener;
-that explicit application role is independent of automatic public-IP
-classification and is absent from ordinary node installations.
+same-origin gateway proxies remain valid. A public node without a local
+identity-provider process can use a loopback HAProxy across private Keycloak
+replicas and expose either its dynamic IP origin or an exact provider DNS name.
+A node that separately hosts a Control Plane can opt into an exact DNS virtual
+host on the same Caddy listener; that explicit application role is independent
+of automatic public-IP classification and is absent from ordinary node
+installations.
 
 Signed heartbeat, Signal registration, and path-negotiation reports refresh the lease timestamps of locally observed STUN candidates while the active WireGuard endpoint remains configured, preventing a healthy agent from disappearing solely because the endpoint-candidate TTL outlasts its one-time startup observation. A restarted Agent restores its own accepted endpoint candidates from the owner-only registered-node state before those loops start, so a pre-existing kernel WireGuard socket cannot leave Signal registration with an empty candidate set when it prevents rebinding the startup STUN socket.
 

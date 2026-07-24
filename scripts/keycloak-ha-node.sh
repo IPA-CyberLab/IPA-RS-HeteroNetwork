@@ -20,6 +20,9 @@ http_port="${HETERONETWORK_KEYCLOAK_HTTP_PORT:-$DEFAULT_HTTP_PORT}"
 management_port="${HETERONETWORK_KEYCLOAK_MANAGEMENT_PORT:-$DEFAULT_MANAGEMENT_PORT}"
 backchannel_port="${HETERONETWORK_KEYCLOAK_BACKCHANNEL_PORT:-$DEFAULT_BACKCHANNEL_PORT}"
 backchannel_listen_addresses="${HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES:-$cluster_bind_address}"
+edge_upstreams="${HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS:-}"
+edge_listen_port="${HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT:-$DEFAULT_BACKCHANNEL_PORT}"
+edge_health_path="${HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH:-/realms/kakurizai/.well-known/openid-configuration}"
 
 usage() {
   cat <<'EOF'
@@ -28,12 +31,16 @@ Usage: keycloak-ha-node.sh COMMAND
 Commands:
   install              Install Keycloak and its private HA backchannel
   install-backchannel  Reconcile only the private HA backchannel proxy
+  install-edge-proxy   Install a loopback proxy to private Keycloak replicas
 
-Required environment:
+Required environment for install:
   HETERONETWORK_KEYCLOAK_ARCHIVE
   HETERONETWORK_KEYCLOAK_CLUSTER_BIND_ADDRESS
   HETERONETWORK_KEYCLOAK_DB_PASSWORD_FILE
   HETERONETWORK_KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD_FILE
+
+Required environment for install-edge-proxy:
+  HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS
 
 Optional environment:
   HETERONETWORK_KEYCLOAK_IMPORT_DIR
@@ -44,11 +51,15 @@ Optional environment:
   HETERONETWORK_KEYCLOAK_MANAGEMENT_PORT
   HETERONETWORK_KEYCLOAK_BACKCHANNEL_PORT
   HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES
+  HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT
+  HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH
 
 The node must already have heteronetwork-db-proxy.service installed. Keycloak
 listens on loopback for HTTP and uses the HeteroNetwork VPN address for its
 encrypted embedded-cache transport. The private backchannel defaults to that
 address and can additionally bind trusted RFC1918 or CGNAT management paths.
+The edge proxy accepts comma-separated private IPv4:port upstreams and exposes
+them only on loopback for the Agent-managed public gateway.
 EOF
 }
 
@@ -88,7 +99,7 @@ validate_private_ipv4() {
     || ((10#$a == 100 && 10#$b >= 64 && 10#$b <= 127)); then
     return
   fi
-  die "backchannel listen address must be private IPv4 or CGNAT: $value"
+  die "address must be private IPv4 or CGNAT: $value"
 }
 
 validate_backchannel_listen_addresses() {
@@ -110,6 +121,35 @@ validate_port() {
   local value="$1" name="$2"
   [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a TCP port"
   ((10#$value >= 1024 && 10#$value <= 65535)) || die "$name is outside 1024-65535"
+}
+
+validate_edge_upstreams() {
+  local endpoint address port
+  local -A seen=()
+  local -a endpoints=()
+  IFS=, read -r -a endpoints <<<"$edge_upstreams"
+  ((${#endpoints[@]} >= 2)) || die "edge proxy requires at least two private upstreams"
+  for endpoint in "${endpoints[@]}"; do
+    [[ -n "$endpoint" && "$endpoint" != *[[:space:]]* && "$endpoint" == *:* ]] \
+      || die "edge upstreams must be comma-separated IPv4:port values without spaces"
+    address="${endpoint%:*}"
+    port="${endpoint##*:}"
+    validate_private_ipv4 "$address"
+    validate_port "$port" "edge upstream port"
+    [[ -z "${seen[$endpoint]:-}" ]] || die "duplicate edge upstream: $endpoint"
+    seen["$endpoint"]=1
+  done
+}
+
+validate_edge_health_path() {
+  [[ "$edge_health_path" == /realms/*/.well-known/openid-configuration \
+    && ${#edge_health_path} -le 1024 \
+    && "$edge_health_path" != *\?* \
+    && "$edge_health_path" != *\#* \
+    && "$edge_health_path" != *[[:space:]]* ]] \
+    || die "edge health path must be a bounded Keycloak realm discovery path"
+  [[ ! "$edge_health_path" =~ [[:cntrl:]] ]] \
+    || die "edge health path must not contain control characters"
 }
 
 validate_config() {
@@ -232,6 +272,105 @@ install_backchannel() {
     systemctl reload-or-restart heteronetwork-keycloak-backchannel.service
   else
     systemctl start heteronetwork-keycloak-backchannel.service
+  fi
+}
+
+render_edge_haproxy_config() {
+  local endpoint index=0
+  cat <<EOF
+global
+    log stdout format raw local0
+    maxconn 2048
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlog-normal
+    timeout connect 2s
+    timeout client 2m
+    timeout server 2m
+
+frontend heteronetwork_keycloak_edge
+    bind 127.0.0.1:${edge_listen_port}
+    default_backend heteronetwork_keycloak_replicas
+
+backend heteronetwork_keycloak_replicas
+    balance roundrobin
+    option httpchk
+    http-check send meth GET uri ${edge_health_path} hdr Host localhost
+    http-check expect status 200
+EOF
+  local -a endpoints=()
+  IFS=, read -r -a endpoints <<<"$edge_upstreams"
+  for endpoint in "${endpoints[@]}"; do
+    index=$((index + 1))
+    printf '    server replica_%s %s check inter 2s fall 2 rise 2\n' "$index" "$endpoint"
+  done
+}
+
+render_edge_service() {
+  cat <<'EOF'
+[Unit]
+Description=HeteroNetwork Keycloak edge proxy
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service
+Requires=heteronetwork-agent.service
+PartOf=heteronetwork-agent.service
+
+[Service]
+Type=notify
+User=haproxy
+Group=haproxy
+RuntimeDirectory=heteronetwork-keycloak-edge-proxy
+ExecStart=/usr/sbin/haproxy -Ws -f /etc/heteronetwork/keycloak-edge-proxy/haproxy.cfg -p /run/heteronetwork-keycloak-edge-proxy/haproxy.pid
+ExecReload=/bin/kill -USR2 $MAINPID
+KillMode=mixed
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target heteronetwork-agent.service
+EOF
+}
+
+install_edge_proxy() {
+  require_root
+  validate_port "$edge_listen_port" "HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT"
+  validate_edge_upstreams
+  validate_edge_health_path
+  command -v haproxy >/dev/null 2>&1 || die "haproxy is not installed"
+  systemctl is-active --quiet heteronetwork-agent.service \
+    || die "heteronetwork-agent.service is not active"
+
+  install -d -o root -g haproxy -m 0750 /etc/heteronetwork/keycloak-edge-proxy
+  render_edge_haproxy_config \
+    | install -o root -g haproxy -m 0640 /dev/stdin \
+      /etc/heteronetwork/keycloak-edge-proxy/haproxy.cfg
+  render_edge_service \
+    | install -o root -g root -m 0644 /dev/stdin \
+      /etc/systemd/system/heteronetwork-keycloak-edge-proxy.service
+  /usr/sbin/haproxy -c -f /etc/heteronetwork/keycloak-edge-proxy/haproxy.cfg
+  systemctl daemon-reload
+  systemctl enable heteronetwork-keycloak-edge-proxy.service
+  if systemctl is-active --quiet heteronetwork-keycloak-edge-proxy.service; then
+    systemctl reload-or-restart heteronetwork-keycloak-edge-proxy.service
+  else
+    systemctl start heteronetwork-keycloak-edge-proxy.service
   fi
 }
 
@@ -380,6 +519,9 @@ case "${1:-}" in
     ;;
   install-backchannel)
     install_backchannel
+    ;;
+  install-edge-proxy)
+    install_edge_proxy
     ;;
   -h|--help|help)
     usage
