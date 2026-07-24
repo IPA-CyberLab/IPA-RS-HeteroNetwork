@@ -31,9 +31,9 @@ use ipars_types::api::{
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
-    socket_addr_is_globally_routable, BootstrapEndpoint, BootstrapEndpointKind, ClusterPolicy,
-    JoinTokenClaims, KeyId, NatConnectivityState, NodeId, PathRecord, PathState, Role,
-    ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
+    socket_addr_is_globally_routable, BootstrapEndpoint, BootstrapEndpointKind, ClusterId,
+    ClusterPolicy, JoinTokenClaims, KeyId, NatConnectivityState, NodeId, PathRecord, PathState,
+    Role, ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
     JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
@@ -48,6 +48,8 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 
 const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
+const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_WEB_OIDC_LOGIN_STATES: usize = 1024;
 const WEB_OIDC_LOGIN_STATE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -89,6 +91,7 @@ pub struct NodeEnrollmentConfig {
     binary_sha256: Arc<str>,
     binary_size: u64,
     max_ttl_seconds: u64,
+    relay_admission_bearer_token: Arc<str>,
 }
 
 impl NodeEnrollmentConfig {
@@ -98,8 +101,13 @@ impl NodeEnrollmentConfig {
         install_base_url: String,
         binary_path: PathBuf,
         max_ttl_seconds: u64,
+        relay_admission_bearer_token: String,
     ) -> Result<Self, String> {
         validate_enrollment_identifier(&key_id, "node enrollment issuer key ID")?;
+        validate_relay_admission_bearer_token(
+            &relay_admission_bearer_token,
+            "node enrollment relay admission bearer token",
+        )?;
         if !(MIN_NODE_ENROLLMENT_TTL_SECONDS..=MAX_JOIN_TOKEN_TTL_SECONDS as u64)
             .contains(&max_ttl_seconds)
         {
@@ -197,6 +205,7 @@ impl NodeEnrollmentConfig {
             binary_sha256: Arc::from(format!("{:x}", digest.finalize())),
             binary_size: metadata.len(),
             max_ttl_seconds,
+            relay_admission_bearer_token: Arc::from(relay_admission_bearer_token),
         })
     }
 
@@ -280,6 +289,28 @@ fn validate_enrollment_identifier(value: &str, label: &str) -> Result<(), String
         return Err(format!(
             "{label} must be 1 to {} non-control characters",
             ipars_types::MAX_JOIN_TOKEN_IDENTIFIER_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relay_admission_bearer_token(value: &str, label: &str) -> Result<(), String> {
+    if value.len() < MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        return Err(format!(
+            "{label} must contain at least {MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes"
+        ));
+    }
+    if value.len() > MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES {
+        return Err(format!(
+            "{label} exceeds {MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES} bytes"
+        ));
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err(format!(
+            "{label} must not contain whitespace or control characters"
         ));
     }
     Ok(())
@@ -2255,6 +2286,7 @@ SystemCallArchitectures=native
 WantedBy=multi-user.target
 UNIT
 
+__RELAY_ADMISSION_INSTALL__
 systemctl daemon-reload
 systemctl enable heteronetwork-gateway.service heteronetwork-agent.service
 systemctl restart heteronetwork-gateway.service
@@ -2272,14 +2304,60 @@ echo "HeteroNetwork node enrolled and started"
         .map(kubernetes_ha_install_script)
         .unwrap_or_default();
     let database_install = postgres_ha_install_script(enrollment, token);
+    let relay_admission_install = relay_admission_install_script(enrollment, token);
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
         .replace("__SHA256__", &enrollment.binary_sha256)
         .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
         .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
+        .replace("__RELAY_ADMISSION_INSTALL__", &relay_admission_install)
         .replace("__DATABASE_INSTALL__", &database_install)
         .replace("__SETUP_INSTALL__", &setup_install)
+}
+
+fn derive_node_enrollment_cluster_secret(
+    enrollment: &NodeEnrollmentConfig,
+    cluster_id: &ClusterId,
+    purpose: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(purpose);
+    digest.update(b"\0");
+    digest.update(enrollment.issuer.signing_key_b64().as_bytes());
+    digest.update(b"\0");
+    digest.update(cluster_id.as_str().as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn relay_admission_install_script(
+    enrollment: &NodeEnrollmentConfig,
+    token: &SignedJoinToken,
+) -> String {
+    const TOKEN_PATH: &str = "/etc/heteronetwork/relay-admission.token";
+    const DROP_IN_PATH: &str =
+        "/etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf";
+    if !token.claims.policy.allow_relay {
+        return format!("rm -f {TOKEN_PATH} {DROP_IN_PATH}\n");
+    }
+    let encoded_bearer_token = STANDARD.encode(enrollment.relay_admission_bearer_token.as_bytes());
+    format!(
+        r#"install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
+printf '%s' '{encoded_bearer_token}' | base64 -d >{TOKEN_PATH}
+chown root:root {TOKEN_PATH}
+chmod 0600 {TOKEN_PATH}
+cat >{DROP_IN_PATH} <<'HETERONETWORK_RELAY_ADMISSION_UNIT'
+[Service]
+Environment=HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH={TOKEN_PATH}
+HETERONETWORK_RELAY_ADMISSION_UNIT
+chown root:root {DROP_IN_PATH}
+chmod 0644 {DROP_IN_PATH}
+"#
+    )
 }
 
 fn postgres_ha_install_script(
@@ -2289,16 +2367,11 @@ fn postgres_ha_install_script(
     let helper = STANDARD.encode(POSTGRES_HA_NODE_SCRIPT.as_bytes());
     let autopilot = STANDARD.encode(POSTGRES_HA_AUTOPILOT_SCRIPT.as_bytes());
     let cluster_id = STANDARD.encode(token.claims.cluster_id.as_str().as_bytes());
-    let mut digest = Sha256::new();
-    digest.update(b"heteronetwork-postgres-ha-autopilot-v1\0");
-    digest.update(enrollment.issuer.signing_key_b64().as_bytes());
-    digest.update(b"\0");
-    digest.update(token.claims.cluster_id.as_str().as_bytes());
-    let bearer_token = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let bearer_token = derive_node_enrollment_cluster_secret(
+        enrollment,
+        &token.claims.cluster_id,
+        b"heteronetwork-postgres-ha-autopilot-v1",
+    );
     format!(
         r#"install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
 install -d -o root -g root -m 0700 /etc/heteronetwork/postgres-autopilot
@@ -3653,6 +3726,7 @@ mod tests {
     use tower::ServiceExt;
 
     const OPERATOR_API_BEARER_TOKEN: &str = "control-plane-test-operator-token-32-bytes";
+    const RELAY_ADMISSION_BEARER_TOKEN: &str = "control-plane-test-relay-admission-token-32-bytes";
 
     use super::*;
 
@@ -4089,6 +4163,7 @@ mod tests {
             "https://static.example".to_string(),
             binary_path.clone(),
             3600,
+            RELAY_ADMISSION_BEARER_TOKEN.to_string(),
         )?;
         let endpoints = vec![
             BootstrapEndpoint {
@@ -4184,6 +4259,7 @@ mod tests {
             "http://127.0.0.1:8443".to_string(),
             binary_path.clone(),
             7 * 24 * 60 * 60,
+            RELAY_ADMISSION_BEARER_TOKEN.to_string(),
         )?;
         let expected_sha256 = enrollment.binary_sha256.to_string();
         let app = router(
@@ -4286,6 +4362,49 @@ mod tests {
         assert!(generated_script.contains("Automatic PostgreSQL HA placement scheduled"));
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
+        assert!(generated_script.contains("/etc/heteronetwork/relay-admission.token"));
+        assert!(generated_script.contains(
+            "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
+        ));
+        let encoded_relay_bearer = STANDARD.encode(RELAY_ADMISSION_BEARER_TOKEN.as_bytes());
+        assert!(generated_script.contains(&format!(
+            "printf '%s' '{encoded_relay_bearer}' | base64 -d >/etc/heteronetwork/relay-admission.token"
+        )));
+        assert!(!generated_script.contains(RELAY_ADMISSION_BEARER_TOKEN));
+
+        let no_relay_request_body = serde_json::json!({
+            "expires_in_seconds": 86_400,
+            "role": "worker",
+            "tags": ["no-relay"],
+            "allow_relay": false,
+            "reusable": false,
+            "max_uses": 1
+        });
+        let no_relay_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(&no_relay_request_body)?))?,
+            )
+            .await?;
+        assert_eq!(no_relay_response.status(), StatusCode::OK);
+        let no_relay_response =
+            axum::body::to_bytes(no_relay_response.into_body(), usize::MAX).await?;
+        let no_relay_response: Value = serde_json::from_slice(&no_relay_response)?;
+        let no_relay_script = no_relay_response["install_script"]
+            .as_str()
+            .ok_or("non-relay enrollment response omitted the install script")?;
+        assert!(no_relay_script.contains(
+            "rm -f /etc/heteronetwork/relay-admission.token /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf"
+        ));
+        assert!(!no_relay_script.contains(&encoded_relay_bearer));
 
         let kubernetes_request_body = serde_json::json!({
             "expires_in_seconds": 86_400,
@@ -4347,6 +4466,7 @@ mod tests {
             .ok_or("Kubernetes enrollment omitted the database autopilot bearer")?;
         assert_eq!(database_bearer, kubernetes_database_bearer);
         assert_eq!(database_bearer.len(), 64);
+        assert_ne!(RELAY_ADMISSION_BEARER_TOKEN, database_bearer);
         let mut script_shell = std::process::Command::new("sh")
             .arg("-n")
             .stdin(Stdio::piped())

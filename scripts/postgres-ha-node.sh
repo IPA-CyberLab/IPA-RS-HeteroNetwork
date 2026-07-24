@@ -347,13 +347,13 @@ validate_proxy_config() {
 }
 
 node_is_dcs_member() {
-  local name address
+  local name address found=1
   while read -r name address; do
     if [[ "$name" == "$node_name" && "$address" == "$node_address" ]]; then
-      return 0
+      found=0
     fi
   done < <(dcs_member_rows)
-  return 1
+  return "$found"
 }
 
 ensure_private_source_file() {
@@ -1241,7 +1241,6 @@ reconcile_dcs() {
         [[ -z "$actual_name" || "$actual_name" == "$desired_name" ]] \
           || die "DCS peer $peer_url is registered as unexpected name $actual_name"
         found=1
-        break
       fi
     done < <(dcs_member_rows)
     ((found == 1)) || die "DCS contains an unmanaged peer URL: $peer_url"
@@ -1257,6 +1256,7 @@ reconcile_dcs() {
     return
   done <<<"$snapshot"
 
+  local added=0
   while read -r desired_name desired_address; do
     desired_url="https://${desired_address}:${dcs_peer_port}"
     found=0
@@ -1266,14 +1266,15 @@ reconcile_dcs() {
         break
       fi
     done <<<"$snapshot"
-    if ((found == 0)); then
+    if ((found == 0 && added == 0)); then
       dcs_etcdctl member add "$desired_name" \
         --peer-urls="$desired_url" \
         --learner >/dev/null
       printf 'Added DCS learner %s at %s.\n' "$desired_name" "$desired_address"
-      return
+      added=1
     fi
   done < <(dcs_member_rows)
+  ((added == 0)) || return
   printf 'DCS membership already matches the requested topology.\n'
 }
 
@@ -1340,7 +1341,7 @@ verify_cluster() {
   local replication streaming_count sync_count
   replication="$(PGPASSWORD="$superuser_password" \
     /usr/lib/postgresql/"$postgres_major"/bin/psql \
-      "host=${service_name} port=${proxy_port} dbname=postgres user=postgres sslmode=verify-full sslrootcert=${state_dir}/pki/ca.crt connect_timeout=3" \
+      "host=${service_name} hostaddr=127.0.0.1 port=${proxy_port} dbname=postgres user=postgres sslmode=verify-full sslrootcert=${state_dir}/pki/ca.crt connect_timeout=3" \
       --no-psqlrc --tuples-only --no-align \
       --command="SELECT count(*) FILTER (WHERE state = 'streaming'), count(*) FILTER (WHERE sync_state IN ('sync', 'quorum')) FROM pg_stat_replication")"
   IFS='|' read -r streaming_count sync_count <<<"$replication"

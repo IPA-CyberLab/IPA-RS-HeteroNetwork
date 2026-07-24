@@ -471,6 +471,8 @@ struct ControlPlaneArgs {
     node_enrollment_max_ttl_seconds: u64,
     #[arg(long, env = "HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH")]
     node_enrollment_binary_path: Option<PathBuf>,
+    #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    node_enrollment_relay_admission_bearer_token_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
     web_oidc_auth_base_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_BACKCHANNEL_BASE_URL")]
@@ -4857,6 +4859,11 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
             node_enrollment_issuer_private_key_path(args).is_some(),
             "--node-enrollment-enabled requires --node-enrollment-issuer-private-key-path or a systemd node-enrollment-issuer.key credential"
         );
+        anyhow::ensure!(
+            args.node_enrollment_relay_admission_bearer_token_path
+                .is_some(),
+            "--node-enrollment-enabled requires --node-enrollment-relay-admission-bearer-token-path"
+        );
     } else {
         anyhow::ensure!(
             args.node_enrollment_issuer_private_key_path.is_none()
@@ -4923,12 +4930,21 @@ fn control_plane_node_enrollment_config(
         None => std::env::current_exe()
             .context("failed to locate the current executable for node enrollment")?,
     };
+    let relay_admission_bearer_token_path = args
+        .node_enrollment_relay_admission_bearer_token_path
+        .as_deref()
+        .context("node enrollment relay admission bearer token path is required")?;
+    let relay_admission_bearer_token = read_relay_admission_bearer_token_file(
+        relay_admission_bearer_token_path,
+        "node enrollment relay admission",
+    )?;
     NodeEnrollmentConfig::new(
         issuer,
         args.node_enrollment_issuer_key_id.clone(),
         public_url,
         binary_path,
         args.node_enrollment_max_ttl_seconds,
+        relay_admission_bearer_token,
     )
     .map(Some)
     .map_err(anyhow::Error::msg)
@@ -20740,7 +20756,12 @@ mod tests {
         let directory = unique_test_dir("node-enrollment-config")?;
         let key_path = directory.join("enrollment.key");
         let binary_path = directory.join("iparsd");
+        let relay_admission_token_path = directory.join("relay-admission.token");
         write_private_test_secret(&key_path, enrollment_issuer.signing_key_b64())?;
+        write_private_test_secret(
+            &relay_admission_token_path,
+            "control-plane-test-relay-admission-token-32-bytes",
+        )?;
         std::fs::write(&binary_path, b"test-linux-amd64-binary")?;
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -20763,6 +20784,10 @@ mod tests {
             binary_path
                 .to_str()
                 .context("test binary path must be UTF-8")?,
+            "--node-enrollment-relay-admission-bearer-token-path",
+            relay_admission_token_path
+                .to_str()
+                .context("test relay admission token path must be UTF-8")?,
         ])?;
         let Command::ControlPlane(args) = cli.command else {
             anyhow::bail!("expected control-plane command");

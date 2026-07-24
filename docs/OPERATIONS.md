@@ -48,7 +48,11 @@ Control Plane receives a readable copy. Configure
 `HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH`. Do not copy the root issuer private
 key to these nodes. A direct non-systemd invocation must instead set
 `HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH`. Enrollment issuance
-requires authenticated management access
+also reads the cluster-wide, owner-only Relay admission credential selected by
+`HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH`. Use the same credential on
+every Relay replica; relay-enabled install scripts place it and the Agent
+systemd drop-in automatically on joining nodes. Enrollment issuance requires
+authenticated management access
 and two distinct active URLs for Control Plane, Signal, and STUN, plus two Relay
 URLs when relay permission is requested.
 

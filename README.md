@@ -218,12 +218,17 @@ HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH=/etc/ipars/node-enrollment
 HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID=web-enrollment
 HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS=604800
 HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH=/opt/ipars/bin/iparsd
+HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/ipars/relay-admission.token
 ```
 
 The private-key path above is for direct daemon invocation. The packaged
 systemd unit instead loads the root-only
 `/etc/credstore/node-enrollment-issuer.key` as a service credential, so the
 shared Signal, STUN, and Relay Unix account cannot read the source key.
+The Relay admission file is an owner-only cluster credential shared by every
+Relay replica. A relay-enabled Add device installer places that credential and
+the corresponding Agent systemd drop-in automatically; joining nodes need no
+manual Relay configuration.
 
 This signer is distinct from the offline root issuer. The verifier limits it to
 non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,
