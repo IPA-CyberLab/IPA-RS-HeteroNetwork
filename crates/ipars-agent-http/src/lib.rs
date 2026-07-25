@@ -140,6 +140,9 @@ struct PublicWebGatewayAccess {
 #[derive(Debug, Clone, Copy)]
 struct PublicWebGatewayRequest;
 
+#[derive(Debug, Clone, Copy)]
+struct OverlayWebUiRequest;
+
 #[derive(Debug, Clone)]
 struct OverlayWebUiAccess {
     origins: Arc<[String]>,
@@ -598,8 +601,10 @@ async fn device_login_providers(
 async fn start_device_login(
     State(state): State<AgentHttpState>,
     public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+    overlay_web_ui: Option<Extension<OverlayWebUiRequest>>,
 ) -> Result<Response, ApiError> {
-    let providers = device_login_providers(&state, public_gateway.is_some()).await?;
+    let control_plane_only = public_gateway.is_some() || overlay_web_ui.is_some();
+    let providers = device_login_providers(&state, control_plane_only).await?;
     let now = Instant::now();
     {
         let mut logins = state.device_logins.lock().await;
@@ -1063,7 +1068,7 @@ async fn require_overlay_web_ui_access(
             return local_web_ui_rejection("cross-origin overlay Web UI requests are rejected");
         }
     }
-    request.extensions_mut().insert(PublicWebGatewayRequest);
+    request.extensions_mut().insert(OverlayWebUiRequest);
     next.run(request).await
 }
 
@@ -1645,9 +1650,11 @@ fn apply_local_ui_security_headers(
 async fn local_ui_config(
     State(state): State<AgentHttpState>,
     public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+    overlay_web_ui: Option<Extension<OverlayWebUiRequest>>,
 ) -> Json<Value> {
     let is_public_gateway = public_gateway.is_some();
-    match select_healthy_web_ui_with_scope(&state, is_public_gateway).await {
+    let control_plane_only = is_public_gateway || overlay_web_ui.is_some();
+    match select_healthy_web_ui_with_scope(&state, control_plane_only).await {
         Ok((candidate, mut config)) => {
             if is_public_gateway
                 && state
@@ -1800,17 +1807,18 @@ async fn proxy_management_request(
     State(state): State<AgentHttpState>,
     request: Request,
 ) -> Response {
-    let public_gateway = request
+    let control_plane_only = request
         .extensions()
         .get::<PublicWebGatewayRequest>()
-        .is_some();
+        .is_some()
+        || request.extensions().get::<OverlayWebUiRequest>().is_some();
     let proxy_request = match management_proxy_request(request).await {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
     let mut candidates = web_ui_candidates(&state)
         .into_iter()
-        .filter(|candidate| !public_gateway || candidate.source.starts_with("control_plane_"))
+        .filter(|candidate| !control_plane_only || candidate.source.starts_with("control_plane_"))
         .collect::<Vec<_>>();
     let selected = selected_web_ui_url(&state).await;
     candidates.sort_by_key(|candidate| {
@@ -1858,7 +1866,7 @@ async fn proxy_management_request(
         .into_response();
     }
 
-    let candidate = match select_healthy_web_ui_with_scope(&state, public_gateway).await {
+    let candidate = match select_healthy_web_ui_with_scope(&state, control_plane_only).await {
         Ok((candidate, _)) => candidate,
         Err(error) => return ApiError::Agent(error).into_response(),
     };
@@ -4160,16 +4168,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlay_web_ui_accepts_only_the_vpn_ip_and_internal_name(
+    async fn overlay_web_ui_preserves_oidc_origins_and_control_plane_scope(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
-        let runtime = Arc::new(AgentRuntime::new(
-            AgentNodeState::generate(Utc::now()),
-            ClusterPolicy::default(),
-        ));
-        let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url]);
+        let (service_url, service_backend, service_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let (control_plane_url, control_plane_backend, control_plane_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let mut node_state = AgentNodeState::generate(Utc::now());
+        node_state.bootstrap_endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::WebUi,
+            url: service_url.clone(),
+        });
+        let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
+        let status = Arc::new(StdRwLock::new(PublicWebGatewayStatus {
+            phase: PublicWebGatewayPhase::Ready,
+            public_ip: Some("203.0.113.10".parse()?),
+            url: Some("https://203.0.113.10/".to_string()),
+            last_error: None,
+            updated_at: Utc::now(),
+        }));
+        let state =
+            AgentHttpState::with_control_plane_urls(runtime, vec![control_plane_url.clone()])
+                .with_public_web_gateway("gateway-secret".to_string(), status, true);
+        set_selected_web_ui(&state, Some(service_url.clone())).await;
         let listen: std::net::SocketAddr = "10.250.0.1:9781".parse()?;
-        let app = overlay_web_ui_router(state, listen, "console.heteronetwork.internal");
+        let app = overlay_web_ui_router(state.clone(), listen, "console.heteronetwork.internal");
+
+        let config = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/config")
+                    .header(header::HOST, "console.heteronetwork.internal:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(config.status(), StatusCode::OK);
+        let config: Value =
+            serde_json::from_slice(&axum::body::to_bytes(config.into_body(), usize::MAX).await?)?;
+        assert_eq!(
+            config
+                .get("selected_web_ui_endpoint")
+                .and_then(Value::as_str),
+            Some(control_plane_url.as_str())
+        );
+        assert_eq!(
+            config.get("issuer_url").and_then(Value::as_str),
+            Some(format!("{control_plane_url}/realms/heteronetwork").as_str())
+        );
+        assert_eq!(
+            config.get("authorization_endpoint").and_then(Value::as_str),
+            Some(
+                format!("{control_plane_url}/realms/heteronetwork/protocol/openid-connect/auth")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            config.get("token_endpoint").and_then(Value::as_str),
+            Some(
+                format!("{control_plane_url}/realms/heteronetwork/protocol/openid-connect/token")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            config.get("device_login_endpoint").and_then(Value::as_str),
+            Some("/v1/web-ui/auth/device")
+        );
+
+        set_selected_web_ui(&state, Some(service_url.clone())).await;
+        let device_login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device")
+                    .header(header::HOST, "10.250.0.1:9781")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(device_login.status(), StatusCode::OK);
+        assert!(control_plane_backend
+            .device_authorization_form
+            .lock()
+            .await
+            .is_some());
+        assert!(service_backend
+            .device_authorization_form
+            .lock()
+            .await
+            .is_none());
+
+        set_selected_web_ui(&state, Some(service_url)).await;
+        let management = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/overview")
+                    .header(header::HOST, "10.250.0.1:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(management.status(), StatusCode::OK);
+        assert_eq!(control_plane_backend.admin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service_backend.admin_calls.load(Ordering::SeqCst), 0);
+
+        set_selected_web_ui(&state, Some(service_backend.base_url.clone())).await;
+        let mutation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/clients/peers/query")
+                    .header(header::HOST, "10.250.0.1:9781")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(mutation.status(), StatusCode::OK);
+        assert_eq!(control_plane_backend.admin_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(service_backend.admin_calls.load(Ordering::SeqCst), 0);
 
         for host in ["10.250.0.1:9781", "console.heteronetwork.internal:9781"] {
             let response = app
@@ -4215,7 +4332,8 @@ mod tests {
             )
             .await?;
         assert_eq!(agent_api.status(), StatusCode::NOT_FOUND);
-        backend_task.abort();
+        service_task.abort();
+        control_plane_task.abort();
         Ok(())
     }
 
