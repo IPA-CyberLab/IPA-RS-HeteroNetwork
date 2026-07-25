@@ -123,9 +123,47 @@ sudo -E scripts/kubeadm-ha-node.sh finalize
 sudo -E scripts/kubeadm-ha-node.sh verify-cluster
 ```
 
-`verify-cluster` requires three Ready nodes, three running API servers, and
-three Flannel pods. It then runs DNS and full cross-node Pod ping checks and
-verifies the derived Flannel MTU.
+## Add worker nodes
+
+Generate a worker-only bundle on any initialized control-plane node:
+
+```bash
+export HETERONETWORK_KUBEADM_NODE_IP=10.250.0.1
+export HETERONETWORK_KUBEADM_CONTROL_PLANES=10.250.0.1,10.250.0.2,10.250.0.3
+sudo -E scripts/kubeadm-ha-node.sh refresh-worker-join-bundle
+```
+
+Transfer the resulting root-only
+`/etc/heteronetwork/kubernetes/worker-join-bundle.json` to the same path on
+each worker with mode `0600`. It contains only a two-hour bootstrap token, the
+cluster CA hash, and the local HAProxy endpoint. It does not contain the
+control-plane certificate upload key.
+
+Prepare and join each worker with its own HeteroNetwork address:
+
+```bash
+export HETERONETWORK_KUBEADM_NODE_IP=10.250.0.10
+export HETERONETWORK_KUBEADM_NODE_NAME=worker-1
+export HETERONETWORK_KUBEADM_CONTROL_PLANES=10.250.0.1,10.250.0.2,10.250.0.3
+sudo -E scripts/kubeadm-ha-node.sh prepare
+sudo -E scripts/kubeadm-ha-node.sh join-worker
+```
+
+`join-worker` rejects a node whose address is in the control-plane backend
+list or which still has control-plane manifests or `admin.conf`. Before
+repurposing an existing control-plane host, export its workloads, snapshot its
+etcd state, and explicitly reset it; the helper does not automate that
+destructive operation. Enroll ordinary workers without the
+`kubernetes-control-plane` and `route-provider` tags so they remain eligible
+for lazy connect.
+
+`verify-cluster` requires exactly the configured control-plane count, all
+registered nodes Ready, and one running Flannel pod per node. It then runs DNS
+and full cross-node Pod ping checks and verifies the derived Flannel MTU:
+
+```bash
+sudo -E scripts/kubeadm-ha-node.sh verify-cluster
+```
 
 ## Failure test
 

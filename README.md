@@ -149,6 +149,12 @@ addresses, elects the first control plane, transfers short-lived kubeadm
 credentials over an authenticated HeteroNetwork-only endpoint, serializes the
 remaining joins, and verifies the resulting stacked-etcd cluster. No per-host
 VPN address, node role, or kubeadm join command is supplied to the hosts.
+Additional Linux hosts can join that cluster as ordinary workers with
+`refresh-worker-join-bundle`, `prepare`, and `join-worker` from
+`scripts/kubeadm-ha-node.sh`. The worker-only bundle contains a short-lived
+bootstrap token and CA hash without the control-plane certificate key. Enroll
+workers without the `kubernetes-control-plane` or `route-provider` tags so
+Flannel VXLAN traffic over their HeteroNetwork node IPs remains lazy.
 
 OIDC is enabled by default with Keycloak:
 

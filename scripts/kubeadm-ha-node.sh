@@ -29,10 +29,13 @@ usage() {
 Usage: kubeadm-ha-node.sh COMMAND
 
 Commands:
-  prepare               Install and configure this Kubernetes control-plane host
+  prepare               Install and configure this Kubernetes host
   init                   Initialize the first stacked-etcd control-plane node
   refresh-join-bundle    Rotate the short-lived kubeadm join credentials
+  refresh-worker-join-bundle
+                         Rotate worker-only kubeadm join credentials
   join-control-plane     Join this host as another stacked-etcd control-plane node
+  join-worker            Join this host as a regular worker node
   install-flannel        Install pinned Flannel on the initialized cluster
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
@@ -52,9 +55,12 @@ Optional environment:
   HETERONETWORK_KUBEADM_SERVICE_CIDR     Default: 10.96.0.0/12
   HETERONETWORK_KUBEADM_KUBERNETES_MINOR Default: v1.36
   HETERONETWORK_KUBEADM_JOIN_BUNDLE      Default: state-dir/join-bundle.json
+  HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE
+                                         Default: state-dir/worker-join-bundle.json
 
 The join bundle contains credentials. Keep it root-owned with mode 0600 and transfer it
 over an authenticated channel. Commands do not print tokens or certificate keys.
+For join-worker, the node IP must not be in HETERONETWORK_KUBEADM_CONTROL_PLANES.
 EOF
 }
 
@@ -152,13 +158,29 @@ validate_common_config() {
     || die "Kubernetes minor must look like v1.36: $kubernetes_minor"
   [[ "$state_dir" == /* ]] || die "state directory must be absolute"
   resolve_node_name
+  backend_addresses >/dev/null
+}
 
+node_is_control_plane_backend() {
   local found=0
   local backend
   while IFS= read -r backend; do
     [[ "$backend" == "$node_ip" ]] && found=1
   done < <(backend_addresses)
-  ((found == 1)) || die "node IP $node_ip is not present in the control-plane backend list"
+  ((found == 1))
+}
+
+validate_control_plane_config() {
+  validate_common_config
+  node_is_control_plane_backend \
+    || die "node IP $node_ip is not present in the control-plane backend list"
+}
+
+validate_worker_config() {
+  validate_common_config
+  if node_is_control_plane_backend; then
+    die "worker node IP $node_ip must not be present in the control-plane backend list"
+  fi
 }
 
 verify_interface_address() {
@@ -203,12 +225,17 @@ backend kubernetes_control_planes
     option tcp-check
     default-server check inter 500ms fastinter 200ms downinter 1s fall 1 rise 2 on-marked-down shutdown-sessions
 EOF
-  local backend backup
+  local backend backup preferred_backend
+  if node_is_control_plane_backend; then
+    preferred_backend="$node_ip"
+  else
+    preferred_backend="$(backend_addresses | sed -n '1p')"
+  fi
   local index=0
   while IFS= read -r backend; do
     index=$((index + 1))
     backup=""
-    [[ "$backend" == "$node_ip" ]] || backup=" backup"
+    [[ "$backend" == "$preferred_backend" ]] || backup=" backup"
     printf '    server control-plane-%d %s:6443%s\n' "$index" "$backend" "$backup"
   done < <(backend_addresses)
 }
@@ -358,7 +385,7 @@ memorySwap:
 EOF
 }
 
-read_join_bundle() {
+read_join_discovery_bundle() {
   local bundle="$1"
   require_command jq
   [[ -f "$bundle" && ! -L "$bundle" ]] || die "join bundle is missing or is a symlink: $bundle"
@@ -367,12 +394,21 @@ read_join_bundle() {
   [[ "$mode" == "600" || "$mode" == "400" ]] \
     || die "join bundle must have mode 0600 or 0400: $bundle has $mode"
 
-  join_endpoint="$(jq -er '.apiServerEndpoint | strings | select(length > 0)' "$bundle")"
-  join_token="$(jq -er '.token | strings | select(test("^[a-z0-9]{6}\\.[a-z0-9]{16}$"))' "$bundle")"
-  join_ca_hash="$(jq -er '.caCertHash | strings | select(test("^sha256:[a-f0-9]{64}$"))' "$bundle")"
-  join_certificate_key="$(jq -er '.certificateKey | strings | select(test("^[a-f0-9]{64}$"))' "$bundle")"
+  join_endpoint="$(jq -er '.apiServerEndpoint | strings | select(length > 0)' "$bundle")" \
+    || die "join bundle has an invalid API server endpoint"
+  join_token="$(jq -er '.token | strings | select(test("^[a-z0-9]{6}\\.[a-z0-9]{16}$"))' "$bundle")" \
+    || die "join bundle has an invalid bootstrap token"
+  join_ca_hash="$(jq -er '.caCertHash | strings | select(test("^sha256:[a-f0-9]{64}$"))' "$bundle")" \
+    || die "join bundle has an invalid CA certificate hash"
   [[ "$join_endpoint" == "${api_name}:${api_proxy_port}" ]] \
     || die "join bundle endpoint does not match the configured local API endpoint"
+}
+
+read_join_bundle() {
+  local bundle="$1"
+  read_join_discovery_bundle "$bundle"
+  join_certificate_key="$(jq -er '.certificateKey | strings | select(test("^[a-f0-9]{64}$"))' "$bundle")" \
+    || die "join bundle has an invalid control-plane certificate key"
 }
 
 render_join_config() {
@@ -396,6 +432,33 @@ nodeRegistration:
   criSocket: "unix:///run/containerd/containerd.sock"
   ignorePreflightErrors:
   - Swap
+  name: "${node_name}"
+EOF
+}
+
+render_worker_join_config() {
+  local bundle="$1"
+  read_join_discovery_bundle "$bundle"
+  jq -e '(keys | sort) == ["apiServerEndpoint", "caCertHash", "token"]' "$bundle" >/dev/null \
+    || die "worker join bundle must contain only discovery credentials"
+  cat <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: "${join_endpoint}"
+    caCertHashes:
+    - "${join_ca_hash}"
+    token: "${join_token}"
+nodeRegistration:
+  criSocket: "unix:///run/containerd/containerd.sock"
+  ignorePreflightErrors:
+  - Swap
+  kubeletExtraArgs:
+  - name: "hostname-override"
+    value: "${node_name}"
+  - name: "node-ip"
+    value: "${node_ip}"
   name: "${node_name}"
 EOF
 }
@@ -581,9 +644,31 @@ join_bundle_path() {
   printf '%s\n' "${HETERONETWORK_KUBEADM_JOIN_BUNDLE:-$state_dir/join-bundle.json}"
 }
 
+worker_join_bundle_path() {
+  printf '%s\n' "${HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE:-$state_dir/worker-join-bundle.json}"
+}
+
+cluster_ca_cert_hash() {
+  openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 -hex \
+    | awk '{print "sha256:" $2}'
+}
+
+render_worker_join_bundle() {
+  local endpoint="$1"
+  local token="$2"
+  local ca_hash="$3"
+  jq -n \
+    --arg apiServerEndpoint "$endpoint" \
+    --arg token "$token" \
+    --arg caCertHash "$ca_hash" \
+    '{apiServerEndpoint: $apiServerEndpoint, token: $token, caCertHash: $caCertHash}'
+}
+
 refresh_join_bundle() {
   require_root
-  validate_common_config
+  validate_control_plane_config
   require_command jq
   require_command kubeadm
   require_command openssl
@@ -605,10 +690,7 @@ refresh_join_bundle() {
   fi
   rm -f "$config"
   certificate_key="$(tail -n 1 <<<"$upload_output" | tr -d '[:space:]')"
-  ca_hash="$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
-    | openssl pkey -pubin -outform DER 2>/dev/null \
-    | openssl dgst -sha256 -hex \
-    | awk '{print "sha256:" $2}')"
+  ca_hash="$(cluster_ca_cert_hash)"
   endpoint="${api_name}:${api_proxy_port}"
   [[ "$token" =~ ^[a-z0-9]{6}\.[a-z0-9]{16}$ ]] || die "kubeadm returned an invalid bootstrap token"
   [[ "$certificate_key" =~ ^[a-f0-9]{64}$ ]] || die "kubeadm returned an invalid certificate key"
@@ -628,9 +710,34 @@ refresh_join_bundle() {
   printf 'join bundle refreshed at %s (credentials not printed)\n' "$bundle"
 }
 
+refresh_worker_join_bundle() {
+  require_root
+  validate_control_plane_config
+  require_command jq
+  require_command kubeadm
+  require_command openssl
+  [[ -f /etc/kubernetes/admin.conf ]] || die "this node is not an initialized control plane"
+
+  local token ca_hash endpoint bundle temporary
+  token="$(kubeadm token create --ttl 2h)"
+  ca_hash="$(cluster_ca_cert_hash)"
+  endpoint="${api_name}:${api_proxy_port}"
+  [[ "$token" =~ ^[a-z0-9]{6}\.[a-z0-9]{16}$ ]] || die "kubeadm returned an invalid bootstrap token"
+  [[ "$ca_hash" =~ ^sha256:[a-f0-9]{64}$ ]] || die "failed to compute the cluster CA public-key hash"
+
+  bundle="$(worker_join_bundle_path)"
+  temporary="$(mktemp)"
+  trap 'rm -f "$temporary"' EXIT
+  render_worker_join_bundle "$endpoint" "$token" "$ca_hash" >"$temporary"
+  install -D -o root -g root -m 0600 "$temporary" "$bundle"
+  rm -f "$temporary"
+  trap - EXIT
+  printf 'worker join bundle refreshed at %s (credentials not printed)\n' "$bundle"
+}
+
 initialize_cluster() {
   require_root
-  validate_common_config
+  validate_control_plane_config
   verify_interface_address
   require_command kubeadm
   [[ -f "$state_dir/node.env" ]] || die "run prepare before init"
@@ -658,7 +765,7 @@ initialize_cluster() {
 
 join_control_plane() {
   require_root
-  validate_common_config
+  validate_control_plane_config
   verify_interface_address
   require_command kubeadm
   [[ -f "$state_dir/node.env" ]] || die "run prepare before join-control-plane"
@@ -679,9 +786,36 @@ join_control_plane() {
   configure_root_kubeconfig
 }
 
+join_worker() {
+  require_root
+  validate_worker_config
+  verify_interface_address
+  require_command kubeadm
+  [[ -f "$state_dir/node.env" ]] || die "run prepare before join-worker"
+  if [[ -f /etc/kubernetes/admin.conf || -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
+    die "this node is already configured as a control plane; refusing worker join"
+  fi
+  if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+    printf 'worker is already joined\n'
+    return
+  fi
+
+  local bundle config
+  bundle="$(worker_join_bundle_path)"
+  config="$(mktemp)"
+  chmod 0600 "$config"
+  trap 'rm -f "$config"' EXIT
+  render_worker_join_config "$bundle" >"$config"
+  kubeadm config validate --config "$config"
+  kubeadm join --config "$config"
+  rm -f "$bundle"
+  rm -f "$config"
+  trap - EXIT
+}
+
 install_flannel() {
   require_root
-  validate_common_config
+  validate_control_plane_config
   require_command curl
   require_command kubectl
   require_command sha256sum
@@ -744,7 +878,7 @@ EOF
 
 finalize_cluster() {
   require_root
-  validate_common_config
+  validate_control_plane_config
   require_command kubectl
   export KUBECONFIG=/etc/kubernetes/admin.conf
   kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
@@ -768,29 +902,62 @@ verify_host() {
   printf 'host prerequisites verified for %s (%s on %s)\n' "$node_name" "$node_ip" "$interface"
 }
 
+validate_cluster_counts() {
+  local expected_control_planes="$1"
+  local actual_nodes="$2"
+  local ready_nodes="$3"
+  local control_plane_nodes="$4"
+  local control_planes="$5"
+  local controller_managers="$6"
+  local flannel_pods="$7"
+  local coredns_pods="$8"
+  local coredns_nodes="$9"
+
+  ((actual_nodes >= expected_control_planes)) \
+    || die "expected at least $expected_control_planes nodes, found $actual_nodes"
+  [[ "$ready_nodes" == "$actual_nodes" ]] || die "expected all $actual_nodes nodes Ready, found $ready_nodes"
+  [[ "$control_plane_nodes" == "$expected_control_planes" ]] \
+    || die "expected $expected_control_planes control-plane nodes, found $control_plane_nodes"
+  [[ "$control_planes" == "$expected_control_planes" ]] \
+    || die "expected $expected_control_planes API servers, found $control_planes"
+  [[ "$controller_managers" == "$expected_control_planes" ]] \
+    || die "expected $expected_control_planes controller managers with ${NODE_MONITOR_GRACE_PERIOD} node monitoring, found $controller_managers"
+  [[ "$flannel_pods" == "$actual_nodes" ]] || die "expected $actual_nodes Flannel pods, found $flannel_pods"
+  [[ "$coredns_pods" == "$expected_control_planes" ]] \
+    || die "expected $expected_control_planes Ready CoreDNS pods, found $coredns_pods"
+  [[ "$coredns_nodes" == "$expected_control_planes" ]] \
+    || die "CoreDNS pods are not spread across $expected_control_planes distinct nodes"
+}
+
 verify_cluster() {
   require_root
-  validate_common_config
+  validate_control_plane_config
   require_command kubectl
   require_command jq
   export KUBECONFIG=/etc/kubernetes/admin.conf
 
-  local expected_nodes actual_nodes ready_nodes control_planes controller_managers flannel_pods coredns_pods coredns_nodes
-  expected_nodes="$(backend_addresses | wc -l | tr -d ' ')"
-  actual_nodes="$(kubectl get nodes -o json | jq '.items | length')"
-  ready_nodes="$(kubectl get nodes -o json | jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length')"
+  local nodes_json expected_control_planes actual_nodes ready_nodes control_plane_nodes
+  local control_planes controller_managers flannel_pods coredns_pods coredns_nodes
+  nodes_json="$(kubectl get nodes -o json)"
+  expected_control_planes="$(backend_addresses | wc -l | tr -d ' ')"
+  actual_nodes="$(jq '.items | length' <<<"$nodes_json")"
+  ready_nodes="$(jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' <<<"$nodes_json")"
+  control_plane_nodes="$(jq '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] != null)] | length' <<<"$nodes_json")"
   control_planes="$(kubectl -n kube-system get pods -l component=kube-apiserver -o json | jq '[.items[] | select(.status.phase == "Running")] | length')"
   controller_managers="$(kubectl -n kube-system get pods -l component=kube-controller-manager -o json | jq --arg expected "--node-monitor-grace-period=${NODE_MONITOR_GRACE_PERIOD}" '[.items[] | select(any(.spec.containers[]?.command[]?; . == $expected))] | length')"
   flannel_pods="$(kubectl -n kube-flannel get pods -l app=flannel -o json | jq '[.items[] | select(.status.phase == "Running")] | length')"
   coredns_pods="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')"
   coredns_nodes="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] | unique | length')"
-  [[ "$actual_nodes" == "$expected_nodes" ]] || die "expected $expected_nodes nodes, found $actual_nodes"
-  [[ "$ready_nodes" == "$expected_nodes" ]] || die "expected $expected_nodes Ready nodes, found $ready_nodes"
-  [[ "$control_planes" == "$expected_nodes" ]] || die "expected $expected_nodes API servers, found $control_planes"
-  [[ "$controller_managers" == "$expected_nodes" ]] || die "expected $expected_nodes controller managers with ${NODE_MONITOR_GRACE_PERIOD} node monitoring, found $controller_managers"
-  [[ "$flannel_pods" == "$expected_nodes" ]] || die "expected $expected_nodes Flannel pods, found $flannel_pods"
-  [[ "$coredns_pods" == "$expected_nodes" ]] || die "expected $expected_nodes Ready CoreDNS pods, found $coredns_pods"
-  [[ "$coredns_nodes" == "$expected_nodes" ]] || die "CoreDNS pods are not spread across all $expected_nodes nodes"
+  validate_cluster_counts \
+    "$expected_control_planes" \
+    "$actual_nodes" \
+    "$ready_nodes" \
+    "$control_plane_nodes" \
+    "$control_planes" \
+    "$controller_managers" \
+    "$flannel_pods" \
+    "$coredns_pods" \
+    "$coredns_nodes"
 
   local namespace="heteronetwork-underlay-e2e"
   kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -859,7 +1026,8 @@ EOF
 
   kubectl -n "$namespace" delete daemonset/network-probe --wait=true >/dev/null
   kubectl delete namespace "$namespace" --wait=true >/dev/null
-  printf 'cluster verified: %s control planes, cross-node Pod traffic, DNS, and Flannel MTU %s\n' "$expected_nodes" "$flannel_mtu"
+  printf 'cluster verified: %s control planes, %s Ready nodes, cross-node Pod traffic, DNS, and Flannel MTU %s\n' \
+    "$expected_control_planes" "$actual_nodes" "$flannel_mtu"
 }
 
 self_test() {
@@ -873,9 +1041,9 @@ self_test() {
   service_cidr="10.96.0.0/12"
   kubernetes_minor="v1.36"
   state_dir="/etc/heteronetwork/kubernetes"
-  validate_common_config
+  validate_control_plane_config
 
-  local rendered bundle
+  local rendered bundle worker_bundle
   rendered="$(render_haproxy_config)"
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
   grep -Fq 'option dontlog-normal' <<<"$rendered"
@@ -897,8 +1065,14 @@ self_test() {
   grep -Fq 'profile cri-containerd.apparmor.d flags=(attach_disconnected,mediate_deleted)' <<<"$rendered"
   grep -Fq 'network,' <<<"$rendered"
   grep -Fq 'deny mount,' <<<"$rendered"
+  validate_cluster_counts 3 5 5 3 3 3 5 3 3
+  if (validate_cluster_counts 3 5 4 3 3 3 5 3 3 >/dev/null 2>&1); then
+    die "cluster validation accepted a non-Ready worker"
+  fi
 
   bundle="$(mktemp)"
+  worker_bundle="$(mktemp)"
+  trap 'rm -f "$bundle" "$worker_bundle"' EXIT
   jq -n \
     --arg apiServerEndpoint "k8s-api.heteronetwork.internal:7443" \
     --arg token "abcdef.0123456789abcdef" \
@@ -907,9 +1081,53 @@ self_test() {
     '{apiServerEndpoint: $apiServerEndpoint, token: $token, caCertHash: $caCertHash, certificateKey: $certificateKey}' >"$bundle"
   chmod 0600 "$bundle"
   rendered="$(render_join_config "$bundle")"
-  rm -f "$bundle"
   grep -Fq 'certificateKey: "1111111111111111111111111111111111111111111111111111111111111111"' <<<"$rendered"
   grep -Fq 'name: "control-plane-2"' <<<"$rendered"
+
+  if (validate_worker_config >/dev/null 2>&1); then
+    rm -f "$bundle"
+    die "worker validation accepted a control-plane node IP"
+  fi
+  node_ip="10.250.0.4"
+  node_name="worker-1"
+  validate_worker_config
+  rendered="$(render_haproxy_config)"
+  grep -Fxq '    server control-plane-1 10.250.0.1:6443' <<<"$rendered"
+  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  if (render_worker_join_config "$bundle" >/dev/null 2>&1); then
+    die "worker join accepted a control-plane join bundle"
+  fi
+
+  render_worker_join_bundle \
+    "k8s-api.heteronetwork.internal:7443" \
+    "abcdef.0123456789abcdef" \
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000" \
+    >"$worker_bundle"
+  chmod 0600 "$worker_bundle"
+  jq -e '
+    (keys | sort) == ["apiServerEndpoint", "caCertHash", "token"]
+    and (has("certificateKey") | not)
+  ' "$worker_bundle" >/dev/null
+  if (render_join_config "$worker_bundle" >/dev/null 2>&1); then
+    die "control-plane join accepted a worker-only join bundle"
+  fi
+  rendered="$(render_worker_join_config "$worker_bundle")"
+  grep -Fq 'apiServerEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
+  grep -Fq 'criSocket: "unix:///run/containerd/containerd.sock"' <<<"$rendered"
+  grep -Fq 'name: "hostname-override"' <<<"$rendered"
+  grep -Fq 'value: "worker-1"' <<<"$rendered"
+  grep -Fq 'name: "node-ip"' <<<"$rendered"
+  grep -Fq 'value: "10.250.0.4"' <<<"$rendered"
+  grep -Fq 'name: "worker-1"' <<<"$rendered"
+  ! grep -Fq 'controlPlane:' <<<"$rendered"
+  ! grep -Fq 'certificateKey:' <<<"$rendered"
+
+  chmod 0644 "$worker_bundle"
+  if (render_worker_join_config "$worker_bundle" >/dev/null 2>&1); then
+    die "worker join accepted a group/world-readable join bundle"
+  fi
+  rm -f "$bundle" "$worker_bundle"
+  trap - EXIT
   printf 'kubeadm HA renderer self-test passed\n'
 }
 
@@ -918,7 +1136,9 @@ case "$command" in
   prepare) prepare_host ;;
   init) initialize_cluster ;;
   refresh-join-bundle) refresh_join_bundle ;;
+  refresh-worker-join-bundle) refresh_worker_join_bundle ;;
   join-control-plane) join_control_plane ;;
+  join-worker) join_worker ;;
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;
