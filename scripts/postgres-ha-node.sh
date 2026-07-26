@@ -1149,7 +1149,8 @@ install_proxy() {
   ensure_service_hosts_entry
   /usr/sbin/haproxy -c -f "$state_dir/haproxy.cfg"
   systemctl daemon-reload
-  systemctl enable --now heteronetwork-db-proxy.service
+  systemctl enable heteronetwork-db-proxy.service
+  systemctl reload-or-restart heteronetwork-db-proxy.service
 }
 
 reconfigure_node() {
@@ -1346,12 +1347,14 @@ verify_cluster() {
   local healthy=0 primaries=0 name address status
   while read -r name address; do
     status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 3 --max-time 10 \
       --cacert "$state_dir/pki/ca.crt" \
       --connect-to "${service_name}:${rest_port}:${address}:${rest_port}" \
       "https://${service_name}:${rest_port}/health")"
     [[ "$status" == "200" ]] || die "Patroni health failed for $name: HTTP $status"
     healthy=$((healthy + 1))
     status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 3 --max-time 10 \
       --cacert "$state_dir/pki/ca.crt" \
       --connect-to "${service_name}:${rest_port}:${address}:${rest_port}" \
       "https://${service_name}:${rest_port}/primary")"
