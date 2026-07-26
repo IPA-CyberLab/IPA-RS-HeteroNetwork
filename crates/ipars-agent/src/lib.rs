@@ -42,7 +42,7 @@ use ipars_types::{
     BootstrapEndpointKind, CandidateSource, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, NatClassification, NatConnectivityState, NatProbeObservation, NodeId,
     NodeRecord, PathChangeEvent, PathChangeKind, PathQualityObservation, PathRecord, PathScore,
-    PathState, Role, Route, Tag, TransportProtocol, VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
+    PathState, Role, Route, Tag, TransportProtocol, VpnIp,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use serde::{Deserialize, Serialize};
@@ -146,8 +146,11 @@ pub struct AgentNodeState {
     pub vpn_ip: Option<VpnIp>,
     #[serde(default)]
     pub registered_node: Option<NodeRecord>,
+    /// Endpoints currently used by the Agent runtime.
     #[serde(default)]
     pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
+    /// Signed endpoints used only until registration or the first non-empty active directory.
+    /// `None` records that signed seeds must not be reintroduced into the runtime directory.
     #[serde(default)]
     pub seed_bootstrap_endpoints: Option<Vec<BootstrapEndpoint>>,
     #[serde(default)]
@@ -226,26 +229,6 @@ impl AgentNodeState {
                     error.reason()
                 ))
             })?;
-            let persisted = self
-                .bootstrap_endpoints
-                .iter()
-                .map(|endpoint| {
-                    (
-                        endpoint.kind,
-                        canonical_bootstrap_endpoint_url(&endpoint.url)
-                            .unwrap_or_else(|| endpoint.url.clone()),
-                    )
-                })
-                .collect::<BTreeSet<_>>();
-            if seeds.iter().any(|endpoint| {
-                let key = canonical_bootstrap_endpoint_url(&endpoint.url)
-                    .unwrap_or_else(|| endpoint.url.clone());
-                !persisted.contains(&(endpoint.kind, key))
-            }) {
-                return Err(AgentError::InvalidState(
-                    "persisted bootstrap endpoints omit a signed seed endpoint".to_string(),
-                ));
-            }
         }
         validate_web_ui_seed_urls(&self.web_ui_seed_urls)?;
         if let Some(node) = &self.registered_node {
@@ -1318,6 +1301,7 @@ fn validate_web_ui_seed_urls(urls: &[String]) -> Result<(), AgentError> {
     validate_bootstrap_endpoint_set(&endpoints, "web UI seed URL set")
 }
 
+/// Selects signed seeds only until a non-empty authoritative directory is available.
 pub fn merge_bootstrap_endpoint_sets(
     active: &[BootstrapEndpoint],
     seeds: &[BootstrapEndpoint],
@@ -1325,60 +1309,11 @@ pub fn merge_bootstrap_endpoint_sets(
     validate_bootstrap_endpoint_set(active, "control-plane service directory")?;
     validate_bootstrap_endpoint_set(seeds, "signed seed endpoint set")?;
 
-    let mut seed_keys = BTreeMap::<BootstrapEndpointKind, BTreeSet<String>>::new();
-    for endpoint in seeds {
-        let key =
-            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone());
-        seed_keys.entry(endpoint.kind).or_default().insert(key);
+    if active.is_empty() {
+        Ok(seeds.to_vec())
+    } else {
+        Ok(active.to_vec())
     }
-    let mut missing_seed_keys = seed_keys.clone();
-    let mut merged = Vec::new();
-    let mut seen = BTreeSet::<(BootstrapEndpointKind, String)>::new();
-    let mut per_kind = BTreeMap::<BootstrapEndpointKind, usize>::new();
-    for endpoint in active {
-        let key =
-            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone());
-        if seen.contains(&(endpoint.kind, key.clone())) {
-            continue;
-        }
-        let count = *per_kind.get(&endpoint.kind).unwrap_or(&0);
-        let missing_seeds = missing_seed_keys
-            .get(&endpoint.kind)
-            .map_or(0, BTreeSet::len);
-        let is_seed = missing_seed_keys
-            .get(&endpoint.kind)
-            .is_some_and(|keys| keys.contains(&key));
-        if !is_seed
-            && count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND.saturating_sub(missing_seeds)
-        {
-            continue;
-        }
-        seen.insert((endpoint.kind, key.clone()));
-        if let Some(keys) = missing_seed_keys.get_mut(&endpoint.kind) {
-            keys.remove(&key);
-        }
-        *per_kind.entry(endpoint.kind).or_default() += 1;
-        merged.push(endpoint.clone());
-    }
-    for endpoint in seeds {
-        let key =
-            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone());
-        if !seen.insert((endpoint.kind, key)) {
-            continue;
-        }
-        let count = per_kind.entry(endpoint.kind).or_default();
-        if *count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND
-            || merged.len() >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS
-        {
-            return Err(AgentError::InvalidState(
-                "merged service directory cannot retain every signed seed endpoint".to_string(),
-            ));
-        }
-        *count += 1;
-        merged.push(endpoint.clone());
-    }
-    validate_bootstrap_endpoint_set(&merged, "merged service directory")?;
-    Ok(merged)
 }
 
 impl AgentRuntime {
@@ -1573,22 +1508,17 @@ impl AgentRuntime {
         if active.is_empty() {
             return Ok(None);
         }
+        validate_bootstrap_endpoint_set(active, "control-plane service directory")?;
 
         let mut state = match self.state.write() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let seeds = state
-            .seed_bootstrap_endpoints
-            .clone()
-            .unwrap_or_else(|| state.bootstrap_endpoints.clone());
-        let merged = merge_bootstrap_endpoint_sets(active, &seeds)?;
-        let seeds_changed = state.seed_bootstrap_endpoints.is_none();
-        if state.bootstrap_endpoints == merged && !seeds_changed {
+        if state.bootstrap_endpoints == active && state.seed_bootstrap_endpoints.is_none() {
             return Ok(None);
         }
-        state.bootstrap_endpoints = merged;
-        state.seed_bootstrap_endpoints = Some(seeds);
+        state.bootstrap_endpoints = active.to_vec();
+        state.seed_bootstrap_endpoints = None;
         state.updated_at = updated_at;
         Ok(Some(state.clone()))
     }
@@ -1603,11 +1533,20 @@ impl AgentRuntime {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state.seed_bootstrap_endpoints.as_deref() == Some(seeds) {
+        if state.seed_bootstrap_endpoints.is_none() {
             return Ok(None);
         }
-        state.bootstrap_endpoints =
-            merge_bootstrap_endpoint_sets(&state.bootstrap_endpoints, seeds)?;
+        if state.registered_node.is_some() {
+            state.seed_bootstrap_endpoints = None;
+            state.updated_at = updated_at;
+            return Ok(Some(state.clone()));
+        }
+        if state.seed_bootstrap_endpoints.as_deref() == Some(seeds)
+            && state.bootstrap_endpoints == seeds
+        {
+            return Ok(None);
+        }
+        state.bootstrap_endpoints = seeds.to_vec();
         state.seed_bootstrap_endpoints = Some(seeds.to_vec());
         state.updated_at = updated_at;
         Ok(Some(state.clone()))
@@ -13038,7 +12977,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_prioritizes_active_ha_endpoints_and_retains_seed_fallbacks() -> Result<(), AgentError>
+    fn runtime_replaces_signed_seeds_with_authoritative_active_directory() -> Result<(), AgentError>
     {
         let mut state = AgentNodeState::generate(Utc::now());
         state.bootstrap_endpoints = vec![
@@ -13050,6 +12989,10 @@ mod tests {
                 kind: BootstrapEndpointKind::Signal,
                 url: "https://seed.example:9443".to_string(),
             },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://retired-stun.example:3478".to_string(),
+            },
         ];
         state.seed_bootstrap_endpoints = Some(state.bootstrap_endpoints.clone());
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
@@ -13060,12 +13003,12 @@ mod tests {
                 url: "https://active.example:8443".to_string(),
             },
             BootstrapEndpoint {
-                kind: BootstrapEndpointKind::ControlPlane,
-                url: "https://seed.example:8443".to_string(),
-            },
-            BootstrapEndpoint {
                 kind: BootstrapEndpointKind::Signal,
                 url: "https://active.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://active-stun.example:3478".to_string(),
             },
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::WebUi,
@@ -13073,27 +13016,17 @@ mod tests {
             },
         ];
 
-        let merged = runtime
+        let replaced = runtime
             .merge_active_bootstrap_endpoints(&active, updated_at)?
             .ok_or_else(|| {
                 AgentError::InvalidState(
-                    "active directory did not change endpoint priority".to_string(),
+                    "active directory did not replace signed seeds".to_string(),
                 )
             })?;
-        assert_eq!(
-            merged.bootstrap_endpoints,
-            vec![
-                active[0].clone(),
-                active[1].clone(),
-                active[2].clone(),
-                active[3].clone(),
-                BootstrapEndpoint {
-                    kind: BootstrapEndpointKind::Signal,
-                    url: "https://seed.example:9443".to_string(),
-                },
-            ]
-        );
-        assert_eq!(merged.updated_at, updated_at);
+        assert_eq!(replaced.bootstrap_endpoints, active);
+        assert_eq!(replaced.seed_bootstrap_endpoints, None);
+        assert_eq!(replaced.updated_at, updated_at);
+        replaced.validate()?;
         assert!(runtime
             .merge_active_bootstrap_endpoints(&active, updated_at)?
             .is_none());
@@ -13110,19 +13043,119 @@ mod tests {
             .ok_or_else(|| {
                 AgentError::InvalidState("replacement directory was not applied".to_string())
             })?;
+        assert_eq!(replaced.bootstrap_endpoints, replacement);
         assert!(replaced
             .bootstrap_endpoints
             .iter()
-            .all(|endpoint| !endpoint.url.contains("active.example")));
-        assert!(replaced
-            .bootstrap_endpoints
-            .iter()
-            .any(|endpoint| endpoint.url.contains("seed.example")));
+            .all(|endpoint| endpoint.kind != BootstrapEndpointKind::Stun));
+
+        let retired_seeds = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: "udp://retired-stun.example:3478".to_string(),
+        }];
+        assert!(runtime
+            .replace_seed_bootstrap_endpoints(
+                &retired_seeds,
+                updated_at + ChronoDuration::seconds(2),
+            )?
+            .is_none());
+        assert_eq!(runtime.state().bootstrap_endpoints, replacement);
         Ok(())
     }
 
     #[test]
-    fn merged_directory_reserves_bounded_capacity_for_signed_seeds() -> Result<(), AgentError> {
+    fn runtime_uses_and_refreshes_signed_seeds_before_active_directory() -> Result<(), AgentError> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let first = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://seed-a.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://seed-a.example:3478".to_string(),
+            },
+        ];
+        let first_state = runtime
+            .replace_seed_bootstrap_endpoints(&first, Utc::now())?
+            .ok_or_else(|| {
+                AgentError::InvalidState("initial signed seeds were not applied".to_string())
+            })?;
+        assert_eq!(first_state.bootstrap_endpoints, first);
+
+        let replacement = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://seed-b.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://seed-b.example:3478".to_string(),
+            },
+        ];
+        let replaced = runtime
+            .replace_seed_bootstrap_endpoints(&replacement, Utc::now())?
+            .ok_or_else(|| {
+                AgentError::InvalidState("replacement signed seeds were not applied".to_string())
+            })?;
+        assert_eq!(replaced.bootstrap_endpoints, replacement);
+        assert_eq!(
+            replaced.seed_bootstrap_endpoints.as_deref(),
+            Some(replacement.as_slice())
+        );
+        assert!(runtime
+            .merge_active_bootstrap_endpoints(&[], Utc::now())?
+            .is_none());
+        assert_eq!(runtime.state().bootstrap_endpoints, replacement);
+        Ok(())
+    }
+
+    #[test]
+    fn registered_runtime_does_not_restore_seeds_over_active_directory() -> Result<(), AgentError> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        let active = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://active.example:8443".to_string(),
+        }];
+        state.bootstrap_endpoints = active.clone();
+        state.seed_bootstrap_endpoints = Some(vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: "udp://retired-stun.example:3478".to_string(),
+        }]);
+        let mut node = peer_record(
+            state.node_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
+            &state.wireguard_public_key_b64,
+            Vec::new(),
+            Vec::new(),
+        );
+        node.identity_public_key = state.identity_public_key_b64.clone();
+        state.vpn_ip = Some(node.vpn_ip);
+        state.registered_node = Some(node);
+        state.validate()?;
+
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let refreshed_seeds = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: "udp://another-retired-stun.example:3478".to_string(),
+        }];
+        let updated = runtime
+            .replace_seed_bootstrap_endpoints(&refreshed_seeds, Utc::now())?
+            .ok_or_else(|| {
+                AgentError::InvalidState("registered seed state was not retired".to_string())
+            })?;
+
+        assert_eq!(updated.bootstrap_endpoints, active);
+        assert_eq!(updated.seed_bootstrap_endpoints, None);
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_endpoint_selection_uses_seeds_only_without_an_active_directory(
+    ) -> Result<(), AgentError> {
         let active = (0..MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
             .map(|index| BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
@@ -13133,13 +13166,30 @@ mod tests {
             kind: BootstrapEndpointKind::ControlPlane,
             url: "https://signed-seed.example:8443".to_string(),
         };
-        let merged = merge_bootstrap_endpoint_sets(&active, std::slice::from_ref(&seed))?;
-        assert_eq!(merged.len(), MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND);
-        assert_eq!(merged.last(), Some(&seed));
-        assert!(merged
-            .iter()
-            .all(|endpoint| endpoint.url != active.last().map_or("", |item| item.url.as_str())));
+        let selected = merge_bootstrap_endpoint_sets(&active, std::slice::from_ref(&seed))?;
+        assert_eq!(selected, active);
+        assert!(!selected.contains(&seed));
+        assert_eq!(
+            merge_bootstrap_endpoint_sets(&[], std::slice::from_ref(&seed))?,
+            vec![seed]
+        );
         Ok(())
+    }
+
+    #[test]
+    fn agent_node_state_validates_active_and_seed_directories_independently(
+    ) -> Result<(), AgentError> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.bootstrap_endpoints = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://active.example:8443".to_string(),
+        }];
+        state.seed_bootstrap_endpoints = Some(vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: "udp://retired-stun.example:3478".to_string(),
+        }]);
+
+        state.validate()
     }
 
     #[test]

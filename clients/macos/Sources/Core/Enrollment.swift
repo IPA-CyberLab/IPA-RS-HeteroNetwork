@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 public enum EnrollmentError: LocalizedError, Equatable {
     case empty
     case invalidLink
@@ -98,7 +104,8 @@ public enum EnrollmentParser {
                       url.user == nil,
                       url.password == nil,
                       url.query == nil,
-                      url.fragment == nil
+                      url.fragment == nil,
+                      scheme == "https" || isLoopbackHost(url.host)
                 else {
                     continue
                 }
@@ -111,5 +118,34 @@ public enum EnrollmentParser {
             }
         }
         return urls
+    }
+
+    private static func isLoopbackHost(_ host: String?) -> Bool {
+        guard let host else { return false }
+        let normalized = host
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if normalized == "localhost"
+            || normalized == "localhost."
+        {
+            return true
+        }
+
+        var ipv4Address = in_addr()
+        if inet_pton(AF_INET, normalized, &ipv4Address) == 1 {
+            return withUnsafeBytes(of: &ipv4Address) { bytes in
+                bytes.count == 4 && bytes[0] == 127
+            }
+        }
+
+        var ipv6Address = in6_addr()
+        if inet_pton(AF_INET6, normalized, &ipv6Address) == 1 {
+            return withUnsafeBytes(of: &ipv6Address) { bytes in
+                bytes.count == 16
+                    && bytes.dropLast().allSatisfy { $0 == 0 }
+                    && bytes.last == 1
+            }
+        }
+        return false
     }
 }

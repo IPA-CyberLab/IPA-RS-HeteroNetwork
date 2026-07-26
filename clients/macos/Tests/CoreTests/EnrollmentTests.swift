@@ -71,6 +71,47 @@ final class EnrollmentTests: XCTestCase {
         XCTAssertEqual(claims["not_before"] as? String, "2026-07-20T12:34:51.123456789Z")
     }
 
+    func testManagementURLsExcludeNonLoopbackHTTPForATS() {
+        let urls = EnrollmentParser.managementURLs(
+            from: [
+                BootstrapEndpoint(
+                    url: "http://100.105.153.15:8080",
+                    kind: .controlPlane
+                ),
+                BootstrapEndpoint(
+                    url: "http://public.example:8080",
+                    kind: .controlPlane
+                ),
+                BootstrapEndpoint(
+                    url: "https://secure.example:8443",
+                    kind: .controlPlane
+                ),
+                BootstrapEndpoint(
+                    url: "http://localhost:8080",
+                    kind: .controlPlane
+                ),
+                BootstrapEndpoint(
+                    url: "http://127.42.0.9:8080",
+                    kind: .controlPlane
+                ),
+                BootstrapEndpoint(
+                    url: "http://[::1]:8080",
+                    kind: .controlPlane
+                ),
+            ]
+        )
+
+        XCTAssertEqual(
+            Set(urls.map(\.absoluteString)),
+            Set([
+                "https://secure.example:8443",
+                "http://localhost:8080",
+                "http://127.42.0.9:8080",
+                "http://[::1]:8080",
+            ])
+        )
+    }
+
     func testRejectsNodeEnrollmentToken() throws {
         let now = Date(timeIntervalSince1970: 1_784_550_896)
         let client = makeToken(now: now)

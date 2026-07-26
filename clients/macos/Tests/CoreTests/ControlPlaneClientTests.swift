@@ -37,10 +37,10 @@ final class ControlPlaneClientTests: XCTestCase {
         var hosts = [String]()
         var selectedGateways = [String]()
         StubURLProtocol.handler = { request in
-            lock.lock()
-            paths.append(request.url?.path ?? "")
-            hosts.append(request.url?.host ?? "")
-            lock.unlock()
+            lock.withLock {
+                paths.append(request.url?.path ?? "")
+                hosts.append(request.url?.host ?? "")
+            }
             if request.url?.path == "/v1/clients/join" {
                 throw URLError(.networkConnectionLost)
             }
@@ -50,9 +50,11 @@ final class ControlPlaneClientTests: XCTestCase {
             let requestObject = try JSONSerialization.jsonObject(
                 with: try requestBody(request)
             ) as? [String: Any]
-            lock.lock()
-            selectedGateways.append(requestObject?["active_gateway_node_id"] as? String ?? "-")
-            lock.unlock()
+            lock.withLock {
+                selectedGateways.append(
+                    requestObject?["active_gateway_node_id"] as? String ?? "-"
+                )
+            }
             let http = HTTPURLResponse(
                 url: try XCTUnwrap(request.url),
                 statusCode: 200,
@@ -72,11 +74,9 @@ final class ControlPlaneClientTests: XCTestCase {
         XCTAssertEqual(session.client, clientRecord)
         XCTAssertEqual(session.peerMap, peerMap)
         XCTAssertEqual(refreshed.controlPlaneURLs.first?.host, "next-gateway.example")
-        lock.lock()
-        let requestedPaths = paths
-        let requestedHosts = hosts
-        let requestedGateways = selectedGateways
-        lock.unlock()
+        let (requestedPaths, requestedHosts, requestedGateways) = lock.withLock {
+            (paths, hosts, selectedGateways)
+        }
         XCTAssertEqual(
             requestedPaths,
             [
@@ -91,6 +91,87 @@ final class ControlPlaneClientTests: XCTestCase {
             ["gateway.example", "cp.example", "gateway.example", "gateway.example"]
         )
         XCTAssertEqual(requestedGateways, ["-", "node-gateway"])
+    }
+
+    func testRefreshReplacesRetiredControlPlanesWithLiveDirectory() async throws {
+        let keyMaterial = ClientKeyMaterial.generate()
+        let now = Date(timeIntervalSince1970: 1_784_550_896)
+        let clientRecord = NodeRecord(
+            nodeID: try keyMaterial.clientID,
+            clusterID: "cluster-a",
+            vpnIP: "100.96.0.10",
+            identityPublicKey: try keyMaterial.identityPublicKey,
+            wireGuardPublicKey: try keyMaterial.wireGuardPublicKey,
+            role: "client",
+            tags: [],
+            endpointCandidates: [],
+            routes: [],
+            registeredAt: now
+        )
+        let storedSession = ClientSession(
+            identityPrivateKey: keyMaterial.identityPrivateKey,
+            wireGuardPrivateKey: keyMaterial.wireGuardPrivateKey,
+            controlPlaneURLs: [
+                URL(string: "https://retired.example:8443")!,
+                URL(string: "https://also-retired.example:8443")!,
+            ],
+            client: clientRecord,
+            peerMap: PeerMap(
+                clusterID: "cluster-a",
+                peers: [gatewayRecord(now: now)],
+                bootstrapEndpoints: [],
+                generatedAt: now
+            ),
+            enrolledAt: now
+        )
+        let livePeerMap = PeerMap(
+            clusterID: "cluster-a",
+            peers: [gatewayRecord(now: now)],
+            bootstrapEndpoints: [
+                BootstrapEndpoint(
+                    url: "https://active.example:8443",
+                    kind: .controlPlane
+                ),
+            ],
+            generatedAt: now
+        )
+        let responseData = try HeteroNetworkCoding.makeEncoder().encode(
+            ClientConfigurationFixture(client: clientRecord, peerMap: livePeerMap)
+        )
+        let lock = NSLock()
+        var requestedHosts = [String]()
+        StubURLProtocol.handler = { request in
+            lock.withLock {
+                requestedHosts.append(request.url?.host ?? "")
+            }
+            let http = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (http, responseData)
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let controlPlane = ControlPlaneClient(session: URLSession(configuration: configuration))
+
+        let refreshed = try await controlPlane.refresh(storedSession)
+
+        let actualRequestedHosts = lock.withLock { requestedHosts }
+        XCTAssertEqual(actualRequestedHosts, ["retired.example"])
+        XCTAssertEqual(
+            refreshed.controlPlaneURLs,
+            [URL(string: "https://active.example:8443")!]
+        )
+        XCTAssertFalse(
+            refreshed.controlPlaneURLs.contains { $0.host == "retired.example" }
+        )
+        XCTAssertFalse(
+            refreshed.controlPlaneURLs.contains { $0.host == "also-retired.example" }
+        )
     }
 
     private func token(now: Date) -> SignedJoinToken {

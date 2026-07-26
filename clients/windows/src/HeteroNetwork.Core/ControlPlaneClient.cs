@@ -98,9 +98,13 @@ public sealed class ControlPlaneClient : IDisposable
 
         storedSession.PeerMap = response.PeerMap;
         storedSession.SelectedGatewayNodeId = response.PeerMap.Peers.FirstOrDefault()?.NodeId;
-        storedSession.ControlPlaneUrls = MergeManagementUrls(
-            EnrollmentParser.ManagementUrls(response.PeerMap.BootstrapEndpoints),
-            storedSession.ControlPlaneUrls);
+        var liveManagementUrls =
+            EnrollmentParser.ManagementUrls(response.PeerMap.BootstrapEndpoints);
+        if (liveManagementUrls.Count > 0)
+        {
+            storedSession.ControlPlaneUrls = liveManagementUrls.ToList();
+        }
+
         storedSession.RefreshedAt = DateTimeOffset.UtcNow;
         return storedSession;
     }
@@ -267,16 +271,6 @@ public sealed class ControlPlaneClient : IDisposable
         {
             throw new ControlPlaneException("The control plane returned an invalid response.");
         }
-    }
-
-    private static List<Uri> MergeManagementUrls(
-        IEnumerable<Uri> discovered,
-        IEnumerable<Uri> existing)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        return discovered.Concat(existing)
-            .Where(uri => seen.Add(uri.AbsoluteUri.TrimEnd('/')))
-            .ToList();
     }
 
     private static async Task<byte[]> ReadBoundedAsync(

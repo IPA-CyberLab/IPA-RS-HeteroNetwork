@@ -2590,8 +2590,9 @@ fn persist_joined_agent_state(
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     let seeds = token.claims.bootstrap_endpoints.clone();
-    let bootstrap_endpoints =
-        merge_bootstrap_endpoint_sets(&response.peer_map.bootstrap_endpoints, &seeds)?;
+    let active = &response.peer_map.bootstrap_endpoints;
+    let bootstrap_endpoints = merge_bootstrap_endpoint_sets(active, &seeds)?;
+    let seed_bootstrap_endpoints = active.is_empty().then_some(seeds);
     let state = AgentNodeState {
         node_id: identity.node_id(),
         identity_private_key_b64: identity.signing_key_b64(),
@@ -2601,7 +2602,7 @@ fn persist_joined_agent_state(
         vpn_ip: Some(response.node.vpn_ip),
         registered_node: Some(response.node.clone()),
         bootstrap_endpoints,
-        seed_bootstrap_endpoints: Some(seeds),
+        seed_bootstrap_endpoints,
         web_ui_seed_urls: Vec::new(),
         created_at: now,
         updated_at: now,
@@ -11296,8 +11297,78 @@ mod tests {
         assert_eq!(state.vpn_ip, Some(node.vpn_ip));
         assert_eq!(state.registered_node, Some(node));
         assert_eq!(state.bootstrap_endpoints, token.claims.bootstrap_endpoints);
+        assert_eq!(
+            state.seed_bootstrap_endpoints,
+            Some(token.claims.bootstrap_endpoints.clone())
+        );
         assert_eq!(state.identity_key_pair()?.node_id(), identity.node_id());
         assert_eq!(state.wireguard_private_key_b64, wireguard.private_key_b64);
+        std::fs::remove_dir_all(state_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn joined_state_discards_token_seeds_after_active_directory_discovery() -> anyhow::Result<()> {
+        let identity = IdentityKeyPair::generate();
+        let wireguard = WireGuardKeyPair::generate();
+        let mut node = cli_test_node_record(identity.node_id());
+        node.identity_public_key = identity.public_key_b64();
+        node.wireguard_public_key = wireguard.public_key_b64.clone();
+        node.vpn_ip = ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)));
+        let token = token_with_bootstrap(vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.10:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.10:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+        ])?;
+        let active = vec![
+            BootstrapEndpoint {
+                url: "https://203.0.113.20:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://203.0.113.21:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "udp://203.0.113.22:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
+            },
+        ];
+        let state_dir = temp_path("join-active-state");
+        let state_path = state_dir.join("agent.json");
+
+        persist_joined_agent_state(
+            &state_path,
+            &identity,
+            &wireguard,
+            &token,
+            &RegisterNodeResponse {
+                node: node.clone(),
+                peer_map: PeerMap {
+                    cluster_id: node.cluster_id.clone(),
+                    peers: Vec::new(),
+                    bootstrap_endpoints: active.clone(),
+                    generated_at: Utc::now(),
+                },
+                relay_map: ipars_types::api::RelayMap {
+                    cluster_id: node.cluster_id.clone(),
+                    relays: Vec::new(),
+                    generated_at: Utc::now(),
+                },
+                cluster_policy: ipars_types::ClusterPolicy::default(),
+            },
+        )?;
+
+        let state = FileAgentStateStore::new(&state_path).load()?;
+        assert_eq!(state.bootstrap_endpoints, active);
+        assert_eq!(state.seed_bootstrap_endpoints, None);
+        let persisted = std::fs::read_to_string(&state_path)?;
+        assert!(!persisted.contains("203.0.113.10"));
         std::fs::remove_dir_all(state_dir)?;
         Ok(())
     }

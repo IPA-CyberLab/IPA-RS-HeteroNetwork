@@ -100,12 +100,12 @@ public final class ControlPlaneClient {
         var updated = storedSession
         updated.peerMap = response.peerMap
         updated.selectedGatewayNodeID = response.peerMap.peers.first?.nodeID
-        updated.controlPlaneURLs = Self.mergedManagementURLs(
-            discovered: EnrollmentParser.managementURLs(
-                from: response.peerMap.bootstrapEndpoints
-            ),
-            existing: storedSession.controlPlaneURLs
+        let liveManagementURLs = EnrollmentParser.managementURLs(
+            from: response.peerMap.bootstrapEndpoints
         )
+        updated.controlPlaneURLs = liveManagementURLs.isEmpty
+            ? storedSession.controlPlaneURLs
+            : liveManagementURLs
         updated.refreshedAt = Date()
         return updated
     }
@@ -243,15 +243,5 @@ public final class ControlPlaneClient {
             }
         }
         return String(decoding: data.prefix(512), as: UTF8.self)
-    }
-
-    private static func mergedManagementURLs(discovered: [URL], existing: [URL]) -> [URL] {
-        var seen = Set<String>()
-        return (discovered + existing).filter { url in
-            let canonical = url.absoluteString.trimmingCharacters(
-                in: CharacterSet(charactersIn: "/")
-            )
-            return seen.insert(canonical).inserted
-        }
     }
 }

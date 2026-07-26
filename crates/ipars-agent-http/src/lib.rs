@@ -1134,12 +1134,14 @@ fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
             trusted_directory: true,
         });
     }
-    for url in &state.control_plane_urls {
-        candidates.push(WebUiCandidate {
-            url: url.clone(),
-            source: "control_plane_runtime",
-            trusted_directory: true,
-        });
+    if runtime_state.bootstrap_endpoints.is_empty() {
+        for url in &state.control_plane_urls {
+            candidates.push(WebUiCandidate {
+                url: url.clone(),
+                source: "control_plane_runtime",
+                trusted_directory: true,
+            });
+        }
     }
 
     let mut seen = BTreeSet::new();
@@ -2072,19 +2074,19 @@ async fn remove_node(
 
 fn runtime_control_plane_urls(state: &AgentHttpState) -> Vec<String> {
     let mut seen = BTreeSet::new();
-    state
-        .runtime
-        .state()
-        .bootstrap_endpoints
-        .into_iter()
-        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
-        .map(|endpoint| endpoint.url.trim_end_matches('/').to_string())
-        .chain(
-            state
-                .control_plane_urls
-                .iter()
-                .map(|url| url.trim_end_matches('/').to_string()),
-        )
+    let runtime_state = state.runtime.state();
+    let urls = if runtime_state.bootstrap_endpoints.is_empty() {
+        state.control_plane_urls.clone()
+    } else {
+        runtime_state
+            .bootstrap_endpoints
+            .into_iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url)
+            .collect()
+    };
+    urls.into_iter()
+        .map(|url| url.trim_end_matches('/').to_string())
         .filter(|url| seen.insert(url.clone()))
         .collect()
 }
@@ -3963,6 +3965,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn active_directory_replaces_agent_http_control_plane_fallbacks(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let retired = "https://retired.example:8443".to_string();
+        let state = AgentHttpState::with_control_plane_urls(runtime.clone(), vec![retired.clone()]);
+
+        assert_eq!(runtime_control_plane_urls(&state), vec![retired.clone()]);
+        assert!(web_ui_candidates(&state).iter().any(|candidate| {
+            candidate.url == retired && candidate.source == "control_plane_runtime"
+        }));
+
+        let active = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://active.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://console.active.example".to_string(),
+            },
+        ];
+        runtime.merge_active_bootstrap_endpoints(&active, Utc::now())?;
+
+        assert_eq!(
+            runtime_control_plane_urls(&state),
+            vec!["https://active.example:8443".to_string()]
+        );
+        let candidates = web_ui_candidates(&state);
+        assert!(candidates.iter().all(|candidate| candidate.url != retired));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.source != "control_plane_runtime"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.url == "https://console.active.example"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn public_web_gateway_requires_proxy_auth_and_limits_routes(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3972,6 +4016,10 @@ mod tests {
         node_state.bootstrap_endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::WebUi,
             url: "https://203.0.113.10".to_string(),
+        });
+        node_state.bootstrap_endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: backend_url.clone(),
         });
         let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
         let status = Arc::new(StdRwLock::new(PublicWebGatewayStatus {
@@ -4178,6 +4226,10 @@ mod tests {
         node_state.bootstrap_endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::WebUi,
             url: service_url.clone(),
+        });
+        node_state.bootstrap_endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: control_plane_url.clone(),
         });
         let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
         let status = Arc::new(StdRwLock::new(PublicWebGatewayStatus {

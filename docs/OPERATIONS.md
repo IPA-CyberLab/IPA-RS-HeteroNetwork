@@ -71,7 +71,7 @@ ipars token create \
   --unlimited-uses
 ```
 
-The command requires two active endpoints for Control Plane, Signal, and STUN, and two Relay endpoints when `--allow-relay` is present. `--allow-degraded-service-directory` exists for deliberate disaster recovery, not routine provisioning. Agents persist the directory learned from registration, heartbeat, and peer-map responses, prefer those active entries on every later loop, and retain signed token entries as fallback seeds.
+The command requires two active endpoints for Control Plane, Signal, and STUN, and two Relay endpoints when `--allow-relay` is present. `--allow-degraded-service-directory` exists for deliberate disaster recovery, not routine provisioning. Signed token entries are initial-discovery seeds only. Agents persist the first non-empty directory learned from registration, heartbeat, or peer-map responses as the authoritative endpoint set; subsequent directories replace it, and retired token entries are not retained.
 
 The Web UI workflow performs the same HA directory check, signs and records the
 token in the shared ledger, and returns a Linux x86_64 install command. The

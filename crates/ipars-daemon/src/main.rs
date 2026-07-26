@@ -8584,16 +8584,14 @@ async fn run_agent(
         }
         None
     };
-    if !stun_servers.is_empty() {
-        background_tasks.push(start_nat_discovery(
-            runtime.clone(),
-            stun_servers.clone(),
-            args.stun_bind,
-            Duration::from_secs(args.nat_discovery_interval_seconds),
-            Duration::from_secs(args.public_nat_discovery_interval_seconds),
-            args.nat_discovery_failure_threshold,
-        ));
-    }
+    background_tasks.push(start_nat_discovery(
+        runtime.clone(),
+        AgentStunDiscoveryConfig::from(&args),
+        args.stun_bind,
+        Duration::from_secs(args.nat_discovery_interval_seconds),
+        Duration::from_secs(args.public_nat_discovery_interval_seconds),
+        args.nat_discovery_failure_threshold,
+    ));
     if otel_metrics_enabled {
         background_tasks.push(start_agent_otel_metrics_export(
             runtime.clone(),
@@ -13091,7 +13089,7 @@ fn start_public_web_gateway(
 
 fn start_nat_discovery(
     runtime: Arc<AgentRuntime>,
-    stun_servers: Vec<SocketAddr>,
+    stun_config: AgentStunDiscoveryConfig,
     stun_bind: SocketAddr,
     interval: Duration,
     public_interval: Duration,
@@ -13113,8 +13111,7 @@ fn start_nat_discovery(
                 nat_discovery_refresh_interval(currently_public, interval, public_interval);
             tokio::time::sleep(next_interval).await;
             let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
-            match runtime
-                .classify_nat_without_candidate_refresh(probe_bind, stun_servers.clone())
+            match classify_nat_from_runtime_directory(runtime.as_ref(), &stun_config, probe_bind)
                 .await
             {
                 Ok(classification) => {
@@ -13150,6 +13147,29 @@ fn start_nat_discovery(
             }
         }
     })
+}
+
+async fn runtime_stun_servers(
+    runtime: &AgentRuntime,
+    config: &AgentStunDiscoveryConfig,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let state = runtime.state();
+    resolve_agent_stun_servers(config, None, &state.bootstrap_endpoints).await
+}
+
+async fn classify_nat_from_runtime_directory(
+    runtime: &AgentRuntime,
+    config: &AgentStunDiscoveryConfig,
+    probe_bind: SocketAddr,
+) -> anyhow::Result<ipars_types::NatClassification> {
+    let stun_servers = runtime_stun_servers(runtime, config).await?;
+    anyhow::ensure!(
+        !stun_servers.is_empty(),
+        "runtime service directory has no usable STUN endpoint"
+    );
+    Ok(runtime
+        .classify_nat_without_candidate_refresh(probe_bind, stun_servers)
+        .await?)
 }
 
 fn nat_discovery_refresh_interval(
@@ -18777,17 +18797,20 @@ fn agent_control_plane_base_urls_with_persisted(
         return normalize_http_base_urls([override_url.to_string()], "control-plane URL");
     }
     let mut base_urls = Vec::new();
-    if let Some(registered_url) = registered_url {
-        base_urls.push(normalize_base_url(registered_url));
-    }
-    base_urls.extend(
-        persisted_bootstrap_endpoints
-            .iter()
-            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
-            .map(|endpoint| endpoint.url.clone()),
-    );
-    if let Some(token) = token {
-        base_urls.extend(control_plane_base_urls(Some(token), None)?);
+    if persisted_bootstrap_endpoints.is_empty() {
+        if let Some(registered_url) = registered_url {
+            base_urls.push(normalize_base_url(registered_url));
+        }
+        if let Some(token) = token {
+            base_urls.extend(control_plane_base_urls(Some(token), None)?);
+        }
+    } else {
+        base_urls.extend(
+            persisted_bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.clone()),
+        );
     }
     normalize_http_base_urls(base_urls, "control-plane endpoint")
 }
@@ -18897,28 +18920,32 @@ fn runtime_control_plane_urls(
     fallback: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let state = runtime.state();
-    normalize_http_base_urls(
+    let base_urls = if state.bootstrap_endpoints.is_empty() {
+        fallback.to_vec()
+    } else {
         state
             .bootstrap_endpoints
             .iter()
             .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
             .map(|endpoint| endpoint.url.clone())
-            .chain(fallback.iter().cloned()),
-        "runtime control-plane endpoint",
-    )
+            .collect()
+    };
+    normalize_http_base_urls(base_urls, "runtime control-plane endpoint")
 }
 
 fn runtime_signal_urls(runtime: &AgentRuntime, fallback: &[String]) -> anyhow::Result<Vec<String>> {
     let state = runtime.state();
-    normalize_http_base_urls(
+    let base_urls = if state.bootstrap_endpoints.is_empty() {
+        fallback.to_vec()
+    } else {
         state
             .bootstrap_endpoints
             .iter()
             .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
             .map(|endpoint| endpoint.url.clone())
-            .chain(fallback.iter().cloned()),
-        "runtime signal endpoint",
-    )
+            .collect()
+    };
+    normalize_http_base_urls(base_urls, "runtime signal endpoint")
 }
 
 #[cfg(test)]
@@ -18948,26 +18975,23 @@ fn signal_base_urls_with_persisted(
     if let Some(override_url) = override_url {
         return normalize_http_base_urls([override_url.to_string()], "signal URL");
     }
-    if let Some(token) = token {
-        token
-            .validate_shape()
-            .context("agent signed join token validation failed")?;
-    }
-    let mut base_urls = persisted_bootstrap_endpoints
+    let bootstrap_endpoints = if persisted_bootstrap_endpoints.is_empty() {
+        if let Some(token) = token {
+            token
+                .validate_shape()
+                .context("agent signed join token validation failed")?;
+            token.claims.bootstrap_endpoints.as_slice()
+        } else {
+            &[]
+        }
+    } else {
+        persisted_bootstrap_endpoints
+    };
+    let base_urls = bootstrap_endpoints
         .iter()
         .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
         .map(|endpoint| endpoint.url.clone())
         .collect::<Vec<_>>();
-    if let Some(token) = token {
-        base_urls.extend(
-            token
-                .claims
-                .bootstrap_endpoints
-                .iter()
-                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Signal)
-                .map(|endpoint| endpoint.url.clone()),
-        );
-    }
     let base_urls = normalize_http_base_urls(base_urls, "signal endpoint")?;
     if base_urls.is_empty() {
         anyhow::bail!("signal URL is required and no signal bootstrap exists");
@@ -18983,13 +19007,43 @@ async fn agent_stun_servers(
     agent_stun_servers_with_persisted(args, token, &[]).await
 }
 
+#[derive(Debug, Clone)]
+struct AgentStunDiscoveryConfig {
+    explicit_servers: Vec<SocketAddr>,
+    public_stun_urls: Vec<String>,
+    disable_public_stun_fallback: bool,
+}
+
+impl From<&AgentArgs> for AgentStunDiscoveryConfig {
+    fn from(args: &AgentArgs) -> Self {
+        Self {
+            explicit_servers: args.stun_servers.clone(),
+            public_stun_urls: args.public_stun_urls.clone(),
+            disable_public_stun_fallback: args.disable_public_stun_fallback,
+        }
+    }
+}
+
 async fn agent_stun_servers_with_persisted(
     args: &AgentArgs,
     token: Option<&SignedJoinToken>,
     persisted_bootstrap_endpoints: &[BootstrapEndpoint],
 ) -> anyhow::Result<Vec<SocketAddr>> {
+    resolve_agent_stun_servers(
+        &AgentStunDiscoveryConfig::from(args),
+        token,
+        persisted_bootstrap_endpoints,
+    )
+    .await
+}
+
+async fn resolve_agent_stun_servers(
+    config: &AgentStunDiscoveryConfig,
+    token: Option<&SignedJoinToken>,
+    persisted_bootstrap_endpoints: &[BootstrapEndpoint],
+) -> anyhow::Result<Vec<SocketAddr>> {
     let mut explicit_servers = Vec::new();
-    for server in &args.stun_servers {
+    for server in &config.explicit_servers {
         if !endpoint_addr_is_usable(*server) {
             anyhow::bail!(
                 "--stun-server must use a usable nonzero, non-unspecified, non-multicast, non-broadcast socket address"
@@ -19002,19 +19056,22 @@ async fn agent_stun_servers_with_persisted(
         explicit_servers.len() <= MAX_AGENT_STUN_SERVERS,
         "--stun-server may contain at most {MAX_AGENT_STUN_SERVERS} unique socket addresses"
     );
-    if let Some(token) = token {
-        token
-            .validate_shape()
-            .context("agent signed join token validation failed")?;
-    }
-    let token_bootstrap_endpoints = token
-        .map(|token| token.claims.bootstrap_endpoints.as_slice())
-        .unwrap_or_default();
+    let bootstrap_endpoints = if persisted_bootstrap_endpoints.is_empty() {
+        if let Some(token) = token {
+            token
+                .validate_shape()
+                .context("agent signed join token validation failed")?;
+            token.claims.bootstrap_endpoints.as_slice()
+        } else {
+            &[]
+        }
+    } else {
+        persisted_bootstrap_endpoints
+    };
     let mut bootstrap_servers = Vec::new();
     let mut bootstrap_failures = Vec::new();
-    for endpoint in persisted_bootstrap_endpoints
+    for endpoint in bootstrap_endpoints
         .iter()
-        .chain(token_bootstrap_endpoints.iter())
         .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::Stun)
     {
         if bootstrap_servers.len() == MAX_AGENT_STUN_SERVERS {
@@ -19061,12 +19118,12 @@ async fn agent_stun_servers_with_persisted(
     }
 
     let mut public_fallback_servers = Vec::new();
-    if !args.disable_public_stun_fallback {
+    if !config.disable_public_stun_fallback {
         anyhow::ensure!(
-            args.public_stun_urls.len() <= MAX_AGENT_STUN_SERVERS,
+            config.public_stun_urls.len() <= MAX_AGENT_STUN_SERVERS,
             "--public-stun-url may contain at most {MAX_AGENT_STUN_SERVERS} URLs"
         );
-        for endpoint in &args.public_stun_urls {
+        for endpoint in &config.public_stun_urls {
             parse_udp_bootstrap_url(endpoint, "public STUN fallback")?;
             match resolve_udp_bootstrap_socket_addrs(endpoint, "public STUN fallback").await {
                 Ok(resolved) => {
@@ -19304,6 +19361,41 @@ mod tests {
             nat_discovery_refresh_interval(true, public, regular),
             public
         );
+    }
+
+    #[tokio::test]
+    async fn periodic_nat_discovery_switches_to_latest_stun_directory() -> anyhow::Result<()> {
+        let retired = SocketAddr::from(([8, 8, 8, 10], 3478));
+        let active = SocketAddr::from(([8, 8, 8, 11], 3478));
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.bootstrap_endpoints = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: format!("udp://{retired}"),
+        }];
+        state.seed_bootstrap_endpoints = None;
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let config = AgentStunDiscoveryConfig {
+            explicit_servers: Vec::new(),
+            public_stun_urls: Vec::new(),
+            disable_public_stun_fallback: true,
+        };
+
+        assert_eq!(
+            runtime_stun_servers(&runtime, &config).await?,
+            vec![retired]
+        );
+        runtime.merge_active_bootstrap_endpoints(
+            &[BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: format!("udp://{active}"),
+            }],
+            Utc::now(),
+        )?;
+        let refreshed = runtime_stun_servers(&runtime, &config).await?;
+
+        assert_eq!(refreshed, vec![active]);
+        assert!(!refreshed.contains(&retired));
+        Ok(())
     }
 
     #[test]
@@ -20097,7 +20189,7 @@ mod tests {
         )?);
         assert_eq!(
             runtime_control_plane_urls(&runtime, std::slice::from_ref(&unavailable_url))?,
-            vec!["https://public-b.example:8443".to_string(), unavailable_url,]
+            vec!["https://public-b.example:8443".to_string()]
         );
         assert_eq!(store.load()?.bootstrap_endpoints, discovered);
 
@@ -36821,6 +36913,10 @@ exec sleep 60
 
     #[test]
     fn agent_control_plane_base_urls_resume_from_persisted_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.99:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }]);
         let persisted = vec![
             BootstrapEndpoint {
                 url: "https://203.0.113.10:8443/".to_string(),
@@ -36842,15 +36938,60 @@ exec sleep 60
         );
         assert_eq!(
             agent_control_plane_base_urls_with_persisted(
-                None,
+                Some(&token),
                 None,
                 Some("https://203.0.113.12:8443/"),
                 &persisted,
             )?,
-            vec![
-                "https://203.0.113.12:8443".to_string(),
-                "https://203.0.113.10:8443".to_string(),
-            ]
+            vec!["https://203.0.113.10:8443".to_string()]
+        );
+        let signal_only = vec![BootstrapEndpoint {
+            url: "https://203.0.113.11:9443".to_string(),
+            kind: BootstrapEndpointKind::Signal,
+        }];
+        assert_eq!(
+            agent_control_plane_base_urls_with_persisted(Some(&token), None, None, &signal_only,)?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_service_directories_replace_startup_fallbacks() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let control_plane_fallback = vec!["https://retired.example:8443".to_string()];
+        let signal_fallback = vec!["https://retired.example:9443".to_string()];
+        assert_eq!(
+            runtime_control_plane_urls(&runtime, &control_plane_fallback)?,
+            control_plane_fallback
+        );
+        assert_eq!(
+            runtime_signal_urls(&runtime, &signal_fallback)?,
+            signal_fallback
+        );
+
+        let active = vec![
+            BootstrapEndpoint {
+                url: "https://active.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://active.example:9443".to_string(),
+                kind: BootstrapEndpointKind::Signal,
+            },
+        ];
+        runtime.merge_active_bootstrap_endpoints(&active, Utc::now())?;
+
+        assert_eq!(
+            runtime_control_plane_urls(&runtime, &control_plane_fallback)?,
+            vec!["https://active.example:8443".to_string()]
+        );
+        assert_eq!(
+            runtime_signal_urls(&runtime, &signal_fallback)?,
+            vec!["https://active.example:9443".to_string()]
         );
         Ok(())
     }
@@ -36963,6 +37104,10 @@ exec sleep 60
 
     #[test]
     fn signal_base_urls_resume_from_persisted_bootstraps() -> anyhow::Result<()> {
+        let token = token_with_bootstrap(vec![BootstrapEndpoint {
+            url: "https://203.0.113.99:9443".to_string(),
+            kind: BootstrapEndpointKind::Signal,
+        }]);
         let persisted = vec![
             BootstrapEndpoint {
                 url: "https://203.0.113.11:9443/".to_string(),
@@ -36975,12 +37120,25 @@ exec sleep 60
         ];
 
         assert_eq!(
-            signal_base_urls_with_persisted(None, None, &persisted)?,
+            signal_base_urls_with_persisted(Some(&token), None, &persisted)?,
             vec![
                 "https://203.0.113.11:9443".to_string(),
                 "https://203.0.113.12:9443".to_string(),
             ]
         );
+        let control_plane_only = vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }];
+        let error = match signal_base_urls_with_persisted(Some(&token), None, &control_plane_only) {
+            Ok(_) => anyhow::bail!(
+                "non-empty active directory without Signal must not fall back to token"
+            ),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("signal URL is required and no signal bootstrap exists"));
         Ok(())
     }
 
@@ -37102,7 +37260,7 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn agent_stun_servers_prioritize_discovered_directory_over_original_token(
+    async fn agent_stun_servers_ignore_original_token_after_directory_discovery(
     ) -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["iparsd", "agent"])?;
         let Command::Agent(args) = cli.command else {
@@ -37119,10 +37277,20 @@ exec sleep 60
 
         assert_eq!(
             agent_stun_servers_with_persisted(&args, Some(&token), &persisted).await?,
-            vec![
-                SocketAddr::from(([8, 8, 8, 11], 3478)),
-                SocketAddr::from(([8, 8, 8, 10], 3478)),
-            ]
+            vec![SocketAddr::from(([8, 8, 8, 11], 3478))]
+        );
+
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--disable-public-stun-fallback"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let control_plane_only = vec![BootstrapEndpoint {
+            url: "https://203.0.113.10:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }];
+        assert_eq!(
+            agent_stun_servers_with_persisted(&args, Some(&token), &control_plane_only).await?,
+            Vec::<SocketAddr>::new()
         );
         Ok(())
     }

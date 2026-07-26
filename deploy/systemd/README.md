@@ -2,8 +2,9 @@
 
 The units in this directory run Control Plane, Signal, STUN, and Relay as one
 public-node failure domain. Each Control Plane renews its instance lease in the
-shared PostgreSQL store. Agents learn every active instance and retain their
-original signed token endpoints as last-resort seeds.
+shared PostgreSQL store. Signed token endpoints are used only for initial
+discovery; Agents persist each non-empty active directory as authoritative and
+replace retired endpoints instead of retaining them as permanent seeds.
 
 `ipars-control-plane.service` uses `BindsTo=` for the other three services. If
 Signal, STUN, or Relay leaves the active state, the Control Plane also stops and
