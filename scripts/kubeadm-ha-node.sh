@@ -212,8 +212,8 @@ defaults
     option dontlog-normal
     option redispatch
     retries 2
-    timeout connect 500ms
-    timeout check 500ms
+    timeout connect 5s
+    timeout check 5s
     timeout client 1m
     timeout server 1m
 
@@ -223,7 +223,7 @@ frontend kubernetes_api
 
 backend kubernetes_control_planes
     option tcp-check
-    default-server check inter 500ms fastinter 200ms downinter 1s fall 1 rise 2 on-marked-down shutdown-sessions
+    default-server check inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
 EOF
   local backend backup preferred_backend
   if node_is_control_plane_backend; then
@@ -1086,9 +1086,9 @@ self_test() {
   grep -Fq 'option dontlog-normal' <<<"$rendered"
   grep -Fq 'option redispatch' <<<"$rendered"
   grep -Fq 'retries 2' <<<"$rendered"
-  grep -Fq 'timeout connect 500ms' <<<"$rendered"
-  grep -Fq 'timeout check 500ms' <<<"$rendered"
-  grep -Fq 'fall 1 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
+  grep -Fq 'timeout connect 5s' <<<"$rendered"
+  grep -Fq 'timeout check 5s' <<<"$rendered"
+  grep -Fq 'fall 2 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
   grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
