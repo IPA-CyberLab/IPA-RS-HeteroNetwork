@@ -590,6 +590,31 @@ HETERONETWORK_KUBEADM_KUBERNETES_MINOR=${kubernetes_minor}
 EOF
 }
 
+kubernetes_versions_are_aligned() {
+  local expected_minor="$1"
+  local kubeadm_version="$2"
+  local kubelet_version="$3"
+  local kubectl_version="$4"
+  [[ "$kubeadm_version" == "${expected_minor}."* ]] \
+    && [[ "$kubelet_version" == "$kubeadm_version" ]] \
+    && [[ "$kubectl_version" == "$kubeadm_version" ]]
+}
+
+installed_kubernetes_toolchain_version() {
+  command -v kubeadm >/dev/null 2>&1 || return 1
+  command -v kubelet >/dev/null 2>&1 || return 1
+  command -v kubectl >/dev/null 2>&1 || return 1
+
+  local kubeadm_version kubelet_version kubectl_version
+  kubeadm_version="$(kubeadm version -o short 2>/dev/null)"
+  kubelet_version="$(kubelet --version 2>/dev/null | sed -nE 's/^Kubernetes (v[0-9]+\.[0-9]+\.[0-9]+).*$/\1/p')"
+  kubectl_version="$(kubectl version --client -o json 2>/dev/null | jq -er '.clientVersion.gitVersion')"
+  kubernetes_versions_are_aligned \
+    "$kubernetes_minor" "$kubeadm_version" "$kubelet_version" "$kubectl_version" \
+    || return 1
+  printf '%s\n' "$kubeadm_version"
+}
+
 install_kubernetes_packages() {
   require_command apt-get
   export DEBIAN_FRONTEND=noninteractive
@@ -611,7 +636,12 @@ install_kubernetes_packages() {
   printf 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/%s/deb/ /\n' "$kubernetes_minor" \
     | install_from_stdin /etc/apt/sources.list.d/kubernetes.list 0644
   apt-get update
-  apt-get install -y kubelet kubeadm kubectl
+  local installed_version
+  if installed_version="$(installed_kubernetes_toolchain_version)"; then
+    printf 'preserving aligned Kubernetes toolchain %s\n' "$installed_version"
+  else
+    apt-get install -y --allow-change-held-packages kubelet kubeadm kubectl
+  fi
   apt-mark hold kubelet kubeadm kubectl >/dev/null
 }
 
@@ -1042,6 +1072,13 @@ self_test() {
   kubernetes_minor="v1.36"
   state_dir="/etc/heteronetwork/kubernetes"
   validate_control_plane_config
+  kubernetes_versions_are_aligned "v1.36" "v1.36.2" "v1.36.2" "v1.36.2"
+  if kubernetes_versions_are_aligned "v1.36" "v1.36.2" "v1.36.3" "v1.36.2"; then
+    die "Kubernetes toolchain validation accepted mixed patch versions"
+  fi
+  if kubernetes_versions_are_aligned "v1.36" "v1.35.9" "v1.35.9" "v1.35.9"; then
+    die "Kubernetes toolchain validation accepted the wrong minor version"
+  fi
 
   local rendered bundle worker_bundle
   rendered="$(render_haproxy_config)"
