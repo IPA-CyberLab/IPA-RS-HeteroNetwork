@@ -154,7 +154,10 @@ Additional Linux hosts can join that cluster as ordinary workers with
 `scripts/kubeadm-ha-node.sh`. The worker-only bundle contains a short-lived
 bootstrap token and CA hash without the control-plane certificate key. Enroll
 workers without the `kubernetes-control-plane` or `route-provider` tags so
-Flannel VXLAN traffic over their HeteroNetwork node IPs remains lazy.
+Flannel VXLAN traffic over their HeteroNetwork node IPs remains lazy. The
+enrollment API reserves `kubernetes-control-plane` for the HA control-plane
+setup, and `join-worker` rejects an existing Agent registration that still
+carries that tag or a `kubernetes-ha-*` cohort tag.
 
 OIDC is enabled by default with Keycloak:
 

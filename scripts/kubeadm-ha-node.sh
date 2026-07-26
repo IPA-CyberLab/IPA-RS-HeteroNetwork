@@ -8,6 +8,7 @@ readonly DEFAULT_POD_CIDR="10.244.0.0/16"
 readonly DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 readonly DEFAULT_KUBERNETES_MINOR="v1.36"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/kubernetes"
+readonly DEFAULT_AGENT_STATE_PATH="/var/lib/heteronetwork/agent.json"
 readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_MANIFEST_SHA256="d078019743c5e0194ce965125fc80ef00af0c1661ec9e12396311f1cfec860a2"
@@ -23,6 +24,7 @@ pod_cidr="${HETERONETWORK_KUBEADM_POD_CIDR:-$DEFAULT_POD_CIDR}"
 service_cidr="${HETERONETWORK_KUBEADM_SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}"
 kubernetes_minor="${HETERONETWORK_KUBEADM_KUBERNETES_MINOR:-$DEFAULT_KUBERNETES_MINOR}"
 state_dir="${HETERONETWORK_KUBEADM_STATE_DIR:-$DEFAULT_STATE_DIR}"
+agent_state_path="${HETERONETWORK_AGENT_STATE_PATH:-$DEFAULT_AGENT_STATE_PATH}"
 
 usage() {
   cat <<'EOF'
@@ -57,6 +59,7 @@ Optional environment:
   HETERONETWORK_KUBEADM_JOIN_BUNDLE      Default: state-dir/join-bundle.json
   HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE
                                          Default: state-dir/worker-join-bundle.json
+  HETERONETWORK_AGENT_STATE_PATH          Default: /var/lib/heteronetwork/agent.json
 
 The join bundle contains credentials. Keep it root-owned with mode 0600 and transfer it
 over an authenticated channel. Commands do not print tokens or certificate keys.
@@ -180,6 +183,28 @@ validate_worker_config() {
   validate_common_config
   if node_is_control_plane_backend; then
     die "worker node IP $node_ip must not be present in the control-plane backend list"
+  fi
+}
+
+validate_worker_enrollment() {
+  require_command jq
+  [[ "$agent_state_path" == /* ]] || die "HeteroNetwork Agent state path must be absolute"
+  [[ -f "$agent_state_path" && ! -L "$agent_state_path" ]] \
+    || die "HeteroNetwork Agent state is missing or is a symlink: $agent_state_path"
+  jq -e --arg node_ip "$node_ip" '
+    (.registered_node | type == "object")
+    and (.registered_node.vpn_ip == $node_ip)
+    and (.registered_node.tags | type == "array")
+    and all(.registered_node.tags[]; type == "string")
+  ' "$agent_state_path" >/dev/null \
+    || die "HeteroNetwork Agent registration does not match worker node IP $node_ip"
+  if jq -e '
+    any(
+      .registered_node.tags[];
+      . == "kubernetes-control-plane" or startswith("kubernetes-ha-")
+    )
+  ' "$agent_state_path" >/dev/null; then
+    die "worker enrollment carries Kubernetes HA control-plane tags; re-enroll this HeteroNetwork node as network-only before joining it as a worker"
   fi
 }
 
@@ -819,6 +844,7 @@ join_control_plane() {
 join_worker() {
   require_root
   validate_worker_config
+  validate_worker_enrollment
   verify_interface_address
   require_command kubeadm
   [[ -f "$state_dir/node.env" ]] || die "run prepare before join-worker"
@@ -1080,7 +1106,7 @@ self_test() {
     die "Kubernetes toolchain validation accepted the wrong minor version"
   fi
 
-  local rendered bundle worker_bundle
+  local rendered bundle worker_bundle worker_state forbidden_tag
   rendered="$(render_haproxy_config)"
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
   grep -Fq 'option dontlog-normal' <<<"$rendered"
@@ -1111,7 +1137,8 @@ self_test() {
 
   bundle="$(mktemp)"
   worker_bundle="$(mktemp)"
-  trap 'rm -f "$bundle" "$worker_bundle"' EXIT
+  worker_state="$(mktemp)"
+  trap 'rm -f "$bundle" "$worker_bundle" "$worker_state"' EXIT
   jq -n \
     --arg apiServerEndpoint "k8s-api.heteronetwork.internal:7443" \
     --arg token "abcdef.0123456789abcdef" \
@@ -1130,6 +1157,22 @@ self_test() {
   node_ip="10.250.0.4"
   node_name="worker-1"
   validate_worker_config
+  agent_state_path="$worker_state"
+  jq -n --arg vpn_ip "$node_ip" \
+    '{registered_node: {vpn_ip: $vpn_ip, tags: []}}' >"$worker_state"
+  validate_worker_enrollment
+  for forbidden_tag in "kubernetes-control-plane" "kubernetes-ha-0123456789abcdef"; do
+    jq -n --arg vpn_ip "$node_ip" --arg tag "$forbidden_tag" \
+      '{registered_node: {vpn_ip: $vpn_ip, tags: [$tag]}}' >"$worker_state"
+    if (validate_worker_enrollment >/dev/null 2>&1); then
+      die "worker enrollment accepted reserved tag $forbidden_tag"
+    fi
+  done
+  jq -n --arg vpn_ip "10.250.0.99" \
+    '{registered_node: {vpn_ip: $vpn_ip, tags: []}}' >"$worker_state"
+  if (validate_worker_enrollment >/dev/null 2>&1); then
+    die "worker enrollment accepted a different HeteroNetwork VPN IP"
+  fi
   rendered="$(render_haproxy_config)"
   grep -Fxq '    server control-plane-1 10.250.0.1:6443' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
@@ -1165,7 +1208,7 @@ self_test() {
   if (render_worker_join_config "$worker_bundle" >/dev/null 2>&1); then
     die "worker join accepted a group/world-readable join bundle"
   fi
-  rm -f "$bundle" "$worker_bundle"
+  rm -f "$bundle" "$worker_bundle" "$worker_state"
   trap - EXIT
   printf 'kubeadm HA renderer self-test passed\n'
 }

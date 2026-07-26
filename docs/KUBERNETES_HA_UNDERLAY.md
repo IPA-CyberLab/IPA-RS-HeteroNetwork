@@ -155,7 +155,11 @@ repurposing an existing control-plane host, export its workloads, snapshot its
 etcd state, and explicitly reset it; the helper does not automate that
 destructive operation. Enroll ordinary workers without the
 `kubernetes-control-plane` and `route-provider` tags so they remain eligible
-for lazy connect.
+for lazy connect. The enrollment API only adds `kubernetes-control-plane`
+during `kubernetes_ha_control_plane` setup and rejects it when supplied by an
+operator. `join-worker` also verifies the persisted HeteroNetwork Agent
+registration and refuses a node carrying that tag or any `kubernetes-ha-*`
+cohort tag.
 
 `verify-cluster` requires exactly the configured control-plane count, all
 registered nodes Ready, and one running Flannel pod per node. It then runs DNS

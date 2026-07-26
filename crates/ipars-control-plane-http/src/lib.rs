@@ -1608,6 +1608,11 @@ where
         let value = value.trim();
         validate_enrollment_identifier(value, "node tag")
             .map_err(NodeEnrollmentApiError::bad_request)?;
+        if value == Tag::kubernetes_control_plane().as_str() {
+            return Err(NodeEnrollmentApiError::bad_request(
+                "the kubernetes-control-plane tag is reserved for Kubernetes HA control-plane enrollment",
+            ));
+        }
         if value.starts_with(KUBERNETES_HA_SETUP_TAG_PREFIX) {
             return Err(NodeEnrollmentApiError::bad_request(format!(
                 "node tags beginning with {KUBERNETES_HA_SETUP_TAG_PREFIX} are reserved"
@@ -2442,6 +2447,8 @@ fn kubernetes_ha_enrollment_setup(
     let cohort_tag = setup_tags.next()?.as_str().to_string();
     if setup_tags.next().is_some()
         || cohort_tag != kubernetes_ha_cohort_tag(&token.claims.nonce)
+        || !token.claims.tags.contains(&Tag::kubernetes_control_plane())
+        || token.claims.tags != token.claims.policy.allowed_tags
         || token.claims.policy.max_token_uses != Some(KUBERNETES_HA_CONTROL_PLANE_COUNT)
     {
         return None;
@@ -4457,6 +4464,17 @@ mod tests {
             cohort_tags[0].as_str(),
             kubernetes_ha_cohort_tag(&kubernetes_token.claims.nonce)
         );
+        let mut missing_control_plane_tag = kubernetes_token.clone();
+        missing_control_plane_tag
+            .claims
+            .tags
+            .remove(&Tag::kubernetes_control_plane());
+        missing_control_plane_tag
+            .claims
+            .policy
+            .allowed_tags
+            .remove(&Tag::kubernetes_control_plane());
+        assert!(kubernetes_ha_enrollment_setup(&missing_control_plane_tag, "encoded").is_none());
         let kubernetes_script = kubernetes_response["install_script"]
             .as_str()
             .ok_or("Kubernetes enrollment response omitted the install script")?;
@@ -4542,6 +4560,44 @@ mod tests {
             )
             .await?;
         assert_eq!(reserved_tag_response.status(), StatusCode::BAD_REQUEST);
+
+        let reserved_control_plane_tag_request = serde_json::json!({
+            "expires_in_seconds": 86_400,
+            "role": "worker",
+            "tags": ["kubernetes-control-plane"],
+            "allow_relay": false,
+            "reusable": false,
+            "max_uses": 1
+        });
+        let reserved_control_plane_tag_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(serde_json::to_vec(
+                        &reserved_control_plane_tag_request,
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(
+            reserved_control_plane_tag_response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let reserved_control_plane_tag_response =
+            axum::body::to_bytes(reserved_control_plane_tag_response.into_body(), usize::MAX)
+                .await?;
+        let reserved_control_plane_tag_response: Value =
+            serde_json::from_slice(&reserved_control_plane_tag_response)?;
+        assert_eq!(
+            reserved_control_plane_tag_response["error"],
+            "the kubernetes-control-plane tag is reserved for Kubernetes HA control-plane enrollment"
+        );
 
         let degraded_at = Utc::now();
         let mut expired_public_a =

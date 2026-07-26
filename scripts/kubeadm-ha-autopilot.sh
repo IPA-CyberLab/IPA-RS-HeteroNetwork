@@ -2,6 +2,7 @@
 set -euo pipefail
 
 readonly DEFAULT_AGENT_API_URL="http://127.0.0.1:9780"
+readonly DEFAULT_AGENT_STATE_PATH="/var/lib/heteronetwork/agent.json"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/kubernetes"
 readonly DEFAULT_COORDINATION_TIMEOUT_SECONDS="3600"
 readonly STAGE_PORT="17444"
@@ -10,6 +11,7 @@ readonly BUNDLE_PORT="17445"
 state_dir="${HETERONETWORK_KUBEADM_STATE_DIR:-$DEFAULT_STATE_DIR}"
 config_path="${HETERONETWORK_KUBEADM_AUTOPILOT_CONFIG:-$state_dir/autopilot.env}"
 agent_api_url="${HETERONETWORK_AGENT_API_URL:-$DEFAULT_AGENT_API_URL}"
+agent_state_path="${HETERONETWORK_AGENT_STATE_PATH:-$DEFAULT_AGENT_STATE_PATH}"
 coordination_timeout_seconds="${HETERONETWORK_KUBEADM_COORDINATION_TIMEOUT_SECONDS:-$DEFAULT_COORDINATION_TIMEOUT_SECONDS}"
 helper="/opt/heteronetwork/libexec/kubeadm-ha-node.sh"
 completion_path="$state_dir/autopilot.complete"
@@ -42,6 +44,23 @@ validate_config() {
   [[ "$coordination_timeout_seconds" =~ ^[0-9]+$ ]] \
     && ((10#$coordination_timeout_seconds >= 300 && 10#$coordination_timeout_seconds <= 7200)) \
     || die "coordination timeout must be between 300 and 7200 seconds"
+}
+
+validate_local_control_plane_enrollment() {
+  [[ "$agent_state_path" == /* ]] || die "HeteroNetwork Agent state path must be absolute"
+  [[ -f "$agent_state_path" && ! -L "$agent_state_path" ]] \
+    || die "HeteroNetwork Agent state is missing or is a symlink: $agent_state_path"
+  jq -e --arg cohort "$HETERONETWORK_KUBEADM_COHORT_TAG" '
+    (.registered_node | type == "object")
+    and (.registered_node.tags | type == "array")
+    and all(.registered_node.tags[]; type == "string")
+    and any(.registered_node.tags[]; . == "kubernetes-control-plane")
+    and (
+      [.registered_node.tags[] | select(startswith("kubernetes-ha-"))]
+      == [$cohort]
+    )
+  ' "$agent_state_path" >/dev/null \
+    || die "local HeteroNetwork enrollment is not a member of the configured Kubernetes HA control-plane cohort"
 }
 
 install_coordination_dependencies() {
@@ -311,6 +330,7 @@ run_autopilot() {
   for command in curl jq ping socat systemctl; do
     require_command "$command"
   done
+  validate_local_control_plane_enrollment
   [[ -x "$helper" ]] || die "kubeadm HA helper is missing"
   install -d -o root -g root -m 0700 "$state_dir"
   exec 9>"$state_dir/autopilot.lock"
@@ -364,18 +384,34 @@ run_autopilot() {
 }
 
 self_test() {
-  local temporary
+  local cohort_temporary state_temporary
   HETERONETWORK_KUBEADM_COHORT_TAG="kubernetes-ha-0123456789abcdef"
   HETERONETWORK_KUBEADM_EXPECTED_CONTROL_PLANES="3"
   HETERONETWORK_KUBEADM_BUNDLE_BEARER_TOKEN="$(printf 'a%.0s' {1..64})"
   coordination_timeout_seconds=300
   validate_config
-  temporary="$(mktemp)"
+  state_temporary="$(mktemp)"
+  agent_state_path="$state_temporary"
+  jq -n --arg cohort "$HETERONETWORK_KUBEADM_COHORT_TAG" \
+    '{registered_node: {tags: ["kubernetes-control-plane", $cohort]}}' >"$state_temporary"
+  validate_local_control_plane_enrollment
+  jq -n --arg cohort "$HETERONETWORK_KUBEADM_COHORT_TAG" \
+    '{registered_node: {tags: [$cohort]}}' >"$state_temporary"
+  if (validate_local_control_plane_enrollment >/dev/null 2>&1); then
+    die "autopilot accepted enrollment without the Kubernetes control-plane tag"
+  fi
+  jq -n \
+    '{registered_node: {tags: ["kubernetes-control-plane", "kubernetes-ha-fedcba9876543210"]}}' \
+    >"$state_temporary"
+  if (validate_local_control_plane_enrollment >/dev/null 2>&1); then
+    die "autopilot accepted enrollment from a different Kubernetes HA cohort"
+  fi
+  cohort_temporary="$(mktemp)"
   printf '10.250.0.10\tnode-c\n10.250.0.2\tnode-a\n10.250.0.3\tnode-b\n' \
-    | LC_ALL=C sort -V >"$temporary"
-  [[ "$(sed -n '1p' "$temporary")" == $'10.250.0.2\tnode-a' ]]
-  [[ "$(sed -n '3p' "$temporary")" == $'10.250.0.10\tnode-c' ]]
-  rm -f "$temporary"
+    | LC_ALL=C sort -V >"$cohort_temporary"
+  [[ "$(sed -n '1p' "$cohort_temporary")" == $'10.250.0.2\tnode-a' ]]
+  [[ "$(sed -n '3p' "$cohort_temporary")" == $'10.250.0.10\tnode-c' ]]
+  rm -f "$cohort_temporary" "$state_temporary"
   log "autopilot self-test passed"
 }
 
