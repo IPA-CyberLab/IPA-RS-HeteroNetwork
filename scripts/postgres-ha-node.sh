@@ -29,6 +29,7 @@ node_address="${HETERONETWORK_DB_NODE_ADDRESS:-}"
 client_listen_address="${HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS:-}"
 members="${HETERONETWORK_DB_MEMBERS:-}"
 dcs_members="${HETERONETWORK_DB_DCS_MEMBERS:-$members}"
+dcs_bootstrap_members="${HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS:-$dcs_members}"
 dcs_initial_cluster_state="${HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE:-new}"
 proxy_backends="${HETERONETWORK_DB_PROXY_BACKENDS:-$members}"
 client_cidrs="${HETERONETWORK_DB_CLIENT_CIDRS:-}"
@@ -79,6 +80,9 @@ Required environment for install-proxy:
 Optional environment:
   HETERONETWORK_DB_INTERFACE       Default: heteronetwork0
   HETERONETWORK_DB_DCS_MEMBERS     Odd 3-9 voter entries; defaults to DB members
+  HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS
+                                     Actual 3-9 DCS entries while joining a learner;
+                                     defaults to HETERONETWORK_DB_DCS_MEMBERS
   HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE
                                      new for a fresh quorum, existing when joining one
   HETERONETWORK_DB_TOPOLOGY_REVISION
@@ -188,6 +192,11 @@ member_rows() {
 
 dcs_member_rows() {
   member_rows_for "$dcs_members" DCS \
+    "$MIN_DCS_MEMBER_COUNT" "$MAX_DCS_MEMBER_COUNT" true
+}
+
+dcs_bootstrap_member_rows() {
+  member_rows_for "$dcs_bootstrap_members" "DCS bootstrap" \
     "$MIN_DCS_MEMBER_COUNT" "$MAX_DCS_MEMBER_COUNT" false
 }
 
@@ -297,15 +306,14 @@ validate_common_config() {
   [[ "$topology_revision" =~ ^[1-9][0-9]*$ ]] || die "topology revision must be positive"
   member_rows >/dev/null
   dcs_member_rows >/dev/null
+  dcs_bootstrap_member_rows >/dev/null
   [[ "$dcs_initial_cluster_state" == "new" || "$dcs_initial_cluster_state" == "existing" ]] \
     || die "DCS initial cluster state must be new or existing"
-  if [[ "$dcs_initial_cluster_state" == "new" ]]; then
-    local initial_dcs_count
-    initial_dcs_count="$(dcs_member_count)"
-    ((10#$initial_dcs_count % 2 == 1)) \
-      || die "a fresh DCS member count must be odd"
-  fi
+  [[ "$dcs_initial_cluster_state" == "existing" \
+      || "$dcs_bootstrap_members" == "$dcs_members" ]] \
+    || die "a fresh DCS must bootstrap with the complete requested topology"
   local -A database_members=()
+  local -A desired_dcs_members=()
   local name address
   while read -r name address; do
     database_members["$name"]="$address"
@@ -313,7 +321,14 @@ validate_common_config() {
   while read -r name address; do
     [[ "${database_members[$name]:-}" == "$address" ]] \
       || die "DCS member $name=$address is not present in HETERONETWORK_DB_MEMBERS"
+    desired_dcs_members["$name"]="$address"
   done < <(dcs_member_rows)
+  while read -r name address; do
+    [[ "${database_members[$name]:-}" == "$address" ]] \
+      || die "DCS bootstrap member $name=$address is not present in HETERONETWORK_DB_MEMBERS"
+    [[ "${desired_dcs_members[$name]:-}" == "$address" ]] \
+      || die "DCS bootstrap member $name=$address is not present in HETERONETWORK_DB_DCS_MEMBERS"
+  done < <(dcs_bootstrap_member_rows)
   application_cidrs >/dev/null
   extra_hba_rows >/dev/null
 }
@@ -337,6 +352,16 @@ validate_node_config() {
     fi
   done < <(member_rows)
   ((found == 1)) || die "$node_name=$node_address is not present in HETERONETWORK_DB_MEMBERS"
+  if node_is_dcs_member; then
+    found=0
+    while read -r name address; do
+      if [[ "$name" == "$node_name" && "$address" == "$node_address" ]]; then
+        found=1
+      fi
+    done < <(dcs_bootstrap_member_rows)
+    ((found == 1)) \
+      || die "$node_name=$node_address must be present in HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS"
+  fi
 }
 
 validate_proxy_config() {
@@ -386,7 +411,7 @@ render_etcd_config() {
   while read -r name address; do
     [[ -z "$initial_cluster" ]] || initial_cluster+=","
     initial_cluster+="${name}=https://${address}:${dcs_peer_port}"
-  done < <(dcs_member_rows)
+  done < <(dcs_bootstrap_member_rows)
 
   cat <<EOF
 name: ${node_name}
@@ -1274,7 +1299,7 @@ reconcile_dcs() {
       added=1
     fi
   done < <(dcs_member_rows)
-  ((added == 0)) || return
+  ((added == 0)) || return 0
   printf 'DCS membership already matches the requested topology.\n'
 }
 
@@ -1368,6 +1393,7 @@ verify_cluster() {
 self_test() {
   local original_members="$members"
   local original_dcs_members="$dcs_members"
+  local original_dcs_bootstrap_members="$dcs_bootstrap_members"
   local original_dcs_initial_cluster_state="$dcs_initial_cluster_state"
   local original_topology_revision="$topology_revision"
   local original_proxy_backends="$proxy_backends"
@@ -1382,7 +1408,8 @@ self_test() {
 
   members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4,db-e=10.250.0.5,db-f=10.250.0.6"
   dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4,db-e=10.250.0.5"
-  dcs_initial_cluster_state="new"
+  dcs_bootstrap_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4"
+  dcs_initial_cluster_state="existing"
   topology_revision="7"
   proxy_backends="$members"
   node_name="db-a"
@@ -1411,9 +1438,9 @@ self_test() {
   grep -Fq 'listen: 10.250.0.1,100.64.0.1:55432' "$test_dir/patroni.yml"
   [[ "$(grep -c 'hostssl keycloak keycloak 10.250.0.[45]/32 scram-sha-256' \
     "$test_dir/patroni.yml")" == "4" ]]
-  grep -Fq '10.250.0.5:12380' "$test_dir/etcd.yml"
-  if grep -Fq '10.250.0.6:12380' "$test_dir/etcd.yml"; then
-    die "non-voter unexpectedly appeared in the DCS configuration"
+  grep -Fq '10.250.0.4:12380' "$test_dir/etcd.yml"
+  if grep -Fq '10.250.0.5:12380' "$test_dir/etcd.yml"; then
+    die "unregistered voter unexpectedly appeared in the DCS bootstrap configuration"
   fi
   grep -Fq 'bind 100.64.0.1:18008' "$test_dir/haproxy.cfg"
   [[ "$(grep -c '^    server db-' "$test_dir/haproxy.cfg")" == "6" ]]
@@ -1448,7 +1475,6 @@ self_test() {
   fi
   if (
     dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4"
-    dcs_initial_cluster_state="new"
     validate_common_config >/dev/null 2>&1
   ); then
     die "even DCS member count self-test unexpectedly succeeded"
@@ -1459,6 +1485,12 @@ self_test() {
   ); then
     die "DCS member outside the database set self-test unexpectedly succeeded"
   fi
+  if (
+    dcs_bootstrap_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-f=10.250.0.6"
+    validate_common_config >/dev/null 2>&1
+  ); then
+    die "DCS bootstrap member outside the requested voter set unexpectedly succeeded"
+  fi
   node_name="db-f"
   node_address="10.250.0.6"
   render_patroni_service >"$test_dir/non-voter.service"
@@ -1468,6 +1500,7 @@ self_test() {
 
   members="$original_members"
   dcs_members="$original_dcs_members"
+  dcs_bootstrap_members="$original_dcs_bootstrap_members"
   dcs_initial_cluster_state="$original_dcs_initial_cluster_state"
   topology_revision="$original_topology_revision"
   proxy_backends="$original_proxy_backends"
