@@ -251,7 +251,7 @@ After=network-online.target heteronetwork-agent.service
 Type=notify
 RuntimeDirectory=heteronetwork-kube-apiserver-lb
 ExecStart=/usr/sbin/haproxy -Ws -f /etc/heteronetwork/kubernetes/haproxy.cfg -p /run/heteronetwork-kube-apiserver-lb/haproxy.pid
-ExecReload=/usr/sbin/haproxy -Ws -f /etc/heteronetwork/kubernetes/haproxy.cfg -p /run/heteronetwork-kube-apiserver-lb/haproxy.pid -sf $MAINPID
+ExecReload=/bin/kill -USR2 $MAINPID
 KillMode=mixed
 Restart=on-failure
 RestartSec=2s
@@ -1092,6 +1092,8 @@ self_test() {
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
   grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  rendered="$(render_haproxy_service)"
+  grep -Fq 'ExecReload=/bin/kill -USR2 $MAINPID' <<<"$rendered"
   rendered="$(render_init_config v1.36.1)"
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"

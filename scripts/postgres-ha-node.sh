@@ -705,7 +705,7 @@ User=haproxy
 Group=haproxy
 RuntimeDirectory=heteronetwork-db-proxy
 ExecStart=/usr/sbin/haproxy -Ws -f ${state_dir}/haproxy.cfg -p /run/heteronetwork-db-proxy/haproxy.pid
-ExecReload=/usr/sbin/haproxy -Ws -f ${state_dir}/haproxy.cfg -p /run/heteronetwork-db-proxy/haproxy.pid -sf \$MAINPID
+ExecReload=/bin/kill -USR2 \$MAINPID
 KillMode=mixed
 Restart=always
 RestartSec=2s
@@ -1402,6 +1402,8 @@ self_test() {
   render_etcd_config >"$test_dir/etcd.yml"
   render_patroni_config >"$test_dir/patroni.yml"
   render_haproxy_config >"$test_dir/haproxy.cfg"
+  render_proxy_service >"$test_dir/haproxy.service"
+  grep -Fq 'ExecReload=/bin/kill -USR2 $MAINPID' "$test_dir/haproxy.service"
   grep -Fq 'synchronous_mode_strict: true' "$test_dir/patroni.yml"
   grep -Fq 'synchronous_node_count: 2' "$test_dir/patroni.yml"
   grep -Fq 'max_wal_senders: 36' "$test_dir/patroni.yml"
