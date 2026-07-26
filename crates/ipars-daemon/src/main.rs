@@ -4506,6 +4506,8 @@ async fn run_control_plane(
     otel_metrics_enabled: bool,
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()> {
+    validate_control_plane_runtime_config(&args)?;
+    let service_lease = required_control_plane_service_lease_config(&args)?;
     let database_url = control_plane_database_url(&args)?;
     match database_kind(database_url.as_deref()) {
         DatabaseKind::Postgres => {
@@ -4515,6 +4517,7 @@ async fn run_control_plane(
             let store = Arc::new(PostgresControlPlaneStore::connect(database_url).await?);
             serve_with_store(
                 args,
+                service_lease,
                 store.clone(),
                 store,
                 otel_metrics_enabled,
@@ -4529,6 +4532,7 @@ async fn run_control_plane(
             let store = Arc::new(SqliteControlPlaneStore::connect(database_url).await?);
             serve_with_store(
                 args,
+                service_lease,
                 store.clone(),
                 store,
                 otel_metrics_enabled,
@@ -4541,6 +4545,7 @@ async fn run_control_plane(
             let ledger = Arc::new(InMemoryTokenLedger::default());
             serve_with_store(
                 args,
+                service_lease,
                 store,
                 ledger,
                 otel_metrics_enabled,
@@ -4553,6 +4558,7 @@ async fn run_control_plane(
 
 async fn serve_with_store<S, L>(
     args: ControlPlaneArgs,
+    service_lease: ControlPlaneServiceLeaseConfig,
     store: Arc<S>,
     token_ledger: Arc<L>,
     otel_metrics_enabled: bool,
@@ -4562,8 +4568,6 @@ where
     S: ControlPlaneStore + 'static,
     L: TokenLedger + 'static,
 {
-    validate_control_plane_runtime_config(&args)?;
-    let service_lease = control_plane_service_lease_config(&args)?;
     let dynamic_web_gateway = args
         .dynamic_web_gateway_enabled
         .then(|| {
@@ -4617,18 +4621,11 @@ where
     config.cluster_policy.path_state_ttl_seconds = args.path_state_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
-    let service_lease_task = if let Some(service_lease) = service_lease {
-        plane
-            .advertise_service_instance(service_lease.instance())
-            .await
-            .context("failed to publish initial HA service lease")?;
-        Some(start_control_plane_service_lease(
-            plane.clone(),
-            service_lease,
-        ))
-    } else {
-        None
-    };
+    plane
+        .advertise_service_instance(service_lease.instance())
+        .await
+        .context("failed to publish initial HA service lease")?;
+    let service_lease_task = start_control_plane_service_lease(plane.clone(), service_lease);
     let mut key_ring = IssuerKeyRing::default();
     key_ring.insert(
         NodeId::from_string(args.issuer_node_id),
@@ -4676,9 +4673,7 @@ where
         http_state = http_state.enable_dynamic_web_gateway(dynamic_web_gateway);
     }
     let result = serve_router(args.listen, router(http_state)).await;
-    if let Some(task) = service_lease_task {
-        task.abort();
-    }
+    service_lease_task.abort();
     if let Some(task) = otel_metrics_task {
         task.abort();
     }
@@ -4761,6 +4756,14 @@ fn control_plane_service_lease_config(
         ttl: Duration::from_secs(args.service_lease_ttl_seconds),
         renew_interval: Duration::from_secs(args.service_lease_renew_interval_seconds),
     }))
+}
+
+fn required_control_plane_service_lease_config(
+    args: &ControlPlaneArgs,
+) -> anyhow::Result<ControlPlaneServiceLeaseConfig> {
+    control_plane_service_lease_config(args)?.context(
+        "control-plane service advertisement is required; configure --service-instance-id, --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url",
+    )
 }
 
 fn start_control_plane_service_lease<S>(
@@ -8408,7 +8411,6 @@ async fn run_agent(
             .await;
     }
     let persisted_registered_node = runtime.state().registered_node.clone();
-    let persisted_bootstrap_endpoints = runtime.state().bootstrap_endpoints.clone();
     let relay_capability_reporter = agent_relay_capability_reporter(&args)?;
     let relay_capability = relay_capability_reporter
         .as_ref()
@@ -8417,12 +8419,8 @@ async fn run_agent(
     if let Some(token) = join_token.as_ref() {
         persist_agent_seed_directory(runtime.as_ref(), &store, &token.claims.bootstrap_endpoints)?;
     }
-    let stun_servers = agent_stun_servers_with_persisted(
-        &args,
-        join_token.as_ref(),
-        &persisted_bootstrap_endpoints,
-    )
-    .await?;
+    let stun_servers =
+        runtime_stun_servers(runtime.as_ref(), &AgentStunDiscoveryConfig::from(&args)).await?;
     if !stun_servers.is_empty() {
         if let Err(error) = classify_agent_startup_nat(
             runtime.as_ref(),
@@ -13159,7 +13157,18 @@ async fn runtime_stun_servers(
     config: &AgentStunDiscoveryConfig,
 ) -> anyhow::Result<Vec<SocketAddr>> {
     let state = runtime.state();
-    resolve_agent_stun_servers(config, None, &state.bootstrap_endpoints).await
+    if state.seed_bootstrap_endpoints.is_none()
+        && bootstrap_endpoints_include_core_services(&state.bootstrap_endpoints)
+    {
+        let authoritative_config = AgentStunDiscoveryConfig {
+            explicit_servers: Vec::new(),
+            public_stun_urls: Vec::new(),
+            disable_public_stun_fallback: true,
+        };
+        resolve_agent_stun_servers(&authoritative_config, None, &state.bootstrap_endpoints).await
+    } else {
+        resolve_agent_stun_servers(config, None, &state.bootstrap_endpoints).await
+    }
 }
 
 async fn classify_nat_from_runtime_directory(
@@ -19033,6 +19042,7 @@ impl From<&AgentArgs> for AgentStunDiscoveryConfig {
     }
 }
 
+#[cfg(test)]
 async fn agent_stun_servers_with_persisted(
     args: &AgentArgs,
     token: Option<&SignedJoinToken>,
@@ -19376,15 +19386,10 @@ mod tests {
     async fn periodic_nat_discovery_switches_to_latest_stun_directory() -> anyhow::Result<()> {
         let retired = SocketAddr::from(([8, 8, 8, 10], 3478));
         let active = SocketAddr::from(([8, 8, 8, 11], 3478));
-        let mut state = AgentNodeState::generate(Utc::now());
-        state.bootstrap_endpoints = vec![BootstrapEndpoint {
-            kind: BootstrapEndpointKind::Stun,
-            url: format!("udp://{retired}"),
-        }];
-        state.seed_bootstrap_endpoints = None;
+        let state = AgentNodeState::generate(Utc::now());
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
         let config = AgentStunDiscoveryConfig {
-            explicit_servers: Vec::new(),
+            explicit_servers: vec![retired],
             public_stun_urls: Vec::new(),
             disable_public_stun_fallback: true,
         };
@@ -19414,6 +19419,34 @@ mod tests {
 
         assert_eq!(refreshed, vec![active]);
         assert!(!refreshed.contains(&retired));
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_requires_complete_service_advertisement() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+
+        let error = match required_control_plane_service_lease_config(&args) {
+            Ok(_) => anyhow::bail!("missing service advertisement must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("control-plane service advertisement is required"));
         Ok(())
     }
 

@@ -35,7 +35,7 @@ Signal must be able to reach at least one control-plane API to authenticate node
 
 ## Deploy Active-Active Public Nodes
 
-Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. Keep the issuer private key offline; public nodes need only the public key.
+Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. A Control Plane refuses to start unless its lease includes Control Plane, Signal, and STUN endpoints, preventing a running replica from silently failing to distribute the replacement directory. Keep the issuer private key offline; public nodes need only the public key.
 
 To expose **Add device** in the Web UI, create a separate enrollment signer and
 install the same root-owned key as
@@ -71,7 +71,7 @@ ipars token create \
   --unlimited-uses
 ```
 
-The command requires two active endpoints for Control Plane, Signal, and STUN, and two Relay endpoints when `--allow-relay` is present. `--allow-degraded-service-directory` exists for deliberate disaster recovery, not routine provisioning. Signed token entries are initial-discovery seeds only. Agents persist the first non-empty directory learned from registration, heartbeat, or peer-map responses as the authoritative endpoint set; subsequent directories replace it, and retired token entries are not retained.
+The command requires two active endpoints for Control Plane, Signal, and STUN, and two Relay endpoints when `--allow-relay` is present. `--allow-degraded-service-directory` exists for deliberate disaster recovery, not routine provisioning. Signed token entries are initial-discovery seeds only. Agents persist the first core-complete directory learned from registration, heartbeat, or peer-map responses as the authoritative endpoint set; subsequent complete directories replace it across Control Plane, Signal, and STUN consumers, and retired token or static entries are not retained.
 
 The Web UI workflow performs the same HA directory check, signs and records the
 token in the shared ledger, and returns a Linux x86_64 install command. The

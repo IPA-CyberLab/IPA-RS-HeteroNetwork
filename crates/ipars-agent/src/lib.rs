@@ -222,6 +222,15 @@ impl AgentNodeState {
                 error.reason()
             ))
         })?;
+        if self.seed_bootstrap_endpoints.is_none()
+            && !self.bootstrap_endpoints.is_empty()
+            && !bootstrap_endpoints_include_core_services(&self.bootstrap_endpoints)
+        {
+            return Err(AgentError::InvalidState(
+                "persisted authoritative bootstrap endpoints must include control_plane, signal, and stun endpoints"
+                    .to_string(),
+            ));
+        }
         if let Some(seeds) = &self.seed_bootstrap_endpoints {
             validate_join_token_bootstrap_endpoints(seeds).map_err(|error| {
                 AgentError::InvalidState(format!(
@@ -1311,6 +1320,11 @@ pub fn merge_bootstrap_endpoint_sets(
 
     if active.is_empty() {
         Ok(seeds.to_vec())
+    } else if !bootstrap_endpoints_include_core_services(active) {
+        Err(AgentError::InvalidState(
+            "control-plane service directory must include control_plane, signal, and stun endpoints"
+                .to_string(),
+        ))
     } else {
         Ok(active.to_vec())
     }
@@ -13193,12 +13207,22 @@ mod tests {
     #[test]
     fn bootstrap_endpoint_selection_uses_seeds_only_without_an_active_directory(
     ) -> Result<(), AgentError> {
-        let active = (0..MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
+        let mut active = (0..MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND)
             .map(|index| BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
                 url: format!("https://active-{index}.example:8443"),
             })
             .collect::<Vec<_>>();
+        active.extend([
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://active.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://active.example:3478".to_string(),
+            },
+        ]);
         let seed = BootstrapEndpoint {
             kind: BootstrapEndpointKind::ControlPlane,
             url: "https://signed-seed.example:8443".to_string(),
@@ -13214,6 +13238,36 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_endpoint_selection_rejects_partial_active_directory() {
+        let active = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://partial.example:8443".to_string(),
+        }];
+        let seeds = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://seed.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://seed.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://seed.example:3478".to_string(),
+            },
+        ];
+
+        let error = match merge_bootstrap_endpoint_sets(&active, &seeds) {
+            Ok(_) => panic!("partial active directory must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must include control_plane, signal, and stun"));
+    }
+
+    #[test]
     fn agent_node_state_validates_active_and_seed_directories_independently(
     ) -> Result<(), AgentError> {
         let mut state = AgentNodeState::generate(Utc::now());
@@ -13226,6 +13280,37 @@ mod tests {
             url: "udp://retired-stun.example:3478".to_string(),
         }]);
 
+        state.validate()
+    }
+
+    #[test]
+    fn agent_node_state_requires_complete_authoritative_directory() -> Result<(), AgentError> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.seed_bootstrap_endpoints = None;
+        state.validate()?;
+
+        state.bootstrap_endpoints = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://partial.example:8443".to_string(),
+        }];
+        let error = match state.validate() {
+            Ok(()) => panic!("partial authoritative directory must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must include control_plane, signal, and stun"));
+
+        state.bootstrap_endpoints.extend([
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://active.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://active.example:3478".to_string(),
+            },
+        ]);
         state.validate()
     }
 

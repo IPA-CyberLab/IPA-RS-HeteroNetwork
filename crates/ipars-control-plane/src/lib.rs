@@ -1218,9 +1218,11 @@ where
             .filter(|instance| instance.lease_expires_at > lease_cutoff)
             .collect::<Vec<_>>();
         instances.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
+            let left_has_core = bootstrap_endpoints_include_core_services(&left.endpoints);
+            let right_has_core = bootstrap_endpoints_include_core_services(&right.endpoints);
+            right_has_core
+                .cmp(&left_has_core)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
                 .then_with(|| left.instance_id.cmp(&right.instance_id))
         });
         instances.truncate(MAX_ACTIVE_SERVICE_INSTANCES);
@@ -4988,6 +4990,64 @@ mod tests {
         assert!(plane.withdraw_service_instance("dynamic-web").await?);
         assert!(!plane.withdraw_service_instance("dynamic-web").await?);
         assert!(plane.service_directory().await?.instances.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_directory_retains_core_instance_when_web_leases_exceed_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-core-retention");
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            Arc::new(InMemoryStore::default()),
+        );
+        let now = Utc::now();
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "core-a",
+                "core-a.example",
+                now - Duration::seconds(30),
+                now + Duration::seconds(30),
+            ))
+            .await?;
+        for index in 0..=MAX_ACTIVE_SERVICE_INSTANCES {
+            let mut dynamic_web = service_instance(
+                &cluster_id,
+                &format!("dynamic-web-{index:03}"),
+                &format!("web-{index:03}.example"),
+                now,
+                now + Duration::seconds(45),
+            );
+            dynamic_web
+                .endpoints
+                .retain(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi);
+            plane.advertise_service_instance(dynamic_web).await?;
+        }
+
+        let directory = plane.service_directory().await?;
+
+        assert_eq!(directory.instances.len(), MAX_ACTIVE_SERVICE_INSTANCES);
+        assert!(directory
+            .instances
+            .iter()
+            .any(|instance| instance.instance_id == "core-a"));
+        assert!(bootstrap_endpoints_include_core_services(
+            &directory.bootstrap_endpoints
+        ));
+        for kind in [
+            BootstrapEndpointKind::ControlPlane,
+            BootstrapEndpointKind::Signal,
+            BootstrapEndpointKind::Stun,
+        ] {
+            assert!(directory
+                .bootstrap_endpoints
+                .iter()
+                .any(|endpoint| endpoint.kind == kind && endpoint.url.contains("core-a.example")));
+        }
         Ok(())
     }
 
