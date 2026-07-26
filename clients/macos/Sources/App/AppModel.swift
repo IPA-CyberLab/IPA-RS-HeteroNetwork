@@ -104,8 +104,11 @@ final class AppModel: ObservableObject {
         lastError = nil
         defer { isBusy = false }
         do {
-            tunnelManager.disconnect()
+            // Keep the overlay route alive until the signed removal reaches a
+            // control plane. Disconnecting first can remove the only working
+            // management path when the public gateway is unavailable.
             try await controlPlane.remove(current)
+            tunnelManager.disconnect()
             try await tunnelManager.removeProfile()
             try sessionStore.delete()
             session = nil

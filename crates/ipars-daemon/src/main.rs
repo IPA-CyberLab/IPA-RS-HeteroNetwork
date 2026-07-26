@@ -12977,6 +12977,13 @@ async fn desired_public_web_gateway_ip(
     (age <= max_age).then_some(classification.local_addr.ip())
 }
 
+fn public_web_gateway_needs_reconciliation(
+    configured_ip: Option<Option<IpAddr>>,
+    desired_ip: Option<IpAddr>,
+) -> bool {
+    configured_ip != Some(desired_ip)
+}
+
 fn start_public_web_gateway(
     runtime: Arc<AgentRuntime>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
@@ -12994,12 +13001,17 @@ fn start_public_web_gateway(
         .build()
         .context("failed to build public Web UI probe client")?;
     Ok(tokio::spawn(async move {
-        let mut configured_ip = None;
+        // Keep "not reconciled yet" distinct from a reconciled standby
+        // configuration. Caddy survives Agent restarts, while the proxy token
+        // does not, so the first iteration must always replace any surviving
+        // configuration even when NAT classification currently has no public
+        // address.
+        let mut configured_ip: Option<Option<IpAddr>> = None;
         loop {
             let desired_ip =
                 desired_public_web_gateway_ip(&runtime, config.classification_max_age).await;
             let desired_url = desired_ip.map(public_web_gateway_url);
-            if desired_ip != configured_ip {
+            if public_web_gateway_needs_reconciliation(configured_ip, desired_ip) {
                 let phase = if desired_ip.is_some() {
                     PublicWebGatewayPhase::Provisioning
                 } else {
@@ -13015,7 +13027,7 @@ fn start_public_web_gateway(
                 .await;
                 match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip).await {
                     Ok(()) => {
-                        configured_ip = desired_ip;
+                        configured_ip = Some(desired_ip);
                         tracing::info!(
                             public_ip = ?desired_ip,
                             "reconciled public Web UI gateway"
@@ -13035,7 +13047,7 @@ fn start_public_web_gateway(
                 }
             }
 
-            if configured_ip == desired_ip {
+            if configured_ip == Some(desired_ip) {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
                     match probe_public_web_gateway(
                         &probe_client,
@@ -19502,6 +19514,22 @@ mod tests {
         assert!(public.contains("reverse_proxy http://10.0.0.10:18447"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
+    }
+
+    #[test]
+    fn public_web_gateway_reconciles_once_after_agent_restart() {
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+
+        assert!(public_web_gateway_needs_reconciliation(None, None));
+        assert!(public_web_gateway_needs_reconciliation(
+            None,
+            Some(public_ip)
+        ));
+        assert!(!public_web_gateway_needs_reconciliation(Some(None), None));
+        assert!(!public_web_gateway_needs_reconciliation(
+            Some(Some(public_ip)),
+            Some(public_ip)
+        ));
     }
 
     #[test]
