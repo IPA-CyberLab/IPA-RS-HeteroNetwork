@@ -23,7 +23,8 @@ use ipars_types::api::{
     SignalNodeUpsertRequest,
 };
 use ipars_types::{
-    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, relay_admission_url_is_usable,
+    bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
+    endpoint_addr_is_usable, relay_admission_url_is_usable,
     validate_join_token_bootstrap_endpoints, AclAction, AclRule, BootstrapEndpoint,
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
     HealthState, JoinTokenClaims, KeyId, NatClassification, NatTraversalStrategy, NodeHealth,
@@ -1244,6 +1245,9 @@ where
                 bootstrap_endpoints.push(endpoint.clone());
                 *count += 1;
             }
+        }
+        if !bootstrap_endpoints_include_core_services(&bootstrap_endpoints) {
+            bootstrap_endpoints.clear();
         }
 
         Ok(ServiceDirectory {
@@ -4967,15 +4971,20 @@ mod tests {
             Arc::new(InMemoryStore::default()),
         );
         let now = Utc::now();
-        plane
-            .advertise_service_instance(service_instance(
-                &cluster_id,
-                "dynamic-web",
-                "public.example",
-                now,
-                now + Duration::seconds(45),
-            ))
-            .await?;
+        let mut dynamic_web = service_instance(
+            &cluster_id,
+            "dynamic-web",
+            "public.example",
+            now,
+            now + Duration::seconds(45),
+        );
+        dynamic_web
+            .endpoints
+            .retain(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi);
+        plane.advertise_service_instance(dynamic_web).await?;
+        let partial = plane.service_directory().await?;
+        assert_eq!(partial.instances.len(), 1);
+        assert!(partial.bootstrap_endpoints.is_empty());
         assert!(plane.withdraw_service_instance("dynamic-web").await?);
         assert!(!plane.withdraw_service_instance("dynamic-web").await?);
         assert!(plane.service_directory().await?.instances.is_empty());

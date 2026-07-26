@@ -198,6 +198,16 @@ pub enum BootstrapEndpointKind {
     WebUi,
 }
 
+pub fn bootstrap_endpoints_include_core_services(endpoints: &[BootstrapEndpoint]) -> bool {
+    [
+        BootstrapEndpointKind::ControlPlane,
+        BootstrapEndpointKind::Signal,
+        BootstrapEndpointKind::Stun,
+    ]
+    .into_iter()
+    .all(|kind| endpoints.iter().any(|endpoint| endpoint.kind == kind))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInstance {
     pub cluster_id: ClusterId,

@@ -22,6 +22,12 @@ services:
       HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@172.30.250.2:5432/heteronetwork
       HETERONETWORK_ROLE: control-plane
       HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH: /run/secrets/heteronetwork-control-plane-operator-api-bearer-token
+      HETERONETWORK_SERVICE_INSTANCE_ID: rootless-e2e
+      HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://172.30.250.3:8443
+      HETERONETWORK_ADVERTISE_SIGNAL_URL: http://172.30.250.4:9443
+      HETERONETWORK_ADVERTISE_STUN_URL: udp://172.30.250.5:3478
+      HETERONETWORK_ADVERTISE_RELAY_URL: udp://172.30.250.6:51820
+      HETERONETWORK_ADVERTISE_WEB_UI_URL: http://172.30.250.3:8443
     networks:
       default:
         ipv4_address: 172.30.250.3

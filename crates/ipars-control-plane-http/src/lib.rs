@@ -31,10 +31,11 @@ use ipars_types::api::{
     SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
-    socket_addr_is_globally_routable, BootstrapEndpoint, BootstrapEndpointKind, ClusterId,
-    ClusterPolicy, JoinTokenClaims, KeyId, NatConnectivityState, NodeId, PathRecord, PathState,
-    Role, ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+    bootstrap_endpoints_include_core_services, socket_addr_is_globally_routable, BootstrapEndpoint,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, JoinTokenClaims, KeyId, NatConnectivityState,
+    NodeId, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics,
+    TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS,
+    MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -3145,6 +3146,11 @@ where
         return Ok(());
     };
     let instance_id = dynamic_web_gateway_instance_id(node_id);
+    let directory = state.plane.service_directory().await?;
+    if !bootstrap_endpoints_include_core_services(&directory.bootstrap_endpoints) {
+        state.plane.withdraw_service_instance(&instance_id).await?;
+        return Ok(());
+    }
     let now = Utc::now();
     let classification = state.plane.nat_classification_for(node_id).await?;
     let public_ip = classification.as_ref().and_then(|classification| {

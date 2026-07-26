@@ -18,6 +18,7 @@ namespace="${HETERONETWORK_K8S_SMOKE_NAMESPACE:-heteronetwork-live-${suffix}}"
 release="${HETERONETWORK_K8S_SMOKE_RELEASE:-heteronetwork-live-${suffix}}"
 bootstrap_name="heteronetwork-bootstrap"
 signal_name="heteronetwork-signal"
+service_instance_id="kubernetes-live-smoke"
 token_secret="heteronetwork-live-join"
 agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
@@ -178,6 +179,8 @@ wait_for_agent_runtime() {
   local pod="$1"
   local status_json
   local metrics_json
+  local state_json
+  local state_directory_summary
   local attempt
   for attempt in $(seq 1 60); do
     status_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
@@ -188,6 +191,8 @@ wait_for_agent_runtime() {
       curl --fail --silent --show-error --max-time 5 \
         -H "Authorization: Bearer ${agent_api_token}" \
         http://127.0.0.1:9780/v1/metrics 2>/dev/null || true)"
+    state_json="$("$kubectl_bin" -n "$namespace" exec "$pod" -c agent -- \
+      cat /var/lib/heteronetwork/agent.json 2>/dev/null || true)"
     if jq -e --arg backend "$agent_runtime_backend" \
       '(.node_id | type == "string")
        and (.vpn_ip | type == "string")
@@ -195,13 +200,33 @@ wait_for_agent_runtime() {
        and ($backend != "linux-command" or .candidate_count >= 1)' \
       >/dev/null 2>&1 <<<"$status_json" \
       && jq -e '.peer_map_synced == true and (.node_id | type == "string")' \
-        >/dev/null 2>&1 <<<"$metrics_json"; then
+        >/dev/null 2>&1 <<<"$metrics_json" \
+      && jq -e \
+        --arg control_plane "$control_plane_url" \
+        --arg signal "$signal_url" \
+        --arg stun "$stun_url" \
+        --arg relay "$relay_bootstrap_url" '
+          .seed_bootstrap_endpoints == null
+          and (.bootstrap_endpoints | length) == 4
+          and any(.bootstrap_endpoints[]?;
+            .kind == "control_plane" and .url == $control_plane)
+          and any(.bootstrap_endpoints[]?;
+            .kind == "signal" and .url == $signal)
+          and any(.bootstrap_endpoints[]?;
+            .kind == "stun" and .url == $stun)
+          and any(.bootstrap_endpoints[]?;
+            .kind == "relay" and .url == $relay)
+        ' >/dev/null 2>&1 <<<"$state_json"; then
       printf '%s\n' "$status_json"
       return 0
     fi
     sleep 2
   done
-  echo "agent pod ${pod} did not report a synchronized peer map, VPN IP, and required endpoint candidate" >&2
+  state_directory_summary="$(jq -c \
+    '{seed_bootstrap_endpoints, bootstrap_endpoints}' \
+    <<<"$state_json" 2>/dev/null || true)"
+  echo "agent pod ${pod} did not report a synchronized runtime and authoritative service directory" >&2
+  echo "Agent service directory: ${state_directory_summary:-<unavailable>}" >&2
   return 1
 }
 
@@ -720,6 +745,10 @@ if [[ ! "$bootstrap_cluster_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   echo "live smoke currently requires an IPv4 bootstrap Service clusterIP, got ${bootstrap_cluster_ip:-<empty>}" >&2
   exit 1
 fi
+control_plane_url="http://${bootstrap_name}.${namespace}.svc:8443"
+signal_url="http://${signal_name}.${namespace}.svc:9443"
+stun_url="udp://${bootstrap_name}.${namespace}.svc:3478"
+relay_bootstrap_url="udp://${relay_service_name}.${namespace}.svc:51820"
 
 init_output="$tmp_dir/init.json"
 issuer_key="$tmp_dir/issuer.key"
@@ -796,6 +825,16 @@ spec:
             - sqlite:///var/lib/heteronetwork/control-plane.sqlite?mode=rwc
             - --operator-api-bearer-token-path
             - /run/secrets/control-plane/operator-api-token
+            - --service-instance-id
+            - ${service_instance_id}
+            - --advertise-control-plane-url
+            - ${control_plane_url}
+            - --advertise-signal-url
+            - ${signal_url}
+            - --advertise-stun-url
+            - ${stun_url}
+            - --advertise-relay-url
+            - ${relay_bootstrap_url}
           ports:
             - name: control-plane
               containerPort: 8443
@@ -873,8 +912,6 @@ EOF
 wait_for_bootstrap_health
 wait_for_signal_health
 
-control_plane_url="http://${bootstrap_name}.${namespace}.svc:8443"
-signal_url="http://${signal_name}.${namespace}.svc:9443"
 agent_state_path="/var/lib/heteronetwork-live/${release}"
 agent_api_service_name="${chart_fullname}-agent"
 "$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \

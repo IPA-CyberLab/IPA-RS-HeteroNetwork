@@ -37,13 +37,13 @@ use ipars_types::api::{
     SignalHolePunchPlanResponse,
 };
 use ipars_types::{
-    canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, private_ip_addrs_share_subnet,
-    socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, BootstrapEndpoint,
-    BootstrapEndpointKind, CandidateSource, ClusterPolicy, EndpointCandidate,
-    EndpointCandidateKind, NatClassification, NatConnectivityState, NatProbeObservation, NodeId,
-    NodeRecord, PathChangeEvent, PathChangeKind, PathQualityObservation, PathRecord, PathScore,
-    PathState, Role, Route, Tag, TransportProtocol, VpnIp,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
+    endpoint_addr_is_usable, private_ip_addrs_share_subnet, socket_addr_is_globally_routable,
+    validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
+    CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
+    NatConnectivityState, NatProbeObservation, NodeId, NodeRecord, PathChangeEvent, PathChangeKind,
+    PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag, TransportProtocol,
+    VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1509,6 +1509,12 @@ impl AgentRuntime {
             return Ok(None);
         }
         validate_bootstrap_endpoint_set(active, "control-plane service directory")?;
+        if !bootstrap_endpoints_include_core_services(active) {
+            return Err(AgentError::InvalidState(
+                "control-plane service directory must include control_plane, signal, and stun endpoints"
+                    .to_string(),
+            ));
+        }
 
         let mut state = match self.state.write() {
             Ok(state) => state,
@@ -13031,10 +13037,20 @@ mod tests {
             .merge_active_bootstrap_endpoints(&active, updated_at)?
             .is_none());
 
-        let replacement = vec![BootstrapEndpoint {
-            kind: BootstrapEndpointKind::ControlPlane,
-            url: "https://replacement.example:8443".to_string(),
-        }];
+        let replacement = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://replacement.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://replacement.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://replacement.example:3478".to_string(),
+            },
+        ];
         let replaced = runtime
             .merge_active_bootstrap_endpoints(
                 &replacement,
@@ -13047,7 +13063,7 @@ mod tests {
         assert!(replaced
             .bootstrap_endpoints
             .iter()
-            .all(|endpoint| endpoint.kind != BootstrapEndpointKind::Stun));
+            .all(|endpoint| endpoint.kind != BootstrapEndpointKind::WebUi));
 
         let retired_seeds = vec![BootstrapEndpoint {
             kind: BootstrapEndpointKind::Stun,
@@ -13061,6 +13077,27 @@ mod tests {
             .is_none());
         assert_eq!(runtime.state().bootstrap_endpoints, replacement);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_rejects_partial_active_service_directory() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let partial = vec![BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: "https://partial.example:8443".to_string(),
+        }];
+
+        let error = match runtime.merge_active_bootstrap_endpoints(&partial, Utc::now()) {
+            Ok(_) => panic!("partial active directory must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must include control_plane, signal, and stun"));
+        assert!(runtime.state().seed_bootstrap_endpoints.is_some());
     }
 
     #[test]

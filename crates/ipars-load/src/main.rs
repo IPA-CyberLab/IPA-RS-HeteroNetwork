@@ -3210,6 +3210,23 @@ async fn run_daemon_scenario(
         let (stopped_role, survivor_urls) = services.stop_control_plane_for_failover(0)?;
         failover_survivor_endpoints = survivor_urls.len();
         failover_stopped_role = Some(stopped_role.clone());
+        let failover_service_directory = daemon_service_directory_endpoints(
+            &survivor_urls,
+            &services.signal_url,
+            services.stun_addr,
+            services.relay_udp_addr,
+        );
+        wait_for_daemon_agent_service_directories(
+            &services.agent_state_paths,
+            &failover_service_directory,
+            agent_readiness_timeout,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "daemon agents retained the retired service endpoint after stopping {stopped_role}"
+            )
+        })?;
         let mut failover_agent_statuses = Vec::with_capacity(services.agent_urls.len());
         for (index, (url, previous_status)) in
             services.agent_urls.iter().zip(&agent_statuses).enumerate()
@@ -5084,6 +5101,12 @@ impl DaemonProcessGroup {
         let signal_url = format!("http://{signal_addr}");
         let relay_http_url = format!("http://{relay_http_addr}");
         let stun_http_url = format!("http://{stun_http_addr}");
+        let expected_bootstrap_endpoints = daemon_service_directory_endpoints(
+            &control_plane_urls,
+            &signal_url,
+            stun_addr,
+            relay_udp_addr,
+        );
         let mut agent_urls = Vec::with_capacity(options.agent_processes);
         let manifest_seed = DaemonRuntimeManifestSeed {
             scenario: scenario.name,
@@ -5146,6 +5169,15 @@ impl DaemonProcessGroup {
                 "--issuer-public-key".to_string(),
                 issuer.public_key_b64(),
             ];
+            control_plane_args.extend(daemon_control_plane_service_lease_args(
+                &role,
+                &daemon_service_instance_endpoints(
+                    &control_plane_urls[index],
+                    &signal_url,
+                    stun_addr,
+                    relay_udp_addr,
+                ),
+            ));
             let mut control_plane_env = vec![(
                 "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN",
                 control_plane_operator_api_bearer_token.as_str(),
@@ -5411,6 +5443,7 @@ impl DaemonProcessGroup {
             signal_url: &signal_url,
             agent_urls: &agent_urls,
             agent_state_paths: &startup.agent_state_paths,
+            expected_bootstrap_endpoints: &expected_bootstrap_endpoints,
             control_plane_operator_api_bearer_token: &control_plane_operator_api_bearer_token,
             signal_operator_api_bearer_token: &signal_operator_api_bearer_token,
             timeout: options.agent_readiness_timeout,
@@ -5656,6 +5689,90 @@ fn daemon_stun_args(
         "--http-listen".to_string(),
         stun_http_addr.to_string(),
     ]
+}
+
+fn daemon_service_instance_endpoints(
+    control_plane_url: &str,
+    signal_url: &str,
+    stun_addr: SocketAddr,
+    relay_udp_addr: SocketAddr,
+) -> Vec<BootstrapEndpoint> {
+    vec![
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: control_plane_url.to_string(),
+        },
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Signal,
+            url: signal_url.to_string(),
+        },
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: format!("udp://{stun_addr}"),
+        },
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Relay,
+            url: format!("udp://{relay_udp_addr}"),
+        },
+    ]
+}
+
+fn daemon_service_directory_endpoints(
+    control_plane_urls: &[String],
+    signal_url: &str,
+    stun_addr: SocketAddr,
+    relay_udp_addr: SocketAddr,
+) -> Vec<BootstrapEndpoint> {
+    let mut endpoints = control_plane_urls
+        .iter()
+        .map(|url| BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url: url.clone(),
+        })
+        .collect::<Vec<_>>();
+    endpoints.extend([
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Signal,
+            url: signal_url.to_string(),
+        },
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: format!("udp://{stun_addr}"),
+        },
+        BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Relay,
+            url: format!("udp://{relay_udp_addr}"),
+        },
+    ]);
+    endpoints
+}
+
+fn daemon_control_plane_service_lease_args(
+    instance_id: &str,
+    endpoints: &[BootstrapEndpoint],
+) -> Vec<String> {
+    let mut args = vec![
+        "--service-instance-id".to_string(),
+        instance_id.to_string(),
+        "--service-lease-ttl-seconds".to_string(),
+        "6".to_string(),
+        "--service-lease-renew-interval-seconds".to_string(),
+        "2".to_string(),
+    ];
+    for endpoint in endpoints {
+        args.push(
+            match endpoint.kind {
+                BootstrapEndpointKind::ControlPlane => "--advertise-control-plane-url",
+                BootstrapEndpointKind::Signal => "--advertise-signal-url",
+                BootstrapEndpointKind::Stun => "--advertise-stun-url",
+                BootstrapEndpointKind::Relay => "--advertise-relay-url",
+                BootstrapEndpointKind::WebUi => "--advertise-web-ui-url",
+            }
+            .to_string(),
+        );
+        args.push(endpoint.url.clone());
+    }
+    args
 }
 
 struct DaemonChild {
@@ -7012,6 +7129,7 @@ struct DaemonAgentReadinessContext<'a> {
     signal_url: &'a str,
     agent_urls: &'a [String],
     agent_state_paths: &'a [PathBuf],
+    expected_bootstrap_endpoints: &'a [BootstrapEndpoint],
     control_plane_operator_api_bearer_token: &'a str,
     signal_operator_api_bearer_token: &'a str,
     timeout: Duration,
@@ -7029,18 +7147,24 @@ async fn wait_for_daemon_agents_ready(
         match daemon_agent_statuses(client, context.agent_urls).await {
             Ok(statuses) => {
                 match load_daemon_agent_identities(context.agent_state_paths, &statuses) {
-                    Ok(identities) => match check_daemon_agent_control_and_signal_readiness(
-                        client,
-                        context.control_plane_urls,
-                        context.signal_url,
-                        &statuses,
-                        &identities,
-                        context.control_plane_operator_api_bearer_token,
-                        context.signal_operator_api_bearer_token,
-                    )
-                    .await
-                    {
-                        Ok(()) => return Ok(()),
+                    Ok(identities) => match validate_daemon_agent_service_directories(
+                        context.agent_state_paths,
+                        context.expected_bootstrap_endpoints,
+                    ) {
+                        Ok(()) => match check_daemon_agent_control_and_signal_readiness(
+                            client,
+                            context.control_plane_urls,
+                            context.signal_url,
+                            &statuses,
+                            &identities,
+                            context.control_plane_operator_api_bearer_token,
+                            context.signal_operator_api_bearer_token,
+                        )
+                        .await
+                        {
+                            Ok(()) => return Ok(()),
+                            Err(error) => last_error = Some(error),
+                        },
                         Err(error) => last_error = Some(error),
                     },
                     Err(error) => last_error = Some(error),
@@ -7156,6 +7280,56 @@ fn load_daemon_agent_identities(
         );
     }
     Ok(identities)
+}
+
+fn validate_daemon_agent_service_directories(
+    state_paths: &[PathBuf],
+    expected_endpoints: &[BootstrapEndpoint],
+) -> anyhow::Result<()> {
+    let expected = expected_endpoints
+        .iter()
+        .map(|endpoint| (endpoint.kind, endpoint.url.as_str()))
+        .collect::<BTreeSet<_>>();
+    for path in state_paths {
+        let state = FileAgentStateStore::new(path)
+            .load()
+            .with_context(|| format!("failed to load daemon agent state {}", path.display()))?;
+        anyhow::ensure!(
+            state.seed_bootstrap_endpoints.is_none(),
+            "daemon agent state {} still retains bootstrap seeds",
+            path.display()
+        );
+        let actual = state
+            .bootstrap_endpoints
+            .iter()
+            .map(|endpoint| (endpoint.kind, endpoint.url.as_str()))
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            actual == expected,
+            "daemon agent state {} service directory mismatch: actual={actual:?}, expected={expected:?}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_daemon_agent_service_directories(
+    state_paths: &[PathBuf],
+    expected_endpoints: &[BootstrapEndpoint],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        match validate_daemon_agent_service_directories(state_paths, expected_endpoints) {
+            Ok(()) => return Ok(()),
+            Err(error) if started.elapsed() >= timeout => {
+                return Err(error).context(
+                    "daemon agents did not converge on the authoritative service directory before timeout",
+                );
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10963,6 +11137,36 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
                 "127.0.0.1:34781".to_string(),
                 "--http-listen".to_string(),
                 "127.0.0.1:34782".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_control_plane_advertises_complete_service_instance() {
+        let endpoints = daemon_service_instance_endpoints(
+            "http://127.0.0.1:31001",
+            "http://127.0.0.1:31002",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31_003),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31_004),
+        );
+
+        assert_eq!(
+            daemon_control_plane_service_lease_args("control-plane-0", &endpoints),
+            vec![
+                "--service-instance-id".to_string(),
+                "control-plane-0".to_string(),
+                "--service-lease-ttl-seconds".to_string(),
+                "6".to_string(),
+                "--service-lease-renew-interval-seconds".to_string(),
+                "2".to_string(),
+                "--advertise-control-plane-url".to_string(),
+                "http://127.0.0.1:31001".to_string(),
+                "--advertise-signal-url".to_string(),
+                "http://127.0.0.1:31002".to_string(),
+                "--advertise-stun-url".to_string(),
+                "udp://127.0.0.1:31003".to_string(),
+                "--advertise-relay-url".to_string(),
+                "udp://127.0.0.1:31004".to_string(),
             ]
         );
     }

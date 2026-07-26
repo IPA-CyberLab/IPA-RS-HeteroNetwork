@@ -25,7 +25,10 @@ use ipars_types::api::{
     AgentWireGuardKeyRotationRequest, AgentWireGuardKeyRotationResponse, PeerMap,
     RemoveNodeRequest, RemoveNodeResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
 };
-use ipars_types::{canonical_bootstrap_endpoint_url, BootstrapEndpointKind, NodeId, PathState};
+use ipars_types::{
+    bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
+    BootstrapEndpointKind, NodeId, PathState,
+};
 use rand_core::{OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1099,22 +1102,26 @@ fn parse_url_ip_addr(host: &str) -> Option<IpAddr> {
 
 fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
     let runtime_state = state.runtime.state();
+    let has_authoritative_directory = runtime_state.seed_bootstrap_endpoints.is_none()
+        && bootstrap_endpoints_include_core_services(&runtime_state.bootstrap_endpoints);
     let own_public_gateway_url = state
         .public_web_gateway
         .as_ref()
         .and_then(|access| access.status.read().ok()?.url.clone())
         .and_then(|url| normalize_web_ui_base_url(&url).ok());
     let mut candidates = Vec::new();
-    for endpoint in runtime_state
-        .bootstrap_endpoints
-        .iter()
-        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
-    {
-        candidates.push(WebUiCandidate {
-            url: endpoint.url.clone(),
-            source: "service_directory",
-            trusted_directory: true,
-        });
+    if has_authoritative_directory {
+        for endpoint in runtime_state
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
+        {
+            candidates.push(WebUiCandidate {
+                url: endpoint.url.clone(),
+                source: "service_directory",
+                trusted_directory: true,
+            });
+        }
     }
     for url in &runtime_state.web_ui_seed_urls {
         candidates.push(WebUiCandidate {
@@ -1123,18 +1130,19 @@ fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
             trusted_directory: false,
         });
     }
-    for endpoint in runtime_state
-        .bootstrap_endpoints
-        .iter()
-        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
-    {
-        candidates.push(WebUiCandidate {
-            url: endpoint.url.clone(),
-            source: "control_plane_directory",
-            trusted_directory: true,
-        });
-    }
-    if runtime_state.bootstrap_endpoints.is_empty() {
+    if has_authoritative_directory {
+        for endpoint in runtime_state
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+        {
+            candidates.push(WebUiCandidate {
+                url: endpoint.url.clone(),
+                source: "control_plane_directory",
+                trusted_directory: true,
+            });
+        }
+    } else {
         for url in &state.control_plane_urls {
             candidates.push(WebUiCandidate {
                 url: url.clone(),
@@ -2075,7 +2083,9 @@ async fn remove_node(
 fn runtime_control_plane_urls(state: &AgentHttpState) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let runtime_state = state.runtime.state();
-    let urls = if runtime_state.bootstrap_endpoints.is_empty() {
+    let urls = if runtime_state.seed_bootstrap_endpoints.is_some()
+        || !bootstrap_endpoints_include_core_services(&runtime_state.bootstrap_endpoints)
+    {
         state.control_plane_urls.clone()
     } else {
         runtime_state
@@ -3980,10 +3990,30 @@ mod tests {
             candidate.url == retired && candidate.source == "control_plane_runtime"
         }));
 
+        runtime.replace_seed_bootstrap_endpoints(
+            &[BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://seed.example:8443".to_string(),
+            }],
+            Utc::now(),
+        )?;
+        assert_eq!(runtime_control_plane_urls(&state), vec![retired.clone()]);
+        assert!(web_ui_candidates(&state).iter().any(|candidate| {
+            candidate.url == retired && candidate.source == "control_plane_runtime"
+        }));
+
         let active = vec![
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
                 url: "https://active.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://active.example:9443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://active.example:3478".to_string(),
             },
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::WebUi,
@@ -4504,14 +4534,31 @@ mod tests {
     async fn local_web_ui_uses_persisted_service_directory_without_runtime_flags(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
-        let mut node_state = AgentNodeState::generate(Utc::now());
-        node_state
-            .bootstrap_endpoints
-            .push(ipars_types::BootstrapEndpoint {
-                kind: BootstrapEndpointKind::WebUi,
-                url: backend_url.clone(),
-            });
-        let runtime = Arc::new(AgentRuntime::new(node_state, ClusterPolicy::default()));
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        runtime.merge_active_bootstrap_endpoints(
+            &[
+                ipars_types::BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: backend_url.clone(),
+                },
+                ipars_types::BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: backend_url.clone(),
+                },
+                ipars_types::BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://127.0.0.1:3478".to_string(),
+                },
+                ipars_types::BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::WebUi,
+                    url: backend_url.clone(),
+                },
+            ],
+            Utc::now(),
+        )?;
         let app = router(AgentHttpState::new(runtime).enable_local_web_ui(true));
 
         let response = app

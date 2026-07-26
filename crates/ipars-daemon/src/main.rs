@@ -103,7 +103,8 @@ use ipars_types::ebpf::{
     PACKET_FLOW_TCP_STATE_TIME_WAIT, PACKET_FLOW_TCP_STATE_UNKNOWN,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, http_url_is_usable_endpoint, socket_addr_is_globally_routable,
+    bootstrap_endpoints_include_core_services, endpoint_addr_is_usable,
+    http_url_is_usable_endpoint, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
     ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatConnectivityState,
     NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
@@ -4746,6 +4747,10 @@ fn control_plane_service_lease_config(
     }
     validate_join_token_bootstrap_endpoints(&endpoints)
         .context("invalid advertised HA service endpoint")?;
+    anyhow::ensure!(
+        bootstrap_endpoints_include_core_services(&endpoints),
+        "advertised HA service instance must include --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url"
+    );
     Ok(Some(ControlPlaneServiceLeaseConfig {
         cluster_id: ClusterId::from_string(args.cluster_id.clone()),
         instance_id: args
@@ -18920,7 +18925,9 @@ fn runtime_control_plane_urls(
     fallback: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let state = runtime.state();
-    let base_urls = if state.bootstrap_endpoints.is_empty() {
+    let base_urls = if state.seed_bootstrap_endpoints.is_some()
+        || !bootstrap_endpoints_include_core_services(&state.bootstrap_endpoints)
+    {
         fallback.to_vec()
     } else {
         state
@@ -18935,7 +18942,9 @@ fn runtime_control_plane_urls(
 
 fn runtime_signal_urls(runtime: &AgentRuntime, fallback: &[String]) -> anyhow::Result<Vec<String>> {
     let state = runtime.state();
-    let base_urls = if state.bootstrap_endpoints.is_empty() {
+    let base_urls = if state.seed_bootstrap_endpoints.is_some()
+        || !bootstrap_endpoints_include_core_services(&state.bootstrap_endpoints)
+    {
         fallback.to_vec()
     } else {
         state
@@ -19385,10 +19394,20 @@ mod tests {
             vec![retired]
         );
         runtime.merge_active_bootstrap_endpoints(
-            &[BootstrapEndpoint {
-                kind: BootstrapEndpointKind::Stun,
-                url: format!("udp://{active}"),
-            }],
+            &[
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: "https://active.example:8443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "https://active.example:9443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: format!("udp://{active}"),
+                },
+            ],
             Utc::now(),
         )?;
         let refreshed = runtime_stun_servers(&runtime, &config).await?;
@@ -20143,6 +20162,10 @@ mod tests {
                 kind: BootstrapEndpointKind::Signal,
                 url: "https://public-b.example:9443".to_string(),
             },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://public-b.example:3478".to_string(),
+            },
         ];
         let response = HeartbeatResponse {
             accepted: true,
@@ -20779,6 +20802,38 @@ mod tests {
             ]
         );
         assert_eq!(args.vpn_pool, "10.250.0.0/16".parse()?);
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_rejects_partial_service_advertisement() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--service-instance-id",
+            "partial-a",
+            "--advertise-control-plane-url",
+            "https://partial.example:8443",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+
+        let error = match control_plane_service_lease_config(&args) {
+            Ok(_) => anyhow::bail!("partial service advertisement must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "--advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url"
+        ));
         Ok(())
     }
 
@@ -36973,6 +37028,20 @@ exec sleep 60
             signal_fallback
         );
 
+        let signed_seeds = vec![BootstrapEndpoint {
+            url: "https://seed.example:8443".to_string(),
+            kind: BootstrapEndpointKind::ControlPlane,
+        }];
+        runtime.replace_seed_bootstrap_endpoints(&signed_seeds, Utc::now())?;
+        assert_eq!(
+            runtime_control_plane_urls(&runtime, &control_plane_fallback)?,
+            control_plane_fallback
+        );
+        assert_eq!(
+            runtime_signal_urls(&runtime, &signal_fallback)?,
+            signal_fallback
+        );
+
         let active = vec![
             BootstrapEndpoint {
                 url: "https://active.example:8443".to_string(),
@@ -36981,6 +37050,10 @@ exec sleep 60
             BootstrapEndpoint {
                 url: "https://active.example:9443".to_string(),
                 kind: BootstrapEndpointKind::Signal,
+            },
+            BootstrapEndpoint {
+                url: "udp://active.example:3478".to_string(),
+                kind: BootstrapEndpointKind::Stun,
             },
         ];
         runtime.merge_active_bootstrap_endpoints(&active, Utc::now())?;
