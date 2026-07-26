@@ -596,6 +596,18 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
         )),
         "rendered Compose config did not include the control-plane host port override"
     );
+    for expected in [
+        "HETERONETWORK_SERVICE_INSTANCE_ID: compose-smoke".to_string(),
+        format!("HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}"),
+        format!("HETERONETWORK_ADVERTISE_SIGNAL_URL: http://127.0.0.1:{signal_port}"),
+        format!("HETERONETWORK_ADVERTISE_STUN_URL: udp://127.0.0.1:{stun_port}"),
+        format!("HETERONETWORK_ADVERTISE_RELAY_URL: udp://127.0.0.1:{relay_udp_port}"),
+    ] {
+        anyhow::ensure!(
+            rendered.contains(&expected),
+            "rendered smoke Compose config omitted required service advertisement {expected}"
+        );
+    }
     anyhow::ensure!(
         rendered.contains("HETERONETWORK_AGENT_JOIN_TOKEN:"),
         "rendered smoke Compose config did not include the inline join token override"
@@ -1707,6 +1719,12 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       HETERONETWORK_DATABASE_URL: postgres://heteronetwork:heteronetwork-dev@postgres:5432/heteronetwork
       HETERONETWORK_ROLE: control-plane
       HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: {control_plane_operator_api_bearer_token}
+      HETERONETWORK_SERVICE_INSTANCE_ID: compose-smoke
+      HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
+      HETERONETWORK_ADVERTISE_SIGNAL_URL: http://127.0.0.1:{signal_port}
+      HETERONETWORK_ADVERTISE_STUN_URL: udp://127.0.0.1:{stun_port}
+      HETERONETWORK_ADVERTISE_RELAY_URL: udp://127.0.0.1:{relay_udp_port}
+      HETERONETWORK_ADVERTISE_WEB_UI_URL: http://127.0.0.1:{control_plane_port}
     secrets: !reset []
     ports:
       - "{control_plane_port}:8443"
