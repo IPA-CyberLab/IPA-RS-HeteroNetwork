@@ -87,6 +87,8 @@ const PASSIVE_WIREGUARD_PUBLIC_KEY_DOMAIN: &[u8] =
 const OVERLAY_QUARANTINE_PUBLIC_KEY_DOMAIN: &[u8] =
     b"HeteroNetwork bounded overlay quarantine key v1\0";
 const OVERLAY_QUARANTINE_NODE_ID: &str = "__overlay_quarantine__";
+const MAX_RESOLVED_OVERLAY_PATHS: usize = 4_096;
+const MAX_PENDING_OVERLAY_DESTINATIONS: usize = 4_096;
 
 mod peer_probe;
 
@@ -577,6 +579,84 @@ fn write_private_agent_state_file(path: &Path, bytes: &[u8]) -> Result<(), Agent
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct PendingOverlayDestinations {
+    queue: VecDeque<IpAddr>,
+    members: BTreeSet<IpAddr>,
+}
+
+impl PendingOverlayDestinations {
+    fn enqueue(&mut self, destination: IpAddr) -> bool {
+        if self.members.contains(&destination)
+            || self.queue.len() >= MAX_PENDING_OVERLAY_DESTINATIONS
+        {
+            return false;
+        }
+        self.members.insert(destination);
+        self.queue.push_back(destination);
+        true
+    }
+
+    fn requeue(&mut self, destination: IpAddr) {
+        if self.members.contains(&destination) {
+            return;
+        }
+        if self.queue.len() >= MAX_PENDING_OVERLAY_DESTINATIONS {
+            if let Some(displaced) = self.queue.pop_back() {
+                self.members.remove(&displaced);
+            }
+        }
+        self.members.insert(destination);
+        self.queue.push_back(destination);
+    }
+
+    fn take(&mut self, maximum: usize) -> Vec<IpAddr> {
+        let mut selected = Vec::with_capacity(maximum.min(self.queue.len()));
+        for _ in 0..maximum {
+            let Some(destination) = self.queue.pop_front() else {
+                break;
+            };
+            self.members.remove(&destination);
+            selected.push(destination);
+        }
+        selected
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverlayShortcutSnapshot {
+    resolved_overlay_peers: BTreeSet<NodeId>,
+    direct_shortcut_targets: BTreeSet<NodeId>,
+}
+
+impl OverlayShortcutSnapshot {
+    pub fn resolved_overlay_peers(&self) -> &BTreeSet<NodeId> {
+        &self.resolved_overlay_peers
+    }
+
+    pub fn direct_shortcut_targets(&self) -> &BTreeSet<NodeId> {
+        &self.direct_shortcut_targets
+    }
+
+    pub fn is_resolved_overlay_peer(&self, peer: &NodeId) -> bool {
+        self.resolved_overlay_peers.contains(peer)
+    }
+
+    pub fn is_direct_shortcut(&self, peer: &NodeId) -> bool {
+        self.direct_shortcut_targets.contains(peer)
+    }
+
+    pub fn requires_overlay_forwarder(&self, peer: &NodeId) -> bool {
+        self.is_resolved_overlay_peer(peer) && !self.is_direct_shortcut(peer)
+    }
+}
+
+#[derive(Debug)]
+struct CachedOverlayShortcutSnapshot {
+    generation: u64,
+    snapshot: Arc<OverlayShortcutSnapshot>,
+}
+
 #[derive(Debug)]
 pub struct AgentRuntime {
     state: RwLock<AgentNodeState>,
@@ -586,8 +666,11 @@ pub struct AgentRuntime {
     local_advertised_routes: tokio::sync::RwLock<Vec<Route>>,
     latest_peer_map: tokio::sync::RwLock<Option<PeerMap>>,
     latest_neighbor_map: tokio::sync::RwLock<Option<NeighborMap>>,
+    neighbor_map_update: tokio::sync::Mutex<()>,
     resolved_overlay_paths: tokio::sync::RwLock<BTreeMap<NodeId, (OverlayPath, DateTime<Utc>)>>,
-    pending_overlay_destinations: tokio::sync::Mutex<BTreeSet<IpAddr>>,
+    overlay_shortcut_generation: AtomicU64,
+    overlay_shortcut_snapshot: tokio::sync::RwLock<Option<CachedOverlayShortcutSnapshot>>,
+    pending_overlay_destinations: tokio::sync::Mutex<PendingOverlayDestinations>,
     peer_map_sync_notify: Arc<tokio::sync::Notify>,
     heartbeat_report_notify: Arc<tokio::sync::Notify>,
     signal_path_notify: Arc<tokio::sync::Notify>,
@@ -1361,8 +1444,13 @@ impl AgentRuntime {
             local_advertised_routes: tokio::sync::RwLock::new(Vec::new()),
             latest_peer_map: tokio::sync::RwLock::new(None),
             latest_neighbor_map: tokio::sync::RwLock::new(None),
+            neighbor_map_update: tokio::sync::Mutex::new(()),
             resolved_overlay_paths: tokio::sync::RwLock::new(BTreeMap::new()),
-            pending_overlay_destinations: tokio::sync::Mutex::new(BTreeSet::new()),
+            overlay_shortcut_generation: AtomicU64::new(0),
+            overlay_shortcut_snapshot: tokio::sync::RwLock::new(None),
+            pending_overlay_destinations: tokio::sync::Mutex::new(
+                PendingOverlayDestinations::default(),
+            ),
             peer_map_sync_notify: Arc::new(tokio::sync::Notify::new()),
             heartbeat_report_notify: Arc::new(tokio::sync::Notify::new()),
             signal_path_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2445,6 +2533,7 @@ impl AgentRuntime {
                 .write()
                 .await
                 .pin_peer(record.key.remote.clone());
+            self.invalidate_overlay_shortcut_snapshot();
         }
         let path_changed = path_change_event(previous.as_ref(), &record);
         let should_report_path_change = path_changed
@@ -2693,6 +2782,7 @@ impl AgentRuntime {
         }
         let pinned = lazy_connect.is_pinned(&peer);
         drop(lazy_connect);
+        self.invalidate_overlay_shortcut_snapshot();
         if !was_active || (pinned && !was_pinned) {
             self.request_lazy_connect_sync();
         }
@@ -2704,6 +2794,7 @@ impl AgentRuntime {
         let changed = lazy_connect.record_remote_activity(peer, observed_at);
         drop(lazy_connect);
         if changed {
+            self.invalidate_overlay_shortcut_snapshot();
             self.request_lazy_connect_path_sync();
         }
     }
@@ -2717,6 +2808,7 @@ impl AgentRuntime {
         let changed = lazy_connect.record_remote_activity_if_idle(peer, observed_at);
         drop(lazy_connect);
         if changed {
+            self.invalidate_overlay_shortcut_snapshot();
             self.request_lazy_connect_path_sync();
         }
         changed
@@ -2819,7 +2911,7 @@ impl AgentRuntime {
                     .pending_overlay_destinations
                     .lock()
                     .await
-                    .insert(destination);
+                    .enqueue(destination);
                 if queued {
                     self.request_lazy_connect_path_sync();
                 }
@@ -2837,6 +2929,7 @@ impl AgentRuntime {
         matched.pinned = lazy_connect.is_pinned(&matched.peer);
         self.packet_flow_match_count.fetch_add(1, Ordering::Relaxed);
         drop(lazy_connect);
+        self.invalidate_overlay_shortcut_snapshot();
         if !was_active || (matched.pinned && !was_pinned) {
             self.request_lazy_connect_sync();
         }
@@ -3126,12 +3219,15 @@ impl AgentRuntime {
         for peer in peers {
             lazy_connect.observe_peer(peer, &local_route_cidrs);
         }
+        drop(lazy_connect);
+        self.invalidate_overlay_shortcut_snapshot();
     }
 
     pub async fn record_neighbor_map_snapshot(
         &self,
         neighbor_map: NeighborMap,
     ) -> Result<(), AgentError> {
+        let _update_guard = self.neighbor_map_update.lock().await;
         neighbor_map
             .validate()
             .map_err(|error| AgentError::InvalidState(error.to_string()))?;
@@ -3142,6 +3238,25 @@ impl AgentRuntime {
                 neighbor_map.node_id
             )));
         }
+        let previous = self.latest_neighbor_map.read().await.clone();
+        if let Some(current) = previous.as_ref().filter(|current| {
+            current.cluster_id == neighbor_map.cluster_id && current.node_id == neighbor_map.node_id
+        }) {
+            if neighbor_map.generated_at < current.generated_at {
+                return Err(AgentError::InvalidState(format!(
+                    "neighbor map generated at {} is older than the accepted map generated at {}",
+                    neighbor_map.generated_at, current.generated_at
+                )));
+            }
+            if neighbor_map.generated_at == current.generated_at
+                && neighbor_map.topology_epoch != current.topology_epoch
+            {
+                return Err(AgentError::InvalidState(format!(
+                    "neighbor map generated at {} conflicts with accepted topology epoch {}",
+                    neighbor_map.generated_at, current.topology_epoch
+                )));
+            }
+        }
         let topology_pins = neighbor_map
             .neighbors
             .iter()
@@ -3151,16 +3266,12 @@ impl AgentRuntime {
             .write()
             .await
             .replace_topology_pins(topology_pins);
-        let previous_epoch = self
-            .latest_neighbor_map
-            .read()
-            .await
-            .as_ref()
-            .map(|current| current.topology_epoch);
+        let previous_epoch = previous.map(|current| current.topology_epoch);
         if previous_epoch.is_some_and(|epoch| epoch != neighbor_map.topology_epoch) {
             self.resolved_overlay_paths.write().await.clear();
             self.overlay_forwarder_endpoints.write().await.clear();
         }
+        self.invalidate_overlay_shortcut_snapshot();
         *self.latest_neighbor_map.write().await = Some(neighbor_map);
         Ok(())
     }
@@ -3170,19 +3281,14 @@ impl AgentRuntime {
     }
 
     pub async fn take_pending_overlay_destinations(&self, maximum: usize) -> Vec<IpAddr> {
-        let mut pending = self.pending_overlay_destinations.lock().await;
-        let selected = pending.iter().copied().take(maximum).collect::<Vec<_>>();
-        for destination in &selected {
-            pending.remove(destination);
-        }
-        selected
+        self.pending_overlay_destinations.lock().await.take(maximum)
     }
 
     pub async fn requeue_overlay_destination(&self, destination: IpAddr) {
         self.pending_overlay_destinations
             .lock()
             .await
-            .insert(destination);
+            .requeue(destination);
     }
 
     pub async fn record_resolved_overlay_path(
@@ -3221,22 +3327,10 @@ impl AgentRuntime {
             .neighbors
             .iter()
             .any(|neighbor| neighbor.node.node_id == target_id);
-        let mut evicted_shortcut = None;
+        let mut evicted_path = None;
         if !is_backbone_neighbor {
-            let shortcut_limit = usize::from(
-                self.lazy_connect
-                    .read()
-                    .await
-                    .policy
-                    .overlay_direct_shortcut_limit,
-            );
-            if shortcut_limit == 0 {
-                return Err(AgentError::InvalidState(
-                    "overlay direct shortcuts are disabled by cluster policy".to_string(),
-                ));
-            }
             let mut resolved = self.resolved_overlay_paths.write().await;
-            if !resolved.contains_key(&target_id) && resolved.len() >= shortcut_limit {
+            if !resolved.contains_key(&target_id) && resolved.len() >= MAX_RESOLVED_OVERLAY_PATHS {
                 let lazy_connect = self.lazy_connect.read().await;
                 let evicted = resolved
                     .iter()
@@ -3245,19 +3339,19 @@ impl AgentRuntime {
                     .map(|(peer, _)| peer.clone())
                     .ok_or_else(|| {
                         AgentError::InvalidState(format!(
-                            "all {shortcut_limit} overlay direct shortcuts are pinned"
+                            "all {MAX_RESOLVED_OVERLAY_PATHS} resolved overlay paths are pinned"
                         ))
                     })?;
                 drop(lazy_connect);
                 resolved.remove(&evicted);
-                evicted_shortcut = Some(evicted.clone());
+                evicted_path = Some(evicted.clone());
                 let mut lazy_connect = self.lazy_connect.write().await;
                 lazy_connect.remove_activity(&evicted);
                 lazy_connect.remove_observed_peer(&evicted);
             }
             resolved.insert(target_id.clone(), (path.clone(), observed_at));
         }
-        if let Some(evicted) = evicted_shortcut {
+        if let Some(evicted) = evicted_path {
             self.overlay_forwarder_endpoints
                 .write()
                 .await
@@ -3275,6 +3369,7 @@ impl AgentRuntime {
         lazy_connect.observe_overlay_shortcut(&path.target, &local_route_cidrs);
         lazy_connect.record_activity(target_id, observed_at);
         drop(lazy_connect);
+        self.invalidate_overlay_shortcut_snapshot();
         self.request_lazy_connect_sync();
         Ok(())
     }
@@ -3310,6 +3405,87 @@ impl AgentRuntime {
             .values()
             .map(|(path, _)| path.clone())
             .collect()
+    }
+
+    pub async fn resolved_overlay_peer_ids(&self) -> BTreeSet<NodeId> {
+        self.overlay_shortcut_snapshot()
+            .await
+            .resolved_overlay_peers
+            .clone()
+    }
+
+    fn invalidate_overlay_shortcut_snapshot(&self) {
+        self.overlay_shortcut_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub async fn overlay_shortcut_snapshot(&self) -> Arc<OverlayShortcutSnapshot> {
+        loop {
+            let generation = self.overlay_shortcut_generation.load(Ordering::Acquire);
+            if let Some(snapshot) = self
+                .overlay_shortcut_snapshot
+                .read()
+                .await
+                .as_ref()
+                .filter(|cached| cached.generation == generation)
+                .map(|cached| cached.snapshot.clone())
+            {
+                return snapshot;
+            }
+
+            let snapshot = {
+                let resolved = self.resolved_overlay_paths.read().await;
+                let lazy_connect = self.lazy_connect.read().await;
+                let resolved_overlay_peers = resolved.keys().cloned().collect::<BTreeSet<_>>();
+                let limit = usize::from(lazy_connect.policy.overlay_direct_shortcut_limit);
+                let mut candidates = resolved
+                    .iter()
+                    .map(|(peer, (_, observed_at))| {
+                        let last_used = lazy_connect
+                            .last_used
+                            .get(peer)
+                            .copied()
+                            .unwrap_or(*observed_at);
+                        (lazy_connect.is_pinned(peer), last_used, peer.clone())
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by(|left, right| {
+                    right
+                        .0
+                        .cmp(&left.0)
+                        .then_with(|| right.1.cmp(&left.1))
+                        .then_with(|| left.2.cmp(&right.2))
+                });
+                Arc::new(OverlayShortcutSnapshot {
+                    resolved_overlay_peers,
+                    direct_shortcut_targets: candidates
+                        .into_iter()
+                        .take(limit)
+                        .map(|(_, _, peer)| peer)
+                        .collect(),
+                })
+            };
+            if generation != self.overlay_shortcut_generation.load(Ordering::Acquire) {
+                continue;
+            }
+
+            let mut cached = self.overlay_shortcut_snapshot.write().await;
+            if generation != self.overlay_shortcut_generation.load(Ordering::Acquire) {
+                continue;
+            }
+            *cached = Some(CachedOverlayShortcutSnapshot {
+                generation,
+                snapshot: snapshot.clone(),
+            });
+            return snapshot;
+        }
+    }
+
+    pub async fn overlay_direct_shortcut_targets(&self) -> BTreeSet<NodeId> {
+        self.overlay_shortcut_snapshot()
+            .await
+            .direct_shortcut_targets
+            .clone()
     }
 
     async fn overlay_destination_is_resolvable(&self, destination: IpAddr) -> bool {
@@ -3366,6 +3542,9 @@ impl AgentRuntime {
             .write()
             .await
             .retain(|peer, _| !idle_peers.contains(peer));
+        if !idle_peers.is_empty() {
+            self.invalidate_overlay_shortcut_snapshot();
+        }
         idle_peers
     }
 }
@@ -5699,6 +5878,10 @@ pub trait PeerMapSink: Send + Sync {
 
 #[async_trait]
 pub trait PeerEndpointResolver: Send + Sync + std::fmt::Debug {
+    async fn prepare_for_peer_map(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+
     async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError>;
 
     async fn persistent_keepalive_seconds_for_peer(
@@ -5724,6 +5907,7 @@ impl PeerEndpointResolver for DirectPeerEndpointResolver {
 pub struct RuntimePeerEndpointResolver {
     runtime: Arc<AgentRuntime>,
     relay_forwarder_endpoint: Option<SocketAddr>,
+    prepared_overlay_shortcuts: Arc<tokio::sync::RwLock<Option<Arc<OverlayShortcutSnapshot>>>>,
 }
 
 impl RuntimePeerEndpointResolver {
@@ -5731,6 +5915,7 @@ impl RuntimePeerEndpointResolver {
         Self {
             runtime,
             relay_forwarder_endpoint: None,
+            prepared_overlay_shortcuts: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -5742,8 +5927,27 @@ impl RuntimePeerEndpointResolver {
 
 #[async_trait]
 impl PeerEndpointResolver for RuntimePeerEndpointResolver {
+    async fn prepare_for_peer_map(&self) -> Result<(), AgentError> {
+        *self.prepared_overlay_shortcuts.write().await =
+            Some(self.runtime.overlay_shortcut_snapshot().await);
+        Ok(())
+    }
+
     async fn endpoint_for_peer(&self, peer: &NodeRecord) -> Result<Option<String>, AgentError> {
         let local_candidates = self.runtime.status().await.candidates;
+        let overlay_endpoint = self
+            .runtime
+            .overlay_forwarder_endpoint(&peer.node_id)
+            .await
+            .map(|endpoint| endpoint.to_string());
+        let prepared_overlay_shortcuts = self.prepared_overlay_shortcuts.read().await.clone();
+        let overlay_shortcuts = match prepared_overlay_shortcuts {
+            Some(snapshot) => snapshot,
+            None => self.runtime.overlay_shortcut_snapshot().await,
+        };
+        if overlay_shortcuts.requires_overlay_forwarder(&peer.node_id) {
+            return Ok(overlay_endpoint);
+        }
         if let Some(probe) = self
             .runtime
             .pending_direct_path_probe(&peer.node_id)
@@ -5762,11 +5966,6 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
                 &peer.node_id,
             ));
         }
-        let overlay_endpoint = self
-            .runtime
-            .overlay_forwarder_endpoint(&peer.node_id)
-            .await
-            .map(|endpoint| endpoint.to_string());
         let path = self.runtime.path_record_for_peer(&peer.node_id).await;
         let Some(path) = path else {
             return Ok(overlay_endpoint.or_else(|| {
@@ -5976,6 +6175,7 @@ where
         if let Some(runtime) = &self.lazy_runtime {
             peers_to_remove.extend(runtime.take_idle_peers_to_close(now).await);
         }
+        self.endpoint_resolver.prepare_for_peer_map().await?;
         let stale_peers = {
             let applied_peers = self.applied_peers.read().await;
             applied_peers
@@ -7514,7 +7714,7 @@ mod tests {
             max_degree: 4,
             vpn_cidr: "100.64.0.0/10"
                 .parse()
-                .expect("static test VPN CIDR must parse"),
+                .unwrap_or_else(|error| panic!("static test VPN CIDR must parse: {error}")),
             neighbors: neighbors
                 .into_iter()
                 .enumerate()
@@ -11514,11 +11714,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_overlay_pending_destinations_retry_in_round_robin_order() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let destinations = (1_u8..=70)
+            .map(|index| IpAddr::V4(Ipv4Addr::new(100, 64, 8, index)))
+            .collect::<Vec<_>>();
+        for destination in &destinations {
+            runtime.requeue_overlay_destination(*destination).await;
+            runtime.requeue_overlay_destination(*destination).await;
+        }
+
+        let first = runtime.take_pending_overlay_destinations(64).await;
+        assert_eq!(first, destinations[..64]);
+        for destination in first {
+            runtime.requeue_overlay_destination(destination).await;
+        }
+
+        let second = runtime.take_pending_overlay_destinations(8).await;
+        assert_eq!(
+            second,
+            destinations[64..70]
+                .iter()
+                .chain(&destinations[..2])
+                .copied()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_overlay_pending_destination_queue_has_a_hard_limit() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        for index in 1..=MAX_PENDING_OVERLAY_DESTINATIONS + 1 {
+            runtime
+                .requeue_overlay_destination(IpAddr::V6(std::net::Ipv6Addr::from(index as u128)))
+                .await;
+        }
+
+        assert_eq!(
+            runtime
+                .take_pending_overlay_destinations(MAX_PENDING_OVERLAY_DESTINATIONS + 1)
+                .await
+                .len(),
+            MAX_PENDING_OVERLAY_DESTINATIONS
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_overlay_shortcuts_expire_and_epoch_changes_clear_them(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut policy = ClusterPolicy::default();
-        policy.idle_timeout_seconds = 1;
-        policy.overlay_direct_shortcut_limit = 1;
+        let policy = ClusterPolicy {
+            idle_timeout_seconds: 1,
+            overlay_direct_shortcut_limit: 1,
+            ..ClusterPolicy::default()
+        };
         let state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
         let runtime = AgentRuntime::new(state, policy);
@@ -11594,6 +11848,154 @@ mod tests {
             .await?;
         assert!(runtime.resolved_overlay_peers().await.is_empty());
         assert_eq!(runtime.overlay_forwarder_endpoint(&target_id).await, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_overlay_keeps_many_logical_paths_but_only_four_direct_shortcuts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+        runtime
+            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node.clone(), Vec::new(), 7))
+            .await?;
+
+        let observed_at = Utc::now();
+        let mut targets = Vec::new();
+        for index in 1_u8..=12 {
+            let direct_endpoint = SocketAddr::from(([8, 8, 8, index], 51_820 + u16::from(index)));
+            let overlay_endpoint = SocketAddr::from(([127, 0, 0, 1], 52_100 + u16::from(index)));
+            let candidate = EndpointCandidate {
+                node_id: NodeId::from_string(format!("overlay-target-{index}")),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: direct_endpoint,
+                observed_at,
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::ControlPlane,
+            };
+            let target = peer_record(
+                candidate.node_id.clone(),
+                IpAddr::V4(Ipv4Addr::new(100, 64, 1, index)),
+                &format!("wg-overlay-target-{index}"),
+                vec![candidate.clone()],
+                Vec::new(),
+            );
+            runtime
+                .record_resolved_overlay_path(
+                    bounded_overlay_path(
+                        local_node.clone(),
+                        target.clone(),
+                        IpAddr::V4(Ipv4Addr::new(100, 64, 1, index)),
+                        7,
+                    ),
+                    observed_at + ChronoDuration::milliseconds(i64::from(index)),
+                )
+                .await?;
+            runtime
+                .upsert_overlay_forwarder_endpoint(target.node_id.clone(), overlay_endpoint)
+                .await;
+            runtime
+                .upsert_path_state(PathRecord {
+                    key: PeerPathKey::new(local_node.clone(), target.node_id.clone()),
+                    selected_state: PathState::DirectPublic,
+                    selected_candidate: Some(candidate),
+                    relay_node: None,
+                    score: PathScore::calculate(
+                        PathState::DirectPublic,
+                        &PathMetrics::default(),
+                        true,
+                        0,
+                    ),
+                    updated_at: observed_at,
+                    pinned: false,
+                })
+                .await?;
+            targets.push((index, target, overlay_endpoint, direct_endpoint));
+        }
+
+        assert_eq!(runtime.resolved_overlay_peers().await.len(), 12);
+        let initial_shortcuts = runtime.overlay_shortcut_snapshot().await;
+        assert_eq!(initial_shortcuts.direct_shortcut_targets().len(), 4);
+        assert!(initial_shortcuts.is_direct_shortcut(&targets[8].1.node_id));
+        assert!(Arc::ptr_eq(
+            &initial_shortcuts,
+            &runtime.overlay_shortcut_snapshot().await
+        ));
+        runtime
+            .record_peer_activity(
+                targets[0].1.node_id.clone(),
+                observed_at + ChronoDuration::seconds(1),
+                false,
+            )
+            .await;
+        runtime
+            .remove_overlay_forwarder_endpoint(&targets[1].1.node_id)
+            .await;
+        let current_shortcuts = runtime.overlay_shortcut_snapshot().await;
+        assert!(!Arc::ptr_eq(&initial_shortcuts, &current_shortcuts));
+        assert!(current_shortcuts.is_direct_shortcut(&targets[0].1.node_id));
+        assert!(current_shortcuts.requires_overlay_forwarder(&targets[8].1.node_id));
+        assert!(runtime
+            .path_record_for_peer(&targets[8].1.node_id)
+            .await
+            .is_some_and(|path| path.selected_state.is_direct()));
+        let resolver = RuntimePeerEndpointResolver::new(runtime);
+        resolver.prepare_for_peer_map().await?;
+        for (index, target, overlay_endpoint, direct_endpoint) in targets {
+            let expected = if index == 2 {
+                None
+            } else if index == 1 || index > 9 {
+                Some(direct_endpoint.to_string())
+            } else {
+                Some(overlay_endpoint.to_string())
+            };
+            assert_eq!(resolver.endpoint_for_peer(&target).await?, expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_overlay_neighbor_map_rejects_management_plane_rollback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let generated_at = Utc::now();
+        let mut accepted = bounded_neighbor_map(local_node.clone(), Vec::new(), 7);
+        accepted.generated_at = generated_at;
+        runtime
+            .record_neighbor_map_snapshot(accepted.clone())
+            .await?;
+
+        let mut older = bounded_neighbor_map(local_node.clone(), Vec::new(), 6);
+        older.generated_at = generated_at - ChronoDuration::seconds(1);
+        let error = match runtime.record_neighbor_map_snapshot(older).await {
+            Ok(()) => panic!("older neighbor map must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AgentError::InvalidState(message) if message.contains("older")));
+        assert_eq!(
+            runtime.neighbor_map_snapshot().await,
+            Some(accepted.clone())
+        );
+
+        let mut conflicting = bounded_neighbor_map(local_node.clone(), Vec::new(), 8);
+        conflicting.generated_at = generated_at;
+        let error = match runtime.record_neighbor_map_snapshot(conflicting).await {
+            Ok(()) => panic!("same-time conflicting neighbor map must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, AgentError::InvalidState(message) if message.contains("conflicts"))
+        );
+        assert_eq!(runtime.neighbor_map_snapshot().await, Some(accepted));
+
+        let mut newer = bounded_neighbor_map(local_node, Vec::new(), 8);
+        newer.generated_at = generated_at + ChronoDuration::seconds(1);
+        runtime.record_neighbor_map_snapshot(newer.clone()).await?;
+        assert_eq!(runtime.neighbor_map_snapshot().await, Some(newer));
         Ok(())
     }
 

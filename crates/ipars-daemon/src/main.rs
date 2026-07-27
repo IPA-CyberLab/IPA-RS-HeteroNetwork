@@ -26,7 +26,7 @@ use hickory_proto::op::{Message as DnsMessage, MessageType, OpCode, ResponseCode
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use ipars_agent::overlay_forwarder::{BoundedOverlayForwarder, OverlayForwarderConfig};
 use ipars_agent::overlay_transit::{
-    OverlayNeighborEndpoint, OverlayNeighborEndpointDirectory, OverlayTransit,
+    OverlayDelivery, OverlayNeighborEndpoint, OverlayNeighborEndpointDirectory, OverlayTransit,
     OverlayTransitClient, OverlayWireGuardPeerForwarder, OverlayWireGuardPeerForwarderConfig,
 };
 use ipars_agent::{
@@ -147,6 +147,7 @@ const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_STUN_SERVERS: usize = MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND;
 const MAX_PENDING_OVERLAY_PATH_RESOLUTIONS_PER_ROUND: usize = 64;
+const MAX_CONCURRENT_OVERLAY_PATH_RESOLUTIONS: usize = 16;
 const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
     "udp://stun.cloudflare.com:3478",
     "udp://stun.cloudflare.com:53",
@@ -208,7 +209,10 @@ const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_OVERLAY_TRANSIT_PORT: u16 = 51_822;
 const OVERLAY_TRANSIT_DELIVERY_QUEUE_CAPACITY: usize = 1_024;
+const OVERLAY_PEER_DELIVERY_QUEUE_CAPACITY: usize = 256;
 const OVERLAY_TRANSIT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const OVERLAY_PREVIOUS_TOPOLOGY_GRACE: Duration = Duration::from_secs(120);
+const OVERLAY_PATH_RESOLUTION_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PEER_PROBE_SAMPLE_COUNT: u16 = 5;
 const DEFAULT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS: u64 = 500;
@@ -8678,6 +8682,11 @@ async fn run_agent(
         background_tasks.push(handle.task);
     }
     if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
+        background_tasks.push(start_overlay_path_resolution(
+            runtime.clone(),
+            http_client.clone(),
+            control_plane_bases.clone(),
+        ));
         let local_vpn_ip = runtime_local_vpn_ip(runtime.as_ref())?.0;
         let loopback_ip = match local_vpn_ip {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -12231,8 +12240,10 @@ struct BoundedOverlayTransitRuntimeConfig {
 
 struct BoundedOverlayPeerTask {
     path: OverlayPath,
+    local_endpoint: SocketAddr,
     path_tx: tokio::sync::watch::Sender<OverlayPath>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    _delivery_tx: tokio::sync::mpsc::Sender<OverlayDelivery>,
     task: tokio::task::JoinHandle<
         Result<(), ipars_agent::overlay_transit::OverlayWireGuardPeerForwarderError>,
     >,
@@ -12256,19 +12267,31 @@ impl BoundedOverlayPeerTask {
     }
 }
 
+#[derive(Clone)]
+struct PreviousBoundedOverlayEndpoints {
+    records: Vec<OverlayNeighborEndpoint>,
+    expires_at: Instant,
+}
+
 struct ActiveBoundedOverlayTransit {
-    _transit: OverlayTransit,
+    transit: OverlayTransit,
     client: OverlayTransitClient,
     endpoints: OverlayNeighborEndpointDirectory,
     neighbor_map: NeighborMap,
-    injection_endpoint: SocketAddr,
+    previous_endpoints: Option<PreviousBoundedOverlayEndpoints>,
+    topology_grace_expires_at: Option<Instant>,
+    delivery_routes:
+        Arc<tokio::sync::RwLock<BTreeMap<NodeId, tokio::sync::mpsc::Sender<OverlayDelivery>>>>,
     delivery_task: tokio::task::JoinHandle<()>,
     peer_tasks: BTreeMap<NodeId, BoundedOverlayPeerTask>,
 }
 
 impl ActiveBoundedOverlayTransit {
+    fn is_finished(&self) -> bool {
+        self.transit.is_finished() || self.delivery_task.is_finished()
+    }
+
     async fn start(
-        runtime: Arc<AgentRuntime>,
         config: &BoundedOverlayTransitRuntimeConfig,
         neighbor_map: NeighborMap,
     ) -> anyhow::Result<Self> {
@@ -12280,14 +12303,6 @@ impl ActiveBoundedOverlayTransit {
             config.namespace.as_ref(),
             "transit",
         )?;
-        let injection_socket = Arc::new(bind_bounded_overlay_udp_socket(
-            SocketAddr::new(config.loopback_ip, 0),
-            config.namespace.as_ref(),
-            "injection",
-        )?);
-        let injection_endpoint = injection_socket
-            .local_addr()
-            .context("failed to read bounded overlay injection endpoint")?;
         let endpoints =
             bounded_overlay_neighbor_endpoints(&neighbor_map, config.transit_bind.port())?;
         let forwarder = BoundedOverlayForwarder::new(
@@ -12305,9 +12320,9 @@ impl ActiveBoundedOverlayTransit {
         .context("failed to start bounded overlay transit")?;
         let client = transit.client();
         let deliveries = transit.take_delivery_receiver();
+        let delivery_routes = Arc::new(tokio::sync::RwLock::new(BTreeMap::new()));
         let delivery_task = tokio::spawn(run_bounded_overlay_delivery_loop(
-            runtime,
-            injection_socket,
+            Arc::clone(&delivery_routes),
             deliveries,
         ));
         tracing::info!(
@@ -12315,15 +12330,16 @@ impl ActiveBoundedOverlayTransit {
             topology_epoch = neighbor_map.topology_epoch,
             neighbors = neighbor_map.neighbors.len(),
             transit = %config.transit_bind,
-            injection = %injection_endpoint,
             "started bounded overlay UDP transit"
         );
         Ok(Self {
-            _transit: transit,
+            transit,
             client,
             endpoints,
             neighbor_map,
-            injection_endpoint,
+            previous_endpoints: None,
+            topology_grace_expires_at: None,
+            delivery_routes,
             delivery_task,
             peer_tasks: BTreeMap::new(),
         })
@@ -12335,21 +12351,56 @@ impl ActiveBoundedOverlayTransit {
         config: &BoundedOverlayTransitRuntimeConfig,
         neighbor_map: NeighborMap,
     ) -> anyhow::Result<()> {
-        if self.neighbor_map != neighbor_map {
-            self.endpoints
-                .replace(bounded_overlay_neighbor_endpoint_records(
-                    &neighbor_map,
-                    config.transit_bind.port(),
-                )?)?;
-            self.client
-                .update_neighbor_map(neighbor_map.clone())
-                .await?;
-            tracing::info!(
-                topology_epoch = neighbor_map.topology_epoch,
-                neighbors = neighbor_map.neighbors.len(),
-                "updated bounded overlay topology"
+        let map_changed = self.neighbor_map != neighbor_map;
+        let topology_changed = self.neighbor_map.topology_epoch != neighbor_map.topology_epoch;
+        let previous_expired = self
+            .previous_endpoints
+            .as_ref()
+            .is_some_and(|previous| Instant::now() >= previous.expires_at);
+        if map_changed || previous_expired {
+            let previous_endpoints = if topology_changed {
+                Some(PreviousBoundedOverlayEndpoints {
+                    records: bounded_overlay_neighbor_endpoint_records(
+                        &self.neighbor_map,
+                        config.transit_bind.port(),
+                    )?,
+                    expires_at: Instant::now() + OVERLAY_PREVIOUS_TOPOLOGY_GRACE,
+                })
+            } else {
+                self.previous_endpoints
+                    .clone()
+                    .filter(|previous| Instant::now() < previous.expires_at)
+            };
+            let current_records = bounded_overlay_neighbor_endpoint_records(
+                &neighbor_map,
+                config.transit_bind.port(),
+            )?;
+            let endpoint_records = bounded_overlay_endpoint_records_with_previous(
+                current_records,
+                previous_endpoints.as_ref(),
             );
-            self.neighbor_map = neighbor_map;
+            OverlayNeighborEndpointDirectory::new(endpoint_records.clone())
+                .context("invalid replacement bounded overlay endpoint directory")?;
+            if map_changed {
+                self.client
+                    .update_neighbor_map(neighbor_map.clone())
+                    .await?;
+            }
+            self.endpoints.replace(endpoint_records)?;
+            self.previous_endpoints = previous_endpoints;
+            if map_changed {
+                tracing::info!(
+                    topology_epoch = neighbor_map.topology_epoch,
+                    neighbors = neighbor_map.neighbors.len(),
+                    previous_epoch_grace = topology_changed,
+                    "updated bounded overlay topology"
+                );
+                self.neighbor_map = neighbor_map;
+            }
+            self.topology_grace_expires_at = self
+                .previous_endpoints
+                .as_ref()
+                .map(|previous| previous.expires_at);
         }
 
         let finished = self
@@ -12361,6 +12412,7 @@ impl ActiveBoundedOverlayTransit {
             self.remove_peer(runtime, &peer).await;
         }
 
+        let direct_shortcuts = runtime.overlay_direct_shortcut_targets().await;
         let mut desired = BTreeMap::new();
         for path in runtime.resolved_overlay_paths().await {
             if path.topology_epoch != self.neighbor_map.topology_epoch
@@ -12368,20 +12420,24 @@ impl ActiveBoundedOverlayTransit {
             {
                 continue;
             }
-            if runtime
-                .path_record_for_peer(&path.target.node_id)
-                .await
-                .is_some_and(|selected| selected.selected_state.is_direct())
+            if direct_shortcuts.contains(&path.target.node_id)
+                && runtime
+                    .path_record_for_peer(&path.target.node_id)
+                    .await
+                    .is_some_and(|selected| selected.selected_state.is_direct())
             {
                 continue;
             }
             desired.insert(path.target.node_id.clone(), path);
         }
 
+        let retain_previous_tasks = self
+            .topology_grace_expires_at
+            .is_some_and(|expires_at| Instant::now() < expires_at);
         let stale = self
             .peer_tasks
             .keys()
-            .filter(|peer| !desired.contains_key(*peer))
+            .filter(|peer| !desired.contains_key(*peer) && !retain_previous_tasks)
             .cloned()
             .collect::<Vec<_>>();
         for peer in stale {
@@ -12390,15 +12446,22 @@ impl ActiveBoundedOverlayTransit {
 
         for (peer, path) in desired {
             let restart = match self.peer_tasks.get_mut(&peer) {
-                Some(task) if task.path == path => false,
-                Some(task) => {
-                    if task.path_tx.send(path.clone()).is_ok() {
-                        task.path = path.clone();
-                        false
-                    } else {
-                        true
-                    }
+                Some(task) if task.path == path => {
+                    runtime
+                        .upsert_overlay_forwarder_endpoint(peer.clone(), task.local_endpoint)
+                        .await;
+                    false
                 }
+                Some(task) => match task.path_tx.send(path.clone()) {
+                    Ok(()) => {
+                        task.path = path.clone();
+                        runtime
+                            .upsert_overlay_forwarder_endpoint(peer.clone(), task.local_endpoint)
+                            .await;
+                        false
+                    }
+                    Err(_) => true,
+                },
                 None => true,
             };
             if restart {
@@ -12430,29 +12493,40 @@ impl ActiveBoundedOverlayTransit {
         let local_endpoint = socket
             .local_addr()
             .context("failed to read bounded overlay peer proxy endpoint")?;
-        let path_id =
-            bounded_overlay_path_id(&path.source, &path.target.node_id, path.topology_epoch);
+        let path_id = bounded_overlay_path_id(
+            &path.source,
+            &path.target.node_id,
+            path.topology_epoch,
+            OsRng.next_u64(),
+        );
         let initial_sequence = OsRng.next_u64().min(u64::MAX - 2);
         let (path_tx, path_rx) = tokio::sync::watch::channel(path.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (delivery_tx, delivery_rx) =
+            tokio::sync::mpsc::channel(OVERLAY_PEER_DELIVERY_QUEUE_CAPACITY);
         let proxy = OverlayWireGuardPeerForwarder::new(
             self.client.clone(),
             OverlayWireGuardPeerForwarderConfig {
                 wireguard_endpoint: config.wireguard_endpoint,
-                injection_endpoint: self.injection_endpoint,
                 path_id,
                 initial_sequence,
             },
             path_rx,
         )
         .context("failed to initialize bounded overlay peer proxy")?;
-        let task = tokio::spawn(proxy.serve(socket, shutdown_rx));
+        let task = tokio::spawn(proxy.serve(socket, delivery_rx, shutdown_rx));
+        self.delivery_routes
+            .write()
+            .await
+            .insert(peer.clone(), delivery_tx.clone());
         self.peer_tasks.insert(
             peer.clone(),
             BoundedOverlayPeerTask {
                 path,
+                local_endpoint,
                 path_tx,
                 shutdown_tx,
+                _delivery_tx: delivery_tx,
                 task,
             },
         );
@@ -12469,6 +12543,7 @@ impl ActiveBoundedOverlayTransit {
     }
 
     async fn remove_peer(&mut self, runtime: &AgentRuntime, peer: &NodeId) {
+        self.delivery_routes.write().await.remove(peer);
         runtime.remove_overlay_forwarder_endpoint(peer).await;
         let Some(task) = self.peer_tasks.remove(peer) else {
             return;
@@ -12476,6 +12551,14 @@ impl ActiveBoundedOverlayTransit {
         if let Err(error) = task.stop().await {
             tracing::warn!(%error, %peer, "failed to stop bounded overlay peer proxy");
         }
+    }
+
+    async fn stop(&mut self, runtime: &AgentRuntime) {
+        let peers = self.peer_tasks.keys().cloned().collect::<Vec<_>>();
+        for peer in peers {
+            self.remove_peer(runtime, &peer).await;
+        }
+        self.delivery_task.abort();
     }
 }
 
@@ -12496,6 +12579,15 @@ fn start_bounded_overlay_transit(
     tokio::spawn(async move {
         let mut active: Option<ActiveBoundedOverlayTransit> = None;
         loop {
+            if active
+                .as_ref()
+                .is_some_and(ActiveBoundedOverlayTransit::is_finished)
+            {
+                tracing::warn!("bounded overlay transit pipeline stopped; restarting");
+                if let Some(mut stopped) = active.take() {
+                    stopped.stop(runtime.as_ref()).await;
+                }
+            }
             if let Some(neighbor_map) = runtime.neighbor_map_snapshot().await {
                 match active.as_mut() {
                     Some(transit) => {
@@ -12509,22 +12601,14 @@ fn start_bounded_overlay_transit(
                             );
                         }
                     }
-                    None => {
-                        match ActiveBoundedOverlayTransit::start(
-                            runtime.clone(),
-                            &config,
-                            neighbor_map,
-                        )
-                        .await
-                        {
-                            Ok(transit) => active = Some(transit),
-                            Err(error) => tracing::warn!(
-                                %error,
-                                bind = %config.transit_bind,
-                                "failed to start bounded overlay transit; will retry"
-                            ),
-                        }
-                    }
+                    None => match ActiveBoundedOverlayTransit::start(&config, neighbor_map).await {
+                        Ok(transit) => active = Some(transit),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            bind = %config.transit_bind,
+                            "failed to start bounded overlay transit; will retry"
+                        ),
+                    },
                 }
             }
             tokio::time::sleep(OVERLAY_TRANSIT_RECONCILE_INTERVAL).await;
@@ -12559,10 +12643,37 @@ fn bounded_overlay_neighbor_endpoint_records(
         .collect())
 }
 
+fn bounded_overlay_endpoint_records_with_previous(
+    current: Vec<OverlayNeighborEndpoint>,
+    previous: Option<&PreviousBoundedOverlayEndpoints>,
+) -> Vec<OverlayNeighborEndpoint> {
+    let mut node_ids = current
+        .iter()
+        .map(|record| record.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut endpoints = current
+        .iter()
+        .map(|record| record.udp_endpoint)
+        .collect::<BTreeSet<_>>();
+    let mut combined = current;
+    if let Some(previous) = previous {
+        combined.extend(previous.records.iter().filter_map(|record| {
+            if node_ids.contains(&record.node_id) || endpoints.contains(&record.udp_endpoint) {
+                return None;
+            }
+            node_ids.insert(record.node_id.clone());
+            endpoints.insert(record.udp_endpoint);
+            Some(record.clone())
+        }));
+    }
+    combined
+}
+
 fn bounded_overlay_path_id(
     source: &NodeId,
     target: &NodeId,
     topology_epoch: u64,
+    session_nonce: u64,
 ) -> [u8; ipars_relay::multihop::MULTIHOP_PATH_ID_BYTES] {
     let mut digest = Sha256::new();
     digest.update(b"HeteroNetwork bounded overlay path v1\0");
@@ -12571,6 +12682,7 @@ fn bounded_overlay_path_id(
     digest.update(target.as_str().as_bytes());
     digest.update([0]);
     digest.update(topology_epoch.to_be_bytes());
+    digest.update(session_nonce.to_be_bytes());
     let digest = digest.finalize();
     let mut path_id = [0_u8; ipars_relay::multihop::MULTIHOP_PATH_ID_BYTES];
     path_id.copy_from_slice(&digest[..ipars_relay::multihop::MULTIHOP_PATH_ID_BYTES]);
@@ -12597,31 +12709,35 @@ fn bind_bounded_overlay_udp_socket(
 }
 
 async fn run_bounded_overlay_delivery_loop(
-    runtime: Arc<AgentRuntime>,
-    injection_socket: Arc<tokio::net::UdpSocket>,
-    mut deliveries: tokio::sync::mpsc::Receiver<ipars_agent::overlay_transit::OverlayDelivery>,
+    delivery_routes: Arc<
+        tokio::sync::RwLock<BTreeMap<NodeId, tokio::sync::mpsc::Sender<OverlayDelivery>>>,
+    >,
+    mut deliveries: tokio::sync::mpsc::Receiver<OverlayDelivery>,
 ) {
     while let Some(delivery) = deliveries.recv().await {
-        let Some(endpoint) = runtime.overlay_forwarder_endpoint(&delivery.source).await else {
+        let source = delivery.source.clone();
+        let sender = delivery_routes.read().await.get(&source).cloned();
+        let Some(sender) = sender else {
             tracing::debug!(
-                source = %delivery.source,
+                %source,
                 "dropped bounded overlay delivery without a reverse peer proxy"
             );
             continue;
         };
-        match injection_socket.send_to(&delivery.payload, endpoint).await {
-            Ok(sent) if sent == delivery.payload.len() => {}
-            Ok(sent) => tracing::warn!(
-                source = %delivery.source,
-                expected_bytes = delivery.payload.len(),
-                sent_bytes = sent,
-                "short bounded overlay delivery injection"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                source = %delivery.source,
-                "failed to inject bounded overlay delivery"
-            ),
+        match sender.try_send(delivery) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    %source,
+                    "bounded overlay peer delivery queue is full"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    %source,
+                    "bounded overlay peer delivery queue is closed"
+                );
+            }
         }
     }
 }
@@ -14788,12 +14904,11 @@ async fn run_signal_path_negotiation_loop(
 async fn negotiate_signal_paths(
     client: &reqwest::Client,
     runtime: &AgentRuntime,
-    control_plane_urls: &[String],
+    _control_plane_urls: &[String],
     signal_urls: &[String],
     hole_puncher: &UdpHolePuncher,
     options: &SignalPathNegotiationOptions,
 ) -> anyhow::Result<()> {
-    resolve_pending_overlay_paths(client, runtime, control_plane_urls).await;
     runtime
         .refresh_candidate_observations(chrono::Utc::now())
         .await;
@@ -15502,6 +15617,8 @@ async fn signal_negotiation_peer_set(
     runtime: &AgentRuntime,
     peer_map: PeerMap,
 ) -> SignalNegotiationPeerSet {
+    let resolved_overlay_peers = runtime.resolved_overlay_peer_ids().await;
+    let direct_shortcut_targets = runtime.overlay_direct_shortcut_targets().await;
     let mut skipped = runtime
         .take_idle_peers_to_close(chrono::Utc::now())
         .await
@@ -15512,7 +15629,10 @@ async fn signal_negotiation_peer_set(
         .await;
     let mut active = Vec::new();
     for peer in peer_map.peers {
-        if runtime.should_connect_peer(&peer).await {
+        if runtime.should_connect_peer(&peer).await
+            && (!resolved_overlay_peers.contains(&peer.node_id)
+                || direct_shortcut_targets.contains(&peer.node_id))
+        {
             active.push(peer);
         } else {
             skipped.insert(peer.node_id);
@@ -19331,15 +19451,26 @@ async fn resolve_pending_overlay_paths(
             return;
         }
     };
-    for destination in destinations {
-        match fetch_overlay_path_from_control_planes(
-            client,
-            control_plane_urls,
-            &identity,
-            destination,
-        )
-        .await
-        {
+    let resolutions = stream::iter(destinations.into_iter().map(|destination| {
+        let identity = &identity;
+        async move {
+            (
+                destination,
+                fetch_overlay_path_from_control_planes(
+                    client,
+                    control_plane_urls,
+                    identity,
+                    destination,
+                )
+                .await,
+            )
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_OVERLAY_PATH_RESOLUTIONS)
+    .collect::<Vec<_>>()
+    .await;
+    for (destination, resolution) in resolutions {
+        match resolution {
             Ok(path) => {
                 if let Err(error) = runtime
                     .record_resolved_overlay_path(path, chrono::Utc::now())
@@ -19362,6 +19493,30 @@ async fn resolve_pending_overlay_paths(
             }
         }
     }
+}
+
+fn start_overlay_path_resolution(
+    runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
+    control_plane_urls: Vec<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let active_control_plane_urls =
+                runtime_control_plane_urls(runtime.as_ref(), &control_plane_urls).unwrap_or_else(
+                    |error| {
+                        tracing::warn!(
+                            %error,
+                            "failed to resolve current control-plane directory for overlay paths"
+                        );
+                        control_plane_urls.clone()
+                    },
+                );
+            resolve_pending_overlay_paths(&client, runtime.as_ref(), &active_control_plane_urls)
+                .await;
+            tokio::time::sleep(OVERLAY_PATH_RESOLUTION_INTERVAL).await;
+        }
+    })
 }
 
 fn neighbor_map_url(control_plane_url: &str) -> String {
@@ -34204,9 +34359,9 @@ exec sleep 60
                 node_id: local.node_id.clone(),
                 topology_epoch: 7,
                 max_degree: 4,
-                vpn_cidr: "127.0.0.0/8"
-                    .parse()
-                    .expect("static loopback test CIDR must parse"),
+                vpn_cidr: "127.0.0.0/8".parse().unwrap_or_else(|error| {
+                    panic!("static loopback test CIDR must parse: {error}")
+                }),
                 neighbors: neighbors
                     .iter()
                     .cloned()
@@ -34291,12 +34446,9 @@ exec sleep 60
         let config_a = config(ip_a, wireguard_a.local_addr()?);
         let config_b = config(ip_b, wireguard_b.local_addr()?);
         let config_c = config(ip_c, wireguard_c.local_addr()?);
-        let mut active_a =
-            ActiveBoundedOverlayTransit::start(runtime_a.clone(), &config_a, map_a.clone()).await?;
-        let mut active_b =
-            ActiveBoundedOverlayTransit::start(runtime_b.clone(), &config_b, map_b.clone()).await?;
-        let mut active_c =
-            ActiveBoundedOverlayTransit::start(runtime_c.clone(), &config_c, map_c.clone()).await?;
+        let mut active_a = ActiveBoundedOverlayTransit::start(&config_a, map_a.clone()).await?;
+        let mut active_b = ActiveBoundedOverlayTransit::start(&config_b, map_b.clone()).await?;
+        let mut active_c = ActiveBoundedOverlayTransit::start(&config_c, map_c.clone()).await?;
         active_a
             .reconcile(runtime_a.as_ref(), &config_a, map_a)
             .await?;
@@ -34333,6 +34485,40 @@ exec sleep 60
             tokio::time::timeout(Duration::from_secs(2), wireguard_a.recv_from(&mut received))
                 .await??;
         assert_eq!(&received[..length], &response);
+
+        let mut map_a_next = overlay_map(&node_a, std::slice::from_ref(&node_b));
+        map_a_next.topology_epoch = 8;
+        map_a_next.generated_at = Utc::now() + chrono::Duration::seconds(1);
+        runtime_a
+            .record_neighbor_map_snapshot(map_a_next.clone())
+            .await?;
+        active_a
+            .reconcile(runtime_a.as_ref(), &config_a, map_a_next.clone())
+            .await?;
+        assert!(active_a.peer_tasks.contains_key(&node_c.node_id));
+        assert!(active_a
+            .delivery_routes
+            .read()
+            .await
+            .contains_key(&node_c.node_id));
+        assert_eq!(
+            runtime_a.overlay_forwarder_endpoint(&node_c.node_id).await,
+            None
+        );
+
+        let mut path_a_next = overlay_path(&node_a, &node_b, &node_c);
+        path_a_next.topology_epoch = 8;
+        path_a_next.generated_at = map_a_next.generated_at;
+        runtime_a
+            .record_resolved_overlay_path(path_a_next, Utc::now())
+            .await?;
+        active_a
+            .reconcile(runtime_a.as_ref(), &config_a, map_a_next)
+            .await?;
+        assert_eq!(
+            runtime_a.overlay_forwarder_endpoint(&node_c.node_id).await,
+            Some(proxy_a)
+        );
 
         drop(active_a);
         drop(active_b);

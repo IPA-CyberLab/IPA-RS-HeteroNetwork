@@ -75,7 +75,7 @@ fn neighbor_map(index: usize, topology_epoch: u64) -> NeighborMap {
         max_degree: 4,
         vpn_cidr: "10.250.0.0/16"
             .parse()
-            .expect("static scale-test VPN CIDR must parse"),
+            .unwrap_or_else(|error| panic!("static scale-test VPN CIDR must parse: {error}")),
         neighbors: neighbor_indices(index)
             .into_iter()
             .map(|(neighbor, kind)| OverlayNeighbor {

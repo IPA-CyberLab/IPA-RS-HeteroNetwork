@@ -201,11 +201,33 @@ Until a direct path is verified, a per-peer loopback proxy encapsulates the
 unchanged inner WireGuard UDP datagram in a multi-hop envelope. Intermediate
 backbone peers forward that opaque WireGuard ciphertext without terminating
 the inner tunnel. Each hop validates the topology epoch, expected route
-position and hop bound, authenticated neighbor source, and replay sequence. A
-missing end-to-end acknowledgement within the bounded timeout retries the
-edge- or vertex-disjoint secondary route. Once WireGuard telemetry confirms a
-direct path, the Agent removes the proxy endpoint and promotes the peer to that
-direct endpoint.
+position and hop bound, authenticated neighbor source, and a fixed 1,024-packet
+sliding replay window. Topology epochs are opaque content identifiers rather
+than ordered counters. The current graph and one previous graph overlap for a
+120-second inbound grace, while `generated_at` rejects management-plane rollback
+and outbound traffic always uses the current graph. Replay state is isolated by
+epoch, and each proxy restart uses a fresh random path session ID. The
+destination acknowledges only after the peer-specific proxy socket sends the
+complete datagram to the local WireGuard UDP endpoint. A missing end-to-end
+acknowledgement within the bounded timeout retries the edge- or
+vertex-disjoint secondary route.
+
+Primary failures are shared by topology epoch and physical representative
+next-hop rather than by logical destination. At most 16 primary attempts can
+wait for acknowledgement through one representative concurrently; a failure
+suppresses that representative for five seconds so all affected destinations
+use their working alternates immediately.
+
+Resolved logical overlay paths are retained independently of direct
+connections. The default policy permits four LRU direct shortcuts while all
+other active peers remain reachable through their loopback overlay proxies.
+Path resolution runs in its own Control Plane failover loop and therefore does
+not depend on Signal or direct-path negotiation being enabled. Its bounded
+deduplicating FIFO retries failed destinations at the tail and resolves up to
+16 requests concurrently, so permanently rejected destinations cannot starve
+the rest of a 1,000-node cluster. Once WireGuard telemetry confirms a direct
+path, the Agent removes that peer's proxy endpoint and promotes it to the
+verified direct endpoint.
 
 ACL-visible idle peers are represented by passive WireGuard peer entries with
 their overlay `/32` AllowedIP and host route, a loopback discard hold endpoint,

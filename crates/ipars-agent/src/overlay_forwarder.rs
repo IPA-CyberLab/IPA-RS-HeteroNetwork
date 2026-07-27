@@ -6,6 +6,7 @@
 //! of a multi-hop path without distributing the full overlay graph to each node.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use ipars_relay::multihop::{
     MultiHopCodecError, MultiHopEnvelope, MAX_MULTIHOP_FRAME_BYTES, MAX_MULTIHOP_PATH_NODES,
@@ -16,6 +17,20 @@ use thiserror::Error;
 
 pub const DEFAULT_OVERLAY_REPLAY_CACHE_CAPACITY: usize = 4_096;
 pub const MAX_OVERLAY_REPLAY_CACHE_CAPACITY: usize = 65_536;
+
+// A peer proxy permits 256 concurrent datagrams and reserves one sequence for
+// each primary and secondary attempt before those sends complete. The bitmap
+// therefore covers twice the maximum 512-sequence in-flight span.
+const OVERLAY_PEER_MAX_IN_FLIGHT_DATAGRAMS: usize = 256;
+const OVERLAY_SEQUENCE_RESERVATIONS_PER_DATAGRAM: usize = 2;
+const OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS: usize =
+    OVERLAY_PEER_MAX_IN_FLIGHT_DATAGRAMS * OVERLAY_SEQUENCE_RESERVATIONS_PER_DATAGRAM * 2;
+const OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS: usize =
+    OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS / u64::BITS as usize;
+
+// One prior graph is enough for an in-flight frame to cross an asynchronous
+// neighbor-map update while keeping both time and retained topology bounded.
+const PREVIOUS_TOPOLOGY_EPOCH_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayForwarderConfig {
@@ -90,11 +105,6 @@ pub enum OverlayForwarderError {
     },
     #[error("neighbor map topology epoch must be non-zero")]
     ZeroTopologyEpoch,
-    #[error("neighbor map topology epoch rolled back from {current_epoch} to {received_epoch}")]
-    NeighborMapEpochRollback {
-        current_epoch: u64,
-        received_epoch: u64,
-    },
     #[error("neighbor map cluster changed from {current_cluster} to {received_cluster}")]
     NeighborMapClusterChanged {
         current_cluster: String,
@@ -151,7 +161,7 @@ pub enum OverlayForwarderError {
     #[error("required next hop {0} is not in the local neighbor map")]
     NextHopNotNeighbor(NodeId),
     #[error(
-        "replayed or non-monotonic frame from {source_node}: sequence {sequence} is not above {highest}"
+        "replayed or out-of-window frame from {source_node}: sequence {sequence}, highest {highest}"
     )]
     ReplayRejected {
         source_node: NodeId,
@@ -162,11 +172,18 @@ pub enum OverlayForwarderError {
     Codec(#[from] MultiHopCodecError),
 }
 
-/// Stateful forwarding engine for one local node and one topology epoch.
+struct PreviousNeighborMap {
+    neighbor_map: NeighborMap,
+    neighbor_ids: BTreeSet<NodeId>,
+    expires_at: Instant,
+}
+
+/// Stateful forwarding engine for one local node and a bounded epoch overlap.
 pub struct BoundedOverlayForwarder {
     local_node: NodeId,
     neighbor_map: NeighborMap,
     neighbor_ids: BTreeSet<NodeId>,
+    previous_neighbor_map: Option<PreviousNeighborMap>,
     config: OverlayForwarderConfig,
     replay_window: ReplayWindow,
 }
@@ -184,6 +201,7 @@ impl BoundedOverlayForwarder {
             local_node,
             neighbor_map,
             neighbor_ids,
+            previous_neighbor_map: None,
             config,
             replay_window,
         })
@@ -201,8 +219,10 @@ impl BoundedOverlayForwarder {
         self.replay_window.len()
     }
 
-    /// Atomically replace the local map. Epoch rollback and cluster changes are
-    /// rejected; advancing the epoch clears replay state scoped to the old map.
+    /// Replace the current local map. Topology epochs are opaque content
+    /// identifiers, so a changed map retains exactly one prior graph for a
+    /// short inbound-only migration grace. Outbound traffic always uses the
+    /// current map.
     pub fn update_neighbor_map(
         &mut self,
         neighbor_map: NeighborMap,
@@ -214,17 +234,22 @@ impl BoundedOverlayForwarder {
                 received_cluster: neighbor_map.cluster_id.to_string(),
             });
         }
-        if neighbor_map.topology_epoch < self.neighbor_map.topology_epoch {
-            return Err(OverlayForwarderError::NeighborMapEpochRollback {
-                current_epoch: self.neighbor_map.topology_epoch,
-                received_epoch: neighbor_map.topology_epoch,
+        if neighbor_map.topology_epoch != self.neighbor_map.topology_epoch {
+            let previous_neighbor_map = std::mem::replace(&mut self.neighbor_map, neighbor_map);
+            let previous_neighbor_ids = std::mem::replace(&mut self.neighbor_ids, neighbor_ids);
+            let previous_epoch = previous_neighbor_map.topology_epoch;
+            self.previous_neighbor_map = Some(PreviousNeighborMap {
+                neighbor_map: previous_neighbor_map,
+                neighbor_ids: previous_neighbor_ids,
+                expires_at: Instant::now() + PREVIOUS_TOPOLOGY_EPOCH_GRACE,
             });
-        }
-        if neighbor_map.topology_epoch > self.neighbor_map.topology_epoch {
-            self.replay_window.clear();
+            self.replay_window
+                .retain_epochs(self.neighbor_map.topology_epoch, Some(previous_epoch));
+            return Ok(());
         }
         self.neighbor_map = neighbor_map;
         self.neighbor_ids = neighbor_ids;
+        self.expire_previous_neighbor_map();
         Ok(())
     }
 
@@ -265,11 +290,15 @@ impl BoundedOverlayForwarder {
             .get(1)
             .cloned()
             .ok_or_else(|| OverlayForwarderError::PathTargetsSource(self.local_node.clone()))?;
-        self.require_next_neighbor(&next_hop)?;
+        self.require_next_neighbor(&next_hop, self.neighbor_map.topology_epoch)?;
 
         if ordered_nodes.len() == 2 {
-            self.replay_window
-                .observe(&self.local_node, path_id, sequence)?;
+            self.replay_window.observe(
+                self.neighbor_map.topology_epoch,
+                &self.local_node,
+                path_id,
+                sequence,
+            )?;
             return Ok(OverlayForwardAction::DirectNeighbor {
                 peer: next_hop,
                 datagram: inner_wireguard_datagram,
@@ -291,8 +320,12 @@ impl BoundedOverlayForwarder {
         )?;
         let datagram = envelope.encode()?;
         self.validate_frame_size(datagram.len())?;
-        self.replay_window
-            .observe(&self.local_node, path_id, sequence)?;
+        self.replay_window.observe(
+            self.neighbor_map.topology_epoch,
+            &self.local_node,
+            path_id,
+            sequence,
+        )?;
         Ok(OverlayForwardAction::Forward { next_hop, datagram })
     }
 
@@ -304,11 +337,12 @@ impl BoundedOverlayForwarder {
     ) -> Result<OverlayForwardAction, OverlayForwarderError> {
         self.validate_frame_size(datagram.len())?;
         let mut envelope = MultiHopEnvelope::decode(datagram, 1)?;
-        self.validate_topology_epoch(envelope.topology_epoch())?;
+        let topology_epoch = envelope.topology_epoch();
+        self.validate_inbound_topology_epoch(topology_epoch)?;
         self.validate_envelope_hop_limit(&envelope)?;
 
         if envelope.is_route_complete() {
-            return self.deliver(previous_hop, envelope);
+            return self.deliver(previous_hop, envelope, topology_epoch);
         }
 
         let expected_local = envelope
@@ -332,21 +366,22 @@ impl BoundedOverlayForwarder {
                 .cloned()
                 .ok_or(MultiHopCodecError::UnexpectedHop)?
         };
-        self.validate_previous_hop(previous_hop, &expected_previous)?;
+        self.validate_previous_hop(previous_hop, &expected_previous, topology_epoch)?;
 
-        envelope.advance_hop(&self.local_node, self.neighbor_map.topology_epoch)?;
+        envelope.advance_hop(&self.local_node, topology_epoch)?;
         let next_hop = envelope
             .next_hop()
             .cloned()
             .unwrap_or_else(|| envelope.destination().clone());
-        self.require_next_neighbor(&next_hop)?;
+        self.require_next_neighbor(&next_hop, topology_epoch)?;
 
         let source = envelope.source().clone();
         let path_id = *envelope.path_id();
         let sequence = envelope.sequence();
         let forwarded = envelope.encode()?;
         self.validate_frame_size(forwarded.len())?;
-        self.replay_window.observe(&source, path_id, sequence)?;
+        self.replay_window
+            .observe(topology_epoch, &source, path_id, sequence)?;
         Ok(OverlayForwardAction::Forward {
             next_hop,
             datagram: forwarded,
@@ -357,6 +392,7 @@ impl BoundedOverlayForwarder {
         &mut self,
         previous_hop: &NodeId,
         envelope: MultiHopEnvelope,
+        topology_epoch: u64,
     ) -> Result<OverlayForwardAction, OverlayForwarderError> {
         if envelope.destination() != &self.local_node {
             return Err(OverlayForwarderError::UnexpectedDestination {
@@ -369,13 +405,14 @@ impl BoundedOverlayForwarder {
             .last()
             .cloned()
             .ok_or(MultiHopCodecError::InvalidPath)?;
-        self.validate_previous_hop(previous_hop, &expected_previous)?;
+        self.validate_previous_hop(previous_hop, &expected_previous, topology_epoch)?;
 
         let source = envelope.source().clone();
         let path_id = *envelope.path_id();
         let sequence = envelope.sequence();
         let payload = envelope.payload_for_destination(&self.local_node)?.to_vec();
-        self.replay_window.observe(&source, path_id, sequence)?;
+        self.replay_window
+            .observe(topology_epoch, &source, path_id, sequence)?;
         Ok(OverlayForwardAction::Deliver { source, payload })
     }
 
@@ -436,6 +473,39 @@ impl BoundedOverlayForwarder {
         Ok(())
     }
 
+    fn validate_inbound_topology_epoch(
+        &mut self,
+        received_epoch: u64,
+    ) -> Result<(), OverlayForwarderError> {
+        self.expire_previous_neighbor_map();
+        if self.neighbor_ids_for_epoch(received_epoch).is_some() {
+            return Ok(());
+        }
+        self.validate_topology_epoch(received_epoch)
+    }
+
+    fn expire_previous_neighbor_map(&mut self) {
+        let expired = self
+            .previous_neighbor_map
+            .as_ref()
+            .is_some_and(|previous| Instant::now() >= previous.expires_at);
+        if expired {
+            self.previous_neighbor_map = None;
+            self.replay_window
+                .retain_epochs(self.neighbor_map.topology_epoch, None);
+        }
+    }
+
+    fn neighbor_ids_for_epoch(&self, topology_epoch: u64) -> Option<&BTreeSet<NodeId>> {
+        if topology_epoch == self.neighbor_map.topology_epoch {
+            return Some(&self.neighbor_ids);
+        }
+        self.previous_neighbor_map
+            .as_ref()
+            .filter(|previous| previous.neighbor_map.topology_epoch == topology_epoch)
+            .map(|previous| &previous.neighbor_ids)
+    }
+
     fn validate_envelope_hop_limit(
         &self,
         envelope: &MultiHopEnvelope,
@@ -465,6 +535,7 @@ impl BoundedOverlayForwarder {
         &self,
         actual: &NodeId,
         expected: &NodeId,
+        topology_epoch: u64,
     ) -> Result<(), OverlayForwarderError> {
         if actual != expected {
             return Err(OverlayForwarderError::PreviousHopMismatch {
@@ -472,7 +543,10 @@ impl BoundedOverlayForwarder {
                 actual: actual.clone(),
             });
         }
-        if !self.neighbor_ids.contains(expected) {
+        if !self
+            .neighbor_ids_for_epoch(topology_epoch)
+            .is_some_and(|neighbor_ids| neighbor_ids.contains(expected))
+        {
             return Err(OverlayForwarderError::PreviousHopNotNeighbor(
                 expected.clone(),
             ));
@@ -480,8 +554,15 @@ impl BoundedOverlayForwarder {
         Ok(())
     }
 
-    fn require_next_neighbor(&self, next_hop: &NodeId) -> Result<(), OverlayForwarderError> {
-        if !self.neighbor_ids.contains(next_hop) {
+    fn require_next_neighbor(
+        &self,
+        next_hop: &NodeId,
+        topology_epoch: u64,
+    ) -> Result<(), OverlayForwarderError> {
+        if !self
+            .neighbor_ids_for_epoch(topology_epoch)
+            .is_some_and(|neighbor_ids| neighbor_ids.contains(next_hop))
+        {
             return Err(OverlayForwarderError::NextHopNotNeighbor(next_hop.clone()));
         }
         Ok(())
@@ -534,78 +615,166 @@ fn validate_neighbor_map(
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReplayPathKey {
+    topology_epoch: u64,
     source: NodeId,
     path_id: [u8; MULTIHOP_PATH_ID_BYTES],
 }
 
 struct ReplayWindow {
     capacity: usize,
-    highest_sequences: HashMap<ReplayPathKey, u64>,
+    sequences: HashMap<ReplayPathKey, ReplaySequenceWindow>,
     recency: VecDeque<(ReplayPathKey, u64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplaySequenceWindow {
+    highest: u64,
+    seen: [u64; OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS],
+}
+
+impl ReplaySequenceWindow {
+    fn new(highest: u64) -> Self {
+        let mut seen = [0; OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS];
+        seen[0] = 1;
+        Self { highest, seen }
+    }
+
+    fn advance_to(&mut self, sequence: u64) {
+        let advance = sequence - self.highest;
+        if advance >= OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS as u64 {
+            self.seen.fill(0);
+        } else {
+            self.shift_older(advance as usize);
+        }
+        self.highest = sequence;
+        self.seen[0] |= 1;
+    }
+
+    fn shift_older(&mut self, distance: usize) {
+        let previous = self.seen;
+        self.seen.fill(0);
+        let word_shift = distance / u64::BITS as usize;
+        let bit_shift = distance % u64::BITS as usize;
+
+        for (source_index, word) in previous.into_iter().enumerate() {
+            let target_index = source_index + word_shift;
+            if target_index >= self.seen.len() {
+                break;
+            }
+            self.seen[target_index] |= word << bit_shift;
+            if bit_shift > 0 && target_index + 1 < self.seen.len() {
+                self.seen[target_index + 1] |= word >> (u64::BITS as usize - bit_shift);
+            }
+        }
+    }
+
+    fn contains(&self, distance: usize) -> bool {
+        let word_index = distance / u64::BITS as usize;
+        let bit_index = distance % u64::BITS as usize;
+        self.seen[word_index] & (1_u64 << bit_index) != 0
+    }
+
+    fn insert(&mut self, distance: usize) {
+        let word_index = distance / u64::BITS as usize;
+        let bit_index = distance % u64::BITS as usize;
+        self.seen[word_index] |= 1_u64 << bit_index;
+    }
 }
 
 impl ReplayWindow {
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            highest_sequences: HashMap::with_capacity(capacity),
+            sequences: HashMap::with_capacity(capacity),
             recency: VecDeque::with_capacity(capacity),
         }
     }
 
     fn len(&self) -> usize {
-        self.highest_sequences.len()
-    }
-
-    fn clear(&mut self) {
-        self.highest_sequences.clear();
-        self.recency.clear();
+        self.sequences.len()
     }
 
     fn observe(
         &mut self,
+        topology_epoch: u64,
         source: &NodeId,
         path_id: [u8; MULTIHOP_PATH_ID_BYTES],
         sequence: u64,
     ) -> Result<(), OverlayForwarderError> {
         let key = ReplayPathKey {
+            topology_epoch,
             source: source.clone(),
             path_id,
         };
-        match self.highest_sequences.get(&key).copied() {
-            Some(highest) if sequence <= highest => {
-                return Err(OverlayForwarderError::ReplayRejected {
-                    source_node: source.clone(),
-                    sequence,
-                    highest,
-                });
+        let recency_sequence = match self.sequences.get_mut(&key) {
+            Some(window) if sequence > window.highest => {
+                window.advance_to(sequence);
+                Some(window.highest)
             }
-            _ => {}
-        }
+            Some(window) => {
+                let distance = window.highest - sequence;
+                if distance >= OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS as u64 {
+                    return Err(OverlayForwarderError::ReplayRejected {
+                        source_node: source.clone(),
+                        sequence,
+                        highest: window.highest,
+                    });
+                }
+                let distance = distance as usize;
+                if window.contains(distance) {
+                    return Err(OverlayForwarderError::ReplayRejected {
+                        source_node: source.clone(),
+                        sequence,
+                        highest: window.highest,
+                    });
+                }
+                window.insert(distance);
+                None
+            }
+            None => {
+                self.sequences
+                    .insert(key.clone(), ReplaySequenceWindow::new(sequence));
+                Some(sequence)
+            }
+        };
 
-        if self.recency.len() >= self.capacity.saturating_mul(2) {
-            self.compact_recency();
+        if let Some(recency_sequence) = recency_sequence {
+            if self.recency.len() >= self.capacity.saturating_mul(2) {
+                self.compact_recency();
+            }
+            self.recency.push_back((key, recency_sequence));
         }
-        self.highest_sequences.insert(key.clone(), sequence);
-        self.recency.push_back((key, sequence));
         self.evict_to_capacity();
         Ok(())
     }
 
+    fn retain_epochs(&mut self, current_epoch: u64, previous_epoch: Option<u64>) {
+        self.sequences.retain(|key, _| {
+            key.topology_epoch == current_epoch || previous_epoch == Some(key.topology_epoch)
+        });
+        self.compact_recency();
+    }
+
     fn evict_to_capacity(&mut self) {
-        while self.highest_sequences.len() > self.capacity {
+        while self.sequences.len() > self.capacity {
             let Some((key, observed_sequence)) = self.recency.pop_front() else {
                 break;
             };
-            if self.highest_sequences.get(&key) == Some(&observed_sequence) {
-                self.highest_sequences.remove(&key);
+            if self
+                .sequences
+                .get(&key)
+                .is_some_and(|window| window.highest == observed_sequence)
+            {
+                self.sequences.remove(&key);
             }
         }
     }
 
     fn compact_recency(&mut self) {
         self.recency.retain(|(key, observed_sequence)| {
-            self.highest_sequences.get(key) == Some(observed_sequence)
+            self.sequences
+                .get(key)
+                .is_some_and(|window| window.highest == *observed_sequence)
         });
     }
 }
@@ -615,6 +784,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::error::Error;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Instant;
 
     use chrono::Utc;
     use ipars_relay::multihop::{MultiHopCodecError, MultiHopEnvelope};
@@ -625,7 +795,9 @@ mod tests {
 
     use super::{
         BoundedOverlayForwarder, OverlayForwardAction, OverlayForwarderConfig,
-        OverlayForwarderError, OverlayPathSelection,
+        OverlayForwarderError, OverlayPathSelection, ReplaySequenceWindow, ReplayWindow,
+        OVERLAY_PEER_MAX_IN_FLIGHT_DATAGRAMS, OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS,
+        OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS, OVERLAY_SEQUENCE_RESERVATIONS_PER_DATAGRAM,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -785,7 +957,57 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_and_non_monotonic_sequences() -> TestResult {
+    fn accepts_only_the_immediately_previous_epoch_during_migration_grace() -> TestResult {
+        let path = overlay_path(&["s", "a", "d"], None, 7);
+        let path_id = [0x33; 16];
+        let mut source = engine("s", &["a"], 7)?;
+        let first = forwarded(source.encapsulate(&path, path_id, 1, vec![1])?, "a");
+        let second = forwarded(source.encapsulate(&path, path_id, 2, vec![2])?, "a");
+        let third = forwarded(source.encapsulate(&path, path_id, 3, vec![3])?, "a");
+        let mut relay = engine("a", &["s", "d"], 7)?;
+
+        let _ = relay.receive(&node("s"), &first)?;
+        relay.update_neighbor_map(neighbor_map("a", &["x", "d"], 8))?;
+
+        let current_path = overlay_path(&["x", "a", "d"], None, 8);
+        let mut current_source = engine("x", &["a"], 8)?;
+        let current = forwarded(
+            current_source.encapsulate(&current_path, path_id, 1, vec![8])?,
+            "a",
+        );
+        let _ = relay.receive(&node("x"), &current)?;
+
+        assert!(matches!(
+            relay.receive(&node("s"), &first),
+            Err(OverlayForwarderError::ReplayRejected {
+                sequence: 1,
+                highest: 1,
+                ..
+            })
+        ));
+
+        let forwarded_previous = forwarded(relay.receive(&node("s"), &second)?, "d");
+        assert_eq!(
+            MultiHopEnvelope::decode(&forwarded_previous, 7)?.topology_epoch(),
+            7
+        );
+
+        match relay.previous_neighbor_map.as_mut() {
+            Some(previous) => previous.expires_at = Instant::now(),
+            None => panic!("previous neighbor map must exist during migration grace"),
+        }
+        assert_eq!(
+            relay.receive(&node("s"), &third),
+            Err(OverlayForwarderError::StaleTopologyEpoch {
+                current_epoch: 8,
+                received_epoch: 7,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicates_but_accepts_bounded_reordering() -> TestResult {
         let path = overlay_path(&["s", "a", "d"], None, 7);
         let path_id = [4; 16];
         let mut source = engine("s", &["a"], 7)?;
@@ -809,6 +1031,10 @@ mod tests {
         );
         assert!(matches!(
             relay.receive(&node("s"), &sequence_nine),
+            Ok(OverlayForwardAction::Forward { .. })
+        ));
+        assert!(matches!(
+            relay.receive(&node("s"), &sequence_nine),
             Err(OverlayForwarderError::ReplayRejected {
                 sequence: 9,
                 highest: 10,
@@ -823,6 +1049,61 @@ mod tests {
         assert!(matches!(
             relay.receive(&node("s"), &sequence_eleven),
             Ok(OverlayForwardAction::Forward { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_window_covers_the_full_proxy_in_flight_sequence_span() -> TestResult {
+        let in_flight_sequence_span =
+            OVERLAY_PEER_MAX_IN_FLIGHT_DATAGRAMS * OVERLAY_SEQUENCE_RESERVATIONS_PER_DATAGRAM;
+        assert_eq!(OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS, 1_024);
+        assert!(OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS >= in_flight_sequence_span);
+        assert_eq!(
+            std::mem::size_of::<ReplaySequenceWindow>(),
+            (OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS + 1) * std::mem::size_of::<u64>()
+        );
+
+        let source = node("s");
+        let latest_in_flight = (in_flight_sequence_span - 1) as u64;
+        let mut replay = ReplayWindow::new(4);
+
+        replay.observe(7, &source, [0x41; 16], latest_in_flight)?;
+        replay.observe(7, &source, [0x41; 16], 0)?;
+        assert!(matches!(
+            replay.observe(7, &source, [0x41; 16], 0),
+            Err(OverlayForwarderError::ReplayRejected {
+                sequence: 0,
+                highest,
+                ..
+            }) if highest == latest_in_flight
+        ));
+
+        replay.observe(7, &source, [0x42; 16], 0)?;
+        replay.observe(7, &source, [0x42; 16], latest_in_flight)?;
+        assert!(matches!(
+            replay.observe(7, &source, [0x42; 16], 0),
+            Err(OverlayForwarderError::ReplayRejected {
+                sequence: 0,
+                highest,
+                ..
+            }) if highest == latest_in_flight
+        ));
+
+        replay.observe(
+            7,
+            &source,
+            [0x43; 16],
+            OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS as u64,
+        )?;
+        replay.observe(7, &source, [0x43; 16], 1)?;
+        assert!(matches!(
+            replay.observe(7, &source, [0x43; 16], 0),
+            Err(OverlayForwarderError::ReplayRejected {
+                sequence: 0,
+                highest,
+                ..
+            }) if highest == OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS as u64
         ));
         Ok(())
     }

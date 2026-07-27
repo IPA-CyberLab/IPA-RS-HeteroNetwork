@@ -241,6 +241,29 @@ counted but ignored for scoring. A compromised member can still under-report
 its own observed quality, so these measurements are path-selection hints, not
 an authorization or billing trust boundary.
 
+## Bounded Overlay Transit
+
+Bounded-overlay transit binds to the assigned VPN address and accepts frames
+only from the exact UDP endpoint of a current bounded-topology neighbor or the
+immediately previous neighbor set during a 120-second migration grace. The hop
+transport is therefore authenticated by the adjacent WireGuard peer. Every
+relay validates its expected previous and next hop against the frame's graph,
+exact topology content identifier, hop budget, frame bounds, and a
+1,024-sequence sliding replay window scoped by epoch. Path session IDs are
+randomized on proxy startup, and the destination sends an end-to-end
+acknowledgement only after the peer proxy has sent the complete datagram to the
+local WireGuard UDP endpoint. Older management-plane maps and same-time
+conflicting epochs are rejected before replacing runtime state.
+
+The relayed payload remains an unchanged inner WireGuard datagram, so
+application confidentiality and peer authentication stay end to end even
+though representatives forward it. Overlay envelope metadata and
+acknowledgements use the authenticated-member hop boundary; they are not
+separately source-signed. A compromised admitted representative can therefore
+drop traffic or forge transit metadata and acknowledgements, but cannot decrypt
+or forge the inner WireGuard session. Deployments requiring Byzantine member
+resistance need an additional source-signed envelope or path-capability layer.
+
 ## Relay Abuse Controls
 
 Relay eligibility requires policy permission, usable public endpoint/admission URL values, fresh healthy heartbeat state, capacity, and E2E-only relay mode. Public IP reachability alone is not enough to become a relay.

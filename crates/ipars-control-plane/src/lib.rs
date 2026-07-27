@@ -1980,6 +1980,11 @@ where
                     })
             })
             .collect::<Vec<_>>();
+        let next_hops = topology.next_hops_from(node_id).ok_or_else(|| {
+            ControlPlaneError::BoundedTopology(format!(
+                "source node {node_id} has no bounded-overlay routing table"
+            ))
+        })?;
 
         let mut selected_routes =
             BTreeMap::<IpNet, ((u32, NodeId, String), AggregateOverlayRoute)>::new();
@@ -1990,18 +1995,10 @@ where
             let Some(filtered_target) = acl_filter_peer(&source, target, &policy) else {
                 continue;
             };
-            let Some(paths) = topology.paths(&source.node_id, &target.node_id) else {
+            let Some((primary_next_hop, secondary_next_hop)) = next_hops.get(&target.node_id)
+            else {
                 continue;
             };
-            let Some(primary_next_hop) = paths.primary.get(1).cloned() else {
-                continue;
-            };
-            let secondary_next_hop = paths
-                .secondary
-                .as_ref()
-                .and_then(|secondary| secondary.nodes.get(1))
-                .filter(|secondary| *secondary != &primary_next_hop)
-                .cloned();
             for route in filtered_target.routes.iter().filter(|route| {
                 route.advertised_by == filtered_target.node_id
                     && route

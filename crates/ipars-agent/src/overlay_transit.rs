@@ -13,12 +13,13 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use ipars_relay::multihop::{
-    MultiHopEnvelope, MAX_MULTIHOP_FRAME_BYTES, MAX_MULTIHOP_PAYLOAD_BYTES, MULTIHOP_PATH_ID_BYTES,
+    MultiHopCodecError, MultiHopEnvelope, MAX_MULTIHOP_FRAME_BYTES, MAX_MULTIHOP_PAYLOAD_BYTES,
+    MULTIHOP_PATH_ID_BYTES,
 };
 use ipars_types::{NodeId, OverlayPath};
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::overlay_forwarder::{
@@ -29,6 +30,8 @@ const OVERLAY_ACK_PAYLOAD: &[u8] = b"IPARS-MH-ACK-V1";
 const DEFAULT_OVERLAY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const DEFAULT_MAX_PENDING_OVERLAY_ACKS: usize = 4_096;
 const MAX_OVERLAY_PEER_IN_FLIGHT_SENDS: usize = 256;
+const MAX_OVERLAY_PRIMARY_IN_FLIGHT_PER_NEXT_HOP: usize = 16;
+const OVERLAY_PRIMARY_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayNeighborEndpoint {
@@ -159,6 +162,16 @@ pub enum OverlayNeighborSendError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum OverlayDeliveryAcknowledgementError {
+    #[error("delivered overlay frame has no reversible relay path")]
+    MissingReversePath,
+    #[error("failed to encode bounded overlay acknowledgement: {0}")]
+    Codec(#[from] MultiHopCodecError),
+    #[error(transparent)]
+    Send(#[from] OverlayNeighborSendError),
+}
+
 /// Sending is abstracted so callers can use a transport with stronger
 /// authentication than plain UDP while retaining the forwarding state machine.
 #[async_trait]
@@ -215,10 +228,73 @@ impl OverlayNeighborSender for UdpOverlayNeighborSender {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayDelivery {
     pub source: NodeId,
     pub payload: Vec<u8>,
+    acknowledgement: Option<OverlayDeliveryAcknowledgement>,
+}
+
+struct OverlayDeliveryAcknowledgement {
+    sender: Arc<dyn OverlayNeighborSender>,
+    delivered: MultiHopEnvelope,
+    stats: OverlayTransitStats,
+}
+
+impl std::fmt::Debug for OverlayDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OverlayDelivery")
+            .field("source", &self.source)
+            .field("payload", &self.payload)
+            .field("acknowledgement_pending", &self.acknowledgement.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for OverlayDelivery {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.payload == other.payload
+    }
+}
+
+impl Eq for OverlayDelivery {}
+
+impl OverlayDelivery {
+    pub fn acknowledgement_pending(&self) -> bool {
+        self.acknowledgement.is_some()
+    }
+
+    /// Confirm that the delivery was accepted by the local WireGuard
+    /// injection path. Dropping a delivery without calling this method causes
+    /// the sender to time out and try its secondary route.
+    pub async fn acknowledge(mut self) -> Result<(), OverlayDeliveryAcknowledgementError> {
+        let Some(acknowledgement) = self.acknowledgement.take() else {
+            return Ok(());
+        };
+        match send_overlay_acknowledgement(
+            acknowledgement.sender.as_ref(),
+            &acknowledgement.delivered,
+        )
+        .await
+        {
+            Ok(()) => {
+                acknowledgement
+                    .stats
+                    .inner
+                    .acknowledgements_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                acknowledgement
+                    .stats
+                    .inner
+                    .send_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +361,12 @@ struct OverlayAcknowledgementKey {
     remote: NodeId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OverlayPrimaryRouteKey {
+    topology_epoch: u64,
+    next_hop: NodeId,
+}
+
 #[derive(Debug, Error)]
 pub enum OverlayPathAttemptError {
     #[error("overlay neighbor send failed: {0}")]
@@ -334,8 +416,12 @@ pub enum OverlayTransitError {
         primary: Box<OverlayPathAttemptError>,
         secondary: Box<OverlayPathAttemptError>,
     },
+    #[error("suppressed primary route used a secondary path that failed: {0}")]
+    SuppressedSecondaryFailed(#[source] Box<OverlayPathAttemptError>),
     #[error("cannot allocate a secondary sequence after {0}")]
     SequenceOverflow(u64),
+    #[error("primary route limiter for next hop {next_hop} closed unexpectedly")]
+    PrimaryRouteLimiterClosed { next_hop: NodeId },
     #[error(
         "direct neighbor {peer} must receive its inner datagram through the WireGuard dataplane"
     )]
@@ -351,6 +437,8 @@ pub struct OverlayTransitClient {
     forwarder: Arc<Mutex<BoundedOverlayForwarder>>,
     sender: Arc<dyn OverlayNeighborSender>,
     pending_acknowledgements: Arc<Mutex<BTreeMap<OverlayAcknowledgementKey, oneshot::Sender<()>>>>,
+    suppressed_primary_routes: Arc<Mutex<BTreeMap<OverlayPrimaryRouteKey, tokio::time::Instant>>>,
+    primary_route_limiters: Arc<Mutex<BTreeMap<OverlayPrimaryRouteKey, Arc<Semaphore>>>>,
     acknowledgement_timeout: Option<std::time::Duration>,
     max_pending_acknowledgements: usize,
     stats: OverlayTransitStats,
@@ -387,11 +475,50 @@ impl OverlayTransitClient {
         sequence: u64,
         inner_wireguard_datagram: Vec<u8>,
     ) -> Result<OverlaySendOutcome, OverlayTransitError> {
+        path.validate()
+            .map_err(|error| OverlayForwarderError::InvalidOverlayPath(error.to_string()))?;
         if path.ordered_nodes.len() == 2 {
             return Err(OverlayTransitError::DirectNeighborRequiresDataplane {
                 peer: path.target.node_id.clone(),
             });
         }
+        let primary_next_hop = path.ordered_nodes.get(1).cloned().ok_or_else(|| {
+            OverlayForwarderError::InvalidOverlayPath(
+                "overlay path has no primary next hop".to_string(),
+            )
+        })?;
+        let route_key = OverlayPrimaryRouteKey {
+            topology_epoch: path.topology_epoch,
+            next_hop: primary_next_hop.clone(),
+        };
+        if path.secondary_ordered_nodes.is_some()
+            && self.primary_route_is_suppressed(&route_key).await
+        {
+            return self
+                .send_suppressed_secondary(path, path_id, sequence, inner_wireguard_datagram)
+                .await;
+        }
+
+        let limiter = {
+            let mut limiters = self.primary_route_limiters.lock().await;
+            Arc::clone(limiters.entry(route_key.clone()).or_insert_with(|| {
+                Arc::new(Semaphore::new(MAX_OVERLAY_PRIMARY_IN_FLIGHT_PER_NEXT_HOP))
+            }))
+        };
+        let primary_permit = limiter.acquire_owned().await.map_err(|_| {
+            OverlayTransitError::PrimaryRouteLimiterClosed {
+                next_hop: primary_next_hop,
+            }
+        })?;
+        if path.secondary_ordered_nodes.is_some()
+            && self.primary_route_is_suppressed(&route_key).await
+        {
+            drop(primary_permit);
+            return self
+                .send_suppressed_secondary(path, path_id, sequence, inner_wireguard_datagram)
+                .await;
+        }
+
         let primary = {
             let mut forwarder = self.forwarder.lock().await;
             forwarder.encapsulate(path, path_id, sequence, inner_wireguard_datagram.clone())?
@@ -406,11 +533,25 @@ impl OverlayTransitClient {
             .send_action_with_acknowledgement(primary, acknowledgement)
             .await
         {
-            Ok(()) => Ok(OverlaySendOutcome {
-                selection: OverlayPathSelection::Primary,
-                sequence,
-            }),
+            Ok(()) => {
+                drop(primary_permit);
+                Ok(OverlaySendOutcome {
+                    selection: OverlayPathSelection::Primary,
+                    sequence,
+                })
+            }
             Err(primary) => {
+                drop(primary_permit);
+                if matches!(
+                    &primary,
+                    OverlayPathAttemptError::Send(_)
+                        | OverlayPathAttemptError::AcknowledgementTimeout { .. }
+                ) {
+                    self.suppressed_primary_routes.lock().await.insert(
+                        route_key,
+                        tokio::time::Instant::now() + OVERLAY_PRIMARY_FAILURE_BACKOFF,
+                    );
+                }
                 let secondary_sequence = sequence
                     .checked_add(1)
                     .ok_or(OverlayTransitError::SequenceOverflow(sequence))?;
@@ -460,15 +601,61 @@ impl OverlayTransitClient {
         &self,
         neighbor_map: ipars_types::NeighborMap,
     ) -> Result<(), OverlayTransitError> {
-        self.forwarder
-            .lock()
-            .await
-            .update_neighbor_map(neighbor_map)?;
+        let topology_changed = {
+            let mut forwarder = self.forwarder.lock().await;
+            let topology_changed =
+                forwarder.neighbor_map().topology_epoch != neighbor_map.topology_epoch;
+            forwarder.update_neighbor_map(neighbor_map)?;
+            topology_changed
+        };
+        if topology_changed {
+            self.suppressed_primary_routes.lock().await.clear();
+            self.primary_route_limiters.lock().await.clear();
+        }
         Ok(())
     }
 
     pub fn stats(&self) -> OverlayTransitStats {
         self.stats.clone()
+    }
+
+    async fn primary_route_is_suppressed(&self, route_key: &OverlayPrimaryRouteKey) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut suppressed = self.suppressed_primary_routes.lock().await;
+        suppressed.retain(|_, until| *until > now);
+        suppressed.contains_key(route_key)
+    }
+
+    async fn send_suppressed_secondary(
+        &self,
+        path: &OverlayPath,
+        path_id: [u8; MULTIHOP_PATH_ID_BYTES],
+        sequence: u64,
+        inner_wireguard_datagram: Vec<u8>,
+    ) -> Result<OverlaySendOutcome, OverlayTransitError> {
+        let secondary = {
+            let mut forwarder = self.forwarder.lock().await;
+            forwarder.encapsulate_selected(
+                path,
+                OverlayPathSelection::Secondary,
+                path_id,
+                sequence,
+                inner_wireguard_datagram,
+            )?
+        };
+        let acknowledgement = OverlayAcknowledgementKey {
+            topology_epoch: path.topology_epoch,
+            path_id,
+            sequence,
+            remote: path.target.node_id.clone(),
+        };
+        self.send_action_with_acknowledgement(secondary, acknowledgement)
+            .await
+            .map(|()| OverlaySendOutcome {
+                selection: OverlayPathSelection::Secondary,
+                sequence,
+            })
+            .map_err(|error| OverlayTransitError::SuppressedSecondaryFailed(Box::new(error)))
     }
 
     async fn send_action(&self, action: OverlayForwardAction) -> Result<(), OverlayTransitError> {
@@ -514,6 +701,7 @@ impl OverlayTransitClient {
         let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
         {
             let mut pending = self.pending_acknowledgements.lock().await;
+            pending.retain(|_, waiter| !waiter.is_closed());
             if pending.len() >= self.max_pending_acknowledgements {
                 return Err(OverlayPathAttemptError::AcknowledgementCapacity {
                     maximum: self.max_pending_acknowledgements,
@@ -646,10 +834,14 @@ impl OverlayTransit {
         let forwarder = Arc::new(Mutex::new(forwarder));
         let stats = OverlayTransitStats::default();
         let pending_acknowledgements = Arc::new(Mutex::new(BTreeMap::new()));
+        let suppressed_primary_routes = Arc::new(Mutex::new(BTreeMap::new()));
+        let primary_route_limiters = Arc::new(Mutex::new(BTreeMap::new()));
         let client = OverlayTransitClient {
             forwarder: Arc::clone(&forwarder),
             sender: Arc::clone(&sender),
             pending_acknowledgements: Arc::clone(&pending_acknowledgements),
+            suppressed_primary_routes,
+            primary_route_limiters,
             acknowledgement_timeout,
             max_pending_acknowledgements,
             stats: stats.clone(),
@@ -657,13 +849,15 @@ impl OverlayTransit {
         let (delivery_tx, deliveries) = mpsc::channel(delivery_queue_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(run_receive_loop(
-            socket,
-            endpoints,
-            forwarder,
-            sender,
-            delivery_tx,
-            pending_acknowledgements,
-            stats,
+            OverlayReceiveLoopState {
+                socket,
+                endpoints,
+                forwarder,
+                sender,
+                deliveries: delivery_tx,
+                pending_acknowledgements,
+                stats,
+            },
             shutdown_rx,
         ));
 
@@ -692,6 +886,10 @@ impl OverlayTransit {
         self.client.stats()
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     pub async fn shutdown(mut self) -> Result<(), OverlayTransitError> {
         let _ = self.shutdown_tx.send(true);
         if let Some(task) = self.task.take() {
@@ -710,31 +908,18 @@ impl Drop for OverlayTransit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayWireGuardPeerForwarderConfig {
     pub wireguard_endpoint: SocketAddr,
-    pub injection_endpoint: SocketAddr,
     pub path_id: [u8; MULTIHOP_PATH_ID_BYTES],
     pub initial_sequence: u64,
 }
 
 impl OverlayWireGuardPeerForwarderConfig {
     fn validate(self) -> Result<Self, OverlayWireGuardPeerForwarderError> {
-        for (name, endpoint) in [
-            ("wireguard", self.wireguard_endpoint),
-            ("injection", self.injection_endpoint),
-        ] {
-            if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-                return Err(
-                    OverlayWireGuardPeerForwarderError::InvalidConfiguredEndpoint {
-                        name,
-                        endpoint,
-                    },
-                );
-            }
-        }
-        if self.wireguard_endpoint == self.injection_endpoint {
+        if !self.wireguard_endpoint.ip().is_loopback() || self.wireguard_endpoint.port() == 0 {
             return Err(
-                OverlayWireGuardPeerForwarderError::SharedConfiguredEndpoint(
-                    self.wireguard_endpoint,
-                ),
+                OverlayWireGuardPeerForwarderError::InvalidConfiguredEndpoint {
+                    name: "wireguard",
+                    endpoint: self.wireguard_endpoint,
+                },
             );
         }
         if self.path_id.iter().all(|byte| *byte == 0) {
@@ -755,6 +940,7 @@ pub struct OverlayWireGuardPeerForwarderStatsSnapshot {
     pub oversized_datagrams_dropped: u64,
     pub overlay_send_failures: u64,
     pub wireguard_injection_failures: u64,
+    pub delivery_acknowledgement_failures: u64,
     pub accepted_path_updates: u64,
     pub rejected_path_updates: u64,
     pub sequence_overflows: u64,
@@ -771,6 +957,7 @@ struct OverlayWireGuardPeerForwarderStatsInner {
     oversized_datagrams_dropped: AtomicU64,
     overlay_send_failures: AtomicU64,
     wireguard_injection_failures: AtomicU64,
+    delivery_acknowledgement_failures: AtomicU64,
     accepted_path_updates: AtomicU64,
     rejected_path_updates: AtomicU64,
     sequence_overflows: AtomicU64,
@@ -808,6 +995,10 @@ impl OverlayWireGuardPeerForwarderStats {
                 .inner
                 .wireguard_injection_failures
                 .load(Ordering::Relaxed),
+            delivery_acknowledgement_failures: self
+                .inner
+                .delivery_acknowledgement_failures
+                .load(Ordering::Relaxed),
             accepted_path_updates: self.inner.accepted_path_updates.load(Ordering::Relaxed),
             rejected_path_updates: self.inner.rejected_path_updates.load(Ordering::Relaxed),
             sequence_overflows: self.inner.sequence_overflows.load(Ordering::Relaxed),
@@ -822,8 +1013,6 @@ pub enum OverlayWireGuardPeerForwarderError {
         name: &'static str,
         endpoint: SocketAddr,
     },
-    #[error("WireGuard and injection endpoints must differ, but both are {0}")]
-    SharedConfiguredEndpoint(SocketAddr),
     #[error("overlay WireGuard path ID must not be all zero")]
     ZeroPathId,
     #[error("invalid initial overlay path: {0}")]
@@ -832,6 +1021,8 @@ pub enum OverlayWireGuardPeerForwarderError {
     NonLoopbackSocket(SocketAddr),
     #[error("overlay WireGuard proxy receive failed: {0}")]
     Receive(#[source] io::Error),
+    #[error("overlay delivery channel closed")]
+    DeliveryChannelClosed,
     #[error("overlay WireGuard sequence space is exhausted at {0}")]
     SequenceOverflow(u64),
 }
@@ -839,8 +1030,9 @@ pub enum OverlayWireGuardPeerForwarderError {
 /// Proxies one remote WireGuard peer through a bounded overlay path.
 ///
 /// The supplied socket is the sole local proxy socket. Only datagrams from
-/// `wireguard_endpoint` enter the overlay, and only datagrams from
-/// `injection_endpoint` are sent back to WireGuard.
+/// `wireguard_endpoint` enter the overlay. Received overlay deliveries arrive
+/// over an in-process channel and are acknowledged only after this socket sends
+/// the complete datagram to WireGuard.
 pub struct OverlayWireGuardPeerForwarder {
     transit: OverlayTransitClient,
     config: OverlayWireGuardPeerForwarderConfig,
@@ -873,6 +1065,7 @@ impl OverlayWireGuardPeerForwarder {
     pub async fn serve(
         mut self,
         socket: UdpSocket,
+        mut deliveries: mpsc::Receiver<OverlayDelivery>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), OverlayWireGuardPeerForwarderError> {
         let local_endpoint = socket
@@ -908,12 +1101,7 @@ impl OverlayWireGuardPeerForwarder {
                     match changed {
                         Ok(()) => {
                             let candidate = self.path_updates.borrow_and_update().clone();
-                            if valid_peer_path_update(
-                                &path,
-                                &candidate,
-                                &path_source,
-                                &path_target,
-                            ) {
+                            if valid_peer_path_update(&candidate, &path_source, &path_target) {
                                 path = candidate;
                                 self.stats
                                     .inner
@@ -927,6 +1115,57 @@ impl OverlayWireGuardPeerForwarder {
                             }
                         }
                         Err(_) => path_updates_open = false,
+                    }
+                }
+                delivery = deliveries.recv() => {
+                    let Some(delivery) = delivery else {
+                        return Err(
+                            OverlayWireGuardPeerForwarderError::DeliveryChannelClosed,
+                        );
+                    };
+                    if delivery.source != path_target {
+                        self.stats
+                            .inner
+                            .unexpected_sources_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if delivery.payload.len() > MAX_MULTIHOP_PAYLOAD_BYTES {
+                        self.stats
+                            .inner
+                            .oversized_datagrams_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if !overlay_wireguard_datagram(&delivery.payload) {
+                        self.stats
+                            .inner
+                            .non_wireguard_datagrams_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    match socket
+                        .send_to(&delivery.payload, self.config.wireguard_endpoint)
+                        .await
+                    {
+                        Ok(sent) if sent == delivery.payload.len() => {
+                            self.stats
+                                .inner
+                                .wireguard_datagrams_injected
+                                .fetch_add(1, Ordering::Relaxed);
+                            if delivery.acknowledge().await.is_err() {
+                                self.stats
+                                    .inner
+                                    .delivery_acknowledgement_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            self.stats
+                                .inner
+                                .wireguard_injection_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 completed = sends.join_next(), if !sends.is_empty() => {
@@ -960,9 +1199,7 @@ impl OverlayWireGuardPeerForwarder {
                         .inner
                         .received_datagrams
                         .fetch_add(1, Ordering::Relaxed);
-                    if source != self.config.wireguard_endpoint
-                        && source != self.config.injection_endpoint
-                    {
+                    if source != self.config.wireguard_endpoint {
                         self.stats
                             .inner
                             .unexpected_sources_dropped
@@ -982,24 +1219,6 @@ impl OverlayWireGuardPeerForwarder {
                             .inner
                             .non_wireguard_datagrams_dropped
                             .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    if source == self.config.injection_endpoint {
-                        match socket.send_to(payload, self.config.wireguard_endpoint).await {
-                            Ok(sent) if sent == payload.len() => {
-                                self.stats
-                                    .inner
-                                    .wireguard_datagrams_injected
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(_) | Err(_) => {
-                                self.stats
-                                    .inner
-                                    .wireguard_injection_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
                         continue;
                     }
 
@@ -1036,16 +1255,10 @@ impl OverlayWireGuardPeerForwarder {
     }
 }
 
-fn valid_peer_path_update(
-    current: &OverlayPath,
-    candidate: &OverlayPath,
-    source: &NodeId,
-    target: &NodeId,
-) -> bool {
+fn valid_peer_path_update(candidate: &OverlayPath, source: &NodeId, target: &NodeId) -> bool {
     candidate.validate().is_ok()
         && candidate.source == *source
         && candidate.target.node_id == *target
-        && candidate.topology_epoch >= current.topology_epoch
 }
 
 fn overlay_wireguard_datagram(payload: &[u8]) -> bool {
@@ -1061,7 +1274,7 @@ fn overlay_wireguard_datagram(payload: &[u8]) -> bool {
     }
 }
 
-async fn run_receive_loop(
+struct OverlayReceiveLoopState {
     socket: Arc<UdpSocket>,
     endpoints: OverlayNeighborEndpointDirectory,
     forwarder: Arc<Mutex<BoundedOverlayForwarder>>,
@@ -1069,8 +1282,21 @@ async fn run_receive_loop(
     deliveries: mpsc::Sender<OverlayDelivery>,
     pending_acknowledgements: Arc<Mutex<BTreeMap<OverlayAcknowledgementKey, oneshot::Sender<()>>>>,
     stats: OverlayTransitStats,
+}
+
+async fn run_receive_loop(
+    state: OverlayReceiveLoopState,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), OverlayTransitError> {
+    let OverlayReceiveLoopState {
+        socket,
+        endpoints,
+        forwarder,
+        sender,
+        deliveries,
+        pending_acknowledgements,
+        stats,
+    } = state;
     let mut datagram = vec![0_u8; MAX_MULTIHOP_FRAME_BYTES];
     loop {
         tokio::select! {
@@ -1111,9 +1337,13 @@ async fn run_receive_loop(
                         }
                     }
                     Ok(OverlayForwardAction::Deliver { source, payload }) => {
-                        let envelope = decoded.expect(
-                            "a frame accepted by the bounded forwarder must decode canonically",
-                        );
+                        let Ok(envelope) = decoded else {
+                            stats
+                                .inner
+                                .invalid_frames_dropped
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
                         if payload == OVERLAY_ACK_PAYLOAD {
                             let acknowledgement = OverlayAcknowledgementKey {
                                 topology_epoch: envelope.topology_epoch(),
@@ -1134,21 +1364,16 @@ async fn run_receive_loop(
                                 .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if send_overlay_acknowledgement(
-                            sender.as_ref(),
-                            &envelope,
-                        )
-                        .await
-                        .is_ok()
-                        {
-                            stats
-                                .inner
-                                .acknowledgements_sent
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            stats.inner.send_failures.fetch_add(1, Ordering::Relaxed);
-                        }
-                        if deliveries.try_send(OverlayDelivery { source, payload }).is_ok() {
+                        let delivery = OverlayDelivery {
+                            source,
+                            payload,
+                            acknowledgement: Some(OverlayDeliveryAcknowledgement {
+                                sender: Arc::clone(&sender),
+                                delivered: envelope,
+                                stats: stats.clone(),
+                            }),
+                        };
+                        if deliveries.try_send(delivery).is_ok() {
                             stats
                                 .inner
                                 .delivered_frames
@@ -1181,12 +1406,12 @@ async fn run_receive_loop(
 async fn send_overlay_acknowledgement(
     sender: &dyn OverlayNeighborSender,
     delivered: &MultiHopEnvelope,
-) -> Result<(), OverlayNeighborSendError> {
+) -> Result<(), OverlayDeliveryAcknowledgementError> {
     let reverse_path = delivered.path().iter().rev().cloned().collect::<Vec<_>>();
     let next_hop = reverse_path
         .first()
-        .expect("multi-hop delivery paths always contain at least one relay")
-        .clone();
+        .cloned()
+        .ok_or(OverlayDeliveryAcknowledgementError::MissingReversePath)?;
     let acknowledgement = MultiHopEnvelope::new(
         delivered.topology_epoch(),
         *delivered.path_id(),
@@ -1197,10 +1422,11 @@ async fn send_overlay_acknowledgement(
         reverse_path,
         OVERLAY_ACK_PAYLOAD.to_vec(),
     )
-    .expect("a reversed accepted multi-hop path must remain valid")
+    .map_err(OverlayDeliveryAcknowledgementError::Codec)?
     .encode()
-    .expect("a bounded acknowledgement must encode canonically");
-    sender.send_frame(&next_hop, &acknowledgement).await
+    .map_err(OverlayDeliveryAcknowledgementError::Codec)?;
+    sender.send_frame(&next_hop, &acknowledgement).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1321,11 +1547,9 @@ mod tests {
 
     fn peer_forwarder_config(
         wireguard_endpoint: SocketAddr,
-        injection_endpoint: SocketAddr,
     ) -> OverlayWireGuardPeerForwarderConfig {
         OverlayWireGuardPeerForwarderConfig {
             wireguard_endpoint,
-            injection_endpoint,
             path_id: [9; MULTIHOP_PATH_ID_BYTES],
             initial_sequence: 100,
         }
@@ -1405,13 +1629,9 @@ mod tests {
         )
         .await?
         .ok_or("delivery channel closed")?;
-        assert_eq!(
-            delivery,
-            OverlayDelivery {
-                source: node("s"),
-                payload,
-            }
-        );
+        assert_eq!(delivery.source, node("s"));
+        assert_eq!(delivery.payload, payload);
+        assert!(delivery.acknowledgement_pending());
         assert_eq!(relay.stats().snapshot().forwarded_frames, 1);
         assert_eq!(destination.stats().snapshot().delivered_frames, 1);
 
@@ -1510,7 +1730,7 @@ mod tests {
         .ok_or("delivery channel closed")?;
         assert_eq!(delivery.payload, vec![0x42]);
         sleep(Duration::from_millis(100)).await;
-        assert_eq!(relay.stats().snapshot().forwarded_frames, 2);
+        assert_eq!(relay.stats().snapshot().forwarded_frames, 1);
         assert_eq!(relay.stats().snapshot().invalid_frames_dropped, 4);
         assert!(timeout(
             Duration::from_millis(100),
@@ -1549,7 +1769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_send_failure_switches_to_secondary_once() -> TestResult {
+    async fn primary_send_failure_suppresses_same_next_hop_across_destinations() -> TestResult {
         let socket = Arc::new(loopback_socket().await?);
         let sender = Arc::new(FailPrimarySender {
             primary: node("a"),
@@ -1583,6 +1803,22 @@ mod tests {
                 sequence: 41,
             }
         );
+        let suppressed_outcome = transit
+            .client()
+            .send_with_secondary_failover(
+                &path(&["s", "a", "e"], Some(&["s", "c", "e"]), 7),
+                [4; 16],
+                42,
+                vec![4, 5, 6],
+            )
+            .await?;
+        assert_eq!(
+            suppressed_outcome,
+            OverlaySendOutcome {
+                selection: OverlayPathSelection::Secondary,
+                sequence: 42,
+            }
+        );
         assert_eq!(
             sender
                 .attempted
@@ -1591,7 +1827,7 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec![node("a"), node("c")]
+            vec![node("a"), node("c"), node("c")]
         );
         assert_eq!(transit.stats().snapshot().send_failures, 1);
 
@@ -1640,16 +1876,27 @@ mod tests {
             8,
         )?;
 
-        let outcome = timeout(
+        let client = source.client();
+        let send_task = tokio::spawn(async move {
+            client
+                .send_with_secondary_failover(
+                    &path(&["s", "a", "d"], Some(&["s", "c", "d"]), 9),
+                    [5; 16],
+                    80,
+                    vec![0x51],
+                )
+                .await
+        });
+        let delivery = timeout(
             Duration::from_secs(2),
-            source.client().send_with_secondary_failover(
-                &path(&["s", "a", "d"], Some(&["s", "c", "d"]), 9),
-                [5; 16],
-                80,
-                vec![0x51],
-            ),
+            destination.delivery_receiver().recv(),
         )
-        .await??;
+        .await?
+        .ok_or("destination delivery channel closed")?;
+        assert_eq!(delivery.payload, vec![0x51]);
+        assert!(!send_task.is_finished());
+        delivery.acknowledge().await?;
+        let outcome = timeout(Duration::from_secs(2), send_task).await???;
         assert_eq!(
             outcome,
             OverlaySendOutcome {
@@ -1657,13 +1904,6 @@ mod tests {
                 sequence: 81,
             }
         );
-        let delivery = timeout(
-            Duration::from_secs(1),
-            destination.delivery_receiver().recv(),
-        )
-        .await?
-        .ok_or("destination delivery channel closed")?;
-        assert_eq!(delivery.payload, vec![0x51]);
         assert_eq!(source.stats().snapshot().acknowledgement_timeouts, 1);
         assert_eq!(source.stats().snapshot().acknowledgements_received, 1);
         assert_eq!(destination.stats().snapshot().acknowledgements_sent, 1);
@@ -1676,7 +1916,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wireguard_peer_forwarder_proxies_both_directions_and_updates_epoch() -> TestResult {
+    async fn cancelled_acknowledgement_waiter_releases_capacity_on_next_send() -> TestResult {
+        let socket = Arc::new(loopback_socket().await?);
+        let sender = Arc::new(RecordingSender::default());
+        let endpoints = OverlayNeighborEndpointDirectory::new([
+            endpoint("a", SocketAddr::from((Ipv4Addr::LOCALHOST, 10_001))),
+            endpoint("c", SocketAddr::from((Ipv4Addr::LOCALHOST, 10_002))),
+        ])?;
+        let transit = OverlayTransit::spawn_with_sender_config(
+            socket,
+            endpoints,
+            forwarder("s", &["a", "c"], 7)?,
+            sender.clone(),
+            8,
+            Some(Duration::from_secs(30)),
+            1,
+        )?;
+        let overlay_path = path(&["s", "a", "d"], Some(&["s", "c", "d"]), 7);
+
+        let first_client = transit.client();
+        let first_path = overlay_path.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .send_with_secondary_failover(&first_path, [7; 16], 1, vec![1])
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while sender.attempted.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        first.abort();
+        assert!(first.await.is_err());
+
+        let second_client = transit.client();
+        let second = tokio::spawn(async move {
+            second_client
+                .send_with_secondary_failover(&overlay_path, [7; 16], 3, vec![2])
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            while sender.attempted.lock().await.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            transit.client.pending_acknowledgements.lock().await.len(),
+            1
+        );
+        second.abort();
+        assert!(second.await.is_err());
+
+        timeout(Duration::from_secs(1), transit.shutdown()).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wireguard_peer_forwarder_accepts_opaque_epoch_updates() -> TestResult {
         let transit_socket = Arc::new(loopback_socket().await?);
         let sender = Arc::new(RecordingSender::default());
         let endpoints = OverlayNeighborEndpointDirectory::new([endpoint(
@@ -1693,25 +1991,24 @@ mod tests {
         let client = transit.client();
 
         let wireguard = loopback_socket().await?;
-        let injection = loopback_socket().await?;
         let proxy_socket = loopback_socket().await?;
         let wireguard_endpoint = wireguard.local_addr()?;
-        let injection_endpoint = injection.local_addr()?;
         let proxy_endpoint = proxy_socket.local_addr()?;
         let (path_tx, path_rx) = watch::channel(path(&["s", "a", "d"], None, 7));
         let proxy = OverlayWireGuardPeerForwarder::new(
             client.clone(),
-            peer_forwarder_config(wireguard_endpoint, injection_endpoint),
+            peer_forwarder_config(wireguard_endpoint),
             path_rx,
         )?;
         let stats = proxy.stats();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, shutdown_rx));
+        let (delivery_tx, delivery_rx) = mpsc::channel(4);
+        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, delivery_rx, shutdown_rx));
 
         client
-            .update_neighbor_map(neighbor_map("s", &["a"], 8))
+            .update_neighbor_map(neighbor_map("s", &["a"], 3))
             .await?;
-        path_tx.send(path(&["s", "a", "d"], None, 8))?;
+        path_tx.send(path(&["s", "a", "d"], None, 3))?;
         timeout(Duration::from_secs(1), async {
             while stats.snapshot().accepted_path_updates != 1 {
                 tokio::task::yield_now().await;
@@ -1732,21 +2029,56 @@ mod tests {
         .await?;
         assert_eq!(recorded.0, node("a"));
         let envelope = MultiHopEnvelope::decode(&recorded.1, 1)?;
-        assert_eq!(envelope.topology_epoch(), 8);
+        assert_eq!(envelope.topology_epoch(), 3);
         assert_eq!(envelope.opaque_payload_len(), outbound.len());
 
         let inbound = wireguard_datagram(0x52);
-        injection.send_to(&inbound, proxy_endpoint).await?;
+        let acknowledgement_stats = transit.stats();
+        let delivered = MultiHopEnvelope::new(
+            3,
+            [7; MULTIHOP_PATH_ID_BYTES],
+            55,
+            1,
+            node("d"),
+            node("s"),
+            vec![node("a")],
+            inbound.clone(),
+        )?;
+        delivery_tx
+            .send(OverlayDelivery {
+                source: node("d"),
+                payload: inbound.clone(),
+                acknowledgement: Some(OverlayDeliveryAcknowledgement {
+                    sender: sender.clone(),
+                    delivered,
+                    stats: acknowledgement_stats,
+                }),
+            })
+            .await?;
         let mut received = vec![0_u8; 128];
         let (length, source) =
             timeout(Duration::from_secs(1), wireguard.recv_from(&mut received)).await??;
         assert_eq!(source, proxy_endpoint);
         assert_eq!(&received[..length], inbound);
+        let acknowledgement = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(recorded) = sender.attempted.lock().await.pop_front() {
+                    break recorded;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(acknowledgement.0, node("a"));
+        let acknowledgement = MultiHopEnvelope::decode(&acknowledgement.1, 1)?;
+        assert_eq!(acknowledgement.topology_epoch(), 3);
+        assert_eq!(acknowledgement.sequence(), 55);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.overlay_datagrams_sent, 1);
         assert_eq!(snapshot.wireguard_datagrams_injected, 1);
         assert_eq!(snapshot.accepted_path_updates, 1);
+        assert_eq!(transit.stats().snapshot().acknowledgements_sent, 1);
 
         shutdown_tx.send(true)?;
         timeout(Duration::from_secs(1), proxy_task).await???;
@@ -1772,31 +2104,39 @@ mod tests {
         )?;
 
         let wireguard = loopback_socket().await?;
-        let injection = loopback_socket().await?;
         let unexpected = loopback_socket().await?;
         let proxy_socket = loopback_socket().await?;
         let proxy_endpoint = proxy_socket.local_addr()?;
         let (_path_tx, path_rx) = watch::channel(path(&["s", "a", "d"], None, 7));
         let proxy = OverlayWireGuardPeerForwarder::new(
             transit.client(),
-            peer_forwarder_config(wireguard.local_addr()?, injection.local_addr()?),
+            peer_forwarder_config(wireguard.local_addr()?),
             path_rx,
         )?;
         let stats = proxy.stats();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, shutdown_rx));
+        let (delivery_tx, delivery_rx) = mpsc::channel(4);
+        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, delivery_rx, shutdown_rx));
 
         unexpected
             .send_to(&wireguard_datagram(0x61), proxy_endpoint)
             .await?;
         wireguard.send_to(b"not-wireguard", proxy_endpoint).await?;
-        injection.send_to(b"not-wireguard", proxy_endpoint).await?;
+        delivery_tx
+            .send(OverlayDelivery {
+                source: node("d"),
+                payload: b"not-wireguard".to_vec(),
+                acknowledgement: None,
+            })
+            .await?;
         let mut oversized = vec![0x71; MAX_MULTIHOP_PAYLOAD_BYTES + 1];
         oversized[..4].copy_from_slice(&4_u32.to_le_bytes());
         wireguard.send_to(&oversized, proxy_endpoint).await?;
 
         timeout(Duration::from_secs(1), async {
-            while stats.snapshot().received_datagrams != 4 {
+            while stats.snapshot().received_datagrams != 3
+                || stats.snapshot().non_wireguard_datagrams_dropped != 2
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1840,18 +2180,18 @@ mod tests {
         )?;
 
         let wireguard = loopback_socket().await?;
-        let injection = loopback_socket().await?;
         let proxy_socket = loopback_socket().await?;
         let proxy_endpoint = proxy_socket.local_addr()?;
         let (_path_tx, path_rx) = watch::channel(path(&["s", "a", "d"], Some(&["s", "c", "d"]), 7));
         let proxy = OverlayWireGuardPeerForwarder::new(
             transit.client(),
-            peer_forwarder_config(wireguard.local_addr()?, injection.local_addr()?),
+            peer_forwarder_config(wireguard.local_addr()?),
             path_rx,
         )?;
         let stats = proxy.stats();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, shutdown_rx));
+        let (_delivery_tx, delivery_rx) = mpsc::channel(4);
+        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, delivery_rx, shutdown_rx));
 
         wireguard
             .send_to(&wireguard_datagram(0x81), proxy_endpoint)
@@ -1897,11 +2237,10 @@ mod tests {
             8,
         )?;
         let wireguard = loopback_socket().await?;
-        let injection = loopback_socket().await?;
         let proxy_socket = loopback_socket().await?;
         let proxy_endpoint = proxy_socket.local_addr()?;
         let (_path_tx, path_rx) = watch::channel(path(&["s", "a", "d"], None, 7));
-        let mut config = peer_forwarder_config(wireguard.local_addr()?, injection.local_addr()?);
+        let mut config = peer_forwarder_config(wireguard.local_addr()?);
         config.path_id = [0; MULTIHOP_PATH_ID_BYTES];
         assert!(matches!(
             OverlayWireGuardPeerForwarder::new(transit.client(), config, path_rx.clone()),
@@ -1913,7 +2252,8 @@ mod tests {
         let proxy = OverlayWireGuardPeerForwarder::new(transit.client(), config, path_rx)?;
         let stats = proxy.stats();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, shutdown_rx));
+        let (_delivery_tx, delivery_rx) = mpsc::channel(4);
+        let proxy_task = tokio::spawn(proxy.serve(proxy_socket, delivery_rx, shutdown_rx));
         wireguard
             .send_to(&wireguard_datagram(0x91), proxy_endpoint)
             .await?;

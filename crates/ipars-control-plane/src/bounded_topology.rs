@@ -267,7 +267,18 @@ impl BoundedTopology {
             });
         }
 
-        let primary_edges = path_edges(&primary);
+        let secondary = self.secondary_path(source, destination, &primary);
+
+        Some(TopologyPaths { primary, secondary })
+    }
+
+    fn secondary_path(
+        &self,
+        source: &NodeId,
+        destination: &NodeId,
+        primary: &[NodeId],
+    ) -> Option<SecondaryPath> {
+        let primary_edges = path_edges(primary);
         let primary_internal_nodes = primary
             .iter()
             .skip(1)
@@ -281,7 +292,7 @@ impl BoundedTopology {
             &primary_internal_nodes,
             &primary_edges,
         );
-        let secondary = if let Some(nodes) = vertex_disjoint {
+        if let Some(nodes) = vertex_disjoint {
             Some(SecondaryPath {
                 kind: SecondaryPathKind::VertexDisjoint,
                 nodes,
@@ -292,9 +303,33 @@ impl BoundedTopology {
                     kind: SecondaryPathKind::EdgeDisjoint,
                     nodes,
                 })
-        };
+        }
+    }
 
-        Some(TopologyPaths { primary, secondary })
+    /// Compute first hops with the same path-disjointness semantics as
+    /// [`Self::paths`]. Primary paths share one BFS tree; alternate paths are
+    /// resolved per destination to preserve vertex-first, edge-only fallback.
+    pub fn next_hops_from(
+        &self,
+        source: &NodeId,
+    ) -> Option<BTreeMap<NodeId, (NodeId, Option<NodeId>)>> {
+        self.adjacency.get(source)?;
+        let primary_predecessors = predecessor_tree_from(source, &self.adjacency);
+        let mut next_hops = BTreeMap::new();
+        for destination in self.adjacency.keys().filter(|node| *node != source) {
+            let Some(primary) = reconstruct_path(source, destination, &primary_predecessors) else {
+                continue;
+            };
+            let Some(primary_next_hop) = primary.get(1).cloned() else {
+                continue;
+            };
+            let secondary_next_hop = self
+                .secondary_path(source, destination, &primary)
+                .and_then(|secondary| secondary.nodes.get(1).cloned())
+                .filter(|secondary| secondary != &primary_next_hop);
+            next_hops.insert(destination.clone(), (primary_next_hop, secondary_next_hop));
+        }
+        Some(next_hops)
     }
 
     /// Returns `None` for an empty or disconnected graph.
@@ -409,6 +444,28 @@ fn add_undirected_edge(
     }
 }
 
+fn predecessor_tree_from(
+    source: &NodeId,
+    adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
+) -> BTreeMap<NodeId, NodeId> {
+    let mut predecessors = BTreeMap::new();
+    let mut visited = BTreeSet::from([source.clone()]);
+    let mut queue = VecDeque::from([source.clone()]);
+    while let Some(current) = queue.pop_front() {
+        let Some(neighbors) = adjacency.get(&current) else {
+            continue;
+        };
+        for neighbor in neighbors {
+            if !visited.insert(neighbor.clone()) {
+                continue;
+            }
+            predecessors.insert(neighbor.clone(), current.clone());
+            queue.push_back(neighbor.clone());
+        }
+    }
+    predecessors
+}
+
 fn inspect_invariants(
     adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
     max_degree: usize,
@@ -511,6 +568,7 @@ fn reconstruct_path(
 mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Instant;
 
     use chrono::Utc;
     use ipars_types::{ClusterId, Role, TokenPolicy, VpnIp};
@@ -602,6 +660,54 @@ mod tests {
             assert!(
                 diameter <= logarithmicish_limit,
                 "degree {max_degree} topology diameter {diameter} exceeds {logarithmicish_limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_next_hop_table_matches_disjoint_paths_at_one_thousand_nodes() {
+        let nodes = records(1_000);
+        for max_degree in SUPPORTED_MAX_DEGREES {
+            let topology = topology(&nodes, max_degree);
+            let source = &nodes[17].node_id;
+            let Some(neighbors) = topology.neighbors(source) else {
+                panic!("source must be present in synthesized topology");
+            };
+            let started = Instant::now();
+            let Some(next_hops) = topology.next_hops_from(source) else {
+                panic!("source must have a next-hop table");
+            };
+            let table_elapsed = started.elapsed();
+
+            assert_eq!(next_hops.len(), nodes.len() - 1);
+            for destination in topology.adjacency().keys().filter(|node| *node != source) {
+                let Some(paths) = topology.paths(source, destination) else {
+                    panic!("synthesized topology must provide paths");
+                };
+                let Some((primary, secondary)) = next_hops.get(destination) else {
+                    panic!("every remote node must have next hops");
+                };
+                assert_eq!(Some(primary), paths.primary.get(1));
+                assert!(neighbors.contains(primary));
+                let Some(secondary_path) = paths.secondary.as_ref() else {
+                    panic!("cycle-union topology must retain an alternate first hop");
+                };
+                assert_eq!(secondary.as_ref(), secondary_path.nodes.get(1));
+                let Some(secondary) = secondary.as_ref() else {
+                    panic!("next-hop table must retain the alternate first hop");
+                };
+                assert!(neighbors.contains(secondary));
+                assert_ne!(secondary, primary);
+                assert!(
+                    path_edges(&paths.primary).is_disjoint(&path_edges(&secondary_path.nodes)),
+                    "degree {max_degree} paths to {destination} share an edge"
+                );
+            }
+            eprintln!(
+                "degree {max_degree}: built {} destinations in {:?}, verified in {:?}",
+                next_hops.len(),
+                table_elapsed,
+                started.elapsed()
             );
         }
     }
