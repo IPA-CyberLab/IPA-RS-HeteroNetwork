@@ -12,7 +12,9 @@ use ipars_types::{
     PathRecord, RelayCapability, Route, ServiceInstance, TokenLedgerMetrics, TokenLedgerRecord,
     TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, VpnIp,
 };
-use sqlx::{Executor, PgPool, Row, SqlitePool};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
+
+const PATH_PAIR_QUERY_CHUNK_SIZE: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct SqliteControlPlaneStore {
@@ -89,6 +91,37 @@ impl SqliteControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        let heartbeat_signature_table_existed = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'heartbeat_signatures'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(sql_error)?
+            > 0;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS heartbeat_signatures (
+                    node_id TEXT PRIMARY KEY NOT NULL,
+                    accepted_signature_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        if !heartbeat_signature_table_existed {
+            self.pool
+                .execute(
+                    r#"
+                INSERT OR IGNORE INTO heartbeat_signatures (node_id, accepted_signature_at)
+                SELECT node_id, json_extract(record_json, '$.last_seen_at')
+                FROM health
+                WHERE json_extract(record_json, '$.last_seen_at') IS NOT NULL;
+                "#,
+                )
+                .await
+                .map_err(sql_error)?;
+        }
         self.pool
             .execute(
                 r#"
@@ -232,6 +265,11 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .transpose()?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let health_result = sqlx::query("DELETE FROM health WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = ?1")
             .bind(node_id.as_str())
             .execute(&mut *transaction)
             .await
@@ -388,6 +426,34 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         row.map(row_to_health).transpose()
     }
 
+    async fn get_heartbeat_signature_timestamp(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError> {
+        let row = sqlx::query(
+            "SELECT accepted_signature_at FROM heartbeat_signatures WHERE node_id = ?1",
+        )
+        .bind(node_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        row.map(|row| parse_utc_timestamp(&row.get::<String, _>("accepted_signature_at")))
+            .transpose()
+    }
+
+    async fn list_health(&self) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let rows = sqlx::query("SELECT node_id, record_json FROM health ORDER BY node_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        let mut health_by_node = BTreeMap::new();
+        for row in rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            health_by_node.insert(node_id, row_to_health(row)?);
+        }
+        Ok(health_by_node)
+    }
+
     async fn upsert_nat_classification(
         &self,
         node_id: NodeId,
@@ -460,7 +526,16 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .map_err(sql_error)?
             .map(row_to_health)
             .transpose()?;
-        ensure_heartbeat_is_newer(&update, previous_health.as_ref())?;
+        let previous_signature_at = sqlx::query(
+            "SELECT accepted_signature_at FROM heartbeat_signatures WHERE node_id = ?1",
+        )
+        .bind(update.node_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(|row| parse_utc_timestamp(&row.get::<String, _>("accepted_signature_at")))
+        .transpose()?;
+        ensure_heartbeat_is_newer(&update, previous_signature_at, previous_health.as_ref())?;
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
@@ -473,6 +548,21 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        if let Some(accepted_signature_at) = update.accepted_signature_at {
+            sqlx::query(
+                r#"
+                INSERT INTO heartbeat_signatures (node_id, accepted_signature_at)
+                VALUES (?1, ?2)
+                ON CONFLICT(node_id)
+                DO UPDATE SET accepted_signature_at = excluded.accepted_signature_at
+                "#,
+            )
+            .bind(update.node_id.as_str())
+            .bind(accepted_signature_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
         sqlx::query(
             r#"
             INSERT INTO health (node_id, record_json)
@@ -600,6 +690,46 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .into_iter()
             .map(row_to_path)
             .collect()
+    }
+
+    async fn list_paths_for_pairs(
+        &self,
+        pairs: &BTreeSet<(NodeId, NodeId)>,
+    ) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        let pairs = pairs.iter().collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for chunk in pairs.chunks(PATH_PAIR_QUERY_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new("SELECT record_json FROM paths WHERE ");
+            {
+                let mut conditions = query.separated(" OR ");
+                for (local, remote) in chunk {
+                    conditions
+                        .push("(local_node_id = ")
+                        .push_bind_unseparated(local.as_str())
+                        .push_unseparated(" AND remote_node_id = ")
+                        .push_bind_unseparated(remote.as_str())
+                        .push_unseparated(")");
+                }
+            }
+            query.push(" ORDER BY local_node_id, remote_node_id");
+            paths.extend(
+                query
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(sql_error)?
+                    .into_iter()
+                    .map(row_to_path)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        paths.sort_by(|left, right| {
+            left.key
+                .local
+                .cmp(&right.key.local)
+                .then_with(|| left.key.remote.cmp(&right.key.remote))
+        });
+        Ok(paths)
     }
 
     async fn upsert_service_instance(
@@ -1012,6 +1142,36 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        let heartbeat_signature_table_existed =
+            sqlx::query_scalar::<_, bool>("SELECT to_regclass('heartbeat_signatures') IS NOT NULL")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS heartbeat_signatures (
+                    node_id TEXT PRIMARY KEY NOT NULL,
+                    accepted_signature_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        if !heartbeat_signature_table_existed {
+            transaction
+                .execute(
+                    r#"
+                INSERT INTO heartbeat_signatures (node_id, accepted_signature_at)
+                SELECT node_id, record_json->>'last_seen_at'
+                FROM health
+                WHERE record_json ? 'last_seen_at'
+                ON CONFLICT (node_id) DO NOTHING;
+                "#,
+                )
+                .await
+                .map_err(sql_error)?;
+        }
         transaction
             .execute(
                 r#"
@@ -1156,6 +1316,11 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .transpose()?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = $1")
             .bind(node_id.as_str())
             .execute(&mut *transaction)
             .await
@@ -1312,6 +1477,34 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         row.map(pg_row_to_health).transpose()
     }
 
+    async fn get_heartbeat_signature_timestamp(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError> {
+        let row = sqlx::query(
+            "SELECT accepted_signature_at FROM heartbeat_signatures WHERE node_id = $1",
+        )
+        .bind(node_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        row.map(|row| parse_utc_timestamp(&row.get::<String, _>("accepted_signature_at")))
+            .transpose()
+    }
+
+    async fn list_health(&self) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let rows = sqlx::query("SELECT node_id, record_json FROM health ORDER BY node_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        let mut health_by_node = BTreeMap::new();
+        for row in rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            health_by_node.insert(node_id, pg_row_to_health(row)?);
+        }
+        Ok(health_by_node)
+    }
+
     async fn upsert_nat_classification(
         &self,
         node_id: NodeId,
@@ -1379,7 +1572,16 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .map_err(sql_error)?
             .map(pg_row_to_health)
             .transpose()?;
-        ensure_heartbeat_is_newer(&update, previous_health.as_ref())?;
+        let previous_signature_at = sqlx::query(
+            "SELECT accepted_signature_at FROM heartbeat_signatures WHERE node_id = $1",
+        )
+        .bind(update.node_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(sql_error)?
+        .map(|row| parse_utc_timestamp(&row.get::<String, _>("accepted_signature_at")))
+        .transpose()?;
+        ensure_heartbeat_is_newer(&update, previous_signature_at, previous_health.as_ref())?;
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
@@ -1392,6 +1594,21 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        if let Some(accepted_signature_at) = update.accepted_signature_at {
+            sqlx::query(
+                r#"
+                INSERT INTO heartbeat_signatures (node_id, accepted_signature_at)
+                VALUES ($1, $2)
+                ON CONFLICT(node_id)
+                DO UPDATE SET accepted_signature_at = excluded.accepted_signature_at
+                "#,
+            )
+            .bind(update.node_id.as_str())
+            .bind(accepted_signature_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        }
         sqlx::query(
             r#"
             INSERT INTO health (node_id, record_json)
@@ -1519,6 +1736,46 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .into_iter()
             .map(pg_row_to_path)
             .collect()
+    }
+
+    async fn list_paths_for_pairs(
+        &self,
+        pairs: &BTreeSet<(NodeId, NodeId)>,
+    ) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        let pairs = pairs.iter().collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for chunk in pairs.chunks(PATH_PAIR_QUERY_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new("SELECT record_json FROM paths WHERE ");
+            {
+                let mut conditions = query.separated(" OR ");
+                for (local, remote) in chunk {
+                    conditions
+                        .push("(local_node_id = ")
+                        .push_bind_unseparated(local.as_str())
+                        .push_unseparated(" AND remote_node_id = ")
+                        .push_bind_unseparated(remote.as_str())
+                        .push_unseparated(")");
+                }
+            }
+            query.push(" ORDER BY local_node_id, remote_node_id");
+            paths.extend(
+                query
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(sql_error)?
+                    .into_iter()
+                    .map(pg_row_to_path)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        paths.sort_by(|left, right| {
+            left.key
+                .local
+                .cmp(&right.key.local)
+                .then_with(|| left.key.remote.cmp(&right.key.remote))
+        });
+        Ok(paths)
     }
 
     async fn upsert_service_instance(
@@ -2016,20 +2273,36 @@ async fn update_postgres_token(
 
 fn ensure_heartbeat_is_newer(
     update: &HeartbeatStoreUpdate,
-    previous: Option<&NodeHealth>,
+    previous_signature_at: Option<DateTime<Utc>>,
+    previous_health: Option<&NodeHealth>,
 ) -> Result<(), ControlPlaneError> {
-    if let Some(previous) = previous {
-        if update.health.last_seen_at <= previous.last_seen_at {
+    if let Some(accepted_signature_at) = update.accepted_signature_at {
+        if let Some(previous_signature_at) = previous_signature_at {
+            if accepted_signature_at <= previous_signature_at {
+                return Err(ControlPlaneError::NodeSignatureRejected {
+                    node_id: update.node_id.clone(),
+                    reason: format!(
+                        "signed_at {accepted_signature_at} is not newer than last accepted heartbeat {previous_signature_at}"
+                    ),
+                });
+            }
+        }
+    } else if let Some(previous_health) = previous_health {
+        if update.health.last_seen_at <= previous_health.last_seen_at {
             return Err(ControlPlaneError::NodeSignatureRejected {
                 node_id: update.node_id.clone(),
-                reason: format!(
-                    "signed_at {} is not newer than last accepted heartbeat {}",
-                    update.health.last_seen_at, previous.last_seen_at
-                ),
+                reason: "unsigned heartbeat was received before the current health snapshot"
+                    .to_string(),
             });
         }
     }
     Ok(())
+}
+
+fn parse_utc_timestamp(value: &str) -> Result<DateTime<Utc>, ControlPlaneError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| ControlPlaneError::Store(error.to_string()))
 }
 
 fn sql_error(error: sqlx::Error) -> ControlPlaneError {
@@ -2171,6 +2444,7 @@ mod tests {
         };
         Ok(HeartbeatStoreUpdate {
             node_id: local.node_id.clone(),
+            accepted_signature_at: Some(accepted_at),
             candidates: vec![candidate],
             nat_classification: None,
             relay_capability: Some(relay),
@@ -2240,6 +2514,14 @@ mod tests {
         assert_eq!(store.list_nodes().await?.len(), 2);
         assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 2);
         assert_eq!(store.list_all_paths().await?.len(), 2);
+        let requested_pairs = BTreeSet::from([(local.node_id.clone(), remote.node_id.clone())]);
+        let requested_paths = store.list_paths_for_pairs(&requested_pairs).await?;
+        assert_eq!(requested_paths.len(), 1);
+        assert_eq!(requested_paths[0].key.local, local.node_id);
+        assert_eq!(
+            store.list_paths_for_pairs(&BTreeSet::new()).await?,
+            Vec::new()
+        );
         store.replace_node_paths(&local.node_id, Vec::new()).await?;
         let remaining_paths = store.list_paths_for(&local.node_id).await?;
         assert_eq!(remaining_paths.len(), 1);
@@ -2330,7 +2612,14 @@ mod tests {
         store
             .upsert_health(local.node_id.clone(), health.clone())
             .await?;
-        assert_eq!(store.get_health(&local.node_id).await?, Some(health));
+        assert_eq!(
+            store.get_health(&local.node_id).await?,
+            Some(health.clone())
+        );
+        assert_eq!(
+            store.list_health().await?,
+            BTreeMap::from([(local.node_id.clone(), health)])
+        );
         let assessed_at = Utc::now();
         let nat_classification = NatClassification::from_observations(
             SocketAddr::from(([10, 0, 0, 10], 51820)),
@@ -2525,10 +2814,13 @@ mod tests {
         let remote = node("node-b", Ipv4Addr::new(100, 64, 0, 2));
         store.insert_node(local.clone()).await?;
         store.insert_node(remote.clone()).await?;
-        let old_at = Utc::now();
+        let received_at = Utc::now();
+        let old_at = received_at - chrono::Duration::seconds(120);
         let new_at = old_at + chrono::Duration::seconds(1);
-        let old = heartbeat_update(&local, &remote, old_at, "old", 10)?;
-        let newest = heartbeat_update(&local, &remote, new_at, "new", 11)?;
+        let mut old = heartbeat_update(&local, &remote, old_at, "old", 10)?;
+        old.health.last_seen_at = received_at;
+        let mut newest = heartbeat_update(&local, &remote, new_at, "new", 11)?;
+        newest.health.last_seen_at = received_at + chrono::Duration::milliseconds(1);
 
         store.apply_heartbeat(old.clone()).await?;
         store.apply_heartbeat(newest.clone()).await?;
@@ -2548,10 +2840,72 @@ mod tests {
             newest.routes.clone().unwrap_or_default()
         );
         assert_eq!(store.get_health(&local.node_id).await?, Some(newest.health));
+        assert_eq!(
+            store
+                .get_heartbeat_signature_timestamp(&local.node_id)
+                .await?,
+            Some(new_at)
+        );
         assert_eq!(store.list_paths_for(&local.node_id).await?, newest.paths);
 
         drop(store);
         let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_backfills_legacy_health_signature_timestamp(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        sqlx::query(
+            "CREATE TABLE health (node_id TEXT PRIMARY KEY NOT NULL, record_json TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await?;
+        let signed_at =
+            DateTime::parse_from_rfc3339("2026-07-27T01:02:03.456789Z")?.with_timezone(&Utc);
+        let health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: signed_at,
+            latency_ms: None,
+            relay_load: None,
+            message: None,
+        };
+        sqlx::query("INSERT INTO health (node_id, record_json) VALUES (?1, ?2)")
+            .bind("legacy-node")
+            .bind(serde_json::to_string(&health)?)
+            .execute(&pool)
+            .await?;
+
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        assert_eq!(
+            store
+                .get_heartbeat_signature_timestamp(&NodeId::from_string("legacy-node"))
+                .await?,
+            Some(signed_at)
+        );
+        let unsigned_node = NodeId::from_string("unsigned-node");
+        store
+            .upsert_health(
+                unsigned_node.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: signed_at + chrono::Duration::seconds(1),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        let pool = store.pool.clone();
+        drop(store);
+        let reopened = SqliteControlPlaneStore::from_pool(pool).await?;
+        assert_eq!(
+            reopened
+                .get_heartbeat_signature_timestamp(&unsigned_node)
+                .await?,
+            None
+        );
         Ok(())
     }
 

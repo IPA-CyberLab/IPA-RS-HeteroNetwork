@@ -7,10 +7,10 @@
 use ipars_types::NodeId;
 use thiserror::Error;
 
-pub const MULTIHOP_FRAME_VERSION: u8 = 1;
+pub const MULTIHOP_FRAME_VERSION: u8 = 2;
 pub const MULTIHOP_PATH_ID_BYTES: usize = 16;
 pub const MAX_MULTIHOP_NODE_ID_BYTES: usize = 128;
-pub const MAX_MULTIHOP_PATH_NODES: usize = 32;
+pub const MAX_MULTIHOP_PATH_NODES: usize = 512;
 pub const MAX_MULTIHOP_PAYLOAD_BYTES: usize = 65_000;
 pub const MAX_MULTIHOP_FRAME_BYTES: usize = 65_507;
 
@@ -21,9 +21,9 @@ const TOPOLOGY_EPOCH_OFFSET: usize = FLAGS_OFFSET + 1;
 const PATH_ID_OFFSET: usize = TOPOLOGY_EPOCH_OFFSET + 8;
 const SEQUENCE_OFFSET: usize = PATH_ID_OFFSET + MULTIHOP_PATH_ID_BYTES;
 const HOP_INDEX_OFFSET: usize = SEQUENCE_OFFSET + 8;
-const HOP_LIMIT_OFFSET: usize = HOP_INDEX_OFFSET + 1;
-const PATH_COUNT_OFFSET: usize = HOP_LIMIT_OFFSET + 1;
-const RESERVED_OFFSET: usize = PATH_COUNT_OFFSET + 1;
+const HOP_LIMIT_OFFSET: usize = HOP_INDEX_OFFSET + 2;
+const PATH_COUNT_OFFSET: usize = HOP_LIMIT_OFFSET + 2;
+const RESERVED_OFFSET: usize = PATH_COUNT_OFFSET + 2;
 const SOURCE_LENGTH_OFFSET: usize = RESERVED_OFFSET + 1;
 const DESTINATION_LENGTH_OFFSET: usize = SOURCE_LENGTH_OFFSET + 2;
 const PAYLOAD_LENGTH_OFFSET: usize = DESTINATION_LENGTH_OFFSET + 2;
@@ -63,7 +63,7 @@ pub enum MultiHopCodecError {
     PayloadUnavailable,
 }
 
-/// A validated V1 multi-hop envelope.
+/// A validated V2 multi-hop envelope.
 ///
 /// `path` contains relay nodes only, in forwarding order. `hop_index` is the
 /// number of path entries already consumed. A complete envelope has
@@ -73,8 +73,8 @@ pub struct MultiHopEnvelope {
     topology_epoch: u64,
     path_id: [u8; MULTIHOP_PATH_ID_BYTES],
     sequence: u64,
-    hop_index: u8,
-    hop_limit: u8,
+    hop_index: u16,
+    hop_limit: u16,
     source: NodeId,
     destination: NodeId,
     path: Vec<NodeId>,
@@ -87,7 +87,7 @@ impl MultiHopEnvelope {
         topology_epoch: u64,
         path_id: [u8; MULTIHOP_PATH_ID_BYTES],
         sequence: u64,
-        hop_limit: u8,
+        hop_limit: u16,
         source: NodeId,
         destination: NodeId,
         path: Vec<NodeId>,
@@ -135,9 +135,9 @@ impl MultiHopEnvelope {
         let mut path_id = [0_u8; MULTIHOP_PATH_ID_BYTES];
         path_id.copy_from_slice(reader.take(MULTIHOP_PATH_ID_BYTES)?);
         let sequence = reader.read_u64()?;
-        let hop_index = reader.read_u8()?;
-        let hop_limit = reader.read_u8()?;
-        let path_count = usize::from(reader.read_u8()?);
+        let hop_index = reader.read_u16()?;
+        let hop_limit = reader.read_u16()?;
+        let path_count = usize::from(reader.read_u16()?);
         if reader.read_u8()? != 0 {
             return Err(MultiHopCodecError::NonCanonicalFrame);
         }
@@ -190,7 +190,7 @@ impl MultiHopEnvelope {
         Ok(envelope)
     }
 
-    /// Encode the envelope using the only canonical V1 representation.
+    /// Encode the envelope using the only canonical V2 representation.
     pub fn encode(&self) -> Result<Vec<u8>, MultiHopCodecError> {
         let encoded_len = self.validate(1)?;
         let mut frame = Vec::with_capacity(encoded_len);
@@ -200,9 +200,9 @@ impl MultiHopEnvelope {
         frame.extend_from_slice(&self.topology_epoch.to_be_bytes());
         frame.extend_from_slice(&self.path_id);
         frame.extend_from_slice(&self.sequence.to_be_bytes());
-        frame.push(self.hop_index);
-        frame.push(self.hop_limit);
-        frame.push(self.path.len() as u8);
+        frame.extend_from_slice(&self.hop_index.to_be_bytes());
+        frame.extend_from_slice(&self.hop_limit.to_be_bytes());
+        frame.extend_from_slice(&(self.path.len() as u16).to_be_bytes());
         frame.push(0);
         frame.extend_from_slice(&(self.source.as_str().len() as u16).to_be_bytes());
         frame.extend_from_slice(&(self.destination.as_str().len() as u16).to_be_bytes());
@@ -269,11 +269,11 @@ impl MultiHopEnvelope {
         self.sequence
     }
 
-    pub fn hop_index(&self) -> u8 {
+    pub fn hop_index(&self) -> u16 {
         self.hop_index
     }
 
-    pub fn hop_limit(&self) -> u8 {
+    pub fn hop_limit(&self) -> u16 {
         self.hop_limit
     }
 
@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_encoding_is_canonical_and_round_trips() -> Result<(), MultiHopCodecError> {
+    fn v2_encoding_is_canonical_and_round_trips() -> Result<(), MultiHopCodecError> {
         let envelope = MultiHopEnvelope::new(
             1,
             path_id(),
@@ -519,11 +519,14 @@ mod tests {
 
         let mut expected = Vec::new();
         expected.extend_from_slice(b"IPARS-MH");
-        expected.extend_from_slice(&[1, 0]);
+        expected.extend_from_slice(&[2, 0]);
         expected.extend_from_slice(&1_u64.to_be_bytes());
         expected.extend_from_slice(&path_id());
         expected.extend_from_slice(&2_u64.to_be_bytes());
-        expected.extend_from_slice(&[0, 1, 1, 0]);
+        expected.extend_from_slice(&0_u16.to_be_bytes());
+        expected.extend_from_slice(&1_u16.to_be_bytes());
+        expected.extend_from_slice(&1_u16.to_be_bytes());
+        expected.push(0);
         expected.extend_from_slice(&1_u16.to_be_bytes());
         expected.extend_from_slice(&1_u16.to_be_bytes());
         expected.extend_from_slice(&2_u32.to_be_bytes());
@@ -593,14 +596,14 @@ mod tests {
         ));
 
         let mut exhausted = encoded.clone();
-        exhausted[HOP_LIMIT_OFFSET] = 1;
+        exhausted[HOP_LIMIT_OFFSET..HOP_LIMIT_OFFSET + 2].copy_from_slice(&1_u16.to_be_bytes());
         assert!(matches!(
             MultiHopEnvelope::decode(&exhausted, 7),
             Err(MultiHopCodecError::ExpiredFrame)
         ));
 
         let mut invalid_index = encoded;
-        invalid_index[HOP_INDEX_OFFSET] = 5;
+        invalid_index[HOP_INDEX_OFFSET..HOP_INDEX_OFFSET + 2].copy_from_slice(&5_u16.to_be_bytes());
         assert!(matches!(
             MultiHopEnvelope::decode(&invalid_index, 7),
             Err(MultiHopCodecError::ExpiredFrame)
@@ -684,20 +687,39 @@ mod tests {
         let maximum_path = (0..MAX_MULTIHOP_PATH_NODES)
             .map(|index| node(&format!("relay-{index:02}")))
             .collect::<Vec<_>>();
-        let maximum_payload = vec![0x5a; MAX_MULTIHOP_PAYLOAD_BYTES];
-        let maximum = MultiHopEnvelope::new(
+        let maximum_path_envelope = MultiHopEnvelope::new(
             1,
             path_id(),
             1,
-            MAX_MULTIHOP_PATH_NODES as u8,
+            MAX_MULTIHOP_PATH_NODES as u16,
             node("s"),
             node("d"),
             maximum_path,
-            maximum_payload,
+            vec![0x5a],
         )?;
-        let maximum_encoded = maximum.encode()?;
-        assert!(maximum_encoded.len() <= MAX_MULTIHOP_FRAME_BYTES);
-        assert_eq!(MultiHopEnvelope::decode(&maximum_encoded, 1)?, maximum);
+        let maximum_path_encoded = maximum_path_envelope.encode()?;
+        assert!(maximum_path_encoded.len() <= MAX_MULTIHOP_FRAME_BYTES);
+        assert_eq!(
+            MultiHopEnvelope::decode(&maximum_path_encoded, 1)?,
+            maximum_path_envelope
+        );
+
+        let maximum_payload_envelope = MultiHopEnvelope::new(
+            1,
+            path_id(),
+            1,
+            1,
+            node("s"),
+            node("d"),
+            vec![node("relay")],
+            vec![0x5a; MAX_MULTIHOP_PAYLOAD_BYTES],
+        )?;
+        let maximum_payload_encoded = maximum_payload_envelope.encode()?;
+        assert!(maximum_payload_encoded.len() <= MAX_MULTIHOP_FRAME_BYTES);
+        assert_eq!(
+            MultiHopEnvelope::decode(&maximum_payload_encoded, 1)?,
+            maximum_payload_envelope
+        );
 
         let too_many_hops = (0..=MAX_MULTIHOP_PATH_NODES)
             .map(|index| node(&format!("relay-{index:02}")))
@@ -707,7 +729,7 @@ mod tests {
                 1,
                 path_id(),
                 1,
-                MAX_MULTIHOP_PATH_NODES as u8,
+                MAX_MULTIHOP_PATH_NODES as u16,
                 node("s"),
                 node("d"),
                 too_many_hops,
@@ -820,7 +842,7 @@ mod tests {
         bad_version[VERSION_OFFSET] = MULTIHOP_FRAME_VERSION + 1;
         assert!(matches!(
             MultiHopEnvelope::decode(&bad_version, 1),
-            Err(MultiHopCodecError::UnsupportedVersion(2))
+            Err(MultiHopCodecError::UnsupportedVersion(3))
         ));
 
         for offset in [FLAGS_OFFSET, RESERVED_OFFSET] {

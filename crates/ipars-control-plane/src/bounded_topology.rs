@@ -1,13 +1,15 @@
-//! Deterministic block-aware bounded-degree topology synthesis for the relay backbone.
+//! Deterministic recursive bounded-degree topology synthesis for the relay backbone.
 //!
-//! The topology is the union of Hamiltonian cycles whose members remain
-//! contiguous inside deterministic blocks. The first cycle follows stable
-//! block and node-ID order and guarantees connectedness. Additional cycles use
-//! domain-separated SHA-256 block and member orderings, which provide redundant
-//! representatives and lower diameter without allowing any cycle to add more
-//! than two neighbors per node.
+//! Membership is placed in a hash-prefix hierarchy. Leaves contain at most the
+//! configured fanout, internal groups contain at most that many child groups,
+//! and every non-root group exposes two deterministic ports to its parent.
+//! Leaf cycles consume at most two physical links per node. Parent groups join
+//! each child's secondary port to the next child's primary port, so each port
+//! consumes one more link and the parent-level block ring survives one failed
+//! representative as a path.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use ipars_crypto::node_id_from_public_key;
 use ipars_types::{
@@ -15,8 +17,10 @@ use ipars_types::{
 };
 use thiserror::Error;
 
-pub const TOPOLOGY_ALGORITHM_VERSION: &str = "block-aware-hamiltonian-cycle-union-v2";
+pub const TOPOLOGY_ALGORITHM_VERSION: &str = "recursive-hash-prefix-block-ring-v3";
 const DEFAULT_PERMUTATION_SEED: &str = "ipars-bounded-backbone";
+const MIN_HIERARCHICAL_BLOCK_SIZE: usize = 4;
+const MAX_HASH_PREFIX_PROBES: usize = 256;
 
 pub const SUPPORTED_MAX_DEGREES: [usize; 2] = [4, 6];
 
@@ -50,7 +54,7 @@ impl BoundedTopologyConfig {
 
 impl Default for BoundedTopologyConfig {
     fn default() -> Self {
-        Self::new(6)
+        Self::new(4)
     }
 }
 
@@ -61,18 +65,90 @@ pub struct TopologyEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TopologyBlock {
-    block_id: String,
+pub struct TopologyGroup {
+    group_id: String,
     node_ids: Vec<NodeId>,
+    parent_group_id: Option<String>,
+    child_group_ids: Vec<String>,
+    depth: usize,
+    representatives: Vec<TopologyRepresentative>,
 }
 
-impl TopologyBlock {
-    pub fn block_id(&self) -> &str {
-        &self.block_id
+impl TopologyGroup {
+    pub fn group_id(&self) -> &str {
+        &self.group_id
     }
 
     pub fn node_ids(&self) -> &[NodeId] {
         &self.node_ids
+    }
+
+    pub fn parent_group_id(&self) -> Option<&str> {
+        self.parent_group_id.as_deref()
+    }
+
+    pub fn child_group_ids(&self) -> &[String] {
+        &self.child_group_ids
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn representatives(&self) -> &[TopologyRepresentative] {
+        &self.representatives
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.child_group_ids.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyRepresentative {
+    node_id: NodeId,
+    plane: usize,
+}
+
+impl TopologyRepresentative {
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn plane(&self) -> usize {
+        self.plane
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TopologyEdgeKind {
+    LeafCycle,
+    HierarchyLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TopologyEdgePlacement {
+    level: usize,
+    plane: usize,
+    kind: TopologyEdgeKind,
+    group_id: String,
+}
+
+impl TopologyEdgePlacement {
+    pub fn level(&self) -> usize {
+        self.level
+    }
+
+    pub fn plane(&self) -> usize {
+        self.plane
+    }
+
+    pub fn kind(&self) -> TopologyEdgeKind {
+        self.kind
+    }
+
+    pub fn group_id(&self) -> &str {
+        &self.group_id
     }
 }
 
@@ -151,17 +227,74 @@ pub enum BoundedTopologyError {
     DuplicateNodeId { node_id: NodeId },
     #[error("bounded topology synthesis violated invariant: {reason}")]
     InvariantViolation { reason: &'static str },
+    #[error("could not allocate two bounded-degree representatives for group {group_id}")]
+    RepresentativeCapacity { group_id: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BoundedTopology {
     topology_epoch: u64,
     max_degree: usize,
-    block_size: usize,
-    blocks: Vec<TopologyBlock>,
-    edge_cycles: BTreeMap<TopologyEdge, BTreeSet<usize>>,
+    fanout: usize,
+    groups: Vec<TopologyGroup>,
+    edge_placements: BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>>,
     adjacency: BTreeMap<NodeId, BTreeSet<NodeId>>,
     invariants: TopologyInvariants,
+    diameter_lower_bound: Option<usize>,
+    routing_node_ids: Vec<NodeId>,
+    routing_node_indexes: BTreeMap<NodeId, usize>,
+    indexed_adjacency: Vec<Vec<usize>>,
+    next_hop_cache: Arc<NextHopCache>,
+}
+
+impl PartialEq for BoundedTopology {
+    fn eq(&self, other: &Self) -> bool {
+        self.topology_epoch == other.topology_epoch
+            && self.max_degree == other.max_degree
+            && self.fanout == other.fanout
+            && self.groups == other.groups
+            && self.edge_placements == other.edge_placements
+            && self.adjacency == other.adjacency
+            && self.invariants == other.invariants
+            && self.diameter_lower_bound == other.diameter_lower_bound
+            && self.routing_node_ids == other.routing_node_ids
+            && self.routing_node_indexes == other.routing_node_indexes
+            && self.indexed_adjacency == other.indexed_adjacency
+    }
+}
+
+impl Eq for BoundedTopology {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactNextHops {
+    primary: u32,
+    secondary: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct NextHopCache {
+    by_source: StdMutex<BTreeMap<usize, Arc<Vec<Option<CompactNextHops>>>>>,
+}
+
+pub(crate) struct TopologyNextHopTable<'a> {
+    topology: &'a BoundedTopology,
+    compact: Arc<Vec<Option<CompactNextHops>>>,
+}
+
+impl TopologyNextHopTable<'_> {
+    pub(crate) fn get(&self, destination: &NodeId) -> Option<(NodeId, Option<NodeId>)> {
+        let destination_index = *self.topology.routing_node_indexes.get(destination)?;
+        let next_hops = self.compact.get(destination_index)?.as_ref()?;
+        let primary = self
+            .topology
+            .routing_node_ids
+            .get(next_hops.primary as usize)?
+            .clone();
+        let secondary = next_hops
+            .secondary
+            .and_then(|index| self.topology.routing_node_ids.get(index as usize).cloned());
+        Some((primary, secondary))
+    }
 }
 
 impl BoundedTopology {
@@ -174,7 +307,8 @@ impl BoundedTopology {
                 max_degree: config.max_degree,
             });
         }
-        let minimum_block_size = usize::from(MIN_OVERLAY_BLOCK_SIZE);
+        let minimum_block_size =
+            usize::from(MIN_OVERLAY_BLOCK_SIZE).max(MIN_HIERARCHICAL_BLOCK_SIZE);
         let maximum_block_size = usize::from(MAX_OVERLAY_BLOCK_SIZE);
         if !(minimum_block_size..=maximum_block_size).contains(&config.block_size) {
             return Err(BoundedTopologyError::InvalidBlockSize {
@@ -186,19 +320,23 @@ impl BoundedTopology {
 
         let node_ids = canonical_node_ids(nodes)?;
         let topology_epoch = topology_epoch(&node_ids, config);
-        let blocks = topology_blocks(&node_ids, config.block_size);
+        let mut hierarchy = build_hierarchy(&node_ids, config)?;
         let mut adjacency = node_ids
             .iter()
             .cloned()
             .map(|node_id| (node_id, BTreeSet::new()))
             .collect::<BTreeMap<_, _>>();
-        let mut edge_cycles = BTreeMap::<TopologyEdge, BTreeSet<usize>>::new();
+        let mut edge_placements = BTreeMap::<TopologyEdge, BTreeSet<TopologyEdgePlacement>>::new();
+        let mut reserved_representative_degree = BTreeMap::new();
 
-        let cycle_count = config.max_degree / 2;
-        for cycle_index in 0..cycle_count {
-            let cycle = block_aware_cycle(&blocks, cycle_index, config);
-            add_hamiltonian_cycle(&mut adjacency, &mut edge_cycles, &cycle, cycle_index);
-        }
+        add_leaf_cycles(&hierarchy, &mut adjacency, &mut edge_placements);
+        allocate_representatives_and_hierarchy_edges(
+            &mut hierarchy,
+            config,
+            &mut reserved_representative_degree,
+            &mut adjacency,
+            &mut edge_placements,
+        )?;
 
         let invariants = inspect_invariants(&adjacency, config.max_degree);
         if !invariants.connected {
@@ -221,15 +359,48 @@ impl BoundedTopology {
                 reason: "graph exceeds the configured maximum degree",
             });
         }
+        if !graph_has_no_articulation_points(&adjacency) {
+            return Err(BoundedTopologyError::InvariantViolation {
+                reason: "a single node failure disconnects the remaining graph",
+            });
+        }
+        let diameter_lower_bound = calculate_diameter_lower_bound(&adjacency);
+        let groups: Vec<TopologyGroup> = hierarchy
+            .into_iter()
+            .map(HierarchyGroup::into_group)
+            .collect();
+        let routing_node_ids = node_ids;
+        let routing_node_indexes = routing_node_ids
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, node_id)| (node_id, index))
+            .collect::<BTreeMap<_, _>>();
+        let indexed_adjacency = routing_node_ids
+            .iter()
+            .map(|node_id| {
+                adjacency
+                    .get(node_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|neighbor| routing_node_indexes.get(neighbor).copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
         Ok(Self {
             topology_epoch,
             max_degree: config.max_degree,
-            block_size: config.block_size,
-            blocks,
-            edge_cycles,
+            fanout: config.block_size,
+            groups,
+            edge_placements,
             adjacency,
             invariants,
+            diameter_lower_bound,
+            routing_node_ids,
+            routing_node_indexes,
+            indexed_adjacency,
+            next_hop_cache: Arc::new(NextHopCache::default()),
         })
     }
 
@@ -241,16 +412,16 @@ impl BoundedTopology {
         self.max_degree
     }
 
-    pub fn block_size(&self) -> usize {
-        self.block_size
+    pub fn fanout(&self) -> usize {
+        self.fanout
     }
 
-    pub fn blocks(&self) -> &[TopologyBlock] {
-        &self.blocks
+    pub fn groups(&self) -> &[TopologyGroup] {
+        &self.groups
     }
 
-    pub fn edge_cycles(&self) -> &BTreeMap<TopologyEdge, BTreeSet<usize>> {
-        &self.edge_cycles
+    pub fn edge_placements(&self) -> &BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>> {
+        &self.edge_placements
     }
 
     pub fn adjacency(&self) -> &BTreeMap<NodeId, BTreeSet<NodeId>> {
@@ -322,6 +493,23 @@ impl BoundedTopology {
         }
 
         let secondary = self.secondary_path(source, destination, &primary);
+        if secondary
+            .as_ref()
+            .is_some_and(|path| path.kind == SecondaryPathKind::VertexDisjoint)
+        {
+            return Some(TopologyPaths { primary, secondary });
+        }
+        if let Some((primary, secondary)) =
+            two_internally_vertex_disjoint_paths(&self.adjacency, source, destination)
+        {
+            return Some(TopologyPaths {
+                primary,
+                secondary: Some(SecondaryPath {
+                    kind: SecondaryPathKind::VertexDisjoint,
+                    nodes: secondary,
+                }),
+            });
+        }
 
         Some(TopologyPaths { primary, secondary })
     }
@@ -360,49 +548,178 @@ impl BoundedTopology {
         }
     }
 
-    /// Compute first hops with the same path-disjointness semantics as
-    /// [`Self::paths`]. Primary paths share one BFS tree; alternate paths are
-    /// resolved per destination to preserve vertex-first, edge-only fallback.
+    pub(crate) fn next_hop_table(&self, source: &NodeId) -> Option<TopologyNextHopTable<'_>> {
+        let source_index = *self.routing_node_indexes.get(source)?;
+        let compact = self.cached_next_hops_from(source_index)?;
+        Some(TopologyNextHopTable {
+            topology: self,
+            compact,
+        })
+    }
+
+    /// Compute primary and alternate first hops. The alternate route never uses
+    /// the primary first-hop node as an internal vertex, so it remains usable
+    /// after that neighbor fails.
     pub fn next_hops_from(
         &self,
         source: &NodeId,
     ) -> Option<BTreeMap<NodeId, (NodeId, Option<NodeId>)>> {
-        self.adjacency.get(source)?;
-        let primary_predecessors = predecessor_tree_from(source, &self.adjacency);
+        let table = self.next_hop_table(source)?;
         let mut next_hops = BTreeMap::new();
-        for destination in self.adjacency.keys().filter(|node| *node != source) {
-            let Some(primary) = reconstruct_path(source, destination, &primary_predecessors) else {
-                continue;
-            };
-            let Some(primary_next_hop) = primary.get(1).cloned() else {
-                continue;
-            };
-            let secondary_next_hop = self
-                .secondary_path(source, destination, &primary)
-                .and_then(|secondary| secondary.nodes.get(1).cloned())
-                .filter(|secondary| secondary != &primary_next_hop);
-            next_hops.insert(destination.clone(), (primary_next_hop, secondary_next_hop));
+        for destination in &self.routing_node_ids {
+            if let Some(hops) = table.get(destination) {
+                next_hops.insert(destination.clone(), hops);
+            }
         }
         Some(next_hops)
     }
 
-    /// Returns `None` for an empty or disconnected graph.
-    pub fn diameter(&self) -> Option<usize> {
-        if self.adjacency.is_empty() {
-            return None;
+    fn cached_next_hops_from(
+        &self,
+        source_index: usize,
+    ) -> Option<Arc<Vec<Option<CompactNextHops>>>> {
+        if let Some(cached) = self
+            .next_hop_cache
+            .by_source
+            .lock()
+            .ok()?
+            .get(&source_index)
+            .cloned()
+        {
+            return Some(cached);
         }
+        let computed = Arc::new(self.compute_next_hops_from(source_index)?);
+        let mut cache = self.next_hop_cache.by_source.lock().ok()?;
+        Some(
+            cache
+                .entry(source_index)
+                .or_insert_with(|| computed.clone())
+                .clone(),
+        )
+    }
 
-        let mut diameter = 0;
-        for source in self.adjacency.keys() {
-            let distances = distances_from(source, &self.adjacency);
-            if distances.len() != self.adjacency.len() {
-                return None;
+    fn compute_next_hops_from(&self, source_index: usize) -> Option<Vec<Option<CompactNextHops>>> {
+        let source_neighbors = self.indexed_adjacency.get(source_index)?;
+        let candidate_distances = source_neighbors
+            .iter()
+            .filter_map(|neighbor| {
+                Some((
+                    u32::try_from(*neighbor).ok()?,
+                    self.indexed_distances_from_avoiding(*neighbor, source_index),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let alternate_labels = source_neighbors
+            .iter()
+            .filter_map(|neighbor| {
+                Some((
+                    u32::try_from(*neighbor).ok()?,
+                    self.alternate_first_hop_labels(source_index, *neighbor),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut table = vec![None; self.routing_node_ids.len()];
+        for destination_index in 0..self.routing_node_ids.len() {
+            if destination_index == source_index {
+                continue;
             }
-            if let Some(farthest) = distances.values().max() {
-                diameter = diameter.max(*farthest);
+            let mut candidates = candidate_distances
+                .iter()
+                .filter_map(|(neighbor, distances)| {
+                    distances[destination_index].map(|distance| (distance + 1, *neighbor))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort();
+            let fallback_primary = candidates.first().map(|(_, neighbor)| *neighbor)?;
+            let reliable = candidates.into_iter().find_map(|(_, primary)| {
+                let secondary = alternate_labels
+                    .get(&primary)?
+                    .get(destination_index)?
+                    .filter(|secondary| *secondary != primary)?;
+                Some((primary, secondary))
+            });
+            let (primary, secondary) = reliable
+                .map(|(primary, secondary)| (primary, Some(secondary)))
+                .unwrap_or((fallback_primary, None));
+            table[destination_index] = Some(CompactNextHops { primary, secondary });
+        }
+        Some(table)
+    }
+
+    fn indexed_distances_from_avoiding(
+        &self,
+        source_index: usize,
+        unavailable_index: usize,
+    ) -> Vec<Option<u32>> {
+        let mut distances = vec![None; self.routing_node_ids.len()];
+        distances[source_index] = Some(0_u32);
+        let mut queue = VecDeque::from([source_index]);
+        while let Some(current) = queue.pop_front() {
+            let Some(distance) = distances[current] else {
+                continue;
+            };
+            for &neighbor in &self.indexed_adjacency[current] {
+                if neighbor == unavailable_index || distances[neighbor].is_some() {
+                    continue;
+                }
+                let Some(next_distance) = distance.checked_add(1) else {
+                    continue;
+                };
+                distances[neighbor] = Some(next_distance);
+                queue.push_back(neighbor);
             }
         }
-        Some(diameter)
+        distances
+    }
+
+    fn alternate_first_hop_labels(
+        &self,
+        source_index: usize,
+        terminal_index: usize,
+    ) -> Vec<Option<u32>> {
+        let mut labels = vec![None; self.routing_node_ids.len()];
+        let mut queue = VecDeque::new();
+        for &neighbor in &self.indexed_adjacency[source_index] {
+            if neighbor == terminal_index {
+                continue;
+            }
+            let Ok(label) = u32::try_from(neighbor) else {
+                return labels;
+            };
+            labels[neighbor] = Some(label);
+            queue.push_back(neighbor);
+        }
+        while let Some(current) = queue.pop_front() {
+            if current == terminal_index {
+                continue;
+            }
+            let Some(label) = labels[current] else {
+                continue;
+            };
+            for &neighbor in &self.indexed_adjacency[current] {
+                if neighbor == source_index || labels[neighbor].is_some() {
+                    continue;
+                }
+                labels[neighbor] = Some(label);
+                queue.push_back(neighbor);
+            }
+        }
+        labels
+    }
+
+    #[cfg(test)]
+    fn cached_next_hop_source_count(&self) -> usize {
+        self.next_hop_cache
+            .by_source
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or(0)
+    }
+
+    /// Returns a cached lower bound from deterministic repeated farthest-node
+    /// sweeps, or `None` for an empty or disconnected graph.
+    pub fn diameter_lower_bound(&self) -> Option<usize> {
+        self.diameter_lower_bound
     }
 }
 
@@ -430,46 +747,387 @@ fn canonical_node_ids(nodes: &[NodeRecord]) -> Result<Vec<NodeId>, BoundedTopolo
     Ok(node_ids)
 }
 
-fn topology_blocks(node_ids: &[NodeId], block_size: usize) -> Vec<TopologyBlock> {
-    node_ids
-        .chunks(block_size)
-        .enumerate()
-        .map(|(index, node_ids)| TopologyBlock {
-            block_id: format!("block-{:04}", index + 1),
-            node_ids: node_ids.to_vec(),
-        })
-        .collect()
+#[derive(Debug, Clone)]
+struct HierarchyGroup {
+    block_id: String,
+    node_ids: Vec<NodeId>,
+    parent_block_id: Option<String>,
+    child_block_ids: Vec<String>,
+    depth: usize,
+    representatives: Vec<TopologyRepresentative>,
 }
 
-fn block_aware_cycle(
-    blocks: &[TopologyBlock],
-    cycle_index: usize,
+impl HierarchyGroup {
+    fn into_group(self) -> TopologyGroup {
+        TopologyGroup {
+            group_id: self.block_id,
+            node_ids: self.node_ids,
+            parent_group_id: self.parent_block_id,
+            child_group_ids: self.child_block_ids,
+            depth: self.depth,
+            representatives: self.representatives,
+        }
+    }
+}
+
+fn build_hierarchy(
+    node_ids: &[NodeId],
     config: &BoundedTopologyConfig,
-) -> Vec<NodeId> {
-    let mut ordered_blocks = blocks.iter().collect::<Vec<_>>();
-    if cycle_index > 0 {
-        ordered_blocks.sort_by_cached_key(|block| {
-            (
-                block_permutation_hash(block, cycle_index, config),
-                block.block_id.clone(),
-            )
-        });
+) -> Result<Vec<HierarchyGroup>, BoundedTopologyError> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let mut cycle = Vec::with_capacity(blocks.iter().map(|block| block.node_ids.len()).sum());
-    for block in ordered_blocks {
-        let mut members = block.node_ids.clone();
-        if cycle_index > 0 {
-            members.sort_by_cached_key(|node_id| {
-                (
-                    permutation_hash(node_id, cycle_index, config),
-                    node_id.clone(),
-                )
+    let mut groups = Vec::new();
+    build_hierarchy_group(
+        node_ids.to_vec(),
+        None,
+        "group-root".to_string(),
+        0,
+        0,
+        Vec::new(),
+        config,
+        &mut groups,
+    )?;
+    groups.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left.block_id.cmp(&right.block_id))
+    });
+    Ok(groups)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hierarchy_group(
+    mut node_ids: Vec<NodeId>,
+    parent_block_id: Option<String>,
+    block_id: String,
+    depth: usize,
+    hash_depth: usize,
+    prefix: Vec<(usize, usize)>,
+    config: &BoundedTopologyConfig,
+    groups: &mut Vec<HierarchyGroup>,
+) -> Result<(), BoundedTopologyError> {
+    node_ids.sort();
+    if node_ids.len() <= config.block_size {
+        groups.push(HierarchyGroup {
+            block_id,
+            node_ids,
+            parent_block_id,
+            child_block_ids: Vec::new(),
+            depth,
+            representatives: Vec::new(),
+        });
+        return Ok(());
+    }
+
+    let mut split = None;
+    for probe in hash_depth..hash_depth.saturating_add(MAX_HASH_PREFIX_PROBES) {
+        let mut buckets = BTreeMap::<usize, Vec<NodeId>>::new();
+        for node_id in &node_ids {
+            buckets
+                .entry(hash_prefix_digit(node_id, probe, config))
+                .or_default()
+                .push(node_id.clone());
+        }
+        if buckets.len() > 1 {
+            split = Some((probe, buckets));
+            break;
+        }
+    }
+    let (split_depth, buckets) = split.ok_or(BoundedTopologyError::InvariantViolation {
+        reason: "hash-prefix hierarchy could not split an oversized leaf",
+    })?;
+
+    let child_specs = buckets
+        .into_iter()
+        .map(|(digit, members)| {
+            let mut child_prefix = prefix.clone();
+            child_prefix.push((split_depth, digit));
+            let child_id = hierarchy_group_id(&child_prefix, config);
+            (digit, child_id, child_prefix, members)
+        })
+        .collect::<Vec<_>>();
+    let child_block_ids = child_specs
+        .iter()
+        .map(|(_, child_id, _, _)| child_id.clone())
+        .collect::<Vec<_>>();
+    groups.push(HierarchyGroup {
+        block_id: block_id.clone(),
+        node_ids,
+        parent_block_id,
+        child_block_ids,
+        depth,
+        representatives: Vec::new(),
+    });
+    for (_, child_id, child_prefix, members) in child_specs {
+        build_hierarchy_group(
+            members,
+            Some(block_id.clone()),
+            child_id,
+            depth + 1,
+            split_depth + 1,
+            child_prefix,
+            config,
+            groups,
+        )?;
+    }
+    Ok(())
+}
+
+fn hash_prefix_digit(node_id: &NodeId, hash_depth: usize, config: &BoundedTopologyConfig) -> usize {
+    let mut material = Vec::new();
+    append_hash_field(&mut material, b"ipars-hierarchy-prefix");
+    append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
+    append_hash_field(&mut material, config.permutation_seed.as_bytes());
+    append_hash_field(&mut material, hash_depth.to_string().as_bytes());
+    append_hash_field(&mut material, node_id.as_str().as_bytes());
+    cryptographic_hash_u64(&material) as usize % config.block_size
+}
+
+fn hierarchy_group_id(prefix: &[(usize, usize)], config: &BoundedTopologyConfig) -> String {
+    let mut material = Vec::new();
+    append_hash_field(&mut material, b"ipars-hierarchy-group");
+    append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
+    append_hash_field(&mut material, config.permutation_seed.as_bytes());
+    for (depth, digit) in prefix {
+        append_hash_field(&mut material, depth.to_string().as_bytes());
+        append_hash_field(&mut material, digit.to_string().as_bytes());
+    }
+    format!("group-{:016x}", cryptographic_hash_u64(&material))
+}
+
+fn add_leaf_cycles(
+    hierarchy: &[HierarchyGroup],
+    adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
+    edge_placements: &mut BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>>,
+) {
+    for group in hierarchy
+        .iter()
+        .filter(|group| group.child_block_ids.is_empty())
+    {
+        add_placed_cycle(
+            adjacency,
+            edge_placements,
+            &group.node_ids,
+            TopologyEdgePlacement {
+                level: group.depth,
+                plane: 0,
+                kind: TopologyEdgeKind::LeafCycle,
+                group_id: group.block_id.clone(),
+            },
+        );
+    }
+}
+
+fn allocate_representatives_and_hierarchy_edges(
+    hierarchy: &mut [HierarchyGroup],
+    config: &BoundedTopologyConfig,
+    reserved_representative_degree: &mut BTreeMap<NodeId, usize>,
+    adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
+    edge_placements: &mut BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>>,
+) -> Result<(), BoundedTopologyError> {
+    let index_by_id = hierarchy
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.block_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut group_order = hierarchy
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.parent_block_id.is_some())
+        .map(|(index, group)| (group.depth, group.block_id.clone(), index))
+        .collect::<Vec<_>>();
+    group_order.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    for (_, _, group_index) in group_order {
+        let role_degree = 1;
+        let candidates = hierarchy[group_index].node_ids.clone();
+        let representatives = select_group_representatives(
+            &hierarchy[group_index].block_id,
+            &candidates,
+            role_degree,
+            reserved_representative_degree,
+            adjacency,
+            config,
+        )?;
+        for representative in &representatives {
+            *reserved_representative_degree
+                .entry(representative.node_id.clone())
+                .or_default() += role_degree;
+        }
+        hierarchy[group_index].representatives = representatives;
+    }
+
+    let parent_ids = hierarchy
+        .iter()
+        .filter(|group| group.child_block_ids.len() >= 2)
+        .map(|group| group.block_id.clone())
+        .collect::<Vec<_>>();
+    for parent_id in parent_ids {
+        let parent_index = index_by_id[&parent_id];
+        let parent_depth = hierarchy[parent_index].depth;
+        let child_ids = hierarchy[parent_index].child_block_ids.clone();
+        add_hierarchy_block_ring(
+            hierarchy,
+            &index_by_id,
+            &child_ids,
+            adjacency,
+            edge_placements,
+            TopologyEdgePlacement {
+                level: parent_depth,
+                plane: 0,
+                kind: TopologyEdgeKind::HierarchyLink,
+                group_id: parent_id,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_hierarchy_block_ring(
+    hierarchy: &[HierarchyGroup],
+    index_by_id: &BTreeMap<String, usize>,
+    child_ids: &[String],
+    adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
+    edge_placements: &mut BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>>,
+    placement: TopologyEdgePlacement,
+) -> Result<(), BoundedTopologyError> {
+    for index in 0..child_ids.len() {
+        let source_child = &hierarchy[index_by_id[&child_ids[index]]];
+        let target_child = &hierarchy[index_by_id[&child_ids[(index + 1) % child_ids.len()]]];
+        let source = representative_for_plane(source_child, 1)?;
+        let target = representative_for_plane(target_child, 0)?;
+        add_undirected_edge(adjacency, source, target);
+        if let Some(edge) = TopologyEdge::new(source.clone(), target.clone()) {
+            edge_placements
+                .entry(edge)
+                .or_default()
+                .insert(placement.clone());
+        }
+    }
+    Ok(())
+}
+
+fn representative_for_plane(
+    group: &HierarchyGroup,
+    plane: usize,
+) -> Result<&NodeId, BoundedTopologyError> {
+    group
+        .representatives
+        .iter()
+        .find(|representative| representative.plane == plane)
+        .map(|representative| &representative.node_id)
+        .ok_or_else(|| BoundedTopologyError::RepresentativeCapacity {
+            group_id: group.block_id.clone(),
+        })
+}
+
+fn select_group_representatives(
+    group_id: &str,
+    candidates: &[NodeId],
+    role_degree: usize,
+    reserved_representative_degree: &BTreeMap<NodeId, usize>,
+    adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
+    config: &BoundedTopologyConfig,
+) -> Result<Vec<TopologyRepresentative>, BoundedTopologyError> {
+    if candidates.len() == 1 {
+        let node_id = candidates[0].clone();
+        let degree = adjacency.get(&node_id).map(BTreeSet::len).unwrap_or(0);
+        let reserved_degree = reserved_representative_degree
+            .get(&node_id)
+            .copied()
+            .unwrap_or(0);
+        if degree + reserved_degree + 2 * role_degree > 4 {
+            return Err(BoundedTopologyError::RepresentativeCapacity {
+                group_id: group_id.to_string(),
             });
         }
-        cycle.extend(members);
+        return Ok(vec![
+            TopologyRepresentative {
+                node_id: node_id.clone(),
+                plane: 0,
+            },
+            TopologyRepresentative { node_id, plane: 1 },
+        ]);
     }
-    cycle
+
+    let mut selected = Vec::with_capacity(2);
+    for plane in 0..2 {
+        let candidate = candidates
+            .iter()
+            .filter(|node_id| {
+                !selected
+                    .iter()
+                    .any(|representative: &TopologyRepresentative| {
+                        &representative.node_id == *node_id
+                    })
+            })
+            .filter(|node_id| {
+                adjacency.get(*node_id).map(BTreeSet::len).unwrap_or(0)
+                    + reserved_representative_degree
+                        .get(*node_id)
+                        .copied()
+                        .unwrap_or(0)
+                    + role_degree
+                    <= 4
+            })
+            .max_by_key(|node_id| {
+                (
+                    representative_score(group_id, plane, node_id, config),
+                    (*node_id).clone(),
+                )
+            })
+            .cloned()
+            .ok_or_else(|| BoundedTopologyError::RepresentativeCapacity {
+                group_id: group_id.to_string(),
+            })?;
+        selected.push(TopologyRepresentative {
+            node_id: candidate,
+            plane,
+        });
+    }
+    Ok(selected)
+}
+
+fn representative_score(
+    group_id: &str,
+    plane: usize,
+    node_id: &NodeId,
+    config: &BoundedTopologyConfig,
+) -> u64 {
+    let mut material = Vec::new();
+    append_hash_field(&mut material, b"ipars-hierarchy-representative");
+    append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
+    append_hash_field(&mut material, config.permutation_seed.as_bytes());
+    append_hash_field(&mut material, group_id.as_bytes());
+    append_hash_field(&mut material, plane.to_string().as_bytes());
+    append_hash_field(&mut material, node_id.as_str().as_bytes());
+    cryptographic_hash_u64(&material)
+}
+
+fn add_placed_cycle(
+    adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
+    edge_placements: &mut BTreeMap<TopologyEdge, BTreeSet<TopologyEdgePlacement>>,
+    cycle: &[NodeId],
+    placement: TopologyEdgePlacement,
+) {
+    if cycle.len() < 2 {
+        return;
+    }
+    let edge_count = if cycle.len() == 2 { 1 } else { cycle.len() };
+    for index in 0..edge_count {
+        let first = &cycle[index];
+        let second = &cycle[(index + 1) % cycle.len()];
+        add_undirected_edge(adjacency, first, second);
+        if let Some(edge) = TopologyEdge::new(first.clone(), second.clone()) {
+            edge_placements
+                .entry(edge)
+                .or_default()
+                .insert(placement.clone());
+        }
+    }
 }
 
 fn topology_epoch(node_ids: &[NodeId], config: &BoundedTopologyConfig) -> u64 {
@@ -483,37 +1141,6 @@ fn topology_epoch(node_ids: &[NodeId], config: &BoundedTopologyConfig) -> u64 {
         append_hash_field(&mut material, node_id.as_str().as_bytes());
     }
     cryptographic_hash_u64(&material)
-}
-
-fn permutation_hash(
-    node_id: &NodeId,
-    cycle_index: usize,
-    config: &BoundedTopologyConfig,
-) -> String {
-    let mut material = Vec::new();
-    append_hash_field(&mut material, b"ipars-bounded-topology-permutation");
-    append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
-    append_hash_field(&mut material, config.permutation_seed.as_bytes());
-    append_hash_field(&mut material, cycle_index.to_string().as_bytes());
-    append_hash_field(&mut material, node_id.as_str().as_bytes());
-    node_id_from_public_key(&material).as_str().to_string()
-}
-
-fn block_permutation_hash(
-    block: &TopologyBlock,
-    cycle_index: usize,
-    config: &BoundedTopologyConfig,
-) -> String {
-    let mut material = Vec::new();
-    append_hash_field(&mut material, b"ipars-bounded-topology-block-permutation");
-    append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
-    append_hash_field(&mut material, config.permutation_seed.as_bytes());
-    append_hash_field(&mut material, cycle_index.to_string().as_bytes());
-    append_hash_field(&mut material, block.block_id.as_bytes());
-    for node_id in &block.node_ids {
-        append_hash_field(&mut material, node_id.as_str().as_bytes());
-    }
-    node_id_from_public_key(&material).as_str().to_string()
 }
 
 fn append_hash_field(material: &mut Vec<u8>, field: &[u8]) {
@@ -531,25 +1158,6 @@ fn cryptographic_hash_u64(material: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-fn add_hamiltonian_cycle(
-    adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
-    edge_cycles: &mut BTreeMap<TopologyEdge, BTreeSet<usize>>,
-    cycle: &[NodeId],
-    cycle_index: usize,
-) {
-    if cycle.len() < 2 {
-        return;
-    }
-    for index in 0..cycle.len() {
-        let first = &cycle[index];
-        let second = &cycle[(index + 1) % cycle.len()];
-        add_undirected_edge(adjacency, first, second);
-        if let Some(edge) = TopologyEdge::new(first.clone(), second.clone()) {
-            edge_cycles.entry(edge).or_default().insert(cycle_index);
-        }
-    }
-}
-
 fn add_undirected_edge(
     adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
     first: &NodeId,
@@ -564,28 +1172,6 @@ fn add_undirected_edge(
     if let Some(neighbors) = adjacency.get_mut(second) {
         neighbors.insert(first.clone());
     }
-}
-
-fn predecessor_tree_from(
-    source: &NodeId,
-    adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
-) -> BTreeMap<NodeId, NodeId> {
-    let mut predecessors = BTreeMap::new();
-    let mut visited = BTreeSet::from([source.clone()]);
-    let mut queue = VecDeque::from([source.clone()]);
-    while let Some(current) = queue.pop_front() {
-        let Some(neighbors) = adjacency.get(&current) else {
-            continue;
-        };
-        for neighbor in neighbors {
-            if !visited.insert(neighbor.clone()) {
-                continue;
-            }
-            predecessors.insert(neighbor.clone(), current.clone());
-            queue.push_back(neighbor.clone());
-        }
-    }
-    predecessors
 }
 
 fn inspect_invariants(
@@ -631,6 +1217,103 @@ fn graph_is_connected(adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>) -> bool {
     distances_from(start, adjacency).len() == adjacency.len()
 }
 
+fn calculate_diameter_lower_bound(adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>) -> Option<usize> {
+    let mut source = adjacency.keys().next()?.clone();
+    let mut lower_bound = 0;
+    for _ in 0..4 {
+        let distances = distances_from(&source, adjacency);
+        if distances.len() != adjacency.len() {
+            return None;
+        }
+        let (farthest, distance) = distances.iter().max_by(
+            |(left_node, left_distance), (right_node, right_distance)| {
+                left_distance
+                    .cmp(right_distance)
+                    .then_with(|| left_node.cmp(right_node))
+            },
+        )?;
+        if *distance <= lower_bound {
+            break;
+        }
+        lower_bound = *distance;
+        source = farthest.clone();
+    }
+    Some(lower_bound)
+}
+
+fn graph_has_no_articulation_points(adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>) -> bool {
+    if adjacency.len() <= 2 {
+        return true;
+    }
+    let Some(root) = adjacency.keys().next().cloned() else {
+        return true;
+    };
+    let mut discovery = BTreeMap::new();
+    let mut low = BTreeMap::new();
+    let mut time = 0;
+    if articulation_dfs(&root, None, adjacency, &mut discovery, &mut low, &mut time) {
+        return false;
+    }
+    discovery.len() == adjacency.len()
+}
+
+fn articulation_dfs(
+    node: &NodeId,
+    parent: Option<&NodeId>,
+    adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
+    discovery: &mut BTreeMap<NodeId, usize>,
+    low: &mut BTreeMap<NodeId, usize>,
+    time: &mut usize,
+) -> bool {
+    let discovered_at = *time;
+    *time += 1;
+    discovery.insert(node.clone(), discovered_at);
+    low.insert(node.clone(), discovered_at);
+    let mut child_count = 0;
+
+    let Some(neighbors) = adjacency.get(node) else {
+        return false;
+    };
+    for neighbor in neighbors {
+        if parent == Some(neighbor) {
+            continue;
+        }
+        if let Some(neighbor_discovery) = discovery.get(neighbor).copied() {
+            if let Some(node_low) = low.get_mut(node) {
+                *node_low = (*node_low).min(neighbor_discovery);
+            }
+            continue;
+        }
+
+        child_count += 1;
+        if articulation_dfs(neighbor, Some(node), adjacency, discovery, low, time) {
+            return true;
+        }
+        let neighbor_low = low.get(neighbor).copied().unwrap_or(discovered_at);
+        if parent.is_some() && neighbor_low >= discovered_at {
+            return true;
+        }
+        if let Some(node_low) = low.get_mut(node) {
+            *node_low = (*node_low).min(neighbor_low);
+        }
+    }
+
+    parent.is_none() && child_count > 1
+}
+
+#[cfg(test)]
+fn graph_survives_any_single_node_failure(adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>) -> bool {
+    if adjacency.len() <= 2 {
+        return true;
+    }
+    adjacency.keys().all(|failed| {
+        let Some(start) = adjacency.keys().find(|node_id| *node_id != failed) else {
+            return true;
+        };
+        distances_from_avoiding(start, failed, adjacency).len() == adjacency.len() - 1
+    })
+}
+
 fn distances_from(
     source: &NodeId,
     adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
@@ -647,6 +1330,35 @@ fn distances_from(
         };
         for neighbor in neighbors {
             if distances.contains_key(neighbor) {
+                continue;
+            }
+            distances.insert(neighbor.clone(), distance + 1);
+            queue.push_back(neighbor.clone());
+        }
+    }
+    distances
+}
+
+#[cfg(test)]
+fn distances_from_avoiding(
+    source: &NodeId,
+    unavailable: &NodeId,
+    adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
+) -> BTreeMap<NodeId, usize> {
+    if source == unavailable || !adjacency.contains_key(source) {
+        return BTreeMap::new();
+    }
+    let mut distances = BTreeMap::from([(source.clone(), 0)]);
+    let mut queue = VecDeque::from([source.clone()]);
+    while let Some(current) = queue.pop_front() {
+        let Some(distance) = distances.get(&current).copied() else {
+            continue;
+        };
+        let Some(neighbors) = adjacency.get(&current) else {
+            continue;
+        };
+        for neighbor in neighbors {
+            if neighbor == unavailable || distances.contains_key(neighbor) {
                 continue;
             }
             distances.insert(neighbor.clone(), distance + 1);
@@ -686,6 +1398,184 @@ fn reconstruct_path(
     Some(reversed)
 }
 
+#[derive(Debug, Clone)]
+struct ResidualEdge {
+    to: usize,
+    reverse_index: usize,
+    capacity: u8,
+    initial_capacity: u8,
+}
+
+fn add_residual_edge(graph: &mut [Vec<ResidualEdge>], from: usize, to: usize, capacity: u8) {
+    let forward_reverse_index = graph[to].len();
+    let reverse_reverse_index = graph[from].len();
+    graph[from].push(ResidualEdge {
+        to,
+        reverse_index: forward_reverse_index,
+        capacity,
+        initial_capacity: capacity,
+    });
+    graph[to].push(ResidualEdge {
+        to: from,
+        reverse_index: reverse_reverse_index,
+        capacity: 0,
+        initial_capacity: 0,
+    });
+}
+
+fn augment_unit_flow(graph: &mut [Vec<ResidualEdge>], source: usize, sink: usize) -> bool {
+    let mut predecessor = vec![None; graph.len()];
+    let mut queue = VecDeque::from([source]);
+    predecessor[source] = Some((source, usize::MAX));
+
+    while let Some(current) = queue.pop_front() {
+        for (edge_index, edge) in graph[current].iter().enumerate() {
+            if edge.capacity == 0 || predecessor[edge.to].is_some() {
+                continue;
+            }
+            predecessor[edge.to] = Some((current, edge_index));
+            if edge.to == sink {
+                break;
+            }
+            queue.push_back(edge.to);
+        }
+        if predecessor[sink].is_some() {
+            break;
+        }
+    }
+    if predecessor[sink].is_none() {
+        return false;
+    }
+
+    let mut cursor = sink;
+    while cursor != source {
+        let Some((previous, edge_index)) = predecessor[cursor] else {
+            return false;
+        };
+        let reverse_index = graph[previous][edge_index].reverse_index;
+        graph[previous][edge_index].capacity -= 1;
+        graph[cursor][reverse_index].capacity += 1;
+        cursor = previous;
+    }
+    true
+}
+
+fn extract_flow_path(
+    graph: &[Vec<ResidualEdge>],
+    remaining_flow: &mut [Vec<u8>],
+    source: usize,
+    sink: usize,
+) -> Option<Vec<usize>> {
+    let mut predecessor = vec![None; graph.len()];
+    let mut queue = VecDeque::from([source]);
+    predecessor[source] = Some((source, usize::MAX));
+
+    while let Some(current) = queue.pop_front() {
+        for (edge_index, edge) in graph[current].iter().enumerate() {
+            if remaining_flow[current][edge_index] == 0 || predecessor[edge.to].is_some() {
+                continue;
+            }
+            predecessor[edge.to] = Some((current, edge_index));
+            if edge.to == sink {
+                break;
+            }
+            queue.push_back(edge.to);
+        }
+        if predecessor[sink].is_some() {
+            break;
+        }
+    }
+    predecessor[sink]?;
+
+    let mut reversed = vec![sink];
+    let mut cursor = sink;
+    while cursor != source {
+        let (previous, edge_index) = predecessor[cursor]?;
+        remaining_flow[previous][edge_index] -= 1;
+        reversed.push(previous);
+        cursor = previous;
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
+fn two_internally_vertex_disjoint_paths(
+    adjacency: &BTreeMap<NodeId, BTreeSet<NodeId>>,
+    source: &NodeId,
+    destination: &NodeId,
+) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+    if source == destination || adjacency.len() < 3 {
+        return None;
+    }
+    let node_ids = adjacency.keys().cloned().collect::<Vec<_>>();
+    let indexes = node_ids
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, node_id)| (node_id, index))
+        .collect::<BTreeMap<_, _>>();
+    let source_index = *indexes.get(source)?;
+    let destination_index = *indexes.get(destination)?;
+    let in_index = |index: usize| index * 2;
+    let out_index = |index: usize| index * 2 + 1;
+    let mut graph = vec![Vec::new(); node_ids.len() * 2];
+
+    for index in 0..node_ids.len() {
+        if index != source_index && index != destination_index {
+            add_residual_edge(&mut graph, in_index(index), out_index(index), 1);
+        }
+    }
+    for (node_id, neighbors) in adjacency {
+        let from_index = *indexes.get(node_id)?;
+        if from_index == destination_index {
+            continue;
+        }
+        for neighbor in neighbors {
+            let to_index = *indexes.get(neighbor)?;
+            if to_index == source_index {
+                continue;
+            }
+            add_residual_edge(&mut graph, out_index(from_index), in_index(to_index), 1);
+        }
+    }
+
+    let flow_source = out_index(source_index);
+    let flow_sink = in_index(destination_index);
+    if !augment_unit_flow(&mut graph, flow_source, flow_sink)
+        || !augment_unit_flow(&mut graph, flow_source, flow_sink)
+    {
+        return None;
+    }
+
+    let mut remaining_flow = graph
+        .iter()
+        .map(|edges| {
+            edges
+                .iter()
+                .map(|edge| edge.initial_capacity.saturating_sub(edge.capacity))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut paths = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let flow_path = extract_flow_path(&graph, &mut remaining_flow, flow_source, flow_sink)?;
+        let mut node_path = vec![source.clone()];
+        for network_edge in flow_path.windows(2) {
+            if network_edge[0] % 2 == 1 && network_edge[1] % 2 == 0 {
+                node_path.push(node_ids[network_edge[1] / 2].clone());
+            }
+        }
+        if node_path.last() != Some(destination) {
+            return None;
+        }
+        paths.push(node_path);
+    }
+    paths.sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+    let secondary = paths.pop()?;
+    let primary = paths.pop()?;
+    Some((primary, secondary))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -707,7 +1597,7 @@ mod tests {
         assert_eq!(topology.invariants().edge_count, 0);
         assert_eq!(topology.invariants().max_observed_degree, 0);
         assert!(topology.invariants().are_satisfied());
-        assert_eq!(topology.diameter(), Some(0));
+        assert_eq!(topology.diameter_lower_bound(), Some(0));
         assert_eq!(
             topology.shortest_path(node_id, node_id),
             Some(vec![node_id.clone()])
@@ -729,7 +1619,7 @@ mod tests {
         assert_eq!(topology.invariants().node_count, 2);
         assert_eq!(topology.invariants().edge_count, 1);
         assert_eq!(topology.invariants().max_observed_degree, 1);
-        assert_eq!(topology.diameter(), Some(1));
+        assert_eq!(topology.diameter_lower_bound(), Some(1));
         let paths = topology.paths(&nodes[0].node_id, &nodes[1].node_id);
         let Some(paths) = paths else {
             panic!("two connected nodes must have a path");
@@ -768,48 +1658,61 @@ mod tests {
     }
 
     #[test]
-    fn blocks_partition_membership_and_mark_redundant_boundary_cycles() {
-        let nodes = records(10);
+    fn recursive_groups_partition_membership_and_expose_placements() {
+        let nodes = records(64);
         let topology = topology_with_config(
             &nodes,
             &BoundedTopologyConfig::new(4)
-                .with_block_size(3)
+                .with_block_size(4)
                 .with_permutation_seed("cluster-a"),
         );
 
-        assert_eq!(topology.block_size(), 3);
-        assert_eq!(
-            topology
-                .blocks()
-                .iter()
-                .map(|block| block.node_ids().len())
-                .collect::<Vec<_>>(),
-            vec![3, 3, 3, 1]
-        );
-        let members = topology
-            .blocks()
+        assert_eq!(topology.fanout(), 4);
+        let leaf_groups = topology
+            .groups()
+            .iter()
+            .filter(|group| group.is_leaf())
+            .collect::<Vec<_>>();
+        assert!(leaf_groups
+            .iter()
+            .all(|block| block.is_leaf() && block.node_ids().len() <= 4));
+        let members = leaf_groups
             .iter()
             .flat_map(|block| block.node_ids().iter().cloned())
             .collect::<BTreeSet<_>>();
         assert_eq!(members.len(), nodes.len());
+        assert_eq!(
+            leaf_groups
+                .iter()
+                .map(|block| block.node_ids().len())
+                .sum::<usize>(),
+            nodes.len()
+        );
 
-        let block_by_node = topology
-            .blocks()
+        let groups_by_id = topology
+            .groups()
             .iter()
-            .flat_map(|block| {
-                block
-                    .node_ids()
-                    .iter()
-                    .map(|node_id| (node_id.clone(), block.block_id().to_string()))
-            })
+            .map(|group| (group.group_id().to_string(), group))
             .collect::<BTreeMap<_, _>>();
-        let crossing_cycles = topology
-            .edge_cycles()
-            .iter()
-            .filter(|(edge, _)| block_by_node[edge.first()] != block_by_node[edge.second()])
-            .flat_map(|(_, cycles)| cycles.iter().copied())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(crossing_cycles, BTreeSet::from([0, 1]));
+        let root = groups_by_id["group-root"];
+        assert_eq!(root.depth(), 0);
+        assert_eq!(root.parent_group_id(), None);
+        for group in topology.groups() {
+            assert!(group.child_group_ids().len() <= 4);
+            if let Some(parent_id) = group.parent_group_id() {
+                let parent = groups_by_id[parent_id];
+                assert_eq!(group.depth(), parent.depth() + 1);
+                assert!(parent
+                    .child_group_ids()
+                    .contains(&group.group_id().to_string()));
+                assert_eq!(group.representatives().len(), 2);
+            }
+        }
+        assert!(topology.edge_placements().values().any(|placements| {
+            placements
+                .iter()
+                .any(|placement| placement.kind() == TopologyEdgeKind::HierarchyLink)
+        }));
     }
 
     #[test]
@@ -829,9 +1732,22 @@ mod tests {
         );
 
         assert_ne!(small_blocks.topology_epoch(), large_blocks.topology_epoch());
-        assert_ne!(small_blocks.edge_cycles(), large_blocks.edge_cycles());
-        assert_eq!(small_blocks.blocks().len(), 32);
-        assert_eq!(large_blocks.blocks().len(), 8);
+        assert_ne!(
+            small_blocks.edge_placements(),
+            large_blocks.edge_placements()
+        );
+        assert!(
+            small_blocks
+                .groups()
+                .iter()
+                .filter(|group| group.is_leaf())
+                .count()
+                > large_blocks
+                    .groups()
+                    .iter()
+                    .filter(|group| group.is_leaf())
+                    .count()
+        );
         assert!(small_blocks.invariants().are_satisfied());
         assert!(large_blocks.invariants().are_satisfied());
     }
@@ -839,7 +1755,7 @@ mod tests {
     #[test]
     fn supported_block_sizes_remain_bounded_at_one_thousand_nodes() {
         let nodes = records(1_000);
-        for block_size in [2, 4, 8, 16, 32, 64] {
+        for block_size in [4, 8, 16, 32, 64] {
             let topology = topology_with_config(
                 &nodes,
                 &BoundedTopologyConfig::new(4)
@@ -848,33 +1764,205 @@ mod tests {
             );
             assert!(topology.invariants().are_satisfied());
             assert!(topology.invariants().max_observed_degree <= 4);
-            assert!(topology.diameter().is_some());
+            assert!(topology.diameter_lower_bound().is_some());
         }
     }
 
     #[test]
-    fn one_thousand_nodes_have_bounded_degree_and_logarithmicish_diameter() {
+    fn thousand_node_paths_fit_the_wire_path_limit_for_every_supported_fanout() {
         let nodes = records(1_000);
-        for max_degree in SUPPORTED_MAX_DEGREES {
-            let topology = topology(&nodes, max_degree);
-            assert!(topology.invariants().are_satisfied());
-            assert_eq!(topology.invariants().node_count, 1_000);
-            assert!(topology.invariants().max_observed_degree <= max_degree);
+        let mut maximum_diameter = 0;
+        for block_size in [4, 8, 16, 32, 64] {
+            let topology = topology_with_config(
+                &nodes,
+                &BoundedTopologyConfig::new(4)
+                    .with_block_size(block_size)
+                    .with_permutation_seed("cluster-a"),
+            );
+            let diameter = exact_indexed_diameter(&topology);
+            maximum_diameter = maximum_diameter.max(diameter);
+            eprintln!("fanout {block_size}: exact diameter {diameter}");
+        }
+        assert!(
+            maximum_diameter < ipars_types::MAX_OVERLAY_PATH_NODES,
+            "diameter {maximum_diameter} exceeds the overlay wire path limit"
+        );
+        assert!(
+            maximum_diameter.saturating_sub(1)
+                <= ipars_types::MAX_OVERLAY_PATH_NODES.saturating_sub(2),
+            "diameter {maximum_diameter} exceeds the multihop intermediate-node limit"
+        );
+    }
 
-            let diameter = topology.diameter();
-            let Some(diameter) = diameter else {
-                panic!("a synthesized topology must be connected");
-            };
-            let logarithmicish_limit = 2 * (usize::BITS - 1_000_usize.leading_zeros()) as usize;
+    #[test]
+    fn thousand_node_sampled_disjoint_paths_fit_the_wire_path_limit() {
+        let nodes = records(1_000);
+        let sampled_sources = [0, 199, 398, 597, 796, 995];
+        let sampled_destinations = [0, 111, 222, 333, 444, 555, 666, 777, 888, 999];
+        for block_size in [4, 8, 16, 32, 64] {
+            let topology = topology_with_config(
+                &nodes,
+                &BoundedTopologyConfig::new(4)
+                    .with_block_size(block_size)
+                    .with_permutation_seed("cluster-a"),
+            );
+            let mut maximum_primary_nodes = 0;
+            let mut maximum_secondary_nodes = 0;
+            for source_index in sampled_sources {
+                for destination_index in sampled_destinations {
+                    if destination_index == source_index {
+                        continue;
+                    }
+                    let destination = &nodes[destination_index];
+                    let paths = topology
+                        .paths(&nodes[source_index].node_id, &destination.node_id)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{} must reach {}",
+                                nodes[source_index].node_id, destination.node_id
+                            )
+                        });
+                    maximum_primary_nodes = maximum_primary_nodes.max(paths.primary.len());
+                    let secondary = paths.secondary.unwrap_or_else(|| {
+                        panic!(
+                            "{} to {} must have a secondary path",
+                            nodes[source_index].node_id, destination.node_id
+                        )
+                    });
+                    maximum_secondary_nodes = maximum_secondary_nodes.max(secondary.nodes.len());
+                }
+            }
+            eprintln!(
+                "fanout {block_size}: sampled primary {maximum_primary_nodes}, secondary {maximum_secondary_nodes} nodes"
+            );
             assert!(
-                diameter <= logarithmicish_limit,
-                "degree {max_degree} topology diameter {diameter} exceeds {logarithmicish_limit}"
+                maximum_primary_nodes <= ipars_types::MAX_OVERLAY_PATH_NODES,
+                "fanout {block_size} primary path has {maximum_primary_nodes} nodes"
+            );
+            assert!(
+                maximum_secondary_nodes <= ipars_types::MAX_OVERLAY_PATH_NODES,
+                "fanout {block_size} secondary path has {maximum_secondary_nodes} nodes"
+            );
+            assert!(
+                maximum_secondary_nodes.saturating_sub(2)
+                    <= ipars_types::MAX_OVERLAY_PATH_NODES.saturating_sub(2),
+                "fanout {block_size} secondary relay path has too many nodes"
             );
         }
     }
 
     #[test]
-    fn bounded_next_hop_table_matches_disjoint_paths_at_one_thousand_nodes() {
+    fn capacity_scan_covers_all_node_counts_and_fanout_boundaries() {
+        let mut cases = BTreeSet::new();
+        for node_count in 5..=256 {
+            for block_size in [4, 5, 8, 16, 32, 64] {
+                cases.insert((node_count, block_size));
+            }
+        }
+        for block_size in 4..=64 {
+            for node_count in [
+                5,
+                block_size,
+                block_size + 1,
+                2 * block_size - 1,
+                2 * block_size,
+                2 * block_size + 1,
+                4 * block_size + 1,
+            ] {
+                cases.insert((node_count, block_size));
+            }
+        }
+        let cases = cases.into_iter().collect::<Vec<_>>();
+        let worker_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(8)
+            .min(cases.len());
+        let chunk_size = cases.len().div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            for chunk in cases.chunks(chunk_size) {
+                scope.spawn(move || {
+                    for &(node_count, block_size) in chunk {
+                        assert_capacity_case(node_count, block_size);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn one_thousand_nodes_survive_every_single_node_failure() {
+        let topology = topology(&records(1_000), 4);
+        assert!(graph_survives_any_single_node_failure(topology.adjacency()));
+    }
+
+    #[test]
+    fn one_node_addition_changes_only_a_bounded_number_of_edges() {
+        let initial = topology(&records(256), 4);
+        let expanded = topology(&records(257), 4);
+        let initial_edges = initial
+            .edge_placements()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expanded_edges = expanded
+            .edge_placements()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let changed_edges = initial_edges.symmetric_difference(&expanded_edges).count();
+
+        assert!(
+            changed_edges <= 64,
+            "one join changed {changed_edges} physical edges"
+        );
+    }
+
+    #[test]
+    fn one_thousand_nodes_have_bounded_degree_hierarchy_and_cached_diameter_bound() {
+        let nodes = records(1_000);
+        for max_degree in SUPPORTED_MAX_DEGREES {
+            let started = Instant::now();
+            let topology = topology(&nodes, max_degree);
+            let synthesis_elapsed = started.elapsed();
+            assert!(topology.invariants().are_satisfied());
+            assert_eq!(topology.invariants().node_count, 1_000);
+            assert!(topology.invariants().max_observed_degree <= 4);
+            assert!(topology.groups().iter().all(|group| {
+                group.child_group_ids().len() <= topology.fanout()
+                    && (group.parent_group_id().is_none()
+                        || group.depth() > 0 && group.representatives().len() == 2)
+            }));
+            let max_depth = topology
+                .groups()
+                .iter()
+                .map(TopologyGroup::depth)
+                .max()
+                .unwrap_or(0);
+            let diameter_lower_bound = topology.diameter_lower_bound().unwrap_or(0);
+            assert!(max_depth > 1);
+            assert!(topology.groups().len() < nodes.len());
+            assert!(topology.invariants().edge_count <= nodes.len() * 2);
+            eprintln!(
+                "degree {max_degree}: {} groups, {} levels, {} edges, diameter >= {diameter_lower_bound}, synthesized in {synthesis_elapsed:?}",
+                topology.groups().len(),
+                max_depth + 1,
+                topology.invariants().edge_count
+            );
+
+            let cached_started = Instant::now();
+            for _ in 0..10_000 {
+                std::hint::black_box(topology.diameter_lower_bound());
+            }
+            assert!(
+                cached_started.elapsed()
+                    < synthesis_elapsed.max(std::time::Duration::from_millis(1))
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_next_hop_table_uses_distinct_source_neighbors_at_one_thousand_nodes() {
         let nodes = records(1_000);
         for max_degree in SUPPORTED_MAX_DEGREES {
             let topology = topology(&nodes, max_degree);
@@ -882,6 +1970,7 @@ mod tests {
             let Some(neighbors) = topology.neighbors(source) else {
                 panic!("source must be present in synthesized topology");
             };
+            assert_eq!(topology.cached_next_hop_source_count(), 0);
             let started = Instant::now();
             let Some(next_hops) = topology.next_hops_from(source) else {
                 panic!("source must have a next-hop table");
@@ -890,28 +1979,19 @@ mod tests {
 
             assert_eq!(next_hops.len(), nodes.len() - 1);
             for destination in topology.adjacency().keys().filter(|node| *node != source) {
-                let Some(paths) = topology.paths(source, destination) else {
-                    panic!("synthesized topology must provide paths");
-                };
                 let Some((primary, secondary)) = next_hops.get(destination) else {
                     panic!("every remote node must have next hops");
                 };
-                assert_eq!(Some(primary), paths.primary.get(1));
                 assert!(neighbors.contains(primary));
-                let Some(secondary_path) = paths.secondary.as_ref() else {
-                    panic!("cycle-union topology must retain an alternate first hop");
-                };
-                assert_eq!(secondary.as_ref(), secondary_path.nodes.get(1));
                 let Some(secondary) = secondary.as_ref() else {
                     panic!("next-hop table must retain the alternate first hop");
                 };
                 assert!(neighbors.contains(secondary));
                 assert_ne!(secondary, primary);
-                assert!(
-                    path_edges(&paths.primary).is_disjoint(&path_edges(&secondary_path.nodes)),
-                    "degree {max_degree} paths to {destination} share an edge"
-                );
             }
+            assert_eq!(topology.cached_next_hop_source_count(), 1);
+            assert_eq!(topology.next_hops_from(source), Some(next_hops.clone()));
+            assert_eq!(topology.cached_next_hop_source_count(), 1);
             eprintln!(
                 "degree {max_degree}: built {} destinations in {:?}, verified in {:?}",
                 next_hops.len(),
@@ -919,6 +1999,50 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    #[test]
+    fn alternate_next_hops_survive_primary_neighbor_failure_for_every_pair() {
+        let nodes = records(64);
+        let topology = topology(&nodes, 4);
+        for source in &nodes {
+            let next_hops = topology
+                .next_hops_from(&source.node_id)
+                .unwrap_or_else(|| panic!("{} must have a routing table", source.node_id));
+            for destination in nodes
+                .iter()
+                .filter(|destination| destination.node_id != source.node_id)
+            {
+                let (primary, secondary) = next_hops
+                    .get(&destination.node_id)
+                    .unwrap_or_else(|| panic!("{} must have next hops", destination.node_id));
+                let secondary = secondary.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "{} to {} must have an alternate first hop",
+                        source.node_id, destination.node_id
+                    )
+                });
+                let mut unavailable_nodes = BTreeSet::from([source.node_id.clone()]);
+                if primary != &destination.node_id {
+                    unavailable_nodes.insert(primary.clone());
+                }
+                let rerouted = topology.shortest_path_avoiding(
+                    secondary,
+                    &destination.node_id,
+                    &unavailable_nodes,
+                    &BTreeSet::new(),
+                );
+                assert!(
+                    rerouted.is_some(),
+                    "{} to {} cannot reroute from {} after {} fails",
+                    source.node_id,
+                    destination.node_id,
+                    secondary,
+                    primary
+                );
+            }
+        }
+        assert_eq!(topology.cached_next_hop_source_count(), nodes.len());
     }
 
     #[test]
@@ -958,7 +2082,7 @@ mod tests {
             panic!("connected topology must produce primary paths");
         };
         let Some(secondary) = paths.secondary else {
-            panic!("Hamiltonian-cycle union must provide an alternate route");
+            panic!("two-connected hierarchy must provide an alternate route");
         };
         let failed_edges = path_edges(&paths.primary);
         let rerouted = topology.shortest_path_avoiding(
@@ -970,6 +2094,41 @@ mod tests {
 
         assert_eq!(rerouted, Some(secondary.nodes.clone()));
         assert!(path_edges(&paths.primary).is_disjoint(&path_edges(&secondary.nodes)));
+    }
+
+    #[test]
+    fn every_node_pair_has_a_vertex_disjoint_secondary_path() {
+        let nodes = records(64);
+        let topology = topology(&nodes, 4);
+        for (source_index, source) in nodes.iter().enumerate() {
+            for destination in nodes.iter().skip(source_index + 1) {
+                let paths = topology
+                    .paths(&source.node_id, &destination.node_id)
+                    .unwrap_or_else(|| {
+                        panic!("{} must reach {}", source.node_id, destination.node_id)
+                    });
+                let secondary = paths.secondary.unwrap_or_else(|| {
+                    panic!(
+                        "{} to {} has no secondary path; primary={:?}",
+                        source.node_id, destination.node_id, paths.primary
+                    )
+                });
+                assert_eq!(secondary.kind, SecondaryPathKind::VertexDisjoint);
+                let primary_internal = paths
+                    .primary
+                    .iter()
+                    .skip(1)
+                    .take(paths.primary.len().saturating_sub(2))
+                    .collect::<BTreeSet<_>>();
+                let secondary_internal = secondary
+                    .nodes
+                    .iter()
+                    .skip(1)
+                    .take(secondary.nodes.len().saturating_sub(2))
+                    .collect::<BTreeSet<_>>();
+                assert!(primary_internal.is_disjoint(&secondary_internal));
+            }
+        }
     }
 
     #[test]
@@ -1025,7 +2184,7 @@ mod tests {
             synthesize_bounded_topology(&nodes, &BoundedTopologyConfig::new(5)),
             Err(BoundedTopologyError::UnsupportedMaxDegree { max_degree: 5 })
         );
-        for block_size in [1, 65] {
+        for block_size in [1, 2, 3, 65] {
             assert_eq!(
                 synthesize_bounded_topology(
                     &nodes,
@@ -1033,7 +2192,7 @@ mod tests {
                 ),
                 Err(BoundedTopologyError::InvalidBlockSize {
                     block_size,
-                    minimum: 2,
+                    minimum: 4,
                     maximum: 64,
                 })
             );
@@ -1062,6 +2221,46 @@ mod tests {
         }
     }
 
+    fn assert_capacity_case(node_count: usize, block_size: usize) {
+        let nodes = records(node_count);
+        let node_ids = match canonical_node_ids(&nodes) {
+            Ok(node_ids) => node_ids,
+            Err(error) => panic!("generated IDs must be unique: {error}"),
+        };
+        let config = BoundedTopologyConfig::new(4)
+            .with_block_size(block_size)
+            .with_permutation_seed("capacity-scan");
+        let mut hierarchy = match build_hierarchy(&node_ids, &config) {
+            Ok(hierarchy) => hierarchy,
+            Err(error) => {
+                panic!("N={node_count}, B={block_size} hierarchy construction failed: {error}")
+            }
+        };
+        let mut adjacency = node_ids
+            .iter()
+            .cloned()
+            .map(|node_id| (node_id, BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        let mut edge_placements = BTreeMap::new();
+        let mut reserved_degree = BTreeMap::new();
+        add_leaf_cycles(&hierarchy, &mut adjacency, &mut edge_placements);
+        allocate_representatives_and_hierarchy_edges(
+            &mut hierarchy,
+            &config,
+            &mut reserved_degree,
+            &mut adjacency,
+            &mut edge_placements,
+        )
+        .unwrap_or_else(|error| {
+            panic!("N={node_count}, B={block_size} representative allocation failed: {error}")
+        });
+        let invariants = inspect_invariants(&adjacency, 4);
+        assert!(
+            invariants.are_satisfied(),
+            "N={node_count}, B={block_size}: {invariants:?}"
+        );
+    }
+
     fn records(count: usize) -> Vec<NodeRecord> {
         (0..count).map(node_record).collect()
     }
@@ -1088,5 +2287,26 @@ mod tests {
             routes: Vec::new(),
             registered_at: Utc::now(),
         }
+    }
+
+    fn exact_indexed_diameter(topology: &BoundedTopology) -> usize {
+        let mut diameter = 0;
+        for source in 0..topology.indexed_adjacency.len() {
+            let mut distances = vec![usize::MAX; topology.indexed_adjacency.len()];
+            distances[source] = 0;
+            let mut queue = VecDeque::from([source]);
+            while let Some(current) = queue.pop_front() {
+                for &neighbor in &topology.indexed_adjacency[current] {
+                    if distances[neighbor] != usize::MAX {
+                        continue;
+                    }
+                    distances[neighbor] = distances[current] + 1;
+                    diameter = diameter.max(distances[neighbor]);
+                    queue.push_back(neighbor);
+                }
+            }
+            assert!(distances.iter().all(|distance| *distance != usize::MAX));
+        }
+        diameter
     }
 }

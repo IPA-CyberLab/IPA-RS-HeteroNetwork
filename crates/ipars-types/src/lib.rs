@@ -1269,7 +1269,7 @@ impl Default for ClusterPolicy {
     }
 }
 
-pub const MIN_OVERLAY_BLOCK_SIZE: u16 = 2;
+pub const MIN_OVERLAY_BLOCK_SIZE: u16 = 4;
 pub const MAX_OVERLAY_BLOCK_SIZE: u16 = 64;
 pub const DEFAULT_OVERLAY_BLOCK_SIZE: u16 = 4;
 
@@ -1282,7 +1282,7 @@ fn default_overlay_max_degree() -> u16 {
 }
 
 fn default_overlay_direct_shortcut_limit() -> u16 {
-    4
+    0
 }
 
 fn default_relay_health_ttl_seconds() -> u64 {
@@ -1391,7 +1391,9 @@ pub struct NodeRecord {
 pub const MAX_OVERLAY_DEGREE: u16 = 64;
 pub const MAX_OVERLAY_NEIGHBORS: usize = MAX_OVERLAY_DEGREE as usize;
 pub const MAX_AGGREGATE_OVERLAY_ROUTES: usize = 4096;
-pub const MAX_OVERLAY_PATH_NODES: usize = 64;
+// The multihop envelope stores at most 512 intermediate nodes. Source and
+// destination are encoded separately in the overlay path.
+pub const MAX_OVERLAY_PATH_NODES: usize = 514;
 pub const MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES: usize = 64;
 pub const MAX_OVERLAY_NODE_ROUTES: usize = 256;
 
@@ -2811,13 +2813,15 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ControlPlaneTopologyBlock {
-        pub block_id: String,
+    pub struct ControlPlaneTopologyGroup {
+        pub group_id: String,
+        pub depth: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_group_id: Option<String>,
+        #[serde(default)]
+        pub child_group_ids: Vec<String>,
         pub node_ids: Vec<NodeId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub primary_representative: Option<NodeId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub secondary_representative: Option<NodeId>,
+        pub leaf: bool,
         #[serde(default)]
         pub representatives: Vec<ControlPlaneTopologyRepresentative>,
     }
@@ -2825,8 +2829,15 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ControlPlaneTopologyRepresentative {
         pub node_id: NodeId,
-        pub cycle_index: usize,
-        pub kind: String,
+        pub plane: u8,
+        pub role: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyRepresentativeAssignment {
+        pub group_id: String,
+        pub depth: usize,
+        pub plane: u8,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2835,22 +2846,31 @@ pub mod api {
         pub vpn_ip: VpnIp,
         pub role: Role,
         pub tags: BTreeSet<Tag>,
-        pub block_id: String,
+        pub leaf_group_id: String,
+        #[serde(default)]
+        pub ancestry: Vec<String>,
         pub degree: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub health_state: Option<HealthState>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_seen_at: Option<DateTime<Utc>>,
         #[serde(default)]
-        pub representative_kinds: Vec<String>,
+        pub representative_for: Vec<ControlPlaneTopologyRepresentativeAssignment>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum ControlPlaneTopologyEdgeKind {
-        IntraBlock,
-        InterBlockPrimary,
-        InterBlockSecondary,
+        LeafCycle,
+        SiblingCycle,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyEdgePlacement {
+        pub group_id: String,
+        pub depth: usize,
+        pub plane: u8,
+        pub kind: ControlPlaneTopologyEdgeKind,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2868,12 +2888,8 @@ pub mod api {
     pub struct ControlPlaneTopologyEdge {
         pub source: NodeId,
         pub target: NodeId,
-        pub kind: ControlPlaneTopologyEdgeKind,
-        pub cycle_index: usize,
         #[serde(default)]
-        pub cycle_indexes: Vec<usize>,
-        pub source_block_id: String,
-        pub target_block_id: String,
+        pub placements: Vec<ControlPlaneTopologyEdgePlacement>,
         #[serde(default)]
         pub observed_status: ControlPlaneTopologyEdgeStatus,
         #[serde(default)]
@@ -2888,14 +2904,18 @@ pub mod api {
         /// Decimal string to preserve the complete u64 epoch in JavaScript.
         pub topology_epoch: String,
         pub algorithm: String,
-        pub block_size: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub root_group_id: Option<String>,
+        pub fanout: u16,
         pub max_degree: u16,
         pub direct_shortcut_limit: u16,
         pub node_count: usize,
+        pub group_count: usize,
+        pub level_count: usize,
         pub edge_count: usize,
         pub max_observed_degree: usize,
-        pub diameter: Option<usize>,
-        pub blocks: Vec<ControlPlaneTopologyBlock>,
+        pub diameter_lower_bound: Option<usize>,
+        pub groups: Vec<ControlPlaneTopologyGroup>,
         pub nodes: Vec<ControlPlaneTopologyNode>,
         pub edges: Vec<ControlPlaneTopologyEdge>,
         pub generated_at: DateTime<Utc>,

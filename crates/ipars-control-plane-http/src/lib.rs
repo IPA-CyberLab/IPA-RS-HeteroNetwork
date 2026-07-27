@@ -5835,18 +5835,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let initial: ControlPlaneTopologyResponse =
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
-        assert_eq!(initial.block_size, 4);
-        assert_eq!(initial.blocks.len(), 3);
+        assert_eq!(initial.fanout, 4);
+        assert!(initial.group_count >= 1);
+        assert_eq!(initial.groups.len(), initial.group_count);
         assert_eq!(initial.nodes.len(), 10);
         assert!(initial.max_observed_degree <= usize::from(initial.max_degree));
         assert!(initial
             .edges
             .iter()
-            .any(|edge| edge.source_block_id != edge.target_block_id));
+            .any(|edge| edge.placements.iter().any(|placement| {
+                placement.kind == ipars_types::api::ControlPlaneTopologyEdgeKind::SiblingCycle
+            })));
         assert!(initial
-            .blocks
+            .groups
             .iter()
-            .all(|block| !block.representatives.is_empty()));
+            .filter(|group| group.parent_group_id.is_some())
+            .all(|group| !group.representatives.is_empty()));
         let observed_edge = initial
             .edges
             .first()
@@ -5932,12 +5936,12 @@ mod tests {
             .await?;
         let updated: ControlPlaneTopologyResponse =
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
-        assert_eq!(updated.block_size, 6);
-        assert_eq!(updated.blocks.len(), 2);
+        assert_eq!(updated.fanout, 6);
+        assert_eq!(updated.groups.len(), updated.group_count);
         assert_ne!(initial.topology_epoch, updated.topology_epoch);
 
         let mut invalid_policy = updated_policy.cluster_policy;
-        invalid_policy.overlay_block_size = 1;
+        invalid_policy.overlay_block_size = 3;
         let response = app
             .oneshot(
                 Request::builder()

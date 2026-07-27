@@ -203,6 +203,9 @@ const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
+const POLL_JITTER_MIN_BASIS_POINTS: u64 = 8_000;
+const POLL_JITTER_MAX_BASIS_POINTS: u64 = 12_000;
+const MAX_INITIAL_POLL_SPREAD: Duration = Duration::from_secs(5);
 const DIRECT_PATH_DATA_PLANE_PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECT_PATH_ENDPOINT_APPLY_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
@@ -13193,6 +13196,32 @@ fn netns_path(namespace: &LinuxNetworkNamespace) -> std::path::PathBuf {
     namespace.path()
 }
 
+fn control_plane_rendezvous_score(node_id: &NodeId, control_plane_url: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ipars/control-plane-rendezvous/v1");
+    hasher.update((node_id.as_str().len() as u64).to_be_bytes());
+    hasher.update(node_id.as_str().as_bytes());
+    hasher.update((control_plane_url.len() as u64).to_be_bytes());
+    hasher.update(control_plane_url.as_bytes());
+    hasher.finalize().into()
+}
+
+fn control_plane_urls_for_node<'a>(
+    control_plane_urls: &'a [String],
+    node_id: &NodeId,
+) -> impl Iterator<Item = &'a String> {
+    let mut ranked_urls = control_plane_urls
+        .iter()
+        .map(|url| (url, control_plane_rendezvous_score(node_id, url)))
+        .collect::<Vec<_>>();
+    ranked_urls.sort_unstable_by(|(left_url, left_score), (right_url, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_url.cmp(right_url))
+    });
+    ranked_urls.into_iter().map(|(url, _score)| url)
+}
+
 #[derive(Debug)]
 struct RelayForwarderTask {
     session_id: String,
@@ -13239,8 +13268,10 @@ async fn register_agent(
     };
 
     let mut failures = Vec::new();
-    for control_plane_url in control_plane_urls {
-        let join_url = control_plane_join_url_from_base(&control_plane_url);
+    for control_plane_url in
+        control_plane_urls_for_node(&control_plane_urls, &request.registration.node_id)
+    {
+        let join_url = control_plane_join_url_from_base(control_plane_url);
         let response = match client.post(&join_url).json(&request).send().await {
             Ok(response) => response,
             Err(error) => {
@@ -13264,7 +13295,7 @@ async fn register_agent(
         {
             Ok(response) => {
                 return Ok(AgentRegistration {
-                    control_plane_url,
+                    control_plane_url: control_plane_url.clone(),
                     response,
                 });
             }
@@ -13801,6 +13832,57 @@ fn start_heartbeat_reporting(config: HeartbeatReporterConfig) -> tokio::task::Jo
     tokio::spawn(run_heartbeat_loop(config))
 }
 
+fn jittered_poll_interval(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        return Duration::ZERO;
+    }
+    jittered_poll_interval_with_entropy(interval, OsRng.next_u64())
+}
+
+fn jittered_poll_interval_with_entropy(interval: Duration, entropy: u64) -> Duration {
+    if interval.is_zero() {
+        return Duration::ZERO;
+    }
+    let jitter_span = POLL_JITTER_MAX_BASIS_POINTS.saturating_sub(POLL_JITTER_MIN_BASIS_POINTS);
+    let basis_points = POLL_JITTER_MIN_BASIS_POINTS + entropy % jitter_span.saturating_add(1);
+    let jittered_nanos = interval.as_nanos().saturating_mul(u128::from(basis_points)) / 10_000;
+    let seconds = jittered_nanos / 1_000_000_000;
+    if seconds > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+    Duration::new(seconds as u64, (jittered_nanos % 1_000_000_000) as u32)
+}
+
+fn initial_poll_delay(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        return Duration::ZERO;
+    }
+    initial_poll_delay_with_entropy(interval, OsRng.next_u64())
+}
+
+fn initial_poll_delay_with_entropy(interval: Duration, entropy: u64) -> Duration {
+    let max_delay = interval.min(MAX_INITIAL_POLL_SPREAD);
+    if max_delay.is_zero() {
+        return Duration::ZERO;
+    }
+    let delay_nanos =
+        max_delay.as_nanos().saturating_mul(u128::from(entropy)) / u128::from(u64::MAX);
+    Duration::new(
+        (delay_nanos / 1_000_000_000) as u64,
+        (delay_nanos % 1_000_000_000) as u32,
+    )
+}
+
+async fn wait_for_initial_poll(delay: Duration, notify: &tokio::sync::Notify) {
+    if delay.is_zero() {
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = notify.notified() => {}
+    }
+}
+
 async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
     let HeartbeatReporterConfig {
         runtime,
@@ -13813,8 +13895,14 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
         route_reporter,
     } = config;
     let heartbeat_report_notify = runtime.heartbeat_report_notifier();
+    wait_for_initial_poll(
+        initial_poll_delay(interval),
+        heartbeat_report_notify.as_ref(),
+    )
+    .await;
     loop {
         let cycle_started = tokio::time::Instant::now();
+        let cycle_interval = jittered_poll_interval(interval);
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
         let routes = heartbeat_routes(route_reporter.as_ref()).await;
@@ -13830,7 +13918,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
             Ok(request) => request,
             Err(error) => {
                 tracing::warn!(%error, "failed to sign agent heartbeat; will retry");
-                tokio::time::sleep(interval).await;
+                tokio::time::sleep(cycle_interval.saturating_sub(cycle_started.elapsed())).await;
                 continue;
             }
         };
@@ -13893,7 +13981,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 "failed to report agent heartbeat; will retry"
             ),
         }
-        let remaining = interval.saturating_sub(cycle_started.elapsed());
+        let remaining = cycle_interval.saturating_sub(cycle_started.elapsed());
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {}
             _ = heartbeat_report_notify.notified() => {}
@@ -13901,10 +13989,8 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
     }
 }
 
-fn notify_peer_map_sync_for_heartbeat(runtime: &AgentRuntime, peer_delta_available: bool) {
-    if peer_delta_available {
-        runtime.peer_map_sync_notifier().notify_one();
-    }
+fn notify_peer_map_sync_for_heartbeat(runtime: &AgentRuntime, _peer_delta_available: bool) {
+    runtime.peer_map_sync_notifier().notify_one();
 }
 
 async fn send_heartbeat_to_control_planes(
@@ -13918,7 +14004,7 @@ async fn send_heartbeat_to_control_planes(
         "control-plane URL is required for heartbeat reporting"
     );
     let mut failures = Vec::new();
-    for control_plane_url in control_plane_urls {
+    for control_plane_url in control_plane_urls_for_node(control_plane_urls, &request.node_id) {
         match send_heartbeat(
             client,
             control_plane_url,
@@ -16915,6 +17001,7 @@ async fn run_peer_map_sync_loop<S, A>(
     S: PeerMapSource + 'static,
     A: PeerMapSink + 'static,
 {
+    wait_for_initial_poll(initial_poll_delay(interval), peer_map_sync_notify.as_ref()).await;
     loop {
         match sync.sync_once().await {
             Ok(summary) => tracing::info!(
@@ -16932,7 +17019,7 @@ async fn run_peer_map_sync_loop<S, A>(
             ),
         }
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(jittered_poll_interval(interval)) => {}
             _ = peer_map_sync_notify.notified() => {}
         }
     }
@@ -19504,7 +19591,7 @@ async fn fetch_neighbor_map_from_control_planes(
         identity.node_id()
     );
     let mut failures = Vec::new();
-    for control_plane_url in control_plane_urls {
+    for control_plane_url in control_plane_urls_for_node(control_plane_urls, node_id) {
         let url = neighbor_map_url(control_plane_url);
         let mut request = ControlPlaneNodeQueryRequest {
             node_id: node_id.clone(),
@@ -19566,7 +19653,7 @@ async fn fetch_peer_map_from_control_planes(
         identity.node_id()
     );
     let mut failures = Vec::new();
-    for control_plane_url in control_plane_urls {
+    for control_plane_url in control_plane_urls_for_node(control_plane_urls, node_id) {
         let url = peer_map_url(control_plane_url);
         let mut request = ControlPlaneNodeQueryRequest {
             node_id: node_id.clone(),
@@ -19622,8 +19709,9 @@ async fn fetch_overlay_path_from_control_planes(
         !control_plane_urls.is_empty(),
         "control-plane URL is required for overlay-path fetch"
     );
+    let node_id = identity.node_id();
     let mut failures = Vec::new();
-    for control_plane_url in control_plane_urls {
+    for control_plane_url in control_plane_urls_for_node(control_plane_urls, &node_id) {
         let url = overlay_path_url(control_plane_url);
         let request = identity
             .sign_overlay_path_query(destination, chrono::Utc::now())
@@ -21554,6 +21642,20 @@ mod tests {
         let notifier = runtime.peer_map_sync_notifier();
         let notified = notifier.notified();
         notify_peer_map_sync_for_heartbeat(&runtime, true);
+        assert!(tokio::time::timeout(Duration::from_millis(100), notified)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_delta_also_wakes_peer_map_sync() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let notifier = runtime.peer_map_sync_notifier();
+        let notified = notifier.notified();
+        notify_peer_map_sync_for_heartbeat(&runtime, false);
         assert!(tokio::time::timeout(Duration::from_millis(100), notified)
             .await
             .is_ok());
@@ -34767,6 +34869,167 @@ exec sleep 60
             neighbor_map_url("http://127.0.0.1:8443/"),
             "http://127.0.0.1:8443/v1/neighbors/query"
         );
+    }
+
+    #[test]
+    fn control_plane_rendezvous_order_is_deterministic_and_input_order_independent() {
+        let urls = (0..4)
+            .map(|index| format!("https://control-plane-{index}.example"))
+            .collect::<Vec<_>>();
+        let node_id = NodeId::from_string("node-stable-rotation");
+        let first = control_plane_urls_for_node(&urls, &node_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let second = control_plane_urls_for_node(&urls, &node_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reversed_urls = urls.clone();
+        reversed_urls.reverse();
+        let reversed = control_plane_urls_for_node(&reversed_urls, &node_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(first, second);
+        assert_eq!(first, reversed);
+        assert_eq!(first.len(), urls.len());
+        assert_eq!(
+            first.iter().cloned().collect::<BTreeSet<_>>(),
+            urls.iter().cloned().collect::<BTreeSet<_>>()
+        );
+        assert!(control_plane_urls_for_node(&[], &node_id).next().is_none());
+    }
+
+    #[test]
+    fn control_plane_rendezvous_order_distributes_primary_endpoints() -> anyhow::Result<()> {
+        let urls = (0..4)
+            .map(|index| format!("https://control-plane-{index}.example"))
+            .collect::<Vec<_>>();
+        let mut counts = [0_usize; 4];
+        for index in 0..1_000 {
+            let node_id = NodeId::from_string(format!("node-distribution-{index}"));
+            let primary = control_plane_urls_for_node(&urls, &node_id)
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("control-plane list is unexpectedly empty"))?;
+            let primary_index = urls
+                .iter()
+                .position(|url| url == primary)
+                .ok_or_else(|| anyhow::anyhow!("ranked endpoint is absent from the input"))?;
+            counts[primary_index] += 1;
+        }
+
+        assert!(
+            counts.iter().all(|count| (150..=350).contains(count)),
+            "rendezvous distribution was unexpectedly skewed: {counts:?}"
+        );
+        assert_eq!(counts.iter().sum::<usize>(), 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_rendezvous_order_only_remaps_removed_primary_endpoints() {
+        let urls = (0..5)
+            .map(|index| format!("https://control-plane-{index}.example"))
+            .collect::<Vec<_>>();
+        let removed_url = urls[2].clone();
+        let remaining_urls = urls
+            .iter()
+            .filter(|url| **url != removed_url)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_primary_count = 0;
+
+        for index in 0..1_000 {
+            let node_id = NodeId::from_string(format!("node-removal-{index}"));
+            let original_order = control_plane_urls_for_node(&urls, &node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let remaining_order = control_plane_urls_for_node(&remaining_urls, &node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let expected_remaining_order = original_order
+                .iter()
+                .filter(|url| **url != removed_url)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            assert_eq!(remaining_order, expected_remaining_order);
+            if original_order.first() == Some(&removed_url) {
+                removed_primary_count += 1;
+            } else {
+                assert_eq!(remaining_order.first(), original_order.first());
+            }
+        }
+
+        assert!(
+            removed_primary_count > 0,
+            "test population did not exercise removal of a primary endpoint"
+        );
+    }
+
+    #[test]
+    fn poll_jitter_stays_within_twenty_percent_and_handles_boundaries() {
+        let interval = Duration::from_secs(10);
+        for entropy in 0..=4_000 {
+            let jittered = jittered_poll_interval_with_entropy(interval, entropy);
+            assert!(
+                (Duration::from_secs(8)..=Duration::from_secs(12)).contains(&jittered),
+                "entropy {entropy} produced out-of-range interval {jittered:?}"
+            );
+        }
+        assert_eq!(
+            jittered_poll_interval_with_entropy(interval, 0),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            jittered_poll_interval_with_entropy(interval, 4_000),
+            Duration::from_secs(12)
+        );
+        assert_eq!(jittered_poll_interval(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            jittered_poll_interval_with_entropy(Duration::ZERO, u64::MAX),
+            Duration::ZERO
+        );
+        assert!(
+            jittered_poll_interval_with_entropy(Duration::from_nanos(1), u64::MAX)
+                <= Duration::from_nanos(1)
+        );
+        assert_eq!(
+            jittered_poll_interval_with_entropy(Duration::MAX, 4_000),
+            Duration::MAX
+        );
+    }
+
+    #[test]
+    fn initial_poll_delay_is_bounded_and_handles_zero_interval() {
+        let interval = Duration::from_secs(3);
+        assert_eq!(initial_poll_delay_with_entropy(interval, 0), Duration::ZERO);
+        assert_eq!(
+            initial_poll_delay_with_entropy(interval, u64::MAX),
+            interval
+        );
+        assert_eq!(
+            initial_poll_delay_with_entropy(Duration::from_secs(120), u64::MAX),
+            MAX_INITIAL_POLL_SPREAD
+        );
+        assert_eq!(initial_poll_delay(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            initial_poll_delay_with_entropy(Duration::ZERO, u64::MAX),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_poll_wait_can_be_woken_promptly() -> anyhow::Result<()> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waiter_notify = notify.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_initial_poll(Duration::from_secs(30), waiter_notify.as_ref()).await;
+        });
+        tokio::task::yield_now().await;
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), waiter).await??;
+        Ok(())
     }
 
     #[test]

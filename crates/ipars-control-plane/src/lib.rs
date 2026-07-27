@@ -4,12 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bounded_topology::{
     BoundedTopology, BoundedTopologyConfig, BoundedTopologyError, TopologyEdge,
-    SUPPORTED_MAX_DEGREES, TOPOLOGY_ALGORITHM_VERSION,
+    TopologyEdgeKind as BoundedTopologyEdgeKind, SUPPORTED_MAX_DEGREES, TOPOLOGY_ALGORITHM_VERSION,
 };
 use chrono::Utc;
 use ipars_crypto::{
@@ -22,9 +22,10 @@ use ipars_crypto::{
 use ipars_types::api::{
     ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
     ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-    ControlPlanePathsResponse, ControlPlaneTopologyBlock, ControlPlaneTopologyEdge,
-    ControlPlaneTopologyEdgeKind, ControlPlaneTopologyEdgeStatus, ControlPlaneTopologyNode,
-    ControlPlaneTopologyRepresentative, ControlPlaneTopologyResponse, HeartbeatRequest,
+    ControlPlanePathsResponse, ControlPlaneTopologyEdge, ControlPlaneTopologyEdgeKind,
+    ControlPlaneTopologyEdgePlacement, ControlPlaneTopologyEdgeStatus, ControlPlaneTopologyGroup,
+    ControlPlaneTopologyNode, ControlPlaneTopologyRepresentative,
+    ControlPlaneTopologyRepresentativeAssignment, ControlPlaneTopologyResponse, HeartbeatRequest,
     HeartbeatResponse, NatTraversalStrategyCount, PathStateCount, PeerConnectionIntent, PeerMap,
     RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest, RegisterNodeResponse,
     RelayMap, RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
@@ -48,7 +49,7 @@ use ipars_types::{
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
 const CONNECTION_INTENT_WAIT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -66,6 +67,8 @@ const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
 const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
 const MAX_CLIENT_GATEWAYS: usize = 4;
 const CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW: Duration = Duration::from_secs(60);
+const OVERLAY_NODE_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(1);
+const MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES: usize = 4;
 pub const MAX_NODE_ENROLLMENT_TOKEN_USES: u32 = 1_000;
 pub const NODE_ENROLLMENT_ALLOWED_ROLES: [&str; 3] = ["edge", "worker", "gateway"];
 
@@ -218,6 +221,19 @@ pub trait ControlPlaneStore: Send + Sync {
         health: NodeHealth,
     ) -> Result<(), ControlPlaneError>;
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
+    async fn get_heartbeat_signature_timestamp(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError>;
+    async fn list_health(&self) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let mut health_by_node = BTreeMap::new();
+        for node in self.list_nodes().await? {
+            if let Some(health) = self.get_health(&node.node_id).await? {
+                health_by_node.insert(node.node_id, health);
+            }
+        }
+        Ok(health_by_node)
+    }
     async fn upsert_nat_classification(
         &self,
         node_id: NodeId,
@@ -238,6 +254,20 @@ pub trait ControlPlaneStore: Send + Sync {
         paths: Vec<PathRecord>,
     ) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
+    async fn list_paths_for_pairs(
+        &self,
+        pairs: &BTreeSet<(NodeId, NodeId)>,
+    ) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .list_all_paths()
+            .await?
+            .into_iter()
+            .filter(|path| pairs.contains(&(path.key.local.clone(), path.key.remote.clone())))
+            .collect())
+    }
     async fn list_all_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
         let mut paths = Vec::new();
         for node in self.list_nodes().await? {
@@ -291,6 +321,7 @@ pub struct RemovedNode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeartbeatStoreUpdate {
     pub node_id: NodeId,
+    pub accepted_signature_at: Option<chrono::DateTime<Utc>>,
     pub candidates: Vec<EndpointCandidate>,
     pub nat_classification: Option<NatClassification>,
     pub relay_capability: Option<RelayCapability>,
@@ -331,6 +362,7 @@ pub struct InMemoryStore {
     cluster_policies: RwLock<BTreeMap<ClusterId, ClusterPolicy>>,
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
+    heartbeat_signature_timestamps: RwLock<BTreeMap<NodeId, chrono::DateTime<Utc>>>,
     nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
     paths: RwLock<Vec<PathRecord>>,
     service_instances: RwLock<BTreeMap<(ClusterId, String), ServiceInstance>>,
@@ -383,6 +415,10 @@ impl ControlPlaneStore for InMemoryStore {
             .remove(node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         let removed_health = self.health.write().await.remove(node_id).is_some();
+        self.heartbeat_signature_timestamps
+            .write()
+            .await
+            .remove(node_id);
         self.nat_classifications.write().await.remove(node_id);
         self.client_gateway_selections
             .write()
@@ -477,6 +513,22 @@ impl ControlPlaneStore for InMemoryStore {
         Ok(self.health.read().await.get(node_id).cloned())
     }
 
+    async fn get_heartbeat_signature_timestamp(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError> {
+        Ok(self
+            .heartbeat_signature_timestamps
+            .read()
+            .await
+            .get(node_id)
+            .copied())
+    }
+
+    async fn list_health(&self) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        Ok(self.health.read().await.clone())
+    }
+
     async fn upsert_nat_classification(
         &self,
         node_id: NodeId,
@@ -505,21 +557,16 @@ impl ControlPlaneStore for InMemoryStore {
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
         let mut nodes = self.nodes.write().await;
         let mut health = self.health.write().await;
+        let mut heartbeat_signature_timestamps = self.heartbeat_signature_timestamps.write().await;
         let mut paths = self.paths.write().await;
         let node = nodes
             .get_mut(&update.node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
-        if let Some(previous) = health.get(&update.node_id) {
-            if update.health.last_seen_at <= previous.last_seen_at {
-                return Err(ControlPlaneError::NodeSignatureRejected {
-                    node_id: update.node_id,
-                    reason: format!(
-                        "signed_at {} is not newer than last accepted heartbeat {}",
-                        update.health.last_seen_at, previous.last_seen_at
-                    ),
-                });
-            }
-        }
+        ensure_heartbeat_is_newer(
+            &update,
+            heartbeat_signature_timestamps.get(&update.node_id).copied(),
+            health.get(&update.node_id),
+        )?;
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
@@ -531,6 +578,9 @@ impl ControlPlaneStore for InMemoryStore {
                 .write()
                 .await
                 .insert(update.node_id.clone(), classification);
+        }
+        if let Some(accepted_signature_at) = update.accepted_signature_at {
+            heartbeat_signature_timestamps.insert(update.node_id.clone(), accepted_signature_at);
         }
         health.insert(update.node_id.clone(), update.health);
         paths.retain(|path| path.key.local != update.node_id);
@@ -572,6 +622,20 @@ impl ControlPlaneStore for InMemoryStore {
 
     async fn list_all_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
         Ok(self.paths.read().await.clone())
+    }
+
+    async fn list_paths_for_pairs(
+        &self,
+        pairs: &BTreeSet<(NodeId, NodeId)>,
+    ) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        Ok(self
+            .paths
+            .read()
+            .await
+            .iter()
+            .filter(|path| pairs.contains(&(path.key.local.clone(), path.key.remote.clone())))
+            .cloned()
+            .collect())
     }
 
     async fn upsert_service_instance(
@@ -1142,16 +1206,36 @@ where
     }
 }
 
+type OverlayTopologyCacheCell = Arc<OnceCell<Result<Arc<BoundedTopology>, String>>>;
+type OverlayTopologyCache = BTreeMap<OverlayTopologyCacheKey, OverlayTopologyCacheCell>;
+
+#[derive(Debug)]
+struct OverlayNodeSnapshot {
+    loaded_at: Instant,
+    nodes: Vec<NodeRecord>,
+    health_by_node: BTreeMap<NodeId, NodeHealth>,
+}
+
 #[derive(Debug)]
 pub struct ControlPlane<S> {
     config: ControlPlaneConfig,
     store: Arc<S>,
     cluster_policy: StdRwLock<ClusterPolicy>,
+    overlay_node_snapshot_cache: Mutex<Option<Arc<OverlayNodeSnapshot>>>,
+    overlay_topology_cache: Mutex<OverlayTopologyCache>,
     allocator: RwLock<VpnAllocator>,
     accepted_node_query_nonces: Mutex<BTreeMap<(NodeId, String), chrono::DateTime<Utc>>>,
     operation_metrics: ControlPlaneOperationMetrics,
     admin_path_pins: RwLock<BTreeMap<(NodeId, NodeId), bool>>,
     connection_intent_notifiers: Mutex<BTreeMap<NodeId, Arc<Notify>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OverlayTopologyCacheKey {
+    node_ids: Vec<NodeId>,
+    block_size: u16,
+    max_degree: u16,
+    permutation_seed: String,
 }
 
 #[derive(Debug, Default)]
@@ -1214,6 +1298,8 @@ where
             accepted_node_query_nonces: Mutex::new(BTreeMap::new()),
             operation_metrics: ControlPlaneOperationMetrics::default(),
             cluster_policy: StdRwLock::new(cluster_policy),
+            overlay_node_snapshot_cache: Mutex::new(None),
+            overlay_topology_cache: Mutex::new(BTreeMap::new()),
             admin_path_pins: RwLock::new(BTreeMap::new()),
             connection_intent_notifiers: Mutex::new(BTreeMap::new()),
             config,
@@ -1477,6 +1563,7 @@ where
         node_id: &NodeId,
     ) -> Result<RemoveNodeResponse, ControlPlaneError> {
         let result = self.store.remove_node(node_id).await?;
+        self.invalidate_overlay_node_snapshot().await;
         self.admin_path_pins
             .write()
             .await
@@ -1620,6 +1707,7 @@ where
                 .upsert_nat_classification(node.node_id.clone(), classification)
                 .await?;
         }
+        self.invalidate_overlay_node_snapshot().await;
         self.registration_response_for_node(node, now).await
     }
 
@@ -2022,7 +2110,7 @@ where
 
         let nodes = self.overlay_nodes().await?;
         let policy = self.current_cluster_policy().await?;
-        let topology = self.overlay_topology(&nodes, &policy)?;
+        let topology = self.overlay_topology(&nodes, &policy).await?;
         let now = Utc::now();
         let nodes_by_id = nodes
             .iter()
@@ -2050,7 +2138,7 @@ where
                     })
             })
             .collect::<Vec<_>>();
-        let next_hops = topology.next_hops_from(node_id).ok_or_else(|| {
+        let next_hops = topology.next_hop_table(node_id).ok_or_else(|| {
             ControlPlaneError::BoundedTopology(format!(
                 "source node {node_id} has no bounded-overlay routing table"
             ))
@@ -2129,186 +2217,218 @@ where
         let mut nodes = self.overlay_nodes().await?;
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let policy = self.current_cluster_policy().await?;
-        let topology = self.overlay_topology(&nodes, &policy)?;
+        let topology = self.overlay_topology(&nodes, &policy).await?;
         let health_by_node = self.health_by_node(&nodes).await?;
-        let observed_paths = self.store.list_all_paths().await?;
+        let observed_path_pairs = topology
+            .edge_placements()
+            .keys()
+            .flat_map(|edge| {
+                [
+                    (edge.first().clone(), edge.second().clone()),
+                    (edge.second().clone(), edge.first().clone()),
+                ]
+            })
+            .collect::<BTreeSet<_>>();
+        let observed_paths = self
+            .store
+            .list_paths_for_pairs(&observed_path_pairs)
+            .await?;
         let mut paths_by_edge = BTreeMap::<TopologyEdge, Vec<&PathRecord>>::new();
         for path in &observed_paths {
             if let Some(edge) = TopologyEdge::new(path.key.local.clone(), path.key.remote.clone()) {
                 paths_by_edge.entry(edge).or_default().push(path);
             }
         }
-        let node_blocks = topology
-            .blocks()
+        let groups_by_id = topology
+            .groups()
             .iter()
-            .flat_map(|block| {
-                block
+            .map(|group| (group.group_id().to_string(), group))
+            .collect::<BTreeMap<_, _>>();
+        let leaf_group_by_node = topology
+            .groups()
+            .iter()
+            .filter(|group| group.is_leaf())
+            .flat_map(|group| {
+                group
                     .node_ids()
                     .iter()
                     .cloned()
-                    .map(|node_id| (node_id, block.block_id().to_string()))
+                    .map(|node_id| (node_id, group.group_id().to_string()))
             })
             .collect::<BTreeMap<_, _>>();
-
-        let mut representative_cycles = BTreeMap::<NodeId, BTreeSet<usize>>::new();
-        let mut edges = Vec::with_capacity(topology.edge_cycles().len());
-        for (edge, cycles) in topology.edge_cycles() {
-            let source_block_id = node_blocks.get(edge.first()).cloned().ok_or_else(|| {
-                ControlPlaneError::BoundedTopology(format!(
-                    "source node {} has no topology block",
-                    edge.first()
-                ))
-            })?;
-            let target_block_id = node_blocks.get(edge.second()).cloned().ok_or_else(|| {
-                ControlPlaneError::BoundedTopology(format!(
-                    "target node {} has no topology block",
-                    edge.second()
-                ))
-            })?;
-            let inter_block = source_block_id != target_block_id;
-            if inter_block {
-                for cycle_index in cycles {
-                    representative_cycles
-                        .entry(edge.first().clone())
-                        .or_default()
-                        .insert(*cycle_index);
-                    representative_cycles
-                        .entry(edge.second().clone())
-                        .or_default()
-                        .insert(*cycle_index);
-                }
+        let mut representative_assignments =
+            BTreeMap::<NodeId, Vec<ControlPlaneTopologyRepresentativeAssignment>>::new();
+        for group in topology.groups() {
+            for representative in group.representatives() {
+                representative_assignments
+                    .entry(representative.node_id().clone())
+                    .or_default()
+                    .push(ControlPlaneTopologyRepresentativeAssignment {
+                        group_id: group.group_id().to_string(),
+                        depth: group.depth(),
+                        plane: u8::try_from(representative.plane()).map_err(|_| {
+                            ControlPlaneError::BoundedTopology(
+                                "representative plane exceeds u8".to_string(),
+                            )
+                        })?,
+                    });
             }
-            let cycle_indexes = cycles.iter().copied().collect::<Vec<_>>();
-            let cycle_index = cycle_indexes.first().copied().unwrap_or(0);
+        }
+        for assignments in representative_assignments.values_mut() {
+            assignments.sort_by(|left, right| {
+                left.depth
+                    .cmp(&right.depth)
+                    .then_with(|| left.group_id.cmp(&right.group_id))
+                    .then_with(|| left.plane.cmp(&right.plane))
+            });
+        }
+
+        let mut edges = Vec::with_capacity(topology.edge_placements().len());
+        for (edge, topology_placements) in topology.edge_placements() {
             let (observed_status, path_states, last_observed_at) = topology_edge_observation(
                 paths_by_edge.get(edge).map(Vec::as_slice).unwrap_or(&[]),
                 generated_at,
                 policy.path_state_ttl_seconds,
             );
-            let kind = if !inter_block {
-                ControlPlaneTopologyEdgeKind::IntraBlock
-            } else if cycles.contains(&0) {
-                ControlPlaneTopologyEdgeKind::InterBlockPrimary
-            } else {
-                ControlPlaneTopologyEdgeKind::InterBlockSecondary
-            };
+            let placements = topology_placements
+                .iter()
+                .map(|placement| {
+                    Ok(ControlPlaneTopologyEdgePlacement {
+                        group_id: placement.group_id().to_string(),
+                        depth: placement.level(),
+                        plane: u8::try_from(placement.plane()).map_err(|_| {
+                            ControlPlaneError::BoundedTopology("edge plane exceeds u8".to_string())
+                        })?,
+                        kind: match placement.kind() {
+                            BoundedTopologyEdgeKind::LeafCycle => {
+                                ControlPlaneTopologyEdgeKind::LeafCycle
+                            }
+                            BoundedTopologyEdgeKind::HierarchyLink => {
+                                ControlPlaneTopologyEdgeKind::SiblingCycle
+                            }
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, ControlPlaneError>>()?;
             edges.push(ControlPlaneTopologyEdge {
                 source: edge.first().clone(),
                 target: edge.second().clone(),
-                kind,
-                cycle_index,
-                cycle_indexes,
-                source_block_id,
-                target_block_id,
+                placements,
                 observed_status,
                 path_states,
                 last_observed_at,
             });
         }
 
-        let blocks = topology
-            .blocks()
+        let groups = topology
+            .groups()
             .iter()
-            .map(|block| {
-                let representatives = block
-                    .node_ids()
+            .map(|group| {
+                let representatives = group
+                    .representatives()
                     .iter()
-                    .flat_map(|node_id| {
-                        representative_cycles
-                            .get(node_id)
-                            .into_iter()
-                            .flatten()
-                            .map(|cycle_index| ControlPlaneTopologyRepresentative {
-                                node_id: node_id.clone(),
-                                cycle_index: *cycle_index,
-                                kind: if *cycle_index == 0 {
-                                    "primary".to_string()
-                                } else {
-                                    "secondary".to_string()
-                                },
-                            })
+                    .map(|representative| {
+                        Ok(ControlPlaneTopologyRepresentative {
+                            node_id: representative.node_id().clone(),
+                            plane: u8::try_from(representative.plane()).map_err(|_| {
+                                ControlPlaneError::BoundedTopology(
+                                    "representative plane exceeds u8".to_string(),
+                                )
+                            })?,
+                            role: if representative.plane() == 0 {
+                                "primary".to_string()
+                            } else {
+                                "secondary".to_string()
+                            },
+                        })
                     })
-                    .collect::<Vec<_>>();
-                let primary_representative = representatives
-                    .iter()
-                    .find(|representative| representative.cycle_index == 0)
-                    .map(|representative| representative.node_id.clone());
-                let secondary_representative = representatives
-                    .iter()
-                    .find(|representative| {
-                        representative.cycle_index > 0
-                            && Some(&representative.node_id) != primary_representative.as_ref()
-                    })
-                    .or_else(|| {
-                        representatives
-                            .iter()
-                            .find(|representative| representative.cycle_index > 0)
-                    })
-                    .map(|representative| representative.node_id.clone());
-                ControlPlaneTopologyBlock {
-                    block_id: block.block_id().to_string(),
-                    node_ids: block.node_ids().to_vec(),
-                    primary_representative,
-                    secondary_representative,
+                    .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+                Ok(ControlPlaneTopologyGroup {
+                    group_id: group.group_id().to_string(),
+                    depth: group.depth(),
+                    parent_group_id: group.parent_group_id().map(str::to_string),
+                    child_group_ids: group.child_group_ids().to_vec(),
+                    node_ids: group.node_ids().to_vec(),
+                    leaf: group.is_leaf(),
                     representatives,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ControlPlaneError>>()?;
 
         let topology_nodes = nodes
             .into_iter()
             .map(|node| {
-                let block_id = node_blocks.get(&node.node_id).cloned().ok_or_else(|| {
-                    ControlPlaneError::BoundedTopology(format!(
-                        "node {} has no topology block",
-                        node.node_id
-                    ))
-                })?;
-                let representative_kinds = representative_cycles
-                    .get(&node.node_id)
-                    .into_iter()
-                    .flatten()
-                    .map(|cycle_index| {
-                        if *cycle_index == 0 {
-                            "primary".to_string()
-                        } else {
-                            "secondary".to_string()
-                        }
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
+                let leaf_group_id =
+                    leaf_group_by_node
+                        .get(&node.node_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ControlPlaneError::BoundedTopology(format!(
+                                "node {} has no topology leaf group",
+                                node.node_id
+                            ))
+                        })?;
+                let mut ancestry = Vec::new();
+                let mut group_id = Some(leaf_group_id.clone());
+                while let Some(current_group_id) = group_id {
+                    let group = groups_by_id.get(&current_group_id).ok_or_else(|| {
+                        ControlPlaneError::BoundedTopology(format!(
+                            "topology group {current_group_id} is absent"
+                        ))
+                    })?;
+                    ancestry.push(current_group_id);
+                    group_id = group.parent_group_id().map(str::to_string);
+                }
+                ancestry.reverse();
                 let degree = topology
                     .neighbors(&node.node_id)
                     .map(BTreeSet::len)
                     .unwrap_or(0);
                 let health = health_by_node.get(&node.node_id);
+                let representative_for = representative_assignments
+                    .remove(&node.node_id)
+                    .unwrap_or_default();
                 Ok(ControlPlaneTopologyNode {
                     node_id: node.node_id,
                     vpn_ip: node.vpn_ip,
                     role: node.role,
                     tags: node.tags,
-                    block_id,
+                    leaf_group_id,
+                    ancestry,
                     degree,
                     health_state: health.map(|health| health.state),
                     last_seen_at: health.map(|health| health.last_seen_at),
-                    representative_kinds,
+                    representative_for,
                 })
             })
             .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+        let root_group_id = topology
+            .groups()
+            .iter()
+            .find(|group| group.parent_group_id().is_none())
+            .map(|group| group.group_id().to_string());
+        let level_count = topology
+            .groups()
+            .iter()
+            .map(|group| group.depth() + 1)
+            .max()
+            .unwrap_or(0);
 
         Ok(ControlPlaneTopologyResponse {
             cluster_id: self.config.cluster_id.clone(),
             topology_epoch: topology.topology_epoch().to_string(),
             algorithm: TOPOLOGY_ALGORITHM_VERSION.to_string(),
-            block_size: policy.overlay_block_size,
+            root_group_id,
+            fanout: policy.overlay_block_size,
             max_degree: policy.overlay_max_degree,
-            direct_shortcut_limit: policy.overlay_direct_shortcut_limit,
+            direct_shortcut_limit: 0,
             node_count: topology.invariants().node_count,
+            group_count: groups.len(),
+            level_count,
             edge_count: topology.invariants().edge_count,
             max_observed_degree: topology.invariants().max_observed_degree,
-            diameter: topology.diameter(),
-            blocks,
+            diameter_lower_bound: topology.diameter_lower_bound(),
+            groups,
             nodes: topology_nodes,
             edges,
             generated_at,
@@ -2330,7 +2450,7 @@ where
             .ok_or(ControlPlaneError::OverlayDestinationNotFound(
                 request.destination,
             ))?;
-        let topology = self.overlay_topology(&nodes, &policy)?;
+        let topology = self.overlay_topology(&nodes, &policy).await?;
         let paths = topology
             .paths(&source.node_id, &target.node_id)
             .ok_or_else(|| ControlPlaneError::OverlayPathUnavailable {
@@ -2354,26 +2474,116 @@ where
     }
 
     async fn overlay_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
-        Ok(self
-            .store
-            .list_nodes()
-            .await?
-            .into_iter()
-            .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
+        let policy = self.current_cluster_policy().await?;
+        let now = Utc::now();
+        let snapshot = self.overlay_node_snapshot().await?;
+        Ok(snapshot
+            .nodes
+            .iter()
+            .filter(|node| {
+                overlay_node_health_allows(
+                    node,
+                    snapshot.health_by_node.get(&node.node_id),
+                    now,
+                    policy.relay_health_ttl_seconds,
+                )
+            })
+            .cloned()
             .collect())
     }
 
-    fn overlay_topology(
+    async fn overlay_node_snapshot(&self) -> Result<Arc<OverlayNodeSnapshot>, ControlPlaneError> {
+        let mut cached = self.overlay_node_snapshot_cache.lock().await;
+        if let Some(snapshot) = cached
+            .as_ref()
+            .filter(|snapshot| snapshot.loaded_at.elapsed() <= OVERLAY_NODE_SNAPSHOT_CACHE_TTL)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+
+        let (nodes, mut health_by_node) =
+            tokio::try_join!(self.store.list_nodes(), self.store.list_health())?;
+        let nodes = nodes
+            .into_iter()
+            .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
+            .collect::<Vec<_>>();
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        health_by_node.retain(|node_id, _| node_ids.contains(node_id));
+        let snapshot = Arc::new(OverlayNodeSnapshot {
+            loaded_at: Instant::now(),
+            nodes,
+            health_by_node,
+        });
+        *cached = Some(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
+    async fn invalidate_overlay_node_snapshot(&self) {
+        self.overlay_node_snapshot_cache.lock().await.take();
+    }
+
+    async fn overlay_topology(
         &self,
         nodes: &[NodeRecord],
         policy: &ClusterPolicy,
-    ) -> Result<BoundedTopology, ControlPlaneError> {
-        Ok(BoundedTopology::synthesize(
-            nodes,
-            &BoundedTopologyConfig::new(usize::from(policy.overlay_max_degree))
-                .with_block_size(usize::from(policy.overlay_block_size))
-                .with_permutation_seed(self.config.cluster_id.as_str()),
-        )?)
+    ) -> Result<Arc<BoundedTopology>, ControlPlaneError> {
+        let mut node_ids = nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<Vec<_>>();
+        node_ids.sort();
+        let key = OverlayTopologyCacheKey {
+            node_ids,
+            block_size: policy.overlay_block_size,
+            max_degree: policy.overlay_max_degree,
+            permutation_seed: self.config.cluster_id.as_str().to_string(),
+        };
+        let cell = {
+            let mut cache = self.overlay_topology_cache.lock().await;
+            cache.retain(|cached_key, cell| cached_key == &key || cell.initialized());
+            while cache.len() >= MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES && !cache.contains_key(&key) {
+                let Some(evicted_key) = cache.keys().next().cloned() else {
+                    break;
+                };
+                cache.remove(&evicted_key);
+            }
+            while cache.len() > MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES {
+                let Some(evicted_key) =
+                    cache.keys().find(|cached_key| *cached_key != &key).cloned()
+                else {
+                    break;
+                };
+                cache.remove(&evicted_key);
+            }
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let config = BoundedTopologyConfig::new(usize::from(policy.overlay_max_degree))
+            .with_block_size(usize::from(policy.overlay_block_size))
+            .with_permutation_seed(self.config.cluster_id.as_str());
+        let topology_nodes = nodes.to_vec();
+        let topology = cell
+            .get_or_init(|| async move {
+                match tokio::task::spawn_blocking(move || {
+                    BoundedTopology::synthesize(&topology_nodes, &config)
+                })
+                .await
+                {
+                    Ok(Ok(topology)) => Ok(Arc::new(topology)),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(format!("topology synthesis task failed: {error}")),
+                }
+            })
+            .await;
+        topology
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|error| ControlPlaneError::BoundedTopology(error.clone()))
     }
 
     pub async fn remove_client(
@@ -2383,6 +2593,7 @@ where
         self.authenticate_client_request(&request, ClientRequestKind::Remove, Utc::now())
             .await?;
         let removed = self.store.remove_node(&request.client_id).await?;
+        self.invalidate_overlay_node_snapshot().await;
         *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
         Ok(RemoveClientResponse {
             client: removed.node,
@@ -2416,6 +2627,7 @@ where
         }
         self.validate_remove_node_request(&request, &node, Utc::now())?;
         let removed = self.store.remove_node(&request.node_id).await?;
+        self.invalidate_overlay_node_snapshot().await;
         *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
         Ok(RemoveNodeResponse {
             node: removed.node,
@@ -2583,9 +2795,12 @@ where
             });
         }
         let policy = self.current_cluster_policy().await?;
-        let previous_health = self.store.get_health(&request.node_id).await?;
+        let previous_signature_at = self
+            .store
+            .get_heartbeat_signature_timestamp(&request.node_id)
+            .await?;
         let now = Utc::now();
-        self.validate_heartbeat_request(&request, &node, previous_health.as_ref(), now)?;
+        self.validate_heartbeat_request(&request, &node, previous_signature_at, now)?;
         self.validate_heartbeat_path_relay_shape(&request)?;
         let path_nodes = if request.path_state.is_empty() {
             None
@@ -2617,9 +2832,11 @@ where
                 }
             }
         }
-        if let Some(signature) = request.node_signature.as_ref() {
-            request.health.last_seen_at = signature.signed_at;
-        }
+        let accepted_signature_at = request
+            .node_signature
+            .as_ref()
+            .map(|signature| signature.signed_at);
+        request.health.last_seen_at = now;
         let idle_timeout_seconds = policy.idle_timeout_seconds;
         let connection_intent_targets = request
             .path_state
@@ -2650,6 +2867,7 @@ where
         self.store
             .apply_heartbeat(HeartbeatStoreUpdate {
                 node_id: request.node_id,
+                accepted_signature_at,
                 candidates: request.candidates,
                 nat_classification: request.nat_classification,
                 relay_capability,
@@ -2935,7 +3153,7 @@ where
         &self,
         request: &HeartbeatRequest,
         node: &NodeRecord,
-        previous_health: Option<&NodeHealth>,
+        previous_signature_at: Option<chrono::DateTime<Utc>>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
         let policy = self.policy_snapshot()?;
@@ -3192,13 +3410,13 @@ where
                 ),
             });
         }
-        if let Some(previous_health) = previous_health {
-            if signed_at <= previous_health.last_seen_at {
+        if let Some(previous_signature_at) = previous_signature_at {
+            if signed_at <= previous_signature_at {
                 return Err(ControlPlaneError::NodeSignatureRejected {
                     node_id: request.node_id.clone(),
                     reason: format!(
                         "signed_at {signed_at} is not newer than last accepted heartbeat {}",
-                        previous_health.last_seen_at
+                        previous_signature_at
                     ),
                 });
             }
@@ -3487,12 +3705,12 @@ where
         &self,
         nodes: &[NodeRecord],
     ) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
-        let mut health_by_node = BTreeMap::new();
-        for node in nodes {
-            if let Some(health) = self.store.get_health(&node.node_id).await? {
-                health_by_node.insert(node.node_id.clone(), health);
-            }
-        }
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut health_by_node = self.store.list_health().await?;
+        health_by_node.retain(|node_id, _| node_ids.contains(node_id));
         Ok(health_by_node)
     }
 
@@ -3769,6 +3987,23 @@ fn client_gateway_health_allows(
             Ok(age) => age <= Duration::from_secs(policy.relay_health_ttl_seconds),
             Err(_) => true,
         }
+}
+
+fn overlay_node_health_allows(
+    node: &NodeRecord,
+    health: Option<&NodeHealth>,
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> bool {
+    let last_seen_at = match health {
+        Some(health) if health.state == HealthState::Unhealthy => return false,
+        Some(health) => health.last_seen_at,
+        None => node.registered_at,
+    };
+    match now.signed_duration_since(last_seen_at).to_std() {
+        Ok(age) => age <= Duration::from_secs(ttl_seconds),
+        Err(_) => true,
+    }
 }
 
 fn client_gateway_candidate_score(
@@ -4219,6 +4454,34 @@ fn timestamp_within_skew(
         return false;
     };
     timestamp >= now - max_skew && timestamp <= now + max_skew
+}
+
+fn ensure_heartbeat_is_newer(
+    update: &HeartbeatStoreUpdate,
+    previous_signature_at: Option<chrono::DateTime<Utc>>,
+    previous_health: Option<&NodeHealth>,
+) -> Result<(), ControlPlaneError> {
+    if let Some(accepted_signature_at) = update.accepted_signature_at {
+        if let Some(previous_signature_at) = previous_signature_at {
+            if accepted_signature_at <= previous_signature_at {
+                return Err(ControlPlaneError::NodeSignatureRejected {
+                    node_id: update.node_id.clone(),
+                    reason: format!(
+                        "signed_at {accepted_signature_at} is not newer than last accepted heartbeat {previous_signature_at}"
+                    ),
+                });
+            }
+        }
+    } else if previous_health
+        .is_some_and(|previous| update.health.last_seen_at <= previous.last_seen_at)
+    {
+        return Err(ControlPlaneError::NodeSignatureRejected {
+            node_id: update.node_id.clone(),
+            reason: "unsigned heartbeat was received before the current health snapshot"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn timestamp_not_after_skew(
@@ -5199,8 +5462,9 @@ mod tests {
         }
 
         let initial = plane_b.overlay_topology_snapshot().await?;
-        assert_eq!(initial.block_size, DEFAULT_OVERLAY_BLOCK_SIZE);
-        assert_eq!(initial.blocks.len(), 3);
+        assert_eq!(initial.fanout, DEFAULT_OVERLAY_BLOCK_SIZE);
+        assert!(initial.root_group_id.is_some());
+        assert_eq!(initial.groups.len(), initial.group_count);
 
         let mut policy = plane_a.current_cluster_policy().await?;
         policy.overlay_block_size = 8;
@@ -5209,12 +5473,12 @@ mod tests {
         let observed = plane_b.current_cluster_policy().await?;
         assert_eq!(observed.overlay_block_size, 8);
         let updated = plane_b.overlay_topology_snapshot().await?;
-        assert_eq!(updated.block_size, 8);
-        assert_eq!(updated.blocks.len(), 2);
+        assert_eq!(updated.fanout, 8);
+        assert_eq!(updated.groups.len(), updated.group_count);
         assert_ne!(initial.topology_epoch, updated.topology_epoch);
         assert!(updated.max_observed_degree <= usize::from(updated.max_degree));
 
-        for block_size in [1, 65] {
+        for block_size in [3, 65] {
             let mut invalid = observed.clone();
             invalid.overlay_block_size = block_size;
             assert!(matches!(
@@ -5226,6 +5490,324 @@ mod tests {
             plane_b.current_cluster_policy().await?.overlay_block_size,
             8
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_topology_cache_reuses_membership_and_rebuilds_for_membership_or_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+
+        for index in 0..8 {
+            let mut node = node_record(&format!("topology-cache-{index}"));
+            node.cluster_id = cluster_id.clone();
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+                100,
+                64,
+                0,
+                u8::try_from(index + 1)?,
+            )));
+            store.insert_node(node).await?;
+        }
+
+        let nodes = plane.overlay_nodes().await?;
+        let policy = plane.current_cluster_policy().await?;
+        let (first, concurrent) = tokio::join!(
+            plane.overlay_topology(&nodes, &policy),
+            plane.overlay_topology(&nodes, &policy)
+        );
+        let first = first?;
+        let concurrent = concurrent?;
+        assert!(Arc::ptr_eq(&first, &concurrent));
+
+        let mut reordered = nodes.clone();
+        reordered.reverse();
+        let reordered_topology = plane.overlay_topology(&reordered, &policy).await?;
+        assert!(Arc::ptr_eq(&first, &reordered_topology));
+
+        let updated_node_id = nodes[0].node_id.clone();
+        store
+            .update_node_candidates(
+                &updated_node_id,
+                vec![EndpointCandidate {
+                    node_id: updated_node_id.clone(),
+                    kind: EndpointCandidateKind::LocalUdp,
+                    addr: "10.0.0.10:51820".parse()?,
+                    observed_at: Utc::now(),
+                    priority: 10,
+                    cost: 1,
+                    source: CandidateSource::InterfaceScan,
+                }],
+            )
+            .await?;
+        store
+            .upsert_health(
+                updated_node_id,
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        let refreshed_nodes = plane.overlay_nodes().await?;
+        let refreshed_topology = plane.overlay_topology(&refreshed_nodes, &policy).await?;
+        assert!(Arc::ptr_eq(&first, &refreshed_topology));
+
+        let mut non_topology_policy = policy.clone();
+        non_topology_policy.path_state_ttl_seconds += 1;
+        plane
+            .set_cluster_policy(non_topology_policy.clone())
+            .await?;
+        let policy_refreshed_topology = plane
+            .overlay_topology(&refreshed_nodes, &non_topology_policy)
+            .await?;
+        assert!(Arc::ptr_eq(&first, &policy_refreshed_topology));
+
+        let mut added = node_record("topology-cache-added");
+        added.cluster_id = cluster_id;
+        added.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)));
+        store.insert_node(added).await?;
+        plane.invalidate_overlay_node_snapshot().await;
+        let expanded_nodes = plane.overlay_nodes().await?;
+        let expanded_topology = plane
+            .overlay_topology(&expanded_nodes, &non_topology_policy)
+            .await?;
+        assert!(!Arc::ptr_eq(&first, &expanded_topology));
+        assert_ne!(first.topology_epoch(), expanded_topology.topology_epoch());
+
+        let mut changed_policy = non_topology_policy;
+        changed_policy.overlay_max_degree = 6;
+        plane.set_cluster_policy(changed_policy.clone()).await?;
+        let changed_topology = plane
+            .overlay_topology(&expanded_nodes, &changed_policy)
+            .await?;
+        assert!(!Arc::ptr_eq(&expanded_topology, &changed_topology));
+        assert_ne!(
+            expanded_topology.topology_epoch(),
+            changed_topology.topology_epoch()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_or_unhealthy_overlay_nodes_are_replaced_in_the_topology(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let mut node_ids = Vec::new();
+        for index in 0..8 {
+            let mut node = node_record(&format!("topology-health-{index}"));
+            node.cluster_id = cluster_id.clone();
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+                100,
+                64,
+                0,
+                u8::try_from(index + 1)?,
+            )));
+            node_ids.push(node.node_id.clone());
+            store.insert_node(node).await?;
+        }
+
+        let policy = plane.current_cluster_policy().await?;
+        let initial_nodes = plane.overlay_nodes().await?;
+        let initial_topology = plane.overlay_topology(&initial_nodes, &policy).await?;
+        assert_eq!(initial_nodes.len(), 8);
+
+        let failed_node = node_ids[0].clone();
+        store
+            .upsert_health(
+                failed_node.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now()
+                        - Duration::seconds(i64::try_from(policy.relay_health_ttl_seconds)? + 1),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        plane.invalidate_overlay_node_snapshot().await;
+        let survivor_nodes = plane.overlay_nodes().await?;
+        let survivor_topology = plane.overlay_topology(&survivor_nodes, &policy).await?;
+        assert_eq!(survivor_nodes.len(), 7);
+        assert!(survivor_nodes
+            .iter()
+            .all(|node| node.node_id != failed_node));
+        assert_ne!(
+            initial_topology.topology_epoch(),
+            survivor_topology.topology_epoch()
+        );
+
+        store
+            .upsert_health(
+                failed_node.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        plane.invalidate_overlay_node_snapshot().await;
+        assert_eq!(plane.overlay_nodes().await?.len(), 8);
+
+        store
+            .upsert_health(
+                failed_node.clone(),
+                NodeHealth {
+                    state: HealthState::Unhealthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        plane.invalidate_overlay_node_snapshot().await;
+        assert!(plane
+            .overlay_nodes()
+            .await?
+            .iter()
+            .all(|node| node.node_id != failed_node));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_topology_cache_memoizes_deterministic_synthesis_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            Arc::new(InMemoryStore::default()),
+        );
+        let mut nodes = Vec::new();
+        for index in 0..8 {
+            let mut node = node_record(&format!("topology-error-{index}"));
+            node.cluster_id = cluster_id.clone();
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+                100,
+                64,
+                0,
+                u8::try_from(index + 1)?,
+            )));
+            nodes.push(node);
+        }
+        let invalid_policy = ClusterPolicy {
+            overlay_block_size: 3,
+            ..ClusterPolicy::default()
+        };
+
+        for _ in 0..2 {
+            assert!(matches!(
+                plane.overlay_topology(&nodes, &invalid_policy).await,
+                Err(ControlPlaneError::BoundedTopology(_))
+            ));
+        }
+        let cache = plane.overlay_topology_cache.lock().await;
+        assert_eq!(cache.len(), 1);
+        assert!(cache.values().all(|cell| cell.initialized()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_node_snapshot_is_reused_across_a_thousand_pollers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let store = Arc::new(InMemoryStore::default());
+        for index in 0..1_000 {
+            let mut node = node_record(&format!("snapshot-node-{index:04}"));
+            node.cluster_id = cluster_id.clone();
+            store.insert_node(node).await?;
+        }
+        let mut client = node_record("snapshot-client");
+        client.cluster_id = cluster_id.clone();
+        client.role = Role::client();
+        store.insert_node(client).await?;
+        let mut foreign = node_record("snapshot-foreign");
+        foreign.cluster_id = ClusterId::from_string("cluster-b");
+        store.insert_node(foreign).await?;
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?),
+            store,
+        );
+
+        let first = plane.overlay_node_snapshot().await?;
+        assert_eq!(first.nodes.len(), 1_000);
+        for _ in 0..1_000 {
+            let cached = plane.overlay_node_snapshot().await?;
+            assert!(Arc::ptr_eq(&first, &cached));
+        }
+
+        plane.invalidate_overlay_node_snapshot().await;
+        let refreshed = plane.overlay_node_snapshot().await?;
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_topology_cache_prunes_abandoned_cells_and_stays_bounded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
+            ),
+            Arc::new(InMemoryStore::default()),
+        );
+        {
+            let mut cache = plane.overlay_topology_cache.lock().await;
+            for index in 0..32 {
+                cache.insert(
+                    OverlayTopologyCacheKey {
+                        node_ids: vec![node_id(&format!("abandoned-{index}"))],
+                        block_size: DEFAULT_OVERLAY_BLOCK_SIZE,
+                        max_degree: ClusterPolicy::default().overlay_max_degree,
+                        permutation_seed: cluster_id.as_str().to_string(),
+                    },
+                    Arc::new(OnceCell::new()),
+                );
+            }
+        }
+
+        let policy = plane.current_cluster_policy().await?;
+        let mut nodes = Vec::new();
+        for index in 0..12 {
+            let mut node = node_record(&format!("bounded-cache-{index}"));
+            node.cluster_id = cluster_id.clone();
+            nodes.push(node);
+        }
+        plane.overlay_topology(&nodes, &policy).await?;
+        {
+            let cache = plane.overlay_topology_cache.lock().await;
+            assert_eq!(cache.len(), 1);
+            assert!(cache.values().all(|cell| cell.initialized()));
+        }
+
+        for retained in 4..=12 {
+            plane.overlay_topology(&nodes[..retained], &policy).await?;
+        }
+        let cache = plane.overlay_topology_cache.lock().await;
+        assert!(cache.len() <= MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES);
+        assert!(cache.values().all(|cell| cell.initialized()));
         Ok(())
     }
 
@@ -5319,6 +5901,13 @@ mod tests {
             node_id: &NodeId,
         ) -> Result<Option<NodeHealth>, ControlPlaneError> {
             self.inner.get_health(node_id).await
+        }
+
+        async fn get_heartbeat_signature_timestamp(
+            &self,
+            node_id: &NodeId,
+        ) -> Result<Option<chrono::DateTime<Utc>>, ControlPlaneError> {
+            self.inner.get_heartbeat_signature_timestamp(node_id).await
         }
 
         async fn upsert_nat_classification(
@@ -6097,8 +6686,14 @@ mod tests {
             .get_health(&node_id("node-a"))
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id("node-a")))?;
-        assert_eq!(stored_health.last_seen_at, new_at);
+        assert!(stored_health.last_seen_at >= old_at);
         assert_eq!(stored_health.message.as_deref(), Some("new"));
+        assert_eq!(
+            store
+                .get_heartbeat_signature_timestamp(&node_id("node-a"))
+                .await?,
+            Some(new_at)
+        );
         let stored_paths = store.list_paths_for(&node_id("node-a")).await?;
         assert_eq!(stored_paths.len(), 1);
         assert_eq!(stored_paths[0].updated_at, new_at);
@@ -7659,7 +8254,20 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(store.get_health(&node_id("node-a")).await?, Some(health));
+        let stored_health = store
+            .get_health(&node_id("node-a"))
+            .await?
+            .ok_or("health should be stored")?;
+        assert_eq!(stored_health.state, health.state);
+        assert_eq!(stored_health.latency_ms, health.latency_ms);
+        assert_eq!(stored_health.message, health.message);
+        assert!(stored_health.last_seen_at >= reported_at);
+        assert_eq!(
+            store
+                .get_heartbeat_signature_timestamp(&node_id("node-a"))
+                .await?,
+            Some(reported_at)
+        );
         assert_eq!(store.list_paths_for(&node_id("node-a")).await?.len(), 1);
 
         let second_reported_at = reported_at + Duration::seconds(1);
@@ -7688,9 +8296,18 @@ mod tests {
             .await?;
 
         assert!(second_response.accepted);
+        let stored_health = store
+            .get_health(&node_id("node-a"))
+            .await?
+            .ok_or("second health should be stored")?;
+        assert_eq!(stored_health.state, second_health.state);
+        assert_eq!(stored_health.latency_ms, second_health.latency_ms);
+        assert_eq!(stored_health.message, second_health.message);
         assert_eq!(
-            store.get_health(&node_id("node-a")).await?,
-            Some(second_health)
+            store
+                .get_heartbeat_signature_timestamp(&node_id("node-a"))
+                .await?,
+            Some(second_reported_at)
         );
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
         Ok(())
@@ -8009,7 +8626,7 @@ mod tests {
         plane
             .register_with_claims(claims(cluster_id), registration_request("node-a"))
             .await?;
-        let signed_at = Utc::now();
+        let signed_at = Utc::now() - Duration::seconds(120);
         let request = signed_heartbeat_at(
             "node-a",
             HeartbeatRequest {
@@ -8036,7 +8653,18 @@ mod tests {
             .get_health(&node_id("node-a"))
             .await?
             .ok_or("health should be stored")?;
-        assert_eq!(accepted_health.last_seen_at, signed_at);
+        assert!(accepted_health.last_seen_at > signed_at + Duration::seconds(90));
+        assert_eq!(
+            store
+                .get_heartbeat_signature_timestamp(&node_id("node-a"))
+                .await?,
+            Some(signed_at)
+        );
+        assert!(plane
+            .overlay_nodes()
+            .await?
+            .iter()
+            .any(|node| node.node_id == node_id("node-a")));
 
         let replay = plane.heartbeat(request).await;
         assert!(matches!(

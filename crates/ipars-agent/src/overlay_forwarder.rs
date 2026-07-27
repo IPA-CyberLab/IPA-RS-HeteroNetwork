@@ -35,7 +35,7 @@ const PREVIOUS_TOPOLOGY_EPOCH_GRACE: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayForwarderConfig {
     pub max_frame_bytes: usize,
-    pub max_relay_hops: u8,
+    pub max_relay_hops: u16,
     pub replay_cache_capacity: usize,
 }
 
@@ -43,7 +43,7 @@ impl Default for OverlayForwarderConfig {
     fn default() -> Self {
         Self {
             max_frame_bytes: MAX_MULTIHOP_FRAME_BYTES,
-            max_relay_hops: MAX_MULTIHOP_PATH_NODES as u8,
+            max_relay_hops: MAX_MULTIHOP_PATH_NODES as u16,
             replay_cache_capacity: DEFAULT_OVERLAY_REPLAY_CACHE_CAPACITY,
         }
     }
@@ -139,7 +139,7 @@ pub enum OverlayForwarderError {
         received_epoch: u64,
     },
     #[error("overlay relay path has {actual} hops, exceeding configured maximum {maximum}")]
-    RelayPathTooLong { actual: usize, maximum: u8 },
+    RelayPathTooLong { actual: usize, maximum: u16 },
     #[error("multi-hop path ID must not be all zero")]
     InvalidPathId,
     #[error("inner WireGuard datagram cannot be empty")]
@@ -149,7 +149,7 @@ pub enum OverlayForwarderError {
     #[error("multi-hop frame is {actual} bytes, exceeding configured maximum {maximum}")]
     FrameTooLarge { actual: usize, maximum: usize },
     #[error("multi-hop hop limit {actual} does not match the relay path length {expected}")]
-    InvalidHopLimit { expected: u8, actual: u8 },
+    InvalidHopLimit { expected: u16, actual: u16 },
     #[error("frame is for forwarding node {expected}, not local node {actual}")]
     UnexpectedLocalHop { expected: NodeId, actual: NodeId },
     #[error("completed frame is for destination {expected}, not local node {actual}")]
@@ -307,7 +307,7 @@ impl BoundedOverlayForwarder {
 
         let relay_nodes = ordered_nodes[1..ordered_nodes.len() - 1].to_vec();
         self.validate_relay_count(relay_nodes.len())?;
-        let hop_limit = relay_nodes.len() as u8;
+        let hop_limit = relay_nodes.len() as u16;
         let envelope = MultiHopEnvelope::new(
             self.neighbor_map.topology_epoch,
             path_id,
@@ -511,7 +511,7 @@ impl BoundedOverlayForwarder {
         envelope: &MultiHopEnvelope,
     ) -> Result<(), OverlayForwarderError> {
         self.validate_relay_count(envelope.path().len())?;
-        let expected = envelope.path().len() as u8;
+        let expected = envelope.path().len() as u16;
         if envelope.hop_limit() != expected {
             return Err(OverlayForwarderError::InvalidHopLimit {
                 expected,

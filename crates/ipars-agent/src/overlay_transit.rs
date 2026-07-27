@@ -1416,7 +1416,7 @@ async fn send_overlay_acknowledgement(
         delivered.topology_epoch(),
         *delivered.path_id(),
         delivered.sequence(),
-        reverse_path.len() as u8,
+        reverse_path.len() as u16,
         delivered.destination().clone(),
         delivered.source().clone(),
         reverse_path,
