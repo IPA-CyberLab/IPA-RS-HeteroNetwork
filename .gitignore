@@ -22,3 +22,5 @@ clients/windows/**/bin/
 clients/windows/**/obj/
 clients/windows/artifacts/
 clients/windows/.build/
+clients/macos/
+

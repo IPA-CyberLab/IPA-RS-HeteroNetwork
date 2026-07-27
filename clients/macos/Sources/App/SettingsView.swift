@@ -24,7 +24,10 @@ struct SettingsView: View {
                 Task { await model.removeThisMac() }
             }
         } message: {
-            Text("The VPN profile and local identity will be deleted.")
+            Text(
+                "The VPN profile and local identity will be deleted. "
+                    + "Control-plane cleanup is best effort when the service is unavailable."
+            )
         }
     }
 

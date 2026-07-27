@@ -63,11 +63,22 @@ final class AppModel: ObservableObject {
         lastError = nil
         defer { isBusy = false }
         do {
-            let refreshed = try await controlPlane.refresh(current)
-            _ = try TunnelProfile(session: refreshed)
-            try sessionStore.save(refreshed)
-            session = refreshed
-            try await tunnelManager.prepare(for: refreshed)
+            let connectionSession: ClientSession
+            do {
+                let refreshed = try await controlPlane.refresh(current)
+                _ = try TunnelProfile(session: refreshed)
+                try sessionStore.save(refreshed)
+                session = refreshed
+                connectionSession = refreshed
+            } catch {
+                // A public management gateway can be unavailable while the
+                // cached WireGuard gateway is still usable. Bring the overlay
+                // up first so the tunnel extension can recover its live
+                // control-plane route instead of deadlocking on refresh.
+                _ = try TunnelProfile(session: current)
+                connectionSession = current
+            }
+            try await tunnelManager.prepare(for: connectionSession)
             try tunnelManager.connect()
         } catch {
             lastError = error.localizedDescription
@@ -104,11 +115,23 @@ final class AppModel: ObservableObject {
         lastError = nil
         defer { isBusy = false }
         do {
+            var remoteRemovalError: Error?
+            // Keep the overlay route alive until the signed removal reaches a
+            // control plane. Disconnecting first can remove the only working
+            // management path when the public gateway is unavailable.
+            do {
+                try await controlPlane.remove(current)
+            } catch {
+                remoteRemovalError = error
+            }
             tunnelManager.disconnect()
-            try await controlPlane.remove(current)
             try await tunnelManager.removeProfile()
             try sessionStore.delete()
             session = nil
+            if let remoteRemovalError {
+                lastError = "This Mac was removed locally, but control-plane cleanup failed: "
+                    + remoteRemovalError.localizedDescription
+            }
         } catch {
             lastError = error.localizedDescription
         }

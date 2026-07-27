@@ -12977,6 +12977,13 @@ async fn desired_public_web_gateway_ip(
     (age <= max_age).then_some(classification.local_addr.ip())
 }
 
+fn public_web_gateway_needs_reconciliation(
+    configured_ip: Option<Option<IpAddr>>,
+    desired_ip: Option<IpAddr>,
+) -> bool {
+    configured_ip != Some(desired_ip)
+}
+
 fn start_public_web_gateway(
     runtime: Arc<AgentRuntime>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
@@ -12994,12 +13001,17 @@ fn start_public_web_gateway(
         .build()
         .context("failed to build public Web UI probe client")?;
     Ok(tokio::spawn(async move {
-        let mut configured_ip = None;
+        // Keep "not reconciled yet" distinct from a reconciled standby
+        // configuration. Caddy survives Agent restarts, while the proxy token
+        // does not, so the first iteration must always replace any surviving
+        // configuration even when NAT classification currently has no public
+        // address.
+        let mut configured_ip: Option<Option<IpAddr>> = None;
         loop {
             let desired_ip =
                 desired_public_web_gateway_ip(&runtime, config.classification_max_age).await;
             let desired_url = desired_ip.map(public_web_gateway_url);
-            if desired_ip != configured_ip {
+            if public_web_gateway_needs_reconciliation(configured_ip, desired_ip) {
                 let phase = if desired_ip.is_some() {
                     PublicWebGatewayPhase::Provisioning
                 } else {
@@ -13015,7 +13027,7 @@ fn start_public_web_gateway(
                 .await;
                 match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip).await {
                     Ok(()) => {
-                        configured_ip = desired_ip;
+                        configured_ip = Some(desired_ip);
                         tracing::info!(
                             public_ip = ?desired_ip,
                             "reconciled public Web UI gateway"
@@ -13035,7 +13047,7 @@ fn start_public_web_gateway(
                 }
             }
 
-            if configured_ip == desired_ip {
+            if configured_ip == Some(desired_ip) {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
                     match probe_public_web_gateway(
                         &probe_client,
@@ -13162,8 +13174,14 @@ async fn runtime_stun_servers(
     {
         let authoritative_config = AgentStunDiscoveryConfig {
             explicit_servers: Vec::new(),
-            public_stun_urls: Vec::new(),
-            disable_public_stun_fallback: true,
+            public_stun_urls: if config.retain_public_fallback_for_gateway {
+                config.public_stun_urls.clone()
+            } else {
+                Vec::new()
+            },
+            disable_public_stun_fallback: config.disable_public_stun_fallback
+                || !config.retain_public_fallback_for_gateway,
+            retain_public_fallback_for_gateway: config.retain_public_fallback_for_gateway,
         };
         resolve_agent_stun_servers(&authoritative_config, None, &state.bootstrap_endpoints).await
     } else {
@@ -19030,6 +19048,7 @@ struct AgentStunDiscoveryConfig {
     explicit_servers: Vec<SocketAddr>,
     public_stun_urls: Vec<String>,
     disable_public_stun_fallback: bool,
+    retain_public_fallback_for_gateway: bool,
 }
 
 impl From<&AgentArgs> for AgentStunDiscoveryConfig {
@@ -19038,6 +19057,8 @@ impl From<&AgentArgs> for AgentStunDiscoveryConfig {
             explicit_servers: args.stun_servers.clone(),
             public_stun_urls: args.public_stun_urls.clone(),
             disable_public_stun_fallback: args.disable_public_stun_fallback,
+            retain_public_fallback_for_gateway: args.public_web_gateway_enabled
+                && args.listen.ip().is_loopback(),
         }
     }
 }
@@ -19392,6 +19413,7 @@ mod tests {
             explicit_servers: vec![retired],
             public_stun_urls: Vec::new(),
             disable_public_stun_fallback: true,
+            retain_public_fallback_for_gateway: false,
         };
 
         assert_eq!(
@@ -19419,6 +19441,127 @@ mod tests {
 
         assert_eq!(refreshed, vec![active]);
         assert!(!refreshed.contains(&retired));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authoritative_private_stun_directory_retains_public_discovery_fallback(
+    ) -> anyhow::Result<()> {
+        let retired = SocketAddr::from(([8, 8, 8, 10], 3478));
+        let public_fallback = SocketAddr::from(([8, 8, 8, 8], 3478));
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let config = AgentStunDiscoveryConfig {
+            explicit_servers: vec![retired],
+            public_stun_urls: vec![format!("udp://{public_fallback}")],
+            disable_public_stun_fallback: false,
+            retain_public_fallback_for_gateway: true,
+        };
+        runtime.merge_active_bootstrap_endpoints(
+            &[
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: "https://active.example:8443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "https://active.example:9443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://10.0.0.1:3478".to_string(),
+                },
+            ],
+            Utc::now(),
+        )?;
+
+        let resolved = runtime_stun_servers(&runtime, &config).await?;
+
+        assert_eq!(resolved, vec![public_fallback]);
+        assert!(!resolved.contains(&retired));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authoritative_private_stun_directory_stays_private_without_public_gateway(
+    ) -> anyhow::Result<()> {
+        let private_stun = SocketAddr::from(([10, 0, 0, 1], 3478));
+        let public_fallback = SocketAddr::from(([8, 8, 8, 8], 3478));
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let config = AgentStunDiscoveryConfig {
+            explicit_servers: Vec::new(),
+            public_stun_urls: vec![format!("udp://{public_fallback}")],
+            disable_public_stun_fallback: false,
+            retain_public_fallback_for_gateway: false,
+        };
+        runtime.merge_active_bootstrap_endpoints(
+            &[
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: "https://active.example:8443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "https://active.example:9443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: format!("udp://{private_stun}"),
+                },
+            ],
+            Utc::now(),
+        )?;
+
+        assert_eq!(
+            runtime_stun_servers(&runtime, &config).await?,
+            vec![private_stun]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authoritative_public_stun_fallback_requires_an_active_public_gateway() -> anyhow::Result<()>
+    {
+        let Cli {
+            command: Command::Agent(public_gateway),
+            ..
+        } = Cli::try_parse_from(["iparsd", "agent"])?
+        else {
+            anyhow::bail!("expected agent command");
+        };
+        assert!(
+            AgentStunDiscoveryConfig::from(public_gateway.as_ref())
+                .retain_public_fallback_for_gateway
+        );
+
+        let Cli {
+            command: Command::Agent(non_loopback),
+            ..
+        } = Cli::try_parse_from(["iparsd", "agent", "--listen", "0.0.0.0:9780"])?
+        else {
+            anyhow::bail!("expected agent command");
+        };
+        assert!(
+            !AgentStunDiscoveryConfig::from(non_loopback.as_ref())
+                .retain_public_fallback_for_gateway
+        );
+
+        let Cli {
+            command: Command::Agent(mut disabled),
+            ..
+        } = Cli::try_parse_from(["iparsd", "agent"])?
+        else {
+            anyhow::bail!("expected agent command");
+        };
+        disabled.public_web_gateway_enabled = false;
+        assert!(
+            !AgentStunDiscoveryConfig::from(disabled.as_ref()).retain_public_fallback_for_gateway
+        );
         Ok(())
     }
 
@@ -19502,6 +19645,22 @@ mod tests {
         assert!(public.contains("reverse_proxy http://10.0.0.10:18447"));
         assert!(!public.contains("/metrics"));
         assert!(!public.contains("/v1/status"));
+    }
+
+    #[test]
+    fn public_web_gateway_reconciles_once_after_agent_restart() {
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+
+        assert!(public_web_gateway_needs_reconciliation(None, None));
+        assert!(public_web_gateway_needs_reconciliation(
+            None,
+            Some(public_ip)
+        ));
+        assert!(!public_web_gateway_needs_reconciliation(Some(None), None));
+        assert!(!public_web_gateway_needs_reconciliation(
+            Some(Some(public_ip)),
+            Some(public_ip)
+        ));
     }
 
     #[test]
