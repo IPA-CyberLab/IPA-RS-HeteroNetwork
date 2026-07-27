@@ -1455,6 +1455,7 @@ pub struct NeighborMap {
     pub node_id: NodeId,
     pub topology_epoch: u64,
     pub max_degree: u16,
+    pub vpn_cidr: IpNet,
     pub neighbors: Vec<OverlayNeighbor>,
     pub aggregate_routes: Vec<AggregateOverlayRoute>,
     #[serde(default)]
@@ -1472,6 +1473,16 @@ impl NeighborMap {
                 format!(
                     "max degree must be between 1 and {MAX_OVERLAY_DEGREE}, got {}",
                     self.max_degree
+                ),
+            ));
+        }
+        if self.vpn_cidr != self.vpn_cidr.trunc() {
+            return Err(OverlayValidationError::new(
+                "vpn_cidr",
+                format!(
+                    "VPN CIDR {} must be canonical {}",
+                    self.vpn_cidr,
+                    self.vpn_cidr.trunc()
                 ),
             ));
         }
@@ -1543,6 +1554,15 @@ impl NeighborMap {
                     format!(
                         "neighbor VPN address {} is duplicated",
                         neighbor.node.vpn_ip
+                    ),
+                ));
+            }
+            if !self.vpn_cidr.contains(&neighbor.node.vpn_ip.0) {
+                return Err(OverlayValidationError::new(
+                    "neighbors",
+                    format!(
+                        "neighbor {} VPN address {} is outside {}",
+                        neighbor.node.node_id, neighbor.node.vpn_ip, self.vpn_cidr
                     ),
                 ));
             }
@@ -19379,6 +19399,7 @@ mod tests {
             node_id: NodeId::from_string("node-a"),
             topology_epoch: 42,
             max_degree: 4,
+            vpn_cidr: "10.250.0.0/24".parse()?,
             neighbors: vec![
                 OverlayNeighbor {
                     node: overlay_test_node("node-b", "cluster-a", "10.250.0.2".parse()?),

@@ -2040,6 +2040,7 @@ where
             node_id: source.node_id,
             topology_epoch: topology.topology_epoch(),
             max_degree: policy.overlay_max_degree,
+            vpn_cidr: IpNet::V4(self.config.vpn_pool),
             neighbors,
             aggregate_routes: selected_routes
                 .into_values()

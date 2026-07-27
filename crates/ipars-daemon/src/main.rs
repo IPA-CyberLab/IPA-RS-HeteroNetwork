@@ -107,9 +107,9 @@ use ipars_types::{
     http_url_is_usable_endpoint, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
     ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatConnectivityState,
-    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore,
-    PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
-    TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics,
+    PathRecord, PathScore, PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken,
+    TokenLedgerMetrics, TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_PATH_SCORE_REASONS,
 };
 use netlink_sys::{
@@ -141,6 +141,7 @@ const CAP_PERFMON_BIT: u8 = 38;
 const CAP_BPF_BIT: u8 = 39;
 const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_STUN_SERVERS: usize = MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND;
+const MAX_PENDING_OVERLAY_PATH_RESOLUTIONS_PER_ROUND: usize = 64;
 const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
     "udp://stun.cloudflare.com:3478",
     "udp://stun.cloudflare.com:53",
@@ -14325,6 +14326,7 @@ async fn negotiate_signal_paths(
     hole_puncher: &UdpHolePuncher,
     options: &SignalPathNegotiationOptions,
 ) -> anyhow::Result<()> {
+    resolve_pending_overlay_paths(client, runtime, control_plane_urls).await;
     runtime
         .refresh_candidate_observations(chrono::Utc::now())
         .await;
@@ -14333,10 +14335,10 @@ async fn negotiate_signal_paths(
         .state()
         .identity_key_pair()
         .context("failed to load agent identity key for signal path signing")?;
-    let peer_map =
-        fetch_peer_map_from_control_planes(client, control_plane_urls, &status.node_id, &identity)
-            .await
-            .context("failed to fetch peer map for signal negotiation")?;
+    let peer_map = runtime
+        .overlay_peer_map_snapshot()
+        .await
+        .context("bounded neighbor map has not been applied for signal negotiation")?;
 
     let peer_set = signal_negotiation_peer_set(runtime, peer_map).await;
     let direct_path_verification = DirectPathVerificationConfig {
@@ -18675,7 +18677,7 @@ impl PeerMapSource for HttpPeerMapSource {
         let control_plane_urls =
             runtime_control_plane_urls(self.runtime.as_ref(), &self.control_plane_urls)
                 .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
-        let peer_map = fetch_peer_map_from_control_planes(
+        let neighbor_map = fetch_neighbor_map_from_control_planes(
             &self.client,
             &control_plane_urls,
             node_id,
@@ -18686,31 +18688,53 @@ impl PeerMapSource for HttpPeerMapSource {
         persist_agent_service_directory(
             self.runtime.as_ref(),
             &self.state_store,
-            &peer_map.bootstrap_endpoints,
+            &neighbor_map.bootstrap_endpoints,
         )
         .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
-        Ok(peer_map)
+        self.runtime
+            .record_neighbor_map_snapshot(neighbor_map.clone())
+            .await?;
+        let mut peers = neighbor_map
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.node.clone())
+            .collect::<Vec<_>>();
+        let mut peer_ids = peers
+            .iter()
+            .map(|peer| peer.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        for peer in self.runtime.resolved_overlay_peers().await {
+            if peer_ids.insert(peer.node_id.clone()) {
+                peers.push(peer);
+            }
+        }
+        Ok(PeerMap {
+            cluster_id: neighbor_map.cluster_id,
+            peers,
+            bootstrap_endpoints: neighbor_map.bootstrap_endpoints,
+            generated_at: neighbor_map.generated_at,
+        })
     }
 }
 
-async fn fetch_peer_map_from_control_planes(
+async fn fetch_neighbor_map_from_control_planes(
     client: &reqwest::Client,
     control_plane_urls: &[String],
     node_id: &NodeId,
     identity: &IdentityKeyPair,
-) -> anyhow::Result<PeerMap> {
+) -> anyhow::Result<NeighborMap> {
     anyhow::ensure!(
         !control_plane_urls.is_empty(),
-        "control-plane URL is required for peer-map fetch"
+        "control-plane URL is required for neighbor-map fetch"
     );
     anyhow::ensure!(
         identity.node_id() == *node_id,
-        "peer-map query node {node_id} does not match signing identity {}",
+        "neighbor-map query node {node_id} does not match signing identity {}",
         identity.node_id()
     );
     let mut failures = Vec::new();
     for control_plane_url in control_plane_urls {
-        let url = peer_map_url(control_plane_url);
+        let url = neighbor_map_url(control_plane_url);
         let mut request = ControlPlaneNodeQueryRequest {
             node_id: node_id.clone(),
             request_signature: None,
@@ -18719,10 +18743,10 @@ async fn fetch_peer_map_from_control_planes(
             identity
                 .sign_control_plane_node_query_request(
                     &request,
-                    ControlPlaneNodeQueryKind::PeerMap,
+                    ControlPlaneNodeQueryKind::NeighborMap,
                     chrono::Utc::now(),
                 )
-                .context("failed to sign control-plane peer-map query")?,
+                .context("failed to sign control-plane neighbor-map query")?,
         );
         let response = match client.post(&url).json(&request).send().await {
             Ok(response) => response,
@@ -18741,22 +18765,150 @@ async fn fetch_peer_map_from_control_planes(
         match read_bounded_agent_json_response(
             response,
             MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
-            "control-plane peer map",
+            "control-plane neighbor map",
         )
         .await
         {
-            Ok(peer_map) => return Ok(peer_map),
+            Ok(neighbor_map) => return Ok(neighbor_map),
             Err(error) => failures.push(format!("{url}: decode failed: {error}")),
         }
     }
     anyhow::bail!(
-        "all control-plane peer-map endpoints failed: {}",
+        "all control-plane neighbor-map endpoints failed: {}",
         failures.join("; ")
     )
 }
 
-fn peer_map_url(control_plane_url: &str) -> String {
-    format!("{}/v1/peers/query", control_plane_url.trim_end_matches('/'))
+async fn fetch_overlay_path_from_control_planes(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    identity: &IdentityKeyPair,
+    destination: IpAddr,
+) -> anyhow::Result<OverlayPath> {
+    anyhow::ensure!(
+        !control_plane_urls.is_empty(),
+        "control-plane URL is required for overlay-path fetch"
+    );
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        let url = overlay_path_url(control_plane_url);
+        let request = identity
+            .sign_overlay_path_query(destination, chrono::Utc::now())
+            .context("failed to sign control-plane overlay-path query")?;
+        let response = match client.post(&url).json(&request).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{url}: send failed: {error}"));
+                continue;
+            }
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{url}: rejected: {error}"));
+                continue;
+            }
+        };
+        let path: OverlayPath = match read_bounded_agent_json_response(
+            response,
+            MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
+            "control-plane overlay path",
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                failures.push(format!("{url}: decode failed: {error}"));
+                continue;
+            }
+        };
+        path.validate()
+            .map_err(|error| anyhow::anyhow!("invalid overlay path from {url}: {error}"))?;
+        anyhow::ensure!(
+            path.source == identity.node_id(),
+            "overlay path source {} does not match local identity {}",
+            path.source,
+            identity.node_id()
+        );
+        anyhow::ensure!(
+            path.destination == destination,
+            "overlay path destination {} does not match query {destination}",
+            path.destination
+        );
+        return Ok(path);
+    }
+    anyhow::bail!(
+        "all control-plane overlay-path endpoints failed: {}",
+        failures.join("; ")
+    )
+}
+
+async fn resolve_pending_overlay_paths(
+    client: &reqwest::Client,
+    runtime: &AgentRuntime,
+    control_plane_urls: &[String],
+) {
+    let destinations = runtime
+        .take_pending_overlay_destinations(MAX_PENDING_OVERLAY_PATH_RESOLUTIONS_PER_ROUND)
+        .await;
+    if destinations.is_empty() {
+        return;
+    }
+    let identity = match runtime.state().identity_key_pair() {
+        Ok(identity) => identity,
+        Err(error) => {
+            for destination in destinations {
+                runtime.requeue_overlay_destination(destination).await;
+            }
+            tracing::warn!(%error, "failed to load identity for overlay-path resolution");
+            return;
+        }
+    };
+    for destination in destinations {
+        match fetch_overlay_path_from_control_planes(
+            client,
+            control_plane_urls,
+            &identity,
+            destination,
+        )
+        .await
+        {
+            Ok(path) => {
+                if let Err(error) = runtime
+                    .record_resolved_overlay_path(path, chrono::Utc::now())
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        %destination,
+                        "rejected resolved bounded-overlay path"
+                    );
+                }
+            }
+            Err(error) => {
+                runtime.requeue_overlay_destination(destination).await;
+                tracing::warn!(
+                    %error,
+                    %destination,
+                    "failed to resolve bounded-overlay path; will retry"
+                );
+            }
+        }
+    }
+}
+
+fn neighbor_map_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/v1/neighbors/query",
+        control_plane_url.trim_end_matches('/')
+    )
+}
+
+fn overlay_path_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/v1/overlay-paths/query",
+        control_plane_url.trim_end_matches('/')
+    )
 }
 
 fn heartbeat_url(control_plane_url: &str) -> String {
@@ -20273,7 +20425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_map_fetch_rejects_oversized_control_plane_response() -> anyhow::Result<()> {
+    async fn neighbor_map_fetch_rejects_oversized_control_plane_response() -> anyhow::Result<()> {
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES + 1
@@ -20281,51 +20433,56 @@ mod tests {
         let (url, server) = spawn_raw_http_response(response).await?;
         let identity = IdentityKeyPair::generate();
         let error = test_error(
-            fetch_peer_map_from_control_planes(
+            fetch_neighbor_map_from_control_planes(
                 &reqwest::Client::new(),
                 &[url],
                 &identity.node_id(),
                 &identity,
             )
             .await,
-            "oversized control-plane peer map response should be rejected",
+            "oversized control-plane neighbor map response should be rejected",
         );
         assert!(
             error
                 .to_string()
-                .contains("control-plane peer map response exceeds maximum size"),
-            "unexpected peer-map error: {error:#}"
+                .contains("control-plane neighbor map response exceeds maximum size"),
+            "unexpected neighbor-map error: {error:#}"
         );
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
-            .context("timed out waiting for oversized peer-map test server")???;
+            .context("timed out waiting for oversized neighbor-map test server")???;
         Ok(())
     }
 
     #[tokio::test]
-    async fn peer_map_fetch_times_out_stalled_endpoint_and_fails_over() -> anyhow::Result<()> {
+    async fn neighbor_map_fetch_times_out_stalled_endpoint_and_fails_over() -> anyhow::Result<()> {
         let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
-        let expected = PeerMap {
+        let identity = IdentityKeyPair::generate();
+        let expected = NeighborMap {
             cluster_id: ClusterId::from_string("cluster-timeout-failover"),
-            peers: Vec::new(),
+            node_id: identity.node_id(),
+            topology_epoch: 1,
+            max_degree: 4,
+            vpn_cidr: "100.64.0.0/10".parse()?,
+            neighbors: Vec::new(),
+            aggregate_routes: Vec::new(),
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
         let response = expected.clone();
         let (available_url, available_task) = spawn_test_http_service(Router::new().route(
-            "/v1/peers/query",
+            "/v1/neighbors/query",
             axum::routing::post(move || {
                 let response = response.clone();
                 async move { axum::Json(response) }
             }),
         ))
         .await?;
-        let identity = IdentityKeyPair::generate();
         let client =
             build_agent_http_client(Duration::from_millis(50), Duration::from_millis(100))?;
         let started = Instant::now();
 
-        let peer_map = fetch_peer_map_from_control_planes(
+        let neighbor_map = fetch_neighbor_map_from_control_planes(
             &client,
             &[stalled_url, available_url],
             &identity.node_id(),
@@ -20333,7 +20490,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(peer_map, expected);
+        assert_eq!(neighbor_map, expected);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "stalled endpoint failover exceeded the bounded request timeout"
@@ -33547,10 +33704,10 @@ exec sleep 60
     }
 
     #[test]
-    fn peer_map_url_trims_control_plane_base_url() {
+    fn neighbor_map_url_trims_control_plane_base_url() {
         assert_eq!(
-            peer_map_url("http://127.0.0.1:8443/"),
-            "http://127.0.0.1:8443/v1/peers/query"
+            neighbor_map_url("http://127.0.0.1:8443/"),
+            "http://127.0.0.1:8443/v1/neighbors/query"
         );
     }
 
@@ -34636,6 +34793,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
@@ -34789,6 +34947,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
@@ -34905,6 +35064,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
@@ -35033,6 +35193,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
@@ -35164,6 +35325,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
@@ -35328,6 +35490,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
@@ -35429,6 +35592,7 @@ exec sleep 60
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         };
+        runtime.record_peer_map_snapshot(peer_map.clone()).await;
         let (control_plane_base, control_plane_task) =
             spawn_test_http_service(Router::new().route(
                 "/v1/peers/query",
