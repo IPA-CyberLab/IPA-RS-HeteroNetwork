@@ -64,6 +64,7 @@
 {{- $agentPeerProbeResponderMaxRequestsPerSecond := printf "%v" .Values.agent.peerProbe.responderMaxRequestsPerSecond -}}
 {{- $agentPeerProbeObservationMaxAgeSeconds := printf "%v" .Values.agent.peerProbe.observationMaxAgeSeconds -}}
 {{- $agentWireguardListenPortValue := printf "%v" .Values.agent.wireguardListenPort -}}
+{{- $agentOverlayTransitPortValue := printf "%v" .Values.agent.overlayTransitPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentNatDiscoveryIntervalSeconds := printf "%v" .Values.agent.natDiscovery.intervalSeconds -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
@@ -127,6 +128,13 @@
 {{- if lt (int $agentWireguardListenPortValue) 1 -}}
 {{- fail "agent.wireguardListenPort must be between 1 and 65535" -}}
 {{- end -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.overlayTransitPort" "value" $agentOverlayTransitPortValue "max" 65535) -}}
+{{- if lt (int $agentOverlayTransitPortValue) 1 -}}
+{{- fail "agent.overlayTransitPort must be between 1 and 65535" -}}
+{{- end -}}
+{{- if eq (int $agentOverlayTransitPortValue) (int $agentWireguardListenPortValue) -}}
+{{- fail "agent.overlayTransitPort must differ from agent.wireguardListenPort" -}}
+{{- end -}}
 {{- include "heteronetwork.validateBindSocketAddress" (dict "path" "agent.stunBind" "value" $agentStunBind) -}}
 {{- $agentStunBindPort := int (regexFind "[0-9]+$" $agentStunBind) -}}
 {{- if ne $agentStunBindPort (int $agentWireguardListenPortValue) -}}
@@ -185,6 +193,9 @@
 {{- end -}}
 {{- if eq (int $agentPeerProbePort) (int $agentWireguardListenPortValue) -}}
 {{- fail "agent.peerProbe.port must differ from agent.wireguardListenPort" -}}
+{{- end -}}
+{{- if eq (int $agentPeerProbePort) (int $agentOverlayTransitPortValue) -}}
+{{- fail "agent.peerProbe.port must differ from agent.overlayTransitPort" -}}
 {{- end -}}
 {{- if lt (int $agentPeerProbeIntervalSeconds) 1 -}}
 {{- fail "agent.peerProbe.intervalSeconds must be greater than zero" -}}
@@ -1100,6 +1111,8 @@ spec:
             - {{ .Values.agent.interfaceName | quote }}
             - --wireguard-listen-port
             - {{ $agentWireguardListenPortValue | quote }}
+            - --overlay-transit-port
+            - {{ $agentOverlayTransitPortValue | quote }}
             - --stun-bind
             - {{ $agentStunBind | quote }}
             - --nat-discovery-interval-seconds

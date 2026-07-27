@@ -24,6 +24,7 @@ serviceAccount:
 agent:
   interfaceName: heteronetwork0
   wireguardListenPort: 51820
+  overlayTransitPort: 51822
   stunBind: "0.0.0.0:51820"
   natDiscovery:
     intervalSeconds: 60

@@ -89,11 +89,13 @@ const DEFAULT_AGENT_PEER_MAP_POLL_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_AGENT_SIGNAL_PATH_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT: u16 = 51_821;
 const DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT: u16 = 51_822;
+const DEFAULT_DOCKER_AGENT_OVERLAY_TRANSIT_PORT: u16 = 51_823;
 const DEFAULT_K8S_AGENT_WIREGUARD_LISTEN_PORT: u16 = 51_820;
 const DEFAULT_K8S_AGENT_API_TARGET_PORT: u16 = 9_780;
 const DEFAULT_K8S_RELAY_UDP_TARGET_PORT: u16 = 51_830;
 const DEFAULT_K8S_RELAY_HTTP_TARGET_PORT: u16 = 9_580;
 const DEFAULT_K8S_AGENT_PEER_PROBE_PORT: u16 = 51_821;
+const DEFAULT_K8S_AGENT_OVERLAY_TRANSIT_PORT: u16 = 51_822;
 const DEFAULT_AGENT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_AGENT_PEER_PROBE_SAMPLE_COUNT: u16 = 5;
 const DEFAULT_AGENT_PEER_PROBE_RESPONSE_TIMEOUT_MILLIS: u64 = 500;
@@ -670,6 +672,8 @@ enum K8sCommand {
 struct AgentPeerProbeInstallArgs {
     #[arg(long = "disable-agent-peer-probe", default_value_t = false)]
     disabled: bool,
+    #[arg(long = "agent-overlay-transit-port")]
+    overlay_transit_port: Option<u16>,
     #[arg(long = "agent-peer-probe-port")]
     port: Option<u16>,
     #[arg(
@@ -713,6 +717,7 @@ impl Default for AgentPeerProbeInstallArgs {
     fn default() -> Self {
         Self {
             disabled: false,
+            overlay_transit_port: None,
             port: None,
             interval_seconds: DEFAULT_AGENT_PEER_PROBE_INTERVAL_SECONDS,
             sample_count: DEFAULT_AGENT_PEER_PROBE_SAMPLE_COUNT,
@@ -6593,6 +6598,7 @@ fn validate_docker_install_args(args: &DockerInstallArgs) -> anyhow::Result<()> 
         args.agent_runtime_backend == "linux-command",
         DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT,
         DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT,
+        DEFAULT_DOCKER_AGENT_OVERLAY_TRANSIT_PORT,
     )?;
     validate_docker_userspace_wireguard_args(args)?;
     validate_docker_relay_advertisement(args)?;
@@ -7142,11 +7148,23 @@ fn validate_agent_peer_probe_settings(
     linux_peer_map_active: bool,
     wireguard_listen_port: u16,
     default_probe_port: u16,
+    default_overlay_transit_port: u16,
 ) -> anyhow::Result<u16> {
     let probe_port = settings.port.unwrap_or(default_probe_port);
+    let overlay_transit_port = settings
+        .overlay_transit_port
+        .unwrap_or(default_overlay_transit_port);
     anyhow::ensure!(
         probe_port > 0,
         "--agent-peer-probe-port must be greater than zero"
+    );
+    anyhow::ensure!(
+        overlay_transit_port > 0,
+        "--agent-overlay-transit-port must be greater than zero"
+    );
+    anyhow::ensure!(
+        overlay_transit_port != wireguard_listen_port,
+        "--agent-overlay-transit-port must differ from the effective WireGuard listen port {wireguard_listen_port}"
     );
     validate_bounded_docker_seconds(
         settings.interval_seconds,
@@ -7184,6 +7202,10 @@ fn validate_agent_peer_probe_settings(
         anyhow::ensure!(
             probe_port != wireguard_listen_port,
             "--agent-peer-probe-port must differ from the effective WireGuard listen port {wireguard_listen_port}"
+        );
+        anyhow::ensure!(
+            probe_port != overlay_transit_port,
+            "--agent-peer-probe-port must differ from --agent-overlay-transit-port"
         );
         let minimum_observation_age = settings
             .interval_seconds
@@ -7336,6 +7358,14 @@ fn docker_install_environment(args: &DockerInstallArgs) -> Vec<InstallEnvironmen
         InstallEnvironment {
             name: "HETERONETWORK_AGENT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS".to_string(),
             value: args.agent_direct_handshake_max_age_seconds.to_string(),
+        },
+        InstallEnvironment {
+            name: "HETERONETWORK_AGENT_OVERLAY_TRANSIT_PORT".to_string(),
+            value: args
+                .agent_peer_probe
+                .overlay_transit_port
+                .unwrap_or(DEFAULT_DOCKER_AGENT_OVERLAY_TRANSIT_PORT)
+                .to_string(),
         },
         InstallEnvironment {
             name: "HETERONETWORK_AGENT_DISABLE_PEER_PROBE".to_string(),
@@ -8308,6 +8338,12 @@ fn append_k8s_agent_pod_values(command: &mut String, args: &K8sInstallArgs) {
         " --set agent.directPathVerification.handshakeMaxAgeSeconds={}",
         args.agent_direct_handshake_max_age_seconds
     ));
+    command.push_str(&format!(
+        " --set agent.overlayTransitPort={}",
+        args.agent_peer_probe
+            .overlay_transit_port
+            .unwrap_or(DEFAULT_K8S_AGENT_OVERLAY_TRANSIT_PORT)
+    ));
     let peer_probe_enabled = !args.agent_peer_probe.disabled
         && !args.disable_agent_peer_map
         && args.agent_runtime_backend == "linux-command";
@@ -8807,6 +8843,7 @@ fn validate_k8s_agent_peer_probe_config(args: &K8sInstallArgs) -> anyhow::Result
         !args.disable_agent_peer_map && args.agent_runtime_backend == "linux-command",
         wireguard_listen_port,
         DEFAULT_K8S_AGENT_PEER_PROBE_PORT,
+        DEFAULT_K8S_AGENT_OVERLAY_TRANSIT_PORT,
     )?;
     Ok(())
 }
@@ -14235,6 +14272,7 @@ fi
     fn docker_install_plan_wires_and_validates_peer_probe() -> anyhow::Result<()> {
         let settings = AgentPeerProbeInstallArgs {
             disabled: false,
+            overlay_transit_port: Some(51_901),
             port: Some(51_900),
             interval_seconds: 45,
             sample_count: 7,
@@ -14250,6 +14288,7 @@ fi
         })?;
         for (name, expected) in [
             ("HETERONETWORK_AGENT_DISABLE_PEER_PROBE", "false"),
+            ("HETERONETWORK_AGENT_OVERLAY_TRANSIT_PORT", "51901"),
             ("HETERONETWORK_AGENT_PEER_PROBE_PORT", "51900"),
             ("HETERONETWORK_AGENT_PEER_PROBE_INTERVAL_SECONDS", "45"),
             ("HETERONETWORK_AGENT_PEER_PROBE_SAMPLE_COUNT", "7"),
@@ -14295,6 +14334,27 @@ fi
                     ..AgentPeerProbeInstallArgs::default()
                 },
                 "--agent-peer-probe-port must differ from the effective WireGuard listen port",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    overlay_transit_port: Some(0),
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-overlay-transit-port must be greater than zero",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    overlay_transit_port: Some(DEFAULT_DOCKER_AGENT_WIREGUARD_LISTEN_PORT),
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-overlay-transit-port must differ from the effective WireGuard listen port",
+            ),
+            (
+                AgentPeerProbeInstallArgs {
+                    overlay_transit_port: Some(DEFAULT_DOCKER_AGENT_PEER_PROBE_PORT),
+                    ..AgentPeerProbeInstallArgs::default()
+                },
+                "--agent-peer-probe-port must differ from --agent-overlay-transit-port",
             ),
             (
                 AgentPeerProbeInstallArgs {
@@ -18876,6 +18936,7 @@ fi
         let mut args = base_k8s_install_args();
         args.agent_peer_probe = AgentPeerProbeInstallArgs {
             disabled: false,
+            overlay_transit_port: Some(51_901),
             port: Some(51_900),
             interval_seconds: 45,
             sample_count: 7,
@@ -18888,6 +18949,7 @@ fi
         let plan = k8s_install_plan(args)?;
         let helm = &plan.commands[2];
         for expected in [
+            "--set agent.overlayTransitPort=51901",
             "--set agent.peerProbe.enabled=true",
             "--set agent.peerProbe.port=51900",
             "--set agent.peerProbe.intervalSeconds=45",
@@ -18921,6 +18983,29 @@ fi
             "--agent-peer-probe-port must differ from the effective WireGuard listen port 51821"
         ));
 
+        let mut transit_wireguard_conflict = base_k8s_install_args();
+        transit_wireguard_conflict
+            .agent_peer_probe
+            .overlay_transit_port = Some(DEFAULT_K8S_AGENT_WIREGUARD_LISTEN_PORT);
+        let error = test_error(
+            k8s_install_plan(transit_wireguard_conflict),
+            "overlay transit and WireGuard ports must differ",
+        );
+        assert!(error.to_string().contains(
+            "--agent-overlay-transit-port must differ from the effective WireGuard listen port 51820"
+        ));
+
+        let mut transit_probe_conflict = base_k8s_install_args();
+        transit_probe_conflict.agent_peer_probe.overlay_transit_port =
+            Some(DEFAULT_K8S_AGENT_PEER_PROBE_PORT);
+        let error = test_error(
+            k8s_install_plan(transit_probe_conflict),
+            "overlay transit and peer probe ports must differ",
+        );
+        assert!(error
+            .to_string()
+            .contains("--agent-peer-probe-port must differ from --agent-overlay-transit-port"));
+
         let mut stale = base_k8s_install_args();
         stale.agent_peer_probe.interval_seconds = 60;
         stale.agent_peer_probe.observation_max_age_seconds = 59;
@@ -18942,6 +19027,8 @@ fi
                 command,
                 "install",
                 "--disable-agent-peer-probe",
+                "--agent-overlay-transit-port",
+                "51901",
                 "--agent-peer-probe-port",
                 "51900",
                 "--agent-peer-probe-interval-seconds",
@@ -18972,6 +19059,7 @@ fi
                 settings,
                 AgentPeerProbeInstallArgs {
                     disabled: true,
+                    overlay_transit_port: Some(51_901),
                     port: Some(51_900),
                     interval_seconds: 45,
                     sample_count: 7,

@@ -189,6 +189,24 @@ Agents do not establish a full mesh. They keep a compact peer map and only negot
 - Kubernetes/API/service exposure needs an underlay path
 - an operator runs an explicit path probe
 
+The Control Plane synthesizes a deterministic bounded-degree backbone from
+cluster membership instead of returning a full mesh. The default cluster policy
+limits each node to four backbone neighbors. Each Agent uses identity-signed,
+on-demand `NeighborMap` and `OverlayPath` queries; the map carries the current
+topology epoch and bounded next hops, while the path carries an ordered primary
+route and, when available, an edge-disjoint secondary route, preferring a
+vertex-disjoint route.
+
+Until a direct path is verified, a per-peer loopback proxy encapsulates the
+unchanged inner WireGuard UDP datagram in a multi-hop envelope. Intermediate
+backbone peers forward that opaque WireGuard ciphertext without terminating
+the inner tunnel. Each hop validates the topology epoch, expected route
+position and hop bound, authenticated neighbor source, and replay sequence. A
+missing end-to-end acknowledgement within the bounded timeout retries the
+edge- or vertex-disjoint secondary route. Once WireGuard telemetry confirms a
+direct path, the Agent removes the proxy endpoint and promotes the peer to that
+direct endpoint.
+
 ACL-visible idle peers are represented by passive WireGuard peer entries with
 their overlay `/32` AllowedIP and host route, a loopback discard hold endpoint,
 no keepalive, and a deterministic quarantine public key that is distinct from

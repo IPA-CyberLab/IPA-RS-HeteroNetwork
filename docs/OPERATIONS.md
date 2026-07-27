@@ -471,6 +471,23 @@ the accepted candidates persisted in its registered-node state before
 heartbeat and Signal registration, even when the surviving kernel WireGuard
 interface already owns the shared port and the startup STUN bind cannot run.
 
+### Bounded lazy-connect transit
+
+A real peer-map runtime listens on the local VPN address for internal bounded
+overlay transit UDP. `--overlay-transit-port` and
+`HETERONETWORK_AGENT_OVERLAY_TRANSIT_PORT` default to `51822`. This listener
+carries multi-hop opaque inner WireGuard datagrams only between the bounded
+backbone neighbors; it is not a public bootstrap, Agent API, or Service port.
+
+The transit port must be nonzero and must differ from
+`--wireguard-listen-port`, from `--peer-probe-port` when peer probing is
+enabled, and from `--overlay-dns-port` when overlay DNS is enabled. Existing
+Compose uses `51823` for this listener because its peer probe uses `51822`. A
+primary route that does not return an acknowledgement within its bounded
+timeout is retried over the edge- or vertex-disjoint secondary route.
+Topology-epoch, replay, and hop validation failures are dropped rather than
+retried.
+
 With the default token or explicit STUN bootstrap, the Agent runs NAT discovery
 before registration and refreshes non-public classifications every
 `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. A public
@@ -534,8 +551,9 @@ Docker install plans set the Agent observation age and bundled Signal TTL from
 the same `--agent-peer-probe-observation-max-age-seconds` value. Kubernetes
 installs must keep the external Signal service TTL at least as fresh as the
 rendered Agent observation age.
-Compose uses probe port `51822` because its bundled WireGuard listener uses
-`51821`; Helm uses WireGuard `51820` and probe `51821`. Monitor
+Compose uses WireGuard `51821`, probe `51822`, and bounded overlay transit
+`51823`. Helm uses WireGuard `51820`, probe `51821`, and bounded overlay transit
+`51822`. Monitor
 `ipars_agent_peer_probe_*`, `ipars_agent_path_quality_observations`, and
 `ipars_signal_path_quality_observations_total{status=...}` in Prometheus, or the
 equivalent OTLP instruments.

@@ -268,6 +268,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES", "true"),
             ("HETERONETWORK_AGENT_STUN_BIND", "0.0.0.0:51821"),
             ("HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
+            ("HETERONETWORK_AGENT_OVERLAY_TRANSIT_PORT", "51823"),
             ("HETERONETWORK_AGENT_RUNTIME_BACKEND", "linux-command"),
             ("HETERONETWORK_DOCKER_DISCOVER_NETWORKS", "true"),
             (
@@ -480,6 +481,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
             ("HETERONETWORK_AGENT_APPLY_DOCKER_ROUTES", "false"),
             ("HETERONETWORK_AGENT_STUN_BIND", "0.0.0.0:51821"),
             ("HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT", "51821"),
+            ("HETERONETWORK_AGENT_OVERLAY_TRANSIT_PORT", "51823"),
             ("HETERONETWORK_AGENT_RUNTIME_BACKEND", "dry-run"),
             ("HETERONETWORK_AGENT_DISABLE_PEER_PROBE", "true"),
             ("HETERONETWORK_AGENT_PEER_PROBE_PORT", "51900"),

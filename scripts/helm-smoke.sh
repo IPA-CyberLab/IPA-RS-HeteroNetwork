@@ -74,6 +74,8 @@ assert_rendered_absent default "name: HETERONETWORK_ROUTE_PROVIDER"
 assert_rendered_absent default "- --kubernetes-route-provider"
 assert_rendered_contains default "- --wireguard-listen-port"
 assert_rendered_contains default '- "51820"'
+assert_rendered_contains default "- --overlay-transit-port"
+assert_rendered_contains default '- "51822"'
 assert_rendered_contains default "- --stun-bind"
 assert_rendered_contains default '- "0.0.0.0:51820"'
 assert_rendered_contains default '- "ip link delete dev heteronetwork0 2>/dev/null || true"'
@@ -97,6 +99,20 @@ template_fails agent-api-token-key-reuses-join-key \
 template_ok agent-listen-port \
   --set agent.wireguardListenPort=51830 \
   --set-string agent.stunBind=0.0.0.0:51830
+
+template_ok agent-overlay-transit-port \
+  --set agent.overlayTransitPort=51901
+
+assert_rendered_contains agent-overlay-transit-port "- --overlay-transit-port"
+assert_rendered_contains agent-overlay-transit-port '- "51901"'
+
+template_fails agent-overlay-transit-port-zero \
+  "agent.overlayTransitPort must be between 1 and 65535" \
+  --set agent.overlayTransitPort=0
+
+template_fails agent-overlay-transit-wireguard-conflict \
+  "agent.overlayTransitPort must differ from agent.wireguardListenPort" \
+  --set agent.overlayTransitPort=51820
 
 assert_rendered_contains agent-listen-port "- --wireguard-listen-port"
 assert_rendered_contains agent-listen-port '- "51830"'
@@ -221,6 +237,10 @@ assert_rendered_absent agent-peer-probe-disabled "- --peer-probe-port"
 template_fails agent-peer-probe-port-conflict \
   "agent.peerProbe.port must differ from agent.wireguardListenPort" \
   --set agent.peerProbe.port=51820
+
+template_fails agent-peer-probe-overlay-transit-port-conflict \
+  "agent.peerProbe.port must differ from agent.overlayTransitPort" \
+  --set agent.peerProbe.port=51822
 
 template_fails agent-peer-probe-samples-zero \
   "agent.peerProbe.sampleCount must be greater than zero" \

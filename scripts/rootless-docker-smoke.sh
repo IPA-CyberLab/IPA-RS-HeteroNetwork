@@ -210,6 +210,8 @@ services:
       - "51821"
       - --peer-probe-port
       - "51822"
+      - --overlay-transit-port
+      - "51823"
     cap_add: !override
       - NET_ADMIN
     devices: !override
