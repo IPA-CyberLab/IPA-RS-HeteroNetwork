@@ -1363,6 +1363,471 @@ pub struct NodeRecord {
     pub registered_at: DateTime<Utc>,
 }
 
+pub const MAX_OVERLAY_DEGREE: u16 = 64;
+pub const MAX_OVERLAY_NEIGHBORS: usize = MAX_OVERLAY_DEGREE as usize;
+pub const MAX_AGGREGATE_OVERLAY_ROUTES: usize = 4096;
+pub const MAX_OVERLAY_PATH_NODES: usize = 64;
+pub const MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES: usize = 64;
+pub const MAX_OVERLAY_NODE_ROUTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayNeighborKind {
+    BackbonePrimary,
+    BackboneSecondary,
+    DirectShortcut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayNeighbor {
+    pub node: NodeRecord,
+    pub kind: OverlayNeighborKind,
+}
+
+impl OverlayNeighbor {
+    pub fn validate(&self) -> Result<(), OverlayValidationError> {
+        validate_overlay_identifier(self.node.node_id.as_str(), "neighbor node ID", "neighbors")?;
+        validate_overlay_identifier(
+            self.node.cluster_id.as_str(),
+            "neighbor cluster ID",
+            "neighbors",
+        )?;
+        if self.node.endpoint_candidates.len() > MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES {
+            return Err(OverlayValidationError::new(
+                "neighbors",
+                format!(
+                    "neighbor {} endpoint candidate count {} exceeds maximum \
+                     {MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES}",
+                    self.node.node_id,
+                    self.node.endpoint_candidates.len()
+                ),
+            ));
+        }
+        if self.node.routes.len() > MAX_OVERLAY_NODE_ROUTES {
+            return Err(OverlayValidationError::new(
+                "neighbors",
+                format!(
+                    "neighbor {} route count {} exceeds maximum {MAX_OVERLAY_NODE_ROUTES}",
+                    self.node.node_id,
+                    self.node.routes.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregateOverlayRoute {
+    pub cidr: IpNet,
+    pub primary_next_hop: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_next_hop: Option<NodeId>,
+}
+
+impl AggregateOverlayRoute {
+    pub fn validate(&self) -> Result<(), OverlayValidationError> {
+        let canonical = self.cidr.trunc();
+        if self.cidr != canonical {
+            return Err(OverlayValidationError::new(
+                "aggregate_routes",
+                format!(
+                    "aggregate route {} must be canonical {}",
+                    self.cidr, canonical
+                ),
+            ));
+        }
+        validate_overlay_identifier(
+            self.primary_next_hop.as_str(),
+            "primary next-hop node ID",
+            "aggregate_routes",
+        )?;
+        if let Some(secondary) = &self.secondary_next_hop {
+            validate_overlay_identifier(
+                secondary.as_str(),
+                "secondary next-hop node ID",
+                "aggregate_routes",
+            )?;
+            if secondary == &self.primary_next_hop {
+                return Err(OverlayValidationError::new(
+                    "aggregate_routes",
+                    format!(
+                        "aggregate route {} must use distinct primary and secondary next hops",
+                        self.cidr
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeighborMap {
+    pub cluster_id: ClusterId,
+    pub node_id: NodeId,
+    pub topology_epoch: u64,
+    pub max_degree: u16,
+    pub neighbors: Vec<OverlayNeighbor>,
+    pub aggregate_routes: Vec<AggregateOverlayRoute>,
+    #[serde(default)]
+    pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
+    pub generated_at: DateTime<Utc>,
+}
+
+impl NeighborMap {
+    pub fn validate(&self) -> Result<(), OverlayValidationError> {
+        validate_overlay_identifier(self.cluster_id.as_str(), "cluster ID", "cluster_id")?;
+        validate_overlay_identifier(self.node_id.as_str(), "node ID", "node_id")?;
+        if self.max_degree == 0 || self.max_degree > MAX_OVERLAY_DEGREE {
+            return Err(OverlayValidationError::new(
+                "max_degree",
+                format!(
+                    "max degree must be between 1 and {MAX_OVERLAY_DEGREE}, got {}",
+                    self.max_degree
+                ),
+            ));
+        }
+        if self.neighbors.len() > usize::from(self.max_degree)
+            || self.neighbors.len() > MAX_OVERLAY_NEIGHBORS
+        {
+            return Err(OverlayValidationError::new(
+                "neighbors",
+                format!(
+                    "neighbor count {} exceeds configured maximum degree {}",
+                    self.neighbors.len(),
+                    self.max_degree
+                ),
+            ));
+        }
+        if self.aggregate_routes.len() > MAX_AGGREGATE_OVERLAY_ROUTES {
+            return Err(OverlayValidationError::new(
+                "aggregate_routes",
+                format!(
+                    "aggregate route count {} exceeds maximum \
+                     {MAX_AGGREGATE_OVERLAY_ROUTES}",
+                    self.aggregate_routes.len()
+                ),
+            ));
+        }
+        validate_join_token_bootstrap_endpoints(&self.bootstrap_endpoints).map_err(|error| {
+            OverlayValidationError::new(
+                "bootstrap_endpoints",
+                format!("bootstrap endpoint validation failed: {}", error.reason()),
+            )
+        })?;
+
+        let mut neighbor_kinds = BTreeMap::new();
+        let mut neighbor_vpn_ips = BTreeSet::new();
+        for (index, neighbor) in self.neighbors.iter().enumerate() {
+            neighbor.validate().map_err(|error| {
+                OverlayValidationError::new(
+                    "neighbors",
+                    format!("neighbor {index} is invalid: {}", error.reason()),
+                )
+            })?;
+            if neighbor.node.cluster_id != self.cluster_id {
+                return Err(OverlayValidationError::new(
+                    "neighbors",
+                    format!(
+                        "neighbor {} belongs to cluster {} instead of {}",
+                        neighbor.node.node_id, neighbor.node.cluster_id, self.cluster_id
+                    ),
+                ));
+            }
+            if neighbor.node.node_id == self.node_id {
+                return Err(OverlayValidationError::new(
+                    "neighbors",
+                    format!("node {} cannot be its own overlay neighbor", self.node_id),
+                ));
+            }
+            if neighbor_kinds
+                .insert(neighbor.node.node_id.clone(), neighbor.kind)
+                .is_some()
+            {
+                return Err(OverlayValidationError::new(
+                    "neighbors",
+                    format!("neighbor {} is duplicated", neighbor.node.node_id),
+                ));
+            }
+            if !neighbor_vpn_ips.insert(neighbor.node.vpn_ip) {
+                return Err(OverlayValidationError::new(
+                    "neighbors",
+                    format!(
+                        "neighbor VPN address {} is duplicated",
+                        neighbor.node.vpn_ip
+                    ),
+                ));
+            }
+        }
+
+        let mut route_cidrs = BTreeSet::new();
+        for (index, route) in self.aggregate_routes.iter().enumerate() {
+            route.validate().map_err(|error| {
+                OverlayValidationError::new(
+                    "aggregate_routes",
+                    format!("aggregate route {index} is invalid: {}", error.reason()),
+                )
+            })?;
+            if !route_cidrs.insert(route.cidr) {
+                return Err(OverlayValidationError::new(
+                    "aggregate_routes",
+                    format!("aggregate route {} is duplicated", route.cidr),
+                ));
+            }
+            match neighbor_kinds.get(&route.primary_next_hop) {
+                Some(OverlayNeighborKind::BackbonePrimary) => {}
+                Some(kind) => {
+                    return Err(OverlayValidationError::new(
+                        "aggregate_routes",
+                        format!(
+                            "primary next hop {} for {} has incompatible kind {kind:?}",
+                            route.primary_next_hop, route.cidr
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(OverlayValidationError::new(
+                        "aggregate_routes",
+                        format!(
+                            "primary next hop {} for {} is not a neighbor",
+                            route.primary_next_hop, route.cidr
+                        ),
+                    ));
+                }
+            }
+            if let Some(secondary) = &route.secondary_next_hop {
+                match neighbor_kinds.get(secondary) {
+                    Some(OverlayNeighborKind::BackboneSecondary) => {}
+                    Some(kind) => {
+                        return Err(OverlayValidationError::new(
+                            "aggregate_routes",
+                            format!(
+                                "secondary next hop {secondary} for {} has incompatible kind \
+                                 {kind:?}",
+                                route.cidr
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(OverlayValidationError::new(
+                            "aggregate_routes",
+                            format!(
+                                "secondary next hop {secondary} for {} is not a neighbor",
+                                route.cidr
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayPathQuery {
+    pub source: NodeId,
+    pub destination: IpAddr,
+    pub source_identity_proof: api::NodeApiRequestSignature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayPathQuerySignaturePayload {
+    pub source: NodeId,
+    pub destination: IpAddr,
+    pub signed_at: DateTime<Utc>,
+    pub nonce: String,
+}
+
+impl OverlayPathQuery {
+    pub fn signature_payload(&self) -> OverlayPathQuerySignaturePayload {
+        OverlayPathQuerySignaturePayload {
+            source: self.source.clone(),
+            destination: self.destination,
+            signed_at: self.source_identity_proof.signed_at,
+            nonce: self.source_identity_proof.nonce.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), OverlayValidationError> {
+        validate_overlay_identifier(self.source.as_str(), "source node ID", "source")?;
+        validate_overlay_destination(self.destination)?;
+        validate_overlay_identifier(
+            &self.source_identity_proof.nonce,
+            "source identity proof nonce",
+            "source_identity_proof",
+        )?;
+        self.source_identity_proof
+            .signature_bytes()
+            .map_err(|error| {
+                OverlayValidationError::new(
+                    "source_identity_proof",
+                    format!(
+                        "source identity proof signature is invalid: {}",
+                        error.reason()
+                    ),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayPath {
+    pub topology_epoch: u64,
+    pub source: NodeId,
+    pub destination: IpAddr,
+    pub ordered_nodes: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_ordered_nodes: Option<Vec<NodeId>>,
+    pub generated_at: DateTime<Utc>,
+}
+
+impl OverlayPath {
+    pub fn validate(&self) -> Result<(), OverlayValidationError> {
+        validate_overlay_identifier(self.source.as_str(), "source node ID", "source")?;
+        validate_overlay_destination(self.destination)?;
+        validate_ordered_overlay_nodes("ordered_nodes", &self.source, &self.ordered_nodes)?;
+        if let Some(secondary) = &self.secondary_ordered_nodes {
+            validate_ordered_overlay_nodes("secondary_ordered_nodes", &self.source, secondary)?;
+            if secondary == &self.ordered_nodes {
+                return Err(OverlayValidationError::new(
+                    "secondary_ordered_nodes",
+                    "secondary path must differ from the primary path",
+                ));
+            }
+            if secondary.last() != self.ordered_nodes.last() {
+                return Err(OverlayValidationError::new(
+                    "secondary_ordered_nodes",
+                    "secondary path must terminate at the same node as the primary path",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayValidationError {
+    field: &'static str,
+    reason: String,
+}
+
+impl OverlayValidationError {
+    fn new(field: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl Display for OverlayValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "overlay field {} is invalid: {}",
+            self.field, self.reason
+        )
+    }
+}
+
+impl std::error::Error for OverlayValidationError {}
+
+fn validate_overlay_identifier(
+    value: &str,
+    label: &str,
+    field: &'static str,
+) -> Result<(), OverlayValidationError> {
+    if value.is_empty() {
+        return Err(OverlayValidationError::new(
+            field,
+            format!("{label} cannot be empty"),
+        ));
+    }
+    if value.len() > MAX_JOIN_TOKEN_IDENTIFIER_BYTES {
+        return Err(OverlayValidationError::new(
+            field,
+            format!("{label} exceeds {MAX_JOIN_TOKEN_IDENTIFIER_BYTES} bytes"),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(OverlayValidationError::new(
+            field,
+            format!("{label} must contain only ASCII letters, digits, '_', '.' or '-'"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_overlay_destination(destination: IpAddr) -> Result<(), OverlayValidationError> {
+    let usable = match destination {
+        IpAddr::V4(address) => {
+            !address.is_unspecified() && !address.is_multicast() && address != Ipv4Addr::BROADCAST
+        }
+        IpAddr::V6(address) => !address.is_unspecified() && !address.is_multicast(),
+    };
+    if !usable {
+        return Err(OverlayValidationError::new(
+            "destination",
+            format!("destination address {destination} is unusable"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ordered_overlay_nodes(
+    field: &'static str,
+    source: &NodeId,
+    nodes: &[NodeId],
+) -> Result<(), OverlayValidationError> {
+    if nodes.is_empty() {
+        return Err(OverlayValidationError::new(
+            field,
+            "ordered path cannot be empty",
+        ));
+    }
+    if nodes.len() > MAX_OVERLAY_PATH_NODES {
+        return Err(OverlayValidationError::new(
+            field,
+            format!(
+                "ordered path node count {} exceeds maximum {MAX_OVERLAY_PATH_NODES}",
+                nodes.len()
+            ),
+        ));
+    }
+    if nodes.first() != Some(source) {
+        return Err(OverlayValidationError::new(
+            field,
+            format!("ordered path must start at source node {source}"),
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    for (index, node) in nodes.iter().enumerate() {
+        validate_overlay_identifier(node.as_str(), "path node ID", field)?;
+        if !seen.insert(node) {
+            return Err(OverlayValidationError::new(
+                field,
+                format!("ordered path repeats node {node} at index {index}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinTokenClaims {
     pub cluster_id: ClusterId,
@@ -18843,6 +19308,221 @@ mod tests {
             assert!(node_signature.signature_bytes().is_err());
             assert!(api_signature.signature_bytes().is_err());
         }
+    }
+
+    fn overlay_test_node(node_id: &str, cluster_id: &str, vpn_ip: IpAddr) -> NodeRecord {
+        NodeRecord {
+            node_id: NodeId::from_string(node_id),
+            cluster_id: ClusterId::from_string(cluster_id),
+            vpn_ip: VpnIp(vpn_ip),
+            identity_public_key: format!("identity-{node_id}"),
+            wireguard_public_key: format!("wireguard-{node_id}"),
+            role: Role::edge(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: Utc::now(),
+        }
+    }
+
+    fn valid_neighbor_map() -> Result<NeighborMap, Box<dyn std::error::Error>> {
+        Ok(NeighborMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            node_id: NodeId::from_string("node-a"),
+            topology_epoch: 42,
+            max_degree: 4,
+            neighbors: vec![
+                OverlayNeighbor {
+                    node: overlay_test_node("node-b", "cluster-a", "10.250.0.2".parse()?),
+                    kind: OverlayNeighborKind::BackbonePrimary,
+                },
+                OverlayNeighbor {
+                    node: overlay_test_node("node-c", "cluster-a", "10.250.0.3".parse()?),
+                    kind: OverlayNeighborKind::BackboneSecondary,
+                },
+            ],
+            aggregate_routes: vec![AggregateOverlayRoute {
+                cidr: "10.42.0.0/16".parse()?,
+                primary_next_hop: NodeId::from_string("node-b"),
+                secondary_next_hop: Some(NodeId::from_string("node-c")),
+            }],
+            bootstrap_endpoints: vec![BootstrapEndpoint {
+                url: "https://control.example:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            }],
+            generated_at: Utc::now(),
+        })
+    }
+
+    #[test]
+    fn neighbor_map_validates_and_round_trips_with_typed_neighbor_kinds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let neighbor_map = valid_neighbor_map()?;
+        neighbor_map.validate()?;
+
+        let encoded = serde_json::to_value(&neighbor_map)?;
+        assert_eq!(
+            encoded["neighbors"][0]["kind"],
+            serde_json::json!("backbone_primary")
+        );
+        assert_eq!(
+            encoded["neighbors"][1]["kind"],
+            serde_json::json!("backbone_secondary")
+        );
+        let decoded: NeighborMap = serde_json::from_value(encoded)?;
+        assert_eq!(decoded, neighbor_map);
+        Ok(())
+    }
+
+    #[test]
+    fn neighbor_map_rejects_degree_identity_and_next_hop_inconsistencies(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let valid = valid_neighbor_map()?;
+
+        let mut invalid = valid.clone();
+        invalid.max_degree = 1;
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("degree overflow should be rejected")?;
+        assert_eq!(error.field(), "neighbors");
+        assert!(error.reason().contains("exceeds configured maximum degree"));
+
+        invalid = valid.clone();
+        invalid.neighbors[0].node.node_id = invalid.node_id.clone();
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("self-neighbor should be rejected")?;
+        assert!(error
+            .reason()
+            .contains("cannot be its own overlay neighbor"));
+
+        invalid = valid.clone();
+        invalid.neighbors.push(invalid.neighbors[0].clone());
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("duplicate neighbor should be rejected")?;
+        assert!(error.reason().contains("is duplicated"));
+
+        invalid = valid.clone();
+        invalid.aggregate_routes[0].primary_next_hop = NodeId::from_string("node-c");
+        invalid.aggregate_routes[0].secondary_next_hop = None;
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("secondary neighbor should not be accepted as a primary next hop")?;
+        assert!(error
+            .reason()
+            .contains("incompatible kind BackboneSecondary"));
+
+        invalid = valid;
+        invalid.aggregate_routes[0].cidr = "10.42.0.1/24".parse()?;
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("non-canonical aggregate route should be rejected")?;
+        assert!(error.reason().contains("must be canonical 10.42.0.0/24"));
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_path_query_binds_and_validates_signed_source_identity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let signed_at = Utc::now();
+        let mut query = OverlayPathQuery {
+            source: NodeId::from_string("node-a"),
+            destination: "10.250.0.9".parse()?,
+            source_identity_proof: api::NodeApiRequestSignature {
+                signed_at,
+                nonce: "path-query-1".to_string(),
+                signature: format!("{}==", "A".repeat(86)),
+            },
+        };
+        query.validate()?;
+        assert_eq!(
+            query.signature_payload(),
+            OverlayPathQuerySignaturePayload {
+                source: query.source.clone(),
+                destination: query.destination,
+                signed_at,
+                nonce: "path-query-1".to_string(),
+            }
+        );
+        let decoded: OverlayPathQuery = serde_json::from_value(serde_json::to_value(&query)?)?;
+        assert_eq!(decoded, query);
+
+        query.source_identity_proof.signature = "short".to_string();
+        let error = query
+            .validate()
+            .err()
+            .ok_or("malformed identity proof should be rejected")?;
+        assert_eq!(error.field(), "source_identity_proof");
+
+        query.source_identity_proof.signature = format!("{}==", "A".repeat(86));
+        query.destination = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let error = query
+            .validate()
+            .err()
+            .ok_or("unspecified destination should be rejected")?;
+        assert_eq!(error.field(), "destination");
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_path_validates_ordered_primary_and_secondary_nodes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut path = OverlayPath {
+            topology_epoch: 42,
+            source: NodeId::from_string("node-a"),
+            destination: "10.250.0.9".parse()?,
+            ordered_nodes: vec![
+                NodeId::from_string("node-a"),
+                NodeId::from_string("node-b"),
+                NodeId::from_string("node-d"),
+            ],
+            secondary_ordered_nodes: Some(vec![
+                NodeId::from_string("node-a"),
+                NodeId::from_string("node-c"),
+                NodeId::from_string("node-d"),
+            ]),
+            generated_at: Utc::now(),
+        };
+        path.validate()?;
+        let decoded: OverlayPath = serde_json::from_value(serde_json::to_value(&path)?)?;
+        assert_eq!(decoded, path);
+
+        path.ordered_nodes[1] = path.source.clone();
+        let error = path
+            .validate()
+            .err()
+            .ok_or("path loops should be rejected")?;
+        assert!(error.reason().contains("repeats node"));
+
+        path.ordered_nodes[1] = NodeId::from_string("node-b");
+        path.secondary_ordered_nodes = Some(vec![
+            NodeId::from_string("node-a"),
+            NodeId::from_string("node-c"),
+            NodeId::from_string("node-e"),
+        ]);
+        let error = path
+            .validate()
+            .err()
+            .ok_or("secondary endpoint mismatch should be rejected")?;
+        assert!(error
+            .reason()
+            .contains("terminate at the same node as the primary path"));
+
+        path.secondary_ordered_nodes = Some(path.ordered_nodes.clone());
+        let error = path
+            .validate()
+            .err()
+            .ok_or("identical secondary path should be rejected")?;
+        assert!(error.reason().contains("must differ"));
+        Ok(())
     }
 
     #[test]
