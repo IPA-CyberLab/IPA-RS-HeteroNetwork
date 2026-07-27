@@ -5230,6 +5230,12 @@ where
             .await
     }
 
+    pub async fn configure_interface_mtu(&self, mtu: u32) -> Result<(), AgentError> {
+        self.runner
+            .run(wireguard_interface_mtu_command(&self.interface, mtu))
+            .await
+    }
+
     pub async fn configure_interface_private_key(
         &self,
         private_key_b64: &str,
@@ -5373,6 +5379,12 @@ where
             ))
             .await
     }
+
+    pub async fn configure_interface_mtu(&self, mtu: u32) -> Result<(), AgentError> {
+        self.runner
+            .run(wireguard_interface_mtu_command(&self.interface, mtu))
+            .await
+    }
 }
 
 #[async_trait]
@@ -5459,6 +5471,20 @@ fn validated_wireguard_private_key(value: &str) -> Result<Vec<u8>, AgentError> {
 
 fn wireguard_remove_peer_command(interface: &str, public_key: &str) -> LinuxCommand {
     LinuxCommand::new("wg", ["set", interface, "peer", public_key, "remove"])
+}
+
+fn wireguard_interface_mtu_command(interface: &str, mtu: u32) -> LinuxCommand {
+    LinuxCommand::new(
+        "ip",
+        [
+            "link".to_string(),
+            "set".to_string(),
+            "dev".to_string(),
+            interface.to_string(),
+            "mtu".to_string(),
+            mtu.to_string(),
+        ],
+    )
 }
 
 #[derive(Debug)]
@@ -5582,6 +5608,41 @@ impl KernelWireGuardBackend {
     }
 
     #[cfg(target_os = "linux")]
+    pub async fn configure_interface_mtu(&self, mtu: u32) -> Result<(), AgentError> {
+        let (connection, handle, _) = with_netlink_namespace(self.namespace.as_ref(), || {
+            rtnetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+        })
+        .map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to open route netlink connection for WireGuard interface {}{}: {error}",
+                self.interface,
+                wireguard_namespace_suffix(self.namespace.as_ref())
+            ))
+        })?;
+        tokio::spawn(connection);
+
+        let index = find_link_index(&handle, &self.interface)
+            .await?
+            .ok_or_else(|| {
+                AgentError::WireGuard(format!(
+                    "WireGuard interface {} was not visible before setting its MTU",
+                    self.interface
+                ))
+            })?;
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
+            .execute()
+            .await
+            .map_err(|error| {
+                AgentError::WireGuard(format!(
+                    "failed to set WireGuard interface {} MTU to {mtu} through rtnetlink: {error}",
+                    self.interface
+                ))
+            })
+    }
+
+    #[cfg(target_os = "linux")]
     pub async fn configure_interface_private_key(
         &self,
         private_key_b64: &str,
@@ -5618,6 +5679,13 @@ impl KernelWireGuardBackend {
 
     #[cfg(not(target_os = "linux"))]
     pub async fn configure_interface_address(&self, _vpn_ip: VpnIp) -> Result<(), AgentError> {
+        Err(AgentError::WireGuard(
+            "kernel WireGuard netlink backend is only supported on Linux".to_string(),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn configure_interface_mtu(&self, _mtu: u32) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
             "kernel WireGuard netlink backend is only supported on Linux".to_string(),
         ))
@@ -9987,6 +10055,7 @@ mod tests {
         let peer = NodeId::from_string("node-a");
 
         backend.ensure_interface().await?;
+        backend.configure_interface_mtu(1280).await?;
         backend
             .configure_interface_address(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))))
             .await?;
@@ -10005,6 +10074,7 @@ mod tests {
             runner.commands().await,
             vec![
                 LinuxCommand::new("wg", ["show", "ipars0"]),
+                LinuxCommand::new("ip", ["link", "set", "dev", "ipars0", "mtu", "1280"]),
                 LinuxCommand::new(
                     "ip",
                     ["address", "replace", "100.64.0.1/32", "dev", "ipars0"]
@@ -10082,16 +10152,20 @@ mod tests {
         let runner = RecordingRunner::default();
         let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
 
+        backend.configure_interface_mtu(1280).await?;
         backend
             .configure_interface_address(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))))
             .await?;
 
         assert_eq!(
             runner.commands().await,
-            vec![LinuxCommand::new(
-                "ip",
-                ["address", "replace", "100.64.0.2/32", "dev", "ipars0"],
-            )]
+            vec![
+                LinuxCommand::new("ip", ["link", "set", "dev", "ipars0", "mtu", "1280"]),
+                LinuxCommand::new(
+                    "ip",
+                    ["address", "replace", "100.64.0.2/32", "dev", "ipars0"],
+                ),
+            ]
         );
         assert_eq!(
             overlay_interface_cidr(VpnIp(IpAddr::V6(std::net::Ipv6Addr::new(

@@ -211,6 +211,10 @@ const DIRECT_PATH_ENDPOINT_APPLY_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_OVERLAY_TRANSIT_PORT: u16 = 51_822;
+// Bounded transit wraps a WireGuard datagram in another overlay path. Keep the
+// inner interface at IPv6's minimum MTU so full-sized TCP segments do not rely
+// on nested UDP fragmentation across heterogeneous underlays.
+const DEFAULT_OVERLAY_WIREGUARD_MTU: u32 = 1_280;
 const OVERLAY_TRANSIT_DELIVERY_QUEUE_CAPACITY: usize = 1_024;
 const OVERLAY_PEER_DELIVERY_QUEUE_CAPACITY: usize = 256;
 const OVERLAY_TRANSIT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1279,6 +1283,12 @@ struct AgentArgs {
         default_value_t = WireGuardApplyBackend::Command
     )]
     wireguard_backend: WireGuardApplyBackend,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_WIREGUARD_MTU",
+        default_value_t = DEFAULT_OVERLAY_WIREGUARD_MTU
+    )]
+    wireguard_mtu: u32,
     #[arg(long, env = "HETERONETWORK_AGENT_USERSPACE_WIREGUARD_COMMAND")]
     userspace_wireguard_command: Option<String>,
     #[arg(
@@ -1992,6 +2002,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         "--http-connect-timeout-seconds must not exceed --http-request-timeout-seconds"
     );
     validate_linux_interface_name(&args.wireguard_interface)?;
+    anyhow::ensure!(
+        (1_280..=65_535).contains(&args.wireguard_mtu),
+        "--wireguard-mtu must be between 1280 and 65535"
+    );
     if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
         anyhow::ensure!(
             args.wireguard_listen_port > 0,
@@ -11912,6 +11926,9 @@ where
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
     wireguard
+        .configure_interface_mtu(args.wireguard_mtu)
+        .await?;
+    wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
     wireguard
@@ -11946,6 +11963,9 @@ where
     let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace);
     wireguard.ensure_interface().await?;
     wireguard
+        .configure_interface_mtu(args.wireguard_mtu)
+        .await?;
+    wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
     wireguard
@@ -11979,6 +11999,9 @@ where
 {
     let wireguard = LinuxWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_mtu(args.wireguard_mtu)
+        .await?;
     wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
@@ -12015,6 +12038,9 @@ where
     let wireguard =
         UserspaceWireGuardBackend::new(args.wireguard_interface.clone(), wireguard_runner);
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_mtu(args.wireguard_mtu)
+        .await?;
     wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
@@ -12059,6 +12085,20 @@ where
             &runtime_wireguard_private_key(&runtime)?,
             args.wireguard_listen_port,
         )
+        .await
+        .map_err(anyhow::Error::from)?;
+    wireguard_runner
+        .run(LinuxCommand::new(
+            "ip",
+            [
+                "link".to_string(),
+                "set".to_string(),
+                "dev".to_string(),
+                args.wireguard_interface.clone(),
+                "mtu".to_string(),
+                args.wireguard_mtu.to_string(),
+            ],
+        ))
         .await
         .map_err(anyhow::Error::from)?;
     wireguard_runner
@@ -12112,6 +12152,9 @@ async fn start_peer_map_sync_with_kernel_backends(
 ) -> anyhow::Result<PeerMapSyncHandle> {
     let wireguard = kernel_wireguard_backend(args.wireguard_interface.clone(), namespace.clone());
     wireguard.ensure_interface().await?;
+    wireguard
+        .configure_interface_mtu(args.wireguard_mtu)
+        .await?;
     wireguard
         .configure_interface_private_key(&runtime_wireguard_private_key(&runtime)?)
         .await?;
@@ -30822,7 +30865,22 @@ exec sleep 60
             anyhow::bail!("expected agent command");
         };
         assert_eq!(default.listen, SocketAddr::from(([127, 0, 0, 1], 9780)));
+        assert_eq!(default.wireguard_mtu, DEFAULT_OVERLAY_WIREGUARD_MTU);
         validate_agent_runtime_config(&default)?;
+
+        for mtu in ["1279", "65536"] {
+            let cli = Cli::try_parse_from(["iparsd", "agent", "--wireguard-mtu", mtu])?;
+            let Command::Agent(args) = cli.command else {
+                anyhow::bail!("expected agent command");
+            };
+            let error = match validate_agent_runtime_config(&args) {
+                Ok(()) => anyhow::bail!("out-of-range WireGuard MTU unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("--wireguard-mtu must be between 1280 and 65535"));
+        }
 
         let exposed = Cli::try_parse_from(["iparsd", "agent", "--listen", "0.0.0.0:9780"])?;
         let Command::Agent(exposed) = exposed.command else {
