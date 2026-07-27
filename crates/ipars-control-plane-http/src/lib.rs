@@ -3772,11 +3772,12 @@ mod tests {
     use ipars_types::api::{
         ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse,
         ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse,
-        ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
-        JoinClientRequest, JoinNodeRequest, RegisterClientRequest, RegisterClientResponse,
-        RegisterNodeRequest, RegisterNodeResponse, RemoveClientResponse, RemoveNodeRequest,
-        RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
-        RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
+        ControlPlanePathsResponse, ControlPlanePolicyResponse, ControlPlaneTopologyEdgeStatus,
+        HeartbeatRequest, HeartbeatResponse, JoinClientRequest, JoinNodeRequest,
+        RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest, RegisterNodeResponse,
+        RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+        RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+        SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId,
@@ -5786,7 +5787,7 @@ mod tests {
                 cluster_id.clone(),
                 Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
             ),
-            store,
+            store.clone(),
         ));
         let join_service = Arc::new(ControlPlaneJoinService::new(
             plane.clone(),
@@ -5846,6 +5847,52 @@ mod tests {
             .blocks
             .iter()
             .all(|block| !block.representatives.is_empty()));
+        let observed_edge = initial
+            .edges
+            .first()
+            .cloned()
+            .ok_or("topology must contain an edge")?;
+        for (local, remote) in [
+            (observed_edge.source.clone(), observed_edge.target.clone()),
+            (observed_edge.target.clone(), observed_edge.source.clone()),
+        ] {
+            store
+                .upsert_path(PathRecord {
+                    key: PeerPathKey::new(local, remote),
+                    selected_state: PathState::DirectNatTraversal,
+                    selected_candidate: None,
+                    relay_node: None,
+                    score: PathScore::calculate(
+                        PathState::DirectNatTraversal,
+                        &PathMetrics::default(),
+                        true,
+                        0,
+                    ),
+                    updated_at: Utc::now(),
+                    pinned: false,
+                })
+                .await?;
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/topology")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let observed: ControlPlaneTopologyResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert!(observed.edges.iter().any(|edge| {
+            edge.source == observed_edge.source
+                && edge.target == observed_edge.target
+                && edge.observed_status == ControlPlaneTopologyEdgeStatus::Connected
+        }));
 
         let mut policy = plane.current_cluster_policy().await?;
         policy.overlay_block_size = 6;

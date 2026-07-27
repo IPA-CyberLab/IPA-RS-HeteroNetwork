@@ -488,6 +488,59 @@ timeout is retried over the edge- or vertex-disjoint secondary route.
 Topology-epoch, replay, and hop validation failures are dropped rather than
 retried.
 
+#### Dynamic block sizing and topology inspection
+
+`ClusterPolicy.overlay_block_size` controls the maximum number of nodes in one
+deterministic topology block. Valid values are 2 through 64.
+`overlay_max_degree` remains independently restricted to 4 or 6. The policy
+endpoint replaces the complete `cluster_policy` object rather than applying a
+partial patch, so fetch and preserve the current policy when changing one
+field. For example, this changes the block size to 8:
+
+```bash
+CONTROL_PLANE=http://127.0.0.1:8443
+
+curl -fsS \
+  -H 'Authorization: Bearer <operator-token>' \
+  "${CONTROL_PLANE}/v1/admin/policy" |
+  jq '.cluster_policy.overlay_block_size = 8 | {cluster_policy}' |
+  curl -fsS -X PUT \
+    -H 'Authorization: Bearer <operator-token>' \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    "${CONTROL_PLANE}/v1/admin/policy"
+```
+
+An accepted topology-policy change updates the content-derived
+`topology_epoch`. Agents converge without restart on subsequent signed
+neighbor-map and overlay-path refreshes. During rollout, inspect the active
+blocks, representative edges, node degrees, and graph statistics with:
+
+```bash
+curl -fsS \
+  -H 'Authorization: Bearer <operator-token>' \
+  "${CONTROL_PLANE}/v1/admin/topology" |
+  jq .
+```
+
+The Web UI uses the same endpoint for its block graph and Mermaid export.
+Confirm that `max_observed_degree` does not exceed `overlay_max_degree`, and
+allow at least one normal neighbor/path refresh interval before diagnosing a
+node as stale. Edge status is `connected` after fresh reachable reports from
+both endpoints, `partial` after one endpoint, `unreachable` after only fresh
+unreachable reports, `stale` when all reports exceed the path-state TTL, and
+`unknown` before either endpoint has reported that edge. A block is not a
+security or ACL boundary; continue to express traffic authorization through
+cluster ACL rules.
+
+The accepted policy is persisted under the cluster ID in the Control Plane
+store. Active-active replicas sharing the same SQLite database or PostgreSQL
+deployment refresh that record before serving policy-dependent responses, and
+a replica restart loads it on the next such request. All replicas for one
+cluster must therefore use the same store. Separate databases, including
+independent in-memory stores, remain separate policy domains and can expose
+alternating topology epochs if placed behind one failover endpoint.
+
 With the default token or explicit STUN bootstrap, the Agent runs NAT discovery
 before registration and refreshes non-public classifications every
 `HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS` seconds. A public

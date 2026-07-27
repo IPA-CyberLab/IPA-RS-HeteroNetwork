@@ -592,6 +592,16 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         .collect()
     }
 
+    async fn list_all_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        sqlx::query("SELECT record_json FROM paths ORDER BY local_node_id, remote_node_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?
+            .into_iter()
+            .map(row_to_path)
+            .collect()
+    }
+
     async fn upsert_service_instance(
         &self,
         instance: ServiceInstance,
@@ -1501,6 +1511,16 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .collect()
     }
 
+    async fn list_all_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        sqlx::query("SELECT record_json FROM paths ORDER BY local_node_id, remote_node_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sql_error)?
+            .into_iter()
+            .map(pg_row_to_path)
+            .collect()
+    }
+
     async fn upsert_service_instance(
         &self,
         instance: ServiceInstance,
@@ -2219,10 +2239,12 @@ mod tests {
         assert_eq!(store.get_node(&local.node_id).await?, Some(local.clone()));
         assert_eq!(store.list_nodes().await?.len(), 2);
         assert_eq!(store.list_paths_for(&local.node_id).await?.len(), 2);
+        assert_eq!(store.list_all_paths().await?.len(), 2);
         store.replace_node_paths(&local.node_id, Vec::new()).await?;
         let remaining_paths = store.list_paths_for(&local.node_id).await?;
         assert_eq!(remaining_paths.len(), 1);
         assert_eq!(remaining_paths[0].key.local, remote.node_id);
+        assert_eq!(store.list_all_paths().await?, remaining_paths);
         store
             .update_node_candidates(&local.node_id, vec![candidate(local.node_id.as_str())])
             .await?;

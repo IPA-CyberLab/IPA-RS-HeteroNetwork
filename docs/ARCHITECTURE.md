@@ -189,13 +189,49 @@ Agents do not establish a full mesh. They keep a compact peer map and only negot
 - Kubernetes/API/service exposure needs an underlay path
 - an operator runs an explicit path probe
 
-The Control Plane synthesizes a deterministic bounded-degree backbone from
-cluster membership instead of returning a full mesh. The default cluster policy
-limits each node to four backbone neighbors. Each Agent uses identity-signed,
-on-demand `NeighborMap` and `OverlayPath` queries; the map carries the current
-topology epoch and bounded next hops, while the path carries an ordered primary
-route and, when available, an edge-disjoint secondary route, preferring a
-vertex-disjoint route.
+The Control Plane synthesizes a deterministic, block-aware bounded-degree
+backbone from cluster membership instead of returning a full mesh. Nodes are
+organized into deterministic blocks of at most
+`ClusterPolicy.overlay_block_size` members; the value is valid from 2 through
+64 and can be changed at runtime through `PUT /v1/admin/policy`. The graph is
+the union of deterministic Hamiltonian cycles. `overlay_max_degree` remains
+restricted to 4 or 6, so two or three cycles can each contribute at most two
+neighbors per node. Duplicate cycle edges can make the observed degree lower,
+but never higher, than that policy bound.
+
+Cycle edges that cross block boundaries make their endpoint nodes
+representatives for that cycle. There is no single elected representative whose
+loss disconnects a block: the redundant cycles provide alternate
+representatives and the path service returns an edge-disjoint secondary route
+when available, preferring a vertex-disjoint route. Representative failure is
+therefore handled by the same bounded acknowledgement timeout, next-hop
+suppression, and secondary-route retry as any other backbone-hop failure.
+
+Each Agent uses identity-signed, on-demand `NeighborMap` and `OverlayPath`
+queries; the map carries the current topology epoch and bounded next hops,
+while the path carries an ordered primary route and its optional secondary
+route. An accepted block-size or other topology-policy change produces a new
+content-derived `topology_epoch`. Agents do not need to restart: they converge
+when their subsequent neighbor-map and overlay-path refreshes observe the new
+epoch, while the existing previous-epoch grace permits in-flight traffic to
+drain. Runtime policy writes are persisted by the Control Plane store under the
+cluster ID. Active-active replicas that share the same SQLite or PostgreSQL
+store refresh that record before serving policy-dependent responses, so a
+change accepted by one replica is observed by the others.
+
+The operator-authenticated `GET /v1/admin/topology` endpoint exposes the current
+blocks, nodes, edges, and graph statistics used by the Web UI topology view and
+its Mermaid export. Each edge also carries an observed status derived from the
+latest directional path heartbeats: `connected`, `partial`, `unreachable`,
+`stale`, or `unknown`. Block membership is topology organization only. It does
+not grant trust, isolate traffic, or replace the role-, tag-, route-, and
+protocol-aware ACL evaluation.
+
+For `N` nodes and maximum degree `D`, each Agent keeps at most `D` backbone
+neighbors and the undirected graph has at most `N * D / 2` edges. The number of
+blocks is approximately `ceil(N / overlay_block_size)`. Changing the block size
+changes locality and the placement of inter-block representatives, but does not
+raise the per-Agent degree bound or turn lazy connect into an idle full mesh.
 
 Until a direct path is verified, a per-peer loopback proxy encapsulates the
 unchanged inner WireGuard UDP datagram in a multi-hop envelope. Intermediate

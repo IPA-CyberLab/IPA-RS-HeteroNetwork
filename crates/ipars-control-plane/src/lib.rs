@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bounded_topology::{
-    BoundedTopology, BoundedTopologyConfig, BoundedTopologyError, SUPPORTED_MAX_DEGREES,
-    TOPOLOGY_ALGORITHM_VERSION,
+    BoundedTopology, BoundedTopologyConfig, BoundedTopologyError, TopologyEdge,
+    SUPPORTED_MAX_DEGREES, TOPOLOGY_ALGORITHM_VERSION,
 };
 use chrono::Utc;
 use ipars_crypto::{
@@ -23,12 +23,12 @@ use ipars_types::api::{
     ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
     ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
     ControlPlanePathsResponse, ControlPlaneTopologyBlock, ControlPlaneTopologyEdge,
-    ControlPlaneTopologyEdgeKind, ControlPlaneTopologyNode, ControlPlaneTopologyRepresentative,
-    ControlPlaneTopologyResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
-    PathStateCount, PeerConnectionIntent, PeerMap, RegisterClientRequest, RegisterClientResponse,
-    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RemoveClientResponse, RemoveNodeRequest,
-    RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
-    SignalNodeUpsertRequest,
+    ControlPlaneTopologyEdgeKind, ControlPlaneTopologyEdgeStatus, ControlPlaneTopologyNode,
+    ControlPlaneTopologyRepresentative, ControlPlaneTopologyResponse, HeartbeatRequest,
+    HeartbeatResponse, NatTraversalStrategyCount, PathStateCount, PeerConnectionIntent, PeerMap,
+    RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest, RegisterNodeResponse,
+    RelayMap, RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
@@ -238,6 +238,20 @@ pub trait ControlPlaneStore: Send + Sync {
         paths: Vec<PathRecord>,
     ) -> Result<(), ControlPlaneError>;
     async fn list_paths_for(&self, node_id: &NodeId) -> Result<Vec<PathRecord>, ControlPlaneError>;
+    async fn list_all_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        let mut paths = Vec::new();
+        for node in self.list_nodes().await? {
+            for path in self.list_paths_for(&node.node_id).await? {
+                if !paths
+                    .iter()
+                    .any(|current: &PathRecord| current.key == path.key)
+                {
+                    paths.push(path);
+                }
+            }
+        }
+        Ok(paths)
+    }
     async fn upsert_service_instance(
         &self,
         instance: ServiceInstance,
@@ -554,6 +568,10 @@ impl ControlPlaneStore for InMemoryStore {
             .filter(|path| &path.key.local == node_id || &path.key.remote == node_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_all_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
+        Ok(self.paths.read().await.clone())
     }
 
     async fn upsert_service_instance(
@@ -1443,18 +1461,13 @@ where
     }
 
     pub async fn list_paths(&self) -> Result<Vec<PathRecord>, ControlPlaneError> {
-        let nodes = self.store.list_nodes().await?;
-        let mut paths = Vec::new();
-        for node in nodes {
-            for path in self.store.list_paths_for(&node.node_id).await? {
-                if !paths
-                    .iter()
-                    .any(|current: &PathRecord| current.key == path.key)
-                {
-                    paths.push(path);
-                }
-            }
-        }
+        let mut paths = self.store.list_all_paths().await?;
+        paths.sort_by(|left, right| {
+            left.key
+                .local
+                .cmp(&right.key.local)
+                .then_with(|| left.key.remote.cmp(&right.key.remote))
+        });
         self.apply_admin_path_pins(&mut paths).await;
         Ok(paths)
     }
@@ -2112,10 +2125,19 @@ where
     pub async fn overlay_topology_snapshot(
         &self,
     ) -> Result<ControlPlaneTopologyResponse, ControlPlaneError> {
+        let generated_at = Utc::now();
         let mut nodes = self.overlay_nodes().await?;
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let policy = self.current_cluster_policy().await?;
         let topology = self.overlay_topology(&nodes, &policy)?;
+        let health_by_node = self.health_by_node(&nodes).await?;
+        let observed_paths = self.store.list_all_paths().await?;
+        let mut paths_by_edge = BTreeMap::<TopologyEdge, Vec<&PathRecord>>::new();
+        for path in &observed_paths {
+            if let Some(edge) = TopologyEdge::new(path.key.local.clone(), path.key.remote.clone()) {
+                paths_by_edge.entry(edge).or_default().push(path);
+            }
+        }
         let node_blocks = topology
             .blocks()
             .iter()
@@ -2158,6 +2180,11 @@ where
             }
             let cycle_indexes = cycles.iter().copied().collect::<Vec<_>>();
             let cycle_index = cycle_indexes.first().copied().unwrap_or(0);
+            let (observed_status, path_states, last_observed_at) = topology_edge_observation(
+                paths_by_edge.get(edge).map(Vec::as_slice).unwrap_or(&[]),
+                generated_at,
+                policy.path_state_ttl_seconds,
+            );
             let kind = if !inter_block {
                 ControlPlaneTopologyEdgeKind::IntraBlock
             } else if cycles.contains(&0) {
@@ -2173,6 +2200,9 @@ where
                 cycle_indexes,
                 source_block_id,
                 target_block_id,
+                observed_status,
+                path_states,
+                last_observed_at,
             });
         }
 
@@ -2252,6 +2282,7 @@ where
                     .neighbors(&node.node_id)
                     .map(BTreeSet::len)
                     .unwrap_or(0);
+                let health = health_by_node.get(&node.node_id);
                 Ok(ControlPlaneTopologyNode {
                     node_id: node.node_id,
                     vpn_ip: node.vpn_ip,
@@ -2259,6 +2290,8 @@ where
                     tags: node.tags,
                     block_id,
                     degree,
+                    health_state: health.map(|health| health.state),
+                    last_seen_at: health.map(|health| health.last_seen_at),
                     representative_kinds,
                 })
             })
@@ -2278,7 +2311,7 @@ where
             blocks,
             nodes: topology_nodes,
             edges,
-            generated_at: Utc::now(),
+            generated_at,
         })
     }
 
@@ -4064,6 +4097,54 @@ fn endpoint_candidate_is_fresh(
     }
 }
 
+fn topology_edge_observation(
+    paths: &[&PathRecord],
+    now: chrono::DateTime<Utc>,
+    ttl_seconds: u64,
+) -> (
+    ControlPlaneTopologyEdgeStatus,
+    Vec<PathState>,
+    Option<chrono::DateTime<Utc>>,
+) {
+    if paths.is_empty() {
+        return (ControlPlaneTopologyEdgeStatus::Unknown, Vec::new(), None);
+    }
+
+    let path_states = paths
+        .iter()
+        .map(|path| path.selected_state)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let last_observed_at = paths.iter().map(|path| path.updated_at).max();
+    let fresh = paths
+        .iter()
+        .copied()
+        .filter(|path| path_is_fresh(path, now, ttl_seconds))
+        .collect::<Vec<_>>();
+    if fresh.is_empty() {
+        return (
+            ControlPlaneTopologyEdgeStatus::Stale,
+            path_states,
+            last_observed_at,
+        );
+    }
+
+    let reachable_reporters = fresh
+        .iter()
+        .filter(|path| path.selected_state != PathState::Unreachable)
+        .map(|path| &path.key.local)
+        .collect::<BTreeSet<_>>();
+    let status = if reachable_reporters.is_empty() {
+        ControlPlaneTopologyEdgeStatus::Unreachable
+    } else if reachable_reporters.len() >= 2 {
+        ControlPlaneTopologyEdgeStatus::Connected
+    } else {
+        ControlPlaneTopologyEdgeStatus::Partial
+    };
+    (status, path_states, last_observed_at)
+}
+
 fn path_is_fresh(path: &PathRecord, now: chrono::DateTime<Utc>, ttl_seconds: u64) -> bool {
     match now.signed_duration_since(path.updated_at).to_std() {
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
@@ -5436,6 +5517,43 @@ mod tests {
             score: PathScore::calculate(PathState::Relay, &PathMetrics::default(), true, 0),
             ..path(local, remote)
         }
+    }
+
+    #[test]
+    fn topology_edge_observation_distinguishes_live_partial_and_stale_paths() {
+        let now = Utc::now();
+        let forward = path("node-a", "node-b");
+        let reverse = path("node-b", "node-a");
+        assert_eq!(
+            topology_edge_observation(&[], now, 30).0,
+            ControlPlaneTopologyEdgeStatus::Unknown
+        );
+        assert_eq!(
+            topology_edge_observation(&[&forward], now, 30).0,
+            ControlPlaneTopologyEdgeStatus::Partial
+        );
+        assert_eq!(
+            topology_edge_observation(&[&forward, &reverse], now, 30).0,
+            ControlPlaneTopologyEdgeStatus::Connected
+        );
+
+        let unreachable = PathRecord {
+            selected_state: PathState::Unreachable,
+            ..forward.clone()
+        };
+        assert_eq!(
+            topology_edge_observation(&[&unreachable], now, 30).0,
+            ControlPlaneTopologyEdgeStatus::Unreachable
+        );
+
+        let stale = PathRecord {
+            updated_at: now - Duration::seconds(31),
+            ..forward
+        };
+        assert_eq!(
+            topology_edge_observation(&[&stale], now, 30).0,
+            ControlPlaneTopologyEdgeStatus::Stale
+        );
     }
 
     fn join_service(

@@ -2837,6 +2837,10 @@ pub mod api {
         pub tags: BTreeSet<Tag>,
         pub block_id: String,
         pub degree: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub health_state: Option<HealthState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_seen_at: Option<DateTime<Utc>>,
         #[serde(default)]
         pub representative_kinds: Vec<String>,
     }
@@ -2849,6 +2853,17 @@ pub mod api {
         InterBlockSecondary,
     }
 
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControlPlaneTopologyEdgeStatus {
+        Connected,
+        Partial,
+        Unreachable,
+        Stale,
+        #[default]
+        Unknown,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ControlPlaneTopologyEdge {
         pub source: NodeId,
@@ -2859,6 +2874,12 @@ pub mod api {
         pub cycle_indexes: Vec<usize>,
         pub source_block_id: String,
         pub target_block_id: String,
+        #[serde(default)]
+        pub observed_status: ControlPlaneTopologyEdgeStatus,
+        #[serde(default)]
+        pub path_states: Vec<PathState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_observed_at: Option<DateTime<Utc>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
