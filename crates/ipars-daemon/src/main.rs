@@ -13174,8 +13174,8 @@ async fn runtime_stun_servers(
     {
         let authoritative_config = AgentStunDiscoveryConfig {
             explicit_servers: Vec::new(),
-            public_stun_urls: Vec::new(),
-            disable_public_stun_fallback: true,
+            public_stun_urls: config.public_stun_urls.clone(),
+            disable_public_stun_fallback: config.disable_public_stun_fallback,
         };
         resolve_agent_stun_servers(&authoritative_config, None, &state.bootstrap_endpoints).await
     } else {
@@ -19431,6 +19431,45 @@ mod tests {
 
         assert_eq!(refreshed, vec![active]);
         assert!(!refreshed.contains(&retired));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authoritative_private_stun_directory_retains_public_discovery_fallback(
+    ) -> anyhow::Result<()> {
+        let retired = SocketAddr::from(([8, 8, 8, 10], 3478));
+        let public_fallback = SocketAddr::from(([8, 8, 8, 8], 3478));
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let config = AgentStunDiscoveryConfig {
+            explicit_servers: vec![retired],
+            public_stun_urls: vec![format!("udp://{public_fallback}")],
+            disable_public_stun_fallback: false,
+        };
+        runtime.merge_active_bootstrap_endpoints(
+            &[
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::ControlPlane,
+                    url: "https://active.example:8443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "https://active.example:9443".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://10.0.0.1:3478".to_string(),
+                },
+            ],
+            Utc::now(),
+        )?;
+
+        let resolved = runtime_stun_servers(&runtime, &config).await?;
+
+        assert_eq!(resolved, vec![public_fallback]);
+        assert!(!resolved.contains(&retired));
         Ok(())
     }
 
