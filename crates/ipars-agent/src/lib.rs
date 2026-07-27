@@ -3490,6 +3490,28 @@ impl AgentRuntime {
             .is_some_and(|(path, _)| Some(path.topology_epoch) == current_epoch)
     }
 
+    pub async fn has_current_overlay_route_to_peer(&self, peer: &NodeId) -> bool {
+        let current_epoch = {
+            let neighbor_map = self.latest_neighbor_map.read().await;
+            let Some(neighbor_map) = neighbor_map.as_ref() else {
+                return false;
+            };
+            if neighbor_map
+                .neighbors
+                .iter()
+                .any(|neighbor| neighbor.node.node_id == *peer)
+            {
+                return true;
+            }
+            neighbor_map.topology_epoch
+        };
+        self.resolved_overlay_paths
+            .read()
+            .await
+            .get(peer)
+            .is_some_and(|(path, _)| path.topology_epoch == current_epoch)
+    }
+
     pub async fn resolved_overlay_peer_ids(&self) -> BTreeSet<NodeId> {
         self.overlay_shortcut_snapshot()
             .await

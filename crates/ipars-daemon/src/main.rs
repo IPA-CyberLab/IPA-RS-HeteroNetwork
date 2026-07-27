@@ -13989,7 +13989,7 @@ async fn apply_heartbeat_connection_intents(
 ) {
     for intent in intents {
         if !runtime
-            .has_current_resolved_overlay_path(&intent.peer)
+            .has_current_overlay_route_to_peer(&intent.peer)
             .await
         {
             runtime
@@ -21697,6 +21697,7 @@ mod tests {
 
     async fn heartbeat_intent_runtime(
         resolved: bool,
+        direct_neighbor: bool,
     ) -> anyhow::Result<(AgentRuntime, PeerConnectionIntent)> {
         let now = Utc::now();
         let mut state = AgentNodeState::generate(now);
@@ -21709,6 +21710,8 @@ mod tests {
                 ..ClusterPolicy::default()
             },
         );
+        let mut peer = node_record("intent-peer");
+        peer.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)));
         runtime
             .record_neighbor_map_snapshot(NeighborMap {
                 cluster_id: ClusterId::from_string("cluster-a"),
@@ -21716,14 +21719,18 @@ mod tests {
                 topology_epoch: 7,
                 max_degree: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
-                neighbors: Vec::new(),
+                neighbors: direct_neighbor
+                    .then(|| ipars_types::OverlayNeighbor {
+                        node: peer.clone(),
+                        kind: ipars_types::OverlayNeighborKind::BackbonePrimary,
+                    })
+                    .into_iter()
+                    .collect(),
                 aggregate_routes: Vec::new(),
                 bootstrap_endpoints: Vec::new(),
                 generated_at: now,
             })
             .await?;
-        let mut peer = node_record("intent-peer");
-        peer.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)));
         if resolved {
             runtime
                 .record_resolved_overlay_path(
@@ -21750,7 +21757,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_unresolved_intent_queues_destination_once() -> anyhow::Result<()> {
-        let (runtime, intent) = heartbeat_intent_runtime(false).await?;
+        let (runtime, intent) = heartbeat_intent_runtime(false, false).await?;
 
         apply_heartbeat_connection_intents(&runtime, vec![intent.clone(), intent.clone()]).await;
 
@@ -21768,10 +21775,32 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_resolved_intent_does_not_requeue_destination() -> anyhow::Result<()> {
-        let (runtime, intent) = heartbeat_intent_runtime(true).await?;
+        let (runtime, intent) = heartbeat_intent_runtime(true, false).await?;
         assert!(
             runtime
                 .has_current_resolved_overlay_path(&intent.peer)
+                .await
+        );
+
+        apply_heartbeat_connection_intents(&runtime, vec![intent.clone()]).await;
+
+        assert!(runtime
+            .take_pending_overlay_destinations(8)
+            .await
+            .is_empty());
+        assert!(runtime
+            .take_idle_peers_to_close(intent.observed_at + ChronoDuration::seconds(1))
+            .await
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_neighbor_intent_does_not_requeue_destination() -> anyhow::Result<()> {
+        let (runtime, intent) = heartbeat_intent_runtime(false, true).await?;
+        assert!(
+            runtime
+                .has_current_overlay_route_to_peer(&intent.peer)
                 .await
         );
 
