@@ -396,6 +396,10 @@ struct WebUiCandidate {
     trusted_directory: bool,
 }
 
+fn web_ui_candidate_is_control_plane(candidate: &WebUiCandidate) -> bool {
+    candidate.source.starts_with("control_plane_")
+}
+
 #[derive(Debug, Serialize)]
 struct WebUiEndpointStatus {
     url: String,
@@ -545,7 +549,7 @@ async fn device_login_providers(
 ) -> Result<Vec<DeviceLoginProvider>, ApiError> {
     let mut candidates = web_ui_candidates(state)
         .into_iter()
-        .filter(|candidate| !control_plane_only || candidate.source.starts_with("control_plane_"))
+        .filter(|candidate| !control_plane_only || web_ui_candidate_is_control_plane(candidate))
         .collect::<Vec<_>>();
     let selected = selected_web_ui_url(state).await;
     candidates.sort_by_key(|candidate| {
@@ -1152,17 +1156,30 @@ fn web_ui_candidates(state: &AgentHttpState) -> Vec<WebUiCandidate> {
         }
     }
 
-    let mut seen = BTreeSet::new();
-    candidates
-        .into_iter()
-        .filter_map(|mut candidate| {
-            candidate.url = normalize_web_ui_base_url(&candidate.url).ok()?;
-            if own_public_gateway_url.as_deref() == Some(candidate.url.as_str()) {
-                return None;
+    let mut deduplicated: Vec<WebUiCandidate> = Vec::new();
+    for mut candidate in candidates {
+        let Ok(url) = normalize_web_ui_base_url(&candidate.url) else {
+            continue;
+        };
+        candidate.url = url;
+        if own_public_gateway_url.as_deref() == Some(candidate.url.as_str()) {
+            continue;
+        }
+        if let Some(existing) = deduplicated
+            .iter_mut()
+            .find(|existing| existing.url == candidate.url)
+        {
+            existing.trusted_directory |= candidate.trusted_directory;
+            if web_ui_candidate_is_control_plane(&candidate)
+                && !web_ui_candidate_is_control_plane(existing)
+            {
+                existing.source = candidate.source;
             }
-            seen.insert(candidate.url.clone()).then_some(candidate)
-        })
-        .collect()
+            continue;
+        }
+        deduplicated.push(candidate);
+    }
+    deduplicated
 }
 
 fn normalize_web_ui_base_url(input: &str) -> Result<String, String> {
@@ -1326,7 +1343,7 @@ async fn select_healthy_web_ui_with_scope(
 ) -> Result<(WebUiCandidate, Value), AgentError> {
     let candidates = web_ui_candidates(state)
         .into_iter()
-        .filter(|candidate| !control_plane_only || candidate.source.starts_with("control_plane_"))
+        .filter(|candidate| !control_plane_only || web_ui_candidate_is_control_plane(candidate))
         .collect::<Vec<_>>();
     let expected_cluster_id = expected_web_ui_cluster_id(state);
     if candidates.is_empty() {
@@ -1828,7 +1845,7 @@ async fn proxy_management_request(
     };
     let mut candidates = web_ui_candidates(&state)
         .into_iter()
-        .filter(|candidate| !control_plane_only || candidate.source.starts_with("control_plane_"))
+        .filter(|candidate| !control_plane_only || web_ui_candidate_is_control_plane(candidate))
         .collect::<Vec<_>>();
     let selected = selected_web_ui_url(&state).await;
     candidates.sort_by_key(|candidate| {
@@ -4531,7 +4548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_web_ui_uses_persisted_service_directory_without_runtime_flags(
+    async fn local_and_overlay_web_ui_use_persisted_service_directory_without_runtime_flags(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
         let runtime = Arc::new(AgentRuntime::new(
@@ -4559,7 +4576,8 @@ mod tests {
             ],
             Utc::now(),
         )?;
-        let app = router(AgentHttpState::new(runtime).enable_local_web_ui(true));
+        let state = AgentHttpState::new(runtime).enable_local_web_ui(true);
+        let app = router(state.clone());
 
         let response = app
             .oneshot(
@@ -4567,6 +4585,22 @@ mod tests {
                     .method("GET")
                     .uri("/ui/config")
                     .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let config: Value = serde_json::from_slice(&body)?;
+        assert_eq!(config["bootstrap_required"], false);
+        assert_eq!(config["selected_web_ui_endpoint"], backend_url);
+
+        let listen: std::net::SocketAddr = "10.250.0.1:9781".parse()?;
+        let overlay = overlay_web_ui_router(state, listen, "console.heteronetwork.internal");
+        let response = overlay
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/config")
+                    .header(header::HOST, "console.heteronetwork.internal:9781")
                     .body(Body::empty())?,
             )
             .await?;
