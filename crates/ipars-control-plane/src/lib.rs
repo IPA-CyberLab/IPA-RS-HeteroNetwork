@@ -2512,6 +2512,13 @@ where
         now: chrono::DateTime<Utc>,
     ) -> Result<Vec<PeerConnectionIntent>, ControlPlaneError> {
         let idle_timeout_seconds = self.policy_snapshot()?.idle_timeout_seconds;
+        let nodes_by_id = self
+            .store
+            .list_nodes()
+            .await?
+            .into_iter()
+            .map(|node| (node.node_id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
         let mut intents = self
             .paths_for(node_id)
             .await?
@@ -2521,9 +2528,11 @@ where
             .filter(|path| path_is_fresh(path, now, idle_timeout_seconds))
             .filter_map(|path| {
                 let observed_at = lazy_connect_local_activity_at(&path).ok().flatten()?;
+                let peer_vpn_ip = nodes_by_id.get(&path.key.local)?.vpn_ip;
                 timestamp_is_fresh(observed_at, now, idle_timeout_seconds).then_some(
                     PeerConnectionIntent {
                         peer: path.key.local,
+                        peer_vpn_ip,
                         observed_at,
                     },
                 )
@@ -6806,11 +6815,17 @@ mod tests {
         let intents = plane
             .connection_intents_for(&node_id("target"), now)
             .await?;
+        let source_vpn_ip = store
+            .get_node(&node_id("source"))
+            .await?
+            .ok_or("source node should remain registered")?
+            .vpn_ip;
 
         assert_eq!(
             intents,
             vec![PeerConnectionIntent {
                 peer: node_id("source"),
+                peer_vpn_ip: source_vpn_ip,
                 observed_at: fresh_activity_at,
             }]
         );

@@ -13293,6 +13293,9 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 let connection_intent_count = response.connection_intents.len();
                 for intent in response.connection_intents {
                     runtime
+                        .requeue_overlay_destination(intent.peer_vpn_ip.0)
+                        .await;
+                    runtime
                         .record_remote_peer_activity(intent.peer, intent.observed_at)
                         .await;
                 }

@@ -2737,6 +2737,7 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct PeerConnectionIntent {
         pub peer: NodeId,
+        pub peer_vpn_ip: VpnIp,
         pub observed_at: DateTime<Utc>,
     }
 
