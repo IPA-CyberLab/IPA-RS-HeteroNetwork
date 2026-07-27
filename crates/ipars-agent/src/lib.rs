@@ -3332,7 +3332,6 @@ impl AgentRuntime {
         }
         *self.latest_neighbor_map.write().await = Some(neighbor_map);
         drop(shortcut_update);
-        self.request_peer_map_sync();
         Ok(())
     }
 
@@ -3475,6 +3474,20 @@ impl AgentRuntime {
             .values()
             .map(|(path, _)| path.clone())
             .collect()
+    }
+
+    pub async fn has_current_resolved_overlay_path(&self, peer: &NodeId) -> bool {
+        let current_epoch = self
+            .latest_neighbor_map
+            .read()
+            .await
+            .as_ref()
+            .map(|neighbor_map| neighbor_map.topology_epoch);
+        self.resolved_overlay_paths
+            .read()
+            .await
+            .get(peer)
+            .is_some_and(|(path, _)| Some(path.topology_epoch) == current_epoch)
     }
 
     pub async fn resolved_overlay_peer_ids(&self) -> BTreeSet<NodeId> {
@@ -12253,6 +12266,26 @@ mod tests {
         newer.generated_at = generated_at + ChronoDuration::seconds(1);
         runtime.record_neighbor_map_snapshot(newer.clone()).await?;
         assert_eq!(runtime.neighbor_map_snapshot().await, Some(newer));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recording_neighbor_map_does_not_self_notify_peer_map_sync(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let peer_map_notify = runtime.peer_map_sync_notifier();
+
+        runtime
+            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node, Vec::new(), 7))
+            .await?;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), peer_map_notify.notified())
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
