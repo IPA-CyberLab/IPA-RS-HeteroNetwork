@@ -11,7 +11,8 @@ use ipars_types::api::{
 };
 use ipars_types::{
     ClusterId, Ed25519SignatureValidationError, JoinTokenClaims, JoinTokenClaimsValidationError,
-    NodeId, SignedJoinToken, SignedJoinTokenValidationError,
+    NodeId, OverlayPathQuery, OverlayPathQuerySignaturePayload, SignedJoinToken,
+    SignedJoinTokenValidationError,
 };
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -173,6 +174,27 @@ impl IdentityKeyPair {
         let payload =
             serde_json::to_vec(&request.signature_payload(kind, signed_at, nonce.clone()))?;
         Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    pub fn sign_overlay_path_query(
+        &self,
+        destination: std::net::IpAddr,
+        signed_at: DateTime<Utc>,
+    ) -> Result<OverlayPathQuery, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let source = self.node_id();
+        let payload = OverlayPathQuerySignaturePayload {
+            source: source.clone(),
+            destination,
+            signed_at,
+            nonce: nonce.clone(),
+        };
+        let payload = serde_json::to_vec(&payload)?;
+        Ok(OverlayPathQuery {
+            source,
+            destination,
+            source_identity_proof: self.sign_node_api_payload(&payload, signed_at, nonce),
+        })
     }
 
     pub fn sign_client_control_request(
@@ -395,6 +417,21 @@ pub fn verify_control_plane_node_query_signature(
         request_signature.nonce.clone(),
     ))?;
     verify_node_api_payload(&payload, request_signature, node_public_key_b64)
+}
+
+pub fn verify_overlay_path_query_signature(
+    request: &OverlayPathQuery,
+    node_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    request
+        .validate()
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(&request.signature_payload())?;
+    verify_node_api_payload(
+        &payload,
+        &request.source_identity_proof,
+        node_public_key_b64,
+    )
 }
 
 pub fn verify_client_control_request_signature(
@@ -995,6 +1032,30 @@ mod tests {
                 ControlPlaneNodeQueryKind::PeerMap,
                 &identity.public_key_b64(),
             ),
+            Err(CryptoError::InvalidSignature)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_overlay_path_query_binds_source_and_destination() -> Result<(), CryptoError> {
+        let identity = IdentityKeyPair::generate();
+        let destination = IpAddr::V4(Ipv4Addr::new(10, 250, 0, 42));
+        let request = identity.sign_overlay_path_query(destination, Utc::now())?;
+
+        verify_overlay_path_query_signature(&request, &identity.public_key_b64())?;
+
+        let mut changed_destination = request.clone();
+        changed_destination.destination = IpAddr::V4(Ipv4Addr::new(10, 250, 0, 43));
+        assert!(matches!(
+            verify_overlay_path_query_signature(&changed_destination, &identity.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+
+        let mut changed_source = request;
+        changed_source.source = NodeId::from_string("node-b");
+        assert!(matches!(
+            verify_overlay_path_query_signature(&changed_source, &identity.public_key_b64()),
             Err(CryptoError::InvalidSignature)
         ));
         Ok(())

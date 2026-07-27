@@ -33,9 +33,9 @@ use ipars_types::api::{
 use ipars_types::{
     bootstrap_endpoints_include_core_services, socket_addr_is_globally_routable, BootstrapEndpoint,
     BootstrapEndpointKind, ClusterId, ClusterPolicy, JoinTokenClaims, KeyId, NatConnectivityState,
-    NodeId, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics,
-    TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS,
-    MAX_JOIN_TOKEN_TTL_SECONDS,
+    NeighborMap, NodeId, OverlayPath, OverlayPathQuery, PathRecord, PathState, Role,
+    ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -435,7 +435,9 @@ where
         .route("/v1/clients/{client_id}", delete(remove_client::<S, L>))
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
         .route("/v1/peers/query", post(peers::<S, L>))
+        .route("/v1/neighbors/query", post(neighbors::<S, L>))
         .route("/v1/paths/query", post(paths::<S, L>))
+        .route("/v1/overlay-paths/query", post(overlay_paths::<S, L>))
         .route(
             "/v1/nodes/authenticate-signal-upsert",
             post(authenticate_signal_node_upsert::<S, L>),
@@ -2980,6 +2982,38 @@ where
     Ok(Json(response))
 }
 
+async fn neighbors<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<ControlPlaneNodeQueryRequest>,
+) -> Result<Json<NeighborMap>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    state
+        .plane
+        .authenticate_node_query(&request, ControlPlaneNodeQueryKind::NeighborMap, Utc::now())
+        .await?;
+    let response = state.plane.neighbor_map_for(&request.node_id).await?;
+    Ok(Json(response))
+}
+
+async fn overlay_paths<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<OverlayPathQuery>,
+) -> Result<Json<OverlayPath>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    state
+        .plane
+        .authenticate_overlay_path_query(&request, Utc::now())
+        .await?;
+    let response = state.plane.overlay_path_for(&request).await?;
+    Ok(Json(response))
+}
+
 async fn remove_node<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Path(node_id): Path<String>,
@@ -3686,12 +3720,14 @@ impl IntoResponse for ApiError {
             | ControlPlaneError::VpnIpAlreadyAllocated(_) => StatusCode::CONFLICT,
             ControlPlaneError::NodeUpdateRejected { .. }
             | ControlPlaneError::NodeRegistrationRejected { .. } => StatusCode::FORBIDDEN,
-            ControlPlaneError::NodeNotFound(_) => StatusCode::NOT_FOUND,
-            ControlPlaneError::PathNotFound { .. } => StatusCode::NOT_FOUND,
+            ControlPlaneError::NodeNotFound(_)
+            | ControlPlaneError::PathNotFound { .. }
+            | ControlPlaneError::OverlayDestinationNotFound(_)
+            | ControlPlaneError::OverlayPathUnavailable { .. } => StatusCode::NOT_FOUND,
             ControlPlaneError::InvalidClusterPolicy(_) => StatusCode::BAD_REQUEST,
-            ControlPlaneError::VpnPoolExhausted | ControlPlaneError::Store(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ControlPlaneError::VpnPoolExhausted
+            | ControlPlaneError::BoundedTopology(_)
+            | ControlPlaneError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         let body = Json(ErrorResponse {
             error: self.0.to_string(),
@@ -5576,6 +5612,149 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let paths: ControlPlanePathsResponse = serde_json::from_slice(&body)?;
         assert!(paths.paths.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_bounded_overlay_queries_require_bound_signatures(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let plane = Arc::new(ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store,
+        ));
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            ledger,
+            IssuerKeyRing::default(),
+        ));
+        let app = router(ControlPlaneHttpState::new(plane.clone(), join_service));
+
+        let mut source_claims = claims(cluster_id.clone(), issuer.node_id(), key_id.clone());
+        source_claims.nonce = "overlay-source".to_string();
+        let source = plane
+            .register_with_claims(source_claims, registration("overlay-source"))
+            .await?
+            .node;
+        let mut destination_claims = claims(cluster_id, issuer.node_id(), key_id);
+        destination_claims.nonce = "overlay-destination".to_string();
+        let destination = plane
+            .register_with_claims(destination_claims, registration("overlay-destination"))
+            .await?
+            .node;
+
+        let unsigned = ControlPlaneNodeQueryRequest {
+            node_id: source.node_id.clone(),
+            request_signature: None,
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/neighbors/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&unsigned)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_operation =
+            signed_node_query("overlay-source", ControlPlaneNodeQueryKind::PeerMap);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/neighbors/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&wrong_operation)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/neighbors/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&signed_node_query(
+                        "overlay-source",
+                        ControlPlaneNodeQueryKind::NeighborMap,
+                    ))?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let neighbor_map: NeighborMap = serde_json::from_slice(&body)?;
+        neighbor_map.validate()?;
+        assert_eq!(neighbor_map.node_id, source.node_id);
+        assert!(neighbor_map
+            .neighbors
+            .iter()
+            .any(|neighbor| neighbor.node.node_id == destination.node_id));
+
+        let mut tampered_path_query = identity_for_node("overlay-source")
+            .sign_overlay_path_query(destination.vpn_ip.0, Utc::now())?;
+        tampered_path_query.destination = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 250));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/overlay-paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&tampered_path_query)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let path_query = identity_for_node("overlay-source")
+            .sign_overlay_path_query(destination.vpn_ip.0, Utc::now())?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/overlay-paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&path_query)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let overlay_path: OverlayPath = serde_json::from_slice(&body)?;
+        overlay_path.validate()?;
+        assert_eq!(overlay_path.source, source.node_id);
+        assert_eq!(overlay_path.destination, destination.vpn_ip.0);
+        assert_eq!(overlay_path.ordered_nodes.first(), Some(&source.node_id));
+        assert_eq!(
+            overlay_path.ordered_nodes.last(),
+            Some(&destination.node_id)
+        );
+
+        let missing_destination = identity_for_node("overlay-source")
+            .sign_overlay_path_query(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 250)), Utc::now())?;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/overlay-paths/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&missing_destination)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         Ok(())
     }

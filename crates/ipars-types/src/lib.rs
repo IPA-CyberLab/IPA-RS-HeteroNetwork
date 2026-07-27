@@ -1216,6 +1216,10 @@ pub struct ClusterPolicy {
     pub allow_nat_traversal: bool,
     pub allow_relay_fallback: bool,
     pub idle_timeout_seconds: u64,
+    #[serde(default = "default_overlay_max_degree")]
+    pub overlay_max_degree: u16,
+    #[serde(default = "default_overlay_direct_shortcut_limit")]
+    pub overlay_direct_shortcut_limit: u16,
     #[serde(default = "default_relay_health_ttl_seconds")]
     pub relay_health_ttl_seconds: u64,
     #[serde(default = "default_endpoint_candidate_ttl_seconds")]
@@ -1246,6 +1250,8 @@ impl Default for ClusterPolicy {
             allow_nat_traversal: true,
             allow_relay_fallback: true,
             idle_timeout_seconds: 300,
+            overlay_max_degree: default_overlay_max_degree(),
+            overlay_direct_shortcut_limit: default_overlay_direct_shortcut_limit(),
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
             path_state_ttl_seconds: default_path_state_ttl_seconds(),
@@ -1258,6 +1264,14 @@ impl Default for ClusterPolicy {
             acl_rules: Vec::new(),
         }
     }
+}
+
+fn default_overlay_max_degree() -> u16 {
+    4
+}
+
+fn default_overlay_direct_shortcut_limit() -> u16 {
+    4
 }
 
 fn default_relay_health_ttl_seconds() -> u64 {
@@ -1386,34 +1400,7 @@ pub struct OverlayNeighbor {
 
 impl OverlayNeighbor {
     pub fn validate(&self) -> Result<(), OverlayValidationError> {
-        validate_overlay_identifier(self.node.node_id.as_str(), "neighbor node ID", "neighbors")?;
-        validate_overlay_identifier(
-            self.node.cluster_id.as_str(),
-            "neighbor cluster ID",
-            "neighbors",
-        )?;
-        if self.node.endpoint_candidates.len() > MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES {
-            return Err(OverlayValidationError::new(
-                "neighbors",
-                format!(
-                    "neighbor {} endpoint candidate count {} exceeds maximum \
-                     {MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES}",
-                    self.node.node_id,
-                    self.node.endpoint_candidates.len()
-                ),
-            ));
-        }
-        if self.node.routes.len() > MAX_OVERLAY_NODE_ROUTES {
-            return Err(OverlayValidationError::new(
-                "neighbors",
-                format!(
-                    "neighbor {} route count {} exceeds maximum {MAX_OVERLAY_NODE_ROUTES}",
-                    self.node.node_id,
-                    self.node.routes.len()
-                ),
-            ));
-        }
-        Ok(())
+        validate_overlay_node_record(&self.node, "neighbors")
     }
 }
 
@@ -1576,12 +1563,14 @@ impl NeighborMap {
                 ));
             }
             match neighbor_kinds.get(&route.primary_next_hop) {
-                Some(OverlayNeighborKind::BackbonePrimary) => {}
-                Some(kind) => {
+                Some(
+                    OverlayNeighborKind::BackbonePrimary | OverlayNeighborKind::BackboneSecondary,
+                ) => {}
+                Some(OverlayNeighborKind::DirectShortcut) => {
                     return Err(OverlayValidationError::new(
                         "aggregate_routes",
                         format!(
-                            "primary next hop {} for {} has incompatible kind {kind:?}",
+                            "primary next hop {} for {} cannot be a direct shortcut",
                             route.primary_next_hop, route.cidr
                         ),
                     ));
@@ -1598,13 +1587,15 @@ impl NeighborMap {
             }
             if let Some(secondary) = &route.secondary_next_hop {
                 match neighbor_kinds.get(secondary) {
-                    Some(OverlayNeighborKind::BackboneSecondary) => {}
-                    Some(kind) => {
+                    Some(
+                        OverlayNeighborKind::BackbonePrimary
+                        | OverlayNeighborKind::BackboneSecondary,
+                    ) => {}
+                    Some(OverlayNeighborKind::DirectShortcut) => {
                         return Err(OverlayValidationError::new(
                             "aggregate_routes",
                             format!(
-                                "secondary next hop {secondary} for {} has incompatible kind \
-                                 {kind:?}",
+                                "secondary next hop {secondary} for {} cannot be a direct shortcut",
                                 route.cidr
                             ),
                         ));
@@ -1678,6 +1669,7 @@ pub struct OverlayPath {
     pub topology_epoch: u64,
     pub source: NodeId,
     pub destination: IpAddr,
+    pub target: NodeRecord,
     pub ordered_nodes: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_ordered_nodes: Option<Vec<NodeId>>,
@@ -1688,7 +1680,30 @@ impl OverlayPath {
     pub fn validate(&self) -> Result<(), OverlayValidationError> {
         validate_overlay_identifier(self.source.as_str(), "source node ID", "source")?;
         validate_overlay_destination(self.destination)?;
+        validate_overlay_node_record(&self.target, "target")?;
         validate_ordered_overlay_nodes("ordered_nodes", &self.source, &self.ordered_nodes)?;
+        if self.ordered_nodes.last() != Some(&self.target.node_id) {
+            return Err(OverlayValidationError::new(
+                "ordered_nodes",
+                format!(
+                    "ordered path must terminate at target node {}",
+                    self.target.node_id
+                ),
+            ));
+        }
+        let target_owns_destination = self.target.vpn_ip.0 == self.destination
+            || self.target.routes.iter().any(|route| {
+                route.advertised_by == self.target.node_id && route.cidr.contains(&self.destination)
+            });
+        if !target_owns_destination {
+            return Err(OverlayValidationError::new(
+                "target",
+                format!(
+                    "target node {} does not own destination {}",
+                    self.target.node_id, self.destination
+                ),
+            ));
+        }
         if let Some(secondary) = &self.secondary_ordered_nodes {
             validate_ordered_overlay_nodes("secondary_ordered_nodes", &self.source, secondary)?;
             if secondary == &self.ordered_nodes {
@@ -1767,6 +1782,36 @@ fn validate_overlay_identifier(
         return Err(OverlayValidationError::new(
             field,
             format!("{label} must contain only ASCII letters, digits, '_', '.' or '-'"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_overlay_node_record(
+    node: &NodeRecord,
+    field: &'static str,
+) -> Result<(), OverlayValidationError> {
+    validate_overlay_identifier(node.node_id.as_str(), "node ID", field)?;
+    validate_overlay_identifier(node.cluster_id.as_str(), "cluster ID", field)?;
+    if node.endpoint_candidates.len() > MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES {
+        return Err(OverlayValidationError::new(
+            field,
+            format!(
+                "node {} endpoint candidate count {} exceeds maximum \
+                 {MAX_OVERLAY_NODE_ENDPOINT_CANDIDATES}",
+                node.node_id,
+                node.endpoint_candidates.len()
+            ),
+        ));
+    }
+    if node.routes.len() > MAX_OVERLAY_NODE_ROUTES {
+        return Err(OverlayValidationError::new(
+            field,
+            format!(
+                "node {} route count {} exceeds maximum {MAX_OVERLAY_NODE_ROUTES}",
+                node.node_id,
+                node.routes.len()
+            ),
         ));
     }
     Ok(())
@@ -2454,6 +2499,7 @@ pub mod api {
     #[serde(rename_all = "snake_case")]
     pub enum ControlPlaneNodeQueryKind {
         PeerMap,
+        NeighborMap,
         Paths,
     }
 
@@ -19409,15 +19455,14 @@ mod tests {
         assert!(error.reason().contains("is duplicated"));
 
         invalid = valid.clone();
+        invalid.neighbors[1].kind = OverlayNeighborKind::DirectShortcut;
         invalid.aggregate_routes[0].primary_next_hop = NodeId::from_string("node-c");
         invalid.aggregate_routes[0].secondary_next_hop = None;
         let error = invalid
             .validate()
             .err()
-            .ok_or("secondary neighbor should not be accepted as a primary next hop")?;
-        assert!(error
-            .reason()
-            .contains("incompatible kind BackboneSecondary"));
+            .ok_or("direct shortcut should not be accepted as a backbone next hop")?;
+        assert!(error.reason().contains("cannot be a direct shortcut"));
 
         invalid = valid;
         invalid.aggregate_routes[0].cidr = "10.42.0.1/24".parse()?;
@@ -19479,6 +19524,7 @@ mod tests {
             topology_epoch: 42,
             source: NodeId::from_string("node-a"),
             destination: "10.250.0.9".parse()?,
+            target: overlay_test_node("node-d", "cluster-a", "10.250.0.9".parse()?),
             ordered_nodes: vec![
                 NodeId::from_string("node-a"),
                 NodeId::from_string("node-b"),

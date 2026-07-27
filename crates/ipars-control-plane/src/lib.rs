@@ -1,3 +1,5 @@
+pub mod bounded_topology;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5,13 +7,16 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bounded_topology::{
+    BoundedTopology, BoundedTopologyConfig, BoundedTopologyError, SUPPORTED_MAX_DEGREES,
+};
 use chrono::Utc;
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_wireguard_public_key_b64,
     verify_client_control_request_signature, verify_control_plane_node_query_signature,
-    verify_heartbeat_request_signature, verify_join_token, verify_remove_node_signature,
-    verify_signal_node_upsert_signature, verify_token_revocation_signature,
-    verify_wireguard_key_rotation_signature, CryptoError,
+    verify_heartbeat_request_signature, verify_join_token, verify_overlay_path_query_signature,
+    verify_remove_node_signature, verify_signal_node_upsert_signature,
+    verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
     ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
@@ -25,15 +30,17 @@ use ipars_types::api::{
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
     endpoint_addr_is_usable, relay_admission_url_is_usable,
-    validate_join_token_bootstrap_endpoints, AclAction, AclRule, BootstrapEndpoint,
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate, EndpointCandidateKind,
-    HealthState, JoinTokenClaims, KeyId, NatClassification, NatTraversalStrategy, NodeHealth,
-    NodeId, NodeRecord, PathRecord, PathState, RelayCapability, Role, Route, ServiceDirectory,
-    ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TokenLedgerRecord,
-    TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_PATH_SCORE_REASONS,
+    validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
+    BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
+    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayNeighbor,
+    OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState, RelayCapability,
+    Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
+    TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
+    TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_DEGREE,
+    MAX_PATH_SCORE_REASONS,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -100,6 +107,15 @@ pub enum ControlPlaneError {
     NodeNotFound(NodeId),
     #[error("path not found: {local} -> {remote}")]
     PathNotFound { local: NodeId, remote: NodeId },
+    #[error("overlay destination not found or denied: {0}")]
+    OverlayDestinationNotFound(IpAddr),
+    #[error("overlay path is unavailable: {source_node} -> {destination_node}")]
+    OverlayPathUnavailable {
+        source_node: NodeId,
+        destination_node: NodeId,
+    },
+    #[error("bounded overlay topology failed: {0}")]
+    BoundedTopology(String),
     #[error("cluster policy rejected: {0}")]
     InvalidClusterPolicy(String),
     #[error("no available VPN IP in pool")]
@@ -123,6 +139,12 @@ pub enum ControlPlaneError {
 impl From<CryptoError> for ControlPlaneError {
     fn from(error: CryptoError) -> Self {
         Self::TokenVerification(error.to_string())
+    }
+}
+
+impl From<BoundedTopologyError> for ControlPlaneError {
+    fn from(error: BoundedTopologyError) -> Self {
+        Self::BoundedTopology(error.to_string())
     }
 }
 
@@ -1679,7 +1701,67 @@ where
             });
         }
 
-        let key = (request.node_id.clone(), signature.nonce.clone());
+        self.accept_node_query_nonce(&request.node_id, signature.signed_at, &signature.nonce, now)
+            .await?;
+        Ok(node)
+    }
+
+    pub async fn authenticate_overlay_path_query(
+        &self,
+        request: &OverlayPathQuery,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        request
+            .validate()
+            .map_err(|error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.source.clone(),
+                reason: error.to_string(),
+            })?;
+        let node = self
+            .store
+            .get_node(&request.source)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.source.clone()))?;
+        if node.role.is_client() {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.source.clone(),
+                reason: "client identities must use the client control API".to_string(),
+            });
+        }
+        verify_overlay_path_query_signature(request, &node.identity_public_key).map_err(
+            |error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.source.clone(),
+                reason: error.to_string(),
+            },
+        )?;
+        self.accept_node_query_nonce(
+            &request.source,
+            request.source_identity_proof.signed_at,
+            &request.source_identity_proof.nonce,
+            now,
+        )
+        .await?;
+        Ok(node)
+    }
+
+    async fn accept_node_query_nonce(
+        &self,
+        node_id: &NodeId,
+        signed_at: chrono::DateTime<Utc>,
+        nonce: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ControlPlaneError> {
+        if !timestamp_within_skew(signed_at, now, self.config.heartbeat_signature_max_age) {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: node_id.clone(),
+                reason: format!(
+                    "signed_at {signed_at} is outside the allowed {}s window",
+                    self.config.heartbeat_signature_max_age.as_secs()
+                ),
+            });
+        }
+
+        let key = (node_id.clone(), nonce.to_string());
         let mut accepted = self.accepted_node_query_nonces.lock().await;
         accepted.retain(|_, accepted_at| {
             now.signed_duration_since(*accepted_at)
@@ -1687,15 +1769,13 @@ where
                 .map_or(true, |age| age <= self.config.heartbeat_signature_max_age)
         });
         if accepted.contains_key(&key) {
-            return Err(ControlPlaneError::NodeRequestReplay(
-                request.node_id.clone(),
-            ));
+            return Err(ControlPlaneError::NodeRequestReplay(node_id.clone()));
         }
         if accepted.len() >= MAX_ACCEPTED_NODE_QUERY_NONCES {
             return Err(ControlPlaneError::NodeRequestAuthenticationCapacity);
         }
         accepted.insert(key, now);
-        Ok(node)
+        Ok(())
     }
 
     pub async fn authenticate_client_request(
@@ -1852,6 +1932,186 @@ where
             directory.bootstrap_endpoints,
             now,
         ))
+    }
+
+    pub async fn neighbor_map_for(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<NeighborMap, ControlPlaneError> {
+        let source = self
+            .store
+            .get_node(node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if source.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: node_id.clone(),
+                reason: "clients cannot join the bounded overlay backbone".to_string(),
+            });
+        }
+
+        let nodes = self.overlay_nodes().await?;
+        let policy = self.policy_snapshot()?;
+        let topology = self.overlay_topology(&nodes, &policy)?;
+        let now = Utc::now();
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let neighbor_ids = topology.neighbors(node_id).ok_or_else(|| {
+            ControlPlaneError::BoundedTopology(format!(
+                "source node {node_id} is absent from topology"
+            ))
+        })?;
+        let primary_neighbor_count = neighbor_ids.len().div_ceil(2);
+        let neighbors = neighbor_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, neighbor_id)| {
+                nodes_by_id
+                    .get(neighbor_id)
+                    .map(|neighbor| OverlayNeighbor {
+                        node: filter_served_endpoint_candidates((*neighbor).clone(), now, &policy),
+                        kind: if index < primary_neighbor_count {
+                            OverlayNeighborKind::BackbonePrimary
+                        } else {
+                            OverlayNeighborKind::BackboneSecondary
+                        },
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let mut selected_routes =
+            BTreeMap::<IpNet, ((u32, NodeId, String), AggregateOverlayRoute)>::new();
+        for target in &nodes {
+            if target.node_id == source.node_id {
+                continue;
+            }
+            let Some(filtered_target) = acl_filter_peer(&source, target, &policy) else {
+                continue;
+            };
+            let Some(paths) = topology.paths(&source.node_id, &target.node_id) else {
+                continue;
+            };
+            let Some(primary_next_hop) = paths.primary.get(1).cloned() else {
+                continue;
+            };
+            let secondary_next_hop = paths
+                .secondary
+                .as_ref()
+                .and_then(|secondary| secondary.nodes.get(1))
+                .filter(|secondary| *secondary != &primary_next_hop)
+                .cloned();
+            for route in filtered_target.routes.iter().filter(|route| {
+                route.advertised_by == filtered_target.node_id
+                    && route
+                        .via
+                        .as_ref()
+                        .is_none_or(|via| via == &filtered_target.node_id)
+            }) {
+                let rank = (
+                    route.metric,
+                    filtered_target.node_id.clone(),
+                    route.id.clone(),
+                );
+                if selected_routes
+                    .get(&route.cidr)
+                    .is_some_and(|(selected_rank, _)| selected_rank <= &rank)
+                {
+                    continue;
+                }
+                selected_routes.insert(
+                    route.cidr,
+                    (
+                        rank,
+                        AggregateOverlayRoute {
+                            cidr: route.cidr,
+                            primary_next_hop: primary_next_hop.clone(),
+                            secondary_next_hop: secondary_next_hop.clone(),
+                        },
+                    ),
+                );
+            }
+        }
+
+        let directory = self.service_directory_at(now).await?;
+        let response = NeighborMap {
+            cluster_id: self.config.cluster_id.clone(),
+            node_id: source.node_id,
+            topology_epoch: topology.topology_epoch(),
+            max_degree: policy.overlay_max_degree,
+            neighbors,
+            aggregate_routes: selected_routes
+                .into_values()
+                .map(|(_, route)| route)
+                .collect(),
+            bootstrap_endpoints: directory.bootstrap_endpoints,
+            generated_at: now,
+        };
+        response
+            .validate()
+            .map_err(|error| ControlPlaneError::BoundedTopology(error.to_string()))?;
+        Ok(response)
+    }
+
+    pub async fn overlay_path_for(
+        &self,
+        request: &OverlayPathQuery,
+    ) -> Result<OverlayPath, ControlPlaneError> {
+        let nodes = self.overlay_nodes().await?;
+        let source = nodes
+            .iter()
+            .find(|node| node.node_id == request.source)
+            .cloned()
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.source.clone()))?;
+        let policy = self.policy_snapshot()?;
+        let target = overlay_target_for_destination(&source, &nodes, request.destination, &policy)
+            .ok_or(ControlPlaneError::OverlayDestinationNotFound(
+                request.destination,
+            ))?;
+        let topology = self.overlay_topology(&nodes, &policy)?;
+        let paths = topology
+            .paths(&source.node_id, &target.node_id)
+            .ok_or_else(|| ControlPlaneError::OverlayPathUnavailable {
+                source_node: source.node_id.clone(),
+                destination_node: target.node_id.clone(),
+            })?;
+        let now = Utc::now();
+        let response = OverlayPath {
+            topology_epoch: topology.topology_epoch(),
+            source: source.node_id,
+            destination: request.destination,
+            target: filter_served_endpoint_candidates(target, now, &policy),
+            ordered_nodes: paths.primary,
+            secondary_ordered_nodes: paths.secondary.map(|path| path.nodes),
+            generated_at: now,
+        };
+        response
+            .validate()
+            .map_err(|error| ControlPlaneError::BoundedTopology(error.to_string()))?;
+        Ok(response)
+    }
+
+    async fn overlay_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+        Ok(self
+            .store
+            .list_nodes()
+            .await?
+            .into_iter()
+            .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
+            .collect())
+    }
+
+    fn overlay_topology(
+        &self,
+        nodes: &[NodeRecord],
+        policy: &ClusterPolicy,
+    ) -> Result<BoundedTopology, ControlPlaneError> {
+        Ok(BoundedTopology::synthesize(
+            nodes,
+            &BoundedTopologyConfig::new(usize::from(policy.overlay_max_degree))
+                .with_permutation_seed(self.config.cluster_id.as_str()),
+        )?)
     }
 
     pub async fn remove_client(
@@ -3409,6 +3669,17 @@ fn service_instance_kind_count(
 }
 
 fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
+    if !SUPPORTED_MAX_DEGREES.contains(&usize::from(policy.overlay_max_degree)) {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "overlay_max_degree must be one of {:?}",
+            SUPPORTED_MAX_DEGREES
+        )));
+    }
+    if policy.overlay_direct_shortcut_limit > MAX_OVERLAY_DEGREE {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "overlay_direct_shortcut_limit must be at most {MAX_OVERLAY_DEGREE}"
+        )));
+    }
     for (name, value) in [
         ("idle_timeout_seconds", policy.idle_timeout_seconds),
         ("relay_health_ttl_seconds", policy.relay_health_ttl_seconds),
@@ -3738,6 +4009,58 @@ fn relay_health_allows(
         Ok(age) => age <= Duration::from_secs(ttl_seconds),
         Err(_) => true,
     }
+}
+
+fn overlay_target_for_destination(
+    source: &NodeRecord,
+    nodes: &[NodeRecord],
+    destination: IpAddr,
+    policy: &ClusterPolicy,
+) -> Option<NodeRecord> {
+    if let Some(target) = nodes.iter().find(|target| target.vpn_ip.0 == destination) {
+        if target.node_id == source.node_id
+            || policy.acl_rules.is_empty()
+            || acl_allows_peer(source, target, policy)
+        {
+            return Some(acl_filter_peer(source, target, policy).unwrap_or_else(|| target.clone()));
+        }
+        return None;
+    }
+
+    let mut selected: Option<(u8, u32, NodeId, String, NodeRecord)> = None;
+    for target in nodes {
+        let Some(filtered_target) = acl_filter_peer(source, target, policy) else {
+            continue;
+        };
+        for route in filtered_target.routes.iter().filter(|route| {
+            route.cidr.contains(&destination)
+                && route.advertised_by == filtered_target.node_id
+                && route
+                    .via
+                    .as_ref()
+                    .is_none_or(|via| via == &filtered_target.node_id)
+        }) {
+            let candidate = (
+                route.cidr.prefix_len(),
+                route.metric,
+                filtered_target.node_id.clone(),
+                route.id.clone(),
+                filtered_target.clone(),
+            );
+            let replace = selected
+                .as_ref()
+                .is_none_or(|(prefix, metric, node_id, route_id, _)| {
+                    candidate.0 > *prefix
+                        || (candidate.0 == *prefix
+                            && (&candidate.1, &candidate.2, &candidate.3)
+                                < (metric, node_id, route_id))
+                });
+            if replace {
+                selected = Some(candidate);
+            }
+        }
+    }
+    selected.map(|(_, _, _, _, target)| target)
 }
 
 fn acl_filter_peer(
