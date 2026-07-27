@@ -114,15 +114,37 @@ require_command() {
 
 port_in_use() {
   local port="$1"
-  ss -H -ltnu 2>/dev/null | awk -v port="$port" '$5 ~ (":" port "$") { found = 1 } END { exit !found }'
+  ss -H -tuan 2>/dev/null | awk -v port="$port" '$5 ~ (":" port "$") { found = 1 } END { exit !found }'
 }
 
 pick_port_base() {
   local base
   local port
   local available
+  local range_min=10000
+  local range_max=29992
+  local ephemeral_min=32768
+  local ephemeral_max=60999
+  local range_size
+
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    read -r ephemeral_min ephemeral_max < /proc/sys/net/ipv4/ip_local_port_range
+  fi
+  if (( ephemeral_min <= range_max + 7 && ephemeral_max >= range_min )); then
+    if (( ephemeral_min >= range_min + 8 )); then
+      range_max=$((ephemeral_min - 8))
+    elif (( ephemeral_max <= 65527 )); then
+      range_min=$((ephemeral_max + 1))
+      range_max=65528
+    else
+      echo "could not find a non-ephemeral port range for smoke services" >&2
+      return 1
+    fi
+  fi
+  range_size=$((range_max - range_min + 1))
+
   for _ in $(seq 1 100); do
-    base=$((40000 + (RANDOM % 12000)))
+    base=$((range_min + (RANDOM % range_size)))
     available=1
     for port in $(seq "$base" "$((base + 7))"); do
       if port_in_use "$port"; then
@@ -139,24 +161,48 @@ pick_port_base() {
   return 1
 }
 
-kill_pid() {
-  local pid="$1"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-  kill "$pid" 2>/dev/null || true
+terminate_pids() {
+  local -a pids=()
+  local candidate
+  local pid
+  local alive
+
+  for candidate in "$@"; do
+    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+    if kill -0 "$candidate" 2>/dev/null; then
+      pids+=("$candidate")
+    fi
+  done
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+      fi
+    done
+    [[ "$alive" == "0" ]] && break
+    sleep 0.1
+  done
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
 }
 
 kill_namespace_processes() {
   local namespace="$1"
-  local pids
-  pids="$(ip netns pids "$namespace" 2>/dev/null || true)"
-  for pid in $pids; do
-    kill_pid "$pid"
-  done
-  sleep 0.2
-  pids="$(ip netns pids "$namespace" 2>/dev/null || true)"
-  for pid in $pids; do
-    kill -9 "$pid" 2>/dev/null || true
-  done
+  local -a pids=()
+  mapfile -t pids < <(ip netns pids "$namespace" 2>/dev/null || true)
+  terminate_pids "${pids[@]}"
 }
 
 dump_failure() {
@@ -207,19 +253,18 @@ cleanup() {
   cleanup_status=$?
   trap - EXIT
   set +e
+  local -a root_pids=("$agent_a_pid" "$agent_b_pid" "$signal_pid")
 
   if [[ "$cleanup_status" -ne 0 ]]; then
     dump_failure
   fi
 
-  kill_pid "$agent_a_pid"
-  kill_pid "$agent_b_pid"
-  kill_pid "$signal_pid"
   if [[ -s "$init_output" ]]; then
     while IFS= read -r pid; do
-      kill_pid "$pid"
+      root_pids+=("$pid")
     done < <(jq -r '.daemon_processes[]?.pid' "$init_output" 2>/dev/null || true)
   fi
+  terminate_pids "${root_pids[@]}"
 
   for namespace in "$agent_a" "$agent_b" "$nat_a" "$nat_b"; do
     kill_namespace_processes "$namespace"
@@ -402,16 +447,7 @@ unblock_direct_peer() {
 }
 
 stop_signal() {
-  kill_pid "$signal_pid"
-  if [[ "$signal_pid" =~ ^[0-9]+$ ]]; then
-    for _ in $(seq 1 30); do
-      if ! kill -0 "$signal_pid" 2>/dev/null; then
-        break
-      fi
-      sleep 0.2
-    done
-    kill -9 "$signal_pid" 2>/dev/null || true
-  fi
+  terminate_pids "$signal_pid"
   signal_pid=""
 }
 

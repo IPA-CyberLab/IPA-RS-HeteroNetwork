@@ -20,15 +20,37 @@ require_command() {
 
 port_in_use() {
   local port="$1"
-  ! ss -H -ltnu 2>/dev/null | awk -v port="$port" '$5 ~ (":" port "$") { found = 1 } END { exit found }'
+  ss -H -tuan 2>/dev/null | awk -v port="$port" '$5 ~ (":" port "$") { found = 1 } END { exit !found }'
 }
 
 pick_port_base() {
   local base
   local port
   local available
+  local range_min=10000
+  local range_max=29993
+  local ephemeral_min=32768
+  local ephemeral_max=60999
+  local range_size
+
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    read -r ephemeral_min ephemeral_max < /proc/sys/net/ipv4/ip_local_port_range
+  fi
+  if (( ephemeral_min <= range_max + 6 && ephemeral_max >= range_min )); then
+    if (( ephemeral_min >= range_min + 7 )); then
+      range_max=$((ephemeral_min - 7))
+    elif (( ephemeral_max <= 65528 )); then
+      range_min=$((ephemeral_max + 1))
+      range_max=65529
+    else
+      echo "could not find a non-ephemeral port range for smoke services" >&2
+      return 1
+    fi
+  fi
+  range_size=$((range_max - range_min + 1))
+
   for _ in $(seq 1 50); do
-    base=$((20000 + (RANDOM % 20000)))
+    base=$((range_min + (RANDOM % range_size)))
     available=1
     for port in $(seq "$base" "$((base + 6))"); do
       if port_in_use "$port"; then
