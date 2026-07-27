@@ -4025,17 +4025,20 @@ fn overlay_target_for_destination(
     policy: &ClusterPolicy,
 ) -> Option<NodeRecord> {
     if let Some(target) = nodes.iter().find(|target| target.vpn_ip.0 == destination) {
-        if target.node_id == source.node_id
-            || policy.acl_rules.is_empty()
-            || acl_allows_peer(source, target, policy)
-        {
+        if target.node_id == source.node_id {
+            return None;
+        }
+        if policy.acl_rules.is_empty() || acl_allows_peer(source, target, policy) {
             return Some(acl_filter_peer(source, target, policy).unwrap_or_else(|| target.clone()));
         }
         return None;
     }
 
     let mut selected: Option<(u8, u32, NodeId, String, NodeRecord)> = None;
-    for target in nodes {
+    for target in nodes
+        .iter()
+        .filter(|target| target.node_id != source.node_id)
+    {
         let Some(filtered_target) = acl_filter_peer(source, target, policy) else {
             continue;
         };
@@ -6661,6 +6664,46 @@ mod tests {
             ControlPlaneError::NodeRegistrationRejected { .. }
         ));
         assert!(error.to_string().contains("relay admission URL"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_path_rejects_a_source_owned_destination(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let source = plane
+            .register_with_claims(claims(cluster_id.clone()), registration_request("node-a"))
+            .await?
+            .node;
+        let target = plane
+            .register_with_claims(claims(cluster_id), registration_request("node-b"))
+            .await?
+            .node;
+        let query = |destination| OverlayPathQuery {
+            source: source.node_id.clone(),
+            destination,
+            source_identity_proof: ipars_types::api::NodeApiRequestSignature {
+                signed_at: Utc::now(),
+                nonce: "overlay-self-path-test".to_string(),
+                signature: String::new(),
+            },
+        };
+
+        assert!(matches!(
+            plane.overlay_path_for(&query(source.vpn_ip.0)).await,
+            Err(ControlPlaneError::OverlayDestinationNotFound(destination))
+                if destination == source.vpn_ip.0
+        ));
+
+        let path = plane.overlay_path_for(&query(target.vpn_ip.0)).await?;
+        assert_eq!(path.source, source.node_id);
+        assert_eq!(path.target.node_id, target.node_id);
+        assert_eq!(path.ordered_nodes.len(), 2);
         Ok(())
     }
 

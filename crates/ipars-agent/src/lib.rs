@@ -2820,6 +2820,9 @@ impl AgentRuntime {
     }
 
     pub async fn record_remote_peer_activity(&self, peer: NodeId, observed_at: DateTime<Utc>) {
+        if peer == self.state().node_id {
+            return;
+        }
         let mut lazy_connect = self.lazy_connect.write().await;
         let changed = lazy_connect.record_remote_activity(peer, observed_at);
         drop(lazy_connect);
@@ -2909,6 +2912,10 @@ impl AgentRuntime {
         }
         if let Some(reason) = packet_flow_destination_drop_reason(destination) {
             self.record_packet_flow_filtered(reason);
+            return None;
+        }
+        if self.local_vpn_destination(destination) {
+            self.record_packet_flow_filtered(AgentPacketFlowDropReason::NoOverlayMatch);
             return None;
         }
         self.packet_flow_observation_count
@@ -3311,10 +3318,20 @@ impl AgentRuntime {
     }
 
     pub async fn take_pending_overlay_destinations(&self, maximum: usize) -> Vec<IpAddr> {
-        self.pending_overlay_destinations.lock().await.take(maximum)
+        let local_vpn_ip = self.state().vpn_ip.map(|vpn_ip| vpn_ip.0);
+        self.pending_overlay_destinations
+            .lock()
+            .await
+            .take(maximum)
+            .into_iter()
+            .filter(|destination| Some(*destination) != local_vpn_ip)
+            .collect()
     }
 
     pub async fn requeue_overlay_destination(&self, destination: IpAddr) {
+        if self.local_vpn_destination(destination) {
+            return;
+        }
         self.pending_overlay_destinations
             .lock()
             .await
@@ -3519,6 +3536,9 @@ impl AgentRuntime {
     }
 
     async fn overlay_destination_is_resolvable(&self, destination: IpAddr) -> bool {
+        if self.local_vpn_destination(destination) {
+            return false;
+        }
         self.latest_neighbor_map
             .read()
             .await
@@ -3530,6 +3550,12 @@ impl AgentRuntime {
                         .iter()
                         .any(|route| route.cidr.contains(&destination))
             })
+    }
+
+    fn local_vpn_destination(&self, destination: IpAddr) -> bool {
+        self.state()
+            .vpn_ip
+            .is_some_and(|vpn_ip| vpn_ip.0 == destination)
     }
 
     pub async fn record_peer_map_snapshot(&self, peer_map: PeerMap) {
@@ -11757,12 +11783,29 @@ mod tests {
     #[tokio::test]
     async fn bounded_overlay_queues_only_unknown_overlay_destinations(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let state = AgentNodeState::generate(Utc::now());
+        let mut state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
+        let local_vpn_destination = IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8));
+        state.vpn_ip = Some(VpnIp(local_vpn_destination));
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
         runtime
-            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node, Vec::new(), 7))
+            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node.clone(), Vec::new(), 7))
             .await?;
+
+        assert!(runtime
+            .record_packet_flow_activity(local_vpn_destination, Utc::now(), false)
+            .await
+            .is_none());
+        runtime
+            .requeue_overlay_destination(local_vpn_destination)
+            .await;
+        runtime
+            .record_remote_peer_activity(local_node, Utc::now())
+            .await;
+        assert!(runtime
+            .take_pending_overlay_destinations(8)
+            .await
+            .is_empty());
 
         let overlay_destination = IpAddr::V4(Ipv4Addr::new(100, 64, 8, 9));
         assert!(runtime

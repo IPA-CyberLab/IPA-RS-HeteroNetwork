@@ -1701,6 +1701,15 @@ impl OverlayPath {
         validate_overlay_identifier(self.source.as_str(), "source node ID", "source")?;
         validate_overlay_destination(self.destination)?;
         validate_overlay_node_record(&self.target, "target")?;
+        if self.target.node_id == self.source {
+            return Err(OverlayValidationError::new(
+                "target",
+                format!(
+                    "source node {} cannot be its own overlay target",
+                    self.source
+                ),
+            ));
+        }
         validate_ordered_overlay_nodes("ordered_nodes", &self.source, &self.ordered_nodes)?;
         if self.ordered_nodes.last() != Some(&self.target.node_id) {
             return Err(OverlayValidationError::new(
@@ -19562,6 +19571,18 @@ mod tests {
         path.validate()?;
         let decoded: OverlayPath = serde_json::from_value(serde_json::to_value(&path)?)?;
         assert_eq!(decoded, path);
+
+        let mut self_path = path.clone();
+        self_path.destination = "10.250.0.1".parse()?;
+        self_path.target = overlay_test_node("node-a", "cluster-a", self_path.destination);
+        self_path.ordered_nodes = vec![self_path.source.clone()];
+        self_path.secondary_ordered_nodes = None;
+        let error = self_path
+            .validate()
+            .err()
+            .ok_or("self-targeting overlay path should be rejected")?;
+        assert_eq!(error.field(), "target");
+        assert!(error.reason().contains("own overlay target"));
 
         path.ordered_nodes[1] = path.source.clone();
         let error = path

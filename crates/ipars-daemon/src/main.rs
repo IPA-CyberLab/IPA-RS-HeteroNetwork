@@ -16529,6 +16529,9 @@ fn relay_admission_request(
     status: &ipars_types::api::AgentStatusResponse,
     peer: &NodeRecord,
 ) -> Option<RelayAdmissionRequest> {
+    if status.node_id == peer.node_id {
+        return None;
+    }
     let local_addr = relay_session_endpoint(&status.candidates)?;
     let peer_addr = relay_session_endpoint(&peer.endpoint_candidates)?;
     let local_is_left = status.node_id <= peer.node_id;
@@ -19414,6 +19417,9 @@ impl PeerMapSource for HttpPeerMapSource {
             .map(|peer| peer.node_id.clone())
             .collect::<BTreeSet<_>>();
         for peer in self.runtime.resolved_overlay_peers().await {
+            if peer.node_id == *node_id {
+                continue;
+            }
             if peer_ids.insert(peer.node_id.clone()) {
                 peers.push(peer);
             }
@@ -34786,6 +34792,24 @@ exec sleep 60
             SocketAddr::from(([203, 0, 113, 30], 51820))
         );
         Ok(())
+    }
+
+    #[test]
+    fn relay_admission_request_rejects_a_self_peer() {
+        let status = agent_status(
+            "local",
+            vec![EndpointCandidate {
+                addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+                ..candidate("local", EndpointCandidateKind::PublicUdp, 10)
+            }],
+        );
+        let mut self_peer = node_record("local");
+        self_peer.endpoint_candidates = vec![EndpointCandidate {
+            addr: SocketAddr::from(([198, 51, 100, 10], 50000)),
+            ..candidate("local", EndpointCandidateKind::PublicUdp, 10)
+        }];
+
+        assert_eq!(relay_admission_request(&status, &self_peer), None);
     }
 
     #[test]
