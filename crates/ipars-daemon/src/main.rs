@@ -19407,11 +19407,20 @@ impl PeerMapSource for HttpPeerMapSource {
         self.runtime
             .record_neighbor_map_snapshot(neighbor_map.clone())
             .await?;
+        let control_client_map = fetch_peer_map_from_control_planes(
+            &self.client,
+            &control_plane_urls,
+            node_id,
+            &identity,
+        )
+        .await
+        .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
         let mut peers = neighbor_map
             .neighbors
             .iter()
             .map(|neighbor| neighbor.node.clone())
             .collect::<Vec<_>>();
+        merge_control_client_projection(&mut peers, control_client_map.peers);
         let mut peer_ids = peers
             .iter()
             .map(|peer| peer.node_id.clone())
@@ -19430,6 +19439,52 @@ impl PeerMapSource for HttpPeerMapSource {
             bootstrap_endpoints: neighbor_map.bootstrap_endpoints,
             generated_at: neighbor_map.generated_at,
         })
+    }
+}
+
+fn merge_control_client_projection(
+    bounded_peers: &mut Vec<NodeRecord>,
+    projected_peers: Vec<NodeRecord>,
+) {
+    for mut projected in projected_peers {
+        if projected.role.is_client() {
+            if let Some(existing) = bounded_peers
+                .iter_mut()
+                .find(|peer| peer.node_id == projected.node_id)
+            {
+                *existing = projected;
+            } else {
+                bounded_peers.push(projected);
+            }
+            continue;
+        }
+
+        projected.routes.retain(|route| {
+            route.id.starts_with("client-node-")
+                && route.advertised_by == projected.node_id
+                && route.via.as_ref() == Some(&projected.node_id)
+        });
+        if projected.routes.is_empty() {
+            continue;
+        }
+
+        if let Some(existing) = bounded_peers
+            .iter_mut()
+            .find(|peer| peer.node_id == projected.node_id)
+        {
+            for route in projected.routes {
+                existing.routes.retain(|current| current.cidr != route.cidr);
+                existing.routes.push(route);
+            }
+            existing.routes.sort_by(|left, right| {
+                left.cidr
+                    .to_string()
+                    .cmp(&right.cidr.to_string())
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        } else {
+            bounded_peers.push(projected);
+        }
     }
 }
 
@@ -19491,6 +19546,68 @@ async fn fetch_neighbor_map_from_control_planes(
     }
     anyhow::bail!(
         "all control-plane neighbor-map endpoints failed: {}",
+        failures.join("; ")
+    )
+}
+
+async fn fetch_peer_map_from_control_planes(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    node_id: &NodeId,
+    identity: &IdentityKeyPair,
+) -> anyhow::Result<PeerMap> {
+    anyhow::ensure!(
+        !control_plane_urls.is_empty(),
+        "control-plane URL is required for peer-map fetch"
+    );
+    anyhow::ensure!(
+        identity.node_id() == *node_id,
+        "peer-map query node {node_id} does not match signing identity {}",
+        identity.node_id()
+    );
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls {
+        let url = peer_map_url(control_plane_url);
+        let mut request = ControlPlaneNodeQueryRequest {
+            node_id: node_id.clone(),
+            request_signature: None,
+        };
+        request.request_signature = Some(
+            identity
+                .sign_control_plane_node_query_request(
+                    &request,
+                    ControlPlaneNodeQueryKind::PeerMap,
+                    chrono::Utc::now(),
+                )
+                .context("failed to sign control-plane peer-map query")?,
+        );
+        let response = match client.post(&url).json(&request).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{url}: send failed: {error}"));
+                continue;
+            }
+        };
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{url}: rejected: {error}"));
+                continue;
+            }
+        };
+        match read_bounded_agent_json_response(
+            response,
+            MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES,
+            "control-plane peer map",
+        )
+        .await
+        {
+            Ok(peer_map) => return Ok(peer_map),
+            Err(error) => failures.push(format!("{url}: decode failed: {error}")),
+        }
+    }
+    anyhow::bail!(
+        "all control-plane peer-map endpoints failed: {}",
         failures.join("; ")
     )
 }
@@ -19653,6 +19770,10 @@ fn neighbor_map_url(control_plane_url: &str) -> String {
         "{}/v1/neighbors/query",
         control_plane_url.trim_end_matches('/')
     )
+}
+
+fn peer_map_url(control_plane_url: &str) -> String {
+    format!("{}/v1/peers/query", control_plane_url.trim_end_matches('/'))
 }
 
 fn overlay_path_url(control_plane_url: &str) -> String {
@@ -21248,6 +21369,109 @@ mod tests {
         );
         stalled_task.abort();
         available_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_peer_map_merges_only_control_client_gateway_projection() -> anyhow::Result<()> {
+        let mut bounded_gateway = node_record("gateway-a");
+        bounded_gateway.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)));
+        bounded_gateway.routes.push(Route {
+            id: "service-a".to_string(),
+            cidr: "10.10.0.0/16".parse()?,
+            advertised_by: bounded_gateway.node_id.clone(),
+            via: Some(bounded_gateway.node_id.clone()),
+            metric: 20,
+            tags: BTreeSet::new(),
+        });
+        let mut bounded_peers = vec![bounded_gateway.clone()];
+
+        let mut direct_client = node_record("node-client-a");
+        direct_client.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 30)));
+        direct_client.role = Role::client();
+
+        let mut projected_gateway = bounded_gateway.clone();
+        projected_gateway.routes.push(Route {
+            id: "client-node-client-a".to_string(),
+            cidr: "100.64.0.30/32".parse()?,
+            advertised_by: projected_gateway.node_id.clone(),
+            via: Some(projected_gateway.node_id.clone()),
+            metric: 10,
+            tags: BTreeSet::new(),
+        });
+
+        let mut non_neighbor_gateway = node_record("gateway-b");
+        non_neighbor_gateway.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11)));
+        non_neighbor_gateway.routes.push(Route {
+            id: "client-node-client-b".to_string(),
+            cidr: "100.64.0.31/32".parse()?,
+            advertised_by: non_neighbor_gateway.node_id.clone(),
+            via: Some(non_neighbor_gateway.node_id.clone()),
+            metric: 10,
+            tags: BTreeSet::new(),
+        });
+        non_neighbor_gateway.routes.push(Route {
+            id: "service-b".to_string(),
+            cidr: "10.20.0.0/16".parse()?,
+            advertised_by: non_neighbor_gateway.node_id.clone(),
+            via: Some(non_neighbor_gateway.node_id.clone()),
+            metric: 20,
+            tags: BTreeSet::new(),
+        });
+        let non_neighbor_gateway_id = non_neighbor_gateway.node_id.clone();
+
+        let mut unrelated_peer = node_record("unrelated");
+        unrelated_peer.routes.push(Route {
+            id: "client-looking-but-not-a-node-route".to_string(),
+            cidr: "10.30.0.0/16".parse()?,
+            advertised_by: unrelated_peer.node_id.clone(),
+            via: Some(unrelated_peer.node_id.clone()),
+            metric: 20,
+            tags: BTreeSet::new(),
+        });
+
+        merge_control_client_projection(
+            &mut bounded_peers,
+            vec![
+                projected_gateway,
+                non_neighbor_gateway,
+                unrelated_peer,
+                direct_client.clone(),
+            ],
+        );
+
+        assert_eq!(
+            bounded_peers
+                .iter()
+                .filter(|peer| peer.node_id == bounded_gateway.node_id)
+                .count(),
+            1
+        );
+        let merged_gateway = bounded_peers
+            .iter()
+            .find(|peer| peer.node_id == bounded_gateway.node_id)
+            .context("bounded gateway should remain present")?;
+        assert!(merged_gateway
+            .routes
+            .iter()
+            .any(|route| route.id == "service-a"));
+        assert!(merged_gateway
+            .routes
+            .iter()
+            .any(|route| route.id == "client-node-client-a"));
+
+        let appended_gateway = bounded_peers
+            .iter()
+            .find(|peer| peer.node_id == non_neighbor_gateway_id)
+            .context("selected client gateway should be appended")?;
+        assert_eq!(appended_gateway.routes.len(), 1);
+        assert_eq!(appended_gateway.routes[0].id, "client-node-client-b");
+        assert!(bounded_peers
+            .iter()
+            .any(|peer| peer.node_id == direct_client.node_id && peer.role.is_client()));
+        assert!(bounded_peers
+            .iter()
+            .all(|peer| peer.node_id != NodeId::from_string("unrelated")));
         Ok(())
     }
 
@@ -34542,6 +34766,14 @@ exec sleep 60
         assert_eq!(
             neighbor_map_url("http://127.0.0.1:8443/"),
             "http://127.0.0.1:8443/v1/neighbors/query"
+        );
+    }
+
+    #[test]
+    fn peer_map_url_trims_control_plane_base_url() {
+        assert_eq!(
+            peer_map_url("http://127.0.0.1:8443/"),
+            "http://127.0.0.1:8443/v1/peers/query"
         );
     }
 
