@@ -14373,6 +14373,7 @@ enum DirectPathVerificationDecision {
     Start(PendingDirectPathProbe),
     Pending,
     Expired,
+    RetrySuppressed(chrono::DateTime<chrono::Utc>),
     MissingCandidate,
 }
 
@@ -14434,6 +14435,9 @@ async fn direct_path_verification_decision_with_data_plane_probe(
         runtime
             .remove_pending_direct_path_probe(&direct.key.remote)
             .await;
+        runtime
+            .clear_direct_path_probe_retry(&direct.key.remote)
+            .await;
         return Ok(DirectPathVerificationDecision::MissingCandidate);
     };
     let telemetry = telemetry_snapshot.and_then(|snapshot| snapshot.get(peer_public_key));
@@ -14452,16 +14456,15 @@ async fn direct_path_verification_decision_with_data_plane_probe(
                 runtime
                     .remove_pending_direct_path_probe(&direct.key.remote)
                     .await;
+                runtime
+                    .clear_direct_path_probe_retry(&direct.key.remote)
+                    .await;
                 runtime.record_direct_path_probe_confirmed();
                 return Ok(DirectPathVerificationDecision::Confirmed(
                     "wireguard_transfer",
                 ));
             }
             if !active {
-                runtime
-                    .remove_pending_direct_path_probe(&direct.key.remote)
-                    .await;
-                runtime.record_direct_path_probe_timeout();
                 return Ok(DirectPathVerificationDecision::Expired);
             }
             if let Some(telemetry) = telemetry {
@@ -14520,6 +14523,9 @@ async fn direct_path_verification_decision_with_data_plane_probe(
                         runtime
                             .remove_pending_direct_path_probe(&direct.key.remote)
                             .await;
+                        runtime
+                            .clear_direct_path_probe_retry(&direct.key.remote)
+                            .await;
                         runtime.record_direct_path_probe_confirmed();
                         return Ok(DirectPathVerificationDecision::Confirmed(
                             "wireguard_overlay_probe",
@@ -14535,6 +14541,9 @@ async fn direct_path_verification_decision_with_data_plane_probe(
                 ) {
                     runtime
                         .remove_pending_direct_path_probe(&direct.key.remote)
+                        .await;
+                    runtime
+                        .clear_direct_path_probe_retry(&direct.key.remote)
                         .await;
                     runtime.record_direct_path_probe_confirmed();
                     return Ok(DirectPathVerificationDecision::Confirmed(
@@ -14556,6 +14565,9 @@ async fn direct_path_verification_decision_with_data_plane_probe(
     if current_direct_matches
         && direct_path_telemetry_is_recent(candidate, telemetry, now, config.handshake_max_age)
     {
+        runtime
+            .clear_direct_path_probe_retry(&direct.key.remote)
+            .await;
         return Ok(DirectPathVerificationDecision::Confirmed(
             "recent_wireguard_handshake",
         ));
@@ -14566,10 +14578,24 @@ async fn direct_path_verification_decision_with_data_plane_probe(
         .and_then(|current| current.selected_candidate.as_ref())
     {
         if direct_path_telemetry_is_recent(current, telemetry, now, config.handshake_max_age) {
+            runtime
+                .clear_direct_path_probe_retry(&direct.key.remote)
+                .await;
             return Ok(DirectPathVerificationDecision::RetainCurrent(
                 "recent_wireguard_handshake",
             ));
         }
+    }
+    if let Some(retry_after) = runtime
+        .direct_path_probe_retry_after(&direct.key.remote)
+        .await
+    {
+        if now < retry_after {
+            return Ok(DirectPathVerificationDecision::RetrySuppressed(retry_after));
+        }
+        runtime
+            .clear_direct_path_probe_retry(&direct.key.remote)
+            .await;
     }
 
     let timeout = chrono::Duration::from_std(config.probe_timeout).map_err(|error| {
@@ -14796,6 +14822,50 @@ async fn set_direct_path_relay_forwarding(
     true
 }
 
+fn direct_path_probe_retry_delay(options: &SignalPathNegotiationOptions) -> Duration {
+    options
+        .direct_path_probe_timeout
+        .max(options.interval.saturating_mul(2))
+}
+
+async fn defer_direct_path_probe_retry(
+    runtime: &AgentRuntime,
+    peer: &NodeId,
+    now: chrono::DateTime<chrono::Utc>,
+    delay: Duration,
+) -> Result<chrono::DateTime<chrono::Utc>, AgentError> {
+    let delay = chrono::Duration::from_std(delay).map_err(|error| {
+        AgentError::PathProbeRejected(format!(
+            "direct path probe retry delay is out of range: {error}"
+        ))
+    })?;
+    let retry_after = now + delay;
+    runtime
+        .defer_direct_path_probe_retry(peer.clone(), retry_after)
+        .await;
+    Ok(retry_after)
+}
+
+async fn restore_relay_after_direct_path_probe_timeout(
+    runtime: &AgentRuntime,
+    supervisor: Option<&Arc<RelayForwarderSupervisor>>,
+    peer: &NodeId,
+    now: chrono::DateTime<chrono::Utc>,
+    retry_delay: Duration,
+) -> Result<(), AgentError> {
+    let _endpoint_update_guard = runtime.wireguard_endpoint_update_guard().await;
+    set_direct_path_relay_forwarding(runtime, supervisor, peer, true).await;
+    defer_direct_path_probe_retry(runtime, peer, now, retry_delay).await?;
+    if runtime
+        .remove_pending_direct_path_probe(peer)
+        .await
+        .is_some()
+    {
+        runtime.record_direct_path_probe_timeout();
+    }
+    Ok(())
+}
+
 fn direct_path_endpoint_matches(
     candidate: &EndpointCandidate,
     telemetry: &WireGuardPeerTelemetry,
@@ -14945,6 +15015,7 @@ async fn negotiate_signal_paths(
     };
     for peer in peer_set.skipped {
         runtime.remove_pending_direct_path_probe(&peer).await;
+        runtime.clear_direct_path_probe_retry(&peer).await;
         remove_relay_session_for_peer(
             runtime,
             options.relay_forwarder_supervisor.as_ref(),
@@ -15045,6 +15116,7 @@ async fn negotiate_signal_paths(
             .await?;
             match decision {
                 DirectPathVerificationDecision::Disabled => {
+                    runtime.clear_direct_path_probe_retry(&peer.node_id).await;
                     if !current_relay_retained {
                         if let Err(error) = prepare_direct_nat_traversal(
                             client,
@@ -15072,6 +15144,7 @@ async fn negotiate_signal_paths(
                     }
                 }
                 DirectPathVerificationDecision::Confirmed(evidence) => {
+                    runtime.clear_direct_path_probe_retry(&peer.node_id).await;
                     record = verification_record.clone();
                     path_selection = StableSignalPathSelection::Candidate;
                     tracing::info!(
@@ -15095,16 +15168,8 @@ async fn negotiate_signal_paths(
                 DirectPathVerificationDecision::Start(probe) => {
                     runtime.upsert_pending_direct_path_probe(probe).await?;
                     runtime.record_direct_path_probe_started();
-                    // Publish the pending endpoint before hole punching so the
-                    // peer-map sync can switch WireGuard away from the relay
-                    // while the direct traversal setup is still running.
-                    set_direct_path_relay_forwarding(
-                        runtime,
-                        options.relay_forwarder_supervisor.as_ref(),
-                        &peer.node_id,
-                        false,
-                    )
-                    .await;
+                    // Keep relay forwarding active until WireGuard has applied
+                    // and observed the direct endpoint.
                     if let Err(error) = prepare_direct_nat_traversal(
                         client,
                         &signal_url,
@@ -15124,6 +15189,13 @@ async fn negotiate_signal_paths(
                         runtime
                             .remove_pending_direct_path_probe(&peer.node_id)
                             .await;
+                        defer_direct_path_probe_retry(
+                            runtime,
+                            &peer.node_id,
+                            now,
+                            direct_path_probe_retry_delay(options),
+                        )
+                        .await?;
                         set_direct_path_relay_forwarding(
                             runtime,
                             options.relay_forwarder_supervisor.as_ref(),
@@ -15186,12 +15258,35 @@ async fn negotiate_signal_paths(
                     )
                     .await;
                 }
+                DirectPathVerificationDecision::RetrySuppressed(retry_after) => {
+                    tracing::debug!(
+                        peer = %verification_record.key.remote,
+                        state = ?verification_record.selected_state,
+                        %retry_after,
+                        "deferred direct WireGuard path verification after failed probe"
+                    );
+                    (record, path_selection) = retain_path_during_direct_probe_retry(
+                        runtime,
+                        &verification_record,
+                        &relay_candidates,
+                        now,
+                    )
+                    .await;
+                }
                 DirectPathVerificationDecision::Expired => {
                     tracing::warn!(
                         peer = %verification_record.key.remote,
                         state = ?verification_record.selected_state,
                         "direct WireGuard path verification expired"
                     );
+                    restore_relay_after_direct_path_probe_timeout(
+                        runtime,
+                        options.relay_forwarder_supervisor.as_ref(),
+                        &peer.node_id,
+                        now,
+                        direct_path_probe_retry_delay(options),
+                    )
+                    .await?;
                     (record, path_selection) = direct_path_failure_record(
                         &verification_record,
                         &relay_candidates,
@@ -15217,6 +15312,7 @@ async fn negotiate_signal_paths(
             runtime
                 .remove_pending_direct_path_probe(&peer.node_id)
                 .await;
+            runtime.clear_direct_path_probe_retry(&peer.node_id).await;
         }
         if record.selected_state == PathState::Relay
             && path_selection == StableSignalPathSelection::Candidate
@@ -15517,6 +15613,39 @@ async fn retain_path_during_direct_probe(
     relay_candidates: &[NodeRecord],
     now: chrono::DateTime<chrono::Utc>,
 ) -> (PathRecord, StableSignalPathSelection) {
+    retain_path_during_direct_transition(
+        runtime,
+        direct,
+        relay_candidates,
+        now,
+        "direct_path_probe_pending",
+    )
+    .await
+}
+
+async fn retain_path_during_direct_probe_retry(
+    runtime: &AgentRuntime,
+    direct: &PathRecord,
+    relay_candidates: &[NodeRecord],
+    now: chrono::DateTime<chrono::Utc>,
+) -> (PathRecord, StableSignalPathSelection) {
+    retain_path_during_direct_transition(
+        runtime,
+        direct,
+        relay_candidates,
+        now,
+        "direct_path_probe_retry_deferred",
+    )
+    .await
+}
+
+async fn retain_path_during_direct_transition(
+    runtime: &AgentRuntime,
+    direct: &PathRecord,
+    relay_candidates: &[NodeRecord],
+    now: chrono::DateTime<chrono::Utc>,
+    reason: &'static str,
+) -> (PathRecord, StableSignalPathSelection) {
     if let Some(mut current) = runtime.path_record_for_peer(&direct.key.remote).await {
         if current.selected_state == PathState::Relay
             && active_relay_session(runtime, &direct.key.remote)
@@ -15528,12 +15657,9 @@ async fn retain_path_during_direct_probe(
                 .score
                 .reasons
                 .iter()
-                .any(|reason| reason == "direct_path_probe_pending")
+                .any(|current| current == reason)
             {
-                current
-                    .score
-                    .reasons
-                    .push("direct_path_probe_pending".to_string());
+                current.score.reasons.push(reason.to_string());
             }
             return (current, StableSignalPathSelection::CurrentRelay);
         }
@@ -15543,17 +15669,14 @@ async fn retain_path_during_direct_probe(
                 .score
                 .reasons
                 .iter()
-                .any(|reason| reason == "direct_path_probe_pending")
+                .any(|current| current == reason)
             {
-                current
-                    .score
-                    .reasons
-                    .push("direct_path_probe_pending".to_string());
+                current.score.reasons.push(reason.to_string());
             }
             return (current, StableSignalPathSelection::CurrentDirect);
         }
     }
-    direct_path_failure_record(direct, relay_candidates, "direct_path_probe_pending", now)
+    direct_path_failure_record(direct, relay_candidates, reason, now)
 }
 
 fn direct_path_failure_record(
@@ -30867,6 +30990,89 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn direct_probe_timeout_restores_relay_forwarding_before_retry() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = Arc::new(RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 1,
+            restart_backoff: Duration::ZERO,
+            crash_policy: test_crash_policy(),
+        }));
+        let peer = NodeId::from_string("peer-direct-timeout");
+        supervisor
+            .upsert(
+                &runtime,
+                RelaySessionState {
+                    peer: peer.clone(),
+                    relay_node: NodeId::from_string("relay-a"),
+                    relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                    admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+                    admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+                    session_id: "session-direct-timeout".to_string(),
+                    session_token: "token-direct-timeout".to_string(),
+                    expires_at: Utc::now() + ChronoDuration::minutes(5),
+                },
+            )
+            .await?;
+        let now = Utc::now();
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: candidate(peer.as_str(), EndpointCandidateKind::PublicUdp, 10),
+                started_at: now - ChronoDuration::seconds(2),
+                expires_at: now - ChronoDuration::seconds(1),
+                endpoint_observed_at: Some(now - ChronoDuration::seconds(2)),
+                baseline_rx_bytes: Some(0),
+                baseline_tx_bytes: Some(0),
+                baseline_latest_handshake_at: None,
+                baseline_relay_inbound_payload_bytes: Some(0),
+                relay_forwarder_suspended: false,
+            })
+            .await?;
+        assert!(set_direct_path_relay_forwarding(&runtime, Some(&supervisor), &peer, false).await);
+        assert!(!supervisor
+            .handles
+            .lock()
+            .await
+            .get(&peer)
+            .context("relay forwarder")?
+            .forwarding_enabled
+            .load(Ordering::Relaxed));
+
+        restore_relay_after_direct_path_probe_timeout(
+            &runtime,
+            Some(&supervisor),
+            &peer,
+            now,
+            Duration::from_secs(30),
+        )
+        .await?;
+
+        assert!(supervisor
+            .handles
+            .lock()
+            .await
+            .get(&peer)
+            .context("relay forwarder")?
+            .forwarding_enabled
+            .load(Ordering::Relaxed));
+        assert!(runtime.pending_direct_path_probe(&peer).await.is_none());
+        assert_eq!(
+            runtime.direct_path_probe_retry_after(&peer).await,
+            Some(now + ChronoDuration::seconds(30))
+        );
+        assert_eq!(runtime.metrics().await.direct_path_probe_timeout_count, 1);
+
+        supervisor.shutdown_all(&runtime).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn relay_forwarder_supervisor_reaps_dead_tasks_and_backs_off() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
@@ -36171,7 +36377,7 @@ exec sleep 60
             direct_path_probe_timeout: Duration::from_millis(1),
             direct_handshake_max_age: Duration::from_secs(180),
             peer_probe_observation_max_age: Duration::from_secs(120),
-            interval: Duration::from_secs(1),
+            interval: Duration::from_secs(30),
         };
 
         negotiate_signal_paths(
@@ -36204,8 +36410,8 @@ exec sleep 60
         negotiate_signal_paths(
             &reqwest::Client::new(),
             &runtime,
-            &[control_plane_base],
-            &[signal_base],
+            std::slice::from_ref(&control_plane_base),
+            std::slice::from_ref(&signal_base),
             &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
             &options,
         )
@@ -36229,6 +36435,33 @@ exec sleep 60
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.direct_path_probe_started_count, 1);
         assert_eq!(metrics.direct_path_probe_confirmed_count, 0);
+        assert_eq!(metrics.direct_path_probe_timeout_count, 1);
+
+        negotiate_signal_paths(
+            &reqwest::Client::new(),
+            &runtime,
+            std::slice::from_ref(&control_plane_base),
+            std::slice::from_ref(&signal_base),
+            &UdpHolePuncher::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            &options,
+        )
+        .await?;
+        let deferred = runtime
+            .path_record_for_peer(&peer.node_id)
+            .await
+            .context("relay path should remain active during direct retry cooldown")?;
+        assert_eq!(deferred.selected_state, PathState::Relay);
+        assert!(deferred
+            .score
+            .reasons
+            .iter()
+            .any(|reason| reason == "direct_path_probe_retry_deferred"));
+        assert!(runtime
+            .pending_direct_path_probe(&peer.node_id)
+            .await
+            .is_none());
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.direct_path_probe_started_count, 1);
         assert_eq!(metrics.direct_path_probe_timeout_count, 1);
 
         signal_task.abort();
@@ -37466,7 +37699,52 @@ exec sleep 60
         assert!(runtime
             .pending_direct_path_probe(&direct.key.remote)
             .await
+            .is_some());
+        restore_relay_after_direct_path_probe_timeout(
+            &runtime,
+            None,
+            &direct.key.remote,
+            now,
+            config.probe_timeout,
+        )
+        .await?;
+        assert!(runtime
+            .pending_direct_path_probe(&direct.key.remote)
+            .await
             .is_none());
+        let retry_after = now + ChronoDuration::seconds(120);
+        assert_eq!(
+            runtime
+                .direct_path_probe_retry_after(&direct.key.remote)
+                .await,
+            Some(retry_after)
+        );
+        assert_eq!(
+            direct_path_verification_decision(
+                &runtime,
+                &direct,
+                None,
+                public_key,
+                now + ChronoDuration::seconds(1),
+                config,
+                None,
+            )
+            .await?,
+            DirectPathVerificationDecision::RetrySuppressed(retry_after)
+        );
+        assert!(matches!(
+            direct_path_verification_decision(
+                &runtime,
+                &direct,
+                None,
+                public_key,
+                retry_after,
+                config,
+                None,
+            )
+            .await?,
+            DirectPathVerificationDecision::Start(_)
+        ));
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.direct_path_probe_confirmed_count, 2);
         assert_eq!(metrics.direct_path_probe_timeout_count, 1);

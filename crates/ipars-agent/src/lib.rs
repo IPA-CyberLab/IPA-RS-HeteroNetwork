@@ -677,6 +677,7 @@ pub struct AgentRuntime {
     wireguard_endpoint_update: tokio::sync::Mutex<()>,
     path_state: tokio::sync::RwLock<BTreeMap<(NodeId, NodeId), PathRecord>>,
     pending_direct_path_probes: tokio::sync::RwLock<BTreeMap<NodeId, PendingDirectPathProbe>>,
+    direct_path_probe_retry_after: tokio::sync::RwLock<BTreeMap<NodeId, DateTime<Utc>>>,
     path_quality_observations: tokio::sync::RwLock<BTreeMap<NodeId, PathQualityObservation>>,
     path_change_events: tokio::sync::RwLock<VecDeque<PathChangeEvent>>,
     path_change_event_total_count: AtomicU64,
@@ -1457,6 +1458,7 @@ impl AgentRuntime {
             wireguard_endpoint_update: tokio::sync::Mutex::new(()),
             path_state: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_direct_path_probes: tokio::sync::RwLock::new(BTreeMap::new()),
+            direct_path_probe_retry_after: tokio::sync::RwLock::new(BTreeMap::new()),
             path_quality_observations: tokio::sync::RwLock::new(BTreeMap::new()),
             path_change_events: tokio::sync::RwLock::new(VecDeque::new()),
             path_change_event_total_count: AtomicU64::new(0),
@@ -2474,7 +2476,35 @@ impl AgentRuntime {
         &self,
         peer: &NodeId,
     ) -> Option<PendingDirectPathProbe> {
-        self.pending_direct_path_probes.write().await.remove(peer)
+        let removed = self.pending_direct_path_probes.write().await.remove(peer);
+        if removed.is_some() {
+            self.request_peer_map_sync();
+        }
+        removed
+    }
+
+    pub async fn direct_path_probe_retry_after(&self, peer: &NodeId) -> Option<DateTime<Utc>> {
+        self.direct_path_probe_retry_after
+            .read()
+            .await
+            .get(peer)
+            .copied()
+    }
+
+    pub async fn defer_direct_path_probe_retry(&self, peer: NodeId, retry_after: DateTime<Utc>) {
+        self.direct_path_probe_retry_after
+            .write()
+            .await
+            .entry(peer)
+            .and_modify(|current| *current = (*current).max(retry_after))
+            .or_insert(retry_after);
+    }
+
+    pub async fn clear_direct_path_probe_retry(&self, peer: &NodeId) {
+        self.direct_path_probe_retry_after
+            .write()
+            .await
+            .remove(peer);
     }
 
     pub fn record_direct_path_probe_started(&self) {
@@ -6306,22 +6336,26 @@ where
             routes.extend(peer_routes.iter().cloned());
             desired_peer_routes.insert(peer.node_id.clone(), peer_routes);
         }
+        let selected_route_cidrs = routes
+            .iter()
+            .map(|route| route.cidr)
+            .collect::<BTreeSet<_>>();
+        let overlay_quarantine = overlay_quarantine.map(|(public_key, mut cidrs)| {
+            cidrs.retain(|cidr| {
+                !local_route_cidrs.contains(cidr) && !selected_route_cidrs.contains(cidr)
+            });
+            (public_key, cidrs)
+        });
         if let Some((_, cidrs)) = &overlay_quarantine {
             let quarantine_node = NodeId::from_string(OVERLAY_QUARANTINE_NODE_ID);
-            routes.extend(
-                cidrs
-                    .iter()
-                    .filter(|cidr| !local_route_cidrs.contains(cidr))
-                    .enumerate()
-                    .map(|(index, cidr)| Route {
-                        id: format!("overlay-quarantine-{index}"),
-                        cidr: *cidr,
-                        advertised_by: quarantine_node.clone(),
-                        via: Some(quarantine_node.clone()),
-                        metric: u32::MAX,
-                        tags: BTreeSet::new(),
-                    }),
-            );
+            routes.extend(cidrs.iter().enumerate().map(|(index, cidr)| Route {
+                id: format!("overlay-quarantine-{index}"),
+                cidr: *cidr,
+                advertised_by: quarantine_node.clone(),
+                via: Some(quarantine_node.clone()),
+                metric: u32::MAX,
+                tags: BTreeSet::new(),
+            }));
         }
         let desired_route_plan = RoutePlan {
             owner: RoutePlanOwner::PeerMap,
@@ -6416,11 +6450,7 @@ where
                     peer: NodeId::from_string(OVERLAY_QUARANTINE_NODE_ID),
                     public_key: public_key.clone(),
                     endpoint: Some(PASSIVE_WIREGUARD_HOLD_ENDPOINT.to_string()),
-                    allowed_ips: cidrs
-                        .iter()
-                        .filter(|cidr| !local_route_cidrs.contains(cidr))
-                        .map(ToString::to_string)
-                        .collect(),
+                    allowed_ips: cidrs.iter().map(ToString::to_string).collect(),
                     persistent_keepalive_seconds: None,
                 })
                 .await?;
@@ -11275,6 +11305,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_pending_direct_probe_requests_endpoint_resync(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let peer_id = NodeId::from_string("peer-probe-resync");
+        let now = Utc::now();
+        let peer_map_sync = runtime.peer_map_sync_notifier();
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: EndpointCandidate {
+                    node_id: peer_id.clone(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: SocketAddr::from(([8, 8, 8, 11], 51_820)),
+                    observed_at: now,
+                    priority: 100,
+                    cost: 10,
+                    source: CandidateSource::ControlPlane,
+                },
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(60),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: None,
+                baseline_tx_bytes: None,
+                baseline_latest_handshake_at: None,
+                baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), peer_map_sync.notified()).await?;
+
+        assert!(runtime
+            .remove_pending_direct_path_probe(&peer_id)
+            .await
+            .is_some());
+        tokio::time::timeout(Duration::from_secs(1), peer_map_sync.notified()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_endpoint_resolver_uses_overlay_until_direct_path_is_selected(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Arc::new(AgentRuntime::new(
@@ -12000,7 +12072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_overlay_replaces_topology_pins_and_installs_one_quarantine_peer(
+    async fn bounded_overlay_quarantine_does_not_duplicate_active_advertised_routes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
@@ -12012,12 +12084,21 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
+        let new_neighbor_id = NodeId::from_string("new-neighbor");
+        let advertised_route = Route {
+            id: "new-neighbor-pod-cidr".to_string(),
+            cidr: "10.240.1.0/24".parse()?,
+            advertised_by: new_neighbor_id.clone(),
+            via: Some(new_neighbor_id.clone()),
+            metric: 10,
+            tags: BTreeSet::new(),
+        };
         let new_neighbor = peer_record(
-            NodeId::from_string("new-neighbor"),
+            new_neighbor_id.clone(),
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11)),
             "wg-new-neighbor",
             Vec::new(),
-            Vec::new(),
+            vec![advertised_route.clone()],
         );
         runtime
             .record_neighbor_map_snapshot(bounded_neighbor_map(
@@ -12028,13 +12109,13 @@ mod tests {
             .await?;
         assert!(runtime.should_connect_peer(&old_neighbor).await);
 
-        runtime
-            .record_neighbor_map_snapshot(bounded_neighbor_map(
-                local_node,
-                vec![new_neighbor.clone()],
-                8,
-            ))
-            .await?;
+        let mut current_map = bounded_neighbor_map(local_node, vec![new_neighbor.clone()], 8);
+        current_map.aggregate_routes = vec![ipars_types::AggregateOverlayRoute {
+            cidr: advertised_route.cidr,
+            primary_next_hop: new_neighbor_id,
+            secondary_next_hop: None,
+        }];
+        runtime.record_neighbor_map_snapshot(current_map).await?;
         assert!(!runtime.should_connect_peer(&old_neighbor).await);
         assert!(runtime.should_connect_peer(&new_neighbor).await);
 
@@ -12060,16 +12141,24 @@ mod tests {
         );
         assert_eq!(
             peers[&new_neighbor.node_id].allowed_ips,
-            vec!["100.64.0.11/32"]
+            vec!["100.64.0.11/32", "10.240.1.0/24"]
         );
         drop(peers);
         let applied_routes = applier.route_manager.applied.read().await;
-        assert!(applied_routes
+        let plan = applied_routes
             .last()
-            .is_some_and(|plan| plan.routes.iter().any(|route| {
-                route.advertised_by == NodeId::from_string(OVERLAY_QUARANTINE_NODE_ID)
-                    && route.cidr.to_string() == "100.64.0.0/10"
-            })));
+            .ok_or_else(|| AgentError::RoutePlanning("missing route plan".to_string()))?;
+        assert!(plan.routes.iter().any(|route| {
+            route.advertised_by == NodeId::from_string(OVERLAY_QUARANTINE_NODE_ID)
+                && route.cidr.to_string() == "100.64.0.0/10"
+        }));
+        assert_eq!(
+            plan.routes
+                .iter()
+                .filter(|route| route.cidr == advertised_route.cidr)
+                .collect::<Vec<_>>(),
+            vec![&advertised_route]
+        );
         Ok(())
     }
 
