@@ -13,17 +13,22 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use ipars_relay::multihop::{
-    MAX_MULTIHOP_FRAME_BYTES, MAX_MULTIHOP_PAYLOAD_BYTES, MULTIHOP_PATH_ID_BYTES,
+    MultiHopEnvelope, MAX_MULTIHOP_FRAME_BYTES, MAX_MULTIHOP_PAYLOAD_BYTES, MULTIHOP_PATH_ID_BYTES,
 };
 use ipars_types::{NodeId, OverlayPath};
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::overlay_forwarder::{
     BoundedOverlayForwarder, OverlayForwardAction, OverlayForwarderError, OverlayPathSelection,
 };
+
+const OVERLAY_ACK_PAYLOAD: &[u8] = b"IPARS-MH-ACK-V1";
+const DEFAULT_OVERLAY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const DEFAULT_MAX_PENDING_OVERLAY_ACKS: usize = 4_096;
+const MAX_OVERLAY_PEER_IN_FLIGHT_SENDS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayNeighborEndpoint {
@@ -231,6 +236,9 @@ pub struct OverlayTransitStatsSnapshot {
     pub unknown_sources_dropped: u64,
     pub delivery_queue_drops: u64,
     pub send_failures: u64,
+    pub acknowledgements_sent: u64,
+    pub acknowledgements_received: u64,
+    pub acknowledgement_timeouts: u64,
 }
 
 #[derive(Default)]
@@ -242,6 +250,9 @@ struct OverlayTransitStatsInner {
     unknown_sources_dropped: AtomicU64,
     delivery_queue_drops: AtomicU64,
     send_failures: AtomicU64,
+    acknowledgements_sent: AtomicU64,
+    acknowledgements_received: AtomicU64,
+    acknowledgement_timeouts: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -259,8 +270,35 @@ impl OverlayTransitStats {
             unknown_sources_dropped: self.inner.unknown_sources_dropped.load(Ordering::Relaxed),
             delivery_queue_drops: self.inner.delivery_queue_drops.load(Ordering::Relaxed),
             send_failures: self.inner.send_failures.load(Ordering::Relaxed),
+            acknowledgements_sent: self.inner.acknowledgements_sent.load(Ordering::Relaxed),
+            acknowledgements_received: self.inner.acknowledgements_received.load(Ordering::Relaxed),
+            acknowledgement_timeouts: self.inner.acknowledgement_timeouts.load(Ordering::Relaxed),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OverlayAcknowledgementKey {
+    topology_epoch: u64,
+    path_id: [u8; MULTIHOP_PATH_ID_BYTES],
+    sequence: u64,
+    remote: NodeId,
+}
+
+#[derive(Debug, Error)]
+pub enum OverlayPathAttemptError {
+    #[error("overlay neighbor send failed: {0}")]
+    Send(#[from] OverlayNeighborSendError),
+    #[error(
+        "timed out after {timeout_millis} ms waiting for overlay acknowledgement from {remote}"
+    )]
+    AcknowledgementTimeout { remote: NodeId, timeout_millis: u64 },
+    #[error("overlay acknowledgement waiter for {remote} closed before delivery")]
+    AcknowledgementWaiterClosed { remote: NodeId },
+    #[error("overlay acknowledgement capacity {maximum} is exhausted")]
+    AcknowledgementCapacity { maximum: usize },
+    #[error("overlay acknowledgement key is already pending for {remote}")]
+    DuplicateAcknowledgement { remote: NodeId },
 }
 
 #[derive(Debug, Error)]
@@ -280,19 +318,21 @@ pub enum OverlayTransitError {
     },
     #[error("overlay delivery queue capacity must be non-zero")]
     ZeroDeliveryQueueCapacity,
+    #[error("overlay acknowledgement capacity must be non-zero")]
+    ZeroAcknowledgementCapacity,
     #[error("overlay forwarding validation failed: {0}")]
     Forwarder(#[from] OverlayForwarderError),
     #[error("overlay neighbor send failed: {0}")]
     Send(#[from] OverlayNeighborSendError),
     #[error("primary send failed ({primary}); secondary path could not be prepared ({secondary})")]
     FailoverPreparation {
-        primary: Box<OverlayNeighborSendError>,
+        primary: Box<OverlayPathAttemptError>,
         secondary: Box<OverlayForwarderError>,
     },
     #[error("both overlay paths failed: primary ({primary}); secondary ({secondary})")]
     BothPathsFailed {
-        primary: Box<OverlayNeighborSendError>,
-        secondary: Box<OverlayNeighborSendError>,
+        primary: Box<OverlayPathAttemptError>,
+        secondary: Box<OverlayPathAttemptError>,
     },
     #[error("cannot allocate a secondary sequence after {0}")]
     SequenceOverflow(u64),
@@ -310,6 +350,9 @@ pub enum OverlayTransitError {
 pub struct OverlayTransitClient {
     forwarder: Arc<Mutex<BoundedOverlayForwarder>>,
     sender: Arc<dyn OverlayNeighborSender>,
+    pending_acknowledgements: Arc<Mutex<BTreeMap<OverlayAcknowledgementKey, oneshot::Sender<()>>>>,
+    acknowledgement_timeout: Option<std::time::Duration>,
+    max_pending_acknowledgements: usize,
     stats: OverlayTransitStats,
 }
 
@@ -333,9 +376,10 @@ impl OverlayTransitClient {
         })
     }
 
-    /// Try primary once, then prepare and send the secondary path once if the
-    /// primary UDP send fails. The retry consumes `sequence + 1` because the
-    /// forwarder records the primary sequence before attempting I/O.
+    /// Try the primary path once, then prepare and send the secondary path once
+    /// if transmission fails or its end-to-end acknowledgement times out. The
+    /// retry consumes `sequence + 1` because the forwarder records the primary
+    /// sequence before attempting I/O.
     pub async fn send_with_secondary_failover(
         &self,
         path: &OverlayPath,
@@ -343,16 +387,30 @@ impl OverlayTransitClient {
         sequence: u64,
         inner_wireguard_datagram: Vec<u8>,
     ) -> Result<OverlaySendOutcome, OverlayTransitError> {
+        if path.ordered_nodes.len() == 2 {
+            return Err(OverlayTransitError::DirectNeighborRequiresDataplane {
+                peer: path.target.node_id.clone(),
+            });
+        }
         let primary = {
             let mut forwarder = self.forwarder.lock().await;
             forwarder.encapsulate(path, path_id, sequence, inner_wireguard_datagram.clone())?
         };
-        match self.send_action(primary).await {
+        let acknowledgement = OverlayAcknowledgementKey {
+            topology_epoch: path.topology_epoch,
+            path_id,
+            sequence,
+            remote: path.target.node_id.clone(),
+        };
+        match self
+            .send_action_with_acknowledgement(primary, acknowledgement)
+            .await
+        {
             Ok(()) => Ok(OverlaySendOutcome {
                 selection: OverlayPathSelection::Primary,
                 sequence,
             }),
-            Err(OverlayTransitError::Send(primary)) => {
+            Err(primary) => {
                 let secondary_sequence = sequence
                     .checked_add(1)
                     .ok_or(OverlayTransitError::SequenceOverflow(sequence))?;
@@ -375,21 +433,26 @@ impl OverlayTransitClient {
                         });
                     }
                 };
-                match self.send_action(secondary).await {
+                let acknowledgement = OverlayAcknowledgementKey {
+                    topology_epoch: path.topology_epoch,
+                    path_id,
+                    sequence: secondary_sequence,
+                    remote: path.target.node_id.clone(),
+                };
+                match self
+                    .send_action_with_acknowledgement(secondary, acknowledgement)
+                    .await
+                {
                     Ok(()) => Ok(OverlaySendOutcome {
                         selection: OverlayPathSelection::Secondary,
                         sequence: secondary_sequence,
                     }),
-                    Err(OverlayTransitError::Send(secondary)) => {
-                        Err(OverlayTransitError::BothPathsFailed {
-                            primary: Box::new(primary),
-                            secondary: Box::new(secondary),
-                        })
-                    }
-                    Err(other) => Err(other),
+                    Err(secondary) => Err(OverlayTransitError::BothPathsFailed {
+                        primary: Box::new(primary),
+                        secondary: Box::new(secondary),
+                    }),
                 }
             }
-            Err(other) => Err(other),
         }
     }
 
@@ -409,15 +472,7 @@ impl OverlayTransitClient {
     }
 
     async fn send_action(&self, action: OverlayForwardAction) -> Result<(), OverlayTransitError> {
-        let (next_hop, datagram) = match action {
-            OverlayForwardAction::Forward { next_hop, datagram } => (next_hop, datagram),
-            OverlayForwardAction::DirectNeighbor { peer, .. } => {
-                return Err(OverlayTransitError::DirectNeighborRequiresDataplane { peer });
-            }
-            OverlayForwardAction::Deliver { .. } => {
-                unreachable!("encapsulation never creates a delivery action")
-            }
-        };
+        let (next_hop, datagram) = forwarding_action_parts(action)?;
         self.sender
             .send_frame(&next_hop, &datagram)
             .await
@@ -428,6 +483,98 @@ impl OverlayTransitClient {
                     .fetch_add(1, Ordering::Relaxed);
             })?;
         Ok(())
+    }
+
+    async fn send_action_with_acknowledgement(
+        &self,
+        action: OverlayForwardAction,
+        acknowledgement: OverlayAcknowledgementKey,
+    ) -> Result<(), OverlayPathAttemptError> {
+        let (next_hop, datagram) = match forwarding_action_parts(action) {
+            Ok(parts) => parts,
+            Err(OverlayTransitError::DirectNeighborRequiresDataplane { .. }) => {
+                unreachable!("direct paths are rejected before acknowledgement tracking")
+            }
+            Err(_) => unreachable!("encapsulation can only produce forwarding actions"),
+        };
+        let Some(timeout) = self.acknowledgement_timeout else {
+            self.sender
+                .send_frame(&next_hop, &datagram)
+                .await
+                .inspect_err(|_| {
+                    self.stats
+                        .inner
+                        .send_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                })?;
+            return Ok(());
+        };
+
+        let remote = acknowledgement.remote.clone();
+        let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_acknowledgements.lock().await;
+            if pending.len() >= self.max_pending_acknowledgements {
+                return Err(OverlayPathAttemptError::AcknowledgementCapacity {
+                    maximum: self.max_pending_acknowledgements,
+                });
+            }
+            if pending.contains_key(&acknowledgement) {
+                return Err(OverlayPathAttemptError::DuplicateAcknowledgement { remote });
+            }
+            pending.insert(acknowledgement.clone(), acknowledged_tx);
+        }
+
+        if let Err(error) = self.sender.send_frame(&next_hop, &datagram).await {
+            self.pending_acknowledgements
+                .lock()
+                .await
+                .remove(&acknowledgement);
+            self.stats
+                .inner
+                .send_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(OverlayPathAttemptError::Send(error));
+        }
+
+        match tokio::time::timeout(timeout, acknowledged_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.pending_acknowledgements
+                    .lock()
+                    .await
+                    .remove(&acknowledgement);
+                Err(OverlayPathAttemptError::AcknowledgementWaiterClosed { remote })
+            }
+            Err(_) => {
+                self.pending_acknowledgements
+                    .lock()
+                    .await
+                    .remove(&acknowledgement);
+                self.stats
+                    .inner
+                    .acknowledgement_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(OverlayPathAttemptError::AcknowledgementTimeout {
+                    remote,
+                    timeout_millis: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                })
+            }
+        }
+    }
+}
+
+fn forwarding_action_parts(
+    action: OverlayForwardAction,
+) -> Result<(NodeId, Vec<u8>), OverlayTransitError> {
+    match action {
+        OverlayForwardAction::Forward { next_hop, datagram } => Ok((next_hop, datagram)),
+        OverlayForwardAction::DirectNeighbor { peer, .. } => {
+            Err(OverlayTransitError::DirectNeighborRequiresDataplane { peer })
+        }
+        OverlayForwardAction::Deliver { .. } => {
+            unreachable!("encapsulation never creates a delivery action")
+        }
     }
 }
 
@@ -450,12 +597,14 @@ impl OverlayTransit {
             Arc::clone(&socket),
             endpoints.clone(),
         ));
-        Self::spawn_with_sender(
+        Self::spawn_with_sender_config(
             socket,
             endpoints,
             forwarder,
             sender,
             delivery_queue_capacity,
+            Some(DEFAULT_OVERLAY_ACK_TIMEOUT),
+            DEFAULT_MAX_PENDING_OVERLAY_ACKS,
         )
     }
 
@@ -466,15 +615,43 @@ impl OverlayTransit {
         sender: Arc<dyn OverlayNeighborSender>,
         delivery_queue_capacity: usize,
     ) -> Result<Self, OverlayTransitError> {
+        Self::spawn_with_sender_config(
+            socket,
+            endpoints,
+            forwarder,
+            sender,
+            delivery_queue_capacity,
+            None,
+            DEFAULT_MAX_PENDING_OVERLAY_ACKS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_sender_config(
+        socket: Arc<UdpSocket>,
+        endpoints: OverlayNeighborEndpointDirectory,
+        forwarder: BoundedOverlayForwarder,
+        sender: Arc<dyn OverlayNeighborSender>,
+        delivery_queue_capacity: usize,
+        acknowledgement_timeout: Option<std::time::Duration>,
+        max_pending_acknowledgements: usize,
+    ) -> Result<Self, OverlayTransitError> {
         if delivery_queue_capacity == 0 {
             return Err(OverlayTransitError::ZeroDeliveryQueueCapacity);
+        }
+        if acknowledgement_timeout.is_some() && max_pending_acknowledgements == 0 {
+            return Err(OverlayTransitError::ZeroAcknowledgementCapacity);
         }
 
         let forwarder = Arc::new(Mutex::new(forwarder));
         let stats = OverlayTransitStats::default();
+        let pending_acknowledgements = Arc::new(Mutex::new(BTreeMap::new()));
         let client = OverlayTransitClient {
             forwarder: Arc::clone(&forwarder),
             sender: Arc::clone(&sender),
+            pending_acknowledgements: Arc::clone(&pending_acknowledgements),
+            acknowledgement_timeout,
+            max_pending_acknowledgements,
             stats: stats.clone(),
         };
         let (delivery_tx, deliveries) = mpsc::channel(delivery_queue_capacity);
@@ -485,6 +662,7 @@ impl OverlayTransit {
             forwarder,
             sender,
             delivery_tx,
+            pending_acknowledgements,
             stats,
             shutdown_rx,
         ));
@@ -503,6 +681,11 @@ impl OverlayTransit {
 
     pub fn delivery_receiver(&mut self) -> &mut mpsc::Receiver<OverlayDelivery> {
         &mut self.deliveries
+    }
+
+    pub fn take_delivery_receiver(&mut self) -> mpsc::Receiver<OverlayDelivery> {
+        let (_replacement_tx, replacement_rx) = mpsc::channel(1);
+        std::mem::replace(&mut self.deliveries, replacement_rx)
     }
 
     pub fn stats(&self) -> OverlayTransitStats {
@@ -710,6 +893,8 @@ impl OverlayWireGuardPeerForwarder {
         let mut next_sequence = self.config.initial_sequence;
         let mut path_updates_open = true;
         let mut datagram = vec![0_u8; MAX_MULTIHOP_PAYLOAD_BYTES + 1];
+        let mut sends =
+            tokio::task::JoinSet::<Result<OverlaySendOutcome, OverlayTransitError>>::new();
 
         loop {
             tokio::select! {
@@ -744,7 +929,31 @@ impl OverlayWireGuardPeerForwarder {
                         Err(_) => path_updates_open = false,
                     }
                 }
-                received = socket.recv_from(&mut datagram) => {
+                completed = sends.join_next(), if !sends.is_empty() => {
+                    match completed {
+                        Some(Ok(Ok(outcome))) => {
+                            self.stats
+                                .inner
+                                .overlay_datagrams_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                            if outcome.selection == OverlayPathSelection::Secondary {
+                                self.stats
+                                    .inner
+                                    .secondary_failovers
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Some(Ok(Err(_))) | Some(Err(_)) => {
+                            self.stats
+                                .inner
+                                .overlay_send_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => {}
+                    }
+                }
+                received = socket.recv_from(&mut datagram),
+                    if sends.len() < MAX_OVERLAY_PEER_IN_FLIGHT_SENDS => {
                     let (length, source) =
                         received.map_err(OverlayWireGuardPeerForwarderError::Receive)?;
                     self.stats
@@ -803,38 +1012,24 @@ impl OverlayWireGuardPeerForwarder {
                             next_sequence,
                         ));
                     };
-                    let result = self
-                        .transit
-                        .send_with_secondary_failover(
-                            &path,
-                            self.config.path_id,
-                            next_sequence,
-                            payload.to_vec(),
-                        )
-                        .await;
+                    let transit = self.transit.clone();
+                    let send_path = path.clone();
+                    let path_id = self.config.path_id;
+                    let sequence = next_sequence;
+                    let payload = payload.to_vec();
+                    sends.spawn(async move {
+                        transit
+                            .send_with_secondary_failover(
+                                &send_path,
+                                path_id,
+                                sequence,
+                                payload,
+                            )
+                            .await
+                    });
                     next_sequence = reserved_limit
                         .checked_add(1)
                         .unwrap_or(reserved_limit);
-                    match result {
-                        Ok(outcome) => {
-                            self.stats
-                                .inner
-                                .overlay_datagrams_sent
-                                .fetch_add(1, Ordering::Relaxed);
-                            if outcome.selection == OverlayPathSelection::Secondary {
-                                self.stats
-                                    .inner
-                                    .secondary_failovers
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(_) => {
-                            self.stats
-                                .inner
-                                .overlay_send_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
                 }
             }
         }
@@ -872,6 +1067,7 @@ async fn run_receive_loop(
     forwarder: Arc<Mutex<BoundedOverlayForwarder>>,
     sender: Arc<dyn OverlayNeighborSender>,
     deliveries: mpsc::Sender<OverlayDelivery>,
+    pending_acknowledgements: Arc<Mutex<BTreeMap<OverlayAcknowledgementKey, oneshot::Sender<()>>>>,
     stats: OverlayTransitStats,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), OverlayTransitError> {
@@ -895,6 +1091,7 @@ async fn run_receive_loop(
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
+                let decoded = MultiHopEnvelope::decode(&datagram[..length], 1);
                 let action = {
                     let mut forwarder = forwarder.lock().await;
                     forwarder.receive(&previous_hop, &datagram[..length])
@@ -914,6 +1111,43 @@ async fn run_receive_loop(
                         }
                     }
                     Ok(OverlayForwardAction::Deliver { source, payload }) => {
+                        let envelope = decoded.expect(
+                            "a frame accepted by the bounded forwarder must decode canonically",
+                        );
+                        if payload == OVERLAY_ACK_PAYLOAD {
+                            let acknowledgement = OverlayAcknowledgementKey {
+                                topology_epoch: envelope.topology_epoch(),
+                                path_id: *envelope.path_id(),
+                                sequence: envelope.sequence(),
+                                remote: source,
+                            };
+                            if let Some(waiter) = pending_acknowledgements
+                                .lock()
+                                .await
+                                .remove(&acknowledgement)
+                            {
+                                let _ = waiter.send(());
+                            }
+                            stats
+                                .inner
+                                .acknowledgements_received
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if send_overlay_acknowledgement(
+                            sender.as_ref(),
+                            &envelope,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            stats
+                                .inner
+                                .acknowledgements_sent
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.inner.send_failures.fetch_add(1, Ordering::Relaxed);
+                        }
                         if deliveries.try_send(OverlayDelivery { source, payload }).is_ok() {
                             stats
                                 .inner
@@ -942,6 +1176,31 @@ async fn run_receive_loop(
             }
         }
     }
+}
+
+async fn send_overlay_acknowledgement(
+    sender: &dyn OverlayNeighborSender,
+    delivered: &MultiHopEnvelope,
+) -> Result<(), OverlayNeighborSendError> {
+    let reverse_path = delivered.path().iter().rev().cloned().collect::<Vec<_>>();
+    let next_hop = reverse_path
+        .first()
+        .expect("multi-hop delivery paths always contain at least one relay")
+        .clone();
+    let acknowledgement = MultiHopEnvelope::new(
+        delivered.topology_epoch(),
+        *delivered.path_id(),
+        delivered.sequence(),
+        reverse_path.len() as u8,
+        delivered.destination().clone(),
+        delivered.source().clone(),
+        reverse_path,
+        OVERLAY_ACK_PAYLOAD.to_vec(),
+    )
+    .expect("a reversed accepted multi-hop path must remain valid")
+    .encode()
+    .expect("a bounded acknowledgement must encode canonically");
+    sender.send_frame(&next_hop, &acknowledgement).await
 }
 
 #[cfg(test)]
@@ -1251,7 +1510,7 @@ mod tests {
         .ok_or("delivery channel closed")?;
         assert_eq!(delivery.payload, vec![0x42]);
         sleep(Duration::from_millis(100)).await;
-        assert_eq!(relay.stats().snapshot().forwarded_frames, 1);
+        assert_eq!(relay.stats().snapshot().forwarded_frames, 2);
         assert_eq!(relay.stats().snapshot().invalid_frames_dropped, 4);
         assert!(timeout(
             Duration::from_millis(100),
@@ -1337,6 +1596,82 @@ mod tests {
         assert_eq!(transit.stats().snapshot().send_failures, 1);
 
         timeout(Duration::from_secs(1), transit.shutdown()).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_end_to_end_acknowledgement_switches_to_secondary_path() -> TestResult {
+        let source_socket = loopback_socket().await?;
+        let unavailable_primary = loopback_socket().await?;
+        let secondary_relay_socket = loopback_socket().await?;
+        let destination_socket = loopback_socket().await?;
+        let source_address = source_socket.local_addr()?;
+        let primary_address = unavailable_primary.local_addr()?;
+        let secondary_relay_address = secondary_relay_socket.local_addr()?;
+        let destination_address = destination_socket.local_addr()?;
+
+        let source_endpoints = OverlayNeighborEndpointDirectory::new([
+            endpoint("a", primary_address),
+            endpoint("c", secondary_relay_address),
+        ])?;
+        let secondary_relay_endpoints = OverlayNeighborEndpointDirectory::new([
+            endpoint("s", source_address),
+            endpoint("d", destination_address),
+        ])?;
+        let destination_endpoints =
+            OverlayNeighborEndpointDirectory::new([endpoint("c", secondary_relay_address)])?;
+
+        let source = OverlayTransit::spawn(
+            source_socket,
+            source_endpoints,
+            forwarder("s", &["a", "c"], 9)?,
+            8,
+        )?;
+        let secondary_relay = OverlayTransit::spawn(
+            secondary_relay_socket,
+            secondary_relay_endpoints,
+            forwarder("c", &["s", "d"], 9)?,
+            8,
+        )?;
+        let mut destination = OverlayTransit::spawn(
+            destination_socket,
+            destination_endpoints,
+            forwarder("d", &["c"], 9)?,
+            8,
+        )?;
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            source.client().send_with_secondary_failover(
+                &path(&["s", "a", "d"], Some(&["s", "c", "d"]), 9),
+                [5; 16],
+                80,
+                vec![0x51],
+            ),
+        )
+        .await??;
+        assert_eq!(
+            outcome,
+            OverlaySendOutcome {
+                selection: OverlayPathSelection::Secondary,
+                sequence: 81,
+            }
+        );
+        let delivery = timeout(
+            Duration::from_secs(1),
+            destination.delivery_receiver().recv(),
+        )
+        .await?
+        .ok_or("destination delivery channel closed")?;
+        assert_eq!(delivery.payload, vec![0x51]);
+        assert_eq!(source.stats().snapshot().acknowledgement_timeouts, 1);
+        assert_eq!(source.stats().snapshot().acknowledgements_received, 1);
+        assert_eq!(destination.stats().snapshot().acknowledgements_sent, 1);
+
+        source.shutdown().await?;
+        secondary_relay.shutdown().await?;
+        destination.shutdown().await?;
+        drop(unavailable_primary);
         Ok(())
     }
 

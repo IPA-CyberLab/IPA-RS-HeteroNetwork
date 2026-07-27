@@ -1,4 +1,5 @@
 pub mod overlay_forwarder;
+pub mod overlay_transit;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
@@ -600,6 +601,7 @@ pub struct AgentRuntime {
     relay_sessions: tokio::sync::RwLock<BTreeMap<NodeId, RelaySessionState>>,
     relay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     relay_forwarder_metrics: tokio::sync::RwLock<BTreeMap<NodeId, Arc<RelayForwarderStats>>>,
+    overlay_forwarder_endpoints: tokio::sync::RwLock<BTreeMap<NodeId, SocketAddr>>,
     userspace_wireguard_process: tokio::sync::RwLock<Option<AgentManagedProcessStatus>>,
     lazy_connect: tokio::sync::RwLock<LazyConnectManager>,
     internal_packet_flow_udp_ports: tokio::sync::RwLock<BTreeSet<u16>>,
@@ -1374,6 +1376,7 @@ impl AgentRuntime {
             relay_sessions: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             relay_forwarder_metrics: tokio::sync::RwLock::new(BTreeMap::new()),
+            overlay_forwarder_endpoints: tokio::sync::RwLock::new(BTreeMap::new()),
             userspace_wireguard_process: tokio::sync::RwLock::new(None),
             lazy_connect: tokio::sync::RwLock::new(LazyConnectManager::new(policy)),
             internal_packet_flow_udp_ports: tokio::sync::RwLock::new(BTreeSet::new()),
@@ -2604,6 +2607,38 @@ impl AgentRuntime {
         self.relay_forwarder_endpoints.read().await.clone()
     }
 
+    pub async fn upsert_overlay_forwarder_endpoint(&self, peer: NodeId, endpoint: SocketAddr) {
+        let endpoint_changed = self
+            .overlay_forwarder_endpoints
+            .write()
+            .await
+            .insert(peer, endpoint)
+            != Some(endpoint);
+        if endpoint_changed {
+            self.request_peer_map_sync();
+        }
+    }
+
+    pub async fn overlay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        self.overlay_forwarder_endpoints
+            .read()
+            .await
+            .get(peer)
+            .copied()
+    }
+
+    pub async fn remove_overlay_forwarder_endpoint(&self, peer: &NodeId) -> Option<SocketAddr> {
+        let removed = self.overlay_forwarder_endpoints.write().await.remove(peer);
+        if removed.is_some() {
+            self.request_peer_map_sync();
+        }
+        removed
+    }
+
+    pub async fn overlay_forwarder_endpoints(&self) -> BTreeMap<NodeId, SocketAddr> {
+        self.overlay_forwarder_endpoints.read().await.clone()
+    }
+
     pub async fn relay_session_needs_renewal(
         &self,
         peer: &NodeId,
@@ -3124,6 +3159,7 @@ impl AgentRuntime {
             .map(|current| current.topology_epoch);
         if previous_epoch.is_some_and(|epoch| epoch != neighbor_map.topology_epoch) {
             self.resolved_overlay_paths.write().await.clear();
+            self.overlay_forwarder_endpoints.write().await.clear();
         }
         *self.latest_neighbor_map.write().await = Some(neighbor_map);
         Ok(())
@@ -3185,6 +3221,7 @@ impl AgentRuntime {
             .neighbors
             .iter()
             .any(|neighbor| neighbor.node.node_id == target_id);
+        let mut evicted_shortcut = None;
         if !is_backbone_neighbor {
             let shortcut_limit = usize::from(
                 self.lazy_connect
@@ -3213,11 +3250,18 @@ impl AgentRuntime {
                     })?;
                 drop(lazy_connect);
                 resolved.remove(&evicted);
+                evicted_shortcut = Some(evicted.clone());
                 let mut lazy_connect = self.lazy_connect.write().await;
                 lazy_connect.remove_activity(&evicted);
                 lazy_connect.remove_observed_peer(&evicted);
             }
             resolved.insert(target_id.clone(), (path.clone(), observed_at));
+        }
+        if let Some(evicted) = evicted_shortcut {
+            self.overlay_forwarder_endpoints
+                .write()
+                .await
+                .remove(&evicted);
         }
 
         let local_route_cidrs = self
@@ -3256,6 +3300,15 @@ impl AgentRuntime {
             .await
             .values()
             .map(|(path, _)| path.target.clone())
+            .collect()
+    }
+
+    pub async fn resolved_overlay_paths(&self) -> Vec<OverlayPath> {
+        self.resolved_overlay_paths
+            .read()
+            .await
+            .values()
+            .map(|(path, _)| path.clone())
             .collect()
     }
 
@@ -3306,6 +3359,10 @@ impl AgentRuntime {
         }
         drop(lazy_connect);
         self.resolved_overlay_paths
+            .write()
+            .await
+            .retain(|peer, _| !idle_peers.contains(peer));
+        self.overlay_forwarder_endpoints
             .write()
             .await
             .retain(|peer, _| !idle_peers.contains(peer));
@@ -5705,14 +5762,20 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
                 &peer.node_id,
             ));
         }
+        let overlay_endpoint = self
+            .runtime
+            .overlay_forwarder_endpoint(&peer.node_id)
+            .await
+            .map(|endpoint| endpoint.to_string());
         let path = self.runtime.path_record_for_peer(&peer.node_id).await;
         let Some(path) = path else {
-            return Ok(preferred_peer_local_udp_candidate(
-                &local_candidates,
-                &peer.endpoint_candidates,
-            )
-            .and_then(|candidate| wireguard_endpoint_for_candidate(&candidate, &peer.node_id))
-            .or_else(|| preferred_endpoint(peer)));
+            return Ok(overlay_endpoint.or_else(|| {
+                preferred_peer_local_udp_candidate(&local_candidates, &peer.endpoint_candidates)
+                    .and_then(|candidate| {
+                        wireguard_endpoint_for_candidate(&candidate, &peer.node_id)
+                    })
+                    .or_else(|| preferred_endpoint(peer))
+            }));
         };
 
         match path.selected_state {
@@ -5724,8 +5787,9 @@ impl PeerEndpointResolver for RuntimePeerEndpointResolver {
                     self.relay_forwarder_endpoint,
                 )
                 .await
-                .map(|endpoint| endpoint.to_string())),
-            PathState::Unreachable => Ok(None),
+                .map(|endpoint| endpoint.to_string())
+                .or(overlay_endpoint)),
+            PathState::Unreachable => Ok(overlay_endpoint),
             PathState::DirectNatTraversal => Ok(preferred_peer_local_udp_candidate(
                 &local_candidates,
                 &peer.endpoint_candidates,
@@ -11011,6 +11075,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_endpoint_resolver_uses_overlay_until_direct_path_is_selected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let local_id = runtime.state().node_id.clone();
+        let peer_id = NodeId::from_string("peer-overlay");
+        let direct_candidate = EndpointCandidate {
+            node_id: peer_id.clone(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: SocketAddr::from(([8, 8, 8, 20], 51_820)),
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::ControlPlane,
+        };
+        let peer = peer_record(
+            peer_id.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 20)),
+            "wg-peer-overlay",
+            vec![direct_candidate.clone()],
+            Vec::new(),
+        );
+        let overlay_endpoint = SocketAddr::from(([127, 0, 0, 1], 52_100));
+        runtime
+            .upsert_overlay_forwarder_endpoint(peer_id.clone(), overlay_endpoint)
+            .await;
+        let resolver = RuntimePeerEndpointResolver::new(runtime.clone());
+
+        assert_eq!(
+            resolver.endpoint_for_peer(&peer).await?,
+            Some(overlay_endpoint.to_string())
+        );
+
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id.clone(), peer_id.clone()),
+                selected_state: PathState::DirectPublic,
+                selected_candidate: Some(direct_candidate),
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::DirectPublic,
+                    &PathMetrics::default(),
+                    true,
+                    0,
+                ),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+        assert_eq!(
+            resolver.endpoint_for_peer(&peer).await?,
+            Some("8.8.8.20:51820".to_string())
+        );
+
+        runtime
+            .upsert_path_state(PathRecord {
+                key: PeerPathKey::new(local_id, peer_id.clone()),
+                selected_state: PathState::Unreachable,
+                selected_candidate: None,
+                relay_node: None,
+                score: PathScore::calculate(
+                    PathState::Unreachable,
+                    &PathMetrics::default(),
+                    true,
+                    0,
+                ),
+                updated_at: Utc::now(),
+                pinned: false,
+            })
+            .await?;
+        assert_eq!(
+            resolver.endpoint_for_peer(&peer).await?,
+            Some(overlay_endpoint.to_string())
+        );
+        runtime.remove_overlay_forwarder_endpoint(&peer_id).await;
+        assert_eq!(resolver.endpoint_for_peer(&peer).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runtime_endpoint_resolver_uses_peer_local_udp_candidate(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Arc::new(AgentRuntime::new(
@@ -11408,6 +11554,12 @@ mod tests {
                 observed_at,
             )
             .await?;
+        runtime
+            .upsert_overlay_forwarder_endpoint(
+                target_id.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 52_101)),
+            )
+            .await;
 
         assert_eq!(runtime.resolved_overlay_peers().await, vec![target.clone()]);
         assert_eq!(runtime.metrics().await.lazy_connect.pinned_peer_count, 0);
@@ -11415,9 +11567,10 @@ mod tests {
             runtime
                 .take_idle_peers_to_close(observed_at + ChronoDuration::seconds(2))
                 .await,
-            vec![target_id]
+            vec![target_id.clone()]
         );
         assert!(runtime.resolved_overlay_peers().await.is_empty());
+        assert_eq!(runtime.overlay_forwarder_endpoint(&target_id).await, None);
 
         runtime
             .record_resolved_overlay_path(
@@ -11431,9 +11584,16 @@ mod tests {
             )
             .await?;
         runtime
+            .upsert_overlay_forwarder_endpoint(
+                target_id.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 52_102)),
+            )
+            .await;
+        runtime
             .record_neighbor_map_snapshot(bounded_neighbor_map(local_node, Vec::new(), 8))
             .await?;
         assert!(runtime.resolved_overlay_peers().await.is_empty());
+        assert_eq!(runtime.overlay_forwarder_endpoint(&target_id).await, None);
         Ok(())
     }
 
