@@ -3119,42 +3119,53 @@ fn node_peer_map_with_clients(
         .into_iter()
         .map(|gateway| gateway.node_id.clone())
         .collect::<Vec<_>>();
-    let source_is_gateway = gateway_ids.contains(&source.node_id);
-    let client_routes_by_gateway = if source_is_gateway {
-        BTreeMap::new()
-    } else {
-        let mut routes = BTreeMap::<NodeId, Vec<Route>>::new();
-        for client in peers
-            .iter()
-            .filter(|peer| peer.role.is_client())
-            .filter(|client| acl_filter_peer(source, client, policy).is_some())
-        {
-            let selected_gateway = client_gateway_selections
+    let visible_clients = peers
+        .iter()
+        .filter(|peer| peer.role.is_client())
+        .filter_map(|client| {
+            acl_filter_peer(source, client, policy)
+                .map(|visible| (visible.node_id.clone(), visible))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let selected_gateway_by_client = visible_clients
+        .values()
+        .filter_map(|client| {
+            client_gateway_selections
                 .get(&client.node_id)
                 .map(|selection| &selection.gateway_node_id)
                 .filter(|gateway| gateway_ids.contains(gateway))
-                .or_else(|| gateway_ids.first());
-            if let Some(route) =
-                selected_gateway.and_then(|gateway| gateway_route_for_client(gateway, client))
-            {
-                routes
-                    .entry(route.advertised_by.clone())
-                    .or_default()
-                    .push(route);
-            }
+                .or_else(|| gateway_ids.first())
+                .cloned()
+                .map(|gateway| (client.node_id.clone(), gateway))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut client_routes_by_gateway = BTreeMap::<NodeId, Vec<Route>>::new();
+    for client in visible_clients.values() {
+        let Some(selected_gateway) = selected_gateway_by_client.get(&client.node_id) else {
+            continue;
+        };
+        if selected_gateway == &source.node_id {
+            continue;
         }
-        routes
-    };
+        if let Some(route) = gateway_route_for_client(selected_gateway, client) {
+            client_routes_by_gateway
+                .entry(route.advertised_by.clone())
+                .or_default()
+                .push(route);
+        }
+    }
 
     peers
         .iter()
         .filter(|peer| peer.node_id != source.node_id)
         .filter_map(|peer| {
             if peer.role.is_client() {
-                if !source_is_gateway {
+                if selected_gateway_by_client.get(&peer.node_id) != Some(&source.node_id) {
                     return None;
                 }
-                return acl_filter_peer(source, peer, policy)
+                return visible_clients
+                    .get(&peer.node_id)
+                    .cloned()
                     .map(|peer| filter_served_endpoint_candidates(peer, generated_at, policy));
             }
 
@@ -5630,7 +5641,15 @@ mod tests {
         assert!(backup_gateway_map
             .peers
             .iter()
-            .any(|peer| peer.node_id == client.node_id));
+            .all(|peer| peer.node_id != client.node_id));
+        assert!(backup_gateway_map.peers.iter().any(|peer| {
+            peer.node_id == gateway.node_id
+                && peer.routes.iter().any(|route| {
+                    route.cidr == client_cidr
+                        && route.advertised_by == gateway.node_id
+                        && route.via.as_ref() == Some(&gateway.node_id)
+                })
+        }));
         let worker_map = plane.peer_map_for(&worker.node_id).await?;
         assert!(worker_map
             .peers
@@ -5684,6 +5703,28 @@ mod tests {
         assert!(heartbeat?.peer_delta_available);
         let selected_backup = plane.peer_map_for(&client.node_id).await?;
         assert_eq!(selected_backup.peers[0].node_id, backup_gateway.node_id);
+        let primary_gateway_after_client_switch = plane.peer_map_for(&gateway.node_id).await?;
+        assert!(primary_gateway_after_client_switch
+            .peers
+            .iter()
+            .all(|peer| peer.node_id != client.node_id));
+        assert!(primary_gateway_after_client_switch
+            .peers
+            .iter()
+            .any(|peer| {
+                peer.node_id == backup_gateway.node_id
+                    && peer.routes.iter().any(|route| {
+                        route.cidr == client_cidr
+                            && route.advertised_by == backup_gateway.node_id
+                            && route.via.as_ref() == Some(&backup_gateway.node_id)
+                    })
+            }));
+        let backup_gateway_after_client_switch =
+            plane.peer_map_for(&backup_gateway.node_id).await?;
+        assert!(backup_gateway_after_client_switch
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == client.node_id));
         let worker_after_client_switch = plane.peer_map_for(&worker.node_id).await?;
         assert!(worker_after_client_switch.peers.iter().any(|peer| {
             peer.node_id == backup_gateway.node_id
