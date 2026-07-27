@@ -37,7 +37,7 @@ Operators can keep the issuer private key outside the control-plane process and 
 
 Token ledger use is recorded in durable state before registration is accepted. Definition initialization, revocation lookup, status/max-use validation, and use consumption are one serialized operation; existing rows are never reset during first use or re-issuance. SQLite serializes with its writer transaction, while PostgreSQL admission and revocation share a transaction-scoped advisory lock derived from cluster/nonce. New records retain the complete signed claims and reject a cluster/nonce collision with a different definition. A separate durable revocation tombstone can be created before claims are first observed; admission materializes the token record as revoked without consuming a use. Tombstone-only entries count as revoked ledger tokens in metrics, and the tombstone plus an optional full token record form the revocation result.
 
-During registration, the control plane validates that the submitted identity public key is valid Ed25519 key material, requires the submitted node ID to match the ID derived from that key, validates the submitted WireGuard public key as base64-encoded 32-byte key material, and rejects endpoint candidates or advertised routes that belong to a different node ID. After registration, agents sign heartbeat updates, node-removal requests, and WireGuard key-rotation requests with their node identity key. The agent rotation endpoint generates the next WireGuard keypair locally, submits the signed previous-to-next public-key transition to the control plane, persists the accepted private key in the owner-only agent state file, and updates the running state used by status, registration refreshes, and heartbeat reports. The control plane verifies signatures against the registered node identity public key, rejects missing, invalid, stale, or replayed heartbeat signatures, stores the accepted signature timestamp as the node health freshness time, only accepts endpoint candidates, advertised route updates, or path-state updates that belong to the reporting node, checks heartbeat route updates against the stored token route policy before replacing a node's route set, only removes a node when the request is signed by that node identity, and only rotates a WireGuard key when the signed previous key still matches the durable node record. This keeps health, relay-capacity, candidate, route, lease-removal, data-plane key, and pair-scoped path-state updates bound to the node that owns the registered identity.
+During registration, the control plane validates that the submitted identity public key is valid Ed25519 key material, requires the submitted node ID to match the ID derived from that key, validates the submitted WireGuard public key as base64-encoded 32-byte key material, and rejects endpoint candidates or advertised routes that belong to a different node ID. After registration, agents sign heartbeat updates, node-removal requests, and WireGuard key-rotation requests with their node identity key. The agent rotation endpoint generates the next WireGuard keypair locally, submits the signed previous-to-next public-key transition to the control plane, persists the accepted private key in the owner-only agent state file, and updates the running state used by status, registration refreshes, and heartbeat reports. The control plane verifies signatures against the registered node identity public key, rejects missing, invalid, stale, or replayed heartbeat signatures, stores the accepted signature timestamp separately for replay ordering, records server receipt time as node health freshness, only accepts endpoint candidates, advertised route updates, or path-state updates that belong to the reporting node, checks heartbeat route updates against the stored token route policy before replacing a node's route set, only removes a node when the request is signed by that node identity, and only rotates a WireGuard key when the signed previous key still matches the durable node record. This keeps health, relay-capacity, candidate, route, lease-removal, data-plane key, and pair-scoped path-state updates bound to the node that owns the registered identity without allowing accepted client clock skew to make a live node immediately stale.
 
 ## Control-Only Clients
 
@@ -189,49 +189,66 @@ Agents do not establish a full mesh. They keep a compact peer map and only negot
 - Kubernetes/API/service exposure needs an underlay path
 - an operator runs an explicit path probe
 
-The Control Plane synthesizes a deterministic, block-aware bounded-degree
-backbone from cluster membership instead of returning a full mesh. Nodes are
-organized into deterministic blocks of at most
-`ClusterPolicy.overlay_block_size` members; the value is valid from 2 through
-64 and can be changed at runtime through `PUT /v1/admin/policy`. The graph is
-the union of deterministic Hamiltonian cycles. `overlay_max_degree` remains
-restricted to 4 or 6, so two or three cycles can each contribute at most two
-neighbors per node. Duplicate cycle edges can make the observed degree lower,
-but never higher, than that policy bound.
+The Control Plane synthesizes a deterministic recursive bounded-degree
+backbone from cluster membership instead of returning a full mesh. Hash-prefix
+placement produces leaf groups with at most
+`ClusterPolicy.overlay_block_size` nodes and recursively groups at most that
+many children under each parent. The fanout is valid from 4 through 64 and can
+be changed at runtime through `PUT /v1/admin/policy`.
 
-Cycle edges that cross block boundaries make their endpoint nodes
-representatives for that cycle. There is no single elected representative whose
-loss disconnects a block: the redundant cycles provide alternate
-representatives and the path service returns an edge-disjoint secondary route
-when available, preferring a vertex-disjoint route. Representative failure is
-therefore handled by the same bounded acknowledgement timeout, next-hop
-suppression, and secondary-route retry as any other backbone-hop failure.
+Every non-root group exposes two deterministic physical representatives to its
+parent. Parent groups connect their child representatives with redundant
+bounded links, while leaf members retain bounded local links. Representative
+capacity is accounted across all levels before a topology is published. The
+synthesizer rejects a result unless it is connected, has no self-loops, remains
+connected after removal of any one node, and keeps every physical node at or
+below the configured degree. `overlay_max_degree` remains restricted to 4 or
+6; the recursive backbone itself uses at most four physical neighbors per node.
+Representative failure is handled by the same bounded acknowledgement timeout,
+next-hop suppression, and secondary-route retry as any other backbone-hop
+failure.
+
+Backbone membership uses fresh Agent health rather than durable registration
+alone. A fresh healthy or degraded heartbeat keeps a node eligible; an
+unhealthy heartbeat or one older than `relay_health_ttl_seconds` removes it
+from the synthesized membership. A newly registered node receives the same TTL
+as a startup grace before its first heartbeat. Removing or restoring a node
+changes the content-derived epoch and deterministically reassigns any affected
+representatives among the surviving membership.
 
 Each Agent uses identity-signed, on-demand `NeighborMap` and `OverlayPath`
 queries; the map carries the current topology epoch and bounded next hops,
 while the path carries an ordered primary route and its optional secondary
-route. An accepted block-size or other topology-policy change produces a new
+route. An accepted fanout or other topology-policy change produces a new
 content-derived `topology_epoch`. Agents do not need to restart: they converge
 when their subsequent neighbor-map and overlay-path refreshes observe the new
 epoch, while the existing previous-epoch grace permits in-flight traffic to
 drain. Runtime policy writes are persisted by the Control Plane store under the
 cluster ID. Active-active replicas that share the same SQLite or PostgreSQL
 store refresh that record before serving policy-dependent responses, so a
-change accepted by one replica is observed by the others.
+change accepted by one replica is observed by the others. Each Control Plane
+caches the synthesized graph by membership and topology policy, including
+deterministic synthesis failures. Synthesis runs outside the asynchronous
+request executor. Per-source next-hop tables are constructed once and cached;
+their secondary first hop avoids the primary neighbor as an internal vertex.
 
 The operator-authenticated `GET /v1/admin/topology` endpoint exposes the current
-blocks, nodes, edges, and graph statistics used by the Web UI topology view and
-its Mermaid export. Each edge also carries an observed status derived from the
-latest directional path heartbeats: `connected`, `partial`, `unreachable`,
-`stale`, or `unknown`. Block membership is topology organization only. It does
+group hierarchy, parent-child relationships, representatives, physical nodes,
+edge placements, and graph statistics used by the Web UI topology view and its
+nested Mermaid export. Each edge also carries an observed status derived from
+the latest directional path heartbeats: `connected`, `partial`, `unreachable`,
+`stale`, or `unknown`. Group membership is topology organization only. It does
 not grant trust, isolate traffic, or replace the role-, tag-, route-, and
 protocol-aware ACL evaluation.
+The endpoint queries path observations only for synthesized physical edge
+pairs; it does not load the cluster's complete logical path table.
 
 For `N` nodes and maximum degree `D`, each Agent keeps at most `D` backbone
-neighbors and the undirected graph has at most `N * D / 2` edges. The number of
-blocks is approximately `ceil(N / overlay_block_size)`. Changing the block size
-changes locality and the placement of inter-block representatives, but does not
-raise the per-Agent degree bound or turn lazy connect into an idle full mesh.
+neighbors and the undirected graph has at most `N * D / 2` edges. Changing the
+fanout changes the hierarchy and representative placement, but does not raise
+the per-Agent degree bound or turn lazy connect into an idle full mesh.
+This bound applies to direct bounded-overlay peers. Client-to-gateway sessions
+terminate outside the backbone and are accounted separately.
 
 Until a direct path is verified, a per-peer loopback proxy encapsulates the
 unchanged inner WireGuard UDP datagram in a multi-hop envelope. Intermediate
@@ -255,15 +272,26 @@ suppresses that representative for five seconds so all affected destinations
 use their working alternates immediately.
 
 Resolved logical overlay paths are retained independently of direct
-connections. The default policy permits four LRU direct shortcuts while all
-other active peers remain reachable through their loopback overlay proxies.
+connections. Agents do not select direct shortcuts independently because that
+can satisfy the initiating node's degree limit while exceeding the remote
+node's limit through endpoint roaming. Direct bounded-overlay links therefore
+come only from the authoritative neighbor map; all other active peers remain
+reachable through their loopback overlay proxies.
+Route ownership, including Kubernetes PodCIDR advertisement, pins reachability
+but does not itself authorize a direct endpoint when a bounded `NeighborMap`
+exists. A non-neighbor route owner stays in passive quarantine until traffic
+triggers path resolution and then uses an overlay proxy. Resolved paths and
+their proxy tasks expire after the idle timeout even when route ownership keeps
+the destination discoverable. Thus advertising one PodCIDR per node does not
+recreate either an `N x N` direct mesh or permanently retained all-pairs proxy
+state.
 Path resolution runs in its own Control Plane failover loop and therefore does
 not depend on Signal or direct-path negotiation being enabled. Its bounded
 deduplicating FIFO retries failed destinations at the tail and resolves up to
 16 requests concurrently, so permanently rejected destinations cannot starve
-the rest of a 1,000-node cluster. Once WireGuard telemetry confirms a direct
-path, the Agent removes that peer's proxy endpoint and promotes it to the
-verified direct endpoint.
+the rest of a 1,000-node cluster. The direct-shortcut policy field is reserved
+for future bilateral, control-plane-issued leases; its fresh-cluster default is
+zero.
 
 ACL-visible idle peers are represented by passive WireGuard peer entries with
 their overlay `/32` AllowedIP and host route, a loopback discard hold endpoint,

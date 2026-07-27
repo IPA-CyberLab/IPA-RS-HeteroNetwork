@@ -486,16 +486,18 @@ Compose uses `51823` for this listener because its peer probe uses `51822`. A
 primary route that does not return an acknowledgement within its bounded
 timeout is retried over the edge- or vertex-disjoint secondary route.
 Topology-epoch, replay, and hop validation failures are dropped rather than
-retried.
+retried. Multi-hop frame v2 uses 16-bit hop counters and permits up to 512
+intermediate relay nodes. Resolved non-neighbor paths are discarded after the
+cluster idle timeout and resolved again on later traffic.
 
-#### Dynamic block sizing and topology inspection
+#### Dynamic group fanout and topology inspection
 
-`ClusterPolicy.overlay_block_size` controls the maximum number of nodes in one
-deterministic topology block. Valid values are 2 through 64.
+`ClusterPolicy.overlay_block_size` controls the maximum leaf membership and
+child-group fanout in the recursive topology. Valid values are 4 through 64.
 `overlay_max_degree` remains independently restricted to 4 or 6. The policy
 endpoint replaces the complete `cluster_policy` object rather than applying a
 partial patch, so fetch and preserve the current policy when changing one
-field. For example, this changes the block size to 8:
+field. For example, this changes the group fanout to 8:
 
 ```bash
 CONTROL_PLANE=http://127.0.0.1:8443
@@ -514,7 +516,7 @@ curl -fsS \
 An accepted topology-policy change updates the content-derived
 `topology_epoch`. Agents converge without restart on subsequent signed
 neighbor-map and overlay-path refreshes. During rollout, inspect the active
-blocks, representative edges, node degrees, and graph statistics with:
+group hierarchy, representative edges, node degrees, and graph statistics with:
 
 ```bash
 curl -fsS \
@@ -523,15 +525,24 @@ curl -fsS \
   jq .
 ```
 
-The Web UI uses the same endpoint for its block graph and Mermaid export.
+The Web UI uses the same endpoint for its group hierarchy and nested Mermaid
+export.
 Confirm that `max_observed_degree` does not exceed `overlay_max_degree`, and
 allow at least one normal neighbor/path refresh interval before diagnosing a
 node as stale. Edge status is `connected` after fresh reachable reports from
 both endpoints, `partial` after one endpoint, `unreachable` after only fresh
 unreachable reports, `stale` when all reports exceed the path-state TTL, and
-`unknown` before either endpoint has reported that edge. A block is not a
+`unknown` before either endpoint has reported that edge. A group is not a
 security or ACL boundary; continue to express traffic authorization through
 cluster ACL rules.
+
+The hierarchy contains only nodes with a fresh healthy/degraded heartbeat.
+An unhealthy node or a heartbeat older than `relay_health_ttl_seconds` is
+removed from active membership and its representatives are reassigned; a fresh
+heartbeat adds it back with a new topology epoch. The degree shown here is the
+direct bounded-overlay degree. Client-to-gateway sessions are separate, and
+non-neighbor Kubernetes PodCIDR owners stay passive until traffic resolves a
+path through the hierarchy.
 
 The accepted policy is persisted under the cluster ID in the Control Plane
 store. Active-active replicas sharing the same SQLite database or PostgreSQL

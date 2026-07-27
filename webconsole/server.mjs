@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -44,8 +44,14 @@ createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/ui/app.js") {
       return sendFile(response, path.join(webuiDir, "app.js"), "text/javascript; charset=utf-8");
     }
+    if (request.method === "GET" && url.pathname === "/ui/theme.js") {
+      return sendFile(response, path.join(webuiDir, "theme.js"), "text/javascript; charset=utf-8");
+    }
     if (request.method === "GET" && url.pathname === "/ui/styles.css") {
       return sendFile(response, path.join(webuiDir, "styles.css"), "text/css; charset=utf-8");
+    }
+    if (request.method === "GET" && url.pathname === "/ui/fonts/noto-sans-jp-ui.ttf") {
+      return sendFile(response, path.join(webuiDir, "noto-sans-jp-ui.ttf"), "font/ttf");
     }
     if (url.pathname.startsWith("/v1/admin/")) return await handleAdmin(request, response, url.pathname);
     if (request.method === "GET" && (url.pathname === "/v1/metrics" || url.pathname === "/v1/policy")) {
@@ -197,13 +203,24 @@ function publicConfig() {
   };
 }
 
-function sendFile(response, filename, contentType) {
-  response.writeHead(200, {
-    "Content-Type": contentType,
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-  });
-  createReadStream(filename).pipe(response);
+async function sendFile(response, filename, contentType) {
+  try {
+    const contents = await readFile(filename);
+    response.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(contents);
+  } catch (error) {
+    if (response.destroyed) return;
+    if (response.headersSent) {
+      response.destroy(error);
+      return;
+    }
+    const status = error.code === "ENOENT" || error.code === "ENOTDIR" ? 404 : 500;
+    sendJson(response, { error: status === 404 ? "not found" : "internal server error" }, status);
+  }
 }
 
 function redirect(response, location) {

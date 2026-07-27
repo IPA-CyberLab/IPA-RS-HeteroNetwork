@@ -97,7 +97,7 @@
     "Registered nodes and their current health.": "登録済みノードと現在の状態を確認します。",
     "Lease-backed control and traversal services.": "リースで冗長化された制御・トラバーサルサービスです。",
     "Selected paths and operator controls.": "選択中の経路とオペレーター制御です。",
-    "Bounded peer blocks and forwarding links.": "制限付きピアブロックと転送リンクを確認します。",
+    "Recursive groups and forwarding links.": "再帰グループと転送リンクを確認します。",
     "Advertised networks and their owners.": "広報されたネットワークと所有ノードです。",
     "Runtime connectivity policy and rules.": "実行時の接続ポリシーとルールです。",
     "Issue a short-lived token and install a node with one command.": "短期トークンを発行し、1 コマンドでノードを追加します。",
@@ -336,65 +336,70 @@
     "Checking": "確認中",
     "Remove this manually added Web UI endpoint?": "手動追加した Web UI エンドポイントを削除しますか？",
     "Runtime overlay policy": "実行時オーバーレイポリシー",
-    "Block size": "ブロックサイズ",
-    "Nodes assigned to each bounded peer block.": "各制限付きピアブロックに割り当てるノード数です。",
+    "Group fanout": "グループファンアウト",
+    "Maximum children or nodes assigned to each group.": "各グループに割り当てる子グループまたはノードの上限です。",
     "Max peer degree": "最大ピア次数",
-    "Maximum bounded-overlay neighbors per node.": "各ノードが持つ制限付きオーバーレイ近傍の上限です。",
-    "Direct shortcuts": "直接ショートカット",
-    "Additional direct peer shortcuts per node.": "各ノードが持つ追加の直接ピアショートカット数です。",
+    "Maximum hierarchy neighbors per node.": "各ノードが持つ階層近傍の上限です。",
     "Save overlay settings": "オーバーレイ設定を保存",
     "Current": "適用中",
     "Unsaved changes": "未保存の変更",
     "Loading policy...": "ポリシーを読み込み中...",
     "Policy unavailable": "ポリシーを取得できません",
     "Loading overlay topology": "オーバーレイトポロジーを読み込み中",
-    "Loading block assignments and links.": "ブロック割り当てとリンクを読み込んでいます。",
+    "Loading group hierarchy and links.": "グループ階層とリンクを読み込んでいます。",
     "Overlay topology unavailable": "オーバーレイトポロジーを取得できません",
     "Retry": "再試行",
     "No overlay topology": "オーバーレイトポロジーはありません",
     "Nodes will appear after joining the cluster.": "ノードがクラスターに参加するとここに表示されます。",
     "Nodes": "ノード",
-    "Blocks": "ブロック",
+    "Groups": "グループ",
+    "Levels": "階層数",
     "Edges": "エッジ",
     "Max degree": "最大次数",
     "Diameter": "直径",
+    "Diameter estimate": "推定直径",
     "Epoch": "エポック",
     "Synthesized topology": "合成トポロジー",
     "Observed topology": "観測済みトポロジー",
-    "Block graph": "ブロックグラフ",
-    "Intra- and inter-block forwarding links": "ブロック内・ブロック間の転送リンク",
+    "Group hierarchy": "グループ階層",
+    "Parent-child hierarchy and forwarding links": "親子階層と転送リンク",
     "Zoom out": "縮小",
     "Reset zoom": "ズームをリセット",
     "Zoom in": "拡大",
     "Zoom": "ズーム",
     "Topology legend": "トポロジー凡例",
-    "Intra-block": "ブロック内",
-    "Inter-block": "ブロック間",
+    "Parent-child": "親子",
+    "Leaf links": "リーフ内リンク",
+    "Sibling links": "兄弟間リンク",
     "Partial": "一部接続",
     "Stale": "期限切れ",
     "Observed connections": "観測済み接続",
     "Path states": "経路状態",
     "Last observed": "最終観測",
     "Node health": "ノード状態",
-    "Primary representative": "第1代表",
-    "Secondary representative": "第2代表",
-    "Member": "メンバー",
-    "Block details": "ブロック詳細",
-    "Select block": "ブロックを選択",
-    "Members": "メンバー",
+    "Representative": "代表",
+    "No representatives": "代表なし",
     "Primary": "第1代表",
     "Secondary": "第2代表",
+    "Leaf": "リーフ",
+    "Member": "メンバー",
+    "Group details": "グループ詳細",
+    "Children": "子グループ",
+    "Members": "メンバー",
+    "Representatives": "代表",
     "Representative assignments": "代表割り当て",
-    "Cycle": "サイクル",
+    "Plane": "プレーン",
+    "Depth": "深さ",
     "Degree": "次数",
     "Algorithm": "アルゴリズム",
+    "Visible groups": "表示グループ",
     "Generated": "生成日時",
     "Mermaid source": "Mermaid ソース",
     "Copy Mermaid source": "Mermaid ソースをコピー",
     "Mermaid copied.": "Mermaid ソースをコピーしました。",
     "Overlay settings saved.": "オーバーレイ設定を保存しました。",
     "Saving overlay settings...": "オーバーレイ設定を保存しています...",
-    "Block size must be an integer between 2 and 64.": "ブロックサイズは 2 から 64 の整数で指定してください。",
+    "Group fanout must be an integer between 4 and 64.": "グループファンアウトは 4 から 64 の整数で指定してください。",
     "Max peer degree must be 4 or 6.": "最大ピア次数は 4 または 6 を指定してください。",
     "Direct shortcuts must be an integer between 0 and 64.": "直接ショートカット数は 0 から 64 の整数で指定してください。"
   };
@@ -429,8 +434,13 @@
       settings: null,
       dirty: false,
       saving: false,
-      selectedBlockId: null,
-      zoom: 1
+      selectedGroupId: null,
+      zoom: 1,
+      mermaidCache: {
+        epoch: null,
+        snapshot: null,
+        source: null
+      }
     },
     enrollment: {
       mode: "linux",
@@ -482,9 +492,16 @@
       [/^(\d+) rules$/, "$1 ルール"],
       [/^(\d+) results$/, "$1 件"],
       [/^(\d+) nodes$/, "$1 ノード"],
-      [/^Block (\d+)$/, "ブロック $1"],
-      [/^Block (\d+) \((\d+)\)$/, "ブロック $1 ($2)"],
-      [/^Block (\d+), (\d+) nodes$/, "ブロック $1、$2 ノード"],
+      [/^Depth (\d+) · Leaf$/, "深さ $1 · リーフ"],
+      [/^Depth (\d+) · (\d+) nodes$/, "深さ $1 · $2 ノード"],
+      [/^Depth (\d+) · (.+)$/, "深さ $1 · $2"],
+      [/^Depth (\d+), (\d+) nodes$/, "深さ $1、$2 ノード"],
+      [/^Depth (\d+)$/, "深さ $1"],
+      [/^Plane (\d+) · Primary$/, "プレーン $1 · 第1代表"],
+      [/^Plane (\d+) · Secondary$/, "プレーン $1 · 第2代表"],
+      [/^Plane (\d+)$/, "プレーン $1"],
+      [/^(.+) · No representatives$/, "$1 · 代表なし"],
+      [/^Showing (\d+) of (\d+) descendant nodes\.$/, "配下ノード $2 台中 $1 台を表示しています。"],
       [/^(\d+) seconds$/, "$1 秒"],
       [/^(\d+) stale$/, "期限切れ $1 件"],
       [/^Showing (\d+) of (\d+) devices and (\d+) of (\d+) paths\.$/, "デバイス $2 台中 $1 台、経路 $4 件中 $3 件を表示しています。"]
@@ -1121,7 +1138,7 @@
     $("nav-node-count").textContent = metrics.node_count == null ? "-" : metrics.node_count;
     $("nav-service-count").textContent = metrics.active_service_instance_count == null ? "-" : metrics.active_service_instance_count;
     $("nav-path-count").textContent = metrics.path_count == null ? "-" : metrics.path_count;
-    $("nav-block-count").textContent = state.topology.data ? normalizedOverlayTopology().blocks.length : "-";
+    $("nav-block-count").textContent = state.topology.data ? normalizedOverlayTopology().groups.length : "-";
     $("nav-rule-count").textContent = (state.overview.cluster_policy.acl_rules || []).length;
   }
 
@@ -1160,11 +1177,11 @@
     var maxDegree = integerSetting(source.overlay_max_degree, integerSetting(snapshot.max_degree, 4));
     if ([4, 6].indexOf(maxDegree) === -1) maxDegree = 4;
     return {
-      blockSize: integerSetting(source.overlay_block_size, integerSetting(snapshot.block_size, 4)),
+      fanout: integerSetting(source.overlay_block_size, integerSetting(snapshot.fanout, 4)),
       maxDegree: maxDegree,
       shortcutLimit: integerSetting(
         source.overlay_direct_shortcut_limit,
-        integerSetting(snapshot.direct_shortcut_limit, Math.min(4, maxDegree))
+        integerSetting(snapshot.direct_shortcut_limit, 0)
       )
     };
   }
@@ -1207,9 +1224,11 @@
     renderTopologyWhenActive();
     return api("/v1/admin/topology").then(function (topology) {
       state.topology.data = topology && typeof topology === "object" ? topology : {};
-      var blocks = Array.isArray(state.topology.data.blocks) ? state.topology.data.blocks : [];
-      if (!blocks.some(function (block) { return String(block.block_id) === String(state.topology.selectedBlockId); })) {
-        state.topology.selectedBlockId = blocks.length ? String(blocks[0].block_id) : null;
+      var groups = Array.isArray(state.topology.data.groups) ? state.topology.data.groups : [];
+      if (!groups.some(function (group) { return String(group.group_id) === String(state.topology.selectedGroupId); })) {
+        var rootGroupId = state.topology.data.root_group_id == null ? null : String(state.topology.data.root_group_id);
+        state.topology.selectedGroupId = groups.some(function (group) { return String(group.group_id) === rootGroupId; })
+          ? rootGroupId : (groups.length ? String(groups[0].group_id) : null);
       }
       updateNavigationCounts();
     }).catch(function (error) {
@@ -1266,9 +1285,18 @@
       if (!entry || entry.node_id == null) return;
       var node = Object.assign({}, entry, {
         node_id: String(entry.node_id),
-        block_id: entry.block_id == null ? "" : String(entry.block_id),
+        leaf_group_id: entry.leaf_group_id == null ? "" : String(entry.leaf_group_id),
+        ancestry: (Array.isArray(entry.ancestry) ? entry.ancestry : []).map(String),
         tags: Array.isArray(entry.tags) ? entry.tags : [],
-        representative_kinds: Array.isArray(entry.representative_kinds) ? entry.representative_kinds : [],
+        representative_for: (Array.isArray(entry.representative_for) ? entry.representative_for : []).filter(function (assignment) {
+          return assignment && assignment.group_id != null;
+        }).map(function (assignment) {
+          return {
+            group_id: String(assignment.group_id),
+            depth: integerSetting(assignment.depth, 0),
+            plane: integerSetting(assignment.plane, 0)
+          };
+        }),
         health_state: entry.health_state == null ? null : String(entry.health_state).toLowerCase(),
         last_seen_at: entry.last_seen_at == null ? null : entry.last_seen_at
       });
@@ -1277,153 +1305,123 @@
       nodeById[node.node_id] = node;
     });
 
-    var blocks = [];
-    var blockById = {};
-    function ensureBlock(blockId, source) {
-      var id = String(blockId || "unassigned");
-      if (blockById[id]) return blockById[id];
-      var input = source || {};
-      var representatives = (Array.isArray(input.representatives) ? input.representatives : []).filter(function (entry) {
-        return entry && entry.node_id != null;
-      }).map(function (entry) {
-        return {
-          node_id: String(entry.node_id),
-          cycle_index: integerSetting(entry.cycle_index, 0),
-          kind: String(entry.kind || "")
-        };
-      });
-      var primary = input.primary_representative == null ? null : String(input.primary_representative);
-      var secondary = input.secondary_representative == null ? null : String(input.secondary_representative);
-      if (representatives.length) {
-        var primaryEntry = representatives.find(function (entry) {
-          return entry.cycle_index === 0 || entry.kind.toLowerCase().indexOf("primary") !== -1;
-        });
-        if (primaryEntry) primary = primaryEntry.node_id;
-        var secondaryEntry = representatives.find(function (entry) {
-          return (entry.cycle_index > 0 || entry.kind.toLowerCase().indexOf("secondary") !== -1)
-            && entry.node_id !== primary;
-        }) || representatives.find(function (entry) {
-          return entry.cycle_index > 0 || entry.kind.toLowerCase().indexOf("secondary") !== -1;
-        });
-        if (secondaryEntry) secondary = secondaryEntry.node_id;
-      }
-      var block = {
-        block_id: id,
-        node_ids: [],
-        primary_representative: primary,
-        secondary_representative: secondary,
-        representatives: representatives,
-        nodeSet: {}
-      };
-      blocks.push(block);
-      blockById[id] = block;
-      return block;
-    }
-
-    (Array.isArray(snapshot.blocks) ? snapshot.blocks : []).forEach(function (entry, index) {
-      if (!entry) return;
-      var id = entry.block_id == null ? "block-" + String(index + 1) : String(entry.block_id);
-      var block = ensureBlock(id, entry);
-      (Array.isArray(entry.node_ids) ? entry.node_ids : []).forEach(function (nodeId) {
-        var normalizedId = String(nodeId);
-        if (!block.nodeSet[normalizedId]) {
-          block.nodeSet[normalizedId] = true;
-          block.node_ids.push(normalizedId);
-        }
-        if (!nodeById[normalizedId]) {
-          var placeholder = {
-            node_id: normalizedId,
-            vpn_ip: "",
-            role: "",
-            tags: [],
-            block_id: id,
-            degree: null,
-            representative_kinds: []
+    var groups = [];
+    var groupById = {};
+    (Array.isArray(snapshot.groups) ? snapshot.groups : []).forEach(function (entry) {
+      if (!entry || entry.group_id == null) return;
+      var groupId = String(entry.group_id);
+      if (groupById[groupId]) return;
+      var group = {
+        group_id: groupId,
+        depth: integerSetting(entry.depth, 0),
+        parent_group_id: entry.parent_group_id == null ? null : String(entry.parent_group_id),
+        child_group_ids: (Array.isArray(entry.child_group_ids) ? entry.child_group_ids : []).map(String),
+        node_ids: (Array.isArray(entry.node_ids) ? entry.node_ids : []).map(String),
+        leaf: Boolean(entry.leaf),
+        representatives: (Array.isArray(entry.representatives) ? entry.representatives : []).filter(function (representative) {
+          return representative && representative.node_id != null;
+        }).map(function (representative) {
+          return {
+            node_id: String(representative.node_id),
+            plane: integerSetting(representative.plane, 0),
+            role: String(representative.role || "")
           };
-          nodes.push(placeholder);
-          nodeById[normalizedId] = placeholder;
-        } else if (!nodeById[normalizedId].block_id) {
-          nodeById[normalizedId].block_id = id;
-        }
+        })
+      };
+      groups.push(group);
+      groupById[groupId] = group;
+    });
+    groups.sort(function (left, right) {
+      return left.depth - right.depth || left.group_id.localeCompare(right.group_id);
+    });
+
+    groups.forEach(function (group) {
+      group.child_group_ids = group.child_group_ids.filter(function (childId, index, values) {
+        return childId !== group.group_id && Boolean(groupById[childId]) && values.indexOf(childId) === index;
       });
+    });
+    groups.forEach(function (group) {
+      if (!group.parent_group_id || !groupById[group.parent_group_id]) return;
+      var parent = groupById[group.parent_group_id];
+      if (parent.child_group_ids.indexOf(group.group_id) === -1) parent.child_group_ids.push(group.group_id);
     });
 
     nodes.forEach(function (node) {
-      var blockId = node.block_id || (blocks.length === 1 ? blocks[0].block_id : "unassigned");
-      var block = ensureBlock(blockId);
-      node.block_id = block.block_id;
-      if (!block.nodeSet[node.node_id]) {
-        block.nodeSet[node.node_id] = true;
-        block.node_ids.push(node.node_id);
+      node.ancestry = node.ancestry.filter(function (groupId) { return Boolean(groupById[groupId]); });
+      if (!node.ancestry.length && node.leaf_group_id && groupById[node.leaf_group_id]) {
+        var cursor = groupById[node.leaf_group_id];
+        var ancestry = [];
+        var seen = {};
+        while (cursor && !seen[cursor.group_id]) {
+          seen[cursor.group_id] = true;
+          ancestry.unshift(cursor.group_id);
+          cursor = cursor.parent_group_id ? groupById[cursor.parent_group_id] : null;
+        }
+        node.ancestry = ancestry;
       }
     });
-    blocks.forEach(function (block) { delete block.nodeSet; });
 
     var edges = (Array.isArray(snapshot.edges) ? snapshot.edges : []).filter(function (edge) {
       return edge && edge.source != null && edge.target != null;
     }).map(function (edge) {
-      var source = String(edge.source);
-      var target = String(edge.target);
-      var sourceNode = nodeById[source] || {};
-      var targetNode = nodeById[target] || {};
-      var pathStates = (Array.isArray(edge.path_states) ? edge.path_states : []).map(function (pathState) {
-        return String(pathState);
-      });
-      var hasObservation = edge.observed_status != null || pathStates.length > 0 || edge.last_observed_at != null;
-      return Object.assign({}, edge, {
-        source: source,
-        target: target,
-        kind: String(edge.kind || ""),
-        source_block_id: edge.source_block_id == null ? String(sourceNode.block_id || "") : String(edge.source_block_id),
-        target_block_id: edge.target_block_id == null ? String(targetNode.block_id || "") : String(edge.target_block_id),
-        observed_status: hasObservation ? normalizedObservedStatus(edge.observed_status) : null,
+      var pathStates = (Array.isArray(edge.path_states) ? edge.path_states : []).map(String);
+      var observedStatus = normalizedObservedStatus(edge.observed_status);
+      var hasObservation = observedStatus !== "unknown"
+        || pathStates.length > 0
+        || edge.last_observed_at != null;
+      return {
+        source: String(edge.source),
+        target: String(edge.target),
+        placements: (Array.isArray(edge.placements) ? edge.placements : []).filter(function (placement) {
+          return placement && placement.group_id != null;
+        }).map(function (placement) {
+          var kind = String(placement.kind || "");
+          return {
+            group_id: String(placement.group_id),
+            depth: integerSetting(placement.depth, 0),
+            plane: integerSetting(placement.plane, 0),
+            kind: kind === "sibling_cycle" ? "sibling_cycle" : "leaf_cycle"
+          };
+        }),
+        observed_status: hasObservation ? observedStatus : null,
         path_states: pathStates,
         last_observed_at: edge.last_observed_at == null ? null : edge.last_observed_at,
         has_observation: hasObservation
-      });
+      };
     });
+
+    var rootGroupId = snapshot.root_group_id == null ? null : String(snapshot.root_group_id);
+    if (!rootGroupId || !groupById[rootGroupId]) {
+      var root = groups.find(function (group) { return group.parent_group_id == null; });
+      rootGroupId = root ? root.group_id : (groups.length ? groups[0].group_id : null);
+    }
     return {
       snapshot: snapshot,
       nodes: nodes,
       nodeById: nodeById,
-      blocks: blocks,
-      blockById: blockById,
+      groups: groups,
+      groupById: groupById,
+      rootGroupId: rootGroupId,
       edges: edges
     };
   }
 
-  function overlayRepresentativeKinds(node, block) {
-    var blockRepresentatives = Array.isArray(block.representatives) ? block.representatives : [];
-    if (blockRepresentatives.length) {
-      var matchingRepresentatives = blockRepresentatives.filter(function (representative) {
-        return node && representative.node_id === node.node_id;
-      });
-      return {
-        primary: matchingRepresentatives.some(function (representative) {
-          return representative.cycle_index === 0 || representative.kind.toLowerCase().indexOf("primary") !== -1;
-        }),
-        secondary: matchingRepresentatives.some(function (representative) {
-          return representative.cycle_index > 0 || representative.kind.toLowerCase().indexOf("secondary") !== -1;
-        })
-      };
-    }
-    var kinds = (node && node.representative_kinds || []).map(function (kind) {
-      return String(kind).toLowerCase();
+  function representativeAssignments(node, group) {
+    if (!node || !group) return [];
+    var assignments = (node.representative_for || []).filter(function (assignment) {
+      return assignment.group_id === group.group_id;
     });
-    var nodeId = node && node.node_id;
-    return {
-      primary: Boolean(nodeId && (nodeId === block.primary_representative || kinds.some(function (kind) { return kind.indexOf("primary") !== -1; }))),
-      secondary: Boolean(nodeId && (nodeId === block.secondary_representative || kinds.some(function (kind) { return kind.indexOf("secondary") !== -1; })))
-    };
+    if (assignments.length) return assignments;
+    return group.representatives.filter(function (representative) {
+      return representative.node_id === node.node_id;
+    }).map(function (representative) {
+      return { group_id: group.group_id, depth: group.depth, plane: representative.plane };
+    });
   }
 
-  function overlayEdgeType(edge) {
-    var kind = String(edge.kind || "").toLowerCase();
-    if (edge.source_block_id && edge.target_block_id && edge.source_block_id === edge.target_block_id) return "intra";
-    if (kind.indexOf("intra") !== -1) return "intra";
-    if (kind.indexOf("secondary") !== -1 || kind.indexOf("failover") !== -1) return "secondary";
-    if (kind.indexOf("shortcut") !== -1) return "shortcut";
-    return "primary";
+  function edgePlacementType(placement) {
+    if (placement && placement.kind === "leaf_cycle") return "intra";
+    return placement && placement.plane > 0 ? "secondary" : "primary";
   }
 
   function normalizedObservedStatus(value) {
@@ -1439,174 +1437,268 @@
       .replace(/[\r\n]+/g, " ");
   }
 
-  function generateTopologyMermaid(model) {
-    var lines = ["flowchart LR"];
-    var aliases = {};
-    var primaryAliases = [];
-    var secondaryAliases = [];
-    var dualAliases = [];
-    var nodeIndex = 0;
-    model.blocks.forEach(function (block, blockIndex) {
-      lines.push('  subgraph block_' + blockIndex + '["Block ' + (blockIndex + 1) + " - " + mermaidLabel(shortId(block.block_id)) + '"]');
-      lines.push("    direction TB");
-      block.node_ids.forEach(function (nodeId) {
-        var node = model.nodeById[nodeId] || { node_id: nodeId };
-        var alias = "node_" + nodeIndex;
-        var representatives = overlayRepresentativeKinds(node, block);
-        var label = mermaidLabel(shortId(node.node_id) + (node.vpn_ip ? " / " + node.vpn_ip : ""));
-        aliases[node.node_id] = alias;
-        lines.push('    ' + alias + '["' + label + '"]');
-        if (representatives.primary && representatives.secondary) dualAliases.push(alias);
-        else if (representatives.primary) primaryAliases.push(alias);
-        else if (representatives.secondary) secondaryAliases.push(alias);
-        nodeIndex += 1;
-      });
-      lines.push("  end");
-    });
+  function groupForNodeBelow(model, parentGroupId, nodeId) {
+    var node = model.nodeById[nodeId];
+    if (!node) return parentGroupId;
+    var index = node.ancestry.indexOf(parentGroupId);
+    if (index >= 0 && index + 1 < node.ancestry.length) return node.ancestry[index + 1];
+    return node.leaf_group_id || parentGroupId;
+  }
 
-    var seenEdges = {};
+  function aggregateTopologyEdges(model) {
+    var aggregated = {};
+    var statusRank = { unknown: 0, connected: 1, stale: 2, partial: 3, unreachable: 4 };
     model.edges.forEach(function (edge) {
-      var sourceAlias = aliases[edge.source];
-      var targetAlias = aliases[edge.target];
-      if (!sourceAlias || !targetAlias || sourceAlias === targetAlias) return;
-      var type = overlayEdgeType(edge);
-      var pair = [sourceAlias, targetAlias].sort().join("|") + "|" + type;
-      if (seenEdges[pair]) return;
-      seenEdges[pair] = true;
-      lines.push("  " + sourceAlias + (type === "intra" ? " --- " : " -.- ") + targetAlias);
+      var placements = edge.placements.length ? edge.placements : [{
+        group_id: model.rootGroupId,
+        depth: 0,
+        plane: 0,
+        kind: "sibling_cycle"
+      }];
+      placements.forEach(function (placement) {
+        if (!model.groupById[placement.group_id]) return;
+        var sourceGroup = placement.kind === "leaf_cycle"
+          ? placement.group_id : groupForNodeBelow(model, placement.group_id, edge.source);
+        var targetGroup = placement.kind === "leaf_cycle"
+          ? placement.group_id : groupForNodeBelow(model, placement.group_id, edge.target);
+        if (!model.groupById[sourceGroup] || !model.groupById[targetGroup]) return;
+        var type = edgePlacementType(placement);
+        var pair = [sourceGroup, targetGroup].sort();
+        var key = pair.join("|") + "|" + placement.group_id + "|" + placement.plane + "|" + placement.kind;
+        if (!aggregated[key]) {
+          aggregated[key] = {
+            source_group_id: pair[0],
+            target_group_id: pair[1],
+            placement_group_id: placement.group_id,
+            depth: placement.depth,
+            plane: placement.plane,
+            kind: placement.kind,
+            type: type,
+            count: 0,
+            observed_status: null,
+            last_observed_at: null,
+            path_states: []
+          };
+        }
+        var aggregate = aggregated[key];
+        aggregate.count += 1;
+        if (edge.has_observation && (!aggregate.observed_status
+          || statusRank[edge.observed_status] > statusRank[aggregate.observed_status])) {
+          aggregate.observed_status = edge.observed_status;
+        }
+        if (edge.last_observed_at && (!aggregate.last_observed_at
+          || String(edge.last_observed_at) > String(aggregate.last_observed_at))) {
+          aggregate.last_observed_at = edge.last_observed_at;
+        }
+        edge.path_states.forEach(function (pathState) {
+          if (aggregate.path_states.indexOf(pathState) === -1) aggregate.path_states.push(pathState);
+        });
+      });
     });
-    lines.push("  classDef primary fill:#97144d,stroke:#690e35,color:#fff");
-    lines.push("  classDef secondary fill:#0f766e,stroke:#115e59,color:#fff");
-    lines.push("  classDef dual fill:#97144d,stroke:#0f766e,stroke-width:4px,color:#fff");
-    if (primaryAliases.length) lines.push("  class " + primaryAliases.join(",") + " primary");
-    if (secondaryAliases.length) lines.push("  class " + secondaryAliases.join(",") + " secondary");
-    if (dualAliases.length) lines.push("  class " + dualAliases.join(",") + " dual");
+    return Object.keys(aggregated).map(function (key) { return aggregated[key]; });
+  }
+
+  function generateTopologyMermaid(model) {
+    var lines = ["flowchart TB"];
+    var aliases = {};
+    model.groups.forEach(function (group, index) { aliases[group.group_id] = "group_" + index; });
+
+    function appendGroup(groupId, indent) {
+      var group = model.groupById[groupId];
+      if (!group) return;
+      var alias = aliases[groupId];
+      var representatives = group.representatives.map(function (representative) {
+        return shortId(representative.node_id) + " p" + representative.plane;
+      }).join(", ");
+      lines.push(indent + 'subgraph sg_' + alias + '["Depth ' + group.depth + " · " + mermaidLabel(shortId(group.group_id)) + '"]');
+      lines.push(indent + "  direction TB");
+      lines.push(indent + "  " + alias + '["' + group.node_ids.length + " nodes"
+        + (representatives ? " · reps " + mermaidLabel(representatives) : "") + '"]');
+      group.child_group_ids.forEach(function (childId) { appendGroup(childId, indent + "  "); });
+      lines.push(indent + "end");
+    }
+
+    if (model.rootGroupId) appendGroup(model.rootGroupId, "  ");
+    model.groups.filter(function (group) {
+      return group.group_id !== model.rootGroupId
+        && (!group.parent_group_id || !model.groupById[group.parent_group_id]);
+    }).forEach(function (group) { appendGroup(group.group_id, "  "); });
+
+    var seenHierarchy = {};
+    model.groups.forEach(function (group) {
+      group.child_group_ids.forEach(function (childId) {
+        if (!aliases[group.group_id] || !aliases[childId]) return;
+        var key = group.group_id + "|" + childId;
+        if (seenHierarchy[key]) return;
+        seenHierarchy[key] = true;
+        lines.push("  " + aliases[group.group_id] + " --> " + aliases[childId]);
+      });
+    });
+    aggregateTopologyEdges(model).forEach(function (edge) {
+      if (edge.source_group_id === edge.target_group_id) return;
+      var source = aliases[edge.source_group_id];
+      var target = aliases[edge.target_group_id];
+      if (!source || !target) return;
+      var label = (edge.kind === "leaf_cycle" ? "leaf" : "sibling") + " p" + edge.plane + " ×" + edge.count;
+      lines.push("  " + source + (edge.type === "intra" ? " ---|" : " -.-|") + label + "| " + target);
+    });
+    lines.push("  classDef group fill:#ffffff,stroke:#528c88,color:#1f2937");
+    if (Object.keys(aliases).length) lines.push("  class " + Object.keys(aliases).map(function (id) {
+      return aliases[id];
+    }).join(",") + " group");
     return lines.join("\n");
   }
 
-  function buildOverlayGraph(model) {
-    var blocks = model.blocks;
-    var maxVisibleNodes = 64;
-    var maxNodes = blocks.reduce(function (maximum, block) {
-      return Math.max(maximum, Math.min(maxVisibleNodes, block.node_ids.length));
-    }, 1);
-    var nodeColumns = Math.max(2, Math.min(8, Math.ceil(Math.sqrt(maxNodes))));
-    var nodeRows = Math.max(1, Math.ceil(maxNodes / nodeColumns));
-    var blockWidth = Math.max(220, nodeColumns * 28 + 48);
-    var blockHeight = 112 + nodeRows * 28;
-    var gapX = 96;
-    var gapY = 74;
-    var columnCount = Math.max(1, Math.min(10, Math.ceil(Math.sqrt(blocks.length * 1.5))));
-    var rowCount = Math.max(1, Math.ceil(blocks.length / columnCount));
-    var contentWidth = columnCount * blockWidth + Math.max(0, columnCount - 1) * gapX;
-    var contentHeight = rowCount * blockHeight + Math.max(0, rowCount - 1) * gapY;
-    var canvasWidth = Math.max(760, contentWidth + 80);
-    var canvasHeight = Math.max(360, contentHeight + 80);
-    var originX = Math.max(40, (canvasWidth - contentWidth) / 2);
-    var originY = 40;
-    var positions = {};
-    var blockPositions = {};
+  function cachedTopologyMermaid(model) {
+    var cache = state.topology.mermaidCache;
+    var epoch = model.snapshot.topology_epoch == null
+      ? null
+      : String(model.snapshot.topology_epoch);
+    var cacheHit = cache.source != null
+      && (epoch == null ? cache.snapshot === model.snapshot : cache.epoch === epoch);
+    if (!cacheHit) {
+      cache.epoch = epoch;
+      cache.snapshot = model.snapshot;
+      cache.source = generateTopologyMermaid(model);
+    }
+    return cache.source;
+  }
 
-    blocks.forEach(function (block, index) {
-      var column = index % columnCount;
-      var row = Math.floor(index / columnCount);
-      var x = originX + column * (blockWidth + gapX);
-      var y = originY + row * (blockHeight + gapY);
-      blockPositions[block.block_id] = {
-        x: x,
-        y: y,
-        width: blockWidth,
-        height: blockHeight,
-        centerX: x + blockWidth / 2,
-        centerY: y + blockHeight / 2
-      };
-      block.node_ids.slice(0, maxVisibleNodes).forEach(function (nodeId, nodeOffset) {
-        var nodeColumn = nodeOffset % nodeColumns;
-        var nodeRow = Math.floor(nodeOffset / nodeColumns);
-        var usableWidth = blockWidth - 56;
-        positions[nodeId] = {
-          x: x + 28 + (nodeColumns === 1 ? usableWidth / 2 : nodeColumn * usableWidth / (nodeColumns - 1)),
-          y: y + 92 + nodeRow * 28
+  function contextualTopologyGroups(model) {
+    if (!model.groups.length) return [];
+    var selected = model.groupById[String(state.topology.selectedGroupId)]
+      || model.groupById[model.rootGroupId] || model.groups[0];
+    var visible = {};
+    function include(group) {
+      if (group) visible[group.group_id] = true;
+    }
+    include(selected);
+    selected.child_group_ids.forEach(function (childId) { include(model.groupById[childId]); });
+
+    var cursor = selected;
+    var visited = {};
+    while (cursor && !visited[cursor.group_id]) {
+      visited[cursor.group_id] = true;
+      include(cursor);
+      var parent = cursor.parent_group_id ? model.groupById[cursor.parent_group_id] : null;
+      if (parent) {
+        include(parent);
+        parent.child_group_ids.forEach(function (childId) { include(model.groupById[childId]); });
+      }
+      cursor = parent;
+    }
+    return model.groups.filter(function (group) { return Boolean(visible[group.group_id]); });
+  }
+
+  function buildOverlayGraph(model, graphGroups) {
+    var depthGroups = {};
+    graphGroups.forEach(function (group) {
+      if (!depthGroups[group.depth]) depthGroups[group.depth] = [];
+      depthGroups[group.depth].push(group);
+    });
+    var depths = Object.keys(depthGroups).map(Number).sort(function (left, right) { return left - right; });
+    var groupWidth = 184;
+    var groupHeight = 78;
+    var horizontalGap = 34;
+    var bandHeight = 138;
+    var largestDepth = depths.reduce(function (maximum, depth) {
+      return Math.max(maximum, depthGroups[depth].length);
+    }, 1);
+    var canvasWidth = Math.max(760, largestDepth * (groupWidth + horizontalGap) + 80);
+    var canvasHeight = Math.max(360, depths.length * bandHeight + 70);
+    var positions = {};
+
+    depths.forEach(function (depth, depthIndex) {
+      var entries = depthGroups[depth];
+      var rowWidth = entries.length * groupWidth + Math.max(0, entries.length - 1) * horizontalGap;
+      var startX = (canvasWidth - rowWidth) / 2;
+      entries.forEach(function (group, index) {
+        positions[group.group_id] = {
+          x: startX + index * (groupWidth + horizontalGap),
+          y: 46 + depthIndex * bandHeight,
+          centerX: startX + index * (groupWidth + horizontalGap) + groupWidth / 2,
+          centerY: 46 + depthIndex * bandHeight + groupHeight / 2
         };
       });
     });
 
-    function edgeEndpoint(nodeId, blockId) {
-      if (positions[nodeId]) return positions[nodeId];
-      var blockPosition = blockPositions[blockId];
-      return blockPosition ? { x: blockPosition.centerX, y: blockPosition.centerY } : null;
-    }
-
-    var seenEdges = {};
-    var edgeMarkup = model.edges.map(function (edge) {
-      var type = overlayEdgeType(edge);
-      var edgeKey = [edge.source, edge.target].sort().join("|") + "|" + type;
-      if (seenEdges[edgeKey]) return "";
-      seenEdges[edgeKey] = true;
-      var source = edgeEndpoint(edge.source, edge.source_block_id);
-      var target = edgeEndpoint(edge.target, edge.target_block_id);
-      if (!source || !target || (source.x === target.x && source.y === target.y)) return "";
-      var cycleIndexes = Array.isArray(edge.cycle_indexes) && edge.cycle_indexes.length
-        ? edge.cycle_indexes : edge.cycle_index == null ? [] : [edge.cycle_index];
-      var label = edge.source + " - " + edge.target + (edge.kind ? " (" + edge.kind + ")" : "")
-        + (cycleIndexes.length ? " - cycles " + cycleIndexes.join(", ") : "")
-        + (edge.has_observation ? " - " + pretty(edge.observed_status) : "")
-        + (edge.path_states.length ? " - paths " + edge.path_states.map(pretty).join(", ") : "")
-        + (edge.last_observed_at ? " - observed " + formatTime(edge.last_observed_at) : "");
-      var observationClass = edge.has_observation ? " overlay-svg-edge-observed-" + edge.observed_status : "";
-      return '<line class="overlay-svg-edge overlay-svg-edge-' + type + observationClass + '" x1="' + source.x + '" y1="' + source.y
-        + '" x2="' + target.x + '" y2="' + target.y + '" vector-effect="non-scaling-stroke"><title>'
-        + escapeHtml(label) + "</title></line>";
+    var bandMarkup = depths.map(function (depth, index) {
+      return '<g class="overlay-svg-depth-band"><line x1="20" y1="' + (28 + index * bandHeight)
+        + '" x2="' + (canvasWidth - 20) + '" y2="' + (28 + index * bandHeight)
+        + '"></line><text x="28" y="' + (22 + index * bandHeight) + '">Depth ' + depth + "</text></g>";
+    }).join("");
+    var hierarchyMarkup = graphGroups.map(function (group) {
+      if (!group.parent_group_id || !positions[group.parent_group_id] || !positions[group.group_id]) return "";
+      var parent = positions[group.parent_group_id];
+      var child = positions[group.group_id];
+      return '<line class="overlay-svg-hierarchy-edge" x1="' + parent.centerX + '" y1="' + (parent.y + groupHeight)
+        + '" x2="' + child.centerX + '" y2="' + child.y + '" vector-effect="non-scaling-stroke"></line>';
     }).join("");
 
-    var selectedBlockId = String(state.topology.selectedBlockId || "");
-    var blockSurfaceMarkup = blocks.map(function (block, blockIndex) {
-      var position = blockPositions[block.block_id];
-      var selectedClass = block.block_id === selectedBlockId ? " selected" : "";
-      return '<g class="overlay-svg-block' + selectedClass + '" data-topology-block="' + escapeHtml(block.block_id)
-        + '" role="button" tabindex="0" aria-label="Block ' + (blockIndex + 1) + ', ' + block.node_ids.length + ' nodes">'
-        + '<rect class="overlay-svg-block-surface" x="' + position.x + '" y="' + position.y + '" width="' + blockWidth
-        + '" height="' + blockHeight + '" rx="6"></rect></g>';
+    var internalLinks = {};
+    var statusRank = { unknown: 0, connected: 1, stale: 2, partial: 3, unreachable: 4 };
+    var edgeMarkup = aggregateTopologyEdges(model).map(function (edge) {
+      if (edge.source_group_id === edge.target_group_id) {
+        if (!internalLinks[edge.source_group_id]) {
+          internalLinks[edge.source_group_id] = { count: 0, observed_status: null };
+        }
+        var internal = internalLinks[edge.source_group_id];
+        internal.count += edge.count;
+        if (edge.observed_status && (!internal.observed_status
+          || statusRank[edge.observed_status] > statusRank[internal.observed_status])) {
+          internal.observed_status = edge.observed_status;
+        }
+        return "";
+      }
+      var source = positions[edge.source_group_id];
+      var target = positions[edge.target_group_id];
+      if (!source || !target) return "";
+      var observationClass = edge.observed_status ? " overlay-svg-edge-observed-" + edge.observed_status : "";
+      var label = (edge.kind === "leaf_cycle" ? "leaf links" : "sibling links") + " · plane " + edge.plane
+        + " · " + edge.count + " links" + (edge.observed_status ? " · " + pretty(edge.observed_status) : "")
+        + (edge.path_states.length ? " · " + edge.path_states.map(pretty).join(", ") : "")
+        + (edge.last_observed_at ? " · " + formatTime(edge.last_observed_at) : "");
+      return '<line class="overlay-svg-edge overlay-svg-edge-' + edge.type + observationClass + '" x1="' + source.centerX
+        + '" y1="' + source.centerY + '" x2="' + target.centerX + '" y2="' + target.centerY
+        + '" vector-effect="non-scaling-stroke"><title>' + escapeHtml(label) + "</title></line>";
     }).join("");
-    var blockMarkup = blocks.map(function (block, blockIndex) {
-      var position = blockPositions[block.block_id];
-      var nodeMarkup = block.node_ids.slice(0, maxVisibleNodes).map(function (nodeId, nodeOffset) {
-        var node = model.nodeById[nodeId] || { node_id: nodeId, representative_kinds: [] };
-        var point = positions[nodeId];
-        var representatives = overlayRepresentativeKinds(node, block);
-        var nodeClass = (representatives.primary ? " primary" : "") + (representatives.secondary ? " secondary" : "");
-        var healthClass = node.health_state ? " health-" + statusClass(node.health_state) : "";
-        var healthRing = node.health_state
-          ? '<circle class="overlay-svg-health-ring ' + statusClass(node.health_state) + '" cx="' + point.x + '" cy="' + point.y + '" r="11"></circle>'
-          : "";
-        var shape = representatives.secondary && !representatives.primary
-          ? '<rect x="' + (point.x - 7) + '" y="' + (point.y - 7) + '" width="14" height="14" rx="3"></rect>'
-          : '<circle cx="' + point.x + '" cy="' + point.y + '" r="' + (representatives.primary ? 8 : 6) + '"></circle>';
-        var indexLabel = block.node_ids.length <= 12
-          ? '<text class="overlay-svg-node-index" x="' + point.x + '" y="' + (point.y + 3) + '">' + (nodeOffset + 1) + "</text>" : "";
-        var nodeLabel = node.node_id + (node.vpn_ip ? " - " + node.vpn_ip : "") + (node.degree == null ? "" : " - degree " + node.degree)
-          + (node.health_state ? " - " + pretty(node.health_state) : "")
-          + (node.last_seen_at ? " - last seen " + formatTime(node.last_seen_at) : "");
-        return '<g class="overlay-svg-node' + nodeClass + healthClass + '" data-node-id="' + escapeHtml(node.node_id)
-          + '" role="button" tabindex="0" aria-label="' + escapeHtml(nodeLabel) + '"><title>' + escapeHtml(nodeLabel)
-          + "</title>" + healthRing + shape + indexLabel + "</g>";
-      }).join("");
-      var overflow = block.node_ids.length > maxVisibleNodes
-        ? '<text class="overlay-svg-overflow" x="' + (position.x + blockWidth - 18) + '" y="' + (position.y + blockHeight - 14)
-          + '" text-anchor="end">+' + (block.node_ids.length - maxVisibleNodes) + "</text>" : "";
-      return '<g class="overlay-svg-block-content"><text class="overlay-svg-block-title" x="' + (position.x + 18)
-        + '" y="' + (position.y + 27) + '">Block ' + (blockIndex + 1) + '</text><text class="overlay-svg-block-id" x="'
-        + (position.x + 18) + '" y="' + (position.y + 47) + '">' + escapeHtml(shortId(block.block_id))
-        + '</text><text class="overlay-svg-block-count" x="' + (position.x + blockWidth - 18) + '" y="' + (position.y + 28)
-        + '" text-anchor="end">' + block.node_ids.length + " nodes</text>" + nodeMarkup + overflow + "</g>";
+
+    var selectedGroupId = String(state.topology.selectedGroupId || "");
+    var groupMarkup = graphGroups.map(function (group) {
+      var position = positions[group.group_id];
+      if (!position) return "";
+      var selectedClass = group.group_id === selectedGroupId ? " selected" : "";
+      var representatives = group.representatives.slice().sort(function (left, right) { return left.plane - right.plane; });
+      var repLabel = representatives.length
+        ? representatives.map(function (representative) { return "p" + representative.plane + " " + shortId(representative.node_id); }).join(" · ")
+        : "No representatives";
+      var nodeHealth = group.node_ids.map(function (nodeId) { return model.nodeById[nodeId]; }).filter(Boolean);
+      var unhealthy = nodeHealth.some(function (node) {
+        return node.health_state && ["healthy", "direct"].indexOf(node.health_state) === -1;
+      });
+      var internal = internalLinks[group.group_id] || { count: 0, observed_status: null };
+      var observationClass = internal.observed_status ? " observed-" + internal.observed_status : "";
+      return '<g class="overlay-svg-group' + selectedClass + (unhealthy ? " degraded" : "") + observationClass + '" data-topology-group="'
+        + escapeHtml(group.group_id) + '" role="button" tabindex="0" aria-label="Depth ' + group.depth + ", "
+        + group.node_ids.length + ' nodes"><title>' + escapeHtml(group.group_id + " · " + repLabel) + '</title><rect x="'
+        + position.x + '" y="' + position.y + '" width="' + groupWidth + '" height="' + groupHeight
+        + '" rx="6"></rect><text class="overlay-svg-group-title" x="' + (position.x + 14) + '" y="' + (position.y + 23)
+        + '">Depth ' + group.depth + (group.leaf ? " · Leaf" : "") + '</text><text class="overlay-svg-group-id" x="'
+        + (position.x + 14) + '" y="' + (position.y + 42) + '">' + escapeHtml(shortId(group.group_id))
+        + '</text><text class="overlay-svg-group-count" x="' + (position.x + groupWidth - 14) + '" y="' + (position.y + 23)
+        + '" text-anchor="end">' + group.node_ids.length + ' nodes</text><text class="overlay-svg-group-reps" x="'
+        + (position.x + 14) + '" y="' + (position.y + 62) + '">' + escapeHtml(repLabel)
+        + (internal.count ? " · " + internal.count + " local links"
+          + (internal.observed_status ? " " + pretty(internal.observed_status) : "") : "") + "</text></g>";
     }).join("");
 
     var scaledWidth = Math.round(canvasWidth * state.topology.zoom);
     return '<svg class="overlay-topology-svg" width="' + canvasWidth + '" height="' + canvasHeight + '" viewBox="0 0 '
-      + canvasWidth + " " + canvasHeight + '" data-base-width="' + canvasWidth + '" style="width:'
-      + scaledWidth + 'px" role="img" aria-labelledby="overlay-graph-title"><title id="overlay-graph-title">'
-      + t("Intra- and inter-block forwarding links") + '</title><g class="overlay-svg-block-surfaces">' + blockSurfaceMarkup
-      + '</g><g class="overlay-svg-edges">' + edgeMarkup + '</g><g class="overlay-svg-blocks">' + blockMarkup + "</g></svg>";
+      + canvasWidth + " " + canvasHeight + '" data-base-width="' + canvasWidth + '" style="width:' + scaledWidth
+      + 'px" role="img" aria-labelledby="overlay-graph-title"><title id="overlay-graph-title">'
+      + t("Parent-child hierarchy and forwarding links") + '</title><g class="overlay-svg-depth-bands">' + bandMarkup
+      + '</g><g class="overlay-svg-hierarchy">' + hierarchyMarkup + '</g><g class="overlay-svg-edges">' + edgeMarkup
+      + '</g><g class="overlay-svg-groups">' + groupMarkup + "</g></svg>";
   }
 
   function overlayStat(label, value, title) {
@@ -1627,20 +1719,17 @@
       ? '<div class="overlay-policy-error" role="alert"><strong>Policy unavailable</strong><span>'
         + escapeHtml(state.topology.policyError) + "</span></div>" : "";
     return '<section class="section-panel overlay-settings-panel"><div class="section-header"><div><h2>Runtime overlay policy</h2>'
-      + '<p>' + escapeHtml((state.topology.data && state.topology.data.algorithm) || "bounded overlay") + '</p></div>' + status
+      + '<p>' + escapeHtml((state.topology.data && state.topology.data.algorithm) || "recursive hierarchy") + '</p></div>' + status
       + '</div><div class="section-body"><div class="overlay-settings-grid"><div class="overlay-setting"><div class="overlay-setting-copy">'
-      + '<label for="overlay-block-size">Block size</label><small>Nodes assigned to each bounded peer block.</small></div>'
-      + '<div class="overlay-range-control"><input id="overlay-block-size-range" data-topology-setting="blockSize" type="range" min="2" max="64" step="1" value="'
-      + escapeHtml(settings.blockSize) + '" aria-label="Block size"><input id="overlay-block-size" data-topology-setting="blockSize" type="number" min="2" max="64" step="1" value="'
-      + escapeHtml(settings.blockSize) + '"></div></div><div class="overlay-setting"><div class="overlay-setting-copy"><span id="overlay-degree-label">Max peer degree</span>'
-      + '<small>Maximum bounded-overlay neighbors per node.</small></div><div class="segmented-control overlay-degree-control" role="group" aria-labelledby="overlay-degree-label">'
+      + '<label for="overlay-group-fanout">Group fanout</label><small>Maximum children or nodes assigned to each group.</small></div>'
+      + '<div class="overlay-range-control"><input id="overlay-group-fanout-range" data-topology-setting="fanout" type="range" min="4" max="64" step="1" value="'
+      + escapeHtml(settings.fanout) + '" aria-label="Group fanout"><input id="overlay-group-fanout" data-topology-setting="fanout" type="number" min="4" max="64" step="1" value="'
+      + escapeHtml(settings.fanout) + '"></div></div><div class="overlay-setting"><div class="overlay-setting-copy"><span id="overlay-degree-label">Max peer degree</span>'
+      + '<small>Maximum hierarchy neighbors per node.</small></div><div class="segmented-control overlay-degree-control" role="group" aria-labelledby="overlay-degree-label">'
       + [4, 6].map(function (degree) {
         return '<button class="segmented-option ' + (settings.maxDegree === degree ? "active" : "") + '" data-overlay-degree="'
           + degree + '" type="button" aria-pressed="' + (settings.maxDegree === degree) + '">' + degree + "</button>";
-      }).join("") + '</div></div><div class="overlay-setting"><div class="overlay-setting-copy"><label for="overlay-shortcut-limit">Direct shortcuts</label>'
-      + '<small>Additional direct peer shortcuts per node.</small></div><div class="overlay-range-control"><input id="overlay-shortcut-limit-range" data-topology-setting="shortcutLimit" type="range" min="0" max="64" step="1" value="'
-      + escapeHtml(settings.shortcutLimit) + '" aria-label="Direct shortcuts"><input id="overlay-shortcut-limit" data-topology-setting="shortcutLimit" type="number" min="0" max="64" step="1" value="'
-      + escapeHtml(settings.shortcutLimit) + '"></div></div></div>' + error
+      }).join("") + '</div></div></div>' + error
       + '<div class="form-actions overlay-settings-actions"><button class="button button-primary" id="save-overlay-settings" type="button"'
       + disabled + '>' + icon(state.topology.saving ? "refresh-cw" : "save") + '<span>'
       + (state.topology.saving ? "Saving overlay settings..." : "Save overlay settings") + "</span></button></div></div></section>";
@@ -1653,13 +1742,15 @@
         + icon("refresh-cw") + "<span>Retry</span></button>" : "") + "</div></section>";
   }
 
-  function renderObservedConnections(model, block) {
+  function renderObservedConnections(model, group) {
+    var memberSet = {};
+    group.node_ids.forEach(function (nodeId) { memberSet[nodeId] = true; });
     var observedEdges = model.edges.filter(function (edge) {
-      return edge.has_observation
-        && (edge.source_block_id === block.block_id || edge.target_block_id === block.block_id);
+      return edge.has_observation && (memberSet[edge.source] || memberSet[edge.target]
+        || edge.placements.some(function (placement) { return placement.group_id === group.group_id; }));
     });
     if (!observedEdges.length) return "";
-    var rows = observedEdges.map(function (edge) {
+    var rows = observedEdges.slice(0, 100).map(function (edge) {
       var pathStates = edge.path_states.length
         ? '<span class="tag-list">' + edge.path_states.map(function (pathState) {
           return '<span class="tag">' + escapeHtml(pretty(pathState)) + "</span>";
@@ -1675,20 +1766,48 @@
       + "<th>Last observed</th></tr></thead><tbody>" + rows + "</tbody></table></div></div>";
   }
 
-  function renderOverlayBlockDetails(model) {
-    if (!model.blocks.length) return "";
-    var selected = model.blockById[String(state.topology.selectedBlockId)] || model.blocks[0];
-    state.topology.selectedBlockId = selected.block_id;
-    var blockOptions = model.blocks.map(function (block, index) {
-      return '<option value="' + escapeHtml(block.block_id) + '" ' + (block.block_id === selected.block_id ? "selected" : "")
-        + ">Block " + (index + 1) + " (" + block.node_ids.length + ")</option>";
+  function renderOverlayGroupDetails(model) {
+    if (!model.groups.length) return "";
+    var selected = model.groupById[String(state.topology.selectedGroupId)] || model.groupById[model.rootGroupId] || model.groups[0];
+    state.topology.selectedGroupId = selected.group_id;
+    var breadcrumbGroups = [];
+    var cursor = selected;
+    var seen = {};
+    while (cursor && !seen[cursor.group_id]) {
+      seen[cursor.group_id] = true;
+      breadcrumbGroups.unshift(cursor);
+      cursor = cursor.parent_group_id ? model.groupById[cursor.parent_group_id] : null;
+    }
+    var breadcrumbs = breadcrumbGroups.map(function (group, index) {
+      var current = index === breadcrumbGroups.length - 1;
+      return (index ? '<span class="overlay-group-breadcrumb-separator">' + icon("chevron-right", 13) + "</span>" : "")
+        + '<button type="button" data-topology-group="' + escapeHtml(group.group_id) + '"' + (current ? ' aria-current="page"' : "")
+        + ' title="' + escapeHtml(group.group_id) + '">Depth ' + group.depth + " · " + escapeHtml(shortId(group.group_id)) + "</button>";
     }).join("");
-    var memberRows = selected.node_ids.map(function (nodeId) {
-      var node = model.nodeById[nodeId] || { node_id: nodeId, tags: [], representative_kinds: [] };
-      var representatives = overlayRepresentativeKinds(node, selected);
-      var badges = [];
-      if (representatives.primary) badges.push(statusPill("healthy", "Primary"));
-      if (representatives.secondary) badges.push(statusPill("info", "Secondary"));
+    var children = selected.child_group_ids.map(function (childId) {
+      var child = model.groupById[childId];
+      if (!child) return "";
+      return '<button class="overlay-child-group" type="button" data-topology-group="' + escapeHtml(child.group_id)
+        + '"><span>' + icon(child.leaf ? "server" : "blocks") + '<strong title="' + escapeHtml(child.group_id) + '">'
+        + escapeHtml(shortId(child.group_id)) + '</strong></span><small>Depth ' + child.depth + " · " + child.node_ids.length
+        + " nodes</small>" + icon("chevron-right") + "</button>";
+    }).join("");
+    var representativeRows = selected.representatives.slice().sort(function (left, right) {
+      return left.plane - right.plane || left.node_id.localeCompare(right.node_id);
+    }).map(function (representative) {
+      return '<span class="overlay-representative-assignment"><small>Plane ' + representative.plane + " · "
+        + escapeHtml(pretty(representative.role || "representative")) + '</small><code title="'
+        + escapeHtml(representative.node_id) + '">' + escapeHtml(shortId(representative.node_id)) + "</code></span>";
+    }).join("");
+    var visibleMembers = selected.node_ids.slice(0, 100);
+    var memberRows = visibleMembers.map(function (nodeId) {
+      var node = model.nodeById[nodeId] || {
+        node_id: nodeId, tags: [], representative_for: [], ancestry: [], health_state: null
+      };
+      var assignments = representativeAssignments(node, selected);
+      var badges = assignments.map(function (assignment) {
+        return statusPill(assignment.plane === 0 ? "healthy" : "info", "Plane " + assignment.plane);
+      });
       if (!badges.length) badges.push('<span class="status-pill unknown">Member</span>');
       var health = node.health_state || node.last_seen_at
         ? '<span class="overlay-node-health">' + (node.health_state ? statusPill(node.health_state, pretty(node.health_state)) : "")
@@ -1705,28 +1824,25 @@
         ? '<button class="overlay-member-row" data-node-id="' + escapeHtml(node.node_id) + '" type="button">' + content + "</button>"
         : '<div class="overlay-member-row">' + content + "</div>";
     }).join("");
-    var assignmentRows = (selected.representatives || []).map(function (representative) {
-      return '<span class="overlay-cycle-assignment"><small>' + escapeHtml(t("Cycle")) + " " + escapeHtml(representative.cycle_index)
-        + ' - ' + escapeHtml(t(pretty(representative.kind || (representative.cycle_index === 0 ? "primary" : "secondary"))))
-        + '</small><code title="' + escapeHtml(representative.node_id) + '">' + escapeHtml(shortId(representative.node_id)) + "</code></span>";
-    }).join("");
-    var assignments = assignmentRows
-      ? '<div class="overlay-cycle-assignments"><strong>Representative assignments</strong><div>' + assignmentRows + "</div></div>"
+    var memberOverflow = selected.node_ids.length > visibleMembers.length
+      ? '<div class="overlay-member-overflow">Showing ' + visibleMembers.length + " of " + selected.node_ids.length + " descendant nodes.</div>"
       : "";
-    return '<section class="section-panel overlay-block-details"><div class="section-header"><div><h2>Block details</h2><p data-no-i18n>'
-      + escapeHtml(selected.block_id) + '</p></div><label class="overlay-block-select"><span>Select block</span><select id="topology-block-select">'
-      + blockOptions + '</select></label></div><div class="overlay-representatives"><div><span>Primary representative</span><strong class="mono" title="'
-      + escapeHtml(selected.primary_representative || "") + '">' + escapeHtml(shortId(selected.primary_representative)) + '</strong></div><div>'
-      + '<span>Secondary representative</span><strong class="mono" title="' + escapeHtml(selected.secondary_representative || "") + '">'
-      + escapeHtml(shortId(selected.secondary_representative)) + '</strong></div><div><span>Members</span><strong>' + selected.node_ids.length
-      + '</strong></div></div>' + assignments + renderObservedConnections(model, selected)
-      + '<div class="overlay-member-list">' + memberRows + "</div></section>";
+    return '<section class="section-panel overlay-group-details"><div class="section-header"><div><h2>Group details</h2><p data-no-i18n>'
+      + escapeHtml(selected.group_id) + '</p></div><span class="status-pill info">Depth ' + selected.depth + "</span></div>"
+      + '<nav class="overlay-group-breadcrumb" aria-label="Group hierarchy">' + breadcrumbs + '</nav><div class="overlay-group-summary"><div><span>Members</span><strong>'
+      + selected.node_ids.length + '</strong></div><div><span>Children</span><strong>' + selected.child_group_ids.length
+      + '</strong></div><div><span>Representatives</span><strong>' + selected.representatives.length + "</strong></div></div>"
+      + (representativeRows ? '<div class="overlay-representative-assignments"><strong>Representative assignments</strong><div>'
+        + representativeRows + "</div></div>" : "")
+      + (children ? '<div class="overlay-child-groups"><div class="overlay-observed-heading"><strong>Children</strong><span>'
+        + selected.child_group_ids.length + '</span></div><div class="overlay-child-group-list">' + children + "</div></div>" : "")
+      + renderObservedConnections(model, selected) + '<div class="overlay-member-list">' + memberRows + memberOverflow + "</div></section>";
   }
 
   function renderOverlayTopology() {
     var settingsPanel = renderOverlaySettings();
     if (state.topology.loading && !state.topology.data) {
-      return settingsPanel + renderOverlayState("Loading overlay topology", "Loading block assignments and links.", "refresh-cw", false);
+      return settingsPanel + renderOverlayState("Loading overlay topology", "Loading group hierarchy and links.", "refresh-cw", false);
     }
     if (state.topology.error && !state.topology.data) {
       return settingsPanel + renderOverlayState("Overlay topology unavailable", state.topology.error, "circle-alert", true);
@@ -1734,25 +1850,36 @@
 
     var model = normalizedOverlayTopology();
     var snapshot = model.snapshot;
-    if (!model.nodes.length && !model.blocks.length) {
+    if (!model.nodes.length && !model.groups.length) {
       return settingsPanel + renderOverlayState("No overlay topology", "Nodes will appear after joining the cluster.", "blocks", false);
     }
     var nodeCount = snapshot.node_count == null ? model.nodes.length : snapshot.node_count;
+    var groupCount = snapshot.group_count == null ? model.groups.length : snapshot.group_count;
+    var levelCount = snapshot.level_count == null
+      ? new Set(model.groups.map(function (group) { return group.depth; })).size : snapshot.level_count;
     var edgeCount = snapshot.edge_count == null ? model.edges.length : snapshot.edge_count;
     var maxDegree = snapshot.max_observed_degree == null
       ? model.nodes.reduce(function (maximum, node) { return Math.max(maximum, Number(node.degree) || 0); }, 0)
       : snapshot.max_observed_degree;
-    var diameter = snapshot.diameter == null ? "-" : snapshot.diameter;
+    var diameterLowerBound = snapshot.diameter_lower_bound == null
+      ? "-"
+      : "\u2265 " + snapshot.diameter_lower_bound;
     var epoch = String(snapshot.topology_epoch == null ? "-" : snapshot.topology_epoch);
-    var graph = buildOverlayGraph(model);
-    var mermaid = generateTopologyMermaid(model);
+    var graphGroups = contextualTopologyGroups(model);
+    var graph = buildOverlayGraph(model, graphGroups);
+    var mermaid = cachedTopologyMermaid(model);
     var observedEdges = model.edges.filter(function (edge) { return edge.has_observation; });
     var observedStatuses = observedEdges.map(function (edge) { return edge.observed_status; }).filter(function (status, index, values) {
       return values.indexOf(status) === index;
     });
-    var observationState = observedStatuses.indexOf("unreachable") !== -1 ? "unreachable"
+    var fullyObserved = model.edges.length > 0 && observedEdges.length === model.edges.length;
+    var fullyConnected = fullyObserved && observedEdges.every(function (edge) {
+      return edge.observed_status === "connected";
+    });
+    var observationState = fullyConnected ? "healthy"
+      : observedStatuses.indexOf("unreachable") !== -1 ? "unreachable"
       : observedStatuses.some(function (status) { return status === "partial" || status === "stale"; }) ? "degraded"
-        : observedStatuses.length && observedStatuses.every(function (status) { return status === "connected"; }) ? "healthy"
+        : observedEdges.length ? "partial"
           : "unknown";
     var topologyStatus = observedEdges.length
       ? statusPill(observationState, "Observed topology")
@@ -1760,9 +1887,8 @@
     var staleError = state.topology.error
       ? '<div class="overlay-inline-error" role="alert">' + icon("circle-alert") + '<span>'
         + escapeHtml(state.topology.error) + "</span></div>" : "";
-    var legend = '<div class="overlay-legend" aria-label="Topology legend"><span><i class="overlay-legend-line intra"></i>Intra-block</span>'
-      + '<span><i class="overlay-legend-line inter"></i>Inter-block</span><span><i class="overlay-legend-node primary"></i>Primary representative</span>'
-      + '<span><i class="overlay-legend-node secondary"></i>Secondary representative</span><span><i class="overlay-legend-node member"></i>Member</span>'
+    var legend = '<div class="overlay-legend" aria-label="Topology legend"><span><i class="overlay-legend-line hierarchy"></i>Parent-child</span>'
+      + '<span><i class="overlay-legend-line intra"></i>Leaf links</span><span><i class="overlay-legend-line inter"></i>Sibling links</span>'
       + (observedStatuses.length ? '<i class="overlay-legend-separator" aria-hidden="true"></i>' + ["connected", "partial", "unreachable", "stale", "unknown"].filter(function (status) {
         return observedStatuses.indexOf(status) !== -1;
       }).map(function (status) {
@@ -1771,10 +1897,10 @@
       + (model.nodes.some(function (node) { return node.health_state; })
         ? '<span><i class="overlay-legend-health"></i>Node health</span>' : "") + "</div>";
     return settingsPanel + staleError + '<div class="overlay-stat-strip">'
-      + overlayStat("Nodes", nodeCount) + overlayStat("Blocks", model.blocks.length)
+      + overlayStat("Nodes", nodeCount) + overlayStat("Groups", groupCount) + overlayStat("Levels", levelCount)
       + overlayStat("Edges", edgeCount) + overlayStat("Max degree", maxDegree)
-      + overlayStat("Diameter", diameter) + overlayStat("Epoch", shortId(epoch), epoch) + '</div>'
-      + '<section class="section-panel overlay-graph-panel"><div class="section-header"><div><h2>Block graph</h2><p>Intra- and inter-block forwarding links</p></div>'
+      + overlayStat("Diameter estimate", diameterLowerBound) + overlayStat("Epoch", shortId(epoch), epoch) + '</div>'
+      + '<section class="section-panel overlay-graph-panel"><div class="section-header"><div><h2>Group hierarchy</h2><p>Parent-child hierarchy and forwarding links</p></div>'
       + '<div class="overlay-graph-actions">' + topologyStatus + '<div class="overlay-zoom-controls" role="group" aria-label="Zoom">'
       + '<button class="icon-button" data-topology-zoom="out" type="button" aria-label="Zoom out" title="Zoom out">' + icon("zoom-out") + '</button>'
       + '<button class="icon-button" data-topology-zoom="reset" type="button" aria-label="Reset zoom" title="Reset zoom">' + icon("maximize-2") + '</button>'
@@ -1782,9 +1908,10 @@
       + '<button class="icon-button" data-topology-zoom="in" type="button" aria-label="Zoom in" title="Zoom in">' + icon("zoom-in") + '</button>'
       + '</div></div></div>' + legend + '<div class="overlay-canvas-scroll">' + graph + '</div><div class="overlay-graph-meta">'
       + '<span><strong>Algorithm</strong><code data-no-i18n>' + escapeHtml(snapshot.algorithm || "-") + '</code></span>'
+      + '<span><strong>Visible groups</strong><code data-no-i18n>' + graphGroups.length + " / " + model.groups.length + '</code></span>'
       + '<span><strong>Generated</strong><time>' + escapeHtml(formatTime(snapshot.generated_at)) + "</time></span></div></section>"
-      + renderOverlayBlockDetails(model)
-      + '<section class="section-panel overlay-mermaid-panel"><div class="section-header"><div><h2>Mermaid source</h2><p data-no-i18n>flowchart LR</p></div>'
+      + renderOverlayGroupDetails(model)
+      + '<section class="section-panel overlay-mermaid-panel"><div class="section-header"><div><h2>Mermaid source</h2><p data-no-i18n>flowchart TB</p></div>'
       + '<button class="icon-button" id="copy-topology-mermaid" type="button" aria-label="Copy Mermaid source" title="Copy Mermaid source">'
       + icon("copy") + '</button></div><pre data-no-i18n><code>' + escapeHtml(mermaid) + "</code></pre></section>";
   }
@@ -2226,7 +2353,7 @@
       nodes: ["Devices", "Registered nodes and their current health."],
       services: ["Public nodes", "Lease-backed control and traversal services."],
       paths: ["Connections", "Selected paths and operator controls."],
-      topology: ["Overlay topology", "Bounded peer blocks and forwarding links."],
+      topology: ["Overlay topology", "Recursive groups and forwarding links."],
       routes: ["Network routes", "Advertised networks and their owners."],
       acl: ["Access control", "Runtime connectivity policy and rules."],
       enrollment: ["Add device", "Issue a short-lived token and install a node with one command."]
@@ -2382,11 +2509,11 @@
 
   function saveOverlaySettings() {
     var settings = state.topology.settings || settingsFromTopologyPolicy(state.topology.policy);
-    var blockSize = Number(settings.blockSize);
+    var fanout = Number(settings.fanout);
     var maxDegree = Number(settings.maxDegree);
     var shortcutLimit = Number(settings.shortcutLimit);
-    if (!Number.isInteger(blockSize) || blockSize < 2 || blockSize > 64) {
-      toast("Block size must be an integer between 2 and 64.", "error");
+    if (!Number.isInteger(fanout) || fanout < 4 || fanout > 64) {
+      toast("Group fanout must be an integer between 4 and 64.", "error");
       return Promise.resolve();
     }
     if ([4, 6].indexOf(maxDegree) === -1) {
@@ -2403,7 +2530,7 @@
       return Promise.resolve();
     }
     var nextPolicy = Object.assign({}, currentPolicy, {
-      overlay_block_size: blockSize,
+      overlay_block_size: fanout,
       overlay_max_degree: maxDegree,
       overlay_direct_shortcut_limit: shortcutLimit
     });
@@ -2439,7 +2566,7 @@
   }
 
   function copyTopologyMermaid() {
-    var source = generateTopologyMermaid(normalizedOverlayTopology());
+    var source = cachedTopologyMermaid(normalizedOverlayTopology());
     return copyText(source).then(function () {
       toast("Mermaid copied.");
     }).catch(function (error) {
@@ -2556,11 +2683,6 @@
   });
 
   document.addEventListener("change", function (event) {
-    if (event.target.matches("#topology-block-select")) {
-      state.topology.selectedBlockId = String(event.target.value);
-      renderView();
-      return;
-    }
     if (event.target.matches("#web-ui-endpoint-select")) {
       var endpoint = event.target.value;
       var selected = state.webUi.endpoints.find(function (entry) { return entry.url === endpoint; });
@@ -2625,9 +2747,9 @@
       openNodeDrawer(node.dataset.nodeId);
       return;
     }
-    var block = event.target.closest("[data-topology-block]");
-    if (block) {
-      state.topology.selectedBlockId = String(block.dataset.topologyBlock);
+    var group = event.target.closest("[data-topology-group]");
+    if (group) {
+      state.topology.selectedGroupId = String(group.dataset.topologyGroup);
       renderView();
       return;
     }
@@ -2730,9 +2852,9 @@
       openNodeDrawer(event.target.dataset.nodeId);
       return;
     }
-    if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-topology-block]")) {
+    if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-topology-group]")) {
       event.preventDefault();
-      state.topology.selectedBlockId = String(event.target.dataset.topologyBlock);
+      state.topology.selectedGroupId = String(event.target.dataset.topologyGroup);
       renderView();
       return;
     }
