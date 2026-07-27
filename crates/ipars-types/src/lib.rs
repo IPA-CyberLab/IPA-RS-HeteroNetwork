@@ -1216,6 +1216,8 @@ pub struct ClusterPolicy {
     pub allow_nat_traversal: bool,
     pub allow_relay_fallback: bool,
     pub idle_timeout_seconds: u64,
+    #[serde(default = "default_overlay_block_size")]
+    pub overlay_block_size: u16,
     #[serde(default = "default_overlay_max_degree")]
     pub overlay_max_degree: u16,
     #[serde(default = "default_overlay_direct_shortcut_limit")]
@@ -1250,6 +1252,7 @@ impl Default for ClusterPolicy {
             allow_nat_traversal: true,
             allow_relay_fallback: true,
             idle_timeout_seconds: 300,
+            overlay_block_size: default_overlay_block_size(),
             overlay_max_degree: default_overlay_max_degree(),
             overlay_direct_shortcut_limit: default_overlay_direct_shortcut_limit(),
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
@@ -1264,6 +1267,14 @@ impl Default for ClusterPolicy {
             acl_rules: Vec::new(),
         }
     }
+}
+
+pub const MIN_OVERLAY_BLOCK_SIZE: u16 = 2;
+pub const MAX_OVERLAY_BLOCK_SIZE: u16 = 64;
+pub const DEFAULT_OVERLAY_BLOCK_SIZE: u16 = 4;
+
+fn default_overlay_block_size() -> u16 {
+    DEFAULT_OVERLAY_BLOCK_SIZE
 }
 
 fn default_overlay_max_degree() -> u16 {
@@ -2796,6 +2807,76 @@ pub mod api {
         pub cluster_id: ClusterId,
         pub vpn_pool: Ipv4Net,
         pub cluster_policy: ClusterPolicy,
+        pub generated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyBlock {
+        pub block_id: String,
+        pub node_ids: Vec<NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub primary_representative: Option<NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_representative: Option<NodeId>,
+        #[serde(default)]
+        pub representatives: Vec<ControlPlaneTopologyRepresentative>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyRepresentative {
+        pub node_id: NodeId,
+        pub cycle_index: usize,
+        pub kind: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyNode {
+        pub node_id: NodeId,
+        pub vpn_ip: VpnIp,
+        pub role: Role,
+        pub tags: BTreeSet<Tag>,
+        pub block_id: String,
+        pub degree: usize,
+        #[serde(default)]
+        pub representative_kinds: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControlPlaneTopologyEdgeKind {
+        IntraBlock,
+        InterBlockPrimary,
+        InterBlockSecondary,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyEdge {
+        pub source: NodeId,
+        pub target: NodeId,
+        pub kind: ControlPlaneTopologyEdgeKind,
+        pub cycle_index: usize,
+        #[serde(default)]
+        pub cycle_indexes: Vec<usize>,
+        pub source_block_id: String,
+        pub target_block_id: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ControlPlaneTopologyResponse {
+        pub cluster_id: ClusterId,
+        /// Decimal string to preserve the complete u64 epoch in JavaScript.
+        pub topology_epoch: String,
+        pub algorithm: String,
+        pub block_size: u16,
+        pub max_degree: u16,
+        pub direct_shortcut_limit: u16,
+        pub node_count: usize,
+        pub edge_count: usize,
+        pub max_observed_degree: usize,
+        pub diameter: Option<usize>,
+        pub blocks: Vec<ControlPlaneTopologyBlock>,
+        pub nodes: Vec<ControlPlaneTopologyNode>,
+        pub edges: Vec<ControlPlaneTopologyEdge>,
         pub generated_at: DateTime<Utc>,
     }
 
@@ -18890,6 +18971,19 @@ mod tests {
     const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
     const MYSQL_CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
     const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+
+    #[test]
+    fn cluster_policy_defaults_missing_overlay_block_size() -> Result<(), serde_json::Error> {
+        let mut encoded = serde_json::to_value(ClusterPolicy::default())?;
+        let Some(object) = encoded.as_object_mut() else {
+            panic!("cluster policy must serialize as an object");
+        };
+        object.remove("overlay_block_size");
+
+        let decoded: ClusterPolicy = serde_json::from_value(encoded)?;
+        assert_eq!(decoded.overlay_block_size, DEFAULT_OVERLAY_BLOCK_SIZE);
+        Ok(())
+    }
 
     #[test]
     fn endpoint_candidate_ipv6_kind_requires_ipv6_address() {

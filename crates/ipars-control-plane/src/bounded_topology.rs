@@ -1,17 +1,21 @@
-//! Deterministic bounded-degree topology synthesis for the relay backbone.
+//! Deterministic block-aware bounded-degree topology synthesis for the relay backbone.
 //!
-//! The topology is the union of Hamiltonian cycles. The first cycle follows
-//! stable node-ID order and guarantees connectedness. Additional cycles use
-//! domain-separated SHA-256 orderings, which lower the diameter without
-//! allowing any cycle to add more than two neighbors per node.
+//! The topology is the union of Hamiltonian cycles whose members remain
+//! contiguous inside deterministic blocks. The first cycle follows stable
+//! block and node-ID order and guarantees connectedness. Additional cycles use
+//! domain-separated SHA-256 block and member orderings, which provide redundant
+//! representatives and lower diameter without allowing any cycle to add more
+//! than two neighbors per node.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ipars_crypto::node_id_from_public_key;
-use ipars_types::{NodeId, NodeRecord};
+use ipars_types::{
+    NodeId, NodeRecord, DEFAULT_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_BLOCK_SIZE, MIN_OVERLAY_BLOCK_SIZE,
+};
 use thiserror::Error;
 
-const TOPOLOGY_ALGORITHM_VERSION: &str = "hamiltonian-cycle-union-v1";
+pub const TOPOLOGY_ALGORITHM_VERSION: &str = "block-aware-hamiltonian-cycle-union-v2";
 const DEFAULT_PERMUTATION_SEED: &str = "ipars-bounded-backbone";
 
 pub const SUPPORTED_MAX_DEGREES: [usize; 2] = [4, 6];
@@ -19,6 +23,7 @@ pub const SUPPORTED_MAX_DEGREES: [usize; 2] = [4, 6];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedTopologyConfig {
     pub max_degree: usize,
+    pub block_size: usize,
     /// Stable namespace for independent clusters or topology policies.
     pub permutation_seed: String,
 }
@@ -27,8 +32,14 @@ impl BoundedTopologyConfig {
     pub fn new(max_degree: usize) -> Self {
         Self {
             max_degree,
+            block_size: usize::from(DEFAULT_OVERLAY_BLOCK_SIZE),
             permutation_seed: DEFAULT_PERMUTATION_SEED.to_string(),
         }
+    }
+
+    pub fn with_block_size(mut self, block_size: usize) -> Self {
+        self.block_size = block_size;
+        self
     }
 
     pub fn with_permutation_seed(mut self, permutation_seed: impl Into<String>) -> Self {
@@ -47,6 +58,22 @@ impl Default for BoundedTopologyConfig {
 pub struct TopologyEdge {
     first: NodeId,
     second: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyBlock {
+    block_id: String,
+    node_ids: Vec<NodeId>,
+}
+
+impl TopologyBlock {
+    pub fn block_id(&self) -> &str {
+        &self.block_id
+    }
+
+    pub fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
+    }
 }
 
 impl TopologyEdge {
@@ -114,6 +141,12 @@ impl TopologyInvariants {
 pub enum BoundedTopologyError {
     #[error("unsupported maximum degree {max_degree}; supported maximum degrees are 4 and 6")]
     UnsupportedMaxDegree { max_degree: usize },
+    #[error("invalid block size {block_size}; block size must be between {minimum} and {maximum}")]
+    InvalidBlockSize {
+        block_size: usize,
+        minimum: usize,
+        maximum: usize,
+    },
     #[error("duplicate node ID in bounded topology membership: {node_id}")]
     DuplicateNodeId { node_id: NodeId },
     #[error("bounded topology synthesis violated invariant: {reason}")]
@@ -124,6 +157,9 @@ pub enum BoundedTopologyError {
 pub struct BoundedTopology {
     topology_epoch: u64,
     max_degree: usize,
+    block_size: usize,
+    blocks: Vec<TopologyBlock>,
+    edge_cycles: BTreeMap<TopologyEdge, BTreeSet<usize>>,
     adjacency: BTreeMap<NodeId, BTreeSet<NodeId>>,
     invariants: TopologyInvariants,
 }
@@ -138,27 +174,30 @@ impl BoundedTopology {
                 max_degree: config.max_degree,
             });
         }
+        let minimum_block_size = usize::from(MIN_OVERLAY_BLOCK_SIZE);
+        let maximum_block_size = usize::from(MAX_OVERLAY_BLOCK_SIZE);
+        if !(minimum_block_size..=maximum_block_size).contains(&config.block_size) {
+            return Err(BoundedTopologyError::InvalidBlockSize {
+                block_size: config.block_size,
+                minimum: minimum_block_size,
+                maximum: maximum_block_size,
+            });
+        }
 
         let node_ids = canonical_node_ids(nodes)?;
         let topology_epoch = topology_epoch(&node_ids, config);
+        let blocks = topology_blocks(&node_ids, config.block_size);
         let mut adjacency = node_ids
             .iter()
             .cloned()
             .map(|node_id| (node_id, BTreeSet::new()))
             .collect::<BTreeMap<_, _>>();
+        let mut edge_cycles = BTreeMap::<TopologyEdge, BTreeSet<usize>>::new();
 
         let cycle_count = config.max_degree / 2;
         for cycle_index in 0..cycle_count {
-            let mut cycle = node_ids.clone();
-            if cycle_index > 0 {
-                cycle.sort_by_cached_key(|node_id| {
-                    (
-                        permutation_hash(node_id, cycle_index, config),
-                        node_id.clone(),
-                    )
-                });
-            }
-            add_hamiltonian_cycle(&mut adjacency, &cycle);
+            let cycle = block_aware_cycle(&blocks, cycle_index, config);
+            add_hamiltonian_cycle(&mut adjacency, &mut edge_cycles, &cycle, cycle_index);
         }
 
         let invariants = inspect_invariants(&adjacency, config.max_degree);
@@ -186,6 +225,9 @@ impl BoundedTopology {
         Ok(Self {
             topology_epoch,
             max_degree: config.max_degree,
+            block_size: config.block_size,
+            blocks,
+            edge_cycles,
             adjacency,
             invariants,
         })
@@ -197,6 +239,18 @@ impl BoundedTopology {
 
     pub fn max_degree(&self) -> usize {
         self.max_degree
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub fn blocks(&self) -> &[TopologyBlock] {
+        &self.blocks
+    }
+
+    pub fn edge_cycles(&self) -> &BTreeMap<TopologyEdge, BTreeSet<usize>> {
+        &self.edge_cycles
     }
 
     pub fn adjacency(&self) -> &BTreeMap<NodeId, BTreeSet<NodeId>> {
@@ -376,10 +430,53 @@ fn canonical_node_ids(nodes: &[NodeRecord]) -> Result<Vec<NodeId>, BoundedTopolo
     Ok(node_ids)
 }
 
+fn topology_blocks(node_ids: &[NodeId], block_size: usize) -> Vec<TopologyBlock> {
+    node_ids
+        .chunks(block_size)
+        .enumerate()
+        .map(|(index, node_ids)| TopologyBlock {
+            block_id: format!("block-{:04}", index + 1),
+            node_ids: node_ids.to_vec(),
+        })
+        .collect()
+}
+
+fn block_aware_cycle(
+    blocks: &[TopologyBlock],
+    cycle_index: usize,
+    config: &BoundedTopologyConfig,
+) -> Vec<NodeId> {
+    let mut ordered_blocks = blocks.iter().collect::<Vec<_>>();
+    if cycle_index > 0 {
+        ordered_blocks.sort_by_cached_key(|block| {
+            (
+                block_permutation_hash(block, cycle_index, config),
+                block.block_id.clone(),
+            )
+        });
+    }
+
+    let mut cycle = Vec::with_capacity(blocks.iter().map(|block| block.node_ids.len()).sum());
+    for block in ordered_blocks {
+        let mut members = block.node_ids.clone();
+        if cycle_index > 0 {
+            members.sort_by_cached_key(|node_id| {
+                (
+                    permutation_hash(node_id, cycle_index, config),
+                    node_id.clone(),
+                )
+            });
+        }
+        cycle.extend(members);
+    }
+    cycle
+}
+
 fn topology_epoch(node_ids: &[NodeId], config: &BoundedTopologyConfig) -> u64 {
     let mut material = Vec::new();
     append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
     append_hash_field(&mut material, config.max_degree.to_string().as_bytes());
+    append_hash_field(&mut material, config.block_size.to_string().as_bytes());
     append_hash_field(&mut material, config.permutation_seed.as_bytes());
     append_hash_field(&mut material, node_ids.len().to_string().as_bytes());
     for node_id in node_ids {
@@ -402,6 +499,23 @@ fn permutation_hash(
     node_id_from_public_key(&material).as_str().to_string()
 }
 
+fn block_permutation_hash(
+    block: &TopologyBlock,
+    cycle_index: usize,
+    config: &BoundedTopologyConfig,
+) -> String {
+    let mut material = Vec::new();
+    append_hash_field(&mut material, b"ipars-bounded-topology-block-permutation");
+    append_hash_field(&mut material, TOPOLOGY_ALGORITHM_VERSION.as_bytes());
+    append_hash_field(&mut material, config.permutation_seed.as_bytes());
+    append_hash_field(&mut material, cycle_index.to_string().as_bytes());
+    append_hash_field(&mut material, block.block_id.as_bytes());
+    for node_id in &block.node_ids {
+        append_hash_field(&mut material, node_id.as_str().as_bytes());
+    }
+    node_id_from_public_key(&material).as_str().to_string()
+}
+
 fn append_hash_field(material: &mut Vec<u8>, field: &[u8]) {
     material.extend_from_slice(&(field.len() as u64).to_be_bytes());
     material.extend_from_slice(field);
@@ -417,7 +531,12 @@ fn cryptographic_hash_u64(material: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
-fn add_hamiltonian_cycle(adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>, cycle: &[NodeId]) {
+fn add_hamiltonian_cycle(
+    adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>,
+    edge_cycles: &mut BTreeMap<TopologyEdge, BTreeSet<usize>>,
+    cycle: &[NodeId],
+    cycle_index: usize,
+) {
     if cycle.len() < 2 {
         return;
     }
@@ -425,6 +544,9 @@ fn add_hamiltonian_cycle(adjacency: &mut BTreeMap<NodeId, BTreeSet<NodeId>>, cyc
         let first = &cycle[index];
         let second = &cycle[(index + 1) % cycle.len()];
         add_undirected_edge(adjacency, first, second);
+        if let Some(edge) = TopologyEdge::new(first.clone(), second.clone()) {
+            edge_cycles.entry(edge).or_default().insert(cycle_index);
+        }
     }
 }
 
@@ -636,11 +758,98 @@ mod tests {
         let nodes = records(128);
         let mut reversed = nodes.clone();
         reversed.reverse();
-        let config = BoundedTopologyConfig::new(6).with_permutation_seed("cluster-a");
+        let config = BoundedTopologyConfig::new(6)
+            .with_block_size(7)
+            .with_permutation_seed("cluster-a");
 
         let first = synthesize_bounded_topology(&nodes, &config);
         let second = synthesize_bounded_topology(&reversed, &config);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn blocks_partition_membership_and_mark_redundant_boundary_cycles() {
+        let nodes = records(10);
+        let topology = topology_with_config(
+            &nodes,
+            &BoundedTopologyConfig::new(4)
+                .with_block_size(3)
+                .with_permutation_seed("cluster-a"),
+        );
+
+        assert_eq!(topology.block_size(), 3);
+        assert_eq!(
+            topology
+                .blocks()
+                .iter()
+                .map(|block| block.node_ids().len())
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        let members = topology
+            .blocks()
+            .iter()
+            .flat_map(|block| block.node_ids().iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(members.len(), nodes.len());
+
+        let block_by_node = topology
+            .blocks()
+            .iter()
+            .flat_map(|block| {
+                block
+                    .node_ids()
+                    .iter()
+                    .map(|node_id| (node_id.clone(), block.block_id().to_string()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let crossing_cycles = topology
+            .edge_cycles()
+            .iter()
+            .filter(|(edge, _)| block_by_node[edge.first()] != block_by_node[edge.second()])
+            .flat_map(|(_, cycles)| cycles.iter().copied())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(crossing_cycles, BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn changing_block_size_advances_epoch_and_changes_secondary_layout() {
+        let nodes = records(128);
+        let small_blocks = topology_with_config(
+            &nodes,
+            &BoundedTopologyConfig::new(4)
+                .with_block_size(4)
+                .with_permutation_seed("cluster-a"),
+        );
+        let large_blocks = topology_with_config(
+            &nodes,
+            &BoundedTopologyConfig::new(4)
+                .with_block_size(16)
+                .with_permutation_seed("cluster-a"),
+        );
+
+        assert_ne!(small_blocks.topology_epoch(), large_blocks.topology_epoch());
+        assert_ne!(small_blocks.edge_cycles(), large_blocks.edge_cycles());
+        assert_eq!(small_blocks.blocks().len(), 32);
+        assert_eq!(large_blocks.blocks().len(), 8);
+        assert!(small_blocks.invariants().are_satisfied());
+        assert!(large_blocks.invariants().are_satisfied());
+    }
+
+    #[test]
+    fn supported_block_sizes_remain_bounded_at_one_thousand_nodes() {
+        let nodes = records(1_000);
+        for block_size in [2, 4, 8, 16, 32, 64] {
+            let topology = topology_with_config(
+                &nodes,
+                &BoundedTopologyConfig::new(4)
+                    .with_block_size(block_size)
+                    .with_permutation_seed("cluster-a"),
+            );
+            assert!(topology.invariants().are_satisfied());
+            assert!(topology.invariants().max_observed_degree <= 4);
+            assert!(topology.diameter().is_some());
+        }
     }
 
     #[test]
@@ -816,6 +1025,19 @@ mod tests {
             synthesize_bounded_topology(&nodes, &BoundedTopologyConfig::new(5)),
             Err(BoundedTopologyError::UnsupportedMaxDegree { max_degree: 5 })
         );
+        for block_size in [1, 65] {
+            assert_eq!(
+                synthesize_bounded_topology(
+                    &nodes,
+                    &BoundedTopologyConfig::new(4).with_block_size(block_size)
+                ),
+                Err(BoundedTopologyError::InvalidBlockSize {
+                    block_size,
+                    minimum: 2,
+                    maximum: 64,
+                })
+            );
+        }
 
         let duplicate = vec![nodes[0].clone(), nodes[0].clone()];
         assert_eq!(

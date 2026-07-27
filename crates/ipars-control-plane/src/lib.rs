@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bounded_topology::{
     BoundedTopology, BoundedTopologyConfig, BoundedTopologyError, SUPPORTED_MAX_DEGREES,
+    TOPOLOGY_ALGORITHM_VERSION,
 };
 use chrono::Utc;
 use ipars_crypto::{
@@ -21,7 +22,9 @@ use ipars_crypto::{
 use ipars_types::api::{
     ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
     ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-    ControlPlanePathsResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
+    ControlPlanePathsResponse, ControlPlaneTopologyBlock, ControlPlaneTopologyEdge,
+    ControlPlaneTopologyEdgeKind, ControlPlaneTopologyNode, ControlPlaneTopologyRepresentative,
+    ControlPlaneTopologyResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
     PathStateCount, PeerConnectionIntent, PeerMap, RegisterClientRequest, RegisterClientResponse,
     RegisterNodeRequest, RegisterNodeResponse, RelayMap, RemoveClientResponse, RemoveNodeRequest,
     RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
@@ -39,8 +42,8 @@ use ipars_types::{
     TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
     TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
     LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_DEGREE,
-    MAX_PATH_SCORE_REASONS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
+    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -171,6 +174,19 @@ impl ControlPlaneConfig {
 
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
+    async fn get_cluster_policy(
+        &self,
+        _cluster_id: &ClusterId,
+    ) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+        Ok(None)
+    }
+    async fn upsert_cluster_policy(
+        &self,
+        _cluster_id: &ClusterId,
+        _policy: ClusterPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        Ok(())
+    }
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError>;
     async fn get_node(&self, node_id: &NodeId) -> Result<Option<NodeRecord>, ControlPlaneError>;
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError>;
@@ -298,6 +314,7 @@ pub trait TokenLedger: Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
+    cluster_policies: RwLock<BTreeMap<ClusterId, ClusterPolicy>>,
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     nat_classifications: RwLock<BTreeMap<NodeId, NatClassification>>,
@@ -308,6 +325,25 @@ pub struct InMemoryStore {
 
 #[async_trait]
 impl ControlPlaneStore for InMemoryStore {
+    async fn get_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+        Ok(self.cluster_policies.read().await.get(cluster_id).cloned())
+    }
+
+    async fn upsert_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        self.cluster_policies
+            .write()
+            .await
+            .insert(cluster_id.clone(), policy);
+        Ok(())
+    }
+
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
         let mut nodes = self.nodes.write().await;
         if nodes.contains_key(&node.node_id) {
@@ -1178,6 +1214,19 @@ where
             .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))
     }
 
+    pub async fn current_cluster_policy(&self) -> Result<ClusterPolicy, ControlPlaneError> {
+        if let Some(policy) = self
+            .store
+            .get_cluster_policy(&self.config.cluster_id)
+            .await?
+        {
+            validate_cluster_policy(&policy)?;
+            self.cache_cluster_policy(policy.clone())?;
+            return Ok(policy);
+        }
+        self.cluster_policy()
+    }
+
     pub async fn advertise_service_instance(
         &self,
         instance: ServiceInstance,
@@ -1282,17 +1331,25 @@ where
         })
     }
 
-    pub fn set_cluster_policy(
+    pub async fn set_cluster_policy(
         &self,
         policy: ClusterPolicy,
     ) -> Result<ClusterPolicy, ControlPlaneError> {
         validate_cluster_policy(&policy)?;
+        self.store
+            .upsert_cluster_policy(&self.config.cluster_id, policy.clone())
+            .await?;
+        self.cache_cluster_policy(policy.clone())?;
+        Ok(policy)
+    }
+
+    fn cache_cluster_policy(&self, policy: ClusterPolicy) -> Result<(), ControlPlaneError> {
         let mut current = self
             .cluster_policy
             .write()
             .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))?;
-        *current = policy.clone();
-        Ok(policy)
+        *current = policy;
+        Ok(())
     }
 
     fn policy_snapshot(&self) -> Result<ClusterPolicy, ControlPlaneError> {
@@ -1311,7 +1368,7 @@ where
 
     pub async fn require_client_gateway(&self) -> Result<NodeRecord, ControlPlaneError> {
         let now = Utc::now();
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let nodes = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&nodes).await?;
         select_client_gateways(&nodes, &health_by_node, now, &policy)
@@ -1347,7 +1404,7 @@ where
         &self,
     ) -> Result<ControlPlaneNatDiscoveryOverview, ControlPlaneError> {
         let classifications = self.store.list_nat_classifications().await?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let now = Utc::now();
         let mut stale_count = 0;
         let mut low_confidence_count = 0;
@@ -1561,7 +1618,7 @@ where
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let directory = self.service_directory_at(now).await?;
         let peer_map = self.filtered_peer_map_for_node(
             &node,
@@ -1852,7 +1909,7 @@ where
     ) -> Result<(), ControlPlaneError> {
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let visible_nodes = peers
             .iter()
             .filter(|peer| peer.node_id != client.node_id && !peer.role.is_client())
@@ -1916,7 +1973,7 @@ where
             .into_iter()
             .collect::<Vec<_>>();
 
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let now = Utc::now();
         let health_by_node = self.health_by_node(&peers).await?;
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
@@ -1951,7 +2008,7 @@ where
         }
 
         let nodes = self.overlay_nodes().await?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let topology = self.overlay_topology(&nodes, &policy)?;
         let now = Utc::now();
         let nodes_by_id = nodes
@@ -2052,6 +2109,179 @@ where
         Ok(response)
     }
 
+    pub async fn overlay_topology_snapshot(
+        &self,
+    ) -> Result<ControlPlaneTopologyResponse, ControlPlaneError> {
+        let mut nodes = self.overlay_nodes().await?;
+        nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let policy = self.current_cluster_policy().await?;
+        let topology = self.overlay_topology(&nodes, &policy)?;
+        let node_blocks = topology
+            .blocks()
+            .iter()
+            .flat_map(|block| {
+                block
+                    .node_ids()
+                    .iter()
+                    .cloned()
+                    .map(|node_id| (node_id, block.block_id().to_string()))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut representative_cycles = BTreeMap::<NodeId, BTreeSet<usize>>::new();
+        let mut edges = Vec::with_capacity(topology.edge_cycles().len());
+        for (edge, cycles) in topology.edge_cycles() {
+            let source_block_id = node_blocks.get(edge.first()).cloned().ok_or_else(|| {
+                ControlPlaneError::BoundedTopology(format!(
+                    "source node {} has no topology block",
+                    edge.first()
+                ))
+            })?;
+            let target_block_id = node_blocks.get(edge.second()).cloned().ok_or_else(|| {
+                ControlPlaneError::BoundedTopology(format!(
+                    "target node {} has no topology block",
+                    edge.second()
+                ))
+            })?;
+            let inter_block = source_block_id != target_block_id;
+            if inter_block {
+                for cycle_index in cycles {
+                    representative_cycles
+                        .entry(edge.first().clone())
+                        .or_default()
+                        .insert(*cycle_index);
+                    representative_cycles
+                        .entry(edge.second().clone())
+                        .or_default()
+                        .insert(*cycle_index);
+                }
+            }
+            let cycle_indexes = cycles.iter().copied().collect::<Vec<_>>();
+            let cycle_index = cycle_indexes.first().copied().unwrap_or(0);
+            let kind = if !inter_block {
+                ControlPlaneTopologyEdgeKind::IntraBlock
+            } else if cycles.contains(&0) {
+                ControlPlaneTopologyEdgeKind::InterBlockPrimary
+            } else {
+                ControlPlaneTopologyEdgeKind::InterBlockSecondary
+            };
+            edges.push(ControlPlaneTopologyEdge {
+                source: edge.first().clone(),
+                target: edge.second().clone(),
+                kind,
+                cycle_index,
+                cycle_indexes,
+                source_block_id,
+                target_block_id,
+            });
+        }
+
+        let blocks = topology
+            .blocks()
+            .iter()
+            .map(|block| {
+                let representatives = block
+                    .node_ids()
+                    .iter()
+                    .flat_map(|node_id| {
+                        representative_cycles
+                            .get(node_id)
+                            .into_iter()
+                            .flatten()
+                            .map(|cycle_index| ControlPlaneTopologyRepresentative {
+                                node_id: node_id.clone(),
+                                cycle_index: *cycle_index,
+                                kind: if *cycle_index == 0 {
+                                    "primary".to_string()
+                                } else {
+                                    "secondary".to_string()
+                                },
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let primary_representative = representatives
+                    .iter()
+                    .find(|representative| representative.cycle_index == 0)
+                    .map(|representative| representative.node_id.clone());
+                let secondary_representative = representatives
+                    .iter()
+                    .find(|representative| {
+                        representative.cycle_index > 0
+                            && Some(&representative.node_id) != primary_representative.as_ref()
+                    })
+                    .or_else(|| {
+                        representatives
+                            .iter()
+                            .find(|representative| representative.cycle_index > 0)
+                    })
+                    .map(|representative| representative.node_id.clone());
+                ControlPlaneTopologyBlock {
+                    block_id: block.block_id().to_string(),
+                    node_ids: block.node_ids().to_vec(),
+                    primary_representative,
+                    secondary_representative,
+                    representatives,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let topology_nodes = nodes
+            .into_iter()
+            .map(|node| {
+                let block_id = node_blocks.get(&node.node_id).cloned().ok_or_else(|| {
+                    ControlPlaneError::BoundedTopology(format!(
+                        "node {} has no topology block",
+                        node.node_id
+                    ))
+                })?;
+                let representative_kinds = representative_cycles
+                    .get(&node.node_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|cycle_index| {
+                        if *cycle_index == 0 {
+                            "primary".to_string()
+                        } else {
+                            "secondary".to_string()
+                        }
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let degree = topology
+                    .neighbors(&node.node_id)
+                    .map(BTreeSet::len)
+                    .unwrap_or(0);
+                Ok(ControlPlaneTopologyNode {
+                    node_id: node.node_id,
+                    vpn_ip: node.vpn_ip,
+                    role: node.role,
+                    tags: node.tags,
+                    block_id,
+                    degree,
+                    representative_kinds,
+                })
+            })
+            .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+
+        Ok(ControlPlaneTopologyResponse {
+            cluster_id: self.config.cluster_id.clone(),
+            topology_epoch: topology.topology_epoch().to_string(),
+            algorithm: TOPOLOGY_ALGORITHM_VERSION.to_string(),
+            block_size: policy.overlay_block_size,
+            max_degree: policy.overlay_max_degree,
+            direct_shortcut_limit: policy.overlay_direct_shortcut_limit,
+            node_count: topology.invariants().node_count,
+            edge_count: topology.invariants().edge_count,
+            max_observed_degree: topology.invariants().max_observed_degree,
+            diameter: topology.diameter(),
+            blocks,
+            nodes: topology_nodes,
+            edges,
+            generated_at: Utc::now(),
+        })
+    }
+
     pub async fn overlay_path_for(
         &self,
         request: &OverlayPathQuery,
@@ -2062,7 +2292,7 @@ where
             .find(|node| node.node_id == request.source)
             .cloned()
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.source.clone()))?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let target = overlay_target_for_destination(&source, &nodes, request.destination, &policy)
             .ok_or(ControlPlaneError::OverlayDestinationNotFound(
                 request.destination,
@@ -2108,6 +2338,7 @@ where
         Ok(BoundedTopology::synthesize(
             nodes,
             &BoundedTopologyConfig::new(usize::from(policy.overlay_max_degree))
+                .with_block_size(usize::from(policy.overlay_block_size))
                 .with_permutation_seed(self.config.cluster_id.as_str()),
         )?)
     }
@@ -2216,7 +2447,7 @@ where
             .iter()
             .map(|peer| (peer.node_id.clone(), peer))
             .collect::<BTreeMap<_, _>>();
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let pins = self.admin_path_pins.read().await.clone();
         let now = Utc::now();
         let mut stale_path_count = 0;
@@ -2318,6 +2549,7 @@ where
                 reason: "clients cannot submit node heartbeats".to_string(),
             });
         }
+        let policy = self.current_cluster_policy().await?;
         let previous_health = self.store.get_health(&request.node_id).await?;
         let now = Utc::now();
         self.validate_heartbeat_request(&request, &node, previous_health.as_ref(), now)?;
@@ -2355,7 +2587,7 @@ where
         if let Some(signature) = request.node_signature.as_ref() {
             request.health.last_seen_at = signature.signed_at;
         }
-        let idle_timeout_seconds = self.policy_snapshot()?.idle_timeout_seconds;
+        let idle_timeout_seconds = policy.idle_timeout_seconds;
         let connection_intent_targets = request
             .path_state
             .iter()
@@ -2508,7 +2740,7 @@ where
         node_id: &NodeId,
         now: chrono::DateTime<Utc>,
     ) -> Result<Vec<PeerConnectionIntent>, ControlPlaneError> {
-        let idle_timeout_seconds = self.policy_snapshot()?.idle_timeout_seconds;
+        let idle_timeout_seconds = self.current_cluster_policy().await?.idle_timeout_seconds;
         let nodes_by_id = self
             .store
             .list_nodes()
@@ -2578,7 +2810,7 @@ where
         let peers = self.store.list_nodes().await?;
         let health_by_node = self.health_by_node(&peers).await?;
         let client_gateway_selections = self.store.list_client_gateway_selections().await?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let directory = self.service_directory_at(rotated_at).await?;
         let peer_map = self.filtered_peer_map_for_node(
             &updated_node,
@@ -3089,7 +3321,7 @@ where
             .cloned()
             .collect::<Vec<_>>();
         let health_by_node = self.health_by_node(&nodes).await?;
-        let policy = self.policy_snapshot()?;
+        let policy = self.current_cluster_policy().await?;
         let mut healthy_node_count = 0;
         let mut degraded_node_count = 0;
         let mut unhealthy_node_count = 0;
@@ -3676,6 +3908,11 @@ fn service_instance_kind_count(
 }
 
 fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
+    if !(MIN_OVERLAY_BLOCK_SIZE..=MAX_OVERLAY_BLOCK_SIZE).contains(&policy.overlay_block_size) {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "overlay_block_size must be between {MIN_OVERLAY_BLOCK_SIZE} and {MAX_OVERLAY_BLOCK_SIZE}"
+        )));
+    }
     if !SUPPORTED_MAX_DEGREES.contains(&usize::from(policy.overlay_max_degree)) {
         return Err(ControlPlaneError::InvalidClusterPolicy(format!(
             "overlay_max_degree must be one of {:?}",
@@ -4607,7 +4844,7 @@ mod tests {
         EndpointCandidate, EndpointCandidateKind, HealthState, KeyId, NatConnectivityState,
         NatProbeObservation, NodeHealth, PathMetrics, PathRecord, PathScore, PathState,
         PeerPathKey, RelayCapability, Role, Tag, TokenPolicy, TransportProtocol,
-        MAX_JOIN_TOKEN_IDENTIFIER_BYTES,
+        DEFAULT_OVERLAY_BLOCK_SIZE, MAX_JOIN_TOKEN_IDENTIFIER_BYTES,
     };
 
     use super::*;
@@ -4856,6 +5093,59 @@ mod tests {
             lease_expires_at,
             updated_at,
         }
+    }
+
+    #[tokio::test]
+    async fn dynamic_block_policy_is_shared_and_advances_topology_epoch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane_a = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let plane_b =
+            ControlPlane::new(ControlPlaneConfig::new(cluster_id.clone(), vpn_pool), store);
+
+        for index in 0..12 {
+            let label = format!("block-node-{index}");
+            let mut node_claims = claims(cluster_id.clone());
+            node_claims.nonce = format!("block-policy-{index}");
+            plane_a
+                .register_with_claims(node_claims, registration_request(&label))
+                .await?;
+        }
+
+        let initial = plane_b.overlay_topology_snapshot().await?;
+        assert_eq!(initial.block_size, DEFAULT_OVERLAY_BLOCK_SIZE);
+        assert_eq!(initial.blocks.len(), 3);
+
+        let mut policy = plane_a.current_cluster_policy().await?;
+        policy.overlay_block_size = 8;
+        plane_a.set_cluster_policy(policy).await?;
+
+        let observed = plane_b.current_cluster_policy().await?;
+        assert_eq!(observed.overlay_block_size, 8);
+        let updated = plane_b.overlay_topology_snapshot().await?;
+        assert_eq!(updated.block_size, 8);
+        assert_eq!(updated.blocks.len(), 2);
+        assert_ne!(initial.topology_epoch, updated.topology_epoch);
+        assert!(updated.max_observed_degree <= usize::from(updated.max_degree));
+
+        for block_size in [1, 65] {
+            let mut invalid = observed.clone();
+            invalid.overlay_block_size = block_size;
+            assert!(matches!(
+                plane_a.set_cluster_policy(invalid).await,
+                Err(ControlPlaneError::InvalidClusterPolicy(_))
+            ));
+        }
+        assert_eq!(
+            plane_b.current_cluster_policy().await?.overlay_block_size,
+            8
+        );
+        Ok(())
     }
 
     #[derive(Default)]

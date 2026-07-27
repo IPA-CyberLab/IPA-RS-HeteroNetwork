@@ -8,8 +8,8 @@ use ipars_control_plane::{
 };
 use ipars_types::api::ClientGatewaySelection;
 use ipars_types::{
-    ClusterId, EndpointCandidate, NatClassification, NodeHealth, NodeId, NodeRecord, PathRecord,
-    RelayCapability, Route, ServiceInstance, TokenLedgerMetrics, TokenLedgerRecord,
+    ClusterId, ClusterPolicy, EndpointCandidate, NatClassification, NodeHealth, NodeId, NodeRecord,
+    PathRecord, RelayCapability, Route, ServiceInstance, TokenLedgerMetrics, TokenLedgerRecord,
     TokenRevocationOutcome, TokenRevocationRecord, TokenStatus, VpnIp,
 };
 use sqlx::{Executor, PgPool, Row, SqlitePool};
@@ -34,6 +34,17 @@ impl SqliteControlPlaneStore {
     }
 
     async fn migrate(&self) -> Result<(), ControlPlaneError> {
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS cluster_policies (
+                    cluster_id TEXT PRIMARY KEY NOT NULL,
+                    record_json TEXT NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
         self.pool
             .execute(
                 r#"
@@ -146,6 +157,38 @@ impl SqliteControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for SqliteControlPlaneStore {
+    async fn get_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+        let row = sqlx::query("SELECT record_json FROM cluster_policies WHERE cluster_id = ?1")
+            .bind(cluster_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        row.map(row_to_cluster_policy).transpose()
+    }
+
+    async fn upsert_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_policies (cluster_id, record_json)
+            VALUES (?1, ?2)
+            ON CONFLICT(cluster_id) DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(serde_json::to_string(&policy).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
         let node_id = node.node_id.clone();
         let vpn_ip = node.vpn_ip;
@@ -907,6 +950,17 @@ impl PostgresControlPlaneStore {
         transaction
             .execute(
                 r#"
+                CREATE TABLE IF NOT EXISTS cluster_policies (
+                    cluster_id TEXT PRIMARY KEY NOT NULL,
+                    record_json JSONB NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
                 CREATE TABLE IF NOT EXISTS nodes (
                     node_id TEXT PRIMARY KEY NOT NULL,
                     record_json JSONB NOT NULL
@@ -1017,6 +1071,38 @@ impl PostgresControlPlaneStore {
 
 #[async_trait]
 impl ControlPlaneStore for PostgresControlPlaneStore {
+    async fn get_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+        let row = sqlx::query("SELECT record_json FROM cluster_policies WHERE cluster_id = $1")
+            .bind(cluster_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sql_error)?;
+        row.map(pg_row_to_cluster_policy).transpose()
+    }
+
+    async fn upsert_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_policies (cluster_id, record_json)
+            VALUES ($1, $2)
+            ON CONFLICT(cluster_id) DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(serde_json::to_value(&policy).map_err(json_error)?)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
         let node_id = node.node_id.clone();
         let vpn_ip = node.vpn_ip;
@@ -1743,6 +1829,11 @@ impl TokenLedger for PostgresControlPlaneStore {
     }
 }
 
+fn row_to_cluster_policy(row: sqlx::sqlite::SqliteRow) -> Result<ClusterPolicy, ControlPlaneError> {
+    let record_json: String = row.get("record_json");
+    serde_json::from_str(&record_json).map_err(json_error)
+}
+
 fn row_to_node(row: sqlx::sqlite::SqliteRow) -> Result<NodeRecord, ControlPlaneError> {
     let record_json: String = row.get("record_json");
     serde_json::from_str(&record_json).map_err(json_error)
@@ -1798,6 +1889,13 @@ fn sqlite_selection_timestamp(millis: i64) -> Result<DateTime<Utc>, ControlPlane
     DateTime::from_timestamp_millis(millis).ok_or_else(|| {
         ControlPlaneError::Store("stored client gateway selection timestamp is invalid".to_string())
     })
+}
+
+fn pg_row_to_cluster_policy(
+    row: sqlx::postgres::PgRow,
+) -> Result<ClusterPolicy, ControlPlaneError> {
+    let record_json: serde_json::Value = row.get("record_json");
+    serde_json::from_value(record_json).map_err(json_error)
 }
 
 fn pg_row_to_node(row: sqlx::postgres::PgRow) -> Result<NodeRecord, ControlPlaneError> {
@@ -2288,6 +2386,47 @@ mod tests {
         assert_eq!(token_metrics.active_count, 0);
         assert_eq!(token_metrics.exhausted_count, 1);
         assert_eq!(token_metrics.use_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_cluster_policy_is_shared_across_store_instances(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("cluster-policy");
+        let cluster_id = ClusterId::from_string("cluster-ha");
+        let store_a = SqliteControlPlaneStore::connect(&database_url).await?;
+        let store_b = SqliteControlPlaneStore::connect(&database_url).await?;
+        assert_eq!(store_a.get_cluster_policy(&cluster_id).await?, None);
+
+        let policy = ClusterPolicy {
+            overlay_block_size: 12,
+            overlay_max_degree: 6,
+            ..ClusterPolicy::default()
+        };
+        store_a
+            .upsert_cluster_policy(&cluster_id, policy.clone())
+            .await?;
+        assert_eq!(
+            store_b.get_cluster_policy(&cluster_id).await?,
+            Some(policy.clone())
+        );
+
+        let reopened = SqliteControlPlaneStore::connect(&database_url).await?;
+        assert_eq!(
+            reopened.get_cluster_policy(&cluster_id).await?,
+            Some(policy)
+        );
+        assert_eq!(
+            reopened
+                .get_cluster_policy(&ClusterId::from_string("other-cluster"))
+                .await?,
+            None
+        );
+
+        drop(store_a);
+        drop(store_b);
+        drop(reopened);
+        let _ = std::fs::remove_file(database_path);
         Ok(())
     }
 

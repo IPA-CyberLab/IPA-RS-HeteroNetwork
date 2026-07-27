@@ -24,11 +24,11 @@ use ipars_crypto::IdentityKeyPair;
 use ipars_types::api::{
     ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse, ControlPlaneNodeOverview,
     ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse,
-    ControlPlanePathsResponse, ControlPlanePolicyResponse, HeartbeatRequest, HeartbeatResponse,
-    JoinClientRequest, JoinNodeRequest, PeerMap, RegisterClientResponse, RegisterNodeResponse,
-    RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
-    RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
-    SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
+    ControlPlanePathsResponse, ControlPlanePolicyResponse, ControlPlaneTopologyResponse,
+    HeartbeatRequest, HeartbeatResponse, JoinClientRequest, JoinNodeRequest, PeerMap,
+    RegisterClientResponse, RegisterNodeResponse, RemoveClientResponse, RemoveNodeRequest,
+    RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
+    RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, socket_addr_is_globally_routable, BootstrapEndpoint,
@@ -463,6 +463,7 @@ where
     });
     let admin = Router::new()
         .route("/v1/admin/overview", get(admin_overview::<S, L>))
+        .route("/v1/admin/topology", get(admin_topology::<S, L>))
         .route("/v1/admin/services", get(admin_services::<S, L>))
         .route("/v1/admin/nodes", get(admin_nodes::<S, L>))
         .route("/v1/admin/paths", get(admin_paths::<S, L>))
@@ -2589,7 +2590,7 @@ where
     Ok(Json(ControlPlaneOverviewResponse {
         cluster_id: config.cluster_id.clone(),
         vpn_pool: config.vpn_pool,
-        cluster_policy: state.plane.cluster_policy()?,
+        cluster_policy: state.plane.current_cluster_policy().await?,
         metrics: control_plane_metrics(&state).await?,
         nodes: admin_node_snapshot(&state.plane).await?,
         paths: state.plane.list_paths().await?,
@@ -2597,6 +2598,16 @@ where
         service_directory: state.plane.service_directory().await?,
         generated_at,
     }))
+}
+
+async fn admin_topology<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<ControlPlaneTopologyResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(state.plane.overlay_topology_snapshot().await?))
 }
 
 async fn admin_services<S, L>(
@@ -2640,7 +2651,7 @@ where
     Ok(Json(ControlPlanePolicyResponse {
         cluster_id: config.cluster_id.clone(),
         vpn_pool: config.vpn_pool,
-        cluster_policy: state.plane.cluster_policy()?,
+        cluster_policy: state.plane.current_cluster_policy().await?,
         generated_at: Utc::now(),
     }))
 }
@@ -2653,7 +2664,10 @@ where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let cluster_policy = state.plane.set_cluster_policy(request.cluster_policy)?;
+    let cluster_policy = state
+        .plane
+        .set_cluster_policy(request.cluster_policy)
+        .await?;
     let config = state.plane.config();
     Ok(Json(ControlPlanePolicyResponse {
         cluster_id: config.cluster_id.clone(),
@@ -2780,7 +2794,7 @@ where
     Ok(Json(ControlPlanePolicyResponse {
         cluster_id: config.cluster_id.clone(),
         vpn_pool: config.vpn_pool,
-        cluster_policy: state.plane.cluster_policy()?,
+        cluster_policy: state.plane.current_cluster_policy().await?,
         generated_at: Utc::now(),
     }))
 }
@@ -2881,7 +2895,7 @@ where
         )
         .await?;
     let peer_map = state.plane.peer_map_for(&request.client_id).await?;
-    let cluster_policy = state.plane.cluster_policy()?;
+    let cluster_policy = state.plane.current_cluster_policy().await?;
     Ok(Json(RegisterClientResponse {
         client,
         peer_map,
@@ -5755,6 +5769,145 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_admin_topology_updates_block_size_without_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let ledger = Arc::new(InMemoryTokenLedger::default());
+        let plane = Arc::new(ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
+            ),
+            store,
+        ));
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            ledger,
+            IssuerKeyRing::default(),
+        ));
+        let app = router(
+            ControlPlaneHttpState::new(plane.clone(), join_service)
+                .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string()),
+        );
+
+        for index in 0..10 {
+            let label = format!("topology-node-{index}");
+            let mut node_claims = claims(cluster_id.clone(), issuer.node_id(), key_id.clone());
+            node_claims.nonce = format!("topology-node-{index}");
+            plane
+                .register_with_claims(node_claims, registration(&label))
+                .await?;
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/topology")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/topology")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let initial: ControlPlaneTopologyResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(initial.block_size, 4);
+        assert_eq!(initial.blocks.len(), 3);
+        assert_eq!(initial.nodes.len(), 10);
+        assert!(initial.max_observed_degree <= usize::from(initial.max_degree));
+        assert!(initial
+            .edges
+            .iter()
+            .any(|edge| edge.source_block_id != edge.target_block_id));
+        assert!(initial
+            .blocks
+            .iter()
+            .all(|block| !block.representatives.is_empty()));
+
+        let mut policy = plane.current_cluster_policy().await?;
+        policy.overlay_block_size = 6;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/admin/policy")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &serde_json::json!({ "cluster_policy": policy }),
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated_policy: ControlPlanePolicyResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(updated_policy.cluster_policy.overlay_block_size, 6);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/admin/topology")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let updated: ControlPlaneTopologyResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(updated.block_size, 6);
+        assert_eq!(updated.blocks.len(), 2);
+        assert_ne!(initial.topology_epoch, updated.topology_epoch);
+
+        let mut invalid_policy = updated_policy.cluster_policy;
+        invalid_policy.overlay_block_size = 1;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/admin/policy")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &serde_json::json!({ "cluster_policy": invalid_policy }),
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(plane.current_cluster_policy().await?.overlay_block_size, 6);
 
         Ok(())
     }
