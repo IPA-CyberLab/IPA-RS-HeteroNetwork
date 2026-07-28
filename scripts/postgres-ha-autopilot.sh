@@ -398,15 +398,21 @@ route_output_uses_interface() {
         if ($field_index == "dev" && field_index < NF) {
           interface_count += 1
           interface = $(field_index + 1)
-        } else if ($field_index == "src" && field_index < NF) {
+        } else if (($field_index == "src" || $field_index == "from") && field_index < NF) {
           source_count += 1
-          source = $(field_index + 1)
+          candidate_source = $(field_index + 1)
+          if (source_count == 1) {
+            source = candidate_source
+          } else if (source != candidate_source) {
+            source_conflict = 1
+          }
         }
       }
     }
     END {
       invalid = interface_count != 1 || interface != expected_interface
-      invalid = invalid || interface == "heteronetwork0" || source_count != 1
+      invalid = invalid || interface == "heteronetwork0" || source_count < 1
+      invalid = invalid || source_conflict
       invalid = invalid || source != expected_source
       if (invalid) {
         exit 1
@@ -3027,10 +3033,26 @@ JSON
   route_output_uses_interface \
     "100.89.33.61 dev tailscale0 table 52 src 100.123.154.79" \
     tailscale0 100.123.154.79
+  route_output_uses_interface \
+    "100.89.33.61 from 100.123.154.79 dev tailscale0 table 52 uid 0" \
+    tailscale0 100.123.154.79
+  route_output_uses_interface \
+    "100.89.33.61 from 100.123.154.79 dev tailscale0 table 52 src 100.123.154.79" \
+    tailscale0 100.123.154.79
+  if route_output_uses_interface \
+    "100.89.33.61 from 100.123.154.80 dev tailscale0 table 52" \
+    tailscale0 100.123.154.79; then
+    die "database underlay route with the wrong from address was accepted"
+  fi
   if route_output_uses_interface \
     "100.89.33.61 dev tailscale0 table 52 src 100.123.154.80" \
     tailscale0 100.123.154.79; then
     die "database underlay route with the wrong source address was accepted"
+  fi
+  if route_output_uses_interface \
+    "100.89.33.61 from 100.123.154.79 dev tailscale0 table 52 src 100.123.154.80" \
+    tailscale0 100.123.154.79; then
+    die "database underlay route with conflicting source addresses was accepted"
   fi
   [[ "$(initial_coordinator_node_id)" == "node-a" ]]
 
