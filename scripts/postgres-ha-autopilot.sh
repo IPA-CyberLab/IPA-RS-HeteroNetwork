@@ -2406,6 +2406,10 @@ apply_local_bundle() {
     "HETERONETWORK_DB_TOPOLOGY_REVISION=$manifest_revision" \
     "HETERONETWORK_DB_NETWORK_PLANE=$manifest_network_plane" \
     "$helper" reconfigure-node
+  if ! run_helper_for_bundle "$bundle_dir" verify; then
+    log "database topology revision $manifest_revision is not healthy yet"
+    return
+  fi
   printf '%s\n' "$manifest_revision" >"$applied_revision_path"
   chmod 0600 "$applied_revision_path"
 }
@@ -3365,6 +3369,28 @@ EOF
     'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
     "$temporary/applied-helper.env"
   rm -f "$applied_revision_path"
+  local unhealthy_helper="$temporary/unhealthy-helper.sh"
+  cat >"$unhealthy_helper" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" != "verify" ]]
+EOF
+  chmod 0700 "$unhealthy_helper"
+  (
+    helper="$unhealthy_helper"
+    configure_helper_environment() {
+      HETERONETWORK_DB_NODE_NAME="db-a"
+      HETERONETWORK_DB_NODE_ADDRESS="100.123.154.79"
+      HETERONETWORK_DB_INTERFACE="tailscale0"
+      export HETERONETWORK_DB_NODE_NAME
+      export HETERONETWORK_DB_NODE_ADDRESS
+      export HETERONETWORK_DB_INTERFACE
+    }
+    systemctl() {
+      return 1
+    }
+    apply_local_bundle node-a 100.123.154.79 >/dev/null
+  )
+  [[ ! -e "$applied_revision_path" ]]
 
   printf '%s\n' \
     $'node-b\t10.250.0.3' \
