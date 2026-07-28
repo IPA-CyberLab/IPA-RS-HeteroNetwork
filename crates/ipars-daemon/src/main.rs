@@ -14014,6 +14014,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
         // Runtime churn must not starve the heartbeat long poll. A pending
         // notification is consumed below and starts the next cycle immediately.
         let response = send.await;
+        let peer_delta_available = heartbeat_response_has_peer_delta(&response);
         match response {
             Ok(response) => {
                 if let Err(error) = persist_agent_service_directory(
@@ -14036,7 +14037,6 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 let connection_intent_count = response.connection_intents.len();
                 apply_heartbeat_connection_intents(runtime.as_ref(), response.connection_intents)
                     .await;
-                notify_peer_map_sync_for_heartbeat(runtime.as_ref(), response.peer_delta_available);
                 tracing::info!(
                     accepted = response.accepted,
                     policy_version = response.policy_version,
@@ -14050,6 +14050,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
                 "failed to report agent heartbeat; will retry"
             ),
         }
+        notify_peer_map_sync_for_heartbeat(runtime.as_ref(), peer_delta_available);
         let remaining = cycle_interval.saturating_sub(cycle_started.elapsed());
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {}
@@ -14077,8 +14078,16 @@ async fn apply_heartbeat_connection_intents(
     }
 }
 
-fn notify_peer_map_sync_for_heartbeat(runtime: &AgentRuntime, _peer_delta_available: bool) {
-    runtime.peer_map_sync_notifier().notify_one();
+fn heartbeat_response_has_peer_delta(response: &anyhow::Result<HeartbeatResponse>) -> bool {
+    response
+        .as_ref()
+        .is_ok_and(|response| response.peer_delta_available)
+}
+
+fn notify_peer_map_sync_for_heartbeat(runtime: &AgentRuntime, peer_delta_available: bool) {
+    if peer_delta_available {
+        runtime.peer_map_sync_notifier().notify_one();
+    }
 }
 
 async fn send_heartbeat_to_control_planes(
@@ -20549,6 +20558,7 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use futures_util::FutureExt;
     use ipars_agent::AgentNodeState;
     use ipars_route_manager::PolicyRule;
     use ipars_types::api::{
@@ -21708,32 +21718,155 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn heartbeat_peer_delta_wakes_peer_map_sync() {
+    fn heartbeat_response(peer_delta_available: bool) -> HeartbeatResponse {
+        HeartbeatResponse {
+            accepted: true,
+            policy_version: 1,
+            peer_delta_available,
+            bootstrap_endpoints: Vec::new(),
+            connection_intents: Vec::new(),
+        }
+    }
+
+    fn peer_map_sync_notification_is_ready(notifier: &tokio::sync::Notify) -> bool {
+        notifier.notified().now_or_never().is_some()
+    }
+
+    #[test]
+    fn heartbeat_peer_delta_wakes_peer_map_sync() {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
         let notifier = runtime.peer_map_sync_notifier();
-        let notified = notifier.notified();
-        notify_peer_map_sync_for_heartbeat(&runtime, true);
-        assert!(tokio::time::timeout(Duration::from_millis(100), notified)
-            .await
-            .is_ok());
+        let response = Ok(heartbeat_response(true));
+
+        notify_peer_map_sync_for_heartbeat(&runtime, heartbeat_response_has_peer_delta(&response));
+
+        assert!(peer_map_sync_notification_is_ready(notifier.as_ref()));
+    }
+
+    #[test]
+    fn heartbeat_without_delta_does_not_wake_peer_map_sync() {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let notifier = runtime.peer_map_sync_notifier();
+        let response = Ok(heartbeat_response(false));
+
+        notify_peer_map_sync_for_heartbeat(&runtime, heartbeat_response_has_peer_delta(&response));
+
+        assert!(!peer_map_sync_notification_is_ready(notifier.as_ref()));
     }
 
     #[tokio::test]
-    async fn heartbeat_without_delta_also_wakes_peer_map_sync() {
+    async fn failed_heartbeat_does_not_wake_peer_map_sync() -> anyhow::Result<()> {
+        let state = AgentNodeState::generate(Utc::now());
+        let identity = state.identity_key_pair()?;
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let notifier = runtime.peer_map_sync_notifier();
+        let request = heartbeat_request(&runtime, &identity, None, None).await?;
+        let response =
+            send_heartbeat_to_control_planes(&reqwest::Client::new(), &[], request, Duration::ZERO)
+                .await;
+        assert!(response.is_err());
+
+        notify_peer_map_sync_for_heartbeat(&runtime, heartbeat_response_has_peer_delta(&response));
+
+        assert!(!peer_map_sync_notification_is_ready(notifier.as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_notifications_are_coalesced_without_a_delta_storm() {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
         let notifier = runtime.peer_map_sync_notifier();
-        let notified = notifier.notified();
-        notify_peer_map_sync_for_heartbeat(&runtime, false);
-        assert!(tokio::time::timeout(Duration::from_millis(100), notified)
-            .await
-            .is_ok());
+
+        for _ in 0..1_000 {
+            let response = Ok(heartbeat_response(false));
+            notify_peer_map_sync_for_heartbeat(
+                &runtime,
+                heartbeat_response_has_peer_delta(&response),
+            );
+        }
+        assert!(!peer_map_sync_notification_is_ready(notifier.as_ref()));
+
+        for _ in 0..1_000 {
+            let response = Ok(heartbeat_response(true));
+            notify_peer_map_sync_for_heartbeat(
+                &runtime,
+                heartbeat_response_has_peer_delta(&response),
+            );
+        }
+        assert!(peer_map_sync_notification_is_ready(notifier.as_ref()));
+        assert!(!peer_map_sync_notification_is_ready(notifier.as_ref()));
+    }
+
+    #[derive(Clone)]
+    struct PeriodicPeerMapSource {
+        fetches: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl PeerMapSource for PeriodicPeerMapSource {
+        async fn fetch_peer_map(&self, _node_id: &NodeId) -> Result<PeerMap, AgentError> {
+            let _ = self.fetches.send(());
+            Ok(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
+                generated_at: Utc::now(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PeriodicPeerMapSink;
+
+    #[async_trait]
+    impl PeerMapSink for PeriodicPeerMapSink {
+        async fn apply_peer_map_update(
+            &self,
+            _peer_map: PeerMap,
+        ) -> Result<ipars_agent::PeerMapApplySummary, AgentError> {
+            Ok(ipars_agent::PeerMapApplySummary {
+                peers_applied: 0,
+                peers_removed: 0,
+                routes_applied: 0,
+                routes_removed: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_map_sync_still_runs_on_its_regular_interval_without_notification(
+    ) -> anyhow::Result<()> {
+        let (fetches, mut observed_fetches) = tokio::sync::mpsc::unbounded_channel();
+        let sync = PeerMapSync::new(
+            NodeId::from_string("node-a"),
+            PeriodicPeerMapSource { fetches },
+            PeriodicPeerMapSink,
+        );
+        let task = tokio::spawn(run_peer_map_sync_loop(
+            sync,
+            Duration::from_millis(5),
+            "ipars-test".to_string(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), observed_fetches.recv())
+                .await?
+                .context("peer-map sync loop ended before the periodic fetch")?;
+        }
+
+        task.abort();
+        let _ = task.await;
+        Ok(())
     }
 
     async fn heartbeat_intent_runtime(
