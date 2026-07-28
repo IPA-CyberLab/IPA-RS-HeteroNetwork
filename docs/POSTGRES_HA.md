@@ -124,6 +124,159 @@ returns. Topology coordination automatically moves to the lowest currently
 active persisted database member, so loss of the original coordinator does not
 stop later certificate issuance or expansion.
 
+## Controlled Overlay-to-Underlay Migration
+
+Use `scripts/postgres-ha-underlay-migrate.sh` to move an existing cluster whose
+PostgreSQL and etcd member addresses use the HeteroNetwork overlay/VPN to an
+`underlay-v1` topology. The procedure retains the existing member names, CA,
+five generated cluster secrets, PostgreSQL data directory, and etcd data
+directory. `adopt-bundle` issues each member a replacement certificate with
+both its legacy VPN address and final underlay address as IP SANs.
+
+This script is not a backup tool. It creates no PostgreSQL base backup, WAL
+archive, etcd snapshot, or duplicate PostgreSQL/etcd data directory.
+`adopt-bundle` creates only the migration configuration and PKI bundle. None of
+the node commands initializes or replaces an existing data directory.
+
+### Prepare the Migration Bundle
+
+Stop and disable `heteronetwork-postgres-autopilot.service` on every current
+database member before adopting the bundle. Keep it disabled until the last
+step below. Confirm that all database members are healthy, every configured DCS
+endpoint passes authenticated `etcdctl endpoint health`, and every final
+underlay address and route satisfies the Network Plane Contract.
+
+Run `adopt-bundle` once from a root shell. Supply these environment variables:
+
+- `HETERONETWORK_DB_LEGACY_MEMBERS`: the existing
+  `name=overlay-or-VPN-IP` map;
+- `HETERONETWORK_DB_MEMBERS`: the final `name=underlay-IP` map, with the same
+  member names in the same order;
+- `HETERONETWORK_DB_MEMBER_IDENTITIES`: the existing
+  `name=HeteroNetwork-node-id` map;
+- `HETERONETWORK_DB_LEGACY_DCS_MEMBERS`: the existing voter map, if it cannot
+  be derived from the legacy member map;
+- `HETERONETWORK_DB_DCS_MEMBERS`: the final odd three-to-nine-voter map;
+- `HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS`: the same value as the final voter
+  map;
+- `HETERONETWORK_DB_TOPOLOGY_REVISION`: a new, positive topology revision.
+
+Preserve the existing client CIDRs and extra HBA entries with
+`HETERONETWORK_DB_CLIENT_CIDRS` and
+`HETERONETWORK_DB_EXTRA_HBA_ENTRIES`. The output path must be absolute, must
+differ from the legacy bundle path, and must not already exist:
+
+```bash
+scripts/postgres-ha-underlay-migrate.sh adopt-bundle \
+  "$MIGRATION_BUNDLE_DIR" "$LEGACY_BUNDLE_DIR"
+```
+
+Distribute that exact root-only migration bundle to every current database
+member. For every node command below, set
+`HETERONETWORK_DB_BUNDLE_DIR` to the local copy,
+`HETERONETWORK_DB_NODE_NAME` to that node's retained member name, and
+`HETERONETWORK_DB_INTERFACE` to the interface that owns its final underlay
+address. The interface must not be `heteronetwork0`. Set
+`HETERONETWORK_DB_LEGACY_INTERFACE` only when the legacy address is not on the
+default `heteronetwork0` interface.
+
+### Required Sequence
+
+Treat every operation that reloads or restarts Patroni or etcd as a serial
+operation. Never run migration commands concurrently on different nodes, and
+never restart two Patroni members or two etcd voters at the same time. Before
+the first operation and after every command, require every configured DCS
+endpoint, not merely a quorum, to be healthy. During the mixed phase, test each
+voter at its currently advertised client address: legacy for a voter not yet
+migrated and underlay for a migrated voter. Do not continue while any endpoint
+is unhealthy.
+
+1. Run `prepare-node` on every Patroni member, one node at a time:
+
+   ```bash
+   sudo env \
+     HETERONETWORK_DB_BUNDLE_DIR="$MIGRATION_BUNDLE_DIR" \
+     HETERONETWORK_DB_NODE_NAME="$NODE_NAME" \
+     HETERONETWORK_DB_INTERFACE="$UNDERLAY_INTERFACE" \
+     scripts/postgres-ha-underlay-migrate.sh prepare-node
+   ```
+
+   This installs the dual-SAN certificate and transition material, reloads
+   Patroni with both legacy and underlay DCS client endpoints, and verifies the
+   local Patroni role. On a DCS voter it also restarts the local etcd service
+   with dual legacy/underlay client and peer listeners while its advertised
+   peer URL remains the legacy URL. Complete this step on all members before
+   changing any etcd member URL.
+
+2. Run `migrate-dcs-node` on exactly one DCS voter at a time:
+
+   ```bash
+   sudo env \
+     HETERONETWORK_DB_BUNDLE_DIR="$MIGRATION_BUNDLE_DIR" \
+     HETERONETWORK_DB_NODE_NAME="$NODE_NAME" \
+     HETERONETWORK_DB_INTERFACE="$UNDERLAY_INTERFACE" \
+     scripts/postgres-ha-underlay-migrate.sh migrate-dcs-node
+   ```
+
+   The command requires every DCS endpoint to be healthy before it calls
+   `etcdctl member update`, changes only the local voter's peer URL, installs
+   its final underlay-only etcd configuration, restarts that voter, and then
+   requires every DCS endpoint to be healthy again. Wait for this command and
+   the full endpoint-health gate to finish before selecting the next voter.
+
+3. After every voter advertises its final underlay peer URL and all DCS
+   endpoints are healthy, run `apply-node` on every Patroni member, one node at
+   a time:
+
+   ```bash
+   sudo env \
+     HETERONETWORK_DB_BUNDLE_DIR="$MIGRATION_BUNDLE_DIR" \
+     HETERONETWORK_DB_NODE_NAME="$NODE_NAME" \
+     HETERONETWORK_DB_INTERFACE="$UNDERLAY_INTERFACE" \
+     scripts/postgres-ha-underlay-migrate.sh apply-node
+   ```
+
+   This applies the final `underlay-v1` Patroni member map and HAProxy backend
+   map, explicitly restarts the local Patroni service, verifies a healthy local
+   database role on the underlay address, and verifies that the PostgreSQL and
+   etcd data-directory identities did not change. Do not apply the next member
+   until the restarted member and every DCS endpoint are healthy.
+
+4. After `apply-node` has succeeded on every member, remove legacy DCS
+   forwarders on each DCS voter:
+
+   ```bash
+   sudo env \
+     HETERONETWORK_DB_BUNDLE_DIR="$MIGRATION_BUNDLE_DIR" \
+     HETERONETWORK_DB_NODE_NAME="$NODE_NAME" \
+     HETERONETWORK_DB_INTERFACE="$UNDERLAY_INTERFACE" \
+     scripts/postgres-ha-underlay-migrate.sh cleanup-legacy-forwarders
+   ```
+
+   Cleanup is gated on every voter having its final peer URL, every DCS endpoint
+   being healthy, the local etcd configuration being underlay-only, and the
+   local native underlay endpoint being healthy. It removes only the obsolete
+   `heteronetwork-dcs-ingress-{79,80}.service` and
+   `heteronetwork-dcs-proxy-*-{79,80}.service` units.
+
+5. After forwarder cleanup and one final all-endpoint health check, start the
+   autopilot on every final database member, one node at a time:
+
+   ```bash
+   sudo systemctl enable --now heteronetwork-postgres-autopilot.service
+   ```
+
+If a command or health gate fails, stop the sequence and leave all later nodes
+unchanged. Correct reachability, certificate, or service health on the current
+node, then rerun the same command. A failed etcd member update restores a fresh
+transition configuration; if the member update succeeded but the following
+restart or health gate failed, repair and retry that same voter because its DCS
+membership already contains the underlay peer URL. Do not delete or reinitialize
+PostgreSQL or etcd data, do not advance to another voter, and do not attempt a
+parallel rollback. Once a peer URL has changed, returning the whole cluster to
+legacy VPN addresses is a separate controlled migration, not an automatic
+rollback performed by this script.
+
 ## Replicated Bootstrap Material
 
 The database CA, per-member certificates, and generated database credentials
