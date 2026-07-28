@@ -1524,7 +1524,7 @@ struct AdminNodeEnrollmentRequest {
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
-    allow_relay: bool,
+    disable_relay: bool,
     #[serde(default)]
     reusable: bool,
     max_uses: Option<u32>,
@@ -1642,6 +1642,7 @@ where
             "Kubernetes HA control-plane enrollment must be reusable with exactly {KUBERNETES_HA_CONTROL_PLANE_COUNT} uses"
         )));
     }
+    let allow_relay = !request.disable_relay;
     if request.tags.len() > MAX_JOIN_TOKEN_TAGS {
         return Err(NodeEnrollmentApiError::bad_request(format!(
             "no more than {MAX_JOIN_TOKEN_TAGS} tags may be requested"
@@ -1681,7 +1682,7 @@ where
         .enrollment_service_directory(Duration::from_secs(enrollment.max_ttl_seconds))
         .await
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
-    require_ha_node_enrollment_directory(&directory, request.allow_relay)?;
+    require_ha_node_enrollment_directory(&directory, allow_relay)?;
 
     let now = Utc::now();
     let expires_at = now
@@ -1709,7 +1710,7 @@ where
         key_id: enrollment.key_id.clone(),
         policy: TokenPolicy {
             allow_join: true,
-            allow_relay: request.allow_relay,
+            allow_relay,
             allowed_routes: Vec::new(),
             allowed_tags: tags,
             max_token_uses: Some(max_uses),
@@ -2153,6 +2154,21 @@ fn node_enrollment_install_script(
     const TEMPLATE: &str = r#"#!/bin/sh
 set -eu
 
+relay_enabled=1
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --disable-relay)
+      relay_enabled=0
+      ;;
+    *)
+      echo "Unknown HeteroNetwork installer argument: $1" >&2
+      echo "Usage: $0 [--disable-relay]" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "HeteroNetwork installation must run as root" >&2
   exit 1
@@ -2396,7 +2412,8 @@ fn relay_admission_install_script(
     }
     let encoded_bearer_token = STANDARD.encode(enrollment.relay_admission_bearer_token.as_bytes());
     format!(
-        r#"install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
+        r#"if [ "$relay_enabled" -eq 1 ]; then
+  install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
 printf '%s' '{encoded_bearer_token}' | base64 -d >{TOKEN_PATH}
 chown root:root {TOKEN_PATH}
 chmod 0600 {TOKEN_PATH}
@@ -2406,6 +2423,9 @@ Environment=HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH={TOKEN_PATH}
 HETERONETWORK_RELAY_ADMISSION_UNIT
 chown root:root {DROP_IN_PATH}
 chmod 0644 {DROP_IN_PATH}
+else
+  rm -f {TOKEN_PATH} {DROP_IN_PATH}
+fi
 "#
     )
 }
@@ -2572,7 +2592,7 @@ fn node_enrollment_install_command(
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "sh -c 'set -eu; tmp=$(mktemp); trap \"rm -f \\\"$tmp\\\"\" EXIT HUP INT TERM; auth=\"{encoded_token}\"; for encoded_base in {script_bases}; do base=$(printf \"%s\" \"$encoded_base\" | base64 -d) || continue; if curl -fsS -H \"Authorization: {NODE_ENROLLMENT_AUTH_SCHEME} $auth\" \"$base/v1/install/linux-amd64.sh\" -o \"$tmp\"; then sudo sh \"$tmp\"; exit; fi; done; echo \"HeteroNetwork installer download failed on every control-plane endpoint\" >&2; exit 1'"
+        "sh -c 'set -eu; tmp=$(mktemp); trap \"rm -f \\\"$tmp\\\"\" EXIT HUP INT TERM; auth=\"{encoded_token}\"; for encoded_base in {script_bases}; do base=$(printf \"%s\" \"$encoded_base\" | base64 -d) || continue; if curl -fsS -H \"Authorization: {NODE_ENROLLMENT_AUTH_SCHEME} $auth\" \"$base/v1/install/linux-amd64.sh\" -o \"$tmp\"; then sudo sh \"$tmp\" \"$@\"; exit; fi; done; echo \"HeteroNetwork installer download failed on every control-plane endpoint\" >&2; exit 1' sh"
     )
 }
 
@@ -4462,7 +4482,6 @@ mod tests {
             "expires_in_seconds": 86_400,
             "role": "edge",
             "tags": ["production", "linux"],
-            "allow_relay": true,
             "reusable": false,
             "max_uses": 1
         });
@@ -4478,6 +4497,27 @@ mod tests {
             )
             .await?;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let legacy_relay_toggle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(
+                        r#"{"expires_in_seconds":86400,"allow_relay":true}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(
+            legacy_relay_toggle.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
 
         let response = app
             .clone()
@@ -4553,6 +4593,8 @@ mod tests {
         assert!(generated_script.contains("Automatic PostgreSQL HA placement scheduled"));
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
+        assert!(generated_script.contains("Usage: $0 [--disable-relay]"));
+        assert!(generated_script.contains("if [ \"$relay_enabled\" -eq 1 ]; then"));
         assert!(generated_script.contains("/etc/heteronetwork/relay-admission.token"));
         assert!(generated_script.contains(
             "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
@@ -4562,12 +4604,14 @@ mod tests {
             "printf '%s' '{encoded_relay_bearer}' | base64 -d >/etc/heteronetwork/relay-admission.token"
         )));
         assert!(!generated_script.contains(RELAY_ADMISSION_BEARER_TOKEN));
+        assert!(install_command.contains("sudo sh \"$tmp\" \"$@\""));
+        assert!(install_command.ends_with("' sh"));
 
         let no_relay_request_body = serde_json::json!({
             "expires_in_seconds": 86_400,
             "role": "worker",
             "tags": ["no-relay"],
-            "allow_relay": false,
+            "disable_relay": true,
             "reusable": false,
             "max_uses": 1
         });
@@ -4592,6 +4636,9 @@ mod tests {
         let no_relay_script = no_relay_response["install_script"]
             .as_str()
             .ok_or("non-relay enrollment response omitted the install script")?;
+        let no_relay_token: SignedJoinToken =
+            serde_json::from_value(no_relay_response["token"].clone())?;
+        assert!(!no_relay_token.claims.policy.allow_relay);
         assert!(no_relay_script.contains(
             "rm -f /etc/heteronetwork/relay-admission.token /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf"
         ));
@@ -4601,7 +4648,6 @@ mod tests {
             "expires_in_seconds": 86_400,
             "role": "worker",
             "tags": ["production"],
-            "allow_relay": true,
             "reusable": true,
             "max_uses": KUBERNETES_HA_CONTROL_PLANE_COUNT,
             "setup": "kubernetes_ha_control_plane"
@@ -4691,7 +4737,6 @@ mod tests {
             "expires_in_seconds": 86_400,
             "role": "worker",
             "tags": [],
-            "allow_relay": true,
             "reusable": true,
             "max_uses": 4,
             "setup": "kubernetes_ha_control_plane"
@@ -4719,7 +4764,6 @@ mod tests {
             "expires_in_seconds": 86_400,
             "role": "edge",
             "tags": ["kubernetes-ha-0123456789abcdef"],
-            "allow_relay": false,
             "reusable": false,
             "max_uses": 1
         });
@@ -4743,7 +4787,6 @@ mod tests {
             "expires_in_seconds": 86_400,
             "role": "worker",
             "tags": ["kubernetes-control-plane"],
-            "allow_relay": false,
             "reusable": false,
             "max_uses": 1
         });
@@ -5321,7 +5364,7 @@ mod tests {
             expires_in_seconds: 86_400,
             role: "edge".to_string(),
             tags: Vec::new(),
-            allow_relay: false,
+            disable_relay: false,
             reusable: true,
             max_uses: Some(1),
             setup: NodeEnrollmentSetup::NetworkOnly,

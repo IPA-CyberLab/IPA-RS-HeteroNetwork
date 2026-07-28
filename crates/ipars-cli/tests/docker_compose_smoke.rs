@@ -1593,7 +1593,6 @@ fn generated_dataplane_ha_join_token(
         "--ttl-seconds",
         "3600",
         "--unlimited-uses",
-        "--allow-relay",
         "--allowed-route",
         "100.64.0.0/10",
     ]);
@@ -1641,7 +1640,6 @@ fn generated_init_output(relay_udp_port: u16) -> Result<Value> {
             "--bootstrap-scheme",
             "http",
             "--emit-issuer-private-key",
-            "--allow-relay",
             "--relay-admission-bearer-token-path",
             relay_admission_token_path
                 .to_str()

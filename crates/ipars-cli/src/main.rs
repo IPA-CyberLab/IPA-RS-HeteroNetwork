@@ -350,7 +350,7 @@ struct InitArgs {
     #[arg(long = "allowed-route")]
     allowed_routes: Vec<ipnet::IpNet>,
     #[arg(long, default_value_t = false)]
-    allow_relay: bool,
+    disable_relay: bool,
     #[arg(long, conflicts_with = "unlimited_uses")]
     max_uses: Option<u32>,
     #[arg(long, default_value_t = false)]
@@ -386,7 +386,11 @@ struct InitArgs {
     relay_http_listen: SocketAddr,
     #[arg(long)]
     relay_admission_url: Option<String>,
-    #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
+    #[arg(
+        long,
+        env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH",
+        conflicts_with = "disable_relay"
+    )]
     relay_admission_bearer_token_path: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:9781")]
     relay_agent_listen: SocketAddr,
@@ -510,7 +514,7 @@ struct TokenCreateArgs {
     #[arg(long, default_value_t = false)]
     allow_degraded_service_directory: bool,
     #[arg(long, default_value_t = false)]
-    allow_relay: bool,
+    disable_relay: bool,
     #[arg(long, conflicts_with = "unlimited_uses")]
     max_uses: Option<u32>,
     #[arg(long, default_value_t = false)]
@@ -1581,6 +1585,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
     validate_init_bootstrap_inputs(&args)?;
+    let allow_relay = !args.disable_relay;
     let identity = issuer_key_from_source(
         args.issuer_private_key_b64.as_deref(),
         args.issuer_private_key_path.as_deref(),
@@ -1603,20 +1608,18 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         args.token_ttl_seconds,
         bootstrap_endpoints.clone(),
         TokenPolicyInput {
-            allow_relay: args.allow_relay,
+            allow_relay,
             allowed_routes: args.allowed_routes.clone(),
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
     )?;
     let token = identity.sign_join_token(claims)?;
-    let relay_admission_bearer_token_path = if args.allow_relay
-        && (args.spawn_daemons || args.relay_admission_bearer_token_path.is_some())
-    {
+    let relay_admission_bearer_token_path = if allow_relay {
         Some(prepare_init_relay_admission_token(&args)?)
     } else {
         None
     };
-    let relay_agent = if args.allow_relay {
+    let relay_agent = if allow_relay {
         Some(prepare_init_relay_agent(
             &args,
             &identity,
@@ -1654,9 +1657,9 @@ fn init(args: InitArgs) -> anyhow::Result<InitOutput> {
         "control-plane".to_string(),
         "signal".to_string(),
         "stun".to_string(),
-        "relay".to_string(),
     ];
-    if relay_agent.is_some() {
+    if allow_relay {
+        services.push("relay".to_string());
         services.push("relay-agent".to_string());
     }
 
@@ -1693,7 +1696,14 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
     validate_listen_port_for_bootstrap(args.control_plane_listen, "--control-plane-listen")?;
     validate_listen_port_for_bootstrap(args.signal_listen, "--signal-listen")?;
     validate_listen_port_for_bootstrap(args.stun_listen, "--stun-listen")?;
-    validate_listen_port_for_bootstrap(args.relay_agent_listen, "--relay-agent-listen")?;
+    if !args.disable_relay {
+        validate_listen_port_for_bootstrap(args.relay_agent_listen, "--relay-agent-listen")?;
+        if args.relay_http_listen.port() == 0 && args.relay_admission_url.is_none() {
+            anyhow::bail!(
+                "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
+            );
+        }
+    }
     anyhow::ensure!(
         args.daemon_ready_timeout_seconds > 0,
         "--daemon-ready-timeout-seconds must be greater than zero"
@@ -1702,21 +1712,11 @@ fn validate_init_bootstrap_inputs(args: &InitArgs) -> anyhow::Result<()> {
         args.daemon_ready_timeout_seconds <= MAX_INIT_DAEMON_READY_TIMEOUT_SECONDS,
         "--daemon-ready-timeout-seconds must be at most {MAX_INIT_DAEMON_READY_TIMEOUT_SECONDS}"
     );
-    if args.relay_http_listen.port() == 0 && args.relay_admission_url.is_none() {
-        anyhow::bail!(
-            "--relay-http-listen must use a nonzero port when --relay-admission-url is omitted"
-        );
-    }
     if let Some(path) = args.control_plane_operator_api_bearer_token_path.as_deref() {
         read_api_bearer_token_file(path, "control-plane operator API")?;
     }
-    if args.relay_admission_bearer_token_path.is_some() && !args.allow_relay {
-        anyhow::bail!("--relay-admission-bearer-token-path requires --allow-relay");
-    }
-    if args.allow_relay && !args.spawn_daemons && args.relay_admission_bearer_token_path.is_none() {
-        anyhow::bail!(
-            "--relay-admission-bearer-token-path is required with --allow-relay when --spawn-daemons is not set"
-        );
+    if args.disable_relay && args.relay_admission_bearer_token_path.is_some() {
+        anyhow::bail!("--relay-admission-bearer-token-path cannot be used with --disable-relay");
     }
     Ok(())
 }
@@ -1764,14 +1764,6 @@ fn init_daemon_specs(
 ) -> Vec<InitDaemonSpec> {
     let log_dir = args.daemon_state_dir.join("logs");
     let control_plane_database_url = effective_control_plane_database_url(args);
-    let relay_admission_url = args.relay_admission_url.clone().unwrap_or_else(|| {
-        format!(
-            "{}://{}:{}",
-            args.bootstrap_scheme,
-            args.public_endpoint.ip(),
-            args.relay_http_listen.port()
-        )
-    });
     let mut stun_args = vec![
         "stun".to_string(),
         "--listen".to_string(),
@@ -1819,34 +1811,16 @@ fn init_daemon_specs(
             "udp://{}",
             SocketAddr::new(args.public_endpoint.ip(), args.stun_listen.port())
         ),
-        "--advertise-relay-url".to_string(),
-        format!("udp://{}", args.public_endpoint),
     ];
+    if !args.disable_relay {
+        control_plane_args.push("--advertise-relay-url".to_string());
+        control_plane_args.push(format!("udp://{}", args.public_endpoint));
+    }
     if let Some(path) = args.control_plane_operator_api_bearer_token_path.as_ref() {
         control_plane_args.push("--operator-api-bearer-token-path".to_string());
         control_plane_args.push(path.display().to_string());
     }
 
-    let relay_node_id = relay_agent
-        .map(|agent| agent.node_id.clone())
-        .unwrap_or_else(|| node_id.clone());
-    let mut relay_args = vec![
-        "relay".to_string(),
-        "--relay-node-id".to_string(),
-        relay_node_id.as_str().to_string(),
-        "--udp-listen".to_string(),
-        args.relay_udp_listen.to_string(),
-        "--http-listen".to_string(),
-        args.relay_http_listen.to_string(),
-        "--public-endpoint".to_string(),
-        args.public_endpoint.to_string(),
-        "--admission-url".to_string(),
-        relay_admission_url.clone(),
-    ];
-    if let Some(path) = relay_admission_bearer_token_path {
-        relay_args.push("--admission-bearer-token-path".to_string());
-        relay_args.push(path.display().to_string());
-    }
     let mut specs = vec![
         InitDaemonSpec {
             service: "control-plane",
@@ -1872,13 +1846,45 @@ fn init_daemon_specs(
             log_path: log_dir.join("stun.log"),
             health_listen: local_health_listen(args.stun_http_listen),
         },
-        InitDaemonSpec {
-            service: "relay",
-            args: relay_args,
-            log_path: log_dir.join("relay.log"),
-            health_listen: local_health_listen(args.relay_http_listen),
-        },
     ];
+    if args.disable_relay {
+        return specs;
+    }
+
+    let relay_admission_url = args.relay_admission_url.clone().unwrap_or_else(|| {
+        format!(
+            "{}://{}:{}",
+            args.bootstrap_scheme,
+            args.public_endpoint.ip(),
+            args.relay_http_listen.port()
+        )
+    });
+    let relay_node_id = relay_agent
+        .map(|agent| agent.node_id.clone())
+        .unwrap_or_else(|| node_id.clone());
+    let mut relay_args = vec![
+        "relay".to_string(),
+        "--relay-node-id".to_string(),
+        relay_node_id.as_str().to_string(),
+        "--udp-listen".to_string(),
+        args.relay_udp_listen.to_string(),
+        "--http-listen".to_string(),
+        args.relay_http_listen.to_string(),
+        "--public-endpoint".to_string(),
+        args.public_endpoint.to_string(),
+        "--admission-url".to_string(),
+        relay_admission_url.clone(),
+    ];
+    if let Some(path) = relay_admission_bearer_token_path {
+        relay_args.push("--admission-bearer-token-path".to_string());
+        relay_args.push(path.display().to_string());
+    }
+    specs.push(InitDaemonSpec {
+        service: "relay",
+        args: relay_args,
+        log_path: log_dir.join("relay.log"),
+        health_listen: local_health_listen(args.relay_http_listen),
+    });
     if let Some(relay_agent) = relay_agent {
         specs.push(InitDaemonSpec {
             service: "relay-agent",
@@ -2676,7 +2682,7 @@ async fn create_token_with_service_directory(
     }
     validate_service_directory_for_token(
         &directory,
-        args.allow_relay,
+        !args.disable_relay,
         args.allow_degraded_service_directory,
     )?;
 
@@ -2845,6 +2851,7 @@ fn validate_service_directory_for_token(
 }
 
 fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
+    let allow_relay = !args.disable_relay;
     let issuer = issuer_key_from_source(
         args.issuer_private_key_b64.as_deref(),
         args.issuer_private_key_path.as_deref(),
@@ -2866,7 +2873,7 @@ fn create_token(args: TokenCreateArgs) -> anyhow::Result<SignedJoinToken> {
         args.ttl_seconds,
         bootstrap_endpoints,
         TokenPolicyInput {
-            allow_relay: args.allow_relay,
+            allow_relay,
             allowed_routes: args.allowed_routes,
             max_token_uses: max_token_uses(args.max_uses, args.unlimited_uses),
         },
@@ -2903,12 +2910,14 @@ fn token_create_bootstrap_endpoints(
             "--stun-bootstrap",
         )?);
     }
-    for url in &args.relay_bootstrap_endpoints {
-        endpoints.push(validated_bootstrap_endpoint(
-            url,
-            BootstrapEndpointKind::Relay,
-            "--relay-bootstrap",
-        )?);
+    if !args.disable_relay {
+        for url in &args.relay_bootstrap_endpoints {
+            endpoints.push(validated_bootstrap_endpoint(
+                url,
+                BootstrapEndpointKind::Relay,
+                "--relay-bootstrap",
+            )?);
+        }
     }
     for url in &args.web_ui_bootstrap_endpoints {
         endpoints.push(validated_bootstrap_endpoint(
@@ -6113,7 +6122,7 @@ fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
     let control_plane = SocketAddr::new(host, args.control_plane_listen.port());
     let signal = SocketAddr::new(host, args.signal_listen.port());
     let stun = SocketAddr::new(host, args.stun_listen.port());
-    vec![
+    let mut endpoints = vec![
         BootstrapEndpoint {
             url: format!("{}://{control_plane}", args.bootstrap_scheme),
             kind: BootstrapEndpointKind::ControlPlane,
@@ -6126,11 +6135,14 @@ fn bootstrap_from_public_endpoint(args: &InitArgs) -> Vec<BootstrapEndpoint> {
             url: format!("udp://{stun}"),
             kind: BootstrapEndpointKind::Stun,
         },
-        BootstrapEndpoint {
+    ];
+    if !args.disable_relay {
+        endpoints.push(BootstrapEndpoint {
             url: format!("udp://{}", args.public_endpoint),
             kind: BootstrapEndpointKind::Relay,
-        },
-    ]
+        });
+    }
+    endpoints
 }
 
 #[cfg(test)]
@@ -10885,7 +10897,7 @@ mod tests {
             default_role: "edge".to_string(),
             tags: Vec::new(),
             allowed_routes: Vec::new(),
-            allow_relay: true,
+            disable_relay: false,
             max_uses: Some(10),
             unlimited_uses: false,
             spawn_daemons: false,
@@ -11597,7 +11609,7 @@ mod tests {
             web_ui_bootstrap_endpoints: Vec::new(),
             service_directory_url: None,
             allow_degraded_service_directory: false,
-            allow_relay: true,
+            disable_relay: false,
             max_uses: Some(7),
             unlimited_uses: false,
         })?;
@@ -11639,7 +11651,7 @@ mod tests {
                 web_ui_bootstrap_endpoints: Vec::new(),
                 service_directory_url: None,
                 allow_degraded_service_directory: false,
-                allow_relay: false,
+                disable_relay: true,
                 max_uses: Some(1),
                 unlimited_uses: false,
             }
@@ -11769,7 +11781,7 @@ mod tests {
     fn init_rejects_invalid_default_token_claim_inputs() -> anyhow::Result<()> {
         let error = match init(InitArgs {
             default_role: "edge role".to_string(),
-            allow_relay: false,
+            disable_relay: true,
             ..valid_init_args()
         }) {
             Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
@@ -11781,7 +11793,7 @@ mod tests {
 
         let error = match init(InitArgs {
             allowed_routes: vec!["0.0.0.0/0".parse()?],
-            allow_relay: false,
+            disable_relay: true,
             ..valid_init_args()
         }) {
             Ok(output) => anyhow::bail!("unexpected valid init output: {output:?}"),
@@ -11792,7 +11804,7 @@ mod tests {
             .contains("--allowed-route must not include unrestricted"));
 
         let mut args = valid_init_args();
-        args.allow_relay = false;
+        args.disable_relay = true;
         args.relay_admission_bearer_token_path = Some(temp_path("unused-relay-token"));
         let error = match init(args) {
             Ok(output) => {
@@ -11802,7 +11814,7 @@ mod tests {
         };
         assert!(error
             .to_string()
-            .contains("--relay-admission-bearer-token-path requires --allow-relay"));
+            .contains("--relay-admission-bearer-token-path cannot be used with --disable-relay"));
         Ok(())
     }
 
@@ -11826,7 +11838,7 @@ mod tests {
             web_ui_bootstrap_endpoints: vec!["https://console.example".to_string()],
             service_directory_url: None,
             allow_degraded_service_directory: false,
-            allow_relay: false,
+            disable_relay: false,
             max_uses: Some(1),
             unlimited_uses: false,
         })?;
@@ -11886,7 +11898,7 @@ mod tests {
             web_ui_bootstrap_endpoints: Vec::new(),
             service_directory_url: None,
             allow_degraded_service_directory: false,
-            allow_relay: false,
+            disable_relay: true,
             max_uses: Some(1),
             unlimited_uses: false,
         };
@@ -11921,12 +11933,11 @@ mod tests {
             "203.0.113.10:51820",
             "--allowed-route",
             "10.43.0.0/16",
-            "--allow-relay",
             "--unlimited-uses",
         ])?;
         if let Command::Init(args) = init.command {
             assert_eq!(args.allowed_routes, vec!["10.43.0.0/16".parse()?]);
-            assert!(args.allow_relay);
+            assert!(!args.disable_relay);
             assert!(args.unlimited_uses);
             assert_eq!(
                 args.stun_alternate_listen,
@@ -11961,6 +11972,7 @@ mod tests {
         {
             assert_eq!(args.allowed_routes, vec!["10.42.0.0/16".parse()?]);
             assert_eq!(args.max_uses, Some(7));
+            assert!(!args.disable_relay);
             assert!(!args.unlimited_uses);
             assert_eq!(
                 token_create_bootstrap_endpoints(&args)?,
@@ -11994,6 +12006,128 @@ mod tests {
     }
 
     #[test]
+    fn relay_policy_disable_flags_parse_and_old_allow_flags_are_rejected() -> anyhow::Result<()> {
+        let init = Cli::try_parse_from([
+            "ipars",
+            "init",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--disable-relay",
+        ])?;
+        let Command::Init(args) = init.command else {
+            anyhow::bail!("expected init command");
+        };
+        assert!(args.disable_relay);
+
+        let token = Cli::try_parse_from([
+            "ipars",
+            "token",
+            "create",
+            "--bootstrap",
+            "https://203.0.113.10:8443",
+            "--disable-relay",
+            "--relay-bootstrap",
+            "udp://203.0.113.10:51820",
+        ])?;
+        let Command::Token {
+            command: TokenCommand::Create(args),
+        } = token.command
+        else {
+            anyhow::bail!("expected token create command");
+        };
+        assert!(args.disable_relay);
+        let token = create_token(*args)?;
+        assert!(!token.claims.policy.allow_relay);
+        assert!(!token
+            .claims
+            .bootstrap_endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == BootstrapEndpointKind::Relay));
+
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "init",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--allow-relay",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "token",
+            "create",
+            "--bootstrap",
+            "https://203.0.113.10:8443",
+            "--allow-relay",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ipars",
+            "init",
+            "--public-endpoint",
+            "203.0.113.10:51820",
+            "--disable-relay",
+            "--relay-admission-bearer-token-path",
+            "/tmp/relay-admission.token",
+        ])
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn init_disable_relay_omits_relay_listener_agent_and_endpoints() -> anyhow::Result<()> {
+        let mut args = valid_init_args();
+        args.disable_relay = true;
+        args.daemon_state_dir = temp_path("disabled-relay-bootstrap");
+        args.relay_udp_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        args.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        args.relay_agent_listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        args.relay_admission_url = None;
+        let state_dir = args.daemon_state_dir.clone();
+
+        let output = init(args)?;
+        assert!(!output.join_token.claims.policy.allow_relay);
+        assert!(output.relay_admission_bearer_token_path.is_none());
+        assert_eq!(
+            output.services,
+            vec![
+                "control-plane".to_string(),
+                "signal".to_string(),
+                "stun".to_string(),
+            ]
+        );
+        assert_eq!(
+            output
+                .daemon_commands
+                .iter()
+                .map(|command| command.service.as_str())
+                .collect::<Vec<_>>(),
+            vec!["control-plane", "signal", "stun"]
+        );
+        assert!(!output
+            .bootstrap_endpoints
+            .iter()
+            .any(|endpoint| { endpoint.kind == BootstrapEndpointKind::Relay }));
+        assert!(!output
+            .join_token
+            .claims
+            .bootstrap_endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == BootstrapEndpointKind::Relay));
+        let control_plane = output
+            .daemon_commands
+            .iter()
+            .find(|command| command.service == "control-plane")
+            .context("expected control-plane daemon command")?;
+        assert!(!control_plane
+            .command
+            .iter()
+            .any(|value| value == "--advertise-relay-url"));
+        assert!(!state_dir.exists());
+        Ok(())
+    }
+
+    #[test]
     fn token_create_rejects_bootstrap_endpoint_scheme_mismatches() -> anyhow::Result<()> {
         let http_for_stun = TokenCreateArgs {
             cluster_id: None,
@@ -12012,7 +12146,7 @@ mod tests {
             web_ui_bootstrap_endpoints: Vec::new(),
             service_directory_url: None,
             allow_degraded_service_directory: false,
-            allow_relay: false,
+            disable_relay: true,
             max_uses: Some(1),
             unlimited_uses: false,
         };
@@ -12057,7 +12191,7 @@ mod tests {
                 web_ui_bootstrap_endpoints: Vec::new(),
                 service_directory_url: None,
                 allow_degraded_service_directory: false,
-                allow_relay: false,
+                disable_relay: true,
                 max_uses: Some(1),
                 unlimited_uses: false,
             }
@@ -12110,6 +12244,7 @@ mod tests {
         let udp_zero_port = TokenCreateArgs {
             relay_bootstrap_endpoints: vec!["udp://203.0.113.10:0".to_string()],
             web_ui_bootstrap_endpoints: Vec::new(),
+            disable_relay: false,
             ..token_args()
         };
         let Err(error) = token_create_bootstrap_endpoints(&udp_zero_port) else {
@@ -12172,11 +12307,23 @@ mod tests {
             .to_string()
             .contains("nonzero port when --relay-admission-url is omitted"));
 
-        let mut explicit_admission = valid_init_args();
-        explicit_admission.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
-        explicit_admission.relay_admission_url = Some("http://relay.example.test:9580".to_string());
-        explicit_admission.allow_relay = false;
-        assert!(init(explicit_admission).is_ok());
+        let mut zero_relay_agent = valid_init_args();
+        zero_relay_agent.relay_agent_listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        let Err(error) = init(zero_relay_agent) else {
+            panic!("port-zero relay agent listen should fail");
+        };
+        assert!(error.to_string().contains("--relay-agent-listen"));
+        assert!(error
+            .to_string()
+            .contains("nonzero port for bootstrap token generation"));
+
+        let mut disabled_relay = valid_init_args();
+        disabled_relay.disable_relay = true;
+        disabled_relay.relay_udp_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        disabled_relay.relay_http_listen = SocketAddr::from(([0, 0, 0, 0], 0));
+        disabled_relay.relay_agent_listen = SocketAddr::from(([127, 0, 0, 1], 0));
+        disabled_relay.relay_admission_url = None;
+        assert!(init(disabled_relay).is_ok());
     }
 
     #[test]
@@ -12215,7 +12362,7 @@ mod tests {
             default_role: "edge".to_string(),
             tags: Vec::new(),
             allowed_routes: vec!["10.43.0.0/16".parse()?],
-            allow_relay: true,
+            disable_relay: false,
             max_uses: None,
             unlimited_uses: true,
             spawn_daemons: false,
@@ -12337,7 +12484,7 @@ mod tests {
             default_role: "edge".to_string(),
             tags: Vec::new(),
             allowed_routes: Vec::new(),
-            allow_relay: true,
+            disable_relay: false,
             max_uses: Some(10),
             unlimited_uses: false,
             spawn_daemons: false,
@@ -12531,29 +12678,49 @@ mod tests {
     }
 
     #[test]
-    fn init_without_spawn_requires_explicit_relay_admission_state() -> anyhow::Result<()> {
+    fn init_without_spawn_generates_default_relay_admission_state() -> anyhow::Result<()> {
         let mut args = valid_init_args();
         args.daemon_state_dir = temp_path("manual-bootstrap-state");
         let state_dir = args.daemon_state_dir.clone();
 
-        let error = match init(args) {
-            Ok(output) => anyhow::bail!(
-                "manual relay bootstrap without an admission token path was accepted: {output:?}"
-            ),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains(
-            "--relay-admission-bearer-token-path is required with --allow-relay when --spawn-daemons is not set"
-        ));
-        assert!(!state_dir.exists());
+        let output = init(args)?;
+        let expected_path = state_dir.join("relay-admission.token");
+        assert_eq!(
+            output.relay_admission_bearer_token_path.as_deref(),
+            Some(expected_path.as_path())
+        );
+        assert!(output.join_token.claims.policy.allow_relay);
+        assert!(output.daemon_processes.is_empty());
+        assert!(output.daemon_commands.iter().any(|command| {
+            command.command.windows(2).any(|values| {
+                values[0] == "--admission-bearer-token-path"
+                    && values[1] == expected_path.display().to_string()
+            })
+        }));
+        assert!(output.daemon_commands.iter().any(|command| {
+            command.command.windows(2).any(|values| {
+                values[0] == "--relay-admission-bearer-token-path"
+                    && values[1] == expected_path.display().to_string()
+            })
+        }));
+        let token = read_init_relay_admission_token(&expected_path)?;
+        validate_relay_admission_bearer_token(&token, "relay admission bearer token")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&expected_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(state_dir)?;
         Ok(())
     }
 
     #[test]
-    fn init_allow_relay_builds_a_registered_relay_agent_spec() -> anyhow::Result<()> {
+    fn init_default_relay_builds_a_registered_relay_agent_spec() -> anyhow::Result<()> {
         let mut args = valid_init_args();
-        args.allow_relay = true;
+        args.disable_relay = false;
         args.spawn_daemons = true;
         args.daemon_state_dir = temp_path("relay-agent-bootstrap");
         let issuer = IdentityKeyPair::generate();

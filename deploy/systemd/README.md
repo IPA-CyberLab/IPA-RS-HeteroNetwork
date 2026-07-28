@@ -57,12 +57,14 @@ rejects key reuse and issuer/key ID collisions. Tokens from this online key are
 verifier-constrained to `edge`, `worker`, or
 `gateway` joins, matching claim/policy tags, no route authority, finite use
 counts, the configured TTL ceiling, and at least two active Control Plane,
-Signal, and STUN endpoints. Relay-enabled tokens also require two Relay
-endpoints. Every Relay replica must read the same
+Signal, STUN, and Relay endpoints because relay permission is enabled by
+default. Every Relay replica must read the same
 `HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH` credential. The Control Plane
 reads that credential through the same owner-only path and places it, together
-with the Agent systemd configuration, in each relay-enabled Add device install
-script. Do not configure Relay admission manually on joining nodes.
+with the Agent systemd configuration, in each Add device install script. Run an
+installer with `--disable-relay` only when that node must not receive Relay
+admission configuration. Do not configure Relay admission manually on joining
+nodes.
 Install the local database proxy and place its complete TLS-verifying
 PostgreSQL URL in `/etc/credstore/database-url`, owned by `root:root` with mode
 `0400`. The unit imports that URL as a separate systemd credential, keeping the

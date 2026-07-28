@@ -50,7 +50,6 @@ Ubuntu hosts:
   "expires_in_seconds": 86400,
   "role": "worker",
   "tags": [],
-  "allow_relay": true,
   "reusable": true,
   "max_uses": 3,
   "setup": "kubernetes_ha_control_plane"

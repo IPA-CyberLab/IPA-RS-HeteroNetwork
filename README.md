@@ -240,9 +240,10 @@ systemd unit instead loads the root-only
 `/etc/credstore/node-enrollment-issuer.key` as a service credential, so the
 shared Signal, STUN, and Relay Unix account cannot read the source key.
 The Relay admission file is an owner-only cluster credential shared by every
-Relay replica. A relay-enabled Add device installer places that credential and
-the corresponding Agent systemd drop-in automatically; joining nodes need no
-manual Relay configuration.
+Relay replica. Add device installers place that credential and the corresponding
+Agent systemd drop-in by default; pass `--disable-relay` to the downloaded
+installer only for nodes that must not receive it. Joining nodes need no manual
+Relay configuration.
 
 This signer is distinct from the offline root issuer. The verifier limits it to
 non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,
@@ -443,7 +444,7 @@ Signed heartbeat, Signal registration, and path-negotiation reports refresh loca
 
 Multi-server STUN probing retains successful observations when another server times out or rejects the request, and uses a responding server for filtering probes. Public and private STUN servers are not mixed in one NAT classification because different routes can expose different local addresses and produce a false address-dependent result. The Agent continues without a reflexive candidate only when every selected STUN endpoint fails.
 
-When relay provisioning is enabled by default without `--spawn-daemons`, `ipars init` requires `--relay-admission-bearer-token-path` and creates or validates the owner-only admission credential there before emitting the manual Relay command. `--disable-relay` skips this credential requirement together with relay permission and Relay/relay-agent bootstrap.
+Without `--spawn-daemons`, default relay provisioning creates or validates the owner-only admission credential at `--relay-admission-bearer-token-path` or `<daemon-state-dir>/relay-admission.token` before emitting the manual Relay commands. `--disable-relay` omits the credential, relay permission, Relay endpoints, and Relay/relay-agent commands.
 
 Join tokens are single-use by default. The durable ledger creates an unseen token without replacing an existing row and serializes definition checking, tombstone checking, status checking, and use consumption as one admission operation, so simultaneous first joins through different Control Plane replicas cannot reset the counter or exceed `max_uses`. SQLite uses its writer transaction; PostgreSQL uses a transaction-scoped advisory lock derived from cluster/nonce. New ledger records retain the complete signed claims and reject reuse of the same cluster/nonce with different bootstrap, time, role/tag, issuer, or policy claims; legacy records remain readable and use their previously persisted immutable definition fields. `ipars init` and `ipars token create` can set route allowlists with repeated `--allowed-route`, enable relay permission by default unless `--disable-relay` is passed, and set admission limits with `--max-uses` or `--unlimited-uses`. For additional tokens, `--bootstrap` and `--control-plane-bootstrap` add validated HTTP(S) control-plane bootstrap URLs, while `--signal-bootstrap`, `--stun-bootstrap`, and `--relay-bootstrap` add typed service bootstrap endpoints for agent signal failover, startup STUN discovery/NAT classification, and relay discovery metadata; STUN and relay bootstraps must use `udp://host:port`. Numeric bootstrap hosts are rejected when they resolve to unusable port-zero, unspecified, multicast, or IPv4 broadcast socket addresses before they can be signed into a token.
 

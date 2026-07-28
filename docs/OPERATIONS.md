@@ -24,7 +24,7 @@ With `--spawn-daemons`, spawned services receive only a fixed system `PATH` and 
 
 All file-backed daemon Bearer credentials must be direct regular files with one hard link, an owner-read bit, and no group or world permissions. Use mode `0400` or `0600`; the `umask 077` examples in this runbook create compliant files. The daemon rejects a final symlink component and verifies file identity across open/read, so mount the credential file itself rather than a symlink managed outside the deployment's trust boundary.
 
-With the default relay provisioning and `--spawn-daemons`, `init` creates or validates the owner-only relay admission credential at `--relay-admission-bearer-token-path` or `<daemon-state-dir>/relay-admission.token`. Without `--spawn-daemons`, `--relay-admission-bearer-token-path` is required so an emitted manual Relay command cannot accidentally run without admission authentication; the parent directory must already exist and the file is created or validated there. The value is passed to Relay and relay-agent by file path only and is never included in daemon argv or JSON output. `--disable-relay` disables this credential and service bootstrap path.
+Default relay provisioning creates or validates the owner-only relay admission credential at `--relay-admission-bearer-token-path` or `<daemon-state-dir>/relay-admission.token`, with or without `--spawn-daemons`. The value is passed to Relay and relay-agent by file path only and is never included in daemon argv or JSON output. `--disable-relay` omits this credential, Relay endpoints, and Relay/relay-agent service bootstrap.
 
 Signal metrics also require a distinct operator token. For a manually supervised Signal service, generate one with `umask 077`, pass `--operator-api-bearer-token-path /etc/heteronetwork/signal-operator-api.token`, and configure the same credential in the metrics scraper. If omitted, Signal metric routes remain absent while health and signed protocol routes continue operating.
 
@@ -79,6 +79,9 @@ owner-only state file, deletes the token, and enables the Agent service with an
 event-driven conntrack detector that activates lazy peers on first traffic. A
 single-use token cannot download the artifact again after its successful join;
 expired, revoked, exhausted, or unknown tokens are rejected.
+Relay admission is configured by default. To opt a node out explicitly, append
+`--disable-relay` to the returned command, or run a downloaded script as
+`sudo sh install-heteronetwork.sh --disable-relay`.
 
 An idle ACL-visible peer remains installed in WireGuard as a passive quarantine
 entry with its overlay `/32` AllowedIP and host route, a loopback discard hold

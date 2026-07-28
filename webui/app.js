@@ -276,8 +276,6 @@
     "Member": "メンバー",
     "Tags (comma separated)": "タグ (カンマ区切り)",
     "example: production, linux": "例: production, linux",
-    "Allow relay service": "リレーサービスを許可",
-    "Permit this node to advertise relay capability.": "このノードがリレー機能を広報することを許可します。",
     "2. Authentication key": "2. 認証キー",
     "Limit how long and how many times the enrollment token can be used.": "登録トークンの有効期間と利用回数を制限します。",
     "Reusable": "再利用可能",
@@ -446,7 +444,6 @@
       mode: "linux",
       role: "edge",
       tags: "",
-      allowRelay: false,
       reusable: false,
       expirationDays: 7,
       clientExpirationDays: 1,
@@ -2229,8 +2226,7 @@
     var reusableUses = enrollment.reusable
       ? '<div class="form-field"><label for="enrollment-max-uses">Maximum uses</label><input id="enrollment-max-uses" data-enrollment-field="maxUses" type="number" min="2" max="1000" value="' + escapeHtml(enrollment.maxUses) + '"></div>'
       : '';
-    var form = '<section class="section-panel enrollment-wizard"><div class="enrollment-step"><div class="step-marker">1</div><div class="step-content"><div class="step-heading"><h2>1. Device settings</h2><p>Choose the identity and capabilities assigned at enrollment.</p></div><div class="form-grid enrollment-form-grid"><div class="form-field"><label for="enrollment-role">Device role</label><select id="enrollment-role" data-enrollment-field="role"><option value="edge" ' + (enrollment.role === "edge" ? "selected" : "") + '>Edge</option><option value="worker" ' + (enrollment.role === "worker" ? "selected" : "") + '>Worker</option><option value="gateway" ' + (enrollment.role === "gateway" ? "selected" : "") + '>Gateway</option></select></div><div class="form-field wide"><label for="enrollment-tags">Tags (comma separated)</label><input id="enrollment-tags" data-enrollment-field="tags" value="' + escapeHtml(enrollment.tags) + '" placeholder="example: production, linux"></div></div>'
-      + enrollmentToggle("allowRelay", "Allow relay service", "Permit this node to advertise relay capability.", enrollment.allowRelay) + '</div></div>'
+    var form = '<section class="section-panel enrollment-wizard"><div class="enrollment-step"><div class="step-marker">1</div><div class="step-content"><div class="step-heading"><h2>1. Device settings</h2><p>Choose the identity and capabilities assigned at enrollment.</p></div><div class="form-grid enrollment-form-grid"><div class="form-field"><label for="enrollment-role">Device role</label><select id="enrollment-role" data-enrollment-field="role"><option value="edge" ' + (enrollment.role === "edge" ? "selected" : "") + '>Edge</option><option value="worker" ' + (enrollment.role === "worker" ? "selected" : "") + '>Worker</option><option value="gateway" ' + (enrollment.role === "gateway" ? "selected" : "") + '>Gateway</option></select></div><div class="form-field wide"><label for="enrollment-tags">Tags (comma separated)</label><input id="enrollment-tags" data-enrollment-field="tags" value="' + escapeHtml(enrollment.tags) + '" placeholder="example: production, linux"></div></div></div></div>'
       + '<div class="enrollment-step"><div class="step-marker">2</div><div class="step-content"><div class="step-heading"><h2>2. Authentication key</h2><p>Limit how long and how many times the enrollment token can be used.</p></div>'
       + enrollmentToggle("reusable", "Reusable", "Allow more than one device to use this token.", enrollment.reusable)
       + '<div class="form-grid enrollment-form-grid"><div class="form-field"><label for="enrollment-expiration">Expiration (days)</label><input id="enrollment-expiration" data-enrollment-field="expirationDays" type="number" min="1" max="30" value="' + escapeHtml(enrollment.expirationDays) + '"></div>' + reusableUses + '</div></div></div>'
@@ -2294,7 +2290,6 @@
       expires_in_seconds: days * 24 * 60 * 60,
       role: enrollment.role,
       tags: csvValues(enrollment.tags),
-      allow_relay: enrollment.allowRelay,
       reusable: enrollment.reusable,
       max_uses: enrollment.reusable ? maxUses : 1
     };
