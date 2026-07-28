@@ -25,6 +25,12 @@ different candidates without sending the complete node ledger to every node.
 This keeps response size and per-autopilot discovery work bounded when the
 HeteroNetwork cluster contains hundreds or thousands of nodes.
 
+The selection epoch is a rotation input, not a registry version. Node health
+can change within an epoch or differ briefly between Control Plane replicas.
+Descriptors therefore bind both the epoch and a digest of the exact selected
+window. A topology change proceeds only after the digest and reciprocal
+reachability agree across three fresh descriptor generations.
+
 The active candidate with the lexicographically lowest HeteroNetwork node ID is
 the sole fresh-cluster coordinator. It chooses up to 32 candidates for which
 every directed pair reports direct host-underlay reachability. The selected

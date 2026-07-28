@@ -3982,12 +3982,28 @@ fn select_database_autopilot_registry_nodes(
     let slots = MAX_DATABASE_AUTOPILOT_CANDIDATES.saturating_sub(selected.len());
     if !snapshot.active_node_ids.is_empty() && slots > 0 {
         let active_len = snapshot.active_node_ids.len();
-        let offset = ((selection_epoch as u128 % active_len as u128)
-            * (slots as u128 % active_len as u128)
-            % active_len as u128) as usize;
+        let mut excluded_active_indices = member_node_ids
+            .iter()
+            .filter_map(|node_id| snapshot.active_node_ids.binary_search(node_id).ok())
+            .collect::<Vec<_>>();
+        excluded_active_indices.sort_unstable();
+        let available_len = active_len.saturating_sub(excluded_active_indices.len());
+        if available_len == 0 {
+            return Ok(selected);
+        }
+        let offset = ((selection_epoch as u128 % available_len as u128)
+            * (slots as u128 % available_len as u128)
+            % available_len as u128) as usize;
+        let mut active_index = offset;
+        for excluded_index in &excluded_active_indices {
+            if *excluded_index > active_index {
+                break;
+            }
+            active_index += 1;
+        }
         let mut examined = 0;
         while selected.len() < MAX_DATABASE_AUTOPILOT_CANDIDATES && examined < active_len {
-            let node_id = &snapshot.active_node_ids[(offset + examined) % active_len];
+            let node_id = &snapshot.active_node_ids[(active_index + examined) % active_len];
             if selected_ids.insert(node_id.clone()) {
                 let node = snapshot.nodes_by_id.get(node_id).ok_or_else(|| {
                     ControlPlaneError::Store(format!(
@@ -5947,6 +5963,34 @@ mod tests {
                 .map(|node| node.node_id.as_str())
                 .collect::<BTreeSet<_>>()
         );
+
+        let active_members = snapshot.active_node_ids[..MAX_DATABASE_AUTOPILOT_MEMBER_IDS].to_vec();
+        let active_member_first =
+            select_database_autopilot_registry_nodes(&snapshot, &active_members, 0)?;
+        let active_member_second =
+            select_database_autopilot_registry_nodes(&snapshot, &active_members, 1)?;
+        assert_eq!(
+            active_member_first[..MAX_DATABASE_AUTOPILOT_MEMBER_IDS]
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect::<Vec<_>>(),
+            active_members
+                .iter()
+                .map(NodeId::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            active_member_first
+                .iter()
+                .skip(MAX_DATABASE_AUTOPILOT_MEMBER_IDS)
+                .map(|node| node.node_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            active_member_second
+                .iter()
+                .skip(MAX_DATABASE_AUTOPILOT_MEMBER_IDS)
+                .map(|node| node.node_id.as_str())
+                .collect::<BTreeSet<_>>()
+        );
         Ok(())
     }
 
@@ -6088,6 +6132,14 @@ mod tests {
                 serde_json::json!({
                     "selection_epoch": 7,
                     "member_node_id": [gateway.node_id.as_str()]
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({
+                    "selection_epoch": 7,
+                    "member_node_ids": [gateway.node_id.as_str()],
+                    "unexpected": true
                 }),
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
