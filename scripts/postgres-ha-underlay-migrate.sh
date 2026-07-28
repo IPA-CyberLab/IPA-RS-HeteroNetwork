@@ -1624,6 +1624,18 @@ installed_etcdctl_at() {
     "$@"
 }
 
+installed_etcdctl_health_at() {
+  local endpoints="$1"
+  etcdctl_action \
+    --endpoints="$endpoints" \
+    --dial-timeout=1s \
+    --command-timeout=2s \
+    --cacert="$state_dir/pki/ca.crt" \
+    --cert="$state_dir/pki/node.crt" \
+    --key="$state_dir/pki/node.key" \
+    endpoint health
+}
+
 find_control_endpoint() {
   local combined endpoint
   combined="$(all_control_endpoints)"
@@ -1776,10 +1788,10 @@ healthy_endpoint_count() {
       address="$(mapping_value_for_name "$legacy_dcs_members" "$name")"
       fallback="https://${address}:${dcs_client_port}"
     fi
-    if installed_etcdctl_at "$endpoint" endpoint health >/dev/null 2>&1 \
+    if installed_etcdctl_health_at "$endpoint" >/dev/null 2>&1 \
       || {
         [[ -n "$fallback" ]] \
-          && installed_etcdctl_at "$fallback" endpoint health >/dev/null 2>&1
+          && installed_etcdctl_health_at "$fallback" >/dev/null 2>&1
       }; then
       healthy=$((healthy + 1))
       [[ "$name" != "$node_name" ]] || local_healthy=1
