@@ -75,6 +75,10 @@ const MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES: u64 = 256 * 1024;
 const NODE_ENROLLMENT_CADDY_VERSION: &str = "2.11.4";
 const NODE_ENROLLMENT_CADDY_SHA256: &str =
     "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9";
+const NODE_ENROLLMENT_RELAY_UDP_PORT: u16 = 18_445;
+const NODE_ENROLLMENT_RELAY_HTTP_PORT: u16 = 18_447;
+const NODE_ENROLLMENT_RELAY_CLASSIFICATION_MAX_AGE_SECONDS: u64 = 45;
+const NODE_ENROLLMENT_RELAY_RECONCILE_INTERVAL_SECONDS: u64 = 15;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -2186,22 +2190,22 @@ fi
 install_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates coreutils curl iproute2 tar wireguard-tools
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates coreutils curl iproute2 jq tar wireguard-tools
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates coreutils curl iproute tar wireguard-tools
+    dnf install -y ca-certificates coreutils curl iproute jq tar wireguard-tools
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates coreutils curl iproute tar wireguard-tools
+    yum install -y ca-certificates coreutils curl iproute jq tar wireguard-tools
   elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install ca-certificates coreutils curl iproute2 tar wireguard-tools
+    zypper --non-interactive install ca-certificates coreutils curl iproute2 jq tar wireguard-tools
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm ca-certificates coreutils curl iproute2 tar wireguard-tools
+    pacman -Sy --noconfirm ca-certificates coreutils curl iproute2 jq tar wireguard-tools
   else
-    echo "Unsupported package manager; install curl, CA certificates, coreutils, iproute2, tar, and wireguard-tools" >&2
+    echo "Unsupported package manager; install curl, CA certificates, coreutils, iproute2, jq, tar, and wireguard-tools" >&2
     exit 1
   fi
 }
 
-for command in base64 curl ip sha256sum tar wg; do
+for command in base64 curl ip jq sha256sum tar wg; do
   if ! command -v "$command" >/dev/null 2>&1; then
     install_dependencies
     break
@@ -2354,6 +2358,7 @@ systemctl daemon-reload
 systemctl enable heteronetwork-gateway.service heteronetwork-agent.service
 systemctl restart heteronetwork-gateway.service
 systemctl restart heteronetwork-agent.service
+__RELAY_AUTOPILOT_START__
 __DATABASE_INSTALL__
 __SETUP_INSTALL__
 echo "HeteroNetwork node enrolled and started"
@@ -2368,6 +2373,7 @@ echo "HeteroNetwork node enrolled and started"
         .unwrap_or_default();
     let database_install = postgres_ha_install_script(enrollment, token);
     let relay_admission_install = relay_admission_install_script(enrollment, token);
+    let relay_autopilot_start = relay_autopilot_start_script(token);
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
@@ -2375,6 +2381,7 @@ echo "HeteroNetwork node enrolled and started"
         .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
         .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
         .replace("__RELAY_ADMISSION_INSTALL__", &relay_admission_install)
+        .replace("__RELAY_AUTOPILOT_START__", &relay_autopilot_start)
         .replace("__DATABASE_INSTALL__", &database_install)
         .replace("__SETUP_INSTALL__", &setup_install)
 }
@@ -2401,30 +2408,418 @@ fn relay_admission_install_script(
     enrollment: &NodeEnrollmentConfig,
     token: &SignedJoinToken,
 ) -> String {
-    const TOKEN_PATH: &str = "/etc/heteronetwork/relay-admission.token";
-    const DROP_IN_PATH: &str =
-        "/etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf";
+    const CLEANUP: &str = r#"systemctl disable --now heteronetwork-relay-autopilot.timer heteronetwork-relay.service >/dev/null 2>&1 || true
+systemctl stop heteronetwork-relay-autopilot.service heteronetwork-relay.service >/dev/null 2>&1 || true
+rm -f \
+  /etc/heteronetwork/relay-admission.token \
+  /etc/heteronetwork/.relay-admission.token.new \
+  /etc/heteronetwork/relay-server-admission.token \
+  /etc/heteronetwork/.relay-server-admission.token.new \
+  /etc/heteronetwork/relay-autopilot/relay.env \
+  /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf \
+  /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new \
+  /etc/systemd/system/heteronetwork-agent.service.d/20-relay-autopilot.conf \
+  /etc/systemd/system/heteronetwork-relay.service \
+  /etc/systemd/system/.heteronetwork-relay.service.new \
+  /etc/systemd/system/heteronetwork-relay-autopilot.service \
+  /etc/systemd/system/.heteronetwork-relay-autopilot.service.new \
+  /etc/systemd/system/heteronetwork-relay-autopilot.timer \
+  /etc/systemd/system/.heteronetwork-relay-autopilot.timer.new \
+  /etc/sysusers.d/.heteronetwork-relay.conf.new \
+  /etc/sysusers.d/heteronetwork-relay.conf \
+  /opt/heteronetwork/libexec/.relay-autopilot.sh.new \
+  /opt/heteronetwork/libexec/relay-autopilot.sh
+rmdir /etc/heteronetwork/relay-autopilot >/dev/null 2>&1 || true
+"#;
+    const TEMPLATE: &str = r#"relay_restart_required=0
+if [ "$relay_enabled" -eq 1 ]; then
+  systemctl stop heteronetwork-relay-autopilot.timer \
+    heteronetwork-relay-autopilot.service >/dev/null 2>&1 || true
+  install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
+  install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+
+  cat >"$tmp_dir/heteronetwork-relay.sysusers" <<'HETERONETWORK_RELAY_SYSUSERS'
+u heteronetwork-relay - "HeteroNetwork Relay" /nonexistent
+HETERONETWORK_RELAY_SYSUSERS
+  install -o root -g root -m 0644 "$tmp_dir/heteronetwork-relay.sysusers" \
+    /etc/sysusers.d/.heteronetwork-relay.conf.new
+  mv -f /etc/sysusers.d/.heteronetwork-relay.conf.new \
+    /etc/sysusers.d/heteronetwork-relay.conf
+  systemd-sysusers /etc/sysusers.d/heteronetwork-relay.conf
+  install -d -o root -g heteronetwork-relay -m 0750 \
+    /etc/heteronetwork/relay-autopilot
+
+  printf '%s' '__RELAY_TOKEN_B64__' | base64 -d >"$tmp_dir/relay-admission.token"
+  install -o root -g root -m 0400 \
+    "$tmp_dir/relay-admission.token" \
+    /etc/heteronetwork/.relay-admission.token.new
+  mv -f /etc/heteronetwork/.relay-admission.token.new \
+    /etc/heteronetwork/relay-admission.token
+  install -o heteronetwork-relay -g heteronetwork-relay -m 0400 \
+    "$tmp_dir/relay-admission.token" \
+    /etc/heteronetwork/.relay-server-admission.token.new
+  if [ ! -f /etc/heteronetwork/relay-server-admission.token ] \
+    || ! cmp -s /etc/heteronetwork/.relay-server-admission.token.new \
+      /etc/heteronetwork/relay-server-admission.token; then
+    relay_restart_required=1
+  fi
+  mv -f /etc/heteronetwork/.relay-server-admission.token.new \
+    /etc/heteronetwork/relay-server-admission.token
+
+  cat >"$tmp_dir/10-relay-admission.conf" <<'HETERONETWORK_RELAY_ADMISSION_UNIT'
+[Service]
+Environment=HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token
+Environment=HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=127.0.0.1:0
+Environment=HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT=127.0.0.1:51820
+HETERONETWORK_RELAY_ADMISSION_UNIT
+  install -o root -g root -m 0644 "$tmp_dir/10-relay-admission.conf" \
+    /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new
+  mv -f \
+    /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new \
+    /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf
+
+  cat >"$tmp_dir/relay-autopilot.sh" <<'HETERONETWORK_RELAY_AUTOPILOT'
+#!/bin/sh
+set -eu
+
+agent_status_url=http://127.0.0.1:9780/v1/status
+agent_service=heteronetwork-agent.service
+relay_service=heteronetwork-relay.service
+relay_env_dir=/etc/heteronetwork/relay-autopilot
+relay_env="$relay_env_dir/relay.env"
+agent_drop_in_dir=/etc/systemd/system/heteronetwork-agent.service.d
+agent_drop_in="$agent_drop_in_dir/20-relay-autopilot.conf"
+status_file=
+relay_env_tmp=
+agent_drop_in_tmp=
+
+cleanup_temporary_files() {
+  [ -z "$status_file" ] || rm -f "$status_file"
+  [ -z "$relay_env_tmp" ] || rm -f "$relay_env_tmp"
+  [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
+}
+trap cleanup_temporary_files EXIT HUP INT TERM
+
+withdraw_relay() {
+  agent_changed=0
+  if [ -e "$agent_drop_in" ] || [ -L "$agent_drop_in" ]; then
+    rm -f "$agent_drop_in"
+    agent_changed=1
+  fi
+  rm -f "$relay_env"
+  if systemctl is-active --quiet "$relay_service"; then
+    systemctl stop "$relay_service" || true
+  fi
+  if [ "$agent_changed" -eq 1 ]; then
+    systemctl daemon-reload
+    systemctl try-restart "$agent_service" || true
+  fi
+}
+
+install -d -o root -g root -m 0755 /run/heteronetwork-relay-autopilot
+status_file=$(mktemp /run/heteronetwork-relay-autopilot/status.XXXXXX)
+if ! curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
+  "$agent_status_url" >"$status_file"; then
+  withdraw_relay
+  exit 0
+fi
+
+if ! jq -e '
+  . as $status
+  | .nat_classification as $nat
+  | (try ($nat.assessed_at
+      | sub("\\.[0-9]+Z$"; "Z")
+      | fromdateiso8601) catch null) as $assessed
+  | ($status.node_id
+      | type == "string"
+        and length > 0
+        and length <= 255
+        and test("^[A-Za-z0-9_.-]+$"))
+    and ($status.vpn_ip
+      | type == "string"
+        and length > 0
+        and length <= 64
+        and test("^[0-9A-Fa-f:.]+$"))
+    and ($nat | type == "object")
+    and ($nat.connectivity_state == "public")
+    and ($nat.mapping_behavior == "no_nat")
+    and ($nat.strategy == "direct_candidate")
+    and ($nat.local_addr | type == "string")
+    and ($nat.observed_endpoint == $nat.local_addr)
+    and ($nat.observations | type == "array" and length > 0)
+    and all($nat.observations[];
+      .local_addr == $nat.local_addr
+      and .reflexive_addr == $nat.local_addr)
+    and ($assessed != null)
+    and ($assessed <= (now + 5))
+    and ($assessed >= (now - __RELAY_CLASSIFICATION_MAX_AGE_SECONDS__))
+' "$status_file" >/dev/null; then
+  withdraw_relay
+  exit 0
+fi
+
+node_id=$(jq -r '.node_id' "$status_file")
+vpn_ip=$(jq -r '.vpn_ip' "$status_file")
+public_ip=$(jq -er '
+  .nat_classification.local_addr
+  | if startswith("[") then
+      capture("^\\[(?<host>[0-9A-Fa-f:.]+)\\]:[0-9]+$").host
+    else
+      capture("^(?<host>[0-9.]+):[0-9]+$").host
+    end
+' "$status_file") || {
+  withdraw_relay
+  exit 0
+}
+
+case "$public_ip" in
+  *:*)
+    case "$public_ip" in
+      ''|*[!0-9A-Fa-f:.]*) withdraw_relay; exit 0 ;;
+    esac
+    relay_udp_listen="[::]:__RELAY_UDP_PORT__"
+    relay_public_endpoint="[$public_ip]:__RELAY_UDP_PORT__"
+    ;;
+  *)
+    case "$public_ip" in
+      ''|*[!0-9.]*) withdraw_relay; exit 0 ;;
+    esac
+    relay_udp_listen="0.0.0.0:__RELAY_UDP_PORT__"
+    relay_public_endpoint="$public_ip:__RELAY_UDP_PORT__"
+    ;;
+esac
+
+case "$vpn_ip" in
+  *:*)
+    case "$vpn_ip" in
+      ''|*[!0-9A-Fa-f:.]*) withdraw_relay; exit 0 ;;
+    esac
+    relay_http_listen="[$vpn_ip]:__RELAY_HTTP_PORT__"
+    relay_http_url="http://[$vpn_ip]:__RELAY_HTTP_PORT__"
+    ;;
+  *)
+    case "$vpn_ip" in
+      ''|*[!0-9.]*) withdraw_relay; exit 0 ;;
+    esac
+    relay_http_listen="$vpn_ip:__RELAY_HTTP_PORT__"
+    relay_http_url="http://$vpn_ip:__RELAY_HTTP_PORT__"
+    ;;
+esac
+
+install -d -o root -g heteronetwork-relay -m 0750 "$relay_env_dir"
+relay_env_tmp=$(mktemp "$relay_env_dir/.relay.env.XXXXXX")
+cat >"$relay_env_tmp" <<HETERONETWORK_RELAY_ENV
+HETERONETWORK_RELAY_NODE_ID=$node_id
+HETERONETWORK_RELAY_UDP_LISTEN=$relay_udp_listen
+HETERONETWORK_RELAY_HTTP_LISTEN=$relay_http_listen
+HETERONETWORK_RELAY_PUBLIC_ENDPOINT=$relay_public_endpoint
+HETERONETWORK_RELAY_ADMISSION_URL=$relay_http_url
+HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-server-admission.token
+HETERONETWORK_RELAY_ENV
+chown root:heteronetwork-relay "$relay_env_tmp"
+chmod 0640 "$relay_env_tmp"
+relay_changed=0
+if [ -f "$relay_env" ] && cmp -s "$relay_env_tmp" "$relay_env"; then
+  rm -f "$relay_env_tmp"
+  relay_env_tmp=
+else
+  mv -f "$relay_env_tmp" "$relay_env"
+  relay_env_tmp=
+  relay_changed=1
+fi
+
+relay_action=start
+if systemctl is-active --quiet "$relay_service"; then
+  if [ "$relay_changed" -eq 1 ]; then
+    relay_action=restart
+  else
+    relay_action=
+  fi
+fi
+if [ -n "$relay_action" ] && ! systemctl "$relay_action" "$relay_service"; then
+  withdraw_relay
+  exit 1
+fi
+
+install -d -o root -g root -m 0755 "$agent_drop_in_dir"
+agent_drop_in_tmp=$(mktemp "$agent_drop_in_dir/.20-relay-autopilot.conf.XXXXXX")
+cat >"$agent_drop_in_tmp" <<HETERONETWORK_AGENT_RELAY_UNIT
+[Service]
+Environment="HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT=$relay_public_endpoint"
+Environment="HETERONETWORK_AGENT_RELAY_ADMISSION_URL=$relay_http_url"
+Environment="HETERONETWORK_AGENT_RELAY_STATUS_URL=$relay_http_url"
+HETERONETWORK_AGENT_RELAY_UNIT
+chown root:root "$agent_drop_in_tmp"
+chmod 0644 "$agent_drop_in_tmp"
+agent_changed=0
+if [ -f "$agent_drop_in" ] && cmp -s "$agent_drop_in_tmp" "$agent_drop_in"; then
+  rm -f "$agent_drop_in_tmp"
+  agent_drop_in_tmp=
+else
+  mv -f "$agent_drop_in_tmp" "$agent_drop_in"
+  agent_drop_in_tmp=
+  agent_changed=1
+fi
+
+if [ "$agent_changed" -eq 1 ]; then
+  systemctl daemon-reload
+  if systemctl is-active --quiet "$agent_service" \
+    && ! systemctl restart "$agent_service"; then
+    rm -f "$agent_drop_in" "$relay_env"
+    systemctl daemon-reload
+    systemctl restart "$agent_service" || true
+    systemctl stop "$relay_service" || true
+    exit 1
+  fi
+fi
+HETERONETWORK_RELAY_AUTOPILOT
+  install -o root -g root -m 0755 "$tmp_dir/relay-autopilot.sh" \
+    /opt/heteronetwork/libexec/.relay-autopilot.sh.new
+  mv -f /opt/heteronetwork/libexec/.relay-autopilot.sh.new \
+    /opt/heteronetwork/libexec/relay-autopilot.sh
+
+  cat >"$tmp_dir/heteronetwork-relay.service" <<'HETERONETWORK_RELAY_UNIT'
+[Unit]
+Description=HeteroNetwork Relay
+Wants=network-online.target heteronetwork-agent.service
+After=network-online.target heteronetwork-agent.service
+ConditionPathExists=/etc/heteronetwork/relay-autopilot/relay.env
+
+[Service]
+Type=simple
+User=heteronetwork-relay
+Group=heteronetwork-relay
+EnvironmentFile=/etc/heteronetwork/relay-autopilot/relay.env
+ExecStart=/opt/heteronetwork/bin/iparsd relay
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+HETERONETWORK_RELAY_UNIT
+  install -o root -g root -m 0644 "$tmp_dir/heteronetwork-relay.service" \
+    /etc/systemd/system/.heteronetwork-relay.service.new
+  if [ -f /etc/systemd/system/heteronetwork-relay.service ] \
+    && cmp -s /etc/systemd/system/.heteronetwork-relay.service.new \
+      /etc/systemd/system/heteronetwork-relay.service; then
+    rm -f /etc/systemd/system/.heteronetwork-relay.service.new
+  else
+    mv -f /etc/systemd/system/.heteronetwork-relay.service.new \
+      /etc/systemd/system/heteronetwork-relay.service
+    relay_restart_required=1
+  fi
+
+  cat >"$tmp_dir/heteronetwork-relay-autopilot.service" <<'HETERONETWORK_RELAY_AUTOPILOT_UNIT'
+[Unit]
+Description=Reconcile HeteroNetwork Relay capability
+Wants=heteronetwork-agent.service
+After=heteronetwork-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/relay-autopilot.sh
+RuntimeDirectory=heteronetwork-relay-autopilot
+RuntimeDirectoryMode=0700
+TimeoutStartSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/etc/heteronetwork/relay-autopilot /etc/systemd/system/heteronetwork-agent.service.d
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+HETERONETWORK_RELAY_AUTOPILOT_UNIT
+  install -o root -g root -m 0644 \
+    "$tmp_dir/heteronetwork-relay-autopilot.service" \
+    /etc/systemd/system/.heteronetwork-relay-autopilot.service.new
+  mv -f /etc/systemd/system/.heteronetwork-relay-autopilot.service.new \
+    /etc/systemd/system/heteronetwork-relay-autopilot.service
+
+  cat >"$tmp_dir/heteronetwork-relay-autopilot.timer" <<'HETERONETWORK_RELAY_AUTOPILOT_TIMER'
+[Unit]
+Description=Periodically reconcile HeteroNetwork Relay capability
+
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=__RELAY_RECONCILE_INTERVAL_SECONDS__s
+RandomizedDelaySec=2s
+AccuracySec=1s
+Unit=heteronetwork-relay-autopilot.service
+
+[Install]
+WantedBy=timers.target
+HETERONETWORK_RELAY_AUTOPILOT_TIMER
+  install -o root -g root -m 0644 \
+    "$tmp_dir/heteronetwork-relay-autopilot.timer" \
+    /etc/systemd/system/.heteronetwork-relay-autopilot.timer.new
+  mv -f /etc/systemd/system/.heteronetwork-relay-autopilot.timer.new \
+    /etc/systemd/system/heteronetwork-relay-autopilot.timer
+else
+__RELAY_CLEANUP__fi
+"#;
     if !token.claims.policy.allow_relay {
-        return format!("rm -f {TOKEN_PATH} {DROP_IN_PATH}\n");
+        return CLEANUP.to_string();
     }
     let encoded_bearer_token = STANDARD.encode(enrollment.relay_admission_bearer_token.as_bytes());
-    format!(
-        r#"if [ "$relay_enabled" -eq 1 ]; then
-  install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
-printf '%s' '{encoded_bearer_token}' | base64 -d >{TOKEN_PATH}
-chown root:root {TOKEN_PATH}
-chmod 0600 {TOKEN_PATH}
-cat >{DROP_IN_PATH} <<'HETERONETWORK_RELAY_ADMISSION_UNIT'
-[Service]
-Environment=HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH={TOKEN_PATH}
-HETERONETWORK_RELAY_ADMISSION_UNIT
-chown root:root {DROP_IN_PATH}
-chmod 0644 {DROP_IN_PATH}
-else
-  rm -f {TOKEN_PATH} {DROP_IN_PATH}
+    TEMPLATE
+        .replace("__RELAY_TOKEN_B64__", &encoded_bearer_token)
+        .replace(
+            "__RELAY_CLASSIFICATION_MAX_AGE_SECONDS__",
+            &NODE_ENROLLMENT_RELAY_CLASSIFICATION_MAX_AGE_SECONDS.to_string(),
+        )
+        .replace(
+            "__RELAY_RECONCILE_INTERVAL_SECONDS__",
+            &NODE_ENROLLMENT_RELAY_RECONCILE_INTERVAL_SECONDS.to_string(),
+        )
+        .replace(
+            "__RELAY_UDP_PORT__",
+            &NODE_ENROLLMENT_RELAY_UDP_PORT.to_string(),
+        )
+        .replace(
+            "__RELAY_HTTP_PORT__",
+            &NODE_ENROLLMENT_RELAY_HTTP_PORT.to_string(),
+        )
+        .replace("__RELAY_CLEANUP__", CLEANUP)
+}
+
+fn relay_autopilot_start_script(token: &SignedJoinToken) -> String {
+    if !token.claims.policy.allow_relay {
+        return String::new();
+    }
+    r#"if [ "$relay_enabled" -eq 1 ]; then
+  if [ "$relay_restart_required" -eq 1 ] \
+    && systemctl is-active --quiet heteronetwork-relay.service; then
+    systemctl restart heteronetwork-relay.service
+  fi
+  systemctl enable --now heteronetwork-relay-autopilot.timer
+  systemctl start heteronetwork-relay-autopilot.service
 fi
 "#
-    )
+    .to_string()
 }
 
 fn postgres_ha_install_script(
@@ -4613,17 +5008,97 @@ mod tests {
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
         assert!(generated_script.contains("Usage: $0 [--disable-relay]"));
         assert!(generated_script.contains("if [ \"$relay_enabled\" -eq 1 ]; then"));
+        assert!(generated_script.contains(
+            "apt-get install -y ca-certificates coreutils curl iproute2 jq tar wireguard-tools"
+        ));
         assert!(generated_script.contains("/etc/heteronetwork/relay-admission.token"));
+        assert!(generated_script.contains("/etc/heteronetwork/relay-server-admission.token"));
+        assert!(generated_script.contains("install -o root -g root -m 0400"));
+        assert!(generated_script
+            .contains("install -o heteronetwork-relay -g heteronetwork-relay -m 0400"));
         assert!(generated_script.contains(
             "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
         ));
+        assert!(generated_script.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=127.0.0.1:0"));
+        assert!(generated_script
+            .contains("HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT=127.0.0.1:51820"));
+        assert!(generated_script.contains(
+            "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-server-admission.token"
+        ));
+        assert!(!generated_script.lines().any(|line| {
+            line == "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
+        }));
+        assert!(generated_script.contains("relay_restart_required=0"));
+        assert!(generated_script
+            .contains("cmp -s /etc/heteronetwork/.relay-server-admission.token.new"));
+        assert!(generated_script.contains("if [ \"$relay_restart_required\" -eq 1 ]"));
+        assert!(generated_script
+            .contains("u heteronetwork-relay - \"HeteroNetwork Relay\" /nonexistent"));
+        assert!(generated_script.contains("User=heteronetwork-relay"));
+        assert!(generated_script.contains("Group=heteronetwork-relay"));
+        assert!(generated_script.contains("heteronetwork-relay-autopilot.service"));
+        assert!(generated_script.contains("heteronetwork-relay-autopilot.timer"));
+        assert!(generated_script.contains("OnUnitInactiveSec=15s"));
+        assert!(generated_script.contains("RuntimeDirectory=heteronetwork-relay-autopilot"));
+        assert!(generated_script.contains(
+            "ReadWritePaths=/etc/heteronetwork/relay-autopilot /etc/systemd/system/heteronetwork-agent.service.d"
+        ));
+        assert!(generated_script.contains("($nat.connectivity_state == \"public\")"));
+        assert!(generated_script.contains("($nat.mapping_behavior == \"no_nat\")"));
+        assert!(generated_script.contains("($nat.strategy == \"direct_candidate\")"));
+        assert!(generated_script.contains("sub(\"\\\\.[0-9]+Z$\"; \"Z\")"));
+        assert!(generated_script.contains("($assessed >= (now - 45))"));
+        assert!(generated_script.contains("relay_udp_listen=\"0.0.0.0:18445\""));
+        assert!(generated_script.contains("relay_udp_listen=\"[::]:18445\""));
+        assert!(generated_script.contains("relay_http_listen=\"$vpn_ip:18447\""));
+        assert!(generated_script.contains("relay_http_listen=\"[$vpn_ip]:18447\""));
+        assert!(generated_script.contains(
+            "Environment=\"HETERONETWORK_AGENT_RELAY_PUBLIC_ENDPOINT=$relay_public_endpoint\""
+        ));
+        assert!(generated_script
+            .contains("Environment=\"HETERONETWORK_AGENT_RELAY_ADMISSION_URL=$relay_http_url\""));
+        assert!(generated_script
+            .contains("Environment=\"HETERONETWORK_AGENT_RELAY_STATUS_URL=$relay_http_url\""));
+        assert!(generated_script.contains("cmp -s \"$relay_env_tmp\" \"$relay_env\""));
+        assert!(generated_script.contains("cmp -s \"$agent_drop_in_tmp\" \"$agent_drop_in\""));
+        assert!(generated_script
+            .contains("systemctl disable --now heteronetwork-relay-autopilot.timer"));
+        assert!(generated_script.contains("rm -f \"$agent_drop_in\" \"$relay_env\""));
+        assert!(
+            generated_script.contains("systemctl enable --now heteronetwork-relay-autopilot.timer")
+        );
+        assert!(!generated_script.contains("__RELAY_"));
         let encoded_relay_bearer = STANDARD.encode(RELAY_ADMISSION_BEARER_TOKEN.as_bytes());
         assert!(generated_script.contains(&format!(
-            "printf '%s' '{encoded_relay_bearer}' | base64 -d >/etc/heteronetwork/relay-admission.token"
+            "printf '%s' '{encoded_relay_bearer}' | base64 -d >\"$tmp_dir/relay-admission.token\""
         )));
         assert!(!generated_script.contains(RELAY_ADMISSION_BEARER_TOKEN));
         assert!(install_command.contains("sudo sh \"$tmp\" \"$@\""));
         assert!(install_command.ends_with("' sh"));
+        let relay_autopilot = generated_script
+            .split_once("cat >\"$tmp_dir/relay-autopilot.sh\" <<'HETERONETWORK_RELAY_AUTOPILOT'\n")
+            .and_then(|(_, tail)| {
+                tail.split_once("\nHETERONETWORK_RELAY_AUTOPILOT\n")
+                    .map(|(script, _)| script)
+            })
+            .ok_or("generated installer omitted the relay autopilot helper")?;
+        let mut relay_shell = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        relay_shell
+            .stdin
+            .take()
+            .ok_or("relay autopilot shell syntax checker stdin is unavailable")?
+            .write_all(relay_autopilot.as_bytes())?;
+        let relay_syntax = relay_shell.wait_with_output()?;
+        assert!(
+            relay_syntax.status.success(),
+            "generated relay autopilot is not valid POSIX shell: {}",
+            String::from_utf8_lossy(&relay_syntax.stderr)
+        );
 
         let kubernetes_request_body = serde_json::json!({
             "expires_in_seconds": 86_400,
