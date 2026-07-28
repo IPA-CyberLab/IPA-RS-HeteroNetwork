@@ -218,6 +218,15 @@ later migration phase requires all endpoints, not merely a quorum.
    peer URL remains the legacy URL. Complete this step on all members before
    changing any etcd member URL.
 
+   If `prepare-node` refuses a voter because its local etcd endpoint has already
+   lost the leader, do not restart it blindly. Run
+   `recover-partitioned-dcs-node` on that voter instead. The recovery command
+   requires three consecutive samples from a healthy remote quorum, verifies
+   that another managed voter is leader, moves only the isolated member's peer
+   URL to its final underlay address, and requires it to rejoin before
+   returning. A healthy local legacy endpoint is refused so this exception
+   cannot replace the normal rolling path.
+
 2. Run `migrate-dcs-node` on exactly one DCS voter at a time:
 
    ```bash

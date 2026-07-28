@@ -80,6 +80,10 @@ Commands:
   prepare-node
       Install migration material, make Patroni use both DCS planes, and restart
       the local etcd voter with dual listeners while advertising its legacy URL.
+  recover-partitioned-dcs-node
+      When the local voter is already isolated, require a healthy remote DCS
+      quorum and a different leader, then move only that voter directly to its
+      final underlay peer URL and require it to rejoin.
   migrate-dcs-node
       Change only the local etcd member peer URL, restart local etcd with its
       final underlay config, and require every DCS endpoint to remain healthy.
@@ -135,6 +139,10 @@ plus one endpoint is healthy. Then run migrate-dcs-node on exactly one voter at
 a time; that phase requires every endpoint to be healthy. Run apply-node only
 after every voter has a healthy final underlay peer URL. No command creates a
 data backup or replaces PostgreSQL/etcd data directories.
+
+recover-partitioned-dcs-node is an exception for a voter that cannot satisfy
+prepare-node because its local etcd has already lost the leader. It refuses a
+healthy local endpoint, a missing remote quorum, or a local DCS leader.
 EOF
 }
 
@@ -1775,11 +1783,13 @@ snapshot_is_all_final() {
 healthy_endpoint_count() {
   local snapshot="$1"
   local require_local="$2"
+  local excluded_name="${3:-}"
   local healthy=0 local_healthy=0 entry name phase address endpoint fallback
   local -a entries
   IFS=, read -r -a entries <<<"$dcs_members"
   for entry in "${entries[@]}"; do
     name="${entry%%=*}"
+    [[ "$name" != "$excluded_name" ]] || continue
     phase="$(snapshot_member_phase "$snapshot" "$name")"
     address="$(mapping_value_for_name "$dcs_members" "$name")"
     endpoint="https://${address}:${dcs_client_port}"
@@ -1812,6 +1822,61 @@ verify_dcs_restart_budget() {
       && validate_dcs_snapshot "$snapshot" >/dev/null 2>&1 \
       && healthy="$(healthy_endpoint_count "$snapshot" true 2>/dev/null)" \
       && ((10#$healthy >= minimum)); then
+      consecutive=$((consecutive + 1))
+      if ((consecutive >= 3)); then
+        printf '%s' "$snapshot"
+        return 0
+      fi
+    else
+      consecutive=0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+dcs_leader_id_at() {
+  local endpoint="$1"
+  local document
+  document="$(
+    bundle_etcdctl_at "$endpoint" endpoint status --write-out=json
+  )" || return 1
+  python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+if not isinstance(document, list) or len(document) != 1:
+    raise SystemExit(1)
+status = document[0].get("Status")
+leader = status.get("leader") if isinstance(status, dict) else None
+if not isinstance(leader, int) or leader <= 0:
+    raise SystemExit(1)
+print(f"{leader:x}")
+' <<<"$document"
+}
+
+snapshot_contains_member_id() {
+  local snapshot="$1"
+  local expected_id="$2"
+  local id actual_name peer_url learner found=0
+  while IFS=$'\t' read -r id actual_name peer_url learner; do
+    [[ "$id" != "$expected_id" ]] || found=$((found + 1))
+  done <<<"$snapshot"
+  ((found == 1))
+}
+
+verify_remote_dcs_quorum() {
+  local attempt snapshot healthy total majority consecutive=0
+  total="$(mapping_count "$dcs_members")"
+  majority="$((10#$total / 2 + 1))"
+  for attempt in {1..60}; do
+    if snapshot="$(read_dcs_snapshot 2>/dev/null)" \
+      && validate_dcs_snapshot "$snapshot" >/dev/null 2>&1 \
+      && healthy="$(
+        healthy_endpoint_count "$snapshot" false "$node_name" 2>/dev/null
+      )" \
+      && ((10#$healthy >= majority)); then
       consecutive=$((consecutive + 1))
       if ((consecutive >= 3)); then
         printf '%s' "$snapshot"
@@ -1916,6 +1981,74 @@ prepare_node() {
   else
     log "prepared non-voter $node_name with dual Patroni DCS hosts"
   fi
+}
+
+recover_partitioned_dcs_node() {
+  require_root
+  acquire_local_lock
+  require_command install
+  require_command curl
+  require_command openssl
+  require_command python3
+  require_command ss
+  require_command systemctl
+  load_node_context true
+  validate_local_network
+  require_existing_installation true
+
+  local snapshot phase member_id control_endpoint leader_id
+  snapshot="$(verify_remote_dcs_quorum)" \
+    || die "a stable remote DCS quorum is required to recover an isolated voter"
+  validate_dcs_snapshot "$snapshot"
+  phase="$(snapshot_member_phase "$snapshot" "$node_name")" \
+    || die "could not determine the isolated DCS member phase"
+  member_id="$(snapshot_member_id "$snapshot" "$node_name")" \
+    || die "could not determine the isolated DCS member ID"
+  control_endpoint="$(find_control_endpoint)" \
+    || die "no healthy remote DCS control endpoint is reachable"
+  leader_id="$(dcs_leader_id_at "$control_endpoint")" \
+    || die "the healthy remote DCS quorum has no observable leader"
+  snapshot_contains_member_id "$snapshot" "$leader_id" \
+    || die "the observed DCS leader is absent from managed membership"
+  [[ "$leader_id" != "$member_id" ]] \
+    || die "refusing partition recovery while the local voter is DCS leader"
+
+  if [[ "$phase" == "legacy" ]] \
+    && installed_etcdctl_health_at \
+      "https://${legacy_node_address}:${dcs_client_port}" >/dev/null 2>&1; then
+    die "local legacy DCS endpoint is healthy; use prepare-node instead"
+  fi
+
+  install_migration_material
+  install_patroni_dual_hosts
+  hup_patroni
+  verify_patroni_role_at "$legacy_node_address"
+
+  local final_config final_peer_url
+  render_to_temporary render_final_etcd_config "$state_dir/etcd.yml"
+  final_config="$rendered_temporary"
+  final_peer_url="https://${node_address}:${dcs_peer_port}"
+  if [[ "$phase" == "legacy" ]]; then
+    install_rendered_etcd_config render_transition_etcd_config
+    if ! bundle_etcdctl_at "$control_endpoint" \
+        member update "$member_id" --peer-urls="$final_peer_url" >/dev/null; then
+      restore_fresh_transition_config
+      die "isolated DCS member update failed; retained the transition config"
+    fi
+  fi
+
+  atomic_install_file \
+    "$final_config" "$state_dir/etcd.yml" root heteronetwork-db-ha 0640
+  stop_local_ingress_forwarders
+  systemctl_action restart "$etcd_service"
+  verify_local_etcd_listener_ownership
+  installed_etcdctl_at \
+    "https://${node_address}:${dcs_client_port}" \
+    endpoint health >/dev/null \
+    || die "recovered local underlay DCS endpoint is not healthy"
+  verify_dcs_restart_budget >/dev/null \
+    || die "recovered voter did not rejoin a stable restart-safe DCS"
+  log "recovered isolated DCS member $node_name on its final underlay peer URL"
 }
 
 restore_fresh_transition_config() {
@@ -2804,6 +2937,11 @@ case "${1:-}" in
   prepare-node)
     (($# == 1)) || die "prepare-node does not accept positional arguments"
     prepare_node
+    ;;
+  recover-partitioned-dcs-node)
+    (($# == 1)) \
+      || die "recover-partitioned-dcs-node does not accept positional arguments"
+    recover_partitioned_dcs_node
     ;;
   migrate-dcs-node)
     (($# == 1)) || die "migrate-dcs-node does not accept positional arguments"
