@@ -1182,14 +1182,16 @@ route_output_matches() {
         if ($i == "dev" && i < NF) {
           dev_count += 1
           dev = $(i + 1)
-        } else if ($i == "src" && i < NF) {
-          src_count += 1
-          src = $(i + 1)
+        } else if (($i == "src" || $i == "from") && i < NF) {
+          source_count += 1
+          if ($(i + 1) != expected_source) {
+            source_mismatch = 1
+          }
         }
       }
     }
     END {
-      if (dev_count != 1 || src_count != 1 || dev != expected_interface || src != expected_source) {
+      if (dev_count != 1 || source_count < 1 || source_mismatch || dev != expected_interface) {
         exit 1
       }
     }
@@ -2548,6 +2550,9 @@ EOF
   node_address="100.64.10.1"
   route_output_matches \
     '100.64.10.2 dev tailscale0 src 100.64.10.1 uid 0' \
+    tailscale0 100.64.10.1
+  route_output_matches \
+    '100.64.10.2 from 100.64.10.1 dev tailscale0 uid 0' \
     tailscale0 100.64.10.1
   if route_output_matches \
       '100.64.10.2 dev heteronetwork0 src 10.250.0.2 uid 0' \
