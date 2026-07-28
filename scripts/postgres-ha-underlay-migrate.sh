@@ -1596,7 +1596,7 @@ all_control_endpoints() {
   old_endpoints="$(client_endpoints_for_map "$legacy_dcs_members")"
   new_endpoints="$(client_endpoints_for_map "$dcs_members")"
   local -a entries
-  IFS=, read -r -a entries <<<"${old_endpoints},${new_endpoints}"
+  IFS=, read -r -a entries <<<"${new_endpoints},${old_endpoints}"
   for endpoint in "${entries[@]}"; do
     [[ -z "${seen[$endpoint]:-}" ]] || continue
     seen["$endpoint"]=1
@@ -1644,13 +1644,34 @@ installed_etcdctl_health_at() {
     endpoint health
 }
 
+bundle_etcdctl_health_at() {
+  local endpoints="$1"
+  etcdctl_action \
+    --endpoints="$endpoints" \
+    --dial-timeout=1s \
+    --command-timeout=2s \
+    --cacert="$bundle_dir/ca/ca.crt" \
+    --cert="$bundle_dir/nodes/$node_name/node.crt" \
+    --key="$bundle_dir/nodes/$node_name/node.key" \
+    endpoint health
+}
+
 find_control_endpoint() {
-  local combined endpoint
+  local excluded_name="${1:-}"
+  local excluded_old="" excluded_new="" combined endpoint
+  if [[ -n "$excluded_name" ]]; then
+    excluded_old="https://$(mapping_value_for_name \
+      "$legacy_dcs_members" "$excluded_name"):${dcs_client_port}"
+    excluded_new="https://$(mapping_value_for_name \
+      "$dcs_members" "$excluded_name"):${dcs_client_port}"
+  fi
   combined="$(all_control_endpoints)"
   local -a endpoints
   IFS=, read -r -a endpoints <<<"$combined"
   for endpoint in "${endpoints[@]}"; do
-    if bundle_etcdctl_at "$endpoint" endpoint health >/dev/null 2>&1; then
+    [[ "$endpoint" != "$excluded_old" && "$endpoint" != "$excluded_new" ]] \
+      || continue
+    if bundle_etcdctl_health_at "$endpoint" >/dev/null 2>&1; then
       printf '%s' "$endpoint"
       return 0
     fi
@@ -1659,8 +1680,9 @@ find_control_endpoint() {
 }
 
 read_dcs_snapshot() {
+  local excluded_name="${1:-}"
   local endpoint document
-  endpoint="$(find_control_endpoint)" \
+  endpoint="$(find_control_endpoint "$excluded_name")" \
     || die "no managed legacy or underlay DCS endpoint is reachable"
   document="$(
     bundle_etcdctl_at "$endpoint" member list --write-out=json
@@ -1871,7 +1893,7 @@ verify_remote_dcs_quorum() {
   total="$(mapping_count "$dcs_members")"
   majority="$((10#$total / 2 + 1))"
   for attempt in {1..60}; do
-    if snapshot="$(read_dcs_snapshot 2>/dev/null)" \
+    if snapshot="$(read_dcs_snapshot "$node_name" 2>/dev/null)" \
       && validate_dcs_snapshot "$snapshot" >/dev/null 2>&1 \
       && healthy="$(
         healthy_endpoint_count "$snapshot" false "$node_name" 2>/dev/null
@@ -2004,7 +2026,7 @@ recover_partitioned_dcs_node() {
     || die "could not determine the isolated DCS member phase"
   member_id="$(snapshot_member_id "$snapshot" "$node_name")" \
     || die "could not determine the isolated DCS member ID"
-  control_endpoint="$(find_control_endpoint)" \
+  control_endpoint="$(find_control_endpoint "$node_name")" \
     || die "no healthy remote DCS control endpoint is reachable"
   leader_id="$(dcs_leader_id_at "$control_endpoint")" \
     || die "the healthy remote DCS quorum has no observable leader"
@@ -2693,6 +2715,19 @@ EOF
   node_name="db-a"
   legacy_node_address="10.250.0.2"
   node_address="100.64.10.1"
+  local control_probe_log="$test_dir/control-probes.log"
+  [[ "$(all_control_endpoints)" == \
+    "https://100.64.10.1:12379,https://100.64.10.2:12379,https://100.64.10.3:12379,https://10.250.0.2:12379,https://10.250.0.3:12379,https://10.250.0.4:12379" ]]
+  bundle_etcdctl_health_at() {
+    printf '%s\n' "$1" >>"$control_probe_log"
+    [[ "$1" == "https://100.64.10.2:12379" ]]
+  }
+  [[ "$(find_control_endpoint db-a)" == "https://100.64.10.2:12379" ]]
+  grep -Fxq 'https://100.64.10.2:12379' "$control_probe_log"
+  if grep -Fq '100.64.10.1' "$control_probe_log" \
+    || grep -Fq '10.250.0.2' "$control_probe_log"; then
+    die "control endpoint discovery probed the excluded local voter"
+  fi
   route_output_matches \
     '100.64.10.2 dev tailscale0 src 100.64.10.1 uid 0' \
     tailscale0 100.64.10.1
