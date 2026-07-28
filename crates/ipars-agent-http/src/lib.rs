@@ -306,6 +306,7 @@ fn gateway_web_ui_routes() -> Router<AgentHttpState> {
         .route("/ui/app.js", get(local_ui_app))
         .route("/ui/theme.js", get(local_ui_theme))
         .route("/ui/styles.css", get(local_ui_styles))
+        .route("/ui/vendor/mermaid.min.js", get(local_ui_mermaid))
         .route("/ui/fonts/noto-sans-jp-ui.ttf", get(local_ui_japanese_font))
         .route("/ui/config", get(local_ui_config))
         .route("/v1/web-ui/healthz", get(healthz))
@@ -1607,6 +1608,16 @@ async fn local_ui_styles() -> Response {
     let mut response = (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../../../webui/styles.css"),
+    )
+        .into_response();
+    apply_local_ui_security_headers(&mut response, false, None);
+    response
+}
+
+async fn local_ui_mermaid() -> Response {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../../webui/vendor/mermaid.min.js"),
     )
         .into_response();
     apply_local_ui_security_headers(&mut response, false, None);
@@ -4408,17 +4419,57 @@ mod tests {
         assert_eq!(control_plane_backend.admin_calls.load(Ordering::SeqCst), 2);
         assert_eq!(service_backend.admin_calls.load(Ordering::SeqCst), 0);
 
+        let index = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/")
+                    .header(header::HOST, "console.heteronetwork.internal:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(index.status(), StatusCode::OK);
+        assert!(index
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.contains("script-src 'self'") && !value.contains("'unsafe-eval'")
+            }));
+        let index = String::from_utf8(to_bytes(index.into_body(), usize::MAX).await?.to_vec())?;
+        let Some(mermaid_script) = index.find("/ui/vendor/mermaid.min.js") else {
+            return Err("Web UI must load the self-origin Mermaid bundle".into());
+        };
+        let Some(app_script) = index.find("/ui/app.js") else {
+            return Err("Web UI must load the application bundle".into());
+        };
+        assert!(mermaid_script < app_script);
+
         for host in ["10.250.0.1:9781", "console.heteronetwork.internal:9781"] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/ui/app.js")
-                        .header(header::HOST, host)
-                        .body(Body::empty())?,
-                )
-                .await?;
-            assert_eq!(response.status(), StatusCode::OK);
+            for path in ["/ui/app.js", "/ui/vendor/mermaid.min.js"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header(header::HOST, host)
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                assert_eq!(response.status(), StatusCode::OK);
+                if path.ends_with("mermaid.min.js") {
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("text/javascript; charset=utf-8")
+                    );
+                    let body = to_bytes(response.into_body(), usize::MAX).await?;
+                    assert!(body.len() > 100_000);
+                    assert!(String::from_utf8(body.to_vec())?.contains("globalThis.mermaid="));
+                }
+            }
         }
 
         let health = app

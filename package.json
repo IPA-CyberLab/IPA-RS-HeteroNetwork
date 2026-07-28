@@ -1,0 +1,17 @@
+{
+  "name": "heteronetwork-webui-assets",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:webui-vendor": "node webui/build-mermaid.mjs",
+    "test": "npm run test:webui && npm run test:webconsole",
+    "test:webui": "node --test webui/app-mermaid.test.mjs",
+    "test:webconsole": "node --test webui/webconsole-route.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "jsdom": "30.0.0",
+    "mermaid": "11.16.0"
+  }
+}

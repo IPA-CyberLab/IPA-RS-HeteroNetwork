@@ -4380,12 +4380,84 @@ textarea::placeholder {
   scrollbar-gutter: stable;
 }
 
+.overlay-mermaid-diagram {
+  min-height: 360px;
+  min-width: 100%;
+  position: relative;
+}
+
+.overlay-mermaid-fallback-notice {
+  background: var(--yellow-soft);
+  border: 1px solid var(--yellow);
+  border-radius: 6px;
+  color: var(--yellow);
+  display: inline-flex;
+  font-size: 11px;
+  line-height: 1.4;
+  margin: 12px 12px 0;
+  max-width: min(520px, calc(100vw - 96px));
+  padding: 8px 10px;
+}
+
 .overlay-topology-svg {
   display: block;
   height: auto;
   margin: 0 auto;
   max-width: none;
   transition: width 160ms ease;
+}
+
+.overlay-mermaid-svg {
+  background: transparent !important;
+  overflow: visible;
+}
+
+.overlay-mermaid-svg text {
+  fill: var(--text) !important;
+  font-family: "Lato", "Helvetica Neue", Arial, sans-serif !important;
+  letter-spacing: 0;
+}
+
+html[lang="ja"] .overlay-mermaid-svg text {
+  font-family: "Noto Sans JP UI", system-ui, sans-serif !important;
+}
+
+.overlay-mermaid-svg .cluster rect {
+  fill: var(--surface) !important;
+  stroke: var(--line-strong) !important;
+}
+
+.overlay-mermaid-svg .node rect,
+.overlay-mermaid-svg .node circle,
+.overlay-mermaid-svg .node ellipse,
+.overlay-mermaid-svg .node path,
+.overlay-mermaid-svg .node polygon {
+  fill: var(--surface-raised) !important;
+  stroke: var(--accent) !important;
+}
+
+.overlay-mermaid-svg .flowchart-link {
+  stroke: var(--line-strong) !important;
+}
+
+.overlay-mermaid-svg .edge-pattern-dotted {
+  stroke: var(--orange) !important;
+}
+
+.overlay-mermaid-svg marker path {
+  fill: var(--line-strong) !important;
+  stroke: var(--line-strong) !important;
+}
+
+.overlay-mermaid-svg .edgeLabel rect,
+.overlay-mermaid-svg .labelBkg {
+  fill: var(--surface-deep) !important;
+  opacity: 0.96 !important;
+}
+
+.overlay-mermaid-svg .edgeLabel text,
+.overlay-mermaid-svg .cluster-label text {
+  fill: var(--text-soft) !important;
 }
 
 .overlay-svg-edge {

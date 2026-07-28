@@ -549,6 +549,7 @@ where
         .route("/ui/app.js", get(ui_app))
         .route("/ui/theme.js", get(ui_theme))
         .route("/ui/styles.css", get(ui_styles))
+        .route("/ui/vendor/mermaid.min.js", get(ui_mermaid))
         .route("/ui/fonts/noto-sans-jp-ui.ttf", get(ui_japanese_font))
         .route("/ui/config", get(ui_config::<S, L>))
         .with_state(state)
@@ -1305,6 +1306,16 @@ async fn ui_styles() -> impl IntoResponse {
     let mut response = (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../../../webui/styles.css"),
+    )
+        .into_response();
+    apply_ui_security_headers(&mut response, false);
+    response
+}
+
+async fn ui_mermaid() -> impl IntoResponse {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../../webui/vendor/mermaid.min.js"),
     )
         .into_response();
     apply_ui_security_headers(&mut response, false);
@@ -9003,10 +9014,51 @@ exit 47
             .get("content-security-policy")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("script-src 'self'")));
+        assert!(response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.contains("'unsafe-eval'")));
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("HeteroNetwork"));
         assert!(body.contains("Public nodes"));
+        let Some(mermaid_script) = body.find("/ui/vendor/mermaid.min.js") else {
+            return Err("Web UI must load the self-origin Mermaid bundle".into());
+        };
+        let Some(app_script) = body.find("/ui/app.js") else {
+            return Err("Web UI must load the application bundle".into());
+        };
+        assert!(mermaid_script < app_script);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui/vendor/mermaid.min.js")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert!(body.len() > 100_000);
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("globalThis.mermaid="));
 
         let response = app
             .clone()

@@ -395,6 +395,7 @@
     "Mermaid source": "Mermaid ソース",
     "Copy Mermaid source": "Mermaid ソースをコピー",
     "Mermaid copied.": "Mermaid ソースをコピーしました。",
+    "Diagram rendering failed. Showing the fallback topology.": "図の描画に失敗したため、フォールバックトポロジーを表示しています。",
     "Overlay settings saved.": "オーバーレイ設定を保存しました。",
     "Saving overlay settings...": "オーバーレイ設定を保存しています...",
     "Group fanout must be an integer between 4 and 64.": "グループファンアウトは 4 から 64 の整数で指定してください。",
@@ -434,8 +435,12 @@
       saving: false,
       selectedGroupId: null,
       zoom: 1,
+      mermaidInitialized: false,
+      mermaidRenderSequence: 0,
+      mermaidQueue: Promise.resolve(),
       mermaidCache: {
         epoch: null,
+        scope: null,
         snapshot: null,
         source: null
       }
@@ -1500,14 +1505,15 @@
     return Object.keys(aggregated).map(function (key) { return aggregated[key]; });
   }
 
-  function generateTopologyMermaid(model) {
+  function generateTopologyMermaid(model, scopedGroups) {
     var lines = ["flowchart TB"];
     var aliases = {};
-    model.groups.forEach(function (group, index) { aliases[group.group_id] = "group_" + index; });
+    var groups = Array.isArray(scopedGroups) ? scopedGroups : model.groups;
+    groups.forEach(function (group, index) { aliases[group.group_id] = "group_" + index; });
 
     function appendGroup(groupId, indent) {
       var group = model.groupById[groupId];
-      if (!group) return;
+      if (!group || !aliases[groupId]) return;
       var alias = aliases[groupId];
       var representatives = group.representatives.map(function (representative) {
         return shortId(representative.node_id) + " p" + representative.plane;
@@ -1516,18 +1522,18 @@
       lines.push(indent + "  direction TB");
       lines.push(indent + "  " + alias + '["' + group.node_ids.length + " nodes"
         + (representatives ? " · reps " + mermaidLabel(representatives) : "") + '"]');
-      group.child_group_ids.forEach(function (childId) { appendGroup(childId, indent + "  "); });
+      group.child_group_ids.filter(function (childId) {
+        return Boolean(aliases[childId]);
+      }).forEach(function (childId) { appendGroup(childId, indent + "  "); });
       lines.push(indent + "end");
     }
 
-    if (model.rootGroupId) appendGroup(model.rootGroupId, "  ");
-    model.groups.filter(function (group) {
-      return group.group_id !== model.rootGroupId
-        && (!group.parent_group_id || !model.groupById[group.parent_group_id]);
+    groups.filter(function (group) {
+      return !group.parent_group_id || !aliases[group.parent_group_id];
     }).forEach(function (group) { appendGroup(group.group_id, "  "); });
 
     var seenHierarchy = {};
-    model.groups.forEach(function (group) {
+    groups.forEach(function (group) {
       group.child_group_ids.forEach(function (childId) {
         if (!aliases[group.group_id] || !aliases[childId]) return;
         var key = group.group_id + "|" + childId;
@@ -1544,24 +1550,28 @@
       var label = (edge.kind === "leaf_cycle" ? "leaf" : "sibling") + " p" + edge.plane + " ×" + edge.count;
       lines.push("  " + source + (edge.type === "intra" ? " ---|" : " -.-|") + label + "| " + target);
     });
-    lines.push("  classDef group fill:#ffffff,stroke:#528c88,color:#1f2937");
     if (Object.keys(aliases).length) lines.push("  class " + Object.keys(aliases).map(function (id) {
       return aliases[id];
     }).join(",") + " group");
     return lines.join("\n");
   }
 
-  function cachedTopologyMermaid(model) {
+  function cachedTopologyMermaid(model, scopedGroups) {
     var cache = state.topology.mermaidCache;
     var epoch = model.snapshot.topology_epoch == null
       ? null
       : String(model.snapshot.topology_epoch);
+    var scope = (Array.isArray(scopedGroups) ? scopedGroups : model.groups).map(function (group) {
+      return group.group_id;
+    }).join("|");
     var cacheHit = cache.source != null
+      && cache.scope === scope
       && (epoch == null ? cache.snapshot === model.snapshot : cache.epoch === epoch);
     if (!cacheHit) {
       cache.epoch = epoch;
+      cache.scope = scope;
       cache.snapshot = model.snapshot;
-      cache.source = generateTopologyMermaid(model);
+      cache.source = generateTopologyMermaid(model, scopedGroups);
     }
     return cache.source;
   }
@@ -1701,6 +1711,115 @@
       + t("Parent-child hierarchy and forwarding links") + '</title><g class="overlay-svg-depth-bands">' + bandMarkup
       + '</g><g class="overlay-svg-hierarchy">' + hierarchyMarkup + '</g><g class="overlay-svg-edges">' + edgeMarkup
       + '</g><g class="overlay-svg-groups">' + groupMarkup + "</g></svg>";
+  }
+
+  function initializeTopologyMermaid() {
+    if (state.topology.mermaidInitialized) return true;
+    if (!window.mermaid || typeof window.mermaid.initialize !== "function"
+      || typeof window.mermaid.render !== "function") return false;
+    try {
+      window.mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        suppressErrorRendering: true,
+        logLevel: "error",
+        maxEdges: 4096,
+        maxTextSize: 1000000,
+        theme: "base",
+        fontFamily: "Lato, Helvetica Neue, Arial, sans-serif",
+        flowchart: {
+          htmlLabels: false,
+          useMaxWidth: false
+        }
+      });
+    } catch (error) {
+      console.error("Mermaid topology initialization failed", error);
+      return false;
+    }
+    state.topology.mermaidInitialized = true;
+    return true;
+  }
+
+  function showTopologyMermaidFallback(target) {
+    if (!target || !target.isConnected) return;
+    target.dataset.renderer = "fallback";
+    target.removeAttribute("aria-busy");
+    if (target.querySelector(".overlay-mermaid-fallback-notice")) return;
+    var notice = document.createElement("div");
+    notice.className = "overlay-mermaid-fallback-notice";
+    notice.setAttribute("role", "status");
+    notice.textContent = t("Diagram rendering failed. Showing the fallback topology.");
+    target.prepend(notice);
+  }
+
+  function topologySvgBaseWidth(svg) {
+    var viewBox = String(svg.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+    if (viewBox.length === 4 && viewBox.every(Number.isFinite) && viewBox[2] > 0) {
+      return Math.max(760, Math.ceil(viewBox[2]));
+    }
+    var width = Number.parseFloat(svg.getAttribute("width"));
+    return Number.isFinite(width) && width > 0 ? Math.max(760, Math.ceil(width)) : 760;
+  }
+
+  function renderTopologyMermaid() {
+    var target = $("overlay-mermaid-diagram");
+    if (!target || !state.topology.data) return Promise.resolve();
+    var model = normalizedOverlayTopology();
+    var source = cachedTopologyMermaid(model, contextualTopologyGroups(model));
+    var sequence = ++state.topology.mermaidRenderSequence;
+    var renderId = "heteronetwork-topology-" + sequence;
+    target.setAttribute("aria-busy", "true");
+    var previousNotice = target.querySelector(".overlay-mermaid-fallback-notice");
+    if (previousNotice) previousNotice.remove();
+    if (!initializeTopologyMermaid()) {
+      showTopologyMermaidFallback(target);
+      return Promise.resolve();
+    }
+
+    var render = state.topology.mermaidQueue.catch(function () {
+      // A prior failed render must not block the latest topology.
+    }).then(function () {
+      if (sequence !== state.topology.mermaidRenderSequence || !target.isConnected) return null;
+      return window.mermaid.render(renderId, source);
+    });
+    state.topology.mermaidQueue = render.then(function () {}, function () {});
+    return render.then(function (result) {
+      if (!result || sequence !== state.topology.mermaidRenderSequence || !target.isConnected) return;
+      var template = document.createElement("template");
+      template.innerHTML = String(result.svg || "").trim();
+      var svg = template.content.querySelector("svg");
+      if (!svg) throw new Error("Mermaid did not return an SVG");
+      var baseWidth = topologySvgBaseWidth(svg);
+      svg.classList.add("overlay-topology-svg", "overlay-mermaid-svg");
+      svg.dataset.baseWidth = String(baseWidth);
+      svg.style.width = Math.round(baseWidth * state.topology.zoom) + "px";
+      svg.setAttribute("role", "img");
+      svg.setAttribute("aria-label", t("Parent-child hierarchy and forwarding links"));
+      target.replaceChildren(svg);
+      target.dataset.renderer = "mermaid";
+      target.removeAttribute("aria-busy");
+      var scroller = target.closest(".overlay-canvas-scroll");
+      if (scroller) {
+        var scheduleFrame = typeof window.requestAnimationFrame === "function"
+          ? window.requestAnimationFrame.bind(window)
+          : window.setTimeout.bind(window);
+        scheduleFrame(function () {
+          if (sequence !== state.topology.mermaidRenderSequence || !target.isConnected) return;
+          scroller.scrollLeft = Math.max(0, (scroller.scrollWidth - scroller.clientWidth) / 2);
+        });
+      }
+      if (typeof result.bindFunctions === "function") {
+        try {
+          result.bindFunctions(target);
+        } catch (error) {
+          console.error("Mermaid topology bindings failed", error);
+        }
+      }
+    }).catch(function (error) {
+      if (sequence !== state.topology.mermaidRenderSequence) return;
+      console.error("Mermaid topology rendering failed", error);
+      showTopologyMermaidFallback(target);
+    });
   }
 
   function overlayStat(label, value, title) {
@@ -1869,7 +1988,7 @@
     var epoch = String(snapshot.topology_epoch == null ? "-" : snapshot.topology_epoch);
     var graphGroups = contextualTopologyGroups(model);
     var graph = buildOverlayGraph(model, graphGroups);
-    var mermaid = cachedTopologyMermaid(model);
+    var mermaid = cachedTopologyMermaid(model, graphGroups);
     var observedEdges = model.edges.filter(function (edge) { return edge.has_observation; });
     var observedStatuses = observedEdges.map(function (edge) { return edge.observed_status; }).filter(function (status, index, values) {
       return values.indexOf(status) === index;
@@ -1908,7 +2027,8 @@
       + '<button class="icon-button" data-topology-zoom="reset" type="button" aria-label="Reset zoom" title="Reset zoom">' + icon("maximize-2") + '</button>'
       + '<span id="overlay-zoom-value" aria-live="polite">' + Math.round(state.topology.zoom * 100) + '%</span>'
       + '<button class="icon-button" data-topology-zoom="in" type="button" aria-label="Zoom in" title="Zoom in">' + icon("zoom-in") + '</button>'
-      + '</div></div></div>' + legend + '<div class="overlay-canvas-scroll">' + graph + '</div><div class="overlay-graph-meta">'
+      + '</div></div></div>' + legend + '<div class="overlay-canvas-scroll"><div id="overlay-mermaid-diagram" class="overlay-mermaid-diagram"'
+      + ' data-renderer="fallback">' + graph + '</div></div><div class="overlay-graph-meta">'
       + '<span><strong>Algorithm</strong><code data-no-i18n>' + escapeHtml(snapshot.algorithm || "-") + '</code></span>'
       + '<span><strong>Visible groups</strong><code data-no-i18n>' + graphGroups.length + " / " + model.groups.length + '</code></span>'
       + '<span><strong>Generated</strong><time>' + escapeHtml(formatTime(snapshot.generated_at)) + "</time></span></div></section>"
@@ -2379,6 +2499,7 @@
     });
     decorateIcons($("view-content"));
     translateTree($("view-content"));
+    if (state.activeView === "topology") renderTopologyMermaid();
   }
 
   function findNode(nodeId) {
@@ -2566,7 +2687,8 @@
   }
 
   function copyTopologyMermaid() {
-    var source = cachedTopologyMermaid(normalizedOverlayTopology());
+    var model = normalizedOverlayTopology();
+    var source = cachedTopologyMermaid(model, contextualTopologyGroups(model));
     return copyText(source).then(function () {
       toast("Mermaid copied.");
     }).catch(function (error) {

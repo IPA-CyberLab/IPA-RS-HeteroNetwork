@@ -29,43 +29,62 @@ const oidc = {
 };
 const loginStates = new Map();
 
-createServer(async (request, response) => {
-  try {
-    const url = new URL(request.url || "/", publicUrl);
-    if (url.pathname === "/") return redirect(response, "/ui/");
-    if (request.method === "GET" && url.pathname === "/ui/login") return handleLogin(response);
-    if (request.method === "GET" && url.pathname === "/ui/callback") {
-      return await handleCallback(response, url);
+export function createWebConsoleServer() {
+  return createServer(async (request, response) => {
+    try {
+      const url = new URL(request.url || "/", publicUrl);
+      if (url.pathname === "/") return redirect(response, "/ui/");
+      if (request.method === "GET" && url.pathname === "/ui/login") return handleLogin(response);
+      if (request.method === "GET" && url.pathname === "/ui/callback") {
+        return await handleCallback(response, url);
+      }
+      if (request.method === "GET" && url.pathname === "/ui/config") return sendJson(response, publicConfig());
+      if (request.method === "GET" && (url.pathname === "/ui" || url.pathname === "/ui/")) {
+        return sendFile(response, path.join(webuiDir, "index.html"), "text/html; charset=utf-8");
+      }
+      if (request.method === "GET" && url.pathname === "/ui/app.js") {
+        return sendFile(response, path.join(webuiDir, "app.js"), "text/javascript; charset=utf-8");
+      }
+      if (request.method === "GET" && url.pathname === "/ui/theme.js") {
+        return sendFile(response, path.join(webuiDir, "theme.js"), "text/javascript; charset=utf-8");
+      }
+      if (request.method === "GET" && url.pathname === "/ui/styles.css") {
+        return sendFile(response, path.join(webuiDir, "styles.css"), "text/css; charset=utf-8");
+      }
+      if (request.method === "GET" && url.pathname === "/ui/vendor/mermaid.min.js") {
+        return sendFile(
+          response,
+          path.join(webuiDir, "vendor", "mermaid.min.js"),
+          "text/javascript; charset=utf-8",
+        );
+      }
+      if (request.method === "GET" && url.pathname === "/ui/fonts/noto-sans-jp-ui.ttf") {
+        return sendFile(response, path.join(webuiDir, "noto-sans-jp-ui.ttf"), "font/ttf");
+      }
+      if (url.pathname.startsWith("/v1/admin/")) return await handleAdmin(request, response, url.pathname);
+      if (request.method === "GET" && (url.pathname === "/v1/metrics" || url.pathname === "/v1/policy")) {
+        const token = await requireAuth(request, readRoles);
+        return await proxyControlPlane(request, response, url.pathname, token);
+      }
+      sendJson(response, { error: "not found" }, 404);
+    } catch (error) {
+      const status = Number(error.statusCode || 500);
+      sendJson(response, { error: error.message || "internal server error" }, status);
     }
-    if (request.method === "GET" && url.pathname === "/ui/config") return sendJson(response, publicConfig());
-    if (request.method === "GET" && (url.pathname === "/ui" || url.pathname === "/ui/")) {
-      return sendFile(response, path.join(webuiDir, "index.html"), "text/html; charset=utf-8");
-    }
-    if (request.method === "GET" && url.pathname === "/ui/app.js") {
-      return sendFile(response, path.join(webuiDir, "app.js"), "text/javascript; charset=utf-8");
-    }
-    if (request.method === "GET" && url.pathname === "/ui/theme.js") {
-      return sendFile(response, path.join(webuiDir, "theme.js"), "text/javascript; charset=utf-8");
-    }
-    if (request.method === "GET" && url.pathname === "/ui/styles.css") {
-      return sendFile(response, path.join(webuiDir, "styles.css"), "text/css; charset=utf-8");
-    }
-    if (request.method === "GET" && url.pathname === "/ui/fonts/noto-sans-jp-ui.ttf") {
-      return sendFile(response, path.join(webuiDir, "noto-sans-jp-ui.ttf"), "font/ttf");
-    }
-    if (url.pathname.startsWith("/v1/admin/")) return await handleAdmin(request, response, url.pathname);
-    if (request.method === "GET" && (url.pathname === "/v1/metrics" || url.pathname === "/v1/policy")) {
-      const token = await requireAuth(request, readRoles);
-      return await proxyControlPlane(request, response, url.pathname, token);
-    }
-    sendJson(response, { error: "not found" }, 404);
-  } catch (error) {
-    const status = Number(error.statusCode || 500);
-    sendJson(response, { error: error.message || "internal server error" }, status);
-  }
-}).listen(port, bindHost, () => {
-  console.log(`HeteroNetwork WebConsole listening on http://${bindHost}:${port}`);
-});
+  });
+}
+
+export function startWebConsoleServer() {
+  const server = createWebConsoleServer();
+  server.listen(port, bindHost, () => {
+    console.log(`HeteroNetwork WebConsole listening on http://${bindHost}:${port}`);
+  });
+  return server;
+}
+
+const isMain = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) startWebConsoleServer();
 
 function handleLogin(response) {
   cleanupLoginStates();

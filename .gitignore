@@ -1,4 +1,5 @@
 /target/
+/node_modules/
 ebpf/*/target/
 **/*.rs.bk
 .DS_Store
