@@ -240,6 +240,7 @@ run_ipars() {
 }
 
 issuer_key_path="$tmp_dir/rootless-e2e-issuer.key"
+init_daemon_state_dir="$tmp_dir/rootless-e2e-bootstrap"
 init_output_path="$tmp_dir/rootless-e2e-init.json"
 token_output_path="$tmp_dir/rootless-e2e-token.json"
 join_token_path="$tmp_dir/rootless-e2e.join.token"
@@ -256,6 +257,8 @@ run_ipars init \
   --issuer-key-id rootless-e2e \
   --issuer-private-key-path "$issuer_key_path" \
   --emit-issuer-private-key \
+  --daemon-state-dir "$init_daemon_state_dir" \
+  --relay-admission-bearer-token-path "$relay_admission_token_path" \
   --token-ttl-seconds 3600 \
   --unlimited-uses \
   --allowed-route 100.64.0.0/10 \
@@ -291,8 +294,7 @@ for secret_path in \
   "$control_plane_operator_token_path" \
   "$signal_operator_token_path" \
   "$stun_operator_token_path" \
-  "$relay_operator_token_path" \
-  "$relay_admission_token_path"; do
+  "$relay_operator_token_path"; do
   generate_secret >"$secret_path"
 done
 
