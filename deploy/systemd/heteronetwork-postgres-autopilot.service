@@ -1,0 +1,17 @@
+[Unit]
+Description=HeteroNetwork automatic PostgreSQL HA placement and reconciliation
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service
+Requires=heteronetwork-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/heteronetwork/postgres-autopilot/autopilot.env
+ExecStart=/opt/heteronetwork/libexec/postgres-ha-autopilot.sh run
+Restart=always
+RestartSec=15s
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

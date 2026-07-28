@@ -75,6 +75,8 @@ const KUBEADM_HA_AUTOPILOT_SCRIPT: &str = include_str!("../../../scripts/kubeadm
 const POSTGRES_HA_NODE_SCRIPT: &str = include_str!("../../../scripts/postgres-ha-node.sh");
 const POSTGRES_HA_AUTOPILOT_SCRIPT: &str =
     include_str!("../../../scripts/postgres-ha-autopilot.sh");
+const POSTGRES_HA_AUTOPILOT_UNIT: &str =
+    include_str!("../../../deploy/systemd/heteronetwork-postgres-autopilot.service");
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS: u64 = 20;
 const MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES: u64 = 256 * 1024;
 const NODE_ENROLLMENT_CADDY_VERSION: &str = "2.11.4";
@@ -3745,23 +3747,7 @@ POSTGRES_AUTOPILOT_ENV
 chown root:root /etc/heteronetwork/postgres-autopilot/autopilot.env
 chmod 0600 /etc/heteronetwork/postgres-autopilot/autopilot.env
 cat >/etc/systemd/system/heteronetwork-postgres-autopilot.service <<'POSTGRES_AUTOPILOT_UNIT'
-[Unit]
-Description=HeteroNetwork automatic PostgreSQL HA placement and reconciliation
-Wants=network-online.target
-After=network-online.target heteronetwork-agent.service
-Requires=heteronetwork-agent.service
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/heteronetwork/postgres-autopilot/autopilot.env
-ExecStart=/opt/heteronetwork/libexec/postgres-ha-autopilot.sh run
-Restart=always
-RestartSec=15s
-TimeoutStartSec=infinity
-
-[Install]
-WantedBy=multi-user.target
+{autopilot_unit}
 POSTGRES_AUTOPILOT_UNIT
 systemctl daemon-reload
 systemctl enable heteronetwork-postgres-autopilot.service
@@ -3770,6 +3756,7 @@ echo "Automatic PostgreSQL HA placement scheduled"
 "#,
         helper = helper,
         autopilot = autopilot,
+        autopilot_unit = POSTGRES_HA_AUTOPILOT_UNIT,
         bearer_token = bearer_token,
         cluster_id = cluster_id,
         role = token.claims.role.as_str(),
