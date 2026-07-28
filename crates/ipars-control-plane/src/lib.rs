@@ -1470,6 +1470,13 @@ where
             .collect())
     }
 
+    pub async fn registered_nodes_with_health(
+        &self,
+    ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
+        let snapshot = self.overlay_node_snapshot().await?;
+        Ok((snapshot.nodes.clone(), snapshot.health_by_node.clone()))
+    }
+
     pub async fn require_client_gateway(&self) -> Result<NodeRecord, ControlPlaneError> {
         let now = Utc::now();
         let policy = self.current_cluster_policy().await?;

@@ -60,6 +60,10 @@ const WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY: &str = "heteronetwork_access_token";
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_DATABASE_AUTOPILOT_REQUEST_BYTES: usize = 8 * 1024;
+const MAX_DATABASE_AUTOPILOT_MEMBER_IDS: usize = 32;
+const MAX_DATABASE_AUTOPILOT_CANDIDATES: usize = 64;
+const DATABASE_AUTOPILOT_REGISTRY_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
@@ -329,6 +333,7 @@ pub struct ControlPlaneHttpState<S, L> {
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
     node_enrollment: Option<Arc<NodeEnrollmentConfig>>,
     dynamic_web_gateway: Option<Arc<DynamicWebGatewayConfig>>,
+    database_autopilot_registry_cache: Arc<Mutex<Option<Arc<DatabaseAutopilotRegistrySnapshot>>>>,
 }
 
 #[derive(Clone)]
@@ -387,6 +392,7 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
             web_ui_auth: self.web_ui_auth.clone(),
             node_enrollment: self.node_enrollment.clone(),
             dynamic_web_gateway: self.dynamic_web_gateway.clone(),
+            database_autopilot_registry_cache: self.database_autopilot_registry_cache.clone(),
         }
     }
 }
@@ -403,6 +409,7 @@ impl<S, L> ControlPlaneHttpState<S, L> {
             web_ui_auth: None,
             node_enrollment: None,
             dynamic_web_gateway: None,
+            database_autopilot_registry_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -470,7 +477,8 @@ where
         let database_autopilot = Router::new()
             .route(
                 "/v1/database-autopilot/nodes",
-                get(database_autopilot_nodes::<S, L>),
+                post(database_autopilot_nodes::<S, L>)
+                    .layer(DefaultBodyLimit::max(MAX_DATABASE_AUTOPILOT_REQUEST_BYTES)),
             )
             .route_layer(middleware::from_fn_with_state(
                 bearer_token,
@@ -3902,7 +3910,7 @@ fn node_enrollment_download_bases(
     bases
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct DatabaseAutopilotRegistryNode {
     node_id: String,
     vpn_ip: String,
@@ -3913,8 +3921,26 @@ struct DatabaseAutopilotRegistryNode {
 #[derive(Debug, Serialize)]
 struct DatabaseAutopilotRegistryResponse {
     cluster_id: String,
+    vpn_cidr: String,
+    selection_epoch: u64,
     nodes: Vec<DatabaseAutopilotRegistryNode>,
     generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseAutopilotRegistryRequest {
+    selection_epoch: u64,
+    member_node_ids: Vec<NodeId>,
+}
+
+#[derive(Debug)]
+struct DatabaseAutopilotRegistrySnapshot {
+    loaded_at: Instant,
+    health_ttl: Duration,
+    generated_at: DateTime<Utc>,
+    nodes_by_id: HashMap<NodeId, DatabaseAutopilotRegistryNode>,
+    active_node_ids: Vec<NodeId>,
 }
 
 fn database_autopilot_node_is_active(
@@ -3937,42 +3963,139 @@ fn database_autopilot_node_is_active(
     }
 }
 
+fn select_database_autopilot_registry_nodes(
+    snapshot: &DatabaseAutopilotRegistrySnapshot,
+    member_node_ids: &[NodeId],
+    selection_epoch: u64,
+) -> Result<Vec<DatabaseAutopilotRegistryNode>, ControlPlaneError> {
+    let mut selected = Vec::with_capacity(MAX_DATABASE_AUTOPILOT_CANDIDATES);
+    let mut selected_ids = BTreeSet::new();
+    for node_id in member_node_ids {
+        let node = snapshot.nodes_by_id.get(node_id).ok_or_else(|| {
+            ControlPlaneError::InvalidClusterPolicy(format!(
+                "persisted database member {node_id} is not registered"
+            ))
+        })?;
+        selected.push(node.clone());
+        selected_ids.insert(node_id.clone());
+    }
+    let slots = MAX_DATABASE_AUTOPILOT_CANDIDATES.saturating_sub(selected.len());
+    if !snapshot.active_node_ids.is_empty() && slots > 0 {
+        let active_len = snapshot.active_node_ids.len();
+        let offset = ((selection_epoch as u128 % active_len as u128)
+            * (slots as u128 % active_len as u128)
+            % active_len as u128) as usize;
+        let mut examined = 0;
+        while selected.len() < MAX_DATABASE_AUTOPILOT_CANDIDATES && examined < active_len {
+            let node_id = &snapshot.active_node_ids[(offset + examined) % active_len];
+            if selected_ids.insert(node_id.clone()) {
+                let node = snapshot.nodes_by_id.get(node_id).ok_or_else(|| {
+                    ControlPlaneError::Store(format!(
+                        "active database node {node_id} is absent from the cached registry"
+                    ))
+                })?;
+                selected.push(node.clone());
+            }
+            examined += 1;
+        }
+    }
+    Ok(selected)
+}
+
+async fn database_autopilot_registry_snapshot<S, L>(
+    state: &ControlPlaneHttpState<S, L>,
+    health_ttl: Duration,
+) -> Result<Arc<DatabaseAutopilotRegistrySnapshot>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let mut cached = state.database_autopilot_registry_cache.lock().await;
+    if let Some(snapshot) = cached.as_ref().filter(|snapshot| {
+        snapshot.loaded_at.elapsed() <= DATABASE_AUTOPILOT_REGISTRY_CACHE_TTL
+            && snapshot.health_ttl == health_ttl
+    }) {
+        return Ok(Arc::clone(snapshot));
+    }
+
+    let generated_at = Utc::now();
+    let cluster_id = &state.plane.config().cluster_id;
+    let (nodes, health_by_node) = state.plane.registered_nodes_with_health().await?;
+    let mut nodes_by_id = HashMap::with_capacity(nodes.len());
+    let mut active_node_ids = Vec::new();
+    for node in nodes
+        .into_iter()
+        .filter(|node| node.cluster_id == *cluster_id)
+    {
+        let active = database_autopilot_node_is_active(
+            &node,
+            health_by_node.get(&node.node_id),
+            generated_at,
+            health_ttl,
+        );
+        let node_id = node.node_id.clone();
+        let registry_node = DatabaseAutopilotRegistryNode {
+            node_id: node_id.to_string(),
+            vpn_ip: node.vpn_ip.to_string(),
+            role: node.role.to_string(),
+            active,
+        };
+        if active {
+            active_node_ids.push(node_id.clone());
+        }
+        nodes_by_id.insert(node_id, registry_node);
+    }
+    active_node_ids.sort();
+    let snapshot = Arc::new(DatabaseAutopilotRegistrySnapshot {
+        loaded_at: Instant::now(),
+        health_ttl,
+        generated_at,
+        nodes_by_id,
+        active_node_ids,
+    });
+    *cached = Some(Arc::clone(&snapshot));
+    Ok(snapshot)
+}
+
 async fn database_autopilot_nodes<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<DatabaseAutopilotRegistryRequest>,
 ) -> Result<Json<DatabaseAutopilotRegistryResponse>, ApiError>
 where
     S: ControlPlaneStore,
     L: TokenLedger,
 {
-    let generated_at = Utc::now();
+    if request.member_node_ids.len() > MAX_DATABASE_AUTOPILOT_MEMBER_IDS
+        || request
+            .member_node_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != request.member_node_ids.len()
+    {
+        return Err(ControlPlaneError::InvalidClusterPolicy(
+            "database autopilot member IDs must be unique and contain at most 32 entries"
+                .to_string(),
+        )
+        .into());
+    }
     let config = state.plane.config();
     let cluster_id = config.cluster_id.clone();
+    let vpn_cidr = config.vpn_pool.to_string();
     let policy = state.plane.current_cluster_policy().await?;
     let ttl = Duration::from_secs(policy.relay_health_ttl_seconds);
-    let (nodes, health_by_node) = state.plane.registered_nodes_with_health().await?;
-    let mut nodes = nodes
-        .into_iter()
-        .filter(|node| node.cluster_id == cluster_id)
-        .map(|node| {
-            let active = database_autopilot_node_is_active(
-                &node,
-                health_by_node.get(&node.node_id),
-                generated_at,
-                ttl,
-            );
-            DatabaseAutopilotRegistryNode {
-                node_id: node.node_id.to_string(),
-                vpn_ip: node.vpn_ip.to_string(),
-                role: node.role.to_string(),
-                active,
-            }
-        })
-        .collect::<Vec<_>>();
-    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let snapshot = database_autopilot_registry_snapshot(&state, ttl).await?;
+    let nodes = select_database_autopilot_registry_nodes(
+        &snapshot,
+        &request.member_node_ids,
+        request.selection_epoch,
+    )?;
     Ok(Json(DatabaseAutopilotRegistryResponse {
         cluster_id: cluster_id.to_string(),
+        vpn_cidr,
+        selection_epoch: request.selection_epoch,
         nodes,
-        generated_at,
+        generated_at: snapshot.generated_at,
     }))
 }
 
@@ -5781,6 +5904,52 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn database_autopilot_registry_is_bounded_and_rotates_large_candidate_sets(
+    ) -> Result<(), ControlPlaneError> {
+        let identities = (0..1_000)
+            .map(|index| node_id(&format!("database-candidate-{index:04}")))
+            .collect::<Vec<_>>();
+        let nodes = identities
+            .iter()
+            .enumerate()
+            .map(|(index, node_id)| DatabaseAutopilotRegistryNode {
+                node_id: node_id.to_string(),
+                vpn_ip: format!("10.250.{}.{}", index / 250, index % 250 + 1),
+                role: "worker".to_string(),
+                active: index != 999,
+            })
+            .collect::<Vec<_>>();
+        let mut active_node_ids = identities[..999].to_vec();
+        active_node_ids.sort();
+        let snapshot = DatabaseAutopilotRegistrySnapshot {
+            loaded_at: Instant::now(),
+            health_ttl: Duration::from_secs(30),
+            generated_at: Utc::now(),
+            nodes_by_id: identities.iter().cloned().zip(nodes).collect(),
+            active_node_ids,
+        };
+        let members = vec![identities[999].clone()];
+        let first = select_database_autopilot_registry_nodes(&snapshot, &members, 0)?;
+        let second = select_database_autopilot_registry_nodes(&snapshot, &members, 1)?;
+        assert_eq!(first.len(), MAX_DATABASE_AUTOPILOT_CANDIDATES);
+        assert_eq!(second.len(), MAX_DATABASE_AUTOPILOT_CANDIDATES);
+        assert_eq!(first[0].node_id, identities[999].as_str());
+        assert!(!first[0].active);
+        assert_eq!(second[0].node_id, identities[999].as_str());
+        assert_ne!(
+            first
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            second
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect::<BTreeSet<_>>()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn node_enrollment_issues_ha_single_use_token_and_protects_artifacts(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5864,13 +6033,19 @@ mod tests {
             "reusable": false,
             "max_uses": 1
         });
+        let registry_request = serde_json::to_vec(&serde_json::json!({
+            "selection_epoch": 7,
+            "member_node_ids": [gateway.node_id.as_str()]
+        }))?;
 
         let unauthenticated_registry = app
             .clone()
             .oneshot(
                 Request::builder()
+                    .method("POST")
                     .uri("/v1/database-autopilot/nodes")
-                    .body(Body::empty())?,
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(registry_request.clone()))?,
             )
             .await?;
         assert_eq!(unauthenticated_registry.status(), StatusCode::UNAUTHORIZED);
@@ -5878,12 +6053,14 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .method("POST")
                     .uri("/v1/database-autopilot/nodes")
+                    .header(header::CONTENT_TYPE, "application/json")
                     .header(
                         header::AUTHORIZATION,
                         format!("Bearer {database_autopilot_bearer}"),
                     )
-                    .body(Body::empty())?,
+                    .body(Body::from(registry_request))?,
             )
             .await?;
         assert_eq!(authenticated_registry.status(), StatusCode::OK);
@@ -5891,11 +6068,92 @@ mod tests {
             axum::body::to_bytes(authenticated_registry.into_body(), usize::MAX).await?;
         let authenticated_registry: Value = serde_json::from_slice(&authenticated_registry)?;
         assert_eq!(authenticated_registry["cluster_id"], cluster_id.as_str());
+        assert_eq!(authenticated_registry["vpn_cidr"], "100.64.0.0/29");
+        assert_eq!(authenticated_registry["selection_epoch"], 7);
         assert_eq!(
             authenticated_registry["nodes"][0]["node_id"],
             gateway.node_id.as_str()
         );
         assert_eq!(authenticated_registry["nodes"][0]["active"], true);
+
+        let too_many_member_ids = (0..=MAX_DATABASE_AUTOPILOT_MEMBER_IDS)
+            .map(|index| format!("database-member-{index}"))
+            .collect::<Vec<_>>();
+        for (request, expected_status) in [
+            (
+                serde_json::json!({"selection_epoch": 7}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({
+                    "selection_epoch": 7,
+                    "member_node_id": [gateway.node_id.as_str()]
+                }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({
+                    "selection_epoch": 7,
+                    "member_node_ids": [
+                        gateway.node_id.as_str(),
+                        gateway.node_id.as_str()
+                    ]
+                }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({
+                    "selection_epoch": 7,
+                    "member_node_ids": ["missing-database-member"]
+                }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({
+                    "selection_epoch": 7,
+                    "member_node_ids": too_many_member_ids
+                }),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/database-autopilot/nodes")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {database_autopilot_bearer}"),
+                        )
+                        .body(Body::from(serde_json::to_vec(&request)?))?,
+                )
+                .await?;
+            assert_eq!(response.status(), expected_status, "request: {request}");
+        }
+        let oversized_registry_request = format!(
+            "{{\"selection_epoch\":7,\"member_node_ids\":[],\"padding\":\"{}\"}}",
+            "x".repeat(MAX_DATABASE_AUTOPILOT_REQUEST_BYTES)
+        );
+        let oversized_registry_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/database-autopilot/nodes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {database_autopilot_bearer}"),
+                    )
+                    .body(Body::from(oversized_registry_request))?,
+            )
+            .await?;
+        assert_eq!(
+            oversized_registry_response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
 
         let unauthenticated = app
             .clone()

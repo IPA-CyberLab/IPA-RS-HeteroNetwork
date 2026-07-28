@@ -29,6 +29,7 @@ node_name="${HETERONETWORK_DB_NODE_NAME:-}"
 node_address="${HETERONETWORK_DB_NODE_ADDRESS:-}"
 client_listen_address="${HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS:-}"
 members="${HETERONETWORK_DB_MEMBERS:-}"
+member_identities="${HETERONETWORK_DB_MEMBER_IDENTITIES:-}"
 dcs_members="${HETERONETWORK_DB_DCS_MEMBERS:-$members}"
 dcs_bootstrap_members="${HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS:-$dcs_members}"
 dcs_initial_cluster_state="${HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE:-new}"
@@ -61,6 +62,7 @@ Commands:
   install-node            Install this PostgreSQL/Patroni member and optional DCS voter
   reconfigure-node        Apply a new member map without replacing PostgreSQL data
   reconcile-dcs           Add or promote at most one DCS learner
+  current-dcs-members     Print the actual DCS membership as name=underlay-ip
   install-proxy           Install only the local primary-selecting database proxy
   verify                  Require DCS quorum, one primary, all replicas, and synchronous writes
   status                  Print bounded cluster health without printing credentials
@@ -68,16 +70,21 @@ Commands:
 
 Required environment for init-bundle:
   HETERONETWORK_DB_MEMBERS       3-32 name=underlay-ip entries, comma separated
+  HETERONETWORK_DB_MEMBER_IDENTITIES
+                                  Matching name=HeteroNetwork-node-id entries
 
 Required environment for install-node:
   HETERONETWORK_DB_NODE_NAME
   HETERONETWORK_DB_NODE_ADDRESS
   HETERONETWORK_DB_INTERFACE
   HETERONETWORK_DB_MEMBERS
+  HETERONETWORK_DB_MEMBER_IDENTITIES
   HETERONETWORK_DB_BUNDLE_DIR
 
 Required environment for install-proxy:
   HETERONETWORK_DB_PROXY_BACKENDS  3-32 name=private-ip entries
+  HETERONETWORK_DB_MEMBERS
+  HETERONETWORK_DB_MEMBER_IDENTITIES
   HETERONETWORK_DB_BUNDLE_DIR
 
 Optional environment:
@@ -126,6 +133,12 @@ validate_name() {
   local value="$1"
   [[ ${#value} -le 63 && "$value" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
     || die "invalid lowercase node or cluster name: $value"
+}
+
+validate_node_id() {
+  local value="$1"
+  [[ ${#value} -le 255 && "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]] \
+    || die "invalid HeteroNetwork node ID: $value"
 }
 
 validate_dns_name() {
@@ -192,6 +205,54 @@ member_rows_for() {
 member_rows() {
   member_rows_for "$members" database \
     "$MIN_DATABASE_MEMBER_COUNT" "$MAX_DATABASE_MEMBER_COUNT" false
+}
+
+member_identity_rows() {
+  local -a entries
+  local entry name node_id
+  IFS=, read -r -a entries <<<"$member_identities"
+  ((${#entries[@]} >= MIN_DATABASE_MEMBER_COUNT \
+      && ${#entries[@]} <= MAX_DATABASE_MEMBER_COUNT)) \
+    || die "database member identity count must be between $MIN_DATABASE_MEMBER_COUNT and $MAX_DATABASE_MEMBER_COUNT"
+
+  local -A seen_names=()
+  local -A seen_node_ids=()
+  for entry in "${entries[@]}"; do
+    [[ "$entry" == "${entry//[[:space:]]/}" ]] \
+      || die "database member identities must not contain whitespace"
+    [[ "$entry" == *=* ]] \
+      || die "database member identity must use name=node-id: $entry"
+    name="${entry%%=*}"
+    node_id="${entry#*=}"
+    validate_name "$name"
+    validate_node_id "$node_id"
+    [[ -z "${seen_names[$name]:-}" ]] \
+      || die "duplicate database member identity name: $name"
+    [[ -z "${seen_node_ids[$node_id]:-}" ]] \
+      || die "duplicate HeteroNetwork node identity: $node_id"
+    seen_names["$name"]=1
+    seen_node_ids["$node_id"]=1
+    printf '%s %s\n' "$name" "$node_id"
+  done
+}
+
+validate_member_identities() {
+  member_identity_rows >/dev/null
+  local -A database_names=()
+  local -A identity_names=()
+  local name value
+  while read -r name value; do
+    database_names["$name"]=1
+  done < <(member_rows)
+  while read -r name value; do
+    [[ -n "${database_names[$name]:-}" ]] \
+      || die "database member identity $name is not present in HETERONETWORK_DB_MEMBERS"
+    identity_names["$name"]=1
+  done < <(member_identity_rows)
+  while read -r name value; do
+    [[ -n "${identity_names[$name]:-}" ]] \
+      || die "database member $name has no HeteroNetwork node identity"
+  done < <(member_rows)
 }
 
 dcs_member_rows() {
@@ -311,6 +372,7 @@ validate_common_config() {
   [[ "$network_plane" == "$DEFAULT_NETWORK_PLANE" ]] \
     || die "database network plane must be $DEFAULT_NETWORK_PLANE"
   member_rows >/dev/null
+  validate_member_identities
   dcs_member_rows >/dev/null
   dcs_bootstrap_member_rows >/dev/null
   [[ "$dcs_initial_cluster_state" == "new" || "$dcs_initial_cluster_state" == "existing" ]] \
@@ -856,12 +918,89 @@ EOF
   chmod 0644 "$node_dir/node.crt" "$node_dir/ca.crt"
 }
 
+bundle_manifest_value() {
+  local output="$1"
+  local key="$2"
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      count += 1
+      value = substr($0, length(key) + 2)
+    }
+    END {
+      if (count != 1 || value == "") {
+        exit 1
+      }
+      print value
+    }
+  ' "$output/manifest.env"
+}
+
+mapping_value_for_name() {
+  local input="$1"
+  local expected_name="$2"
+  tr ',' '\n' <<<"$input" \
+    | awk -F= -v expected_name="$expected_name" '
+        $1 == expected_name {
+          count += 1
+          value = $2
+        }
+        END {
+          if (count != 1 || value == "") {
+            exit 1
+          }
+          print value
+        }
+      '
+}
+
+validate_existing_bundle_identity_stability() {
+  local output="$1"
+  [[ -f "$output/manifest.env" && ! -L "$output/manifest.env" ]] \
+    || die "existing bundle manifest is missing or unsafe"
+  local old_members old_identities old_network_plane
+  old_members="$(bundle_manifest_value "$output" HETERONETWORK_DB_MEMBERS)" \
+    || die "existing bundle has no valid member map"
+  old_identities="$(
+    bundle_manifest_value "$output" HETERONETWORK_DB_MEMBER_IDENTITIES
+  )" || die "existing bundle has no persisted HeteroNetwork member identities"
+  old_network_plane="$(
+    bundle_manifest_value "$output" HETERONETWORK_DB_NETWORK_PLANE
+  )" || die "existing bundle has no network-plane contract"
+  [[ "$old_network_plane" == "$DEFAULT_NETWORK_PLANE" ]] \
+    || die "existing bundle network plane must be $DEFAULT_NETWORK_PLANE"
+  (
+    members="$old_members"
+    member_identities="$old_identities"
+    validate_member_identities
+  ) || die "existing bundle member identities are invalid"
+
+  local entry name old_node_id old_address desired_node_id desired_address
+  local -a entries
+  IFS=, read -r -a entries <<<"$old_identities"
+  for entry in "${entries[@]}"; do
+    name="${entry%%=*}"
+    old_node_id="${entry#*=}"
+    old_address="$(mapping_value_for_name "$old_members" "$name")" \
+      || die "existing bundle identity $name has no database member"
+    desired_node_id="$(mapping_value_for_name "$member_identities" "$name")" \
+      || die "automatic database member removal is refused for $name"
+    desired_address="$(mapping_value_for_name "$members" "$name")" \
+      || die "automatic database member removal is refused for $name"
+    [[ "$desired_node_id" == "$old_node_id" ]] \
+      || die "HeteroNetwork identity drift is refused for $name"
+    [[ "$desired_address" == "$old_address" ]] \
+      || die "underlay address drift is refused for $name ($old_address -> $desired_address)"
+  done
+}
+
 write_bundle_manifest() {
   local output="$1"
   cat >"$output/manifest.env" <<EOF
 HETERONETWORK_DB_CLUSTER_NAME=${cluster_name}
 HETERONETWORK_DB_MEMBERS=${members}
+HETERONETWORK_DB_MEMBER_IDENTITIES=${member_identities}
 HETERONETWORK_DB_DCS_MEMBERS=${dcs_members}
+HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=${dcs_bootstrap_members}
 HETERONETWORK_DB_SERVICE_NAME=${service_name}
 HETERONETWORK_DB_POSTGRES_PORT=${postgres_port}
 HETERONETWORK_DB_REST_PORT=${rest_port}
@@ -914,6 +1053,7 @@ extend_bundle() {
   require_command openssl
   require_command install
   validate_bundle_authority "$output"
+  validate_existing_bundle_identity_stability "$output"
 
   local original_bundle_dir="$bundle_dir"
   bundle_dir="$output"
@@ -1084,10 +1224,55 @@ verify_interface_address() {
   fi
 }
 
+route_output_uses_interface() {
+  local output="$1"
+  local expected_interface="$2"
+  local expected_source="$3"
+  [[ "$expected_interface" != "heteronetwork0" ]] || return 1
+  awk \
+    -v expected_interface="$expected_interface" \
+    -v expected_source="$expected_source" '
+    {
+      for (field_index = 1; field_index <= NF; field_index += 1) {
+        if ($field_index == "dev" && field_index < NF) {
+          interface_count += 1
+          interface = $(field_index + 1)
+        } else if ($field_index == "src" && field_index < NF) {
+          source_count += 1
+          source = $(field_index + 1)
+        }
+      }
+    }
+    END {
+      invalid = interface_count != 1 || interface != expected_interface
+      invalid = invalid || interface == "heteronetwork0" || source_count != 1
+      invalid = invalid || source != expected_source
+      if (invalid) {
+        exit 1
+      }
+    }
+  ' <<<"$output"
+}
+
+verify_member_routes() {
+  require_command ip
+  local name address route
+  while read -r name address; do
+    if [[ "$address" == "$node_address" || "$address" == 127.* ]]; then
+      continue
+    fi
+    route="$(ip -4 route get "$address" from "$node_address" 2>/dev/null)" \
+      || die "no host-underlay route from $node_address to $name=$address"
+    route_output_uses_interface "$route" "$interface" "$node_address" \
+      || die "route to $name=$address does not use selected host-underlay interface $interface"
+  done < <(member_rows)
+}
+
 install_node() {
   require_root
   validate_node_config
   verify_interface_address
+  verify_member_routes
   require_command apt-get
   require_command openssl
 
@@ -1167,6 +1352,7 @@ reconfigure_node() {
   require_root
   validate_node_config
   verify_interface_address
+  verify_member_routes
   require_command openssl
   require_command systemctl
   if [[ ! -f /etc/systemd/system/heteronetwork-db.service ]]; then
@@ -1257,9 +1443,62 @@ for member in document.get("members", []):
 '
 }
 
-reconcile_dcs() {
+current_dcs_members() {
   require_root
   validate_node_config
+  verify_interface_address
+  verify_member_routes
+  require_command python3
+  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
+  validate_bundle_authority "$bundle_dir"
+
+  local snapshot
+  snapshot="$(dcs_member_snapshot)"
+  [[ -n "$snapshot" ]] || die "DCS membership is empty"
+  local output="" desired_name desired_address desired_url
+  local id actual_name peer_url learner found actual_count=0 matched_count=0
+  while IFS=$'\t' read -r id actual_name peer_url learner; do
+    actual_count=$((actual_count + 1))
+    found=0
+    while read -r desired_name desired_address; do
+      desired_url="https://${desired_address}:${dcs_peer_port}"
+      if [[ "$peer_url" == "$desired_url" ]]; then
+        [[ -z "$actual_name" || "$actual_name" == "$desired_name" ]] \
+          || die "DCS peer $peer_url is registered as unexpected name $actual_name"
+        found=1
+        break
+      fi
+    done < <(dcs_member_rows)
+    ((found == 1)) || die "DCS contains an unmanaged peer URL: $peer_url"
+  done <<<"$snapshot"
+
+  while read -r desired_name desired_address; do
+    desired_url="https://${desired_address}:${dcs_peer_port}"
+    found=0
+    while IFS=$'\t' read -r id actual_name peer_url learner; do
+      if [[ "$peer_url" == "$desired_url" ]]; then
+        found=1
+        break
+      fi
+    done <<<"$snapshot"
+    if ((found == 1)); then
+      [[ -z "$output" ]] || output+=","
+      output+="${desired_name}=${desired_address}"
+      matched_count=$((matched_count + 1))
+    fi
+  done < <(dcs_member_rows)
+  ((matched_count == actual_count)) \
+    || die "DCS membership could not be mapped to the requested topology"
+  printf '%s\n' "$output"
+}
+
+reconcile_dcs_unlocked() {
+  [[ -n "${ETCD_LOCK_KEY:-}" && -n "${ETCD_LOCK_REV:-}" ]] \
+    || die "DCS reconciliation requires the distributed etcd lock"
+  require_root
+  validate_node_config
+  verify_interface_address
+  verify_member_routes
   require_command python3
   [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
   validate_bundle_authority "$bundle_dir"
@@ -1314,9 +1553,30 @@ reconcile_dcs() {
   printf 'DCS membership already matches the requested topology.\n'
 }
 
+reconcile_dcs() {
+  require_root
+  validate_node_config
+  verify_interface_address
+  verify_member_routes
+  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
+  validate_bundle_authority "$bundle_dir"
+  /opt/heteronetwork/postgres-ha/etcdctl \
+    --endpoints="$(etcd_endpoints)" \
+    --dial-timeout=3s \
+    --command-timeout=45s \
+    --cacert="$bundle_dir/ca/ca.crt" \
+    --cert="$bundle_dir/nodes/$node_name/node.crt" \
+    --key="$bundle_dir/nodes/$node_name/node.key" \
+    lock --ttl=60 \
+    "/heteronetwork/postgres-ha/${cluster_name}/dcs-reconcile" \
+    "$0" reconcile-dcs-unlocked
+}
+
 reconcile_patroni_config() {
   require_root
   validate_node_config
+  verify_interface_address
+  verify_member_routes
   local synchronous_count
   synchronous_count="$(synchronous_standby_count)"
   [[ -x /opt/heteronetwork/postgres-ha/patroni/bin/patronictl ]] \
@@ -1405,6 +1665,7 @@ verify_cluster() {
 
 self_test() {
   local original_members="$members"
+  local original_member_identities="$member_identities"
   local original_interface="$interface"
   local original_dcs_members="$dcs_members"
   local original_dcs_bootstrap_members="$dcs_bootstrap_members"
@@ -1421,6 +1682,7 @@ self_test() {
   trap '[[ -z "${test_dir:-}" || "$test_dir" != /tmp/heteronetwork-postgres-ha-test.* ]] || rm -rf "$test_dir"' RETURN
 
   members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5,db-f=100.64.10.6"
+  member_identities="db-a=node-a,db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f"
   interface="tailscale0"
   dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
   dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
@@ -1481,7 +1743,21 @@ self_test() {
     "$test_dir/generated-bundle/manifest.env"
   grep -Fq 'HETERONETWORK_DB_NETWORK_PLANE=underlay-v1' \
     "$test_dir/generated-bundle/manifest.env"
+  grep -Fq \
+    'HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4' \
+    "$test_dir/generated-bundle/manifest.env"
+  grep -Fq \
+    'HETERONETWORK_DB_MEMBER_IDENTITIES=db-a=node-a,db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f' \
+    "$test_dir/generated-bundle/manifest.env"
+  if (
+    member_identities="db-a=node-z,db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f"
+    validate_existing_bundle_identity_stability \
+      "$test_dir/generated-bundle" >/dev/null 2>&1
+  ); then
+    die "existing database member identity drift was accepted"
+  fi
   members="${members},db-g=100.64.10.7"
+  member_identities="${member_identities},db-g=node-g"
   proxy_backends="$members"
   topology_revision="8"
   extend_bundle "$test_dir/generated-bundle" >/dev/null 2>&1
@@ -1491,6 +1767,7 @@ self_test() {
   grep -Fq 'HETERONETWORK_DB_TOPOLOGY_REVISION=8' \
     "$test_dir/generated-bundle/manifest.env"
   members="${members%,db-g=100.64.10.7}"
+  member_identities="${member_identities%,db-g=node-g}"
   proxy_backends="$members"
   topology_revision="7"
   if (
@@ -1504,6 +1781,30 @@ self_test() {
     member_rows >/dev/null 2>&1
   ); then
     die "duplicate member self-test unexpectedly succeeded"
+  fi
+  if (
+    member_identities="db-a=node-a,db-b=node-a,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f"
+    validate_member_identities >/dev/null 2>&1
+  ); then
+    die "duplicate HeteroNetwork member identity unexpectedly succeeded"
+  fi
+  if route_output_uses_interface \
+    "100.64.10.2 dev heteronetwork0 src 10.250.0.1 uid 0" \
+    "tailscale0" "100.64.10.1"; then
+    die "overlay-routed database member was accepted"
+  fi
+  route_output_uses_interface \
+    "100.64.10.2 dev tailscale0 table 52 src 100.64.10.1 uid 0" \
+    "tailscale0" "100.64.10.1"
+  if route_output_uses_interface \
+    "100.64.10.2 dev eth0 src 192.0.2.10 uid 0" \
+    "tailscale0" "100.64.10.1"; then
+    die "database member route on the wrong underlay interface was accepted"
+  fi
+  if route_output_uses_interface \
+    "100.64.10.2 dev tailscale0 src 100.64.10.9 uid 0" \
+    "tailscale0" "100.64.10.1"; then
+    die "database member route with the wrong source address was accepted"
   fi
   if (
     dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
@@ -1531,6 +1832,7 @@ self_test() {
   fi
 
   members="$original_members"
+  member_identities="$original_member_identities"
   interface="$original_interface"
   dcs_members="$original_dcs_members"
   dcs_bootstrap_members="$original_dcs_bootstrap_members"
@@ -1568,6 +1870,12 @@ case "${1:-}" in
     ;;
   reconcile-dcs)
     reconcile_dcs
+    ;;
+  reconcile-dcs-unlocked)
+    reconcile_dcs_unlocked
+    ;;
+  current-dcs-members)
+    current_dcs_members
     ;;
   reconcile-patroni)
     reconcile_patroni_config

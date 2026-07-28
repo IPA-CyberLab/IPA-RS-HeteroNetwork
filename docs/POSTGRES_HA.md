@@ -15,42 +15,77 @@ same command installs and starts:
 - `heteronetwork-postgres-autopilot.service`;
 - the PostgreSQL/Patroni/DCS renderer used by the autopilot.
 
-The autopilot waits until at least three enrolled Linux nodes advertise
-mutually reachable host-underlay addresses. The lowest ready database member
-creates the first topology. Other nodes download the authenticated bootstrap
-bundle over the encrypted HeteroNetwork overlay and configure themselves
-without operator input.
+The autopilot requests a bounded placement window from a dedicated
+bearer-authenticated Control Plane endpoint. It never treats an Agent's bounded
+or lazy-connected peer map as a cluster-wide registry. The Control Plane always
+includes persisted database members, then fills the response with at most 64
+currently active non-client candidates selected from its cached node registry.
+The window rotates by a shared epoch, so later reconciliations can inspect
+different candidates without sending the complete node ledger to every node.
+This keeps response size and per-autopilot discovery work bounded when the
+HeteroNetwork cluster contains hundreds or thousands of nodes.
 
-Every ready non-client Linux node with a reachable underlay address becomes a
-synchronous PostgreSQL replica, up to 32 members. Public Internet reachability
-is irrelevant; direct reachability over a host network such as a site LAN,
-routed management network, or Tailscale is required. The first three members
-form the initial etcd DCS quorum. When at least five database members exist, the
-autopilot expands the DCS to five voters one at a time:
+The active candidate with the lexicographically lowest HeteroNetwork node ID is
+the sole fresh-cluster coordinator. It chooses up to 32 candidates for which
+every directed pair reports direct host-underlay reachability. The selected
+window and reciprocal result must remain unchanged across three fresh
+descriptor generations; rereading a stale descriptor does not advance the
+window. After at least three members converge, the coordinator creates the
+first topology. Other nodes download the authenticated bundle over the
+encrypted HeteroNetwork overlay and configure themselves without operator
+input. Bundle downloads require both the cluster bearer and a source VPN
+address mapped to a persisted database member in the current bounded response.
+The authorization set is refreshed from member IDs on every reconciliation, so
+candidates outside the 32-member topology and removed member identities cannot
+retrieve CA private material. An inactive or underlay-unreachable nonmember
+candidate is skipped instead of blocking ready members.
+
+Selected members become synchronous PostgreSQL replicas. Public Internet
+reachability is irrelevant; direct reachability over a host network such as a
+site LAN, routed management network, or Tailscale is required. The first three
+members form the initial etcd DCS quorum when only three or four database
+members are ready. A bootstrap with at least five ready members starts with
+five voters. When a three-voter topology later reaches at least five database
+members, the autopilot first persists a five-member DCS target and then
+reconciles one learner at a time:
 
 1. add one etcd learner;
 2. start it with the existing-cluster configuration;
 3. wait until etcd allows promotion;
 4. promote it and repeat for the fifth voter.
 
-This avoids changing quorum before a new member has copied the Raft log. A
-five-voter DCS requires two synchronous PostgreSQL standbys, so an acknowledged
-write is present on the primary and two replicas. The steady-state topology can
-lose any two correctly distributed database/DCS members without losing
-acknowledged data or DCS quorum.
+Persisting the target before mutating etcd makes an interruption recoverable:
+the next coordinator recognizes an already-added learner and resumes promotion
+instead of rejecting it as unmanaged. This also avoids changing quorum before a
+new member has copied the Raft log. A five-voter DCS requires two synchronous
+PostgreSQL standbys, so an acknowledged write is present on the primary and two
+replicas. The steady-state topology can lose any two correctly distributed
+database/DCS members without losing acknowledged data or DCS quorum.
 
 ## Network Plane Contract
 
-The Agent peer map is discovery input only. Each node selects the sole global
-IPv4 address on `HETERONETWORK_DB_UNDERLAY_INTERFACE` when explicitly
-configured, otherwise prefers `tailscale0`, then falls back to its
+The Control Plane response supplies the selected node IDs, roles, active state,
+persisted-member VPN mappings, and the cluster VPN CIDR. Each candidate selects
+the sole global IPv4 address on `HETERONETWORK_DB_UNDERLAY_INTERFACE` when
+explicitly configured, otherwise prefers `tailscale0`, then falls back to its
 highest-priority IPv4 `local_udp` host candidate. It advertises that choice
 through a bearer-authenticated discovery listener on its VPN address. Peers
-accept the descriptor only when its node identity and `underlay-v1` marker
-match, reject every registered VPN address, and require a fixed, non-secret
-health endpoint to be reachable directly over the advertised underlay. The
-local address must be assigned to exactly one host interface, and
-`heteronetwork0` is explicitly rejected.
+accept the descriptor only when its node identity, selection digest, freshness,
+and `underlay-v1` marker match. Every address in the cluster VPN CIDR, including
+addresses belonging to candidates outside the current window or clients, is
+rejected as a database underlay.
+
+The fixed, non-secret underlay health endpoint must be reachable directly. It
+is a bounded, single-process listener running as a dynamic unprivileged user;
+it accepts at most eight simultaneous connections and applies a two-second read
+timeout. It does not serve credentials, descriptors, or bundle data.
+
+The local address must be assigned to exactly one host interface, and
+`heteronetwork0` is explicitly rejected. Before bootstrap, expansion, install,
+or reconfiguration, `ip route get` must show that every remote database address
+uses that same selected host-underlay interface with the local underlay address
+as its source. An address that happens to route through the HeteroNetwork
+overlay is therefore not accepted as an underlay.
 
 The resulting bundle records
 `HETERONETWORK_DB_NETWORK_PLANE=underlay-v1`. PostgreSQL replication, Patroni
@@ -61,16 +96,23 @@ bundle replication remain on the overlay, so an overlay outage can prevent
 topology discovery or expansion, but it cannot take down an already configured
 database quorum or make a Control Plane lose its local HAProxy database path.
 
-Bundles without the `underlay-v1` marker, or bundles containing a currently
-registered VPN address as a database member, are rejected. The autopilot does
-not rewrite such a topology automatically: changing existing etcd peer URLs and
-member certificate IP SANs requires a controlled migration.
+Bundles persist a one-to-one mapping between database member names and
+HeteroNetwork node IDs. An existing node ID cannot be rebound to a different
+underlay address, and a member name cannot be rebound to another node ID.
+Bundles without this identity map or the `underlay-v1` marker, and bundles
+containing any currently registered VPN address as a database member, are
+rejected. The autopilot does not rewrite such a topology automatically:
+changing existing etcd peer URLs, member identities, addresses, or certificate
+IP SANs requires a controlled migration.
 
-The autopilot reconciles every 30 seconds. A later Linux enrollment therefore
-adds a PostgreSQL replica automatically and, while the DCS has fewer than five
-voters, also advances the learner workflow. A temporarily unreachable existing
-database member is retained in the topology and rejoins from the current
-Patroni timeline when it returns.
+The autopilot reconciles every 30 seconds. A later active Linux enrollment can
+therefore enter the bounded candidate pool and become a PostgreSQL replica.
+While the DCS has fewer than five voters, reconciliation also advances the
+learner workflow. A temporarily unreachable existing database member is
+retained in the topology and rejoins from the current Patroni timeline when it
+returns. Topology coordination automatically moves to the lowest currently
+active persisted database member, so loss of the original coordinator does not
+stop later certificate issuance or expansion.
 
 ## Replicated Bootstrap Material
 
@@ -96,7 +138,7 @@ database-cluster credential compromise.
 Do not expose the following ports to the Internet:
 
 ```text
-17446  overlay discovery/bundle replication and underlay reachability probe
+17446  overlay discovery/bundle replication and underlay health (separate IPs)
 55432  PostgreSQL
 18008  Patroni REST/TLS health
 12379  etcd client TLS
