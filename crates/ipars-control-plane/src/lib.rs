@@ -1213,6 +1213,7 @@ type OverlayTopologyCache = BTreeMap<OverlayTopologyCacheKey, OverlayTopologyCac
 struct OverlayNodeSnapshot {
     loaded_at: Instant,
     nodes: Vec<NodeRecord>,
+    clients: Vec<NodeRecord>,
     health_by_node: BTreeMap<NodeId, NodeHealth>,
 }
 
@@ -2145,12 +2146,6 @@ where
                     })
             })
             .collect::<Vec<_>>();
-        let next_hops = topology.next_hop_table(node_id).ok_or_else(|| {
-            ControlPlaneError::BoundedTopology(format!(
-                "source node {node_id} has no bounded-overlay routing table"
-            ))
-        })?;
-
         let mut selected_routes =
             BTreeMap::<IpNet, ((u32, NodeId, String), AggregateOverlayRoute)>::new();
         for target in &nodes {
@@ -2158,10 +2153,6 @@ where
                 continue;
             }
             let Some(filtered_target) = acl_filter_peer(&source, target, &policy) else {
-                continue;
-            };
-            let Some((primary_next_hop, secondary_next_hop)) = next_hops.get(&target.node_id)
-            else {
                 continue;
             };
             for route in filtered_target.routes.iter().filter(|route| {
@@ -2184,18 +2175,22 @@ where
                 }
                 selected_routes.insert(
                     route.cidr,
-                    (
-                        rank,
-                        AggregateOverlayRoute {
-                            cidr: route.cidr,
-                            primary_next_hop: primary_next_hop.clone(),
-                            secondary_next_hop: secondary_next_hop.clone(),
-                        },
-                    ),
+                    (rank, AggregateOverlayRoute { cidr: route.cidr }),
                 );
             }
         }
 
+        let snapshot = self.overlay_node_snapshot().await?;
+        let client_gateway_selections = self.store.list_client_gateway_selections().await?;
+        let client_route_peers = node_client_route_projection(
+            &source,
+            &snapshot.nodes,
+            &snapshot.clients,
+            &snapshot.health_by_node,
+            &client_gateway_selections,
+            &policy,
+            now,
+        );
         let directory = self.service_directory_at(now).await?;
         let response = NeighborMap {
             cluster_id: self.config.cluster_id.clone(),
@@ -2208,6 +2203,7 @@ where
                 .into_values()
                 .map(|(_, route)| route)
                 .collect(),
+            client_route_peers,
             bootstrap_endpoints: directory.bootstrap_endpoints,
             generated_at: now,
         };
@@ -2510,10 +2506,10 @@ where
 
         let (nodes, mut health_by_node) =
             tokio::try_join!(self.store.list_nodes(), self.store.list_health())?;
-        let nodes = nodes
+        let (nodes, clients) = nodes
             .into_iter()
-            .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
-            .collect::<Vec<_>>();
+            .filter(|node| node.cluster_id == self.config.cluster_id)
+            .partition::<Vec<_>, _>(|node| !node.role.is_client());
         let node_ids = nodes
             .iter()
             .map(|node| node.node_id.clone())
@@ -2522,6 +2518,7 @@ where
         let snapshot = Arc::new(OverlayNodeSnapshot {
             loaded_at: Instant::now(),
             nodes,
+            clients,
             health_by_node,
         });
         *cached = Some(Arc::clone(&snapshot));
@@ -3945,6 +3942,77 @@ fn node_peer_map_with_clients(
             ))
         })
         .collect()
+}
+
+fn node_client_route_projection(
+    source: &NodeRecord,
+    backbone_nodes: &[NodeRecord],
+    clients: &[NodeRecord],
+    health_by_node: &BTreeMap<NodeId, NodeHealth>,
+    client_gateway_selections: &BTreeMap<NodeId, ClientGatewaySelection>,
+    policy: &ClusterPolicy,
+    generated_at: chrono::DateTime<Utc>,
+) -> Vec<NodeRecord> {
+    let gateways = select_client_gateways(backbone_nodes, health_by_node, generated_at, policy);
+    let gateway_ids = gateways
+        .iter()
+        .map(|gateway| gateway.node_id.clone())
+        .collect::<Vec<_>>();
+    let gateways_by_id = gateways
+        .into_iter()
+        .map(|gateway| (gateway.node_id.clone(), gateway))
+        .collect::<BTreeMap<_, _>>();
+    let visible_clients = clients
+        .iter()
+        .filter_map(|client| acl_filter_peer(source, client, policy))
+        .collect::<Vec<_>>();
+    let mut direct_clients = Vec::new();
+    let mut routes_by_gateway = BTreeMap::<NodeId, BTreeMap<IpNet, Route>>::new();
+
+    for client in visible_clients {
+        let selected_gateway = client_gateway_selections
+            .get(&client.node_id)
+            .map(|selection| &selection.gateway_node_id)
+            .filter(|gateway| gateway_ids.contains(gateway))
+            .cloned()
+            .or_else(|| gateway_ids.first().cloned());
+        let Some(selected_gateway) = selected_gateway else {
+            continue;
+        };
+        if selected_gateway == source.node_id {
+            direct_clients.push(filter_served_endpoint_candidates(
+                client,
+                generated_at,
+                policy,
+            ));
+            continue;
+        }
+        let Some(route) = gateway_route_for_client(&selected_gateway, &client) else {
+            continue;
+        };
+        insert_preferred_gateway_route(
+            routes_by_gateway.entry(selected_gateway).or_default(),
+            route,
+        );
+    }
+
+    let mut projection = direct_clients;
+    for (gateway_id, routes) in routes_by_gateway {
+        let Some(gateway) = gateways_by_id.get(&gateway_id) else {
+            continue;
+        };
+        let Some(mut projected_gateway) = acl_filter_peer(source, gateway, policy) else {
+            continue;
+        };
+        projected_gateway.routes = routes.into_values().collect();
+        projection.push(filter_served_endpoint_candidates(
+            projected_gateway,
+            generated_at,
+            policy,
+        ));
+    }
+    projection.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    projection
 }
 
 fn select_client_gateways<'a>(
@@ -5758,6 +5826,7 @@ mod tests {
 
         let first = plane.overlay_node_snapshot().await?;
         assert_eq!(first.nodes.len(), 1_000);
+        assert_eq!(first.clients.len(), 1);
         for _ in 0..1_000 {
             let cached = plane.overlay_node_snapshot().await?;
             assert!(Arc::ptr_eq(&first, &cached));
@@ -5766,6 +5835,86 @@ mod tests {
         plane.invalidate_overlay_node_snapshot().await;
         let refreshed = plane.overlay_node_snapshot().await?;
         assert!(!Arc::ptr_eq(&first, &refreshed));
+        Ok(())
+    }
+
+    #[test]
+    fn client_route_projection_does_not_return_the_full_worker_directory(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let mut gateway_a = node_record("projection-gateway-a");
+        gateway_a.role = Role::gateway();
+        gateway_a.vpn_ip = VpnIp("100.64.0.10".parse()?);
+        let mut gateway_a_candidate = candidate("projection-gateway-a");
+        gateway_a_candidate.kind = EndpointCandidateKind::PublicUdp;
+        gateway_a_candidate.addr = "1.1.1.1:51820".parse()?;
+        gateway_a.endpoint_candidates = vec![gateway_a_candidate];
+
+        let mut gateway_b = node_record("projection-gateway-b");
+        gateway_b.role = Role::gateway();
+        gateway_b.vpn_ip = VpnIp("100.64.0.11".parse()?);
+        let mut gateway_b_candidate = candidate("projection-gateway-b");
+        gateway_b_candidate.kind = EndpointCandidateKind::PublicUdp;
+        gateway_b_candidate.addr = "8.8.8.8:51820".parse()?;
+        gateway_b.endpoint_candidates = vec![gateway_b_candidate];
+
+        let mut backbone_nodes = vec![gateway_a.clone(), gateway_b.clone()];
+        let mut worker_ids = BTreeSet::new();
+        for index in 0..998 {
+            let worker = node_record(&format!("projection-worker-{index:04}"));
+            worker_ids.insert(worker.node_id.clone());
+            backbone_nodes.push(worker);
+        }
+
+        let mut direct_client = node_record("projection-client-direct");
+        direct_client.role = Role::client();
+        direct_client.vpn_ip = VpnIp("100.64.1.10".parse()?);
+        let mut remote_client = node_record("projection-client-remote");
+        remote_client.role = Role::client();
+        remote_client.vpn_ip = VpnIp("100.64.1.11".parse()?);
+        let clients = vec![direct_client.clone(), remote_client.clone()];
+        let selections = BTreeMap::from([
+            (
+                direct_client.node_id.clone(),
+                ClientGatewaySelection {
+                    client_id: direct_client.node_id.clone(),
+                    gateway_node_id: gateway_a.node_id.clone(),
+                    selected_at: now,
+                },
+            ),
+            (
+                remote_client.node_id.clone(),
+                ClientGatewaySelection {
+                    client_id: remote_client.node_id.clone(),
+                    gateway_node_id: gateway_b.node_id.clone(),
+                    selected_at: now,
+                },
+            ),
+        ]);
+
+        let projection = node_client_route_projection(
+            &gateway_a,
+            &backbone_nodes,
+            &clients,
+            &BTreeMap::new(),
+            &selections,
+            &ClusterPolicy::default(),
+            now,
+        );
+
+        assert_eq!(projection.len(), 2);
+        assert!(projection
+            .iter()
+            .any(|peer| peer.node_id == direct_client.node_id && peer.role.is_client()));
+        let projected_gateway = projection
+            .iter()
+            .find(|peer| peer.node_id == gateway_b.node_id)
+            .ok_or("remote client gateway should be projected")?;
+        assert_eq!(projected_gateway.routes.len(), 1);
+        assert_eq!(projected_gateway.routes[0].cidr, "100.64.1.11/32".parse()?);
+        assert!(projection
+            .iter()
+            .all(|peer| !worker_ids.contains(&peer.node_id)));
         Ok(())
     }
 

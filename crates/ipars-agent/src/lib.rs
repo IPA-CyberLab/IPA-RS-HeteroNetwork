@@ -7950,6 +7950,7 @@ mod tests {
                 })
                 .collect(),
             aggregate_routes: Vec::new(),
+            client_route_peers: Vec::new(),
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         }
@@ -12421,8 +12422,6 @@ mod tests {
         let mut neighbor_map = bounded_neighbor_map(local_node.clone(), backbone.clone(), 11);
         neighbor_map.aggregate_routes = vec![ipars_types::AggregateOverlayRoute {
             cidr: pod_route.cidr,
-            primary_next_hop: backbone[0].node_id.clone(),
-            secondary_next_hop: Some(backbone[1].node_id.clone()),
         }];
         runtime.record_neighbor_map_snapshot(neighbor_map).await?;
 
@@ -12548,8 +12547,6 @@ mod tests {
         let mut current_map = bounded_neighbor_map(local_node, vec![new_neighbor.clone()], 8);
         current_map.aggregate_routes = vec![ipars_types::AggregateOverlayRoute {
             cidr: advertised_route.cidr,
-            primary_next_hop: new_neighbor_id,
-            secondary_next_hop: None,
         }];
         runtime.record_neighbor_map_snapshot(current_map).await?;
         assert!(!runtime.should_connect_peer(&old_neighbor).await);

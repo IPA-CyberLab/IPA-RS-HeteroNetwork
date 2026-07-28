@@ -1425,6 +1425,7 @@ pub struct NodeRecord {
 pub const MAX_OVERLAY_DEGREE: u16 = 64;
 pub const MAX_OVERLAY_NEIGHBORS: usize = MAX_OVERLAY_DEGREE as usize;
 pub const MAX_AGGREGATE_OVERLAY_ROUTES: usize = 4096;
+pub const MAX_OVERLAY_CLIENT_ROUTE_PEERS: usize = 4096;
 // The multihop envelope stores at most 512 intermediate nodes. Source and
 // destination are encoded separately in the overlay path.
 pub const MAX_OVERLAY_PATH_NODES: usize = 514;
@@ -1454,9 +1455,6 @@ impl OverlayNeighbor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateOverlayRoute {
     pub cidr: IpNet,
-    pub primary_next_hop: NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secondary_next_hop: Option<NodeId>,
 }
 
 impl AggregateOverlayRoute {
@@ -1471,27 +1469,6 @@ impl AggregateOverlayRoute {
                 ),
             ));
         }
-        validate_overlay_identifier(
-            self.primary_next_hop.as_str(),
-            "primary next-hop node ID",
-            "aggregate_routes",
-        )?;
-        if let Some(secondary) = &self.secondary_next_hop {
-            validate_overlay_identifier(
-                secondary.as_str(),
-                "secondary next-hop node ID",
-                "aggregate_routes",
-            )?;
-            if secondary == &self.primary_next_hop {
-                return Err(OverlayValidationError::new(
-                    "aggregate_routes",
-                    format!(
-                        "aggregate route {} must use distinct primary and secondary next hops",
-                        self.cidr
-                    ),
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -1505,6 +1482,8 @@ pub struct NeighborMap {
     pub vpn_cidr: IpNet,
     pub neighbors: Vec<OverlayNeighbor>,
     pub aggregate_routes: Vec<AggregateOverlayRoute>,
+    #[serde(default)]
+    pub client_route_peers: Vec<NodeRecord>,
     #[serde(default)]
     pub bootstrap_endpoints: Vec<BootstrapEndpoint>,
     pub generated_at: DateTime<Utc>,
@@ -1552,6 +1531,16 @@ impl NeighborMap {
                     "aggregate route count {} exceeds maximum \
                      {MAX_AGGREGATE_OVERLAY_ROUTES}",
                     self.aggregate_routes.len()
+                ),
+            ));
+        }
+        if self.client_route_peers.len() > MAX_OVERLAY_CLIENT_ROUTE_PEERS {
+            return Err(OverlayValidationError::new(
+                "client_route_peers",
+                format!(
+                    "client route peer count {} exceeds maximum \
+                     {MAX_OVERLAY_CLIENT_ROUTE_PEERS}",
+                    self.client_route_peers.len()
                 ),
             ));
         }
@@ -1615,6 +1604,77 @@ impl NeighborMap {
             }
         }
 
+        let mut client_route_peer_ids = BTreeSet::new();
+        let mut client_route_peer_vpn_ips = BTreeSet::new();
+        for (index, peer) in self.client_route_peers.iter().enumerate() {
+            validate_overlay_node_record(peer, "client_route_peers").map_err(|error| {
+                OverlayValidationError::new(
+                    "client_route_peers",
+                    format!("client route peer {index} is invalid: {}", error.reason()),
+                )
+            })?;
+            if peer.cluster_id != self.cluster_id {
+                return Err(OverlayValidationError::new(
+                    "client_route_peers",
+                    format!(
+                        "client route peer {} belongs to cluster {} instead of {}",
+                        peer.node_id, peer.cluster_id, self.cluster_id
+                    ),
+                ));
+            }
+            if peer.node_id == self.node_id {
+                return Err(OverlayValidationError::new(
+                    "client_route_peers",
+                    format!(
+                        "node {} cannot project itself as a client route peer",
+                        self.node_id
+                    ),
+                ));
+            }
+            if !client_route_peer_ids.insert(peer.node_id.clone()) {
+                return Err(OverlayValidationError::new(
+                    "client_route_peers",
+                    format!("client route peer {} is duplicated", peer.node_id),
+                ));
+            }
+            if !client_route_peer_vpn_ips.insert(peer.vpn_ip) {
+                return Err(OverlayValidationError::new(
+                    "client_route_peers",
+                    format!(
+                        "client route peer VPN address {} is duplicated",
+                        peer.vpn_ip
+                    ),
+                ));
+            }
+            if !self.vpn_cidr.contains(&peer.vpn_ip.0) {
+                return Err(OverlayValidationError::new(
+                    "client_route_peers",
+                    format!(
+                        "client route peer {} VPN address {} is outside {}",
+                        peer.node_id, peer.vpn_ip, self.vpn_cidr
+                    ),
+                ));
+            }
+            if !peer.role.is_client()
+                && (peer.routes.is_empty()
+                    || peer.routes.iter().any(|route| {
+                        !route.id.starts_with("client-")
+                            || !overlay_route_is_host(route.cidr)
+                            || !self.vpn_cidr.contains(&route.cidr.addr())
+                            || route.advertised_by != peer.node_id
+                            || route.via.as_ref() != Some(&peer.node_id)
+                    }))
+            {
+                return Err(OverlayValidationError::new(
+                    "client_route_peers",
+                    format!(
+                        "non-client projection {} must contain only self-owned client routes",
+                        peer.node_id
+                    ),
+                ));
+            }
+        }
+
         let mut route_cidrs = BTreeSet::new();
         for (index, route) in self.aggregate_routes.iter().enumerate() {
             route.validate().map_err(|error| {
@@ -1629,57 +1689,15 @@ impl NeighborMap {
                     format!("aggregate route {} is duplicated", route.cidr),
                 ));
             }
-            match neighbor_kinds.get(&route.primary_next_hop) {
-                Some(
-                    OverlayNeighborKind::BackbonePrimary | OverlayNeighborKind::BackboneSecondary,
-                ) => {}
-                Some(OverlayNeighborKind::DirectShortcut) => {
-                    return Err(OverlayValidationError::new(
-                        "aggregate_routes",
-                        format!(
-                            "primary next hop {} for {} cannot be a direct shortcut",
-                            route.primary_next_hop, route.cidr
-                        ),
-                    ));
-                }
-                None => {
-                    return Err(OverlayValidationError::new(
-                        "aggregate_routes",
-                        format!(
-                            "primary next hop {} for {} is not a neighbor",
-                            route.primary_next_hop, route.cidr
-                        ),
-                    ));
-                }
-            }
-            if let Some(secondary) = &route.secondary_next_hop {
-                match neighbor_kinds.get(secondary) {
-                    Some(
-                        OverlayNeighborKind::BackbonePrimary
-                        | OverlayNeighborKind::BackboneSecondary,
-                    ) => {}
-                    Some(OverlayNeighborKind::DirectShortcut) => {
-                        return Err(OverlayValidationError::new(
-                            "aggregate_routes",
-                            format!(
-                                "secondary next hop {secondary} for {} cannot be a direct shortcut",
-                                route.cidr
-                            ),
-                        ));
-                    }
-                    None => {
-                        return Err(OverlayValidationError::new(
-                            "aggregate_routes",
-                            format!(
-                                "secondary next hop {secondary} for {} is not a neighbor",
-                                route.cidr
-                            ),
-                        ));
-                    }
-                }
-            }
         }
         Ok(())
+    }
+}
+
+fn overlay_route_is_host(cidr: IpNet) -> bool {
+    match cidr {
+        IpNet::V4(cidr) => cidr.prefix_len() == 32,
+        IpNet::V6(cidr) => cidr.prefix_len() == 128,
     }
 }
 
@@ -19633,6 +19651,8 @@ mod tests {
     }
 
     fn valid_neighbor_map() -> Result<NeighborMap, Box<dyn std::error::Error>> {
+        let mut client = overlay_test_node("client-a", "cluster-a", "10.250.0.4".parse()?);
+        client.role = Role::client();
         Ok(NeighborMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: NodeId::from_string("node-a"),
@@ -19651,9 +19671,8 @@ mod tests {
             ],
             aggregate_routes: vec![AggregateOverlayRoute {
                 cidr: "10.42.0.0/16".parse()?,
-                primary_next_hop: NodeId::from_string("node-b"),
-                secondary_next_hop: Some(NodeId::from_string("node-c")),
             }],
+            client_route_peers: vec![client],
             bootstrap_endpoints: vec![BootstrapEndpoint {
                 url: "https://control.example:8443".to_string(),
                 kind: BootstrapEndpointKind::ControlPlane,
@@ -19683,7 +19702,7 @@ mod tests {
     }
 
     #[test]
-    fn neighbor_map_rejects_degree_identity_and_next_hop_inconsistencies(
+    fn neighbor_map_rejects_degree_identity_and_projection_inconsistencies(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let valid = valid_neighbor_map()?;
 
@@ -19715,14 +19734,59 @@ mod tests {
         assert!(error.reason().contains("is duplicated"));
 
         invalid = valid.clone();
-        invalid.neighbors[1].kind = OverlayNeighborKind::DirectShortcut;
-        invalid.aggregate_routes[0].primary_next_hop = NodeId::from_string("node-c");
-        invalid.aggregate_routes[0].secondary_next_hop = None;
+        invalid
+            .client_route_peers
+            .push(invalid.client_route_peers[0].clone());
         let error = invalid
             .validate()
             .err()
-            .ok_or("direct shortcut should not be accepted as a backbone next hop")?;
-        assert!(error.reason().contains("cannot be a direct shortcut"));
+            .ok_or("duplicate client route peer should be rejected")?;
+        assert_eq!(error.field(), "client_route_peers");
+        assert!(error.reason().contains("is duplicated"));
+
+        invalid = valid.clone();
+        invalid.client_route_peers[0].role = Role::edge();
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("non-client projection without client routes should be rejected")?;
+        assert!(error
+            .reason()
+            .contains("must contain only self-owned client routes"));
+
+        let mut projected_gateway =
+            overlay_test_node("gateway-a", "cluster-a", "10.250.0.5".parse()?);
+        projected_gateway.routes.push(Route {
+            id: "client-custom-id".to_string(),
+            cidr: "10.250.0.6/32".parse()?,
+            advertised_by: projected_gateway.node_id.clone(),
+            via: Some(projected_gateway.node_id.clone()),
+            metric: 10,
+            tags: BTreeSet::new(),
+        });
+        let mut projected = valid.clone();
+        projected.client_route_peers.push(projected_gateway.clone());
+        projected.validate()?;
+
+        invalid = projected.clone();
+        invalid.client_route_peers[1].routes[0].cidr = "10.250.0.0/28".parse()?;
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("non-host client projection route should be rejected")?;
+        assert!(error
+            .reason()
+            .contains("must contain only self-owned client routes"));
+
+        invalid = projected;
+        invalid.client_route_peers[1].routes[0].cidr = "10.251.0.6/32".parse()?;
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("client projection route outside the VPN must be rejected")?;
+        assert!(error
+            .reason()
+            .contains("must contain only self-owned client routes"));
 
         invalid = valid;
         invalid.aggregate_routes[0].cidr = "10.42.0.1/24".parse()?;

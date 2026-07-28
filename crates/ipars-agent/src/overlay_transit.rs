@@ -1496,6 +1496,7 @@ mod tests {
                 })
                 .collect(),
             aggregate_routes: Vec::new(),
+            client_route_peers: Vec::new(),
             bootstrap_endpoints: Vec::new(),
             generated_at: Utc::now(),
         }
