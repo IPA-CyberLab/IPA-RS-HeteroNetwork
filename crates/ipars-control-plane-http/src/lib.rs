@@ -1524,8 +1524,6 @@ struct AdminNodeEnrollmentRequest {
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
-    disable_relay: bool,
-    #[serde(default)]
     reusable: bool,
     max_uses: Option<u32>,
     #[serde(default)]
@@ -1642,7 +1640,6 @@ where
             "Kubernetes HA control-plane enrollment must be reusable with exactly {KUBERNETES_HA_CONTROL_PLANE_COUNT} uses"
         )));
     }
-    let allow_relay = !request.disable_relay;
     if request.tags.len() > MAX_JOIN_TOKEN_TAGS {
         return Err(NodeEnrollmentApiError::bad_request(format!(
             "no more than {MAX_JOIN_TOKEN_TAGS} tags may be requested"
@@ -1682,7 +1679,7 @@ where
         .enrollment_service_directory(Duration::from_secs(enrollment.max_ttl_seconds))
         .await
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
-    require_ha_node_enrollment_directory(&directory, allow_relay)?;
+    require_ha_node_enrollment_directory(&directory, true)?;
 
     let now = Utc::now();
     let expires_at = now
@@ -1710,7 +1707,7 @@ where
         key_id: enrollment.key_id.clone(),
         policy: TokenPolicy {
             allow_join: true,
-            allow_relay,
+            allow_relay: true,
             allowed_routes: Vec::new(),
             allowed_tags: tags,
             max_token_uses: Some(max_uses),
@@ -4519,6 +4516,27 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
 
+        let enrollment_relay_toggle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/admin/enrollment")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(
+                        r#"{"expires_in_seconds":86400,"disable_relay":true}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(
+            enrollment_relay_toggle.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
         let response = app
             .clone()
             .oneshot(
@@ -4606,43 +4624,6 @@ mod tests {
         assert!(!generated_script.contains(RELAY_ADMISSION_BEARER_TOKEN));
         assert!(install_command.contains("sudo sh \"$tmp\" \"$@\""));
         assert!(install_command.ends_with("' sh"));
-
-        let no_relay_request_body = serde_json::json!({
-            "expires_in_seconds": 86_400,
-            "role": "worker",
-            "tags": ["no-relay"],
-            "disable_relay": true,
-            "reusable": false,
-            "max_uses": 1
-        });
-        let no_relay_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/admin/enrollment")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(
-                        header::AUTHORIZATION,
-                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
-                    )
-                    .body(Body::from(serde_json::to_vec(&no_relay_request_body)?))?,
-            )
-            .await?;
-        assert_eq!(no_relay_response.status(), StatusCode::OK);
-        let no_relay_response =
-            axum::body::to_bytes(no_relay_response.into_body(), usize::MAX).await?;
-        let no_relay_response: Value = serde_json::from_slice(&no_relay_response)?;
-        let no_relay_script = no_relay_response["install_script"]
-            .as_str()
-            .ok_or("non-relay enrollment response omitted the install script")?;
-        let no_relay_token: SignedJoinToken =
-            serde_json::from_value(no_relay_response["token"].clone())?;
-        assert!(!no_relay_token.claims.policy.allow_relay);
-        assert!(no_relay_script.contains(
-            "rm -f /etc/heteronetwork/relay-admission.token /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf"
-        ));
-        assert!(!no_relay_script.contains(&encoded_relay_bearer));
 
         let kubernetes_request_body = serde_json::json!({
             "expires_in_seconds": 86_400,
@@ -5364,7 +5345,6 @@ mod tests {
             expires_in_seconds: 86_400,
             role: "edge".to_string(),
             tags: Vec::new(),
-            disable_relay: false,
             reusable: true,
             max_uses: Some(1),
             setup: NodeEnrollmentSetup::NetworkOnly,
