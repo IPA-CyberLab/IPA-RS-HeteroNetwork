@@ -90,6 +90,9 @@ Commands:
   apply-node
       Reconfigure the existing Patroni member for the final underlay manifest,
       explicitly restart Patroni, and require a healthy local database role.
+  verify-final
+      Verify the final DCS and PostgreSQL topology without reconfiguring or
+      restarting a service.
   cleanup-legacy-forwarders
       After full native-underlay DCS verification, remove only obsolete
       heteronetwork-dcs-ingress-{79,80}.service and
@@ -2385,6 +2388,30 @@ apply_node() {
   log "applied underlay topology revision $topology_revision to $node_name"
 }
 
+verify_final() {
+  require_root
+  acquire_local_lock
+  require_command curl
+  require_command openssl
+  require_command python3
+  load_node_context false
+  validate_local_network
+  require_existing_installation false
+
+  local snapshot topology_phase
+  snapshot="$(verify_all_dcs_endpoints)" \
+    || die "all DCS endpoints must be healthy for final verification"
+  snapshot_is_all_final "$snapshot" \
+    || die "all DCS voters must use final underlay peer URLs"
+  topology_phase="$(verify_rolling_patroni_topology)" \
+    || die "PostgreSQL HA topology did not stabilize for final verification"
+  [[ "$topology_phase" == "final" ]] \
+    || die "PostgreSQL members still advertise legacy addresses"
+  verify_final_database_topology \
+    || die "full PostgreSQL HA verification did not stabilize"
+  log "verified final underlay topology revision $topology_revision"
+}
+
 validate_native_final_etcd_config() {
   local path="$state_dir/etcd.yml"
   ensure_regular_file "$path"
@@ -3126,6 +3153,10 @@ case "${1:-}" in
   apply-node)
     (($# == 1)) || die "apply-node does not accept positional arguments"
     apply_node
+    ;;
+  verify-final)
+    (($# == 1)) || die "verify-final does not accept positional arguments"
+    verify_final
     ;;
   cleanup-legacy-forwarders)
     (($# == 1)) \

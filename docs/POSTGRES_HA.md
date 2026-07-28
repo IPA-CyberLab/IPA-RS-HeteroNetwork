@@ -265,6 +265,11 @@ later migration phase requires all endpoints, not merely a quorum.
    full final-address HA verification. Do not apply the next member until the
    restarted member and every DCS endpoint are healthy.
 
+   If the last member completed its reconfiguration but its immediate full
+   replication check timed out, run `verify-final` after it catches up. This
+   repeats the final checks without changing configuration or restarting a
+   service.
+
 4. After `apply-node` has succeeded on every member, remove legacy DCS
    forwarders on each DCS voter:
 
