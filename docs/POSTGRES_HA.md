@@ -132,6 +132,9 @@ PostgreSQL and etcd member addresses use the HeteroNetwork overlay/VPN to an
 five generated cluster secrets, PostgreSQL data directory, and etcd data
 directory. `adopt-bundle` issues each member a replacement certificate with
 both its legacy VPN address and final underlay address as IP SANs.
+An older source manifest may contain retired members, but every retained member
+must still have the same legacy address and, when present, the same persisted
+HeteroNetwork identity. Retired entries are not copied into the new topology.
 
 This script is not a backup tool. It creates no PostgreSQL base backup, WAL
 archive, etcd snapshot, or duplicate PostgreSQL/etcd data directory.

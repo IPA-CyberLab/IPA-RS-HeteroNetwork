@@ -919,14 +919,34 @@ validate_legacy_bundle() {
     persisted="$(
       legacy_manifest_optional_value "$directory" HETERONETWORK_DB_MEMBERS
     )" || die "legacy bundle manifest has no unique member map"
-    [[ "$persisted" == "$legacy_members" ]] \
-      || die "legacy bundle member map does not match HETERONETWORK_DB_LEGACY_MEMBERS"
-    persisted="$(
+    (
+      validate_member_mapping "$persisted" legacy-bundle-database \
+        "$MIN_DATABASE_MEMBER_COUNT" "$MAX_DATABASE_MEMBER_COUNT" false
+    ) || die "legacy bundle manifest has an invalid member map"
+    local entry name address persisted_address
+    local -a entries
+    IFS=, read -r -a entries <<<"$legacy_members"
+    for entry in "${entries[@]}"; do
+      name="${entry%%=*}"
+      address="${entry#*=}"
+      persisted_address="$(mapping_value_for_name "$persisted" "$name")" \
+        || die "current legacy member is absent from the legacy bundle: $name"
+      [[ "$persisted_address" == "$address" ]] \
+        || die "legacy bundle rebinds $name from $address to $persisted_address"
+    done
+    if persisted="$(
       legacy_manifest_optional_value \
         "$directory" HETERONETWORK_DB_MEMBER_IDENTITIES
-    )" || die "legacy bundle manifest has no unique member identity map"
-    [[ "$persisted" == "$member_identities" ]] \
-      || die "legacy bundle member identities do not match the migration identities"
+    )"; then
+      for entry in "${entries[@]}"; do
+        name="${entry%%=*}"
+        address="$(mapping_value_for_name "$member_identities" "$name")"
+        persisted_address="$(mapping_value_for_name "$persisted" "$name")" \
+          || die "current legacy member has no persisted identity: $name"
+        [[ "$persisted_address" == "$address" ]] \
+          || die "legacy bundle rebinds the HeteroNetwork identity for $name"
+      done
+    fi
     persisted="$(
       legacy_manifest_optional_value "$directory" HETERONETWORK_DB_CLUSTER_NAME
     )" || die "legacy bundle manifest has no unique cluster name"
@@ -2472,6 +2492,16 @@ self_test() {
   topology_revision="9"
   network_plane="underlay-v1"
   helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/postgres-ha-node.sh"
+  cat >"$legacy/manifest.env" <<'EOF'
+HETERONETWORK_DB_CLUSTER_NAME=heteronetwork
+HETERONETWORK_DB_MEMBERS=db-retired=10.250.0.1,db-a=10.250.0.2,db-b=10.250.0.3,db-c=10.250.0.4
+HETERONETWORK_DB_DCS_MEMBERS=db-retired=10.250.0.1,db-a=10.250.0.2,db-b=10.250.0.3
+HETERONETWORK_DB_SERVICE_NAME=postgres.heteronetwork.internal
+HETERONETWORK_DB_POSTGRES_PORT=55432
+HETERONETWORK_DB_REST_PORT=18008
+HETERONETWORK_DB_TOPOLOGY_REVISION=8
+EOF
+  chmod 0600 "$legacy/manifest.env"
   adopt_bundle "$adopted" "$legacy" >/dev/null
 
   grep -Fxq "$cluster_id" "$adopted/cluster-id"
