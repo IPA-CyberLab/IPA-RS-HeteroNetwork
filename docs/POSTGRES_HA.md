@@ -148,6 +148,8 @@ underlay address and route satisfies the Network Plane Contract.
 
 Run `adopt-bundle` once from a root shell. Supply these environment variables:
 
+- `HETERONETWORK_DB_CLUSTER_ID`: the Control Plane cluster UUID used by the
+  autopilot bundle identity check;
 - `HETERONETWORK_DB_LEGACY_MEMBERS`: the existing
   `name=overlay-or-VPN-IP` map;
 - `HETERONETWORK_DB_MEMBERS`: the final `name=underlay-IP` map, with the same
@@ -163,10 +165,13 @@ Run `adopt-bundle` once from a root shell. Supply these environment variables:
 
 Preserve the existing client CIDRs and extra HBA entries with
 `HETERONETWORK_DB_CLIENT_CIDRS` and
-`HETERONETWORK_DB_EXTRA_HBA_ENTRIES`. The output path must be absolute, must
-differ from the legacy bundle path, and must not already exist:
+`HETERONETWORK_DB_EXTRA_HBA_ENTRIES`. Controlled migration accepts only the
+standard autopilot data paths, service ports, and PostgreSQL major version.
+The output path must be the autopilot's authoritative bundle path, must differ
+from the legacy bundle path, and must not already exist:
 
 ```bash
+MIGRATION_BUNDLE_DIR=/etc/heteronetwork/postgres-autopilot/bundle
 scripts/postgres-ha-underlay-migrate.sh adopt-bundle \
   "$MIGRATION_BUNDLE_DIR" "$LEGACY_BUNDLE_DIR"
 ```
@@ -184,12 +189,14 @@ default `heteronetwork0` interface.
 
 Treat every operation that reloads or restarts Patroni or etcd as a serial
 operation. Never run migration commands concurrently on different nodes, and
-never restart two Patroni members or two etcd voters at the same time. Before
-the first operation and after every command, require every configured DCS
-endpoint, not merely a quorum, to be healthy. During the mixed phase, test each
-voter at its currently advertised client address: legacy for a voter not yet
-migrated and underlay for a migrated voter. Do not continue while any endpoint
-is unhealthy.
+never restart two Patroni members or two etcd voters at the same time.
+`prepare-node` requires three consecutive healthy samples from the local voter
+and at least a quorum plus one reachable endpoint. This is the minimum that
+leaves a DCS quorum while that voter restarts. A prepared voter is checked
+through its native underlay listener first; an unprepared voter falls back to
+its legacy endpoint. Complete preparation on all voters, then require every
+configured DCS endpoint to be healthy before changing any member URL. Every
+later migration phase requires all endpoints, not merely a quorum.
 
 1. Run `prepare-node` on every Patroni member, one node at a time:
 
@@ -255,9 +262,11 @@ is unhealthy.
 
    Cleanup is gated on every voter having its final peer URL, every DCS endpoint
    being healthy, the local etcd configuration being underlay-only, and the
-   local native underlay endpoint being healthy. It removes only the obsolete
+   local native underlay sockets being owned by the etcd service. It removes
+   only strictly validated obsolete
    `heteronetwork-dcs-ingress-{79,80}.service` and
-   `heteronetwork-dcs-proxy-*-{79,80}.service` units.
+   `heteronetwork-dcs-proxy-*-{79,80}.service` units, including matching
+   transient units under `/run/systemd/transient`.
 
 5. After forwarder cleanup and one final all-endpoint health check, start the
    autopilot on every final database member, one node at a time:
