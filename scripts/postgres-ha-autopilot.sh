@@ -11,6 +11,8 @@ readonly TARGET_DCS_MEMBER_COUNT="5"
 readonly BUNDLE_PORT="17446"
 readonly DATABASE_NETWORK_PLANE="underlay-v1"
 readonly REQUIRED_CONVERGENCE_RECONCILES="3"
+readonly BUNDLE_HEALTH_RETRY_ATTEMPTS="6"
+readonly BUNDLE_HEALTH_RETRY_SECONDS="5"
 readonly UNDERLAY_HEALTH_MAX_CONNECTIONS="8"
 readonly UNDERLAY_HEALTH_READ_TIMEOUT_SECONDS="2"
 readonly MAX_BUNDLE_ARCHIVE_BYTES="4194304"
@@ -37,6 +39,7 @@ local_reachability_path="$state_dir/local-reachability.tsv"
 authoritative_stability_path="$state_dir/authoritative-stability.tsv"
 reciprocal_stability_path="$state_dir/reciprocal-stability.tsv"
 applied_revision_path="$state_dir/applied-revision"
+configured_revision_path="$state_dir/configured-revision"
 curl_config_path="$state_dir/curl.conf"
 underlay_health_handler="${HETERONETWORK_DB_UNDERLAY_HEALTH_HANDLER:-/opt/heteronetwork/libexec/postgres-underlay-health.py}"
 underlay_health_handler_changed=0
@@ -2358,6 +2361,21 @@ configure_helper_environment() {
   export HETERONETWORK_DB_INTERFACE HETERONETWORK_DB_NODE_NAME HETERONETWORK_DB_NODE_ADDRESS
 }
 
+wait_for_bundle_health() {
+  local attempt output
+  for ((attempt = 1; attempt <= BUNDLE_HEALTH_RETRY_ATTEMPTS; attempt += 1)); do
+    if output="$(run_helper_for_bundle "$bundle_dir" verify 2>&1)"; then
+      log "$output"
+      return 0
+    fi
+    if ((attempt == BUNDLE_HEALTH_RETRY_ATTEMPTS)); then
+      log "database topology revision $manifest_revision is not healthy yet: $output"
+      return 1
+    fi
+    sleep "$BUNDLE_HEALTH_RETRY_SECONDS"
+  done
+}
+
 apply_local_bundle() {
   local local_node_id="$1"
   local local_underlay_ip="$2"
@@ -2389,31 +2407,38 @@ apply_local_bundle() {
     && systemctl is-active --quiet heteronetwork-db.service; then
     return
   fi
-  local initial_state="existing"
-  [[ "$manifest_revision" == "1" ]] && initial_state="new"
-  log "applying database topology revision $manifest_revision as $local_name"
-  env \
-    "HETERONETWORK_DB_CLUSTER_NAME=$manifest_cluster_name" \
-    "HETERONETWORK_DB_INTERFACE=$HETERONETWORK_DB_INTERFACE" \
-    "HETERONETWORK_DB_NODE_NAME=$local_name" \
-    "HETERONETWORK_DB_NODE_ADDRESS=$local_underlay_ip" \
-    "HETERONETWORK_DB_MEMBERS=$manifest_members" \
-    "HETERONETWORK_DB_MEMBER_IDENTITIES=$manifest_member_identities" \
-    "HETERONETWORK_DB_DCS_MEMBERS=$manifest_dcs_members" \
-    "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$manifest_dcs_bootstrap_members" \
-    "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=$initial_state" \
-    "HETERONETWORK_DB_PROXY_BACKENDS=$manifest_members" \
-    "HETERONETWORK_DB_CLIENT_CIDRS=$manifest_client_cidrs" \
-    "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$manifest_extra_hba_entries" \
-    "HETERONETWORK_DB_BUNDLE_DIR=$bundle_dir" \
-    "HETERONETWORK_DB_SERVICE_NAME=$manifest_service_name" \
-    "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
-    "HETERONETWORK_DB_REST_PORT=$manifest_rest_port" \
-    "HETERONETWORK_DB_TOPOLOGY_REVISION=$manifest_revision" \
-    "HETERONETWORK_DB_NETWORK_PLANE=$manifest_network_plane" \
-    "$helper" reconfigure-node
-  if ! run_helper_for_bundle "$bundle_dir" verify; then
-    log "database topology revision $manifest_revision is not healthy yet"
+  local configured_revision=0
+  [[ -f "$configured_revision_path" ]] \
+    && configured_revision="$(<"$configured_revision_path")"
+  if [[ "$configured_revision" != "$manifest_revision" ]] \
+    || ! systemctl is-active --quiet heteronetwork-db.service; then
+    local initial_state="existing"
+    [[ "$manifest_revision" == "1" ]] && initial_state="new"
+    log "applying database topology revision $manifest_revision as $local_name"
+    env \
+      "HETERONETWORK_DB_CLUSTER_NAME=$manifest_cluster_name" \
+      "HETERONETWORK_DB_INTERFACE=$HETERONETWORK_DB_INTERFACE" \
+      "HETERONETWORK_DB_NODE_NAME=$local_name" \
+      "HETERONETWORK_DB_NODE_ADDRESS=$local_underlay_ip" \
+      "HETERONETWORK_DB_MEMBERS=$manifest_members" \
+      "HETERONETWORK_DB_MEMBER_IDENTITIES=$manifest_member_identities" \
+      "HETERONETWORK_DB_DCS_MEMBERS=$manifest_dcs_members" \
+      "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$manifest_dcs_bootstrap_members" \
+      "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=$initial_state" \
+      "HETERONETWORK_DB_PROXY_BACKENDS=$manifest_members" \
+      "HETERONETWORK_DB_CLIENT_CIDRS=$manifest_client_cidrs" \
+      "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$manifest_extra_hba_entries" \
+      "HETERONETWORK_DB_BUNDLE_DIR=$bundle_dir" \
+      "HETERONETWORK_DB_SERVICE_NAME=$manifest_service_name" \
+      "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
+      "HETERONETWORK_DB_REST_PORT=$manifest_rest_port" \
+      "HETERONETWORK_DB_TOPOLOGY_REVISION=$manifest_revision" \
+      "HETERONETWORK_DB_NETWORK_PLANE=$manifest_network_plane" \
+      "$helper" reconfigure-node
+    printf '%s\n' "$manifest_revision" >"$configured_revision_path"
+    chmod 0600 "$configured_revision_path"
+  fi
+  if ! wait_for_bundle_health; then
     return
   fi
   printf '%s\n' "$manifest_revision" >"$applied_revision_path"
@@ -2802,6 +2827,7 @@ self_test() {
   authoritative_stability_path="$state_dir/authoritative-stability.tsv"
   reciprocal_stability_path="$state_dir/reciprocal-stability.tsv"
   applied_revision_path="$state_dir/applied-revision"
+  configured_revision_path="$state_dir/configured-revision"
   underlay_health_handler="$state_dir/postgres-underlay-health.py"
   install -d -m 0700 "$state_dir"
   legacy_database_service_path="$temporary/heteronetwork-db.service"
@@ -3390,15 +3416,19 @@ EOF
   grep -Fxq \
     'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
     "$temporary/applied-helper.env"
-  rm -f "$applied_revision_path"
+  rm -f "$applied_revision_path" "$configured_revision_path"
   local unhealthy_helper="$temporary/unhealthy-helper.sh"
   cat >"$unhealthy_helper" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "${1:-}" >>"${HETERONETWORK_DB_TEST_HELPER_LOG:?}"
 [[ "${1:-}" != "verify" ]]
 EOF
   chmod 0700 "$unhealthy_helper"
+  local unhealthy_helper_log="$temporary/unhealthy-helper.log"
   (
     helper="$unhealthy_helper"
+    HETERONETWORK_DB_TEST_HELPER_LOG="$unhealthy_helper_log"
+    export HETERONETWORK_DB_TEST_HELPER_LOG
     configure_helper_environment() {
       HETERONETWORK_DB_NODE_NAME="db-a"
       HETERONETWORK_DB_NODE_ADDRESS="100.123.154.79"
@@ -3408,11 +3438,20 @@ EOF
       export HETERONETWORK_DB_INTERFACE
     }
     systemctl() {
-      return 1
+      [[ -f "$temporary/database-active" ]]
     }
+    sleep() {
+      return 0
+    }
+    apply_local_bundle node-a 100.123.154.79 >/dev/null
+    touch "$temporary/database-active"
     apply_local_bundle node-a 100.123.154.79 >/dev/null
   )
   [[ ! -e "$applied_revision_path" ]]
+  [[ "$(<"$configured_revision_path")" == "$manifest_revision" ]]
+  [[ "$(grep -c '^reconfigure-node$' "$unhealthy_helper_log")" == "1" ]]
+  [[ "$(grep -c '^verify$' "$unhealthy_helper_log")" == \
+    "$((BUNDLE_HEALTH_RETRY_ATTEMPTS * 2))" ]]
 
   printf '%s\n' \
     $'node-b\t10.250.0.3' \
