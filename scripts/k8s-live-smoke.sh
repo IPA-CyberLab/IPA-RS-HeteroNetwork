@@ -758,7 +758,6 @@ run_ipars init \
   --issuer-key-id live-smoke \
   --token-ttl-seconds "$timeout_seconds" \
   --default-role kubernetes-node \
-  --allow-relay \
   --relay-admission-bearer-token-path "$relay_admission_token_file" \
   --daemon-state-dir "$tmp_dir/bootstrap" \
   --allowed-route "$service_cidr" \

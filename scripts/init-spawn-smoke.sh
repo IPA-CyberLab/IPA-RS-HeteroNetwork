@@ -152,7 +152,6 @@ chmod 600 "$control_plane_operator_token_path"
   --relay-udp-listen "127.0.0.1:${relay_udp_port}" \
   --relay-http-listen "127.0.0.1:${relay_http_port}" \
   --relay-agent-listen "127.0.0.1:${relay_agent_port}" \
-  --allow-relay \
   --unlimited-uses \
   --allowed-route 100.64.0.0/10 >"$output_path"
 

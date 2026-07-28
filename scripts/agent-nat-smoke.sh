@@ -920,7 +920,6 @@ if ! "$ipars_bin" init \
   --relay-http-listen "${root_public_ip}:${relay_http_port}" \
   --relay-agent-listen "127.0.0.1:${relay_agent_port}" \
   --control-plane-operator-api-bearer-token-path "$control_plane_operator_token_path" \
-  --allow-relay \
   --unlimited-uses \
   --allowed-route 100.64.0.0/10 \
   --token-ttl-seconds 3600 \
