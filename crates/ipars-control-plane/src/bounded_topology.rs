@@ -1039,7 +1039,7 @@ fn select_group_representatives(
             .get(&node_id)
             .copied()
             .unwrap_or(0);
-        if degree + reserved_degree + 2 * role_degree > 4 {
+        if degree + reserved_degree + 2 * role_degree > config.max_degree {
             return Err(BoundedTopologyError::RepresentativeCapacity {
                 group_id: group_id.to_string(),
             });
@@ -1071,7 +1071,7 @@ fn select_group_representatives(
                         .copied()
                         .unwrap_or(0)
                     + role_degree
-                    <= 4
+                    <= config.max_degree
             })
             .max_by_key(|node_id| {
                 (
@@ -1580,6 +1580,7 @@ fn two_internally_vertex_disjoint_paths(
 mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     use chrono::Utc;
@@ -1640,6 +1641,70 @@ mod tests {
                 .adjacency()
                 .values()
                 .all(|neighbors| neighbors.len() <= max_degree));
+        }
+    }
+
+    #[test]
+    fn representative_capacity_uses_the_configured_degree_limit() {
+        let candidates = [
+            NodeId::from_string("candidate-a"),
+            NodeId::from_string("candidate-b"),
+        ];
+        let adjacency = candidates
+            .iter()
+            .enumerate()
+            .map(|(candidate_index, candidate)| {
+                let neighbors = (0..4)
+                    .map(|neighbor_index| {
+                        NodeId::from_string(format!("neighbor-{candidate_index}-{neighbor_index}"))
+                    })
+                    .collect();
+                (candidate.clone(), neighbors)
+            })
+            .collect::<BTreeMap<_, BTreeSet<_>>>();
+        let reserved_degree = BTreeMap::new();
+        let degree_four = BoundedTopologyConfig::new(4);
+        let degree_six = BoundedTopologyConfig::new(6);
+
+        for candidate_count in [1, 2] {
+            let candidates = &candidates[..candidate_count];
+            assert!(matches!(
+                select_group_representatives(
+                    "capacity-test",
+                    candidates,
+                    1,
+                    &reserved_degree,
+                    &adjacency,
+                    &degree_four,
+                ),
+                Err(BoundedTopologyError::RepresentativeCapacity { .. })
+            ));
+
+            let representatives = match select_group_representatives(
+                "capacity-test",
+                candidates,
+                1,
+                &reserved_degree,
+                &adjacency,
+                &degree_six,
+            ) {
+                Ok(representatives) => representatives,
+                Err(error) => panic!(
+                    "degree six must admit representatives with four existing links: {error}"
+                ),
+            };
+            assert_eq!(representatives.len(), 2);
+            assert_eq!(
+                representatives
+                    .iter()
+                    .map(TopologyRepresentative::plane)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([0, 1])
+            );
+            assert_eq!(
+                representatives[0].node_id() == representatives[1].node_id(),
+                candidate_count == 1
+            );
         }
     }
 
@@ -1753,19 +1818,93 @@ mod tests {
     }
 
     #[test]
-    fn supported_block_sizes_remain_bounded_at_one_thousand_nodes() {
+    fn every_supported_policy_is_deterministic_bounded_and_locally_reassigned_at_one_thousand_nodes(
+    ) {
         let nodes = records(1_000);
-        for block_size in [4, 8, 16, 32, 64] {
-            let topology = topology_with_config(
-                &nodes,
-                &BoundedTopologyConfig::new(4)
-                    .with_block_size(block_size)
-                    .with_permutation_seed("cluster-a"),
-            );
-            assert!(topology.invariants().are_satisfied());
-            assert!(topology.invariants().max_observed_degree <= 4);
-            assert!(topology.diameter_lower_bound().is_some());
-        }
+        let reordered = nodes.iter().cloned().rev().collect::<Vec<_>>();
+        let cases = SUPPORTED_MAX_DEGREES
+            .into_iter()
+            .flat_map(|max_degree| {
+                (usize::from(MIN_OVERLAY_BLOCK_SIZE)..=usize::from(MAX_OVERLAY_BLOCK_SIZE))
+                    .map(move |block_size| (max_degree, block_size))
+            })
+            .collect::<Vec<_>>();
+        let maximum_representative_changes = AtomicUsize::new(0);
+        let worker_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(8)
+            .min(cases.len());
+        let chunk_size = cases.len().div_ceil(worker_count);
+
+        std::thread::scope(|scope| {
+            for chunk in cases.chunks(chunk_size) {
+                let nodes = &nodes;
+                let reordered = &reordered;
+                let maximum_representative_changes = &maximum_representative_changes;
+                scope.spawn(move || {
+                    for &(max_degree, block_size) in chunk {
+                        let config = BoundedTopologyConfig::new(max_degree)
+                            .with_block_size(block_size)
+                            .with_permutation_seed("all-supported-policies");
+                        let initial = topology_with_config(nodes, &config);
+                        let reordered_topology = topology_with_config(reordered, &config);
+                        assert!(
+                            initial == reordered_topology,
+                            "N=1000, D={max_degree}, B={block_size} depends on input order"
+                        );
+                        assert_degree_bound(&initial, max_degree, block_size);
+                        drop(reordered_topology);
+
+                        let removed_node = busiest_representative(&initial);
+                        let survivors = nodes
+                            .iter()
+                            .filter(|node| node.node_id != removed_node)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let updated = topology_with_config(&survivors, &config);
+                        assert_degree_bound(&updated, max_degree, block_size);
+                        assert_stable_groups_keep_representatives(
+                            &initial,
+                            &updated,
+                            &removed_node,
+                            max_degree,
+                            block_size,
+                        );
+
+                        let affected_group_count = initial
+                            .groups()
+                            .iter()
+                            .filter(|group| group.node_ids().contains(&removed_node))
+                            .count();
+                        let representative_changes =
+                            changed_representative_slots(&initial, &updated);
+                        let representative_change_bound = 4 * (block_size + affected_group_count);
+                        assert!(
+                            representative_changes <= representative_change_bound,
+                            "N=1000, D={max_degree}, B={block_size}: deleting \
+                             {removed_node} changed {representative_changes} representative slots \
+                             (bound {representative_change_bound}, affected hierarchy groups \
+                             {affected_group_count})"
+                        );
+                        assert!(updated.groups().iter().all(|group| {
+                            group
+                                .representatives()
+                                .iter()
+                                .all(|representative| representative.node_id() != &removed_node)
+                        }));
+                        maximum_representative_changes
+                            .fetch_max(representative_changes, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        eprintln!(
+            "all {} supported policies passed; maximum representative slot changes after one deletion: {}",
+            cases.len(),
+            maximum_representative_changes.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -1927,7 +2066,7 @@ mod tests {
             let synthesis_elapsed = started.elapsed();
             assert!(topology.invariants().are_satisfied());
             assert_eq!(topology.invariants().node_count, 1_000);
-            assert!(topology.invariants().max_observed_degree <= 4);
+            assert!(topology.invariants().max_observed_degree <= max_degree);
             assert!(topology.groups().iter().all(|group| {
                 group.child_group_ids().len() <= topology.fanout()
                     && (group.parent_group_id().is_none()
@@ -2219,6 +2358,106 @@ mod tests {
             Ok(topology) => topology,
             Err(error) => panic!("topology synthesis failed: {error}"),
         }
+    }
+
+    fn assert_degree_bound(topology: &BoundedTopology, max_degree: usize, block_size: usize) {
+        assert!(
+            topology.invariants().are_satisfied(),
+            "N={}, D={max_degree}, B={block_size}: {:?}",
+            topology.invariants().node_count,
+            topology.invariants()
+        );
+        assert!(
+            topology
+                .adjacency()
+                .values()
+                .all(|neighbors| neighbors.len() <= max_degree),
+            "N={}, D={max_degree}, B={block_size}: observed degree {}",
+            topology.invariants().node_count,
+            topology.invariants().max_observed_degree
+        );
+    }
+
+    fn busiest_representative(topology: &BoundedTopology) -> NodeId {
+        let mut assignments = BTreeMap::<NodeId, usize>::new();
+        for representative in topology
+            .groups()
+            .iter()
+            .flat_map(TopologyGroup::representatives)
+        {
+            *assignments
+                .entry(representative.node_id().clone())
+                .or_default() += 1;
+        }
+        let busiest = assignments
+            .into_iter()
+            .max_by_key(|(node_id, assignment_count)| (*assignment_count, node_id.clone()))
+            .map(|(node_id, _)| node_id);
+        match busiest {
+            Some(node_id) => node_id,
+            None => panic!("a 1,000-node hierarchy must have representatives"),
+        }
+    }
+
+    fn assert_stable_groups_keep_representatives(
+        initial: &BoundedTopology,
+        updated: &BoundedTopology,
+        removed_node: &NodeId,
+        max_degree: usize,
+        block_size: usize,
+    ) {
+        let updated_groups = updated
+            .groups()
+            .iter()
+            .map(|group| (group.group_id(), group))
+            .collect::<BTreeMap<_, _>>();
+        for initial_group in initial.groups() {
+            let Some(updated_group) = updated_groups.get(initial_group.group_id()) else {
+                continue;
+            };
+            if initial_group.node_ids() == updated_group.node_ids() {
+                assert!(
+                    initial_group.representatives() == updated_group.representatives(),
+                    "N=1000, D={max_degree}, B={block_size}: deleting {removed_node} \
+                     changed representatives for unaffected group {}",
+                    initial_group.group_id()
+                );
+            } else {
+                assert!(
+                    initial_group.node_ids().contains(removed_node),
+                    "N=1000, D={max_degree}, B={block_size}: deleting {removed_node} \
+                     changed membership outside its hierarchy path in group {}",
+                    initial_group.group_id()
+                );
+            }
+        }
+    }
+
+    fn changed_representative_slots(initial: &BoundedTopology, updated: &BoundedTopology) -> usize {
+        let representative_assignments = |topology: &BoundedTopology| {
+            topology
+                .groups()
+                .iter()
+                .flat_map(|group| {
+                    group.representatives().iter().map(|representative| {
+                        (
+                            (group.group_id().to_string(), representative.plane()),
+                            representative.node_id().clone(),
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let initial_assignments = representative_assignments(initial);
+        let updated_assignments = representative_assignments(updated);
+        initial_assignments
+            .keys()
+            .chain(updated_assignments.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|slot| initial_assignments.get(slot) != updated_assignments.get(slot))
+            .count()
     }
 
     fn assert_capacity_case(node_count: usize, block_size: usize) {
