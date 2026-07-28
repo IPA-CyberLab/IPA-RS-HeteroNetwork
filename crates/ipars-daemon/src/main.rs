@@ -36884,13 +36884,14 @@ exec sleep 60
     async fn signal_negotiation_records_relay_selected_after_admission_failover(
     ) -> anyhow::Result<()> {
         async fn relay_admission_success(
+            axum::extract::State(relay_node): axum::extract::State<NodeId>,
             axum::Json(request): axum::Json<RelayAdmissionRequest>,
         ) -> axum::Json<RelayAdmissionResponse> {
             let session_id = RelaySessionId::new(&request.left, &request.right)
                 .as_str()
                 .to_string();
             axum::Json(RelayAdmissionResponse {
-                relay_node: NodeId::from_string("relay-good"),
+                relay_node,
                 session_id,
                 session_token: "token-good".to_string(),
                 expires_at: Utc::now() + ChronoDuration::seconds(60),
@@ -36928,8 +36929,16 @@ exec sleep 60
             .record_peer_activity(peer.node_id.clone(), Utc::now(), false)
             .await;
 
+        let relay_a = NodeId::from_string("relay-a");
+        let relay_b = NodeId::from_string("relay-b");
+        let (bad_relay_id, good_relay_id) =
+            if relay_pair_rendezvous_ordering(&local, &peer.node_id, &relay_a, &relay_b).is_lt() {
+                (relay_a, relay_b)
+            } else {
+                (relay_b, relay_a)
+            };
         let unavailable = unused_http_base_url().await?;
-        let mut relay_bad = node_record("relay-bad");
+        let mut relay_bad = node_record(bad_relay_id.as_str());
         relay_bad.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
@@ -36940,10 +36949,12 @@ exec sleep 60
             e2e_only: true,
         });
         let (relay_base, relay_task) = spawn_test_http_service(
-            Router::new().route("/v1/sessions", axum::routing::post(relay_admission_success)),
+            Router::new()
+                .route("/v1/sessions", axum::routing::post(relay_admission_success))
+                .with_state(good_relay_id.clone()),
         )
         .await?;
-        let mut relay_good = node_record("relay-good");
+        let mut relay_good = node_record(good_relay_id.as_str());
         relay_good.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
@@ -37008,12 +37019,12 @@ exec sleep 60
             .await
             .context("relay path record should be stored")?;
         assert_eq!(record.selected_state, PathState::Relay);
-        assert_eq!(record.relay_node, Some(NodeId::from_string("relay-good")));
+        assert_eq!(record.relay_node, Some(good_relay_id.clone()));
         let session = runtime
             .relay_session(&peer.node_id)
             .await
             .context("relay session should be stored")?;
-        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        assert_eq!(session.relay_node, good_relay_id);
         let metrics = runtime.metrics().await;
         assert_eq!(metrics.relay_admission_attempt_count, 2);
         assert_eq!(metrics.relay_admission_success_count, 1);
