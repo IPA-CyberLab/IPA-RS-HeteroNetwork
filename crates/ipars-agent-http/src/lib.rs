@@ -4106,6 +4106,15 @@ mod tests {
             )
             .await?;
         assert_eq!(public_asset.status(), StatusCode::OK);
+        let public_asset = String::from_utf8(
+            to_bytes(public_asset.into_body(), usize::MAX)
+                .await?
+                .to_vec(),
+        )?;
+        assert!(public_asset.contains(r#"window.open("about:blank", "_blank")"#));
+        assert!(
+            !public_asset.contains(r#"window.open("about:blank", "heteronetwork-device-login")"#)
+        );
 
         let public_config = app
             .clone()

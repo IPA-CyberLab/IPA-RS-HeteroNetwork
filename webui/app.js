@@ -905,7 +905,7 @@
   }
 
   function startDeviceLogin() {
-    var authWindow = window.open("about:blank", "heteronetwork-device-login");
+    var authWindow = window.open("about:blank", "_blank");
     return fetch(state.config.device_login_endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -915,9 +915,9 @@
       try { body = await response.json(); } catch (_) { body = {}; }
       if (!response.ok) throw new Error(body.error || (t("Device sign-in failed") + " (" + response.status + ")"));
       var verificationUrl = body.verification_uri_complete || body.verification_uri;
-      if (authWindow) {
-        authWindow.opener = null;
+      if (authWindow && !authWindow.closed) {
         authWindow.location.replace(verificationUrl);
+        authWindow.opener = null;
       } else {
         window.open(verificationUrl, "_blank", "noopener,noreferrer");
       }
@@ -929,6 +929,7 @@
         Date.now() + Math.max(30, body.expires_in || 600) * 1000
       );
     }).then(function (accessToken) {
+      if (authWindow && !authWindow.closed) authWindow.close();
       state.token = accessToken;
       sessionStorage.setItem("heteronetwork_access_token", accessToken);
       $("auth-error").textContent = "";
@@ -1147,6 +1148,7 @@
     state.loading = true;
     return api("/v1/admin/overview").then(function (overview) {
       state.overview = overview;
+      $("auth-error").textContent = "";
       showDashboard();
       setConnection(true);
       $("cluster-name").textContent = overview.cluster_id;
@@ -1155,7 +1157,10 @@
       updateNavigationCounts();
       renderView();
     }).catch(function (error) {
-      if (error.message !== "authentication required") setStatus(error.message, true);
+      if (error.message !== "authentication required") {
+        setStatus(error.message, true);
+        if (!state.overview) $("auth-error").textContent = error.message;
+      }
     }).finally(function () {
       state.loading = false;
     });
