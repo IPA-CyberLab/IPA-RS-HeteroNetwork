@@ -1189,8 +1189,7 @@ route_output_matches() {
       }
     }
     END {
-      if (dev_count != 1 || src_count != 1
-          || dev != expected_interface || src != expected_source) {
+      if (dev_count != 1 || src_count != 1 || dev != expected_interface || src != expected_source) {
         exit 1
       }
     }
@@ -2547,6 +2546,14 @@ EOF
   node_name="db-a"
   legacy_node_address="10.250.0.2"
   node_address="100.64.10.1"
+  route_output_matches \
+    '100.64.10.2 dev tailscale0 src 100.64.10.1 uid 0' \
+    tailscale0 100.64.10.1
+  if route_output_matches \
+      '100.64.10.2 dev heteronetwork0 src 10.250.0.2 uid 0' \
+      tailscale0 100.64.10.1; then
+    die "route validator accepted the wrong interface and source"
+  fi
   local transition="$test_dir/transition.yml"
   local final="$test_dir/final.yml"
   render_transition_etcd_config >"$transition"
