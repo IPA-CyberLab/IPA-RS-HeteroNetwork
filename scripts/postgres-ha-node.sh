@@ -1271,16 +1271,18 @@ route_output_uses_interface() {
         if ($field_index == "dev" && field_index < NF) {
           interface_count += 1
           interface = $(field_index + 1)
-        } else if ($field_index == "src" && field_index < NF) {
+        } else if (($field_index == "src" || $field_index == "from") && field_index < NF) {
           source_count += 1
-          source = $(field_index + 1)
+          if ($(field_index + 1) != expected_source) {
+            source_mismatch = 1
+          }
         }
       }
     }
     END {
       invalid = interface_count != 1 || interface != expected_interface
-      invalid = invalid || interface == "heteronetwork0" || source_count != 1
-      invalid = invalid || source != expected_source
+      invalid = invalid || interface == "heteronetwork0" || source_count < 1
+      invalid = invalid || source_mismatch
       if (invalid) {
         exit 1
       }
@@ -1876,6 +1878,9 @@ self_test() {
   fi
   route_output_uses_interface \
     "100.64.10.2 dev tailscale0 table 52 src 100.64.10.1 uid 0" \
+    "tailscale0" "100.64.10.1"
+  route_output_uses_interface \
+    "100.64.10.2 from 100.64.10.1 dev tailscale0 table 52 uid 0" \
     "tailscale0" "100.64.10.1"
   if route_output_uses_interface \
     "100.64.10.2 dev eth0 src 192.0.2.10 uid 0" \
