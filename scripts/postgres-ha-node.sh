@@ -1384,6 +1384,13 @@ install_proxy() {
   systemctl reload-or-restart heteronetwork-db-proxy.service
 }
 
+activate_reconfigured_services() {
+  # A hard proxy restart releases listeners retained by older HAProxy workers
+  # before Patroni moves its REST API onto the underlay address.
+  systemctl restart heteronetwork-db-proxy.service
+  systemctl reload-or-restart heteronetwork-db.service
+}
+
 reconfigure_node() {
   require_root
   validate_node_config
@@ -1435,8 +1442,7 @@ reconfigure_node() {
   if node_is_dcs_member; then
     systemctl enable --now heteronetwork-db-dcs.service
   fi
-  systemctl reload-or-restart heteronetwork-db.service
-  systemctl reload-or-restart heteronetwork-db-proxy.service
+  activate_reconfigured_services
 }
 
 etcd_endpoints() {
@@ -1892,6 +1898,15 @@ self_test() {
     "tailscale0" "100.64.10.1"; then
     die "database member route with the wrong source address was accepted"
   fi
+  local service_action_log="$test_dir/service-actions.log"
+  systemctl() {
+    printf '%s\n' "$*" >>"$service_action_log"
+  }
+  activate_reconfigured_services
+  [[ "$(sed -n '1p' "$service_action_log")" == \
+    "restart heteronetwork-db-proxy.service" ]]
+  [[ "$(sed -n '2p' "$service_action_log")" == \
+    "reload-or-restart heteronetwork-db.service" ]]
   if (
     dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
     validate_common_config >/dev/null 2>&1
