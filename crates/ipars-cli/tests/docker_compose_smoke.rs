@@ -2568,6 +2568,7 @@ where
 {
     let remote_cidr = remote_cidr.into();
     let remote_workload_ip = remote_workload_ip.into();
+    request_compose_overlay_route_resolution(compose, service, remote_workload_ip)?;
     let script = r#"
 set -eu
 interface="$1"
@@ -2635,6 +2636,7 @@ fn wait_for_compose_advertised_route_replacement(
     replacement_cidr: Ipv4Net,
 ) -> Result<()> {
     let replacement_ip = ipv4_network_probe_address(replacement_cidr);
+    request_compose_overlay_route_resolution(compose, service, replacement_ip.into())?;
     let script = r#"
 set -eu
 interface="$1"
@@ -2684,6 +2686,56 @@ fi
             );
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn request_compose_overlay_route_resolution(
+    compose: &ComposeProject,
+    service: &str,
+    destination: IpAddr,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "destination": destination,
+        "detector": "compose-route-demand",
+        "pin": false,
+    })
+    .to_string();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let result = compose_exec_post_json(
+            compose,
+            service,
+            "http://127.0.0.1:9780/v1/packet-flow",
+            &body,
+        )
+        .and_then(|response| {
+            ensure_json_string_equals(&response, "destination", &destination.to_string())?;
+            ensure_json_field_absent_or_null(&response, &["filtered_reason"])?;
+            let pending = response
+                .get("resolution_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let matched = response
+                .get("matched")
+                .is_some_and(|value| !value.is_null());
+            anyhow::ensure!(
+                pending || matched,
+                "{service} neither queued nor matched lazy overlay route demand for {destination}: {response}"
+            );
+            Ok(())
+        });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "Docker Agent {service} did not accept lazy overlay route demand for {destination}: {error}\n{}",
+                    compose_diagnostics(compose)
+                );
+            }
+        }
     }
 }
 

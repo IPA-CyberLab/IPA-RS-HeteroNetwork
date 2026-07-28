@@ -1146,7 +1146,7 @@ struct AgentArgs {
         long,
         env = "HETERONETWORK_AGENT_PACKET_FLOW_DETECTOR",
         value_enum,
-        default_value_t = PacketFlowDetector::Disabled
+        default_value_t = PacketFlowDetector::Auto
     )]
     packet_flow_detector: PacketFlowDetector,
     #[arg(long, env = "HETERONETWORK_AGENT_PACKET_FLOW_CONNTRACK_PATH")]
@@ -1553,6 +1553,7 @@ impl std::fmt::Display for RouteApplyBackend {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PacketFlowDetector {
+    Auto,
     Disabled,
     #[value(name = "proc-net-conntrack")]
     ProcNetConntrack,
@@ -1569,6 +1570,7 @@ enum PacketFlowDetector {
 impl PacketFlowDetector {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Disabled => "disabled",
             Self::ProcNetConntrack => "proc-net-conntrack",
             Self::ConntrackNetlink => "conntrack-netlink",
@@ -1576,6 +1578,18 @@ impl PacketFlowDetector {
             Self::EbpfJsonl => "ebpf-jsonl",
             Self::EbpfRingbuf => "ebpf-ringbuf",
         }
+    }
+}
+
+fn effective_packet_flow_detector(args: &AgentArgs) -> PacketFlowDetector {
+    match args.packet_flow_detector {
+        PacketFlowDetector::Auto
+            if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand =>
+        {
+            PacketFlowDetector::ConntrackNetlinkEvents
+        }
+        PacketFlowDetector::Auto => PacketFlowDetector::Disabled,
+        detector => detector,
     }
 }
 
@@ -1930,7 +1944,7 @@ fn preflight_agent_runtime_with_path_and_checks(
     if needs.ipv6_forwarding {
         (checks.ipv6_forwarding)()?;
     }
-    if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
+    if effective_packet_flow_detector(args) == PacketFlowDetector::EbpfRingbuf {
         let config = EbpfRingbufConfig::from_args(args)?;
         (checks.ebpf_object)(&config.object_path)?;
         for attachment in &config.attachments {
@@ -1986,6 +2000,7 @@ fn preflight_agent_runtime_with_path_and_checks(
 }
 
 fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
+    let packet_flow_detector = effective_packet_flow_detector(args);
     validate_agent_api_auth_config(args)?;
     if args.enroll_only {
         anyhow::ensure!(
@@ -2268,7 +2283,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.runtime_command_output_max_bytes <= MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES,
         "--runtime-command-output-max-bytes must not exceed {MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES}"
     );
-    if args.packet_flow_detector != PacketFlowDetector::Disabled {
+    if packet_flow_detector != PacketFlowDetector::Disabled {
         validate_positive_seconds(
             args.packet_flow_poll_interval_seconds,
             "--packet-flow-poll-interval-seconds",
@@ -2276,7 +2291,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     }
     validate_packet_flow_dedup_ttl_seconds(args.packet_flow_dedup_ttl_seconds)?;
     validate_packet_flow_detector_specific_args(args)?;
-    if args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
+    if packet_flow_detector == PacketFlowDetector::ProcNetConntrack {
         validate_bounded_u64(
             args.packet_flow_procfs_max_bytes,
             "--packet-flow-procfs-max-bytes",
@@ -2294,7 +2309,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         )?;
     }
     if matches!(
-        args.packet_flow_detector,
+        packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     ) {
         validate_bounded_usize(
@@ -2303,7 +2318,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             MAX_PACKET_FLOW_RECORDS,
         )?;
     }
-    if args.packet_flow_detector == PacketFlowDetector::EbpfJsonl {
+    if packet_flow_detector == PacketFlowDetector::EbpfJsonl {
         anyhow::ensure!(
             args.packet_flow_ebpf_event_path.is_some(),
             "--packet-flow-ebpf-event-path is required when --packet-flow-detector ebpf-jsonl is set"
@@ -2324,7 +2339,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             MAX_PACKET_FLOW_RECORDS,
         )?;
     }
-    if args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
+    if packet_flow_detector == PacketFlowDetector::EbpfRingbuf {
         anyhow::ensure!(
             args.packet_flow_ebpf_object_path.is_some(),
             "--packet-flow-ebpf-object-path is required when --packet-flow-detector ebpf-ringbuf is set"
@@ -2665,7 +2680,7 @@ fn validate_packet_flow_detector_specific_args(args: &AgentArgs) -> anyhow::Resu
             "--packet-flow-ebpf-sockops-attach requires --packet-flow-detector ebpf-ringbuf"
         );
     }
-    if args.packet_flow_detector == PacketFlowDetector::Disabled {
+    if effective_packet_flow_detector(args) == PacketFlowDetector::Disabled {
         anyhow::ensure!(
             !args.packet_flow_pin,
             "--packet-flow-pin requires --packet-flow-detector to be enabled"
@@ -3031,18 +3046,19 @@ fn validate_http_url(value: &str, name: &str) -> anyhow::Result<()> {
 }
 
 fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
+    let packet_flow_detector = effective_packet_flow_detector(args);
     let netfilter_netlink = matches!(
-        args.packet_flow_detector,
+        packet_flow_detector,
         PacketFlowDetector::ConntrackNetlink | PacketFlowDetector::ConntrackNetlinkEvents
     );
-    let conntrack_procfs_path = args.packet_flow_detector == PacketFlowDetector::ProcNetConntrack
+    let conntrack_procfs_path = packet_flow_detector == PacketFlowDetector::ProcNetConntrack
         && args.packet_flow_conntrack_path.is_some();
-    let ebpf_ringbuf = args.packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
+    let ebpf_ringbuf = packet_flow_detector == PacketFlowDetector::EbpfRingbuf;
     let ebpf_tracepoints = ebpf_ringbuf && !args.packet_flow_ebpf_attach.is_empty();
     let ebpf_cgroup = ebpf_ringbuf
         && (!args.packet_flow_ebpf_cgroup_attach.is_empty()
             || !args.packet_flow_ebpf_sockops_attach.is_empty());
-    let ebpf_jsonl = args.packet_flow_detector == PacketFlowDetector::EbpfJsonl;
+    let ebpf_jsonl = packet_flow_detector == PacketFlowDetector::EbpfJsonl;
     let docker_api_socket =
         args.apply_docker_routes && args.docker_discover_networks && args.docker_api_url.is_none();
     let relay_forwarder_netns = args.relay_forwarder_bind.is_some()
@@ -8840,12 +8856,16 @@ async fn run_agent(
             "Kubernetes advertised routes will be reconciled through peer-map route ownership"
         );
     }
-    match args.packet_flow_detector {
+    let packet_flow_detector = effective_packet_flow_detector(&args);
+    match packet_flow_detector {
+        PacketFlowDetector::Auto => {
+            unreachable!("automatic packet-flow detector must resolve before startup")
+        }
         PacketFlowDetector::Disabled => {}
         PacketFlowDetector::ProcNetConntrack => {
             let limits = ProcNetConntrackReadLimits::from_args(&args)?;
             tracing::info!(
-                detector = args.packet_flow_detector.as_str(),
+                detector = packet_flow_detector.as_str(),
                 conntrack_path = ?args.packet_flow_conntrack_path,
                 interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
@@ -8867,7 +8887,7 @@ async fn run_agent(
         PacketFlowDetector::ConntrackNetlink => {
             let limits = ConntrackNetlinkReadLimits::from_args(&args)?;
             tracing::info!(
-                detector = args.packet_flow_detector.as_str(),
+                detector = packet_flow_detector.as_str(),
                 interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 max_flows = limits.max_flows,
@@ -8885,7 +8905,7 @@ async fn run_agent(
         PacketFlowDetector::ConntrackNetlinkEvents => {
             let limits = ConntrackNetlinkReadLimits::from_args(&args)?;
             tracing::info!(
-                detector = args.packet_flow_detector.as_str(),
+                detector = packet_flow_detector.as_str(),
                 idle_poll_interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
                 max_flows = limits.max_flows,
@@ -8907,7 +8927,7 @@ async fn run_agent(
                 .clone()
                 .context("--packet-flow-ebpf-event-path is required")?;
             tracing::info!(
-                detector = args.packet_flow_detector.as_str(),
+                detector = packet_flow_detector.as_str(),
                 event_path = %event_path.display(),
                 interval_seconds = args.packet_flow_poll_interval_seconds,
                 dedup_ttl_seconds = args.packet_flow_dedup_ttl_seconds,
@@ -8930,7 +8950,7 @@ async fn run_agent(
             let config = EbpfRingbufConfig::from_args(&args)?;
             let limits = EbpfRingbufReadLimits::from_args(&args)?;
             tracing::info!(
-                detector = args.packet_flow_detector.as_str(),
+                detector = packet_flow_detector.as_str(),
                 object_path = %config.object_path.display(),
                 ringbuf_map = %config.ringbuf_map,
                 tracepoint_attachments = config.attachments.len(),
@@ -25331,6 +25351,61 @@ mod tests {
     }
 
     #[test]
+    fn agent_packet_flow_detector_auto_default_tracks_linux_peer_map() -> anyhow::Result<()> {
+        let plain = Cli::try_parse_from(["iparsd", "agent"])?;
+        let Command::Agent(plain) = plain.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert_eq!(plain.packet_flow_detector, PacketFlowDetector::Auto);
+        assert_eq!(plain.packet_flow_detector.as_str(), "auto");
+        assert_eq!(
+            effective_packet_flow_detector(&plain),
+            PacketFlowDetector::Disabled
+        );
+
+        let applying = Cli::try_parse_from(["iparsd", "agent", "--apply-peer-map"])?;
+        let Command::Agent(applying) = applying.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert_eq!(applying.packet_flow_detector, PacketFlowDetector::Auto);
+        assert_eq!(
+            effective_packet_flow_detector(&applying),
+            PacketFlowDetector::ConntrackNetlinkEvents
+        );
+
+        let dry_run = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--runtime-backend",
+            "dry-run",
+            "--apply-peer-map",
+        ])?;
+        let Command::Agent(dry_run) = dry_run.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert_eq!(
+            effective_packet_flow_detector(&dry_run),
+            PacketFlowDetector::Disabled
+        );
+
+        let disabled = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--apply-peer-map",
+            "--packet-flow-detector",
+            "disabled",
+        ])?;
+        let Command::Agent(disabled) = disabled.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert_eq!(
+            effective_packet_flow_detector(&disabled),
+            PacketFlowDetector::Disabled
+        );
+        Ok(())
+    }
+
+    #[test]
     fn agent_args_accept_packet_flow_detector() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
@@ -29010,7 +29085,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(!needs.wg_command);
             assert!(needs.route_netlink);
             assert!(needs.generic_netlink);
-            assert!(!needs.netfilter_netlink);
+            assert!(needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -29044,7 +29119,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             assert!(needs.wg_command);
             assert!(needs.route_netlink);
             assert!(!needs.generic_netlink);
-            assert!(!needs.netfilter_netlink);
+            assert!(needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(!needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -30180,7 +30255,7 @@ exec sleep 60
             assert!(!needs.wg_command);
             assert!(needs.route_netlink);
             assert!(needs.generic_netlink);
-            assert!(!needs.netfilter_netlink);
+            assert!(needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -30212,7 +30287,7 @@ exec sleep 60
             assert!(!needs.wg_command);
             assert!(needs.route_netlink);
             assert!(needs.generic_netlink);
-            assert!(!needs.netfilter_netlink);
+            assert!(needs.netfilter_netlink);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(needs.cap_sys_admin);

@@ -404,6 +404,14 @@ sudo env PATH="$PATH" CARGO="$(command -v cargo)" HETERONETWORK_RUN_EBPF_ATTACH_
 
 ## CLI Surface
 
+`iparsd agent` defaults `--packet-flow-detector` to `auto`. A Linux agent that
+applies its peer map resolves `auto` to the conntrack NEW/UPDATE event
+subscriber, so ordinary workload traffic activates exact advertised routes
+without extra detector configuration. Agents without a Linux peer-map
+dataplane avoid that capability requirement; use
+`--packet-flow-detector disabled` explicitly to opt an applying agent out of
+traffic-driven lazy route activation.
+
 After a successful `ipars join`, the owner-only state file contains the
 accepted NodeRecord and bootstrap endpoints as well as the generated keys and
 VPN IP. `iparsd agent` can resume from that state without consuming the

@@ -4165,7 +4165,7 @@ impl AgentRuntime {
             .clone()
     }
 
-    async fn overlay_destination_is_resolvable(&self, destination: IpAddr) -> bool {
+    pub async fn overlay_destination_is_resolvable(&self, destination: IpAddr) -> bool {
         if self.local_vpn_destination(destination) {
             return false;
         }

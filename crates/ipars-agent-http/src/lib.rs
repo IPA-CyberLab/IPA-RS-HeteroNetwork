@@ -2464,9 +2464,14 @@ async fn packet_flow(
             request.pin,
         )
         .await;
+    let resolution_pending = destination_drop_reason.is_none()
+        && matched.is_none()
+        && state
+            .runtime
+            .overlay_destination_is_resolvable(request.destination)
+            .await;
     let filtered_reason = destination_drop_reason.or_else(|| {
-        matched
-            .is_none()
+        (matched.is_none() && !resolution_pending)
             .then_some(AgentPacketFlowDropReason::NoOverlayMatch)
     });
     Ok((
@@ -2475,6 +2480,7 @@ async fn packet_flow(
             destination: request.destination,
             recorded_at,
             observation,
+            resolution_pending,
             filtered_reason,
             matched,
         }),
@@ -3544,9 +3550,9 @@ mod tests {
         RotateWireGuardKeyResponse,
     };
     use ipars_types::{
-        BootstrapEndpoint, CandidateSource, ClusterId, ClusterPolicy, EndpointCandidate,
-        EndpointCandidateKind, NodeId, NodeRecord, PathMetrics, PathRecord, PathScore, PathState,
-        PeerPathKey, Role, Route, TokenPolicy, VpnIp,
+        AggregateOverlayRoute, BootstrapEndpoint, CandidateSource, ClusterId, ClusterPolicy,
+        EndpointCandidate, EndpointCandidateKind, NeighborMap, NodeId, NodeRecord, PathMetrics,
+        PathRecord, PathScore, PathState, PeerPathKey, Role, Route, TokenPolicy, VpnIp,
     };
     use tower::ServiceExt;
 
@@ -6168,6 +6174,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(!packet_flow.resolution_pending);
         assert_eq!(
             packet_flow.observation.protocol,
             Some(ipars_types::TransportProtocol::Udp)
@@ -6196,6 +6203,57 @@ mod tests {
         assert_eq!(matched.route, Some(route));
         assert!(matched.pinned);
         assert!(runtime.should_connect_peer(&peer_record).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_agent_reports_pending_lazy_overlay_route_resolution(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+        let destination = IpAddr::V4(Ipv4Addr::new(10, 44, 3, 10));
+        runtime
+            .record_neighbor_map_snapshot(NeighborMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                node_id: local_node,
+                topology_epoch: 1,
+                routing_epoch: 1,
+                max_degree: 4,
+                vpn_cidr: "100.64.0.0/10".parse()?,
+                neighbors: Vec::new(),
+                aggregate_routes: vec![AggregateOverlayRoute {
+                    cidr: "10.44.0.0/16".parse()?,
+                }],
+                client_route_peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await?;
+        let app = router(AgentHttpState::new(runtime.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packet-flow")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"destination":"{destination}","detector":"unit-test"}}"#
+                    )))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(packet_flow.resolution_pending);
+        assert_eq!(packet_flow.filtered_reason, None);
+        assert_eq!(packet_flow.matched, None);
+        assert_eq!(
+            runtime.take_pending_overlay_destinations(1).await,
+            vec![destination]
+        );
         Ok(())
     }
 
@@ -6253,6 +6311,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(!packet_flow.resolution_pending);
         assert!(packet_flow.matched.is_none());
         assert_eq!(
             packet_flow.filtered_reason,
@@ -6307,6 +6366,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let packet_flow: AgentPacketFlowResponse = serde_json::from_slice(&body)?;
+        assert!(!packet_flow.resolution_pending);
         assert!(packet_flow.matched.is_none());
         assert_eq!(
             packet_flow.filtered_reason,

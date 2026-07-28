@@ -662,14 +662,24 @@ fi
 
 echo "Rootless Docker BoringTun two-agent VPN packet and direct-path smoke passed"
 
-if ! assert_workload_http agent 172.30.252.2; then
+if ! wait_for_workload_http agent 172.30.252.2; then
   rootless_dataplane_diagnostics "agent could not reach remote rootless workload"
   exit 1
 fi
-if ! assert_workload_http agent-b 172.30.251.2; then
+if ! wait_for_workload_http agent-b 172.30.251.2; then
   rootless_dataplane_diagnostics "agent-b could not reach remote rootless workload"
   exit 1
 fi
+for service in agent agent-b; do
+  if ! agent_get "$service" /v1/metrics \
+    | jq -e '
+      (.packet_flow_observation_count // 0) >= 1
+      and (.lazy_connect.observed_route_count // 0) >= 1
+    ' >/dev/null; then
+    rootless_dataplane_diagnostics "${service} did not resolve workload traffic lazily"
+    exit 1
+  fi
+done
 
 agent_a_container="$(rootless_e2e_compose ps -q agent)"
 if [[ -z "$agent_a_container" ]]; then

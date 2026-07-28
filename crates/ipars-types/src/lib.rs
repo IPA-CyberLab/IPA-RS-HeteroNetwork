@@ -18793,6 +18793,7 @@ pub mod api {
         pub destination: IpAddr,
         pub recorded_at: DateTime<Utc>,
         pub observation: AgentPacketFlowObservation,
+        pub resolution_pending: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filtered_reason: Option<AgentPacketFlowDropReason>,
         pub matched: Option<AgentPacketFlowMatch>,
