@@ -2267,6 +2267,18 @@ verify_rolling_patroni_topology() {
   return 1
 }
 
+verify_final_database_topology() {
+  local attempt output
+  for attempt in {1..60}; do
+    if output="$(run_standard_helper "$bundle_dir" verify 2>&1)"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 verify_local_etcd_listener_ownership() {
   local main_pid sockets
   main_pid="$(
@@ -2367,7 +2379,7 @@ apply_node() {
   topology_phase="$(verify_rolling_patroni_topology)" \
     || die "PostgreSQL HA topology did not stabilize after local underlay apply"
   if [[ "$topology_phase" == "final" ]]; then
-    run_standard_helper "$bundle_dir" verify \
+    verify_final_database_topology \
       || die "full PostgreSQL HA verification failed after final underlay apply"
   fi
   log "applied underlay topology revision $topology_revision to $node_name"
@@ -2841,6 +2853,22 @@ EOF
       >/dev/null 2>&1; then
     die "rolling Patroni validator accepted an unmanaged member address"
   fi
+  local final_verify_attempt_file="$test_dir/final-verify-attempt"
+  printf '0\n' >"$final_verify_attempt_file"
+  run_standard_helper() {
+    local attempts
+    attempts="$(cat "$final_verify_attempt_file")"
+    attempts=$((10#$attempts + 1))
+    printf '%s\n' "$attempts" >"$final_verify_attempt_file"
+    ((attempts >= 3)) || return 1
+    printf 'final verification fixture passed\n'
+  }
+  sleep() {
+    :
+  }
+  [[ "$(verify_final_database_topology)" == \
+    "final verification fixture passed" ]]
+  [[ "$(cat "$final_verify_attempt_file")" == "3" ]]
   route_output_matches \
     '100.64.10.2 dev tailscale0 src 100.64.10.1 uid 0' \
     tailscale0 100.64.10.1
