@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly DEFAULT_CLUSTER_NAME="heteronetwork"
-readonly DEFAULT_INTERFACE="heteronetwork0"
+readonly DEFAULT_INTERFACE=""
 readonly DEFAULT_SERVICE_NAME="postgres.heteronetwork.internal"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/postgres-ha"
 readonly DEFAULT_DATA_DIR="/var/lib/heteronetwork-postgres-ha"
@@ -14,6 +14,7 @@ readonly DEFAULT_DCS_PEER_PORT="12380"
 readonly DEFAULT_DCS_METRICS_PORT="12381"
 readonly DEFAULT_PROXY_PORT="25432"
 readonly DEFAULT_POSTGRES_MAJOR="17"
+readonly DEFAULT_NETWORK_PLANE="underlay-v1"
 readonly PATRONI_VERSION="4.1.4"
 readonly ETCD_VERSION="v3.6.11"
 readonly ETCD_LINUX_AMD64_SHA256="8756f7a4eaf921668a83de0bf13c0f65cae9186a165696e3ae8396afe6f557ed"
@@ -48,6 +49,7 @@ dcs_metrics_port="${HETERONETWORK_DB_DCS_METRICS_PORT:-$DEFAULT_DCS_METRICS_PORT
 proxy_port="${HETERONETWORK_DB_PROXY_PORT:-$DEFAULT_PROXY_PORT}"
 postgres_major="${HETERONETWORK_DB_POSTGRES_MAJOR:-$DEFAULT_POSTGRES_MAJOR}"
 topology_revision="${HETERONETWORK_DB_TOPOLOGY_REVISION:-1}"
+network_plane="${HETERONETWORK_DB_NETWORK_PLANE:-$DEFAULT_NETWORK_PLANE}"
 
 usage() {
   cat <<'EOF'
@@ -65,11 +67,12 @@ Commands:
   self-test               Run non-privileged config renderer and validation checks
 
 Required environment for init-bundle:
-  HETERONETWORK_DB_MEMBERS       3-32 name=private-ip entries, comma separated
+  HETERONETWORK_DB_MEMBERS       3-32 name=underlay-ip entries, comma separated
 
 Required environment for install-node:
   HETERONETWORK_DB_NODE_NAME
   HETERONETWORK_DB_NODE_ADDRESS
+  HETERONETWORK_DB_INTERFACE
   HETERONETWORK_DB_MEMBERS
   HETERONETWORK_DB_BUNDLE_DIR
 
@@ -78,7 +81,6 @@ Required environment for install-proxy:
   HETERONETWORK_DB_BUNDLE_DIR
 
 Optional environment:
-  HETERONETWORK_DB_INTERFACE       Default: heteronetwork0
   HETERONETWORK_DB_DCS_MEMBERS     Odd 3-9 voter entries; defaults to DB members
   HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS
                                      Actual 3-9 DCS entries while joining a learner;
@@ -87,6 +89,7 @@ Optional environment:
                                      new for a fresh quorum, existing when joining one
   HETERONETWORK_DB_TOPOLOGY_REVISION
                                      Monotonic positive integer, default: 1
+  HETERONETWORK_DB_NETWORK_PLANE     Must be underlay-v1 (default)
   HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS
                                      Optional private management address used by remote proxies
   HETERONETWORK_DB_CLIENT_CIDRS    Additional comma-separated application source CIDRs
@@ -98,8 +101,9 @@ Optional environment:
   HETERONETWORK_DB_REST_PORT       Default: 18008
   HETERONETWORK_DB_PROXY_PORT      Default: 25432
 
-The replication addresses need only be mutually reachable private addresses.
-They must remain available independently of this database's current primary.
+The replication addresses must be mutually reachable host-underlay addresses.
+They and their interfaces must remain available independently of HeteroNetwork's
+overlay and of this database's current primary.
 The automatic coordinator replicates the private bundle only among enrolled
 database members. Manual recovery bundles must remain root-only.
 EOF
@@ -172,7 +176,7 @@ member_rows_for() {
   local -A seen_addresses=()
   for entry in "${entries[@]}"; do
     [[ "$entry" == "${entry//[[:space:]]/}" ]] || die "member entries must not contain whitespace"
-    [[ "$entry" == *=* ]] || die "member entry must use name=private-ip: $entry"
+    [[ "$entry" == *=* ]] || die "member entry must use name=underlay-ip: $entry"
     name="${entry%%=*}"
     address="${entry#*=}"
     validate_name "$name"
@@ -304,6 +308,8 @@ validate_common_config() {
   validate_port "$proxy_port"
   [[ "$postgres_major" =~ ^[0-9]{2}$ ]] || die "PostgreSQL major must be a two-digit version"
   [[ "$topology_revision" =~ ^[1-9][0-9]*$ ]] || die "topology revision must be positive"
+  [[ "$network_plane" == "$DEFAULT_NETWORK_PLANE" ]] \
+    || die "database network plane must be $DEFAULT_NETWORK_PLANE"
   member_rows >/dev/null
   dcs_member_rows >/dev/null
   dcs_bootstrap_member_rows >/dev/null
@@ -337,6 +343,9 @@ validate_node_config() {
   validate_common_config
   validate_name "$node_name"
   validate_ipv4 "$node_address"
+  [[ -n "$interface" ]] || die "HETERONETWORK_DB_INTERFACE is required"
+  [[ "$interface" != "heteronetwork0" ]] \
+    || die "database services must not bind to the HeteroNetwork overlay interface"
   if [[ -n "$client_listen_address" ]]; then
     validate_ipv4 "$client_listen_address"
     [[ "$client_listen_address" != "$node_address" ]] \
@@ -857,6 +866,7 @@ HETERONETWORK_DB_SERVICE_NAME=${service_name}
 HETERONETWORK_DB_POSTGRES_PORT=${postgres_port}
 HETERONETWORK_DB_REST_PORT=${rest_port}
 HETERONETWORK_DB_TOPOLOGY_REVISION=${topology_revision}
+HETERONETWORK_DB_NETWORK_PLANE=${network_plane}
 EOF
   chmod 0600 "$output/manifest.env"
 }
@@ -1395,6 +1405,7 @@ verify_cluster() {
 
 self_test() {
   local original_members="$members"
+  local original_interface="$interface"
   local original_dcs_members="$dcs_members"
   local original_dcs_bootstrap_members="$dcs_bootstrap_members"
   local original_dcs_initial_cluster_state="$dcs_initial_cluster_state"
@@ -1409,15 +1420,16 @@ self_test() {
   test_dir="$(mktemp -d /tmp/heteronetwork-postgres-ha-test.XXXXXX)"
   trap '[[ -z "${test_dir:-}" || "$test_dir" != /tmp/heteronetwork-postgres-ha-test.* ]] || rm -rf "$test_dir"' RETURN
 
-  members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4,db-e=10.250.0.5,db-f=10.250.0.6"
-  dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4,db-e=10.250.0.5"
-  dcs_bootstrap_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4"
+  members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5,db-f=100.64.10.6"
+  interface="tailscale0"
+  dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+  dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
   dcs_initial_cluster_state="existing"
   topology_revision="7"
   proxy_backends="$members"
   node_name="db-a"
-  node_address="10.250.0.1"
-  client_listen_address="100.64.0.1"
+  node_address="100.64.10.1"
+  client_listen_address="10.250.0.1"
   extra_hba_entries="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   bundle_dir="$test_dir/bundle"
   install -d -m 0700 "$bundle_dir/secrets"
@@ -1442,15 +1454,20 @@ self_test() {
   grep -Fq 'synchronous_node_count: 2' "$test_dir/patroni.yml"
   grep -Fq 'max_wal_senders: 36' "$test_dir/patroni.yml"
   grep -Fq 'max_replication_slots: 36' "$test_dir/patroni.yml"
-  grep -Fq 'listen: 10.250.0.1,100.64.0.1:55432' "$test_dir/patroni.yml"
+  grep -Fq 'listen: 100.64.10.1,10.250.0.1:55432' "$test_dir/patroni.yml"
   [[ "$(grep -c 'hostssl keycloak keycloak 10.250.0.[45]/32 scram-sha-256' \
     "$test_dir/patroni.yml")" == "4" ]]
-  grep -Fq '10.250.0.4:12380' "$test_dir/etcd.yml"
-  if grep -Fq '10.250.0.5:12380' "$test_dir/etcd.yml"; then
+  grep -Fq '100.64.10.4:12380' "$test_dir/etcd.yml"
+  if grep -Fq '100.64.10.5:12380' "$test_dir/etcd.yml"; then
     die "unregistered voter unexpectedly appeared in the DCS bootstrap configuration"
   fi
-  grep -Fq 'bind 100.64.0.1:18008' "$test_dir/haproxy.cfg"
+  grep -Fq 'bind 10.250.0.1:18008' "$test_dir/haproxy.cfg"
   [[ "$(grep -c '^    server db-' "$test_dir/haproxy.cfg")" == "6" ]]
+  grep -Fq 'server db-a 100.64.10.1:55432 check port 18008' \
+    "$test_dir/haproxy.cfg"
+  if grep -Eq '^    server db-.* 10\.250\.' "$test_dir/haproxy.cfg"; then
+    die "overlay VPN address unexpectedly appeared in a database proxy backend"
+  fi
   init_bundle "$test_dir/generated-bundle" >/dev/null 2>&1
   openssl x509 -in "$test_dir/generated-bundle/ca/ca.crt" -noout -text \
     | grep -F 'Certificate Sign, CRL Sign' >/dev/null
@@ -1462,7 +1479,9 @@ self_test() {
     "$test_dir/generated-bundle/nodes/db-f/node.crt" >/dev/null
   grep -Fq 'HETERONETWORK_DB_TOPOLOGY_REVISION=7' \
     "$test_dir/generated-bundle/manifest.env"
-  members="${members},db-g=10.250.0.7"
+  grep -Fq 'HETERONETWORK_DB_NETWORK_PLANE=underlay-v1' \
+    "$test_dir/generated-bundle/manifest.env"
+  members="${members},db-g=100.64.10.7"
   proxy_backends="$members"
   topology_revision="8"
   extend_bundle "$test_dir/generated-bundle" >/dev/null 2>&1
@@ -1471,41 +1490,48 @@ self_test() {
     "$test_dir/generated-bundle/nodes/db-g/node.crt" >/dev/null
   grep -Fq 'HETERONETWORK_DB_TOPOLOGY_REVISION=8' \
     "$test_dir/generated-bundle/manifest.env"
-  members="${members%,db-g=10.250.0.7}"
+  members="${members%,db-g=100.64.10.7}"
   proxy_backends="$members"
   topology_revision="7"
   if (
-    members="db-a=10.250.0.1,db-a=10.250.0.2,db-c=10.250.0.3"
+    interface="heteronetwork0"
+    validate_node_config >/dev/null 2>&1
+  ); then
+    die "overlay interface self-test unexpectedly succeeded"
+  fi
+  if (
+    members="db-a=100.64.10.1,db-a=100.64.10.2,db-c=100.64.10.3"
     member_rows >/dev/null 2>&1
   ); then
     die "duplicate member self-test unexpectedly succeeded"
   fi
   if (
-    dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-d=10.250.0.4"
+    dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
     validate_common_config >/dev/null 2>&1
   ); then
     die "even DCS member count self-test unexpectedly succeeded"
   fi
   if (
-    dcs_members="db-a=10.250.0.1,db-b=10.250.0.2,db-z=10.250.0.99"
+    dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-z=100.64.10.99"
     validate_common_config >/dev/null 2>&1
   ); then
     die "DCS member outside the database set self-test unexpectedly succeeded"
   fi
   if (
-    dcs_bootstrap_members="db-a=10.250.0.1,db-b=10.250.0.2,db-c=10.250.0.3,db-f=10.250.0.6"
+    dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-f=100.64.10.6"
     validate_common_config >/dev/null 2>&1
   ); then
     die "DCS bootstrap member outside the requested voter set unexpectedly succeeded"
   fi
   node_name="db-f"
-  node_address="10.250.0.6"
+  node_address="100.64.10.6"
   render_patroni_service >"$test_dir/non-voter.service"
   if grep -Fq 'heteronetwork-db-dcs.service' "$test_dir/non-voter.service"; then
     die "non-voter Patroni service unexpectedly depends on the local DCS service"
   fi
 
   members="$original_members"
+  interface="$original_interface"
   dcs_members="$original_dcs_members"
   dcs_bootstrap_members="$original_dcs_bootstrap_members"
   dcs_initial_cluster_state="$original_dcs_initial_cluster_state"

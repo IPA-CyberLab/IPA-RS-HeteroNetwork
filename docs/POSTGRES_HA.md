@@ -15,16 +15,18 @@ same command installs and starts:
 - `heteronetwork-postgres-autopilot.service`;
 - the PostgreSQL/Patroni/DCS renderer used by the autopilot.
 
-The autopilot waits until at least three enrolled Linux nodes can reach each
-other through HeteroNetwork. The lowest ready database member creates the first
-topology. Other nodes download the authenticated bootstrap bundle over the
-encrypted overlay and configure themselves without operator input.
+The autopilot waits until at least three enrolled Linux nodes advertise
+mutually reachable host-underlay addresses. The lowest ready database member
+creates the first topology. Other nodes download the authenticated bootstrap
+bundle over the encrypted HeteroNetwork overlay and configure themselves
+without operator input.
 
-Every ready non-client Linux node becomes a synchronous PostgreSQL replica, up
-to 32 members. Public Internet reachability is irrelevant to placement. The
-first three members form the initial etcd DCS quorum. When at least five
-database members exist, the autopilot expands the DCS to five voters one at a
-time:
+Every ready non-client Linux node with a reachable underlay address becomes a
+synchronous PostgreSQL replica, up to 32 members. Public Internet reachability
+is irrelevant; direct reachability over a host network such as a site LAN,
+routed management network, or Tailscale is required. The first three members
+form the initial etcd DCS quorum. When at least five database members exist, the
+autopilot expands the DCS to five voters one at a time:
 
 1. add one etcd learner;
 2. start it with the existing-cluster configuration;
@@ -36,6 +38,33 @@ five-voter DCS requires two synchronous PostgreSQL standbys, so an acknowledged
 write is present on the primary and two replicas. The steady-state topology can
 lose any two correctly distributed database/DCS members without losing
 acknowledged data or DCS quorum.
+
+## Network Plane Contract
+
+The Agent peer map is discovery input only. Each node selects the sole global
+IPv4 address on `HETERONETWORK_DB_UNDERLAY_INTERFACE` when explicitly
+configured, otherwise prefers `tailscale0`, then falls back to its
+highest-priority IPv4 `local_udp` host candidate. It advertises that choice
+through a bearer-authenticated discovery listener on its VPN address. Peers
+accept the descriptor only when its node identity and `underlay-v1` marker
+match, reject every registered VPN address, and require a fixed, non-secret
+health endpoint to be reachable directly over the advertised underlay. The
+local address must be assigned to exactly one host interface, and
+`heteronetwork0` is explicitly rejected.
+
+The resulting bundle records
+`HETERONETWORK_DB_NETWORK_PLANE=underlay-v1`. PostgreSQL replication, Patroni
+REST health, etcd client/peer traffic, and HAProxy backend checks use only the
+recorded underlay member addresses. The underlay reachability probe depends on
+`network-online.target`, not the HeteroNetwork Agent. Discovery and encrypted
+bundle replication remain on the overlay, so an overlay outage can prevent
+topology discovery or expansion, but it cannot take down an already configured
+database quorum or make a Control Plane lose its local HAProxy database path.
+
+Bundles without the `underlay-v1` marker, or bundles containing a currently
+registered VPN address as a database member, are rejected. The autopilot does
+not rewrite such a topology automatically: changing existing etcd peer URLs and
+member certificate IP SANs requires a controlled migration.
 
 The autopilot reconciles every 30 seconds. A later Linux enrollment therefore
 adds a PostgreSQL replica automatically and, while the DCS has fewer than five
@@ -52,10 +81,12 @@ are stored with mode `0600` below:
 /etc/heteronetwork/postgres-autopilot/bundle
 ```
 
-Each database member serves an authenticated copy only on its HeteroNetwork
-address. The bearer is derived by the Control Plane from the cluster ID and
-node-enrollment signing key, then written to a root-only systemd environment
-file. The signing key itself is never included in an enrollment response.
+Each database member serves an authenticated copy only on its encrypted
+HeteroNetwork VPN address. The bearer is derived by the Control Plane from the
+cluster ID and node-enrollment signing key, then written to a root-only systemd
+environment file. The signing key itself is never included in an enrollment
+response. The underlay listener serves only the fixed health response and never
+receives the bundle bearer.
 
 Every member keeps the complete private bundle so loss of the node that created
 the cluster does not prevent later enrollment or certificate issuance.
@@ -65,7 +96,7 @@ database-cluster credential compromise.
 Do not expose the following ports to the Internet:
 
 ```text
-17446  authenticated autopilot bundle replication
+17446  overlay discovery/bundle replication and underlay reachability probe
 55432  PostgreSQL
 18008  Patroni REST/TLS health
 12379  etcd client TLS
@@ -80,6 +111,7 @@ Database members run:
 ```text
 heteronetwork-postgres-autopilot.service
 heteronetwork-postgres-bundle.service
+heteronetwork-postgres-underlay-probe.service
 heteronetwork-db.service
 heteronetwork-db-proxy.service
 ```

@@ -8,6 +8,7 @@ readonly MIN_DATABASE_MEMBER_COUNT="3"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
 readonly TARGET_DCS_MEMBER_COUNT="5"
 readonly BUNDLE_PORT="17446"
+readonly DATABASE_NETWORK_PLANE="underlay-v1"
 
 state_dir="${HETERONETWORK_DB_AUTOPILOT_STATE_DIR:-$DEFAULT_STATE_DIR}"
 config_path="${HETERONETWORK_DB_AUTOPILOT_CONFIG:-$state_dir/autopilot.env}"
@@ -60,6 +61,12 @@ validate_config() {
     || ((10#$reconcile_interval_seconds < 5 || 10#$reconcile_interval_seconds > 3600)); then
     die "reconcile interval must be between 5 and 3600 seconds"
   fi
+  if [[ -n "${HETERONETWORK_DB_UNDERLAY_INTERFACE:-}" ]]; then
+    [[ "$HETERONETWORK_DB_UNDERLAY_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] \
+      || die "invalid database underlay interface"
+    [[ "$HETERONETWORK_DB_UNDERLAY_INTERFACE" != "heteronetwork0" ]] \
+      || die "database underlay interface must not be heteronetwork0"
+  fi
 }
 
 install_coordination_dependencies() {
@@ -68,7 +75,7 @@ install_coordination_dependencies() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get -o DPkg::Lock::Timeout=300 update
   apt-get -o DPkg::Lock::Timeout=300 install --yes --no-install-recommends \
-    ca-certificates curl iputils-ping jq openssl python3 socat tar util-linux
+    ca-certificates curl iproute2 jq openssl python3 socat tar util-linux
   touch "$state_dir/dependencies.ready"
 }
 
@@ -100,12 +107,118 @@ read_peer_map() {
   curl -fsS --connect-timeout 2 --max-time 10 "$agent_api_url/v1/peers"
 }
 
-local_vpn_ip() {
-  read_agent_status \
-    | jq -er '.vpn_ip | select(type == "string" and test("^[0-9]+(\\.[0-9]+){3}$"))'
+is_valid_ipv4() {
+  local value="$1"
+  local a b c d extra octet
+  IFS=. read -r a b c d extra <<<"$value"
+  [[ -z "${extra:-}" && -n "${a:-}" && -n "${b:-}" && -n "${c:-}" && -n "${d:-}" ]] \
+    || return 1
+  for octet in "$a" "$b" "$c" "$d"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    ((10#$octet <= 255)) || return 1
+  done
 }
 
-peer_autopilot_is_ready() {
+candidate_ipv4_addresses() {
+  jq -r '
+    [
+      .[]
+      | select(.kind == "local_udp")
+      | . as $candidate
+      | try (
+          .addr
+          | capture("^(?<address>[0-9]+(?:\\.[0-9]+){3}):[0-9]+$")
+          | {
+              address: .address,
+              priority: ($candidate.priority // 0),
+              cost: ($candidate.cost // 4294967295)
+            }
+        )
+    ]
+    | sort_by([-.priority, .cost, .address])
+    | .[].address
+  '
+}
+
+select_underlay_candidate() {
+  local candidates_json="$1"
+  local forbidden_addresses="$2"
+  local address
+  while IFS= read -r address; do
+    is_valid_ipv4 "$address" || continue
+    if grep -Fxq "$address" <<<"$forbidden_addresses"; then
+      continue
+    fi
+    printf '%s' "$address"
+    return 0
+  done < <(candidate_ipv4_addresses <<<"$candidates_json")
+  return 1
+}
+
+local_identity_row() {
+  local status vpn_ip node_id underlay_ip underlay_interface
+  status="$(read_agent_status)" || return 1
+  vpn_ip="$(jq -er \
+    '.vpn_ip | select(type == "string" and test("^[0-9]+(\\.[0-9]+){3}$"))' \
+    <<<"$status")" || return 1
+  node_id="$(jq -er '.node_id | select(type == "string" and length > 0)' \
+    <<<"$status")" || return 1
+  underlay_interface="${HETERONETWORK_DB_UNDERLAY_INTERFACE:-}"
+  if [[ -n "$underlay_interface" ]]; then
+    underlay_ip="$(address_for_interface "$underlay_interface")" || return 1
+  elif underlay_ip="$(address_for_interface tailscale0 2>/dev/null)"; then
+    :
+  else
+    underlay_ip="$(select_underlay_candidate \
+      "$(jq -c '.candidates // []' <<<"$status")" "$vpn_ip")" || return 1
+  fi
+  [[ "$underlay_ip" != "$vpn_ip" ]] || return 1
+  underlay_interface="$(interface_for_address "$underlay_ip")" || return 1
+  [[ "$underlay_interface" != "heteronetwork0" ]] || return 1
+  printf '%s\t%s\t%s\n' "$vpn_ip" "$node_id" "$underlay_ip"
+}
+
+address_for_interface() {
+  local interface="$1"
+  ip -o -4 address show dev "$interface" scope global \
+    | awk '
+        {
+          split($4, parts, "/")
+          if (parts[1] != "") {
+            count += 1
+            address = parts[1]
+          }
+        }
+        END {
+          if (count != 1) {
+            exit 1
+          }
+          print address
+        }
+      '
+}
+
+interface_for_address() {
+  local address="$1"
+  ip -o -4 address show scope global \
+    | awk -v address="$address" '
+        {
+          split($4, parts, "/")
+          if (parts[1] == address) {
+            count += 1
+            interface = $2
+          }
+        }
+        END {
+          if (count != 1) {
+            exit 1
+          }
+          print interface
+        }
+      '
+}
+
+activate_overlay_discovery() {
   curl -fsS --connect-timeout 2 --max-time 5 \
     --header "Content-Type: application/json" \
     --data "$(
@@ -114,29 +227,100 @@ peer_autopilot_is_ready() {
         pin: false,
         protocol: "tcp",
         destination_port: $port,
-        detector: "postgres-autopilot",
+        detector: "postgres-autopilot-discovery",
         application: "http",
         tcp_state: "syn_sent"
       }'
     )" \
     "$agent_api_url/v1/packet-flow" >/dev/null 2>&1 || true
-  curl --config "$curl_config_path" \
+}
+
+underlay_from_member_descriptor() {
+  local descriptor="$1"
+  local expected_node_id="$2"
+  jq -er \
+    --arg node_id "$expected_node_id" \
+    --arg network_plane "$DATABASE_NETWORK_PLANE" '
+      select(.node_id == $node_id)
+      | select(.network_plane == $network_plane)
+      | .underlay_ip
+      | select(type == "string")
+    ' <<<"$descriptor"
+}
+
+peer_underlay_address() {
+  local vpn_ip="$1"
+  local expected_node_id="$2"
+  local forbidden_addresses="$3"
+  local descriptor underlay_ip
+  activate_overlay_discovery "$vpn_ip"
+  descriptor="$(curl --config "$curl_config_path" \
+    "http://${vpn_ip}:${BUNDLE_PORT}/v1/postgres-ha/member" 2>/dev/null)" \
+    || return 1
+  underlay_ip="$(underlay_from_member_descriptor \
+    "$descriptor" "$expected_node_id")" || return 1
+  is_valid_ipv4 "$underlay_ip" || return 1
+  grep -Fxq "$underlay_ip" <<<"$forbidden_addresses" && return 1
+  peer_autopilot_is_ready "$underlay_ip" || return 1
+  printf '%s' "$underlay_ip"
+}
+
+peer_autopilot_is_ready() {
+  curl -fsS --connect-timeout 2 --max-time 5 \
     "http://$1:${BUNDLE_PORT}/health" >/dev/null 2>&1
 }
 
+validate_eligible_snapshot() {
+  local path="$1"
+  local vpn_ip node_id underlay_ip extra all_vpn_ips
+  local -A seen_vpn_ips=()
+  local -A seen_node_ids=()
+  local -A seen_underlay_ips=()
+  all_vpn_ips="$(cut -f1 "$path")"
+  while IFS=$'\t' read -r vpn_ip node_id underlay_ip extra; do
+    [[ -n "$vpn_ip" && -n "$node_id" && -n "$underlay_ip" && -z "${extra:-}" ]] \
+      || return 1
+    is_valid_ipv4 "$vpn_ip" || return 1
+    is_valid_ipv4 "$underlay_ip" || return 1
+    [[ "$vpn_ip" != "$underlay_ip" ]] || return 1
+    grep -Fxq "$underlay_ip" <<<"$all_vpn_ips" && return 1
+    [[ -z "${seen_vpn_ips[$vpn_ip]:-}" ]] || return 1
+    [[ -z "${seen_node_ids[$node_id]:-}" ]] || return 1
+    [[ -z "${seen_underlay_ips[$underlay_ip]:-}" ]] || return 1
+    seen_vpn_ips["$vpn_ip"]=1
+    seen_node_ids["$node_id"]=1
+    seen_underlay_ips["$underlay_ip"]=1
+  done <"$path"
+}
+
 write_eligible_snapshot() {
-  local status peers local_ip local_node_id candidates temporary ip node_id
-  status="$(read_agent_status)" || return 1
+  local local_vpn_ip="$1"
+  local local_node_id="$2"
+  local local_underlay_ip="$3"
+  local peers candidates temporary forbidden_addresses
+  local vpn_ip node_id underlay_ip
   peers="$(read_peer_map)" || return 1
-  local_ip="$(jq -er \
-    '.vpn_ip | select(type == "string" and test("^[0-9]+(\\.[0-9]+){3}$"))' \
-    <<<"$status")" || return 1
-  local_node_id="$(jq -er '.node_id | select(type == "string" and length > 0)' \
-    <<<"$status")" || return 1
+  forbidden_addresses="$(
+    {
+      printf '%s\n' "$local_vpn_ip"
+      jq -r '
+        .peers[]
+        | select(.vpn_ip | type == "string")
+        | .vpn_ip
+      ' <<<"$peers"
+    } | LC_ALL=C sort -u
+  )" || return 1
   candidates="$(mktemp "$state_dir/eligible-candidates.XXXXXX")"
   temporary="$(mktemp "$state_dir/eligible.XXXXXX")"
-  if ! {
-    printf '%s\t%s\n' "$local_ip" "$local_node_id"
+  printf '%s\t%s\t%s\n' \
+    "$local_vpn_ip" "$local_node_id" "$local_underlay_ip" >"$candidates"
+  while IFS=$'\t' read -r vpn_ip node_id; do
+    is_valid_ipv4 "$vpn_ip" || continue
+    underlay_ip="$(peer_underlay_address \
+      "$vpn_ip" "$node_id" "$forbidden_addresses")" \
+      || continue
+    printf '%s\t%s\t%s\n' "$vpn_ip" "$node_id" "$underlay_ip" >>"$candidates"
+  done < <(
     jq -r '
       .peers[]
       | select(.role != "client")
@@ -144,16 +328,12 @@ write_eligible_snapshot() {
       | [.vpn_ip, .node_id]
       | @tsv
     ' <<<"$peers"
-  } | LC_ALL=C sort -V -u >"$candidates"; then
+  )
+  if ! LC_ALL=C sort -V -u "$candidates" >"$temporary" \
+    || ! validate_eligible_snapshot "$temporary"; then
     rm -f "$candidates" "$temporary"
     return 1
   fi
-
-  while IFS=$'\t' read -r ip node_id; do
-    if [[ "$ip" == "$local_ip" ]] || peer_autopilot_is_ready "$ip"; then
-      printf '%s\t%s\n' "$ip" "$node_id" >>"$temporary"
-    fi
-  done <"$candidates"
   if ! install -o root -g root -m 0600 "$temporary" "$eligible_path"; then
     rm -f "$candidates" "$temporary"
     return 1
@@ -172,8 +352,8 @@ eligible_count() {
   printf '%s\n' "$count"
 }
 
-initial_coordinator_ip() {
-  sed -n '1s/\t.*//p' "$eligible_path"
+initial_coordinator_underlay_ip() {
+  awk -F '\t' 'NR == 1 { print $3 }' "$eligible_path"
 }
 
 manifest_value() {
@@ -204,7 +384,9 @@ load_bundle_manifest() {
   manifest_postgres_port="$(manifest_value "$directory" HETERONETWORK_DB_POSTGRES_PORT)"
   manifest_rest_port="$(manifest_value "$directory" HETERONETWORK_DB_REST_PORT)"
   manifest_revision="$(manifest_value "$directory" HETERONETWORK_DB_TOPOLOGY_REVISION)"
+  manifest_network_plane="$(manifest_value "$directory" HETERONETWORK_DB_NETWORK_PLANE)"
   [[ "$manifest_revision" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$manifest_network_plane" == "$DATABASE_NETWORK_PLANE" ]] || return 1
   [[ -f "$directory/cluster-id" && ! -L "$directory/cluster-id" ]] || return 1
   [[ "$(<"$directory/cluster-id")" == "$HETERONETWORK_DB_CLUSTER_ID" ]] || return 1
 }
@@ -215,7 +397,7 @@ run_helper_for_bundle() {
   load_bundle_manifest "$directory" || die "invalid database bundle manifest"
   env \
     "HETERONETWORK_DB_CLUSTER_NAME=$manifest_cluster_name" \
-    "HETERONETWORK_DB_INTERFACE=${HETERONETWORK_DB_INTERFACE:-heteronetwork0}" \
+    "HETERONETWORK_DB_INTERFACE=${HETERONETWORK_DB_INTERFACE:-}" \
     "HETERONETWORK_DB_NODE_NAME=${HETERONETWORK_DB_NODE_NAME:-db-a}" \
     "HETERONETWORK_DB_NODE_ADDRESS=${HETERONETWORK_DB_NODE_ADDRESS:-10.255.255.254}" \
     "HETERONETWORK_DB_MEMBERS=$manifest_members" \
@@ -227,6 +409,7 @@ run_helper_for_bundle() {
     "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
     "HETERONETWORK_DB_REST_PORT=$manifest_rest_port" \
     "HETERONETWORK_DB_TOPOLOGY_REVISION=$manifest_revision" \
+    "HETERONETWORK_DB_NETWORK_PLANE=$manifest_network_plane" \
     "$helper" "$@"
 }
 
@@ -292,7 +475,7 @@ install_bundle_directory() {
   rm -rf "$previous"
 }
 
-write_bundle_handler() {
+write_bundle_handlers() {
   cat >"$state_dir/serve-bundle.sh" <<'EOF'
 #!/bin/sh
 set -eu
@@ -318,6 +501,18 @@ case "$request" in
     printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
       "${#body}" "$body"
     ;;
+  "GET /v1/postgres-ha/member HTTP/1.1")
+    if [ ! -s "$MEMBER_DESCRIPTOR" ]; then
+      body=waiting
+      printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+        "${#body}" "$body"
+      exit 0
+    fi
+    length=$(wc -c <"$MEMBER_DESCRIPTOR" | tr -d ' ')
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %s\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n' \
+      "$length"
+    cat "$MEMBER_DESCRIPTOR"
+    ;;
   "GET /v1/postgres-ha/bundle HTTP/1.1")
     if [ ! -s "$BUNDLE_ARCHIVE" ]; then
       body=waiting
@@ -338,25 +533,46 @@ case "$request" in
 esac
 EOF
   chmod 0700 "$state_dir/serve-bundle.sh"
+
+  cat >"$state_dir/serve-underlay-health.sh" <<'EOF'
+#!/bin/sh
+set -eu
+request=
+IFS= read -r request || true
+request=$(printf '%s' "$request" | tr -d '\r')
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | tr -d '\r')
+  [ -n "$line" ] || break
+done
+case "$request" in
+  "GET /health HTTP/1.1")
+    body=ready
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+      "${#body}" "$body"
+    ;;
+  *)
+    body='not found'
+    printf 'HTTP/1.1 404 Not Found\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+      "${#body}" "$body"
+    ;;
+esac
+EOF
+  chmod 0700 "$state_dir/serve-underlay-health.sh"
 }
 
-start_bundle_server() {
-  local local_ip="$1"
-  cat >"$state_dir/bundle-server.env" <<EOF
-BUNDLE_BEARER_TOKEN=${HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN}
-BUNDLE_ARCHIVE=${bundle_archive}
-EOF
-  chmod 0600 "$state_dir/bundle-server.env"
-  write_bundle_handler
-  cat >/etc/systemd/system/heteronetwork-postgres-bundle.service <<EOF
+render_bundle_listener_unit() {
+  local description="$1"
+  local listen_address="$2"
+  local handler="$3"
+  local dependencies="$4"
+  cat <<EOF
 [Unit]
-Description=HeteroNetwork replicated PostgreSQL HA bundle endpoint
-After=heteronetwork-agent.service
-Requires=heteronetwork-agent.service
+Description=${description}
+${dependencies}
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat TCP4-LISTEN:${BUNDLE_PORT},bind=${local_ip},reuseaddr,fork EXEC:${state_dir}/serve-bundle.sh,nofork
+ExecStart=/usr/bin/socat TCP4-LISTEN:${BUNDLE_PORT},bind=${listen_address},reuseaddr,fork EXEC:${handler},nofork
 Restart=always
 RestartSec=2s
 NoNewPrivileges=true
@@ -369,8 +585,68 @@ RestrictAddressFamilies=AF_INET AF_UNIX
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now heteronetwork-postgres-bundle.service >/dev/null
+}
+
+install_bundle_listener_unit() {
+  local service_name="$1"
+  local description="$2"
+  local listen_address="$3"
+  local handler="$4"
+  local dependencies="$5"
+  local unit_name="${service_name}.service"
+  local unit_path="/etc/systemd/system/${unit_name}"
+  local unit_temporary unit_changed=0
+  unit_temporary="$(mktemp "$state_dir/${unit_name}.XXXXXX")"
+  render_bundle_listener_unit \
+    "$description" "$listen_address" "$handler" "$dependencies" \
+    >"$unit_temporary"
+  if [[ ! -f "$unit_path" ]] || ! cmp -s "$unit_temporary" "$unit_path"; then
+    install -o root -g root -m 0644 "$unit_temporary" "$unit_path"
+    unit_changed=1
+  fi
+  rm -f "$unit_temporary"
+  ((unit_changed == 0)) || systemctl daemon-reload
+  systemctl enable "$unit_name" >/dev/null
+  if ! systemctl is-active --quiet "$unit_name"; then
+    systemctl start "$unit_name"
+  elif ((unit_changed == 1)); then
+    systemctl restart "$unit_name"
+  fi
+}
+
+start_bundle_servers() {
+  local vpn_ip="$1"
+  local node_id="$2"
+  local underlay_ip="$3"
+  local descriptor_temporary
+  descriptor_temporary="$(mktemp "$state_dir/member.json.XXXXXX")"
+  jq -cn \
+    --arg node_id "$node_id" \
+    --arg underlay_ip "$underlay_ip" \
+    --arg network_plane "$DATABASE_NETWORK_PLANE" \
+    '{node_id: $node_id, underlay_ip: $underlay_ip, network_plane: $network_plane}' \
+    >"$descriptor_temporary"
+  chmod 0600 "$descriptor_temporary"
+  mv "$descriptor_temporary" "$state_dir/member.json"
+  cat >"$state_dir/bundle-server.env" <<EOF
+BUNDLE_BEARER_TOKEN=${HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN}
+BUNDLE_ARCHIVE=${bundle_archive}
+MEMBER_DESCRIPTOR=${state_dir}/member.json
+EOF
+  chmod 0600 "$state_dir/bundle-server.env"
+  write_bundle_handlers
+  install_bundle_listener_unit \
+    heteronetwork-postgres-bundle \
+    "HeteroNetwork PostgreSQL HA overlay discovery and bundle endpoint" \
+    "$vpn_ip" \
+    "$state_dir/serve-bundle.sh" \
+    $'Requires=heteronetwork-agent.service\nAfter=heteronetwork-agent.service'
+  install_bundle_listener_unit \
+    heteronetwork-postgres-underlay-probe \
+    "HeteroNetwork PostgreSQL HA underlay reachability endpoint" \
+    "$underlay_ip" \
+    "$state_dir/serve-underlay-health.sh" \
+    $'Wants=network-online.target\nAfter=network-online.target'
 }
 
 publish_bundle_archive() {
@@ -389,18 +665,19 @@ download_best_bundle() {
   fi
   local best_revision="$current_revision"
   local best_directory=""
-  local ip _node_id archive extracted candidate_revision
-  while IFS=$'\t' read -r ip _node_id; do
+  local vpn_ip _node_id _underlay_ip archive extracted candidate_revision
+  while IFS=$'\t' read -r vpn_ip _node_id _underlay_ip; do
     archive="$(mktemp "$state_dir/download.XXXXXX")"
     if ! curl --config "$curl_config_path" \
-      "http://${ip}:${BUNDLE_PORT}/v1/postgres-ha/bundle" \
+      "http://${vpn_ip}:${BUNDLE_PORT}/v1/postgres-ha/bundle" \
       --output "$archive" 2>/dev/null; then
       rm -f "$archive"
       continue
     fi
     extracted="$state_dir/downloaded.$RANDOM.$RANDOM"
     if ! safe_extract_bundle "$archive" "$extracted" >/dev/null 2>&1 \
-      || ! validate_bundle_directory "$extracted"; then
+      || ! validate_bundle_directory "$extracted" \
+      || bundle_uses_snapshot_vpn_address "$extracted"; then
       rm -f "$archive"
       rm -rf "$extracted"
       continue
@@ -440,12 +717,12 @@ PY
 }
 
 initial_members_from_snapshot() {
-  local output="" index=0 ip _node_id name
-  while IFS=$'\t' read -r ip _node_id; do
+  local output="" index=0 _vpn_ip _node_id underlay_ip name
+  while IFS=$'\t' read -r _vpn_ip _node_id underlay_ip; do
     ((index < MAX_DATABASE_MEMBER_COUNT)) || break
     name="$(member_name_for_index "$index")"
     [[ -z "$output" ]] || output+=","
-    output+="${name}=${ip}"
+    output+="${name}=${underlay_ip}"
     index=$((index + 1))
   done <"$eligible_path"
   printf '%s' "$output"
@@ -476,7 +753,10 @@ limit = int(sys.argv[3])
 addresses = {entry.split("=", 1)[1] for entry in current}
 with open(snapshot, encoding="utf-8") as source:
     for line in source:
-        address = line.split("\t", 1)[0]
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 3:
+            raise SystemExit("invalid eligible database member row")
+        address = fields[2]
         if address in addresses or len(current) >= limit:
             continue
         index = len(current)
@@ -516,23 +796,42 @@ member_name_for_ip() {
     | awk -F= -v address="$address" '$2 == address { print $1; found = 1 } END { if (!found) exit 1 }'
 }
 
+bundle_uses_snapshot_vpn_address() {
+  local directory="$1"
+  load_bundle_manifest "$directory" || return 0
+  local vpn_ip _node_id _underlay_ip
+  while IFS=$'\t' read -r vpn_ip _node_id _underlay_ip; do
+    if member_name_for_ip "$manifest_members" "$vpn_ip" >/dev/null 2>&1; then
+      return 0
+    fi
+  done <"$eligible_path"
+  return 1
+}
+
 configure_helper_environment() {
   local directory="$1"
-  local local_ip="$2"
+  local local_underlay_ip="$2"
   load_bundle_manifest "$directory" || die "database bundle manifest is unavailable"
-  HETERONETWORK_DB_NODE_NAME="$(member_name_for_ip "$manifest_members" "$local_ip")"
-  HETERONETWORK_DB_NODE_ADDRESS="$local_ip"
-  export HETERONETWORK_DB_NODE_NAME HETERONETWORK_DB_NODE_ADDRESS
+  HETERONETWORK_DB_NODE_NAME="$(
+    member_name_for_ip "$manifest_members" "$local_underlay_ip"
+  )"
+  HETERONETWORK_DB_NODE_ADDRESS="$local_underlay_ip"
+  HETERONETWORK_DB_INTERFACE="$(interface_for_address "$local_underlay_ip")" \
+    || die "database underlay address $local_underlay_ip is not assigned to exactly one interface"
+  [[ "$HETERONETWORK_DB_INTERFACE" != "heteronetwork0" ]] \
+    || die "database services must not bind to the HeteroNetwork overlay interface"
+  export HETERONETWORK_DB_INTERFACE HETERONETWORK_DB_NODE_NAME HETERONETWORK_DB_NODE_ADDRESS
 }
 
 apply_local_bundle() {
-  local local_ip="$1"
+  local local_underlay_ip="$1"
   load_bundle_manifest "$bundle_dir" || return
   local local_name
-  if ! local_name="$(member_name_for_ip "$manifest_members" "$local_ip")"; then
+  if ! local_name="$(member_name_for_ip "$manifest_members" "$local_underlay_ip")"; then
     log "node is outside the ${MAX_DATABASE_MEMBER_COUNT}-member database replica limit"
     return
   fi
+  configure_helper_environment "$bundle_dir" "$local_underlay_ip"
   local applied_revision=0
   [[ -f "$applied_revision_path" ]] && applied_revision="$(<"$applied_revision_path")"
   if [[ "$applied_revision" == "$manifest_revision" ]] \
@@ -544,9 +843,9 @@ apply_local_bundle() {
   log "applying database topology revision $manifest_revision as $local_name"
   env \
     "HETERONETWORK_DB_CLUSTER_NAME=$manifest_cluster_name" \
-    "HETERONETWORK_DB_INTERFACE=${HETERONETWORK_DB_INTERFACE:-heteronetwork0}" \
+    "HETERONETWORK_DB_INTERFACE=$HETERONETWORK_DB_INTERFACE" \
     "HETERONETWORK_DB_NODE_NAME=$local_name" \
-    "HETERONETWORK_DB_NODE_ADDRESS=$local_ip" \
+    "HETERONETWORK_DB_NODE_ADDRESS=$local_underlay_ip" \
     "HETERONETWORK_DB_MEMBERS=$manifest_members" \
     "HETERONETWORK_DB_DCS_MEMBERS=$manifest_dcs_members" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=$initial_state" \
@@ -556,6 +855,7 @@ apply_local_bundle() {
     "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
     "HETERONETWORK_DB_REST_PORT=$manifest_rest_port" \
     "HETERONETWORK_DB_TOPOLOGY_REVISION=$manifest_revision" \
+    "HETERONETWORK_DB_NETWORK_PLANE=$manifest_network_plane" \
     "$helper" reconfigure-node
   printf '%s\n' "$manifest_revision" >"$applied_revision_path"
   chmod 0600 "$applied_revision_path"
@@ -577,6 +877,7 @@ bootstrap_bundle() {
     "HETERONETWORK_DB_DCS_MEMBERS=$dcs" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=new" \
     "HETERONETWORK_DB_TOPOLOGY_REVISION=1" \
+    "HETERONETWORK_DB_NETWORK_PLANE=$DATABASE_NETWORK_PLANE" \
     "$helper" init-bundle "$temporary"
   printf '%s\n' "$HETERONETWORK_DB_CLUSTER_ID" >"$temporary/cluster-id"
   chmod 0600 "$temporary/cluster-id"
@@ -585,11 +886,11 @@ bootstrap_bundle() {
   log "created automatic database topology with $count replicas and $dcs_count DCS voters"
 }
 
-coordinator_ip_for_bundle() {
-  local ip _node_id
-  while IFS=$'\t' read -r ip _node_id; do
-    if member_name_for_ip "$manifest_members" "$ip" >/dev/null 2>&1; then
-      printf '%s' "$ip"
+coordinator_underlay_ip_for_bundle() {
+  local _vpn_ip _node_id underlay_ip
+  while IFS=$'\t' read -r _vpn_ip _node_id underlay_ip; do
+    if member_name_for_ip "$manifest_members" "$underlay_ip" >/dev/null 2>&1; then
+      printf '%s' "$underlay_ip"
       return
     fi
   done <"$eligible_path"
@@ -600,16 +901,16 @@ stage_topology() {
   local new_members="$1"
   local new_dcs="$2"
   local new_revision="$3"
+  local local_underlay_ip="$4"
   local stage="$state_dir/stage.$RANDOM.$RANDOM"
   cp -a "$bundle_dir" "$stage"
-  local local_ip
-  local_ip="$(local_vpn_ip)"
   local local_name
-  local_name="$(member_name_for_ip "$manifest_members" "$local_ip")"
+  local_name="$(member_name_for_ip "$manifest_members" "$local_underlay_ip")"
   env \
     "HETERONETWORK_DB_CLUSTER_NAME=$manifest_cluster_name" \
+    "HETERONETWORK_DB_INTERFACE=$HETERONETWORK_DB_INTERFACE" \
     "HETERONETWORK_DB_NODE_NAME=$local_name" \
-    "HETERONETWORK_DB_NODE_ADDRESS=$local_ip" \
+    "HETERONETWORK_DB_NODE_ADDRESS=$local_underlay_ip" \
     "HETERONETWORK_DB_MEMBERS=$new_members" \
     "HETERONETWORK_DB_DCS_MEMBERS=$new_dcs" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=existing" \
@@ -619,6 +920,7 @@ stage_topology() {
     "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
     "HETERONETWORK_DB_REST_PORT=$manifest_rest_port" \
     "HETERONETWORK_DB_TOPOLOGY_REVISION=$new_revision" \
+    "HETERONETWORK_DB_NETWORK_PLANE=$manifest_network_plane" \
     "$helper" extend-bundle "$stage" >/dev/null
   printf '%s\n' "$HETERONETWORK_DB_CLUSTER_ID" >"$stage/cluster-id"
   chmod 0600 "$stage/cluster-id"
@@ -626,8 +928,8 @@ stage_topology() {
 }
 
 reconcile_as_coordinator() {
-  local local_ip="$1"
-  configure_helper_environment "$bundle_dir" "$local_ip"
+  local local_underlay_ip="$1"
+  configure_helper_environment "$bundle_dir" "$local_underlay_ip"
   local dcs_result=""
   if systemctl is-active --quiet heteronetwork-db.service; then
     dcs_result="$(run_helper_for_bundle "$bundle_dir" reconcile-dcs 2>&1)" || {
@@ -661,28 +963,42 @@ reconcile_as_coordinator() {
 
   local next_revision stage
   next_revision="$((10#$manifest_revision + 1))"
-  stage="$(stage_topology "$new_members" "$new_dcs" "$next_revision")"
+  stage="$(stage_topology \
+    "$new_members" "$new_dcs" "$next_revision" "$local_underlay_ip")"
   if ((dcs_changed == 1)); then
-    configure_helper_environment "$stage" "$local_ip"
+    configure_helper_environment "$stage" "$local_underlay_ip"
     run_helper_for_bundle "$stage" reconcile-dcs
   fi
   install_bundle_directory "$stage"
   publish_bundle_archive
   log "published database topology revision $next_revision"
-  apply_local_bundle "$local_ip"
+  apply_local_bundle "$local_underlay_ip"
   run_helper_for_bundle "$bundle_dir" reconcile-patroni >/dev/null 2>&1 || true
 }
 
 reconcile_once() {
-  local local_ip
-  local_ip="$(local_vpn_ip)"
+  local identity local_vpn_ip local_node_id local_underlay_ip
+  identity="$(local_identity_row)" || {
+    log "waiting for a non-overlay local UDP underlay candidate"
+    return
+  }
+  IFS=$'\t' read -r local_vpn_ip local_node_id local_underlay_ip <<<"$identity"
   if unmanaged_legacy_database_exists; then
     log "existing database is not managed by autopilot; refusing a new bootstrap"
     return
   fi
-  start_bundle_server "$local_ip"
-  if ! write_eligible_snapshot; then
-    log "waiting for the local peer map"
+  start_bundle_servers "$local_vpn_ip" "$local_node_id" "$local_underlay_ip"
+  if ! write_eligible_snapshot \
+    "$local_vpn_ip" "$local_node_id" "$local_underlay_ip"; then
+    log "waiting for a valid underlay database peer map"
+    return
+  fi
+  if [[ -d "$bundle_dir" ]] && ! load_bundle_manifest "$bundle_dir"; then
+    log "existing database bundle lacks the ${DATABASE_NETWORK_PLANE} contract; refusing automatic migration"
+    return
+  fi
+  if [[ -d "$bundle_dir" ]] && bundle_uses_snapshot_vpn_address "$bundle_dir"; then
+    log "database bundle contains an overlay VPN address; refusing to apply it"
     return
   fi
   download_best_bundle
@@ -694,7 +1010,7 @@ reconcile_once() {
       log "waiting for $MIN_DATABASE_MEMBER_COUNT ready Linux nodes ($count ready)"
       return
     fi
-    if [[ "$local_ip" != "$(initial_coordinator_ip)" ]]; then
+    if [[ "$local_underlay_ip" != "$(initial_coordinator_underlay_ip)" ]]; then
       log "waiting for the initial database coordinator"
       return
     fi
@@ -702,15 +1018,15 @@ reconcile_once() {
   fi
 
   publish_bundle_archive
-  apply_local_bundle "$local_ip"
+  apply_local_bundle "$local_underlay_ip"
   load_bundle_manifest "$bundle_dir"
-  local coordinator_ip
-  coordinator_ip="$(coordinator_ip_for_bundle)" || {
+  local coordinator_underlay_ip
+  coordinator_underlay_ip="$(coordinator_underlay_ip_for_bundle)" || {
     log "no reachable database coordinator is available"
     return
   }
-  if [[ "$local_ip" == "$coordinator_ip" ]]; then
-    reconcile_as_coordinator "$local_ip"
+  if [[ "$local_underlay_ip" == "$coordinator_underlay_ip" ]]; then
+    reconcile_as_coordinator "$local_underlay_ip"
   fi
 }
 
@@ -725,7 +1041,7 @@ run_autopilot() {
   [[ -x "$helper" ]] || die "PostgreSQL HA helper is missing"
   install -d -o root -g root -m 0700 "$state_dir"
   install_coordination_dependencies
-  for command in curl flock jq openssl ping python3 socat systemctl tar; do
+  for command in base64 cmp curl flock ip jq openssl python3 socat systemctl tar; do
     require_command "$command"
   done
   write_curl_config
@@ -759,6 +1075,12 @@ self_test() {
   HETERONETWORK_DB_LOCAL_ROLE="worker"
   reconcile_interval_seconds=30
   validate_config
+  if (
+    HETERONETWORK_DB_UNDERLAY_INTERFACE="heteronetwork0"
+    validate_config >/dev/null 2>&1
+  ); then
+    die "overlay underlay-interface self-test unexpectedly succeeded"
+  fi
   touch "$legacy_database_service_path"
   unmanaged_legacy_database_exists
   rm -f "$legacy_database_service_path"
@@ -767,14 +1089,87 @@ self_test() {
   fi
   eligible_path="$temporary/eligible.tsv"
   [[ "$(eligible_count)" == "0" ]]
-  printf '10.250.0.10\tnode-c\n10.250.0.2\tnode-a\n10.250.0.3\tnode-b\n' \
+  local selected_candidate candidate_fixture
+  candidate_fixture='[
+    {"kind":"local_udp","addr":"10.250.0.2:51820","priority":100,"cost":1},
+    {"kind":"public_udp","addr":"203.0.113.20:51820","priority":90,"cost":10},
+    {"kind":"local_udp","addr":"100.123.154.79:51820","priority":80,"cost":20}
+  ]'
+  selected_candidate="$(select_underlay_candidate \
+    "$candidate_fixture" $'10.250.0.2\n10.250.0.3')"
+  [[ "$selected_candidate" == "100.123.154.79" ]]
+  if select_underlay_candidate \
+    '[{"kind":"local_udp","addr":"10.250.0.2:51820"}]' \
+    "10.250.0.2" >/dev/null; then
+    die "overlay-only database candidate was accepted"
+  fi
+  local descriptor
+  descriptor='{
+    "node_id":"node-a",
+    "underlay_ip":"100.123.154.79",
+    "network_plane":"underlay-v1"
+  }'
+  [[ "$(underlay_from_member_descriptor "$descriptor" node-a)" == "100.123.154.79" ]]
+  if underlay_from_member_descriptor "$descriptor" node-b >/dev/null 2>&1; then
+    die "member descriptor with the wrong node identity was accepted"
+  fi
+  if underlay_from_member_descriptor \
+    '{"node_id":"node-a","underlay_ip":"100.123.154.79","network_plane":"overlay"}' \
+    node-a >/dev/null 2>&1; then
+    die "member descriptor with the wrong network plane was accepted"
+  fi
+  write_bundle_handlers
+  sh -n "$state_dir/serve-bundle.sh"
+  sh -n "$state_dir/serve-underlay-health.sh"
+  grep -Fq 'GET /v1/postgres-ha/member HTTP/1.1' "$state_dir/serve-bundle.sh"
+  grep -Fq 'GET /v1/postgres-ha/bundle HTTP/1.1' "$state_dir/serve-bundle.sh"
+  if grep -Fq 'GET /v1/postgres-ha/bundle HTTP/1.1' \
+    "$state_dir/serve-underlay-health.sh"; then
+    die "underlay health handler unexpectedly serves the private database bundle"
+  fi
+  if grep -Fq 'BUNDLE_BEARER_TOKEN' "$state_dir/serve-underlay-health.sh"; then
+    die "underlay health handler unexpectedly exposes the bundle bearer"
+  fi
+  render_bundle_listener_unit \
+    "underlay probe" \
+    "100.123.154.79" \
+    "$state_dir/serve-underlay-health.sh" \
+    $'Wants=network-online.target\nAfter=network-online.target' \
+    >"$temporary/underlay.service"
+  grep -Fq 'bind=100.123.154.79' "$temporary/underlay.service"
+  if grep -Fq 'heteronetwork-agent.service' "$temporary/underlay.service"; then
+    die "underlay probe unexpectedly depends on the Agent"
+  fi
+  render_bundle_listener_unit \
+    "overlay bundle" \
+    "10.250.0.2" \
+    "$state_dir/serve-bundle.sh" \
+    $'Requires=heteronetwork-agent.service\nAfter=heteronetwork-agent.service' \
+    >"$temporary/bundle.service"
+  grep -Fq 'bind=10.250.0.2' "$temporary/bundle.service"
+  grep -Fq 'Requires=heteronetwork-agent.service' "$temporary/bundle.service"
+
+  printf '%s\n' \
+    $'10.250.0.10\tnode-c\t163.220.236.52' \
+    $'10.250.0.2\tnode-a\t100.123.154.79' \
+    $'10.250.0.3\tnode-b\t100.89.33.61' \
     | LC_ALL=C sort -V >"$eligible_path"
-  [[ "$(initial_coordinator_ip)" == "10.250.0.2" ]]
+  validate_eligible_snapshot "$eligible_path"
+  printf '%s\n' \
+    $'10.250.0.2\tnode-a\t100.123.154.79' \
+    $'10.250.0.3\tnode-b\t100.123.154.79' \
+    >"$temporary/duplicate-underlay.tsv"
+  if validate_eligible_snapshot "$temporary/duplicate-underlay.tsv"; then
+    die "duplicate database underlay address was accepted"
+  fi
+  [[ "$(initial_coordinator_underlay_ip)" == "100.123.154.79" ]]
   local generated
   generated="$(initial_members_from_snapshot)"
-  [[ "$generated" == "db-a=10.250.0.2,db-b=10.250.0.3,db-c=10.250.0.10" ]]
+  [[ "$generated" == \
+    "db-a=100.123.154.79,db-b=100.89.33.61,db-c=163.220.236.52" ]]
+  [[ "$generated" != *"10.250."* ]]
   generated="$(expand_members_from_snapshot \
-    "db-a=10.250.0.2,db-b=10.250.0.3,db-c=10.250.0.10")"
+    "db-a=100.123.154.79,db-b=100.89.33.61,db-c=163.220.236.52")"
   [[ "$(member_count "$generated")" == "3" ]]
   [[ "$(member_name_for_index 31)" == "db-af" ]]
   bootstrap_bundle >/dev/null 2>&1
@@ -782,11 +1177,22 @@ self_test() {
   [[ "$(member_count "$manifest_members")" == "3" ]]
   [[ "$(member_count "$manifest_dcs_members")" == "3" ]]
   [[ "$manifest_revision" == "1" ]]
+  [[ "$manifest_network_plane" == "$DATABASE_NETWORK_PLANE" ]]
+  if bundle_uses_snapshot_vpn_address "$bundle_dir"; then
+    die "underlay database bundle was classified as overlay-dependent"
+  fi
 
-  printf '10.250.0.2\tnode-a\n10.250.0.3\tnode-b\n10.250.0.4\tnode-d\n10.250.0.5\tnode-e\n10.250.0.10\tnode-c\n' \
+  printf '%s\n' \
+    $'10.250.0.2\tnode-a\t100.123.154.79' \
+    $'10.250.0.3\tnode-b\t100.89.33.61' \
+    $'10.250.0.4\tnode-d\t163.220.236.51' \
+    $'10.250.0.5\tnode-e\t100.94.130.38' \
+    $'10.250.0.10\tnode-c\t163.220.236.52' \
     | LC_ALL=C sort -V >"$eligible_path"
+  validate_eligible_snapshot "$eligible_path"
   generated="$(expand_members_from_snapshot "$manifest_members")"
   [[ "$(member_count "$generated")" == "5" ]]
+  [[ "$generated" != *"10.250."* ]]
   local dcs_four dcs_five
   dcs_four="$(next_dcs_topology "$generated" "$manifest_dcs_members")"
   dcs_five="$(next_dcs_topology "$generated" "$dcs_four")"
@@ -797,6 +1203,12 @@ self_test() {
   local extracted="$state_dir/extracted"
   safe_extract_bundle "$bundle_archive" "$extracted"
   validate_bundle_directory "$extracted"
+  local legacy_bundle="$state_dir/legacy-bundle"
+  cp -a "$extracted" "$legacy_bundle"
+  sed -i '/^HETERONETWORK_DB_NETWORK_PLANE=/d' "$legacy_bundle/manifest.env"
+  if validate_bundle_directory "$legacy_bundle" >/dev/null 2>&1; then
+    die "database bundle without an underlay contract was accepted"
+  fi
   local malicious="$state_dir/malicious.tar.gz"
   python3 - "$malicious" <<'PY'
 import io
