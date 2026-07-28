@@ -599,8 +599,8 @@ defaults
     option dontlog-normal
     option redispatch
     retries 2
-    timeout connect 3s
-    timeout check 3s
+    timeout connect 5s
+    timeout check 5s
     timeout client 5m
     timeout server 5m
 
@@ -611,7 +611,7 @@ frontend heteronetwork_postgres
 backend heteronetwork_postgres_primary
     option httpchk GET /primary
     http-check expect status 200
-    default-server inter 2s fastinter 500ms downinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+    default-server inter 6s fastinter 6s downinter 6s fall 3 rise 2 on-marked-down shutdown-sessions
 EOF
   local name address
   while read -r name address; do
@@ -1433,9 +1433,10 @@ self_test() {
   render_patroni_config >"$test_dir/patroni.yml"
   render_haproxy_config >"$test_dir/haproxy.cfg"
   render_proxy_service >"$test_dir/haproxy.service"
-  grep -Fq 'timeout connect 3s' "$test_dir/haproxy.cfg"
-  grep -Fq 'timeout check 3s' "$test_dir/haproxy.cfg"
-  grep -Fq 'fall 3 rise 2 on-marked-down shutdown-sessions' "$test_dir/haproxy.cfg"
+  grep -Fq 'timeout connect 5s' "$test_dir/haproxy.cfg"
+  grep -Fq 'timeout check 5s' "$test_dir/haproxy.cfg"
+  grep -Fq 'inter 6s fastinter 6s downinter 6s fall 3 rise 2 on-marked-down shutdown-sessions' \
+    "$test_dir/haproxy.cfg"
   grep -Fq 'ExecReload=/bin/kill -USR2 $MAINPID' "$test_dir/haproxy.service"
   grep -Fq 'synchronous_mode_strict: true' "$test_dir/patroni.yml"
   grep -Fq 'synchronous_node_count: 2' "$test_dir/patroni.yml"

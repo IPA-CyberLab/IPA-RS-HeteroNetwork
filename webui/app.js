@@ -2621,6 +2621,10 @@
     var provider = state.config && state.config.provider;
     var logoutEndpoint = state.config && state.config.logout_endpoint;
     clearSession();
+    if (location.protocol !== "https:") {
+      showAuth("");
+      return;
+    }
     if (logoutEndpoint && state.config.client_id) {
       var params = new URLSearchParams({ client_id: state.config.client_id });
       params.set(provider === "cognito" ? "logout_uri" : "post_logout_redirect_uri", location.origin + "/ui/");

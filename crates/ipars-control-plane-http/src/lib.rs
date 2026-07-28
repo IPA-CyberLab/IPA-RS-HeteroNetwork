@@ -583,6 +583,13 @@ struct WebAuthFlowError {
     message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessTokenValidation {
+    Valid,
+    Invalid,
+    Unavailable,
+}
+
 impl WebAuthFlowError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -712,12 +719,17 @@ impl WebUiAuthConfig {
     }
 
     pub async fn validate_access_token(&self, token: &str) -> bool {
+        self.access_token_validation(token).await == AccessTokenValidation::Valid
+    }
+
+    async fn access_token_validation(&self, token: &str) -> AccessTokenValidation {
         if token.is_empty() || token.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES * 16 {
-            return false;
+            return AccessTokenValidation::Invalid;
         }
         let Some(backchannel_host) = self.access_token_backchannel_host(token) else {
-            return false;
+            return AccessTokenValidation::Invalid;
         };
+        let mut rejected = false;
         for endpoint in &self.backchannel_userinfo_endpoints {
             let response = match timeout(
                 Duration::from_secs(5),
@@ -733,6 +745,12 @@ impl WebUiAuthConfig {
                 _ => continue,
             };
             if !response.status().is_success() {
+                if matches!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) {
+                    rejected = true;
+                }
                 continue;
             }
             let body =
@@ -750,10 +768,14 @@ impl WebUiAuthConfig {
                 })
                 .is_some_and(|subject| !subject.is_empty())
             {
-                return true;
+                return AccessTokenValidation::Valid;
             }
         }
-        false
+        if rejected {
+            AccessTokenValidation::Invalid
+        } else {
+            AccessTokenValidation::Unavailable
+        }
     }
 
     fn access_token_backchannel_host(&self, token: &str) -> Option<header::HeaderValue> {
@@ -965,11 +987,20 @@ impl WebUiAuthConfig {
                 format!("OIDC token response is invalid: {error}"),
             )
         })?;
-        if !self.validate_access_token(&tokens.access_token).await {
-            return Err(WebAuthFlowError::new(
-                StatusCode::UNAUTHORIZED,
-                "OIDC access token failed provider validation",
-            ));
+        match self.access_token_validation(&tokens.access_token).await {
+            AccessTokenValidation::Valid => {}
+            AccessTokenValidation::Invalid => {
+                return Err(WebAuthFlowError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "OIDC access token failed provider validation",
+                ));
+            }
+            AccessTokenValidation::Unavailable => {
+                return Err(WebAuthFlowError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "identity provider is temporarily unavailable",
+                ));
+            }
         }
         Ok(tokens.access_token)
     }
@@ -1172,24 +1203,34 @@ async fn require_management_auth(
         .as_deref()
         .zip(provided)
         .is_some_and(|(expected, provided)| operator_api_token_matches(expected, provided));
-    let oidc_authenticated = if operator_authenticated {
-        false
+    let oidc_validation = if operator_authenticated {
+        None
     } else if let (Some(oidc), Some(token)) = (auth.web_ui_auth.as_deref(), provided) {
-        oidc.validate_access_token(token).await
+        Some(oidc.access_token_validation(token).await)
     } else {
-        false
+        None
     };
-    if !operator_authenticated && !oidc_authenticated {
+    if operator_authenticated || oidc_validation == Some(AccessTokenValidation::Valid) {
+        return next.run(request).await;
+    }
+    if oidc_validation == Some(AccessTokenValidation::Unavailable) {
         return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
             Json(ErrorResponse {
-                error: "management API authentication was rejected".to_string(),
+                error: "identity provider is temporarily unavailable".to_string(),
             }),
         )
             .into_response();
     }
-    next.run(request).await
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(ErrorResponse {
+            error: "management API authentication was rejected".to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn ui_index() -> impl IntoResponse {
@@ -3957,6 +3998,92 @@ mod tests {
         assert!(!config.validate_access_token(&foreign_realm_token).await);
         primary_task.abort();
         fallback_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_validation_distinguishes_rejection_from_provider_outage(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/realms/heteronetwork/protocol/openid-connect/userinfo",
+                get(|headers: HeaderMap| async move {
+                    if headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer rejected-token")
+                    {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?;
+
+        assert_eq!(
+            config.access_token_validation("rejected-token").await,
+            AccessTokenValidation::Invalid
+        );
+        assert_eq!(
+            config.access_token_validation("outage-token").await,
+            AccessTokenValidation::Unavailable
+        );
+
+        let auth = Arc::new(ManagementAuth {
+            operator_api_bearer_token: None,
+            web_ui_auth: Some(Arc::new(config)),
+        });
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .route_layer(middleware::from_fn_with_state(
+                auth,
+                require_management_auth,
+            ));
+        let unavailable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, "Bearer outage-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.headers().get(header::RETRY_AFTER),
+            Some(&header::HeaderValue::from_static("5"))
+        );
+        assert!(unavailable
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .is_none());
+
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, "Bearer rejected-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected.headers().get(header::WWW_AUTHENTICATE),
+            Some(&header::HeaderValue::from_static("Bearer"))
+        );
+        task.abort();
         Ok(())
     }
 

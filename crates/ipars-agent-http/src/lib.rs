@@ -40,6 +40,7 @@ const MAX_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
 const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const WEB_UI_MANAGEMENT_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODE_INSTALL_PROXY_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
@@ -736,7 +737,7 @@ async fn start_device_login(
         {
             token_endpoints.push(DeviceLoginTokenEndpoint {
                 url: endpoint,
-                host_header: selected_provider.host_header.clone(),
+                host_header: candidate.host_header.clone(),
             });
         }
     }
@@ -1934,10 +1935,11 @@ async fn forward_management_request(
     request: &ManagementProxyRequest,
 ) -> Result<Response, AgentError> {
     let url = format!("{}{}", candidate.url, request.path_and_query);
+    let request_timeout = management_proxy_timeout(state, request);
     let mut builder = state
         .control_plane_client
         .request(request.method.clone(), &url)
-        .timeout(state.control_plane_request_timeout)
+        .timeout(request_timeout)
         .body(request.body.clone());
     for name in [
         header::ACCEPT,
@@ -1989,6 +1991,16 @@ async fn forward_management_request(
             .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
     );
     Ok(proxied)
+}
+
+fn management_proxy_timeout(state: &AgentHttpState, request: &ManagementProxyRequest) -> Duration {
+    if request.path_and_query.starts_with("/v1/admin/") {
+        state
+            .control_plane_request_timeout
+            .min(WEB_UI_MANAGEMENT_CANDIDATE_TIMEOUT)
+    } else {
+        state.control_plane_request_timeout
+    }
 }
 
 async fn read_bounded_response_bytes(
@@ -4713,6 +4725,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_login_fallback_preserves_each_provider_host(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_url, _, first_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let (second_url, _, second_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec![first_url.clone(), second_url.clone()],
+        )
+        .enable_local_web_ui(true);
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logins = state.device_logins.lock().await;
+        let pending = logins
+            .pending
+            .values()
+            .next()
+            .ok_or("device login was not retained")?;
+        assert_eq!(pending.token_endpoints.len(), 2);
+        for endpoint in &pending.token_endpoints {
+            let url = reqwest::Url::parse(&endpoint.url)?;
+            let expected_host = url
+                .host_str()
+                .map(|host| match url.port() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                })
+                .ok_or("device token endpoint omitted a host")?;
+            assert_eq!(endpoint.host_header.to_str()?, expected_host);
+        }
+
+        first_task.abort();
+        second_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_web_ui_read_proxy_fails_over_and_preserves_authorization(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (failed_url, failed, failed_task) =
@@ -4775,6 +4838,25 @@ mod tests {
         failed_task.abort();
         healthy_task.abort();
         Ok(())
+    }
+
+    #[test]
+    fn management_proxy_caps_admin_candidate_timeout() {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::new(runtime);
+        let request = ManagementProxyRequest {
+            method: Method::GET,
+            path_and_query: "/v1/admin/overview".to_string(),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            management_proxy_timeout(&state, &request),
+            Duration::from_secs(5)
+        );
     }
 
     #[tokio::test]
