@@ -28,10 +28,22 @@ use crate::overlay_forwarder::{
 
 const OVERLAY_ACK_PAYLOAD: &[u8] = b"IPARS-MH-ACK-V1";
 const DEFAULT_OVERLAY_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_OVERLAY_ACK_TIMEOUT_PATH_HOPS: u32 = 32;
 const DEFAULT_MAX_PENDING_OVERLAY_ACKS: usize = 4_096;
 const MAX_OVERLAY_PEER_IN_FLIGHT_SENDS: usize = 256;
 const MAX_OVERLAY_PRIMARY_IN_FLIGHT_PER_NEXT_HOP: usize = 16;
 const OVERLAY_PRIMARY_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn overlay_acknowledgement_timeout(
+    base_timeout: std::time::Duration,
+    selected_path_node_count: usize,
+) -> std::time::Duration {
+    let path_hops = selected_path_node_count.saturating_sub(1).max(1);
+    let multiplier = u32::try_from(path_hops)
+        .unwrap_or(MAX_OVERLAY_ACK_TIMEOUT_PATH_HOPS)
+        .min(MAX_OVERLAY_ACK_TIMEOUT_PATH_HOPS);
+    base_timeout.saturating_mul(multiplier)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayNeighborEndpoint {
@@ -530,7 +542,7 @@ impl OverlayTransitClient {
             remote: path.target.node_id.clone(),
         };
         match self
-            .send_action_with_acknowledgement(primary, acknowledgement)
+            .send_action_with_acknowledgement(primary, acknowledgement, &path.ordered_nodes)
             .await
         {
             Ok(()) => {
@@ -555,6 +567,12 @@ impl OverlayTransitClient {
                 let secondary_sequence = sequence
                     .checked_add(1)
                     .ok_or(OverlayTransitError::SequenceOverflow(sequence))?;
+                let Some(secondary_path) = path.secondary_ordered_nodes.as_deref() else {
+                    return Err(OverlayTransitError::FailoverPreparation {
+                        primary: Box::new(primary),
+                        secondary: Box::new(OverlayForwarderError::SecondaryPathUnavailable),
+                    });
+                };
                 let secondary_result = {
                     let mut forwarder = self.forwarder.lock().await;
                     forwarder.encapsulate_selected(
@@ -581,7 +599,7 @@ impl OverlayTransitClient {
                     remote: path.target.node_id.clone(),
                 };
                 match self
-                    .send_action_with_acknowledgement(secondary, acknowledgement)
+                    .send_action_with_acknowledgement(secondary, acknowledgement, secondary_path)
                     .await
                 {
                     Ok(()) => Ok(OverlaySendOutcome {
@@ -633,6 +651,10 @@ impl OverlayTransitClient {
         sequence: u64,
         inner_wireguard_datagram: Vec<u8>,
     ) -> Result<OverlaySendOutcome, OverlayTransitError> {
+        let secondary_path = path
+            .secondary_ordered_nodes
+            .as_deref()
+            .ok_or(OverlayForwarderError::SecondaryPathUnavailable)?;
         let secondary = {
             let mut forwarder = self.forwarder.lock().await;
             forwarder.encapsulate_selected(
@@ -649,7 +671,7 @@ impl OverlayTransitClient {
             sequence,
             remote: path.target.node_id.clone(),
         };
-        self.send_action_with_acknowledgement(secondary, acknowledgement)
+        self.send_action_with_acknowledgement(secondary, acknowledgement, secondary_path)
             .await
             .map(|()| OverlaySendOutcome {
                 selection: OverlayPathSelection::Secondary,
@@ -676,6 +698,7 @@ impl OverlayTransitClient {
         &self,
         action: OverlayForwardAction,
         acknowledgement: OverlayAcknowledgementKey,
+        selected_path: &[NodeId],
     ) -> Result<(), OverlayPathAttemptError> {
         let (next_hop, datagram) = match forwarding_action_parts(action) {
             Ok(parts) => parts,
@@ -684,7 +707,7 @@ impl OverlayTransitClient {
             }
             Err(_) => unreachable!("encapsulation can only produce forwarding actions"),
         };
-        let Some(timeout) = self.acknowledgement_timeout else {
+        let Some(base_timeout) = self.acknowledgement_timeout else {
             self.sender
                 .send_frame(&next_hop, &datagram)
                 .await
@@ -696,6 +719,7 @@ impl OverlayTransitClient {
                 })?;
             return Ok(());
         };
+        let timeout = overlay_acknowledgement_timeout(base_timeout, selected_path.len());
 
         let remote = acknowledgement.remote.clone();
         let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
@@ -1574,6 +1598,103 @@ mod tests {
                 .push_back((next_hop.clone(), frame.to_vec()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn acknowledgement_timeout_scales_from_configured_base_by_path_hops() {
+        let base_timeout = Duration::from_millis(250);
+
+        assert_eq!(
+            overlay_acknowledgement_timeout(base_timeout, 2),
+            base_timeout
+        );
+        assert_eq!(
+            overlay_acknowledgement_timeout(base_timeout, 3),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            overlay_acknowledgement_timeout(base_timeout, 9),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn acknowledgement_timeout_caps_long_path_scaling() {
+        let base_timeout = Duration::from_millis(250);
+        let maximum_timeout = base_timeout.saturating_mul(MAX_OVERLAY_ACK_TIMEOUT_PATH_HOPS);
+
+        assert_eq!(
+            overlay_acknowledgement_timeout(
+                base_timeout,
+                MAX_OVERLAY_ACK_TIMEOUT_PATH_HOPS as usize + 1,
+            ),
+            maximum_timeout
+        );
+        assert_eq!(
+            overlay_acknowledgement_timeout(base_timeout, usize::MAX),
+            maximum_timeout
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_and_secondary_acknowledgements_use_selected_path_lengths() -> TestResult {
+        let socket = Arc::new(loopback_socket().await?);
+        let sender = Arc::new(RecordingSender::default());
+        let endpoints = OverlayNeighborEndpointDirectory::new([
+            endpoint("a", SocketAddr::from((Ipv4Addr::LOCALHOST, 10_001))),
+            endpoint("c", SocketAddr::from((Ipv4Addr::LOCALHOST, 10_002))),
+        ])?;
+        let transit = OverlayTransit::spawn_with_sender_config(
+            socket,
+            endpoints,
+            forwarder("s", &["a", "c"], 7)?,
+            sender.clone(),
+            8,
+            Some(Duration::from_millis(5)),
+            8,
+        )?;
+
+        let error = match transit
+            .client()
+            .send_with_secondary_failover(
+                &path(&["s", "a", "d"], Some(&["s", "c", "x", "y", "d"]), 7),
+                [6; MULTIHOP_PATH_ID_BYTES],
+                1,
+                vec![1],
+            )
+            .await
+        {
+            Ok(outcome) => {
+                return Err(
+                    format!("both unacknowledged paths must time out, got {outcome:?}").into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        match error {
+            OverlayTransitError::BothPathsFailed { primary, secondary } => {
+                assert!(matches!(
+                    primary.as_ref(),
+                    OverlayPathAttemptError::AcknowledgementTimeout {
+                        remote,
+                        timeout_millis: 10,
+                    } if remote == &node("d")
+                ));
+                assert!(matches!(
+                    secondary.as_ref(),
+                    OverlayPathAttemptError::AcknowledgementTimeout {
+                        remote,
+                        timeout_millis: 20,
+                    } if remote == &node("d")
+                ));
+            }
+            other => panic!("expected both paths to time out, got {other:?}"),
+        }
+        assert_eq!(sender.attempted.lock().await.len(), 2);
+
+        timeout(Duration::from_secs(1), transit.shutdown()).await??;
+        Ok(())
     }
 
     #[tokio::test]

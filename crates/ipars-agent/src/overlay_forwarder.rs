@@ -5,7 +5,7 @@
 //! adjacent to its local node. Taken together, those checks validate every edge
 //! of a multi-hop path without distributing the full overlay graph to each node.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ipars_relay::multihop::{
@@ -28,9 +28,10 @@ const OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS: usize =
 const OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS: usize =
     OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS / u64::BITS as usize;
 
-// One prior graph is enough for an in-flight frame to cross an asynchronous
-// neighbor-map update while keeping both time and retained topology bounded.
 const PREVIOUS_TOPOLOGY_EPOCH_GRACE: Duration = Duration::from_secs(120);
+// Neighbor maps can include route projections, so rapid control-plane churn
+// must not grow retained topology memory without a hard limit.
+const MAX_RETAINED_TOPOLOGY_EPOCHS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlayForwarderConfig {
@@ -172,18 +173,18 @@ pub enum OverlayForwarderError {
     Codec(#[from] MultiHopCodecError),
 }
 
-struct PreviousNeighborMap {
+struct RetainedNeighborMap {
     neighbor_map: NeighborMap,
     neighbor_ids: BTreeSet<NodeId>,
     expires_at: Instant,
 }
 
-/// Stateful forwarding engine for one local node and a bounded epoch overlap.
+/// Stateful forwarding engine for one local node and bounded epoch overlap.
 pub struct BoundedOverlayForwarder {
     local_node: NodeId,
     neighbor_map: NeighborMap,
     neighbor_ids: BTreeSet<NodeId>,
-    previous_neighbor_map: Option<PreviousNeighborMap>,
+    retained_neighbor_maps: VecDeque<RetainedNeighborMap>,
     config: OverlayForwarderConfig,
     replay_window: ReplayWindow,
 }
@@ -201,7 +202,7 @@ impl BoundedOverlayForwarder {
             local_node,
             neighbor_map,
             neighbor_ids,
-            previous_neighbor_map: None,
+            retained_neighbor_maps: VecDeque::with_capacity(MAX_RETAINED_TOPOLOGY_EPOCHS),
             config,
             replay_window,
         })
@@ -220,9 +221,8 @@ impl BoundedOverlayForwarder {
     }
 
     /// Replace the current local map. Topology epochs are opaque content
-    /// identifiers, so a changed map retains exactly one prior graph for a
-    /// short inbound-only migration grace. Outbound traffic always uses the
-    /// current map.
+    /// identifiers. Changed maps remain available for a bounded migration
+    /// grace so in-flight and make-before-break paths can finish.
     pub fn update_neighbor_map(
         &mut self,
         neighbor_map: NeighborMap,
@@ -234,22 +234,31 @@ impl BoundedOverlayForwarder {
                 received_cluster: neighbor_map.cluster_id.to_string(),
             });
         }
+        self.expire_retained_neighbor_maps();
+
         if neighbor_map.topology_epoch != self.neighbor_map.topology_epoch {
-            let previous_neighbor_map = std::mem::replace(&mut self.neighbor_map, neighbor_map);
-            let previous_neighbor_ids = std::mem::replace(&mut self.neighbor_ids, neighbor_ids);
-            let previous_epoch = previous_neighbor_map.topology_epoch;
-            self.previous_neighbor_map = Some(PreviousNeighborMap {
-                neighbor_map: previous_neighbor_map,
-                neighbor_ids: previous_neighbor_ids,
+            let incoming_epoch = neighbor_map.topology_epoch;
+            self.retained_neighbor_maps
+                .retain(|retained| retained.neighbor_map.topology_epoch != incoming_epoch);
+
+            let retained_neighbor_map = std::mem::replace(&mut self.neighbor_map, neighbor_map);
+            let retained_neighbor_ids = std::mem::replace(&mut self.neighbor_ids, neighbor_ids);
+            let retained_epoch = retained_neighbor_map.topology_epoch;
+            self.retained_neighbor_maps
+                .retain(|retained| retained.neighbor_map.topology_epoch != retained_epoch);
+            self.retained_neighbor_maps.push_back(RetainedNeighborMap {
+                neighbor_map: retained_neighbor_map,
+                neighbor_ids: retained_neighbor_ids,
                 expires_at: Instant::now() + PREVIOUS_TOPOLOGY_EPOCH_GRACE,
             });
-            self.replay_window
-                .retain_epochs(self.neighbor_map.topology_epoch, Some(previous_epoch));
+            while self.retained_neighbor_maps.len() > MAX_RETAINED_TOPOLOGY_EPOCHS {
+                self.retained_neighbor_maps.pop_front();
+            }
+            self.retain_replay_epochs();
             return Ok(());
         }
         self.neighbor_map = neighbor_map;
         self.neighbor_ids = neighbor_ids;
-        self.expire_previous_neighbor_map();
         Ok(())
     }
 
@@ -285,20 +294,17 @@ impl BoundedOverlayForwarder {
             return Err(OverlayForwarderError::InvalidPathId);
         }
 
+        let topology_epoch = path.topology_epoch;
         let ordered_nodes = self.validate_selected_path(path, selection)?;
         let next_hop = ordered_nodes
             .get(1)
             .cloned()
             .ok_or_else(|| OverlayForwarderError::PathTargetsSource(self.local_node.clone()))?;
-        self.require_next_neighbor(&next_hop, self.neighbor_map.topology_epoch)?;
+        self.require_next_neighbor(&next_hop, topology_epoch)?;
 
         if ordered_nodes.len() == 2 {
-            self.replay_window.observe(
-                self.neighbor_map.topology_epoch,
-                &self.local_node,
-                path_id,
-                sequence,
-            )?;
+            self.replay_window
+                .observe(topology_epoch, &self.local_node, path_id, sequence)?;
             return Ok(OverlayForwardAction::DirectNeighbor {
                 peer: next_hop,
                 datagram: inner_wireguard_datagram,
@@ -309,7 +315,7 @@ impl BoundedOverlayForwarder {
         self.validate_relay_count(relay_nodes.len())?;
         let hop_limit = relay_nodes.len() as u16;
         let envelope = MultiHopEnvelope::new(
-            self.neighbor_map.topology_epoch,
+            topology_epoch,
             path_id,
             sequence,
             hop_limit,
@@ -320,12 +326,8 @@ impl BoundedOverlayForwarder {
         )?;
         let datagram = envelope.encode()?;
         self.validate_frame_size(datagram.len())?;
-        self.replay_window.observe(
-            self.neighbor_map.topology_epoch,
-            &self.local_node,
-            path_id,
-            sequence,
-        )?;
+        self.replay_window
+            .observe(topology_epoch, &self.local_node, path_id, sequence)?;
         Ok(OverlayForwardAction::Forward { next_hop, datagram })
     }
 
@@ -417,7 +419,7 @@ impl BoundedOverlayForwarder {
     }
 
     fn validate_selected_path<'a>(
-        &self,
+        &mut self,
         path: &'a OverlayPath,
         selection: OverlayPathSelection,
     ) -> Result<&'a [NodeId], OverlayForwarderError> {
@@ -456,54 +458,59 @@ impl BoundedOverlayForwarder {
         Ok(ordered_nodes)
     }
 
-    fn validate_topology_epoch(&self, received_epoch: u64) -> Result<(), OverlayForwarderError> {
+    fn validate_topology_epoch(
+        &mut self,
+        received_epoch: u64,
+    ) -> Result<(), OverlayForwarderError> {
+        self.expire_retained_neighbor_maps();
         let current_epoch = self.neighbor_map.topology_epoch;
-        if received_epoch < current_epoch {
-            return Err(OverlayForwarderError::StaleTopologyEpoch {
-                current_epoch,
-                received_epoch,
-            });
+        // Epochs are opaque hashes; membership is the only valid freshness test.
+        if self.neighbor_ids_for_epoch(received_epoch).is_some() {
+            return Ok(());
         }
-        if received_epoch > current_epoch {
-            return Err(OverlayForwarderError::FutureTopologyEpoch {
-                current_epoch,
-                received_epoch,
-            });
-        }
-        Ok(())
+        Err(OverlayForwarderError::StaleTopologyEpoch {
+            current_epoch,
+            received_epoch,
+        })
     }
 
     fn validate_inbound_topology_epoch(
         &mut self,
         received_epoch: u64,
     ) -> Result<(), OverlayForwarderError> {
-        self.expire_previous_neighbor_map();
-        if self.neighbor_ids_for_epoch(received_epoch).is_some() {
-            return Ok(());
-        }
         self.validate_topology_epoch(received_epoch)
     }
 
-    fn expire_previous_neighbor_map(&mut self) {
-        let expired = self
-            .previous_neighbor_map
-            .as_ref()
-            .is_some_and(|previous| Instant::now() >= previous.expires_at);
-        if expired {
-            self.previous_neighbor_map = None;
-            self.replay_window
-                .retain_epochs(self.neighbor_map.topology_epoch, None);
+    fn expire_retained_neighbor_maps(&mut self) {
+        let now = Instant::now();
+        let previous_len = self.retained_neighbor_maps.len();
+        self.retained_neighbor_maps
+            .retain(|retained| now < retained.expires_at);
+        if self.retained_neighbor_maps.len() != previous_len {
+            self.retain_replay_epochs();
         }
+    }
+
+    fn retain_replay_epochs(&mut self) {
+        let mut retained_epochs =
+            HashSet::with_capacity(self.retained_neighbor_maps.len().saturating_add(1));
+        retained_epochs.insert(self.neighbor_map.topology_epoch);
+        retained_epochs.extend(
+            self.retained_neighbor_maps
+                .iter()
+                .map(|retained| retained.neighbor_map.topology_epoch),
+        );
+        self.replay_window.retain_epochs(&retained_epochs);
     }
 
     fn neighbor_ids_for_epoch(&self, topology_epoch: u64) -> Option<&BTreeSet<NodeId>> {
         if topology_epoch == self.neighbor_map.topology_epoch {
             return Some(&self.neighbor_ids);
         }
-        self.previous_neighbor_map
-            .as_ref()
-            .filter(|previous| previous.neighbor_map.topology_epoch == topology_epoch)
-            .map(|previous| &previous.neighbor_ids)
+        self.retained_neighbor_maps
+            .iter()
+            .find(|retained| retained.neighbor_map.topology_epoch == topology_epoch)
+            .map(|retained| &retained.neighbor_ids)
     }
 
     fn validate_envelope_hop_limit(
@@ -748,10 +755,9 @@ impl ReplayWindow {
         Ok(())
     }
 
-    fn retain_epochs(&mut self, current_epoch: u64, previous_epoch: Option<u64>) {
-        self.sequences.retain(|key, _| {
-            key.topology_epoch == current_epoch || previous_epoch == Some(key.topology_epoch)
-        });
+    fn retain_epochs(&mut self, retained_epochs: &HashSet<u64>) {
+        self.sequences
+            .retain(|key, _| retained_epochs.contains(&key.topology_epoch));
         self.compact_recency();
     }
 
@@ -781,7 +787,7 @@ impl ReplayWindow {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::error::Error;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Instant;
@@ -796,8 +802,9 @@ mod tests {
     use super::{
         BoundedOverlayForwarder, OverlayForwardAction, OverlayForwarderConfig,
         OverlayForwarderError, OverlayPathSelection, ReplaySequenceWindow, ReplayWindow,
-        OVERLAY_PEER_MAX_IN_FLIGHT_DATAGRAMS, OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS,
-        OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS, OVERLAY_SEQUENCE_RESERVATIONS_PER_DATAGRAM,
+        MAX_RETAINED_TOPOLOGY_EPOCHS, OVERLAY_PEER_MAX_IN_FLIGHT_DATAGRAMS,
+        OVERLAY_REPLAY_SEQUENCE_WINDOW_BITS, OVERLAY_REPLAY_SEQUENCE_WINDOW_WORDS,
+        OVERLAY_SEQUENCE_RESERVATIONS_PER_DATAGRAM,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -941,45 +948,80 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stale_topology_epoch() -> TestResult {
-        let path = overlay_path(&["s", "a", "d"], None, 7);
-        let mut source = engine("s", &["a"], 7)?;
-        let mut relay = engine("a", &["s", "d"], 8)?;
+    fn rejects_unknown_topology_epoch_without_ordering_opaque_hashes() -> TestResult {
+        let path = overlay_path(&["s", "a", "d"], None, 99);
+        let mut source = engine("s", &["a"], 99)?;
+        let mut relay = engine("a", &["s", "d"], 7)?;
         let to_a = forwarded(source.encapsulate(&path, [3; 16], 1, vec![1])?, "a");
 
         assert_eq!(
             relay.receive(&node("s"), &to_a),
             Err(OverlayForwarderError::StaleTopologyEpoch {
-                current_epoch: 8,
-                received_epoch: 7,
+                current_epoch: 7,
+                received_epoch: 99,
             })
         );
         Ok(())
     }
 
     #[test]
-    fn accepts_only_the_immediately_previous_epoch_during_migration_grace() -> TestResult {
-        let path = overlay_path(&["s", "a", "d"], None, 7);
+    fn retains_multiple_unexpired_epochs_and_their_replay_state() -> TestResult {
+        let epoch_one = 0xf123_4567_89ab_cdef;
+        let epoch_two = 7;
+        let epoch_three = 0x1234_5678_9abc_def0;
         let path_id = [0x33; 16];
-        let mut source = engine("s", &["a"], 7)?;
-        let first = forwarded(source.encapsulate(&path, path_id, 1, vec![1])?, "a");
-        let second = forwarded(source.encapsulate(&path, path_id, 2, vec![2])?, "a");
-        let third = forwarded(source.encapsulate(&path, path_id, 3, vec![3])?, "a");
-        let mut relay = engine("a", &["s", "d"], 7)?;
+        let path_one = overlay_path(&["s", "a", "d"], None, epoch_one);
+        let mut source_one = engine("s", &["a"], epoch_one)?;
+        let epoch_one_first =
+            forwarded(source_one.encapsulate(&path_one, path_id, 1, vec![1])?, "a");
+        let epoch_one_second =
+            forwarded(source_one.encapsulate(&path_one, path_id, 2, vec![2])?, "a");
+        let mut relay = engine("a", &["s", "d"], epoch_one)?;
+        let _ = relay.receive(&node("s"), &epoch_one_first)?;
 
-        let _ = relay.receive(&node("s"), &first)?;
-        relay.update_neighbor_map(neighbor_map("a", &["x", "d"], 8))?;
+        relay.update_neighbor_map(neighbor_map("a", &["x", "d"], epoch_two))?;
+        let path_two = overlay_path(&["x", "a", "d"], None, epoch_two);
+        let mut source_two = engine("x", &["a"], epoch_two)?;
+        let epoch_two_first =
+            forwarded(source_two.encapsulate(&path_two, path_id, 1, vec![3])?, "a");
+        let epoch_two_second =
+            forwarded(source_two.encapsulate(&path_two, path_id, 2, vec![4])?, "a");
+        let _ = relay.receive(&node("x"), &epoch_two_first)?;
 
-        let current_path = overlay_path(&["x", "a", "d"], None, 8);
-        let mut current_source = engine("x", &["a"], 8)?;
-        let current = forwarded(
-            current_source.encapsulate(&current_path, path_id, 1, vec![8])?,
+        relay.update_neighbor_map(neighbor_map("a", &["c", "d"], epoch_three))?;
+        let path_three = overlay_path(&["c", "a", "d"], None, epoch_three);
+        let mut source_three = engine("c", &["a"], epoch_three)?;
+        let epoch_three_first = forwarded(
+            source_three.encapsulate(&path_three, path_id, 1, vec![5])?,
             "a",
         );
-        let _ = relay.receive(&node("x"), &current)?;
+        let _ = relay.receive(&node("c"), &epoch_three_first)?;
+
+        let retained_epochs: HashSet<_> = relay
+            .retained_neighbor_maps
+            .iter()
+            .map(|retained| retained.neighbor_map.topology_epoch)
+            .collect();
+        assert_eq!(retained_epochs, HashSet::from([epoch_one, epoch_two]));
 
         assert!(matches!(
-            relay.receive(&node("s"), &first),
+            relay.receive(&node("s"), &epoch_one_first),
+            Err(OverlayForwarderError::ReplayRejected {
+                sequence: 1,
+                highest: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            relay.receive(&node("x"), &epoch_two_first),
+            Err(OverlayForwarderError::ReplayRejected {
+                sequence: 1,
+                highest: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            relay.receive(&node("c"), &epoch_three_first),
             Err(OverlayForwarderError::ReplayRejected {
                 sequence: 1,
                 highest: 1,
@@ -987,23 +1029,175 @@ mod tests {
             })
         ));
 
-        let forwarded_previous = forwarded(relay.receive(&node("s"), &second)?, "d");
+        let forwarded_epoch_one = forwarded(relay.receive(&node("s"), &epoch_one_second)?, "d");
         assert_eq!(
-            MultiHopEnvelope::decode(&forwarded_previous, 7)?.topology_epoch(),
-            7
+            MultiHopEnvelope::decode(&forwarded_epoch_one, 1)?.topology_epoch(),
+            epoch_one
+        );
+        let forwarded_epoch_two = forwarded(relay.receive(&node("x"), &epoch_two_second)?, "d");
+        assert_eq!(
+            MultiHopEnvelope::decode(&forwarded_epoch_two, 1)?.topology_epoch(),
+            epoch_two
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_paths_can_finish_on_retained_epochs_with_epoch_local_validation() -> TestResult {
+        let epoch_one = 0xfedc_ba98_7654_3210;
+        let epoch_two = 3;
+        let epoch_three = 0x0123_4567_89ab_cdef;
+        let mut source = engine("s", &["a"], epoch_one)?;
+
+        source.update_neighbor_map(neighbor_map("s", &["b"], epoch_two))?;
+        source.update_neighbor_map(neighbor_map("s", &["c"], epoch_three))?;
+
+        let retained_path = overlay_path(&["s", "a", "d"], None, epoch_one);
+        let retained_datagram = forwarded(
+            source.encapsulate(&retained_path, [0x34; 16], 1, vec![1])?,
+            "a",
+        );
+        assert_eq!(
+            MultiHopEnvelope::decode(&retained_datagram, 1)?.topology_epoch(),
+            epoch_one
         );
 
-        match relay.previous_neighbor_map.as_mut() {
-            Some(previous) => previous.expires_at = Instant::now(),
-            None => panic!("previous neighbor map must exist during migration grace"),
-        }
+        let cross_epoch_path = overlay_path(&["s", "b", "d"], None, epoch_one);
         assert_eq!(
-            relay.receive(&node("s"), &third),
+            source.encapsulate(&cross_epoch_path, [0x35; 16], 1, vec![1]),
+            Err(OverlayForwarderError::NextHopNotNeighbor(node("b")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deduplicates_epochs_when_a_retained_epoch_becomes_current_again() -> TestResult {
+        let epoch_one = 0x9000_0000_0000_0001;
+        let epoch_two = 2;
+        let epoch_three = 0x8000_0000_0000_0003;
+        let mut forwarder = engine("a", &["s", "d"], epoch_one)?;
+
+        forwarder.update_neighbor_map(neighbor_map("a", &["x", "d"], epoch_two))?;
+        forwarder.update_neighbor_map(neighbor_map("a", &["c", "d"], epoch_three))?;
+        forwarder.update_neighbor_map(neighbor_map("a", &["x", "d"], epoch_two))?;
+        forwarder.update_neighbor_map(neighbor_map("a", &["x", "d"], epoch_two))?;
+
+        assert_eq!(forwarder.neighbor_map.topology_epoch, epoch_two);
+        let retained_epochs: Vec<_> = forwarder
+            .retained_neighbor_maps
+            .iter()
+            .map(|retained| retained.neighbor_map.topology_epoch)
+            .collect();
+        assert_eq!(retained_epochs.len(), 2);
+        assert_eq!(
+            retained_epochs.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([epoch_one, epoch_three])
+        );
+        assert!(!retained_epochs.contains(&epoch_two));
+        Ok(())
+    }
+
+    #[test]
+    fn expires_each_retained_epoch_and_only_its_replay_state() -> TestResult {
+        let epoch_one = 0x7000_0000_0000_0001;
+        let epoch_two = 2;
+        let epoch_three = 0x6000_0000_0000_0003;
+        let replay_source = node("s");
+        let mut forwarder = engine("a", &["s", "d"], epoch_one)?;
+        forwarder
+            .replay_window
+            .observe(epoch_one, &replay_source, [0x36; 16], 1)?;
+
+        forwarder.update_neighbor_map(neighbor_map("a", &["x", "d"], epoch_two))?;
+        forwarder
+            .replay_window
+            .observe(epoch_two, &replay_source, [0x37; 16], 1)?;
+        forwarder.update_neighbor_map(neighbor_map("a", &["c", "d"], epoch_three))?;
+        forwarder
+            .replay_window
+            .observe(epoch_three, &replay_source, [0x38; 16], 1)?;
+
+        let retained_epoch_one = forwarder
+            .retained_neighbor_maps
+            .iter_mut()
+            .find(|retained| retained.neighbor_map.topology_epoch == epoch_one);
+        match retained_epoch_one {
+            Some(retained) => retained.expires_at = Instant::now(),
+            None => panic!("first topology epoch must be retained"),
+        }
+        forwarder.expire_retained_neighbor_maps();
+
+        let retained_epochs: HashSet<_> = forwarder
+            .retained_neighbor_maps
+            .iter()
+            .map(|retained| retained.neighbor_map.topology_epoch)
+            .collect();
+        assert_eq!(retained_epochs, HashSet::from([epoch_two]));
+        let replay_epochs: HashSet<_> = forwarder
+            .replay_window
+            .sequences
+            .keys()
+            .map(|key| key.topology_epoch)
+            .collect();
+        assert_eq!(replay_epochs, HashSet::from([epoch_two, epoch_three]));
+        assert_eq!(
+            forwarder.validate_topology_epoch(epoch_one),
             Err(OverlayForwarderError::StaleTopologyEpoch {
-                current_epoch: 8,
-                received_epoch: 7,
+                current_epoch: epoch_three,
+                received_epoch: epoch_one,
             })
         );
+        assert_eq!(forwarder.validate_topology_epoch(epoch_two), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn migration_history_and_replay_epochs_stay_within_the_same_bound() -> TestResult {
+        let epochs: Vec<_> = (1..=MAX_RETAINED_TOPOLOGY_EPOCHS + 3)
+            .map(|index| (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect();
+        let replay_source = node("s");
+        let mut forwarder = engine("a", &["s", "d"], epochs[0])?;
+
+        for (index, next_epoch) in epochs.iter().copied().enumerate().skip(1) {
+            let current_epoch = forwarder.neighbor_map.topology_epoch;
+            forwarder
+                .replay_window
+                .observe(current_epoch, &replay_source, [index as u8; 16], 1)?;
+            forwarder.update_neighbor_map(neighbor_map("a", &["s", "d"], next_epoch))?;
+        }
+        forwarder.replay_window.observe(
+            forwarder.neighbor_map.topology_epoch,
+            &replay_source,
+            [0xff; 16],
+            1,
+        )?;
+
+        assert_eq!(
+            forwarder.retained_neighbor_maps.len(),
+            MAX_RETAINED_TOPOLOGY_EPOCHS
+        );
+        let expected_retained =
+            &epochs[epochs.len() - MAX_RETAINED_TOPOLOGY_EPOCHS - 1..epochs.len() - 1];
+        let retained_epochs: Vec<_> = forwarder
+            .retained_neighbor_maps
+            .iter()
+            .map(|retained| retained.neighbor_map.topology_epoch)
+            .collect();
+        assert_eq!(retained_epochs, expected_retained);
+
+        let expected_replay_epochs: HashSet<_> = expected_retained
+            .iter()
+            .copied()
+            .chain(std::iter::once(epochs[epochs.len() - 1]))
+            .collect();
+        let replay_epochs: HashSet<_> = forwarder
+            .replay_window
+            .sequences
+            .keys()
+            .map(|key| key.topology_epoch)
+            .collect();
+        assert_eq!(replay_epochs, expected_replay_epochs);
         Ok(())
     }
 

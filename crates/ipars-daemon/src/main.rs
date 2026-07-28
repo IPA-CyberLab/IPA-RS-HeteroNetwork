@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
 use std::fs::File;
@@ -220,6 +220,7 @@ const OVERLAY_TRANSIT_DELIVERY_QUEUE_CAPACITY: usize = 1_024;
 const OVERLAY_PEER_DELIVERY_QUEUE_CAPACITY: usize = 256;
 const OVERLAY_TRANSIT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const OVERLAY_PREVIOUS_TOPOLOGY_GRACE: Duration = Duration::from_secs(120);
+const MAX_OVERLAY_PREVIOUS_TOPOLOGIES: usize = 8;
 const OVERLAY_PATH_RESOLUTION_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_PEER_PROBE_INTERVAL_SECONDS: u64 = 30;
 const DEFAULT_PEER_PROBE_SAMPLE_COUNT: u16 = 5;
@@ -12353,6 +12354,7 @@ impl BoundedOverlayPeerTask {
 
 #[derive(Clone)]
 struct PreviousBoundedOverlayEndpoints {
+    topology_epoch: u64,
     records: Vec<OverlayNeighborEndpoint>,
     expires_at: Instant,
 }
@@ -12362,8 +12364,7 @@ struct ActiveBoundedOverlayTransit {
     client: OverlayTransitClient,
     endpoints: OverlayNeighborEndpointDirectory,
     neighbor_map: NeighborMap,
-    previous_endpoints: Option<PreviousBoundedOverlayEndpoints>,
-    topology_grace_expires_at: Option<Instant>,
+    previous_endpoints: VecDeque<PreviousBoundedOverlayEndpoints>,
     delivery_routes:
         Arc<tokio::sync::RwLock<BTreeMap<NodeId, tokio::sync::mpsc::Sender<OverlayDelivery>>>>,
     delivery_task: tokio::task::JoinHandle<()>,
@@ -12421,8 +12422,7 @@ impl ActiveBoundedOverlayTransit {
             client,
             endpoints,
             neighbor_map,
-            previous_endpoints: None,
-            topology_grace_expires_at: None,
+            previous_endpoints: VecDeque::new(),
             delivery_routes,
             delivery_task,
             peer_tasks: BTreeMap::new(),
@@ -12437,31 +12437,35 @@ impl ActiveBoundedOverlayTransit {
     ) -> anyhow::Result<()> {
         let map_changed = self.neighbor_map != neighbor_map;
         let topology_changed = self.neighbor_map.topology_epoch != neighbor_map.topology_epoch;
-        let previous_expired = self
-            .previous_endpoints
-            .as_ref()
-            .is_some_and(|previous| Instant::now() >= previous.expires_at);
+        let now = Instant::now();
+        let previous_count = self.previous_endpoints.len();
+        self.previous_endpoints
+            .retain(|previous| previous.expires_at > now);
+        let previous_expired = self.previous_endpoints.len() != previous_count;
         if map_changed || previous_expired {
-            let previous_endpoints = if topology_changed {
-                Some(PreviousBoundedOverlayEndpoints {
-                    records: bounded_overlay_neighbor_endpoint_records(
-                        &self.neighbor_map,
-                        config.transit_bind.port(),
-                    )?,
-                    expires_at: Instant::now() + OVERLAY_PREVIOUS_TOPOLOGY_GRACE,
-                })
-            } else {
+            if topology_changed {
                 self.previous_endpoints
-                    .clone()
-                    .filter(|previous| Instant::now() < previous.expires_at)
-            };
+                    .retain(|previous| previous.topology_epoch != self.neighbor_map.topology_epoch);
+                self.previous_endpoints
+                    .push_back(PreviousBoundedOverlayEndpoints {
+                        topology_epoch: self.neighbor_map.topology_epoch,
+                        records: bounded_overlay_neighbor_endpoint_records(
+                            &self.neighbor_map,
+                            config.transit_bind.port(),
+                        )?,
+                        expires_at: Instant::now() + OVERLAY_PREVIOUS_TOPOLOGY_GRACE,
+                    });
+                while self.previous_endpoints.len() > MAX_OVERLAY_PREVIOUS_TOPOLOGIES {
+                    self.previous_endpoints.pop_front();
+                }
+            }
             let current_records = bounded_overlay_neighbor_endpoint_records(
                 &neighbor_map,
                 config.transit_bind.port(),
             )?;
             let endpoint_records = bounded_overlay_endpoint_records_with_previous(
                 current_records,
-                previous_endpoints.as_ref(),
+                &self.previous_endpoints,
             );
             OverlayNeighborEndpointDirectory::new(endpoint_records.clone())
                 .context("invalid replacement bounded overlay endpoint directory")?;
@@ -12471,7 +12475,6 @@ impl ActiveBoundedOverlayTransit {
                     .await?;
             }
             self.endpoints.replace(endpoint_records)?;
-            self.previous_endpoints = previous_endpoints;
             if map_changed {
                 tracing::info!(
                     topology_epoch = neighbor_map.topology_epoch,
@@ -12481,10 +12484,6 @@ impl ActiveBoundedOverlayTransit {
                 );
                 self.neighbor_map = neighbor_map;
             }
-            self.topology_grace_expires_at = self
-                .previous_endpoints
-                .as_ref()
-                .map(|previous| previous.expires_at);
         }
 
         let finished = self
@@ -12515,14 +12514,18 @@ impl ActiveBoundedOverlayTransit {
             desired.insert(path.target.node_id.clone(), path);
         }
 
-        let retain_previous_tasks = self
-            .topology_grace_expires_at
-            .is_some_and(|expires_at| Instant::now() < expires_at);
+        let retained_epochs = self
+            .previous_endpoints
+            .iter()
+            .map(|previous| previous.topology_epoch)
+            .collect::<BTreeSet<_>>();
         let stale = self
             .peer_tasks
-            .keys()
-            .filter(|peer| !desired.contains_key(*peer) && !retain_previous_tasks)
-            .cloned()
+            .iter()
+            .filter(|(peer, task)| {
+                !desired.contains_key(*peer) && !retained_epochs.contains(&task.path.topology_epoch)
+            })
+            .map(|(peer, _)| peer.clone())
             .collect::<Vec<_>>();
         for peer in stale {
             self.remove_peer(runtime, &peer).await;
@@ -12729,7 +12732,7 @@ fn bounded_overlay_neighbor_endpoint_records(
 
 fn bounded_overlay_endpoint_records_with_previous(
     current: Vec<OverlayNeighborEndpoint>,
-    previous: Option<&PreviousBoundedOverlayEndpoints>,
+    previous: &VecDeque<PreviousBoundedOverlayEndpoints>,
 ) -> Vec<OverlayNeighborEndpoint> {
     let mut node_ids = current
         .iter()
@@ -12740,7 +12743,7 @@ fn bounded_overlay_endpoint_records_with_previous(
         .map(|record| record.udp_endpoint)
         .collect::<BTreeSet<_>>();
     let mut combined = current;
-    if let Some(previous) = previous {
+    for previous in previous.iter().rev() {
         combined.extend(previous.records.iter().filter_map(|record| {
             if node_ids.contains(&record.node_id) || endpoints.contains(&record.udp_endpoint) {
                 return None;
@@ -19584,11 +19587,17 @@ impl PeerMapSource for HttpPeerMapSource {
             .iter()
             .map(|neighbor| neighbor.node.clone())
             .collect::<Vec<_>>();
-        merge_control_client_projection(&mut peers, neighbor_map.client_route_peers);
         let mut peer_ids = peers
             .iter()
             .map(|peer| peer.node_id.clone())
             .collect::<BTreeSet<_>>();
+        for peer in self.runtime.retained_overlay_neighbors().await {
+            if peer_ids.insert(peer.node_id.clone()) {
+                peers.push(peer);
+            }
+        }
+        merge_control_client_projection(&mut peers, neighbor_map.client_route_peers);
+        peer_ids.extend(peers.iter().map(|peer| peer.node_id.clone()));
         for peer in self.runtime.resolved_overlay_peers().await {
             if peer.node_id == *node_id {
                 continue;
@@ -21493,9 +21502,29 @@ mod tests {
 
         let mut neighbor = node_record("bounded-neighbor");
         neighbor.vpn_ip = VpnIp("100.64.0.2".parse()?);
+        let mut retained_neighbor = node_record("retained-neighbor");
+        retained_neighbor.vpn_ip = VpnIp("100.64.0.4".parse()?);
         let mut client_peer = node_record("direct-client");
         client_peer.role = Role::client();
         client_peer.vpn_ip = VpnIp("100.64.0.3".parse()?);
+        let generated_at = Utc::now();
+        runtime
+            .record_neighbor_map_snapshot(NeighborMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                node_id: local_node.clone(),
+                topology_epoch: 6,
+                max_degree: 4,
+                vpn_cidr: "100.64.0.0/10".parse()?,
+                neighbors: vec![ipars_types::OverlayNeighbor {
+                    node: retained_neighbor.clone(),
+                    kind: ipars_types::OverlayNeighborKind::BackbonePrimary,
+                }],
+                aggregate_routes: Vec::new(),
+                client_route_peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
+                generated_at,
+            })
+            .await?;
         let neighbor_map = NeighborMap {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: local_node.clone(),
@@ -21509,7 +21538,7 @@ mod tests {
             aggregate_routes: Vec::new(),
             client_route_peers: vec![client_peer.clone()],
             bootstrap_endpoints: Vec::new(),
-            generated_at: Utc::now(),
+            generated_at: generated_at + chrono::Duration::milliseconds(1),
         };
         let (control_plane_url, control_plane_task) = spawn_test_http_service(Router::new().route(
             "/v1/neighbors/query",
@@ -21528,11 +21557,15 @@ mod tests {
 
         let peer_map = source.fetch_peer_map(&local_node).await?;
 
-        assert_eq!(peer_map.peers.len(), 2);
+        assert_eq!(peer_map.peers.len(), 3);
         assert!(peer_map
             .peers
             .iter()
             .any(|peer| peer.node_id == neighbor.node_id));
+        assert!(peer_map
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == retained_neighbor.node_id));
         assert!(peer_map
             .peers
             .iter()
@@ -35793,22 +35826,100 @@ exec sleep 60
             .contains_key(&node_c.node_id));
         assert_eq!(
             runtime_a.overlay_forwarder_endpoint(&node_c.node_id).await,
+            Some(proxy_a)
+        );
+
+        request[8] = 0x43;
+        wireguard_a.send_to(&request, proxy_a).await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), wireguard_c.recv_from(&mut received))
+                .await??;
+        assert_eq!(&received[..length], &request);
+
+        let mut map_a_latest = overlay_map(&node_a, std::slice::from_ref(&node_b));
+        map_a_latest.topology_epoch = 9;
+        map_a_latest.generated_at = map_a_next.generated_at + chrono::Duration::seconds(1);
+        runtime_a
+            .record_neighbor_map_snapshot(map_a_latest.clone())
+            .await?;
+        active_a
+            .reconcile(runtime_a.as_ref(), &config_a, map_a_latest.clone())
+            .await?;
+        assert_eq!(active_a.previous_endpoints.len(), 2);
+        request[8] = 0x44;
+        wireguard_a.send_to(&request, proxy_a).await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), wireguard_c.recv_from(&mut received))
+                .await??;
+        assert_eq!(&received[..length], &request);
+
+        for topology_epoch in 10_u64..=16 {
+            let mut next_map = overlay_map(&node_a, std::slice::from_ref(&node_b));
+            next_map.topology_epoch = topology_epoch;
+            next_map.generated_at = map_a_latest.generated_at + chrono::Duration::milliseconds(1);
+            runtime_a
+                .record_neighbor_map_snapshot(next_map.clone())
+                .await?;
+            active_a
+                .reconcile(runtime_a.as_ref(), &config_a, next_map.clone())
+                .await?;
+            map_a_latest = next_map;
+        }
+        assert_eq!(
+            active_a.previous_endpoints.len(),
+            MAX_OVERLAY_PREVIOUS_TOPOLOGIES
+        );
+        assert_eq!(
+            active_a
+                .previous_endpoints
+                .front()
+                .map(|previous| previous.topology_epoch),
+            Some(8)
+        );
+        assert!(!active_a.peer_tasks.contains_key(&node_c.node_id));
+        assert_eq!(
+            runtime_a.overlay_forwarder_endpoint(&node_c.node_id).await,
             None
         );
 
         let mut path_a_next = overlay_path(&node_a, &node_b, &node_c);
-        path_a_next.topology_epoch = 8;
-        path_a_next.generated_at = map_a_next.generated_at;
+        path_a_next.topology_epoch = map_a_latest.topology_epoch;
+        path_a_next.generated_at = map_a_latest.generated_at;
         runtime_a
             .record_resolved_overlay_path(path_a_next, Utc::now())
             .await?;
         active_a
-            .reconcile(runtime_a.as_ref(), &config_a, map_a_next)
+            .reconcile(runtime_a.as_ref(), &config_a, map_a_latest.clone())
             .await?;
-        assert_eq!(
-            runtime_a.overlay_forwarder_endpoint(&node_c.node_id).await,
-            Some(proxy_a)
-        );
+        let migrated_proxy = runtime_a
+            .overlay_forwarder_endpoint(&node_c.node_id)
+            .await
+            .context("latest topology should create a replacement peer proxy")?;
+        assert_ne!(migrated_proxy, proxy_a);
+        let mut map_b_latest = overlay_map(&node_b, &[node_a.clone(), node_c.clone()]);
+        map_b_latest.topology_epoch = map_a_latest.topology_epoch;
+        map_b_latest.generated_at = map_a_latest.generated_at;
+        runtime_b
+            .record_neighbor_map_snapshot(map_b_latest.clone())
+            .await?;
+        active_b
+            .reconcile(runtime_b.as_ref(), &config_b, map_b_latest)
+            .await?;
+        let mut map_c_latest = overlay_map(&node_c, std::slice::from_ref(&node_b));
+        map_c_latest.topology_epoch = map_a_latest.topology_epoch;
+        map_c_latest.generated_at = map_a_latest.generated_at;
+        runtime_c
+            .record_neighbor_map_snapshot(map_c_latest.clone())
+            .await?;
+        active_c
+            .reconcile(runtime_c.as_ref(), &config_c, map_c_latest)
+            .await?;
+        request[8] = 0x45;
+        wireguard_a.send_to(&request, migrated_proxy).await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), wireguard_c.recv_from(&mut received))
+                .await??;
+        assert_eq!(&received[..length], &request);
 
         drop(active_a);
         drop(active_b);
