@@ -2177,6 +2177,96 @@ if document.get("role") not in {
   die "local Patroni role did not become healthy after restart"
 }
 
+validate_patroni_topology_document() {
+  local document="$1"
+  local expected_sync
+  expected_sync="$(((10#$(mapping_count "$dcs_members") - 1) / 2))"
+  python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+final_members = dict(item.split("=", 1) for item in sys.argv[1].split(","))
+legacy_members = dict(item.split("=", 1) for item in sys.argv[2].split(","))
+port = sys.argv[3]
+expected_sync = int(sys.argv[4])
+if not isinstance(document, list) or len(document) != len(final_members):
+    raise SystemExit(1)
+
+seen = set()
+primary_count = 0
+sync_count = 0
+all_final = True
+timelines = set()
+for row in document:
+    if not isinstance(row, dict):
+        raise SystemExit(1)
+    name = row.get("Member")
+    host = row.get("Host")
+    role = row.get("Role")
+    state = row.get("State")
+    timeline = row.get("TL")
+    if (
+        not isinstance(name, str)
+        or name not in final_members
+        or name in seen
+        or not isinstance(host, str)
+        or not isinstance(role, str)
+        or not isinstance(state, str)
+        or not isinstance(timeline, int)
+        or timeline <= 0
+    ):
+        raise SystemExit(1)
+    seen.add(name)
+    timelines.add(timeline)
+    final_host = f"{final_members[name]}:{port}"
+    legacy_host = f"{legacy_members[name]}:{port}"
+    if host not in {final_host, legacy_host}:
+        raise SystemExit(1)
+    all_final = all_final and host == final_host
+
+    normalized_role = role.lower()
+    normalized_state = state.lower()
+    if normalized_role in {"leader", "primary", "master"}:
+        if normalized_state != "running":
+            raise SystemExit(1)
+        primary_count += 1
+    elif normalized_role in {"replica", "sync standby"}:
+        if normalized_state != "streaming":
+            raise SystemExit(1)
+        sync_count += normalized_role == "sync standby"
+    else:
+        raise SystemExit(1)
+
+if (
+    seen != set(final_members)
+    or primary_count != 1
+    or sync_count < expected_sync
+    or len(timelines) != 1
+):
+    raise SystemExit(1)
+print("final" if all_final else "mixed")
+' "$members" "$legacy_members" "$postgres_port" "$expected_sync" <<<"$document"
+}
+
+verify_rolling_patroni_topology() {
+  local attempt document phase
+  for attempt in {1..60}; do
+    if document="$(
+      env PAGER=cat \
+        /opt/heteronetwork/postgres-ha/patroni/bin/patronictl \
+        -c "$state_dir/patroni.yml" list -f json 2>/dev/null
+    )" && phase="$(
+      validate_patroni_topology_document "$document" 2>/dev/null
+    )"; then
+      printf '%s' "$phase"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 verify_local_etcd_listener_ownership() {
   local main_pid sockets
   main_pid="$(
@@ -2273,8 +2363,13 @@ apply_node() {
   systemctl_action is-active --quiet "$patroni_service" \
     || die "Patroni is inactive after explicit restart"
   verify_patroni_role_at "$node_address"
-  run_standard_helper "$bundle_dir" verify \
-    || die "full PostgreSQL HA verification failed after local underlay apply"
+  local topology_phase
+  topology_phase="$(verify_rolling_patroni_topology)" \
+    || die "PostgreSQL HA topology did not stabilize after local underlay apply"
+  if [[ "$topology_phase" == "final" ]]; then
+    run_standard_helper "$bundle_dir" verify \
+      || die "full PostgreSQL HA verification failed after final underlay apply"
+  fi
   log "applied underlay topology revision $topology_revision to $node_name"
 }
 
@@ -2727,6 +2822,24 @@ EOF
   if grep -Fq '100.64.10.1' "$control_probe_log" \
     || grep -Fq '10.250.0.2' "$control_probe_log"; then
     die "control endpoint discovery probed the excluded local voter"
+  fi
+  local patroni_mixed patroni_final patroni_unmanaged
+  patroni_mixed='[
+    {"Member":"db-a","Host":"100.64.10.1:55432","Role":"Leader","State":"running","TL":7},
+    {"Member":"db-b","Host":"10.250.0.3:55432","Role":"Sync Standby","State":"streaming","TL":7},
+    {"Member":"db-c","Host":"100.64.10.3:55432","Role":"Replica","State":"streaming","TL":7}
+  ]'
+  patroni_final='[
+    {"Member":"db-a","Host":"100.64.10.1:55432","Role":"Leader","State":"running","TL":7},
+    {"Member":"db-b","Host":"100.64.10.2:55432","Role":"Sync Standby","State":"streaming","TL":7},
+    {"Member":"db-c","Host":"100.64.10.3:55432","Role":"Replica","State":"streaming","TL":7}
+  ]'
+  [[ "$(validate_patroni_topology_document "$patroni_mixed")" == "mixed" ]]
+  [[ "$(validate_patroni_topology_document "$patroni_final")" == "final" ]]
+  patroni_unmanaged="${patroni_mixed/10.250.0.3/203.0.113.20}"
+  if validate_patroni_topology_document "$patroni_unmanaged" \
+      >/dev/null 2>&1; then
+    die "rolling Patroni validator accepted an unmanaged member address"
   fi
   route_output_matches \
     '100.64.10.2 dev tailscale0 src 100.64.10.1 uid 0' \

@@ -258,8 +258,12 @@ later migration phase requires all endpoints, not merely a quorum.
    This applies the final `underlay-v1` Patroni member map and HAProxy backend
    map, explicitly restarts the local Patroni service, verifies a healthy local
    database role on the underlay address, and verifies that the PostgreSQL and
-   etcd data-directory identities did not change. Do not apply the next member
-   until the restarted member and every DCS endpoint are healthy.
+   etcd data-directory identities did not change. During the rolling phase it
+   accepts only the declared legacy or underlay member addresses while
+   requiring one primary, every replica streaming on one timeline, and the
+   configured synchronous-standby count. The last member additionally runs the
+   full final-address HA verification. Do not apply the next member until the
+   restarted member and every DCS endpoint are healthy.
 
 4. After `apply-node` has succeeded on every member, remove legacy DCS
    forwarders on each DCS voter:
