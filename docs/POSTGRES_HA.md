@@ -105,6 +105,10 @@ database quorum or make a Control Plane lose its local HAProxy database path.
 Bundles persist a one-to-one mapping between database member names and
 HeteroNetwork node IDs. An existing node ID cannot be rebound to a different
 underlay address, and a member name cannot be rebound to another node ID.
+The manifest also persists `HETERONETWORK_DB_CLIENT_CIDRS` and
+`HETERONETWORK_DB_EXTRA_HBA_ENTRIES` through topology expansion and local
+application. Empty access lists are recorded explicitly; each key must occur
+exactly once, and every non-empty value must pass CIDR and HBA validation.
 Bundles without this identity map or the `underlay-v1` marker, and bundles
 containing any currently registered VPN address as a database member, are
 rejected. The autopilot does not rewrite such a topology automatically:

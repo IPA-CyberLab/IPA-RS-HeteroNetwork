@@ -301,8 +301,17 @@ validate_sql_identifier() {
     || die "invalid lowercase PostgreSQL identifier: $value"
 }
 
+validate_nonempty_csv() {
+  local value="$1"
+  local label="$2"
+  [[ -z "$value" \
+    || ("$value" != ,* && "$value" != *, && "$value" != *,,*) ]] \
+    || die "$label must not contain empty entries"
+}
+
 extra_hba_rows() {
   [[ -n "$extra_hba_entries" ]] || return 0
+  validate_nonempty_csv "$extra_hba_entries" "extra HBA entries"
   local -a entries
   local entry database user cidr remainder
   local -A seen=()
@@ -341,6 +350,7 @@ application_cidrs() {
   seen["127.0.0.1/32"]=1
 
   [[ -n "$client_cidrs" ]] || return 0
+  validate_nonempty_csv "$client_cidrs" "client CIDRs"
   local -a values
   IFS=, read -r -a values <<<"$client_cidrs"
   for cidr in "${values[@]}"; do
@@ -921,13 +931,14 @@ EOF
 bundle_manifest_value() {
   local output="$1"
   local key="$2"
-  awk -v key="$key" '
+  local allow_empty="${3:-false}"
+  awk -v key="$key" -v allow_empty="$allow_empty" '
     index($0, key "=") == 1 {
       count += 1
       value = substr($0, length(key) + 2)
     }
     END {
-      if (count != 1 || value == "") {
+      if (count != 1 || (allow_empty != "true" && value == "")) {
         exit 1
       }
       print value
@@ -953,10 +964,30 @@ mapping_value_for_name() {
       '
 }
 
+validate_bundle_access_manifest() {
+  local output="$1"
+  [[ -f "$output/manifest.env" && ! -L "$output/manifest.env" ]] \
+    || die "existing bundle manifest is missing or unsafe"
+  local persisted_client_cidrs persisted_extra_hba_entries
+  persisted_client_cidrs="$(
+    bundle_manifest_value "$output" HETERONETWORK_DB_CLIENT_CIDRS true
+  )" || die "existing bundle has no valid client CIDR manifest entry"
+  persisted_extra_hba_entries="$(
+    bundle_manifest_value "$output" HETERONETWORK_DB_EXTRA_HBA_ENTRIES true
+  )" || die "existing bundle has no valid extra HBA manifest entry"
+  (
+    client_cidrs="$persisted_client_cidrs"
+    extra_hba_entries="$persisted_extra_hba_entries"
+    application_cidrs >/dev/null
+    extra_hba_rows >/dev/null
+  ) || die "existing bundle has invalid client CIDRs or extra HBA entries"
+}
+
 validate_existing_bundle_identity_stability() {
   local output="$1"
   [[ -f "$output/manifest.env" && ! -L "$output/manifest.env" ]] \
     || die "existing bundle manifest is missing or unsafe"
+  validate_bundle_access_manifest "$output"
   local old_members old_identities old_network_plane
   old_members="$(bundle_manifest_value "$output" HETERONETWORK_DB_MEMBERS)" \
     || die "existing bundle has no valid member map"
@@ -1001,6 +1032,8 @@ HETERONETWORK_DB_MEMBERS=${members}
 HETERONETWORK_DB_MEMBER_IDENTITIES=${member_identities}
 HETERONETWORK_DB_DCS_MEMBERS=${dcs_members}
 HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=${dcs_bootstrap_members}
+HETERONETWORK_DB_CLIENT_CIDRS=${client_cidrs}
+HETERONETWORK_DB_EXTRA_HBA_ENTRIES=${extra_hba_entries}
 HETERONETWORK_DB_SERVICE_NAME=${service_name}
 HETERONETWORK_DB_POSTGRES_PORT=${postgres_port}
 HETERONETWORK_DB_REST_PORT=${rest_port}
@@ -1078,6 +1111,7 @@ validate_bundle() {
   validate_common_config
   require_command openssl
   validate_bundle_authority "$output"
+  validate_bundle_access_manifest "$output"
   local original_bundle_dir="$bundle_dir"
   bundle_dir="$output"
   local secret
@@ -1675,6 +1709,7 @@ self_test() {
   local original_node_name="$node_name"
   local original_node_address="$node_address"
   local original_client_listen_address="$client_listen_address"
+  local original_client_cidrs="$client_cidrs"
   local original_extra_hba_entries="$extra_hba_entries"
   local original_bundle_dir="$bundle_dir"
   local test_dir
@@ -1692,6 +1727,7 @@ self_test() {
   node_name="db-a"
   node_address="100.64.10.1"
   client_listen_address="10.250.0.1"
+  client_cidrs="192.0.2.0/24,198.51.100.10/32"
   extra_hba_entries="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   bundle_dir="$test_dir/bundle"
   install -d -m 0700 "$bundle_dir/secrets"
@@ -1749,6 +1785,45 @@ self_test() {
   grep -Fq \
     'HETERONETWORK_DB_MEMBER_IDENTITIES=db-a=node-a,db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f' \
     "$test_dir/generated-bundle/manifest.env"
+  grep -Fxq \
+    'HETERONETWORK_DB_CLIENT_CIDRS=192.0.2.0/24,198.51.100.10/32' \
+    "$test_dir/generated-bundle/manifest.env"
+  grep -Fxq \
+    'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
+    "$test_dir/generated-bundle/manifest.env"
+  validate_bundle_access_manifest "$test_dir/generated-bundle"
+  local empty_access_manifest="$test_dir/empty-access-manifest"
+  install -d -m 0700 "$empty_access_manifest"
+  client_cidrs=""
+  extra_hba_entries=""
+  write_bundle_manifest "$empty_access_manifest"
+  grep -Fxq 'HETERONETWORK_DB_CLIENT_CIDRS=' \
+    "$empty_access_manifest/manifest.env"
+  grep -Fxq 'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=' \
+    "$empty_access_manifest/manifest.env"
+  validate_bundle_access_manifest "$empty_access_manifest"
+  local invalid_access_manifest="$test_dir/invalid-access-manifest"
+  cp -a "$empty_access_manifest" "$invalid_access_manifest"
+  sed -i \
+    's|^HETERONETWORK_DB_CLIENT_CIDRS=$|HETERONETWORK_DB_CLIENT_CIDRS=192.0.2.0/33|' \
+    "$invalid_access_manifest/manifest.env"
+  if (
+    validate_bundle_access_manifest "$invalid_access_manifest" >/dev/null 2>&1
+  ); then
+    die "invalid client CIDR bundle manifest entry was accepted"
+  fi
+  rm -rf "$invalid_access_manifest"
+  cp -a "$empty_access_manifest" "$invalid_access_manifest"
+  sed -i \
+    's|^HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$|HETERONETWORK_DB_EXTRA_HBA_ENTRIES=Keycloak:keycloak:10.250.0.4/32|' \
+    "$invalid_access_manifest/manifest.env"
+  if (
+    validate_bundle_access_manifest "$invalid_access_manifest" >/dev/null 2>&1
+  ); then
+    die "invalid extra HBA bundle manifest entry was accepted"
+  fi
+  client_cidrs="192.0.2.0/24,198.51.100.10/32"
+  extra_hba_entries="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   if (
     member_identities="db-a=node-z,db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f"
     validate_existing_bundle_identity_stability \
@@ -1765,6 +1840,12 @@ self_test() {
     -CAfile "$test_dir/generated-bundle/ca/ca.crt" \
     "$test_dir/generated-bundle/nodes/db-g/node.crt" >/dev/null
   grep -Fq 'HETERONETWORK_DB_TOPOLOGY_REVISION=8' \
+    "$test_dir/generated-bundle/manifest.env"
+  grep -Fxq \
+    'HETERONETWORK_DB_CLIENT_CIDRS=192.0.2.0/24,198.51.100.10/32' \
+    "$test_dir/generated-bundle/manifest.env"
+  grep -Fxq \
+    'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
     "$test_dir/generated-bundle/manifest.env"
   members="${members%,db-g=100.64.10.7}"
   member_identities="${member_identities%,db-g=node-g}"
@@ -1842,6 +1923,7 @@ self_test() {
   node_name="$original_node_name"
   node_address="$original_node_address"
   client_listen_address="$original_client_listen_address"
+  client_cidrs="$original_client_cidrs"
   extra_hba_entries="$original_extra_hba_entries"
   bundle_dir="$original_bundle_dir"
   rm -rf "$test_dir"

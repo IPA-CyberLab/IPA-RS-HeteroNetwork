@@ -103,6 +103,10 @@ validate_config() {
     [[ "$HETERONETWORK_DB_UNDERLAY_INTERFACE" != "heteronetwork0" ]] \
       || die "database underlay interface must not be heteronetwork0"
   fi
+  validate_database_access_values \
+    "${HETERONETWORK_DB_CLIENT_CIDRS:-}" \
+    "${HETERONETWORK_DB_EXTRA_HBA_ENTRIES:-}" \
+    || die "invalid database client CIDRs or extra HBA entries"
 }
 
 install_coordination_dependencies() {
@@ -231,6 +235,55 @@ ipv4_is_in_cidr() {
 is_valid_node_id() {
   local value="$1"
   [[ ${#value} -le 255 && "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]]
+}
+
+is_valid_access_cidr() {
+  local value="$1"
+  local address prefix extra
+  IFS=/ read -r address prefix extra <<<"$value"
+  [[ -z "${extra:-}" && -n "${address:-}" && "$prefix" =~ ^[0-9]{1,2}$ ]] \
+    || return 1
+  ((10#$prefix <= 32)) || return 1
+  is_valid_ipv4 "$address"
+}
+
+validate_database_access_values() {
+  local client_cidrs_input="$1"
+  local extra_hba_entries_input="$2"
+  local entry database user cidr remainder
+  local -a entries
+
+  if [[ -n "$client_cidrs_input" ]]; then
+    [[ "$client_cidrs_input" == "${client_cidrs_input//[[:space:]]/}" \
+      && "$client_cidrs_input" != ,* \
+      && "$client_cidrs_input" != *, \
+      && "$client_cidrs_input" != *,,* ]] || return 1
+    IFS=, read -r -a entries <<<"$client_cidrs_input"
+    for cidr in "${entries[@]}"; do
+      is_valid_access_cidr "$cidr" || return 1
+    done
+  fi
+
+  if [[ -n "$extra_hba_entries_input" ]]; then
+    [[ "$extra_hba_entries_input" == "${extra_hba_entries_input//[[:space:]]/}" \
+      && "$extra_hba_entries_input" != ,* \
+      && "$extra_hba_entries_input" != *, \
+      && "$extra_hba_entries_input" != *,,* ]] || return 1
+    IFS=, read -r -a entries <<<"$extra_hba_entries_input"
+    for entry in "${entries[@]}"; do
+      database="${entry%%:*}"
+      remainder="${entry#*:}"
+      [[ "$remainder" != "$entry" ]] || return 1
+      user="${remainder%%:*}"
+      cidr="${remainder#*:}"
+      [[ "$cidr" != "$remainder" && "$cidr" != *:* ]] || return 1
+      [[ ${#database} -le 63 && "$database" =~ ^[a-z_][a-z0-9_]*$ ]] \
+        || return 1
+      [[ ${#user} -le 63 && "$user" =~ ^[a-z_][a-z0-9_]*$ ]] \
+        || return 1
+      is_valid_access_cidr "$cidr" || return 1
+    done
+  fi
 }
 
 candidate_ipv4_addresses() {
@@ -1191,13 +1244,14 @@ PY
 manifest_value() {
   local directory="$1"
   local key="$2"
-  awk -v key="$key" '
+  local allow_empty="${3:-false}"
+  awk -v key="$key" -v allow_empty="$allow_empty" '
     index($0, key "=") == 1 {
       count += 1
       value = substr($0, length(key) + 2)
     }
     END {
-      if (count != 1 || value == "") {
+      if (count != 1 || (allow_empty != "true" && value == "")) {
         exit 1
       }
       print value
@@ -1218,11 +1272,19 @@ load_bundle_manifest() {
   manifest_dcs_bootstrap_members="$(
     manifest_value "$directory" HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS
   )"
+  manifest_client_cidrs="$(
+    manifest_value "$directory" HETERONETWORK_DB_CLIENT_CIDRS true
+  )" || return 1
+  manifest_extra_hba_entries="$(
+    manifest_value "$directory" HETERONETWORK_DB_EXTRA_HBA_ENTRIES true
+  )" || return 1
   manifest_service_name="$(manifest_value "$directory" HETERONETWORK_DB_SERVICE_NAME)"
   manifest_postgres_port="$(manifest_value "$directory" HETERONETWORK_DB_POSTGRES_PORT)"
   manifest_rest_port="$(manifest_value "$directory" HETERONETWORK_DB_REST_PORT)"
   manifest_revision="$(manifest_value "$directory" HETERONETWORK_DB_TOPOLOGY_REVISION)"
   manifest_network_plane="$(manifest_value "$directory" HETERONETWORK_DB_NETWORK_PLANE)"
+  validate_database_access_values \
+    "$manifest_client_cidrs" "$manifest_extra_hba_entries" || return 1
   [[ "$manifest_revision" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "$manifest_network_plane" == "$DATABASE_NETWORK_PLANE" ]] || return 1
   [[ -f "$directory/cluster-id" && ! -L "$directory/cluster-id" ]] || return 1
@@ -1244,6 +1306,8 @@ run_helper_for_bundle() {
     "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$manifest_dcs_bootstrap_members" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=existing" \
     "HETERONETWORK_DB_PROXY_BACKENDS=$manifest_members" \
+    "HETERONETWORK_DB_CLIENT_CIDRS=$manifest_client_cidrs" \
+    "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$manifest_extra_hba_entries" \
     "HETERONETWORK_DB_BUNDLE_DIR=$directory" \
     "HETERONETWORK_DB_SERVICE_NAME=$manifest_service_name" \
     "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
@@ -2143,11 +2207,17 @@ with open(snapshot, encoding="utf-8") as source:
             )
         if len(names) >= limit:
             continue
-        index = len(names)
-        suffix = string.ascii_lowercase[index] if index < 26 else "a" + string.ascii_lowercase[index - 26]
-        name = f"db-{suffix}"
-        if name in addresses_by_name:
-            raise SystemExit("generated database member name already exists")
+        for index in range(limit):
+            suffix = (
+                string.ascii_lowercase[index]
+                if index < 26
+                else "a" + string.ascii_lowercase[index - 26]
+            )
+            name = f"db-{suffix}"
+            if name not in addresses_by_name:
+                break
+        else:
+            raise SystemExit("no generated database member name is available")
         names.append(name)
         addresses_by_name[name] = address
         node_ids_by_name[name] = node_id
@@ -2327,6 +2397,8 @@ apply_local_bundle() {
     "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$manifest_dcs_bootstrap_members" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=$initial_state" \
     "HETERONETWORK_DB_PROXY_BACKENDS=$manifest_members" \
+    "HETERONETWORK_DB_CLIENT_CIDRS=$manifest_client_cidrs" \
+    "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$manifest_extra_hba_entries" \
     "HETERONETWORK_DB_BUNDLE_DIR=$bundle_dir" \
     "HETERONETWORK_DB_SERVICE_NAME=$manifest_service_name" \
     "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
@@ -2356,6 +2428,8 @@ bootstrap_bundle() {
     "HETERONETWORK_DB_DCS_MEMBERS=$dcs" \
     "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$dcs" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=new" \
+    "HETERONETWORK_DB_CLIENT_CIDRS=${HETERONETWORK_DB_CLIENT_CIDRS:-}" \
+    "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=${HETERONETWORK_DB_EXTRA_HBA_ENTRIES:-}" \
     "HETERONETWORK_DB_TOPOLOGY_REVISION=1" \
     "HETERONETWORK_DB_NETWORK_PLANE=$DATABASE_NETWORK_PLANE" \
     "$helper" init-bundle "$temporary"
@@ -2403,6 +2477,8 @@ stage_topology() {
     "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$new_dcs_bootstrap" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=existing" \
     "HETERONETWORK_DB_PROXY_BACKENDS=$new_members" \
+    "HETERONETWORK_DB_CLIENT_CIDRS=$manifest_client_cidrs" \
+    "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$manifest_extra_hba_entries" \
     "HETERONETWORK_DB_BUNDLE_DIR=$stage" \
     "HETERONETWORK_DB_SERVICE_NAME=$manifest_service_name" \
     "HETERONETWORK_DB_POSTGRES_PORT=$manifest_postgres_port" \
@@ -2725,8 +2801,22 @@ self_test() {
   HETERONETWORK_DB_CONTROL_PLANE_URLS_B64="$(
     printf '%s' 'https://control.example.test' | base64 -w0
   )"
+  HETERONETWORK_DB_CLIENT_CIDRS="192.0.2.0/24,198.51.100.10/32"
+  HETERONETWORK_DB_EXTRA_HBA_ENTRIES="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   reconcile_interval_seconds=30
   validate_config
+  if (
+    HETERONETWORK_DB_CLIENT_CIDRS="192.0.2.0/24,"
+    validate_config >/dev/null 2>&1
+  ); then
+    die "client CIDRs with an empty entry were accepted"
+  fi
+  if (
+    HETERONETWORK_DB_EXTRA_HBA_ENTRIES="Keycloak:keycloak:10.250.0.4/32"
+    validate_config >/dev/null 2>&1
+  ); then
+    die "invalid extra HBA entry was accepted"
+  fi
   if (
     HETERONETWORK_DB_UNDERLAY_INTERFACE="heteronetwork0"
     validate_config >/dev/null 2>&1
@@ -3019,6 +3109,52 @@ JSON
   [[ "$(member_count "$manifest_dcs_bootstrap_members")" == "3" ]]
   [[ "$manifest_revision" == "1" ]]
   [[ "$manifest_network_plane" == "$DATABASE_NETWORK_PLANE" ]]
+  [[ "$manifest_client_cidrs" == \
+    "192.0.2.0/24,198.51.100.10/32" ]]
+  [[ "$manifest_extra_hba_entries" == \
+    "keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32" ]]
+  local empty_access_bundle="$state_dir/empty-access-bundle"
+  cp -a "$bundle_dir" "$empty_access_bundle"
+  sed -i \
+    -e 's|^HETERONETWORK_DB_CLIENT_CIDRS=.*$|HETERONETWORK_DB_CLIENT_CIDRS=|' \
+    -e 's|^HETERONETWORK_DB_EXTRA_HBA_ENTRIES=.*$|HETERONETWORK_DB_EXTRA_HBA_ENTRIES=|' \
+    "$empty_access_bundle/manifest.env"
+  load_bundle_manifest "$empty_access_bundle"
+  [[ -z "$manifest_client_cidrs" ]]
+  [[ -z "$manifest_extra_hba_entries" ]]
+  validate_bundle_directory "$empty_access_bundle"
+  local invalid_access_bundle="$state_dir/invalid-access-bundle"
+  cp -a "$bundle_dir" "$invalid_access_bundle"
+  sed -i \
+    's|^HETERONETWORK_DB_CLIENT_CIDRS=.*$|HETERONETWORK_DB_CLIENT_CIDRS=192.0.2.0/33|' \
+    "$invalid_access_bundle/manifest.env"
+  if load_bundle_manifest "$invalid_access_bundle" >/dev/null 2>&1; then
+    die "bundle manifest with an invalid client CIDR was accepted"
+  fi
+  rm -rf "$invalid_access_bundle"
+  cp -a "$bundle_dir" "$invalid_access_bundle"
+  sed -i \
+    's|^HETERONETWORK_DB_EXTRA_HBA_ENTRIES=.*$|HETERONETWORK_DB_EXTRA_HBA_ENTRIES=Keycloak:keycloak:10.250.0.4/32|' \
+    "$invalid_access_bundle/manifest.env"
+  if load_bundle_manifest "$invalid_access_bundle" >/dev/null 2>&1; then
+    die "bundle manifest with an invalid extra HBA entry was accepted"
+  fi
+  rm -rf "$invalid_access_bundle"
+  cp -a "$bundle_dir" "$invalid_access_bundle"
+  sed -i '/^HETERONETWORK_DB_CLIENT_CIDRS=/d' \
+    "$invalid_access_bundle/manifest.env"
+  if load_bundle_manifest "$invalid_access_bundle" >/dev/null 2>&1; then
+    die "bundle manifest without a client CIDR entry was accepted"
+  fi
+  rm -rf "$invalid_access_bundle"
+  cp -a "$bundle_dir" "$invalid_access_bundle"
+  printf '%s\n' 'HETERONETWORK_DB_CLIENT_CIDRS=203.0.113.0/24' \
+    >>"$invalid_access_bundle/manifest.env"
+  if load_bundle_manifest "$invalid_access_bundle" >/dev/null 2>&1; then
+    die "bundle manifest with duplicate client CIDR entries was accepted"
+  fi
+  rm -rf "$empty_access_bundle" "$invalid_access_bundle"
+  load_bundle_manifest "$bundle_dir"
   cmp -s "$bundle_member_vpn_path" <(
     printf '%s\n' 10.250.0.2 10.250.0.3 10.250.0.10
   )
@@ -3135,6 +3271,28 @@ JSON
   [[ "$(member_count "$generated")" == "5" ]]
   [[ "$(member_count "$generated_identities")" == "5" ]]
   [[ "$generated" != *"10.250."* ]]
+  cp "$eligible_path" "$temporary/eligible-before-legacy-expansion.tsv"
+  printf '%s\n' \
+    $'10.250.0.3\tnode-b\t100.89.33.61' \
+    $'10.250.0.10\tnode-c\t163.220.236.52' \
+    $'10.250.0.4\tnode-d\t163.220.236.51' \
+    $'10.250.0.5\tnode-e\t100.94.130.38' \
+    $'10.250.0.6\tnode-f\t192.0.2.50' \
+    $'10.250.0.2\tnode-a\t100.123.154.79' \
+    >"$eligible_path"
+  local legacy_expanded legacy_members legacy_identities
+  legacy_expanded="$(
+    expand_members_from_snapshot \
+      "db-b=100.89.33.61,db-c=163.220.236.52,db-d=163.220.236.51,db-e=100.94.130.38,db-f=192.0.2.50" \
+      "db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f"
+  )"
+  legacy_members="${legacy_expanded%%$'\n'*}"
+  legacy_identities="${legacy_expanded#*$'\n'}"
+  [[ "$legacy_members" == \
+    "db-b=100.89.33.61,db-c=163.220.236.52,db-d=163.220.236.51,db-e=100.94.130.38,db-f=192.0.2.50,db-a=100.123.154.79" ]]
+  [[ "$legacy_identities" == \
+    "db-b=node-b,db-c=node-c,db-d=node-d,db-e=node-e,db-f=node-f,db-a=node-a" ]]
+  cp "$temporary/eligible-before-legacy-expansion.tsv" "$eligible_path"
   cp "$eligible_path" "$temporary/eligible-good.tsv"
   sed -i \
     's/100.123.154.79/100.123.154.80/' \
@@ -3156,6 +3314,10 @@ JSON
   [[ "$(member_count "$manifest_dcs_members")" == "5" ]]
   [[ "$(member_count "$manifest_dcs_bootstrap_members")" == "3" ]]
   [[ "$manifest_revision" == "2" ]]
+  [[ "$manifest_client_cidrs" == \
+    "192.0.2.0/24,198.51.100.10/32" ]]
+  [[ "$manifest_extra_hba_entries" == \
+    "keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32" ]]
   load_bundle_manifest "$bundle_dir"
   [[ "$(member_count "$manifest_dcs_members")" == "3" ]]
   rm -rf "$staged_five"
@@ -3169,8 +3331,40 @@ JSON
   [[ "$(member_count "$manifest_dcs_members")" == "5" ]]
   [[ "$(member_count "$manifest_dcs_bootstrap_members")" == "4" ]]
   [[ "$manifest_revision" == "3" ]]
+  [[ "$manifest_client_cidrs" == \
+    "192.0.2.0/24,198.51.100.10/32" ]]
+  [[ "$manifest_extra_hba_entries" == \
+    "keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32" ]]
   rm -rf "$staged_four"
   load_bundle_manifest "$bundle_dir"
+  local capture_helper="$temporary/capture-helper.sh"
+  cat >"$capture_helper" <<EOF
+#!/usr/bin/env bash
+env | LC_ALL=C sort >"$temporary/applied-helper.env"
+EOF
+  chmod 0700 "$capture_helper"
+  (
+    helper="$capture_helper"
+    configure_helper_environment() {
+      HETERONETWORK_DB_NODE_NAME="db-a"
+      HETERONETWORK_DB_NODE_ADDRESS="100.123.154.79"
+      HETERONETWORK_DB_INTERFACE="tailscale0"
+      export HETERONETWORK_DB_NODE_NAME
+      export HETERONETWORK_DB_NODE_ADDRESS
+      export HETERONETWORK_DB_INTERFACE
+    }
+    systemctl() {
+      return 1
+    }
+    apply_local_bundle node-a 100.123.154.79 >/dev/null
+  )
+  grep -Fxq \
+    'HETERONETWORK_DB_CLIENT_CIDRS=192.0.2.0/24,198.51.100.10/32' \
+    "$temporary/applied-helper.env"
+  grep -Fxq \
+    'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
+    "$temporary/applied-helper.env"
+  rm -f "$applied_revision_path"
 
   printf '%s\n' \
     $'node-b\t10.250.0.3' \
