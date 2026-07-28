@@ -32,10 +32,11 @@ use ipars_types::api::{
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, socket_addr_is_globally_routable, BootstrapEndpoint,
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, JoinTokenClaims, KeyId, NatConnectivityState,
-    NeighborMap, NodeId, OverlayPath, OverlayPathQuery, PathRecord, PathState, Role,
-    ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, JoinTokenClaims, KeyId,
+    NatConnectivityState, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath,
+    OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag,
+    TokenLedgerMetrics, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS,
+    MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -460,6 +461,25 @@ where
             "/v1/install/iparsd-linux-amd64",
             get(node_enrollment_binary::<S, L>),
         );
+    let protocol = if let Some(enrollment) = state.node_enrollment.as_deref() {
+        let bearer_token: Arc<str> = Arc::from(derive_node_enrollment_cluster_secret(
+            enrollment,
+            &state.plane.config().cluster_id,
+            b"heteronetwork-postgres-ha-autopilot-v1",
+        ));
+        let database_autopilot = Router::new()
+            .route(
+                "/v1/database-autopilot/nodes",
+                get(database_autopilot_nodes::<S, L>),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                bearer_token,
+                require_database_autopilot_bearer,
+            ));
+        protocol.merge(database_autopilot)
+    } else {
+        protocol
+    };
 
     let management_auth = Arc::new(ManagementAuth {
         operator_api_bearer_token: state.operator_api_bearer_token.clone(),
@@ -2217,7 +2237,510 @@ umask 077
 install -d -m 0755 /opt/heteronetwork/bin
 install -d -m 0700 /var/lib/heteronetwork
 tmp_dir=$(mktemp -d /var/lib/heteronetwork/install.XXXXXX)
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+iparsd_path=/opt/heteronetwork/bin/iparsd
+iparsd_previous_snapshot="$tmp_dir/iparsd.previous"
+iparsd_snapshot_ready=0
+iparsd_was_present=0
+iparsd_replaced=0
+relay_autopilot_transaction_active=0
+relay_autopilot_timer_enable_state=not-found
+relay_autopilot_timer_was_active=0
+relay_autopilot_service_was_active=0
+relay_service_was_active=0
+relay_agent_enable_state=not-found
+relay_agent_was_active=0
+relay_snapshot_ready=0
+relay_snapshot_dir="$tmp_dir/relay-rollback"
+relay_snapshot_manifest="$relay_snapshot_dir/manifest"
+relay_snapshot_directory_manifest="$relay_snapshot_dir/directories"
+relay_transaction_paths='
+/etc/sysusers.d/heteronetwork-relay.conf
+/etc/heteronetwork/relay-admission.token
+/etc/heteronetwork/relay-server-admission.token
+/etc/heteronetwork/relay-autopilot/relay.env
+/etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf
+/etc/systemd/system/heteronetwork-agent.service.d/20-relay-autopilot.conf
+/opt/heteronetwork/libexec/relay-autopilot.sh
+/etc/systemd/system/heteronetwork-relay.service
+/etc/systemd/system/heteronetwork-relay-autopilot.service
+/etc/systemd/system/heteronetwork-relay-autopilot.timer
+'
+relay_transaction_temporary_paths='
+/etc/heteronetwork/.relay-admission.token.new
+/etc/heteronetwork/.relay-server-admission.token.new
+/etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new
+/etc/systemd/system/.heteronetwork-relay.service.new
+/etc/systemd/system/.heteronetwork-relay-autopilot.service.new
+/etc/systemd/system/.heteronetwork-relay-autopilot.timer.new
+/etc/sysusers.d/.heteronetwork-relay.conf.new
+/opt/heteronetwork/libexec/.relay-autopilot.sh.new
+'
+relay_transaction_random_temporary_globs='
+/etc/heteronetwork/relay-autopilot/.relay.env.*
+/etc/systemd/system/heteronetwork-agent.service.d/.20-relay-autopilot.conf.*
+'
+relay_transaction_directories='
+/etc/heteronetwork/relay-autopilot
+/etc/systemd/system/heteronetwork-agent.service.d
+/opt/heteronetwork/libexec
+'
+
+verify_systemd_unit_stopped() (
+  unit_name=$1
+  unit_load_state=
+  unit_state=
+  if ! unit_load_state=$(systemctl show \
+    --property=LoadState --value "$unit_name" 2>/dev/null); then
+    echo "Unable to inspect $unit_name" >&2
+    return 1
+  fi
+  if [ "$unit_load_state" = "not-found" ]; then
+    return 0
+  fi
+  if ! unit_state=$(systemctl show --property=ActiveState --value "$unit_name" 2>/dev/null); then
+    echo "Unable to verify that $unit_name stopped" >&2
+    return 1
+  fi
+  case "$unit_state" in
+    inactive|failed)
+      return 0
+      ;;
+    *)
+      echo "$unit_name remains in $unit_state state" >&2
+      return 1
+      ;;
+  esac
+)
+
+stop_systemd_unit_with_kill() {
+  unit_name=$1
+  stop_reported_error=0
+  if ! systemctl stop "$unit_name"; then
+    stop_reported_error=1
+  fi
+  if verify_systemd_unit_stopped "$unit_name"; then
+    if [ "$stop_reported_error" -eq 1 ]; then
+      echo "$unit_name reported a stop error but is no longer active" >&2
+    fi
+    return 0
+  fi
+
+  echo "$unit_name did not stop normally; forcing its remaining processes down" >&2
+  if ! systemctl kill --kill-whom=all --signal=SIGKILL "$unit_name"; then
+    echo "Unable to send SIGKILL to $unit_name" >&2
+  fi
+  if ! systemctl stop "$unit_name"; then
+    echo "Unable to complete the forced stop job for $unit_name" >&2
+  fi
+  verify_systemd_unit_stopped "$unit_name"
+}
+
+systemd_unit_enable_state() {
+  unit_name=$1
+  unit_enable_state=
+  if unit_enable_state=$(systemctl is-enabled "$unit_name" 2>/dev/null); then
+    :
+  elif [ -z "$unit_enable_state" ]; then
+    unit_load_state=
+    if ! unit_load_state=$(systemctl show \
+      --property=LoadState --value "$unit_name" 2>/dev/null); then
+      echo "Unable to inspect enablement for $unit_name" >&2
+      return 1
+    fi
+    if [ "$unit_load_state" = "not-found" ]; then
+      unit_enable_state=not-found
+    else
+      echo "Unable to determine enablement for $unit_name" >&2
+      return 1
+    fi
+  fi
+  case "$unit_enable_state" in
+    enabled|enabled-runtime|linked|linked-runtime|alias|static|indirect|disabled|\
+masked|masked-runtime|generated|transient|not-found)
+      printf '%s\n' "$unit_enable_state"
+      ;;
+    *)
+      echo "Unsupported enablement state '$unit_enable_state' for $unit_name" >&2
+      return 1
+      ;;
+  esac
+}
+
+restore_systemd_unit_enable_state() {
+  unit_name=$1
+  expected_enable_state=$2
+  case "$expected_enable_state" in
+    enabled)
+      systemctl unmask "$unit_name" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit_name" >/dev/null 2>&1 || true
+      systemctl disable "$unit_name" >/dev/null 2>&1 || true
+      systemctl enable "$unit_name" >/dev/null
+      ;;
+    enabled-runtime)
+      systemctl unmask "$unit_name" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit_name" >/dev/null 2>&1 || true
+      systemctl disable "$unit_name" >/dev/null 2>&1 || true
+      systemctl enable --runtime "$unit_name" >/dev/null
+      ;;
+    disabled)
+      systemctl unmask "$unit_name" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit_name" >/dev/null 2>&1 || true
+      systemctl disable "$unit_name" >/dev/null 2>&1 || true
+      ;;
+    masked)
+      systemctl disable "$unit_name" >/dev/null 2>&1 || true
+      systemctl unmask --runtime "$unit_name" >/dev/null 2>&1 || true
+      systemctl mask "$unit_name" >/dev/null
+      ;;
+    masked-runtime)
+      systemctl disable "$unit_name" >/dev/null 2>&1 || true
+      systemctl unmask "$unit_name" >/dev/null 2>&1 || true
+      systemctl mask --runtime "$unit_name" >/dev/null
+      ;;
+    linked|linked-runtime|alias|static|indirect|generated|transient|not-found)
+      systemctl disable "$unit_name" >/dev/null 2>&1 || true
+      ;;
+    *)
+      echo "Refusing to restore unsupported enablement state '$expected_enable_state' for $unit_name" >&2
+      return 1
+      ;;
+  esac
+  actual_enable_state=$(systemd_unit_enable_state "$unit_name") || return 1
+  if [ "$actual_enable_state" != "$expected_enable_state" ]; then
+    echo "Unable to restore $unit_name enablement: expected $expected_enable_state, got $actual_enable_state" >&2
+    return 1
+  fi
+}
+
+remove_relay_transaction_temporary_files() {
+  relay_temporary_cleanup_failed=0
+  for relay_path in $relay_transaction_temporary_paths; do
+    if ! rm -f "$relay_path"; then
+      relay_temporary_cleanup_failed=1
+    fi
+  done
+  for relay_path in $relay_transaction_random_temporary_globs; do
+    if ! rm -f "$relay_path"; then
+      relay_temporary_cleanup_failed=1
+    fi
+  done
+  [ "$relay_temporary_cleanup_failed" -eq 0 ]
+}
+
+snapshot_iparsd_binary() {
+  rm -f "$iparsd_previous_snapshot"
+  iparsd_was_present=0
+  if [ -e "$iparsd_path" ] || [ -L "$iparsd_path" ]; then
+    if [ ! -f "$iparsd_path" ] && [ ! -L "$iparsd_path" ]; then
+      echo "Refusing to replace non-file HeteroNetwork binary path $iparsd_path" >&2
+      return 1
+    fi
+    cp -a -- "$iparsd_path" "$iparsd_previous_snapshot"
+    iparsd_was_present=1
+  fi
+  iparsd_snapshot_ready=1
+}
+
+restore_iparsd_binary() {
+  if [ "$iparsd_snapshot_ready" -ne 1 ]; then
+    return 0
+  fi
+  iparsd_restore_path="$iparsd_path.rollback.new"
+  if [ "$iparsd_was_present" -eq 1 ]; then
+    if [ ! -e "$iparsd_previous_snapshot" ] \
+      && [ ! -L "$iparsd_previous_snapshot" ]; then
+      echo "Previous HeteroNetwork binary snapshot is missing" >&2
+      return 1
+    fi
+    if ! rm -f "$iparsd_restore_path" \
+      || ! cp -a -- "$iparsd_previous_snapshot" "$iparsd_restore_path" \
+      || ! mv -f -- "$iparsd_restore_path" "$iparsd_path"; then
+      echo "Unable to restore the previous HeteroNetwork binary" >&2
+      rm -f "$iparsd_restore_path"
+      return 1
+    fi
+  elif ! rm -f "$iparsd_path" "$iparsd_restore_path"; then
+    echo "Unable to remove the HeteroNetwork binary created by the failed install" >&2
+    return 1
+  fi
+  iparsd_replaced=0
+}
+
+discard_iparsd_snapshot() {
+  rm -f "$iparsd_previous_snapshot"
+  iparsd_snapshot_ready=0
+  iparsd_was_present=0
+}
+
+snapshot_relay_transaction_files() {
+  rm -rf "$relay_snapshot_dir"
+  install -d -m 0700 "$relay_snapshot_dir/files"
+  : >"$relay_snapshot_manifest"
+  : >"$relay_snapshot_directory_manifest"
+  for relay_path in $relay_transaction_directories; do
+    if [ -e "$relay_path" ] || [ -L "$relay_path" ]; then
+      if [ ! -d "$relay_path" ] || [ -L "$relay_path" ]; then
+        echo "Refusing to snapshot non-directory Relay path $relay_path" >&2
+        return 1
+      fi
+      relay_directory_mode=$(stat -c '%a' "$relay_path")
+      relay_directory_uid=$(stat -c '%u' "$relay_path")
+      relay_directory_gid=$(stat -c '%g' "$relay_path")
+      printf 'present %s %s %s %s\n' \
+        "$relay_directory_mode" \
+        "$relay_directory_uid" \
+        "$relay_directory_gid" \
+        "$relay_path" >>"$relay_snapshot_directory_manifest"
+    else
+      printf 'absent - - - %s\n' "$relay_path" >>"$relay_snapshot_directory_manifest"
+    fi
+  done
+  for relay_path in $relay_transaction_paths; do
+    if [ -e "$relay_path" ] || [ -L "$relay_path" ]; then
+      if [ ! -f "$relay_path" ] && [ ! -L "$relay_path" ]; then
+        echo "Refusing to snapshot non-file Relay path $relay_path" >&2
+        return 1
+      fi
+      relay_snapshot_path="$relay_snapshot_dir/files$relay_path"
+      install -d -m 0700 "$(dirname "$relay_snapshot_path")"
+      cp -a -- "$relay_path" "$relay_snapshot_path"
+      printf 'present %s\n' "$relay_path" >>"$relay_snapshot_manifest"
+    else
+      printf 'absent %s\n' "$relay_path" >>"$relay_snapshot_manifest"
+    fi
+  done
+  relay_snapshot_ready=1
+}
+
+restore_relay_transaction_directories() {
+  relay_directory_restore_failed=0
+  while read -r relay_directory_state relay_directory_mode relay_directory_uid \
+    relay_directory_gid relay_path relay_extra; do
+    if [ -z "$relay_directory_state" ] || [ -z "$relay_path" ] || [ -n "$relay_extra" ]; then
+      echo "Invalid Relay directory rollback manifest entry" >&2
+      relay_directory_restore_failed=1
+      continue
+    fi
+    case "$relay_directory_state" in
+      present)
+        if [ ! -d "$relay_path" ] || [ -L "$relay_path" ]; then
+          echo "Relay rollback directory is missing $relay_path" >&2
+          relay_directory_restore_failed=1
+          continue
+        fi
+        relay_current_owner=$(stat -c '%u:%g' "$relay_path")
+        if [ "$relay_current_owner" != "$relay_directory_uid:$relay_directory_gid" ] \
+          && ! chown "$relay_directory_uid:$relay_directory_gid" "$relay_path"; then
+          echo "Unable to restore Relay directory ownership for $relay_path" >&2
+          relay_directory_restore_failed=1
+        fi
+        if ! chmod "$relay_directory_mode" "$relay_path"; then
+          echo "Unable to restore Relay directory mode for $relay_path" >&2
+          relay_directory_restore_failed=1
+        fi
+        ;;
+      absent)
+        if ! rmdir "$relay_path" 2>/dev/null \
+          && { [ -e "$relay_path" ] || [ -L "$relay_path" ]; }; then
+          echo "Unable to remove Relay directory created by the failed upgrade: $relay_path" >&2
+          relay_directory_restore_failed=1
+        fi
+        ;;
+      *)
+        echo "Invalid Relay directory rollback state for $relay_path" >&2
+        relay_directory_restore_failed=1
+        ;;
+    esac
+  done <"$relay_snapshot_directory_manifest"
+  [ "$relay_directory_restore_failed" -eq 0 ]
+}
+
+restore_relay_transaction_files() {
+  if [ "$relay_snapshot_ready" -ne 1 ] \
+    || [ ! -f "$relay_snapshot_manifest" ] \
+    || [ ! -f "$relay_snapshot_directory_manifest" ]; then
+    return 0
+  fi
+  relay_restore_failed=0
+  while read -r relay_snapshot_state relay_path relay_extra; do
+    if [ -z "$relay_snapshot_state" ] || [ -z "$relay_path" ] || [ -n "$relay_extra" ]; then
+      echo "Invalid Relay rollback manifest entry" >&2
+      relay_restore_failed=1
+      continue
+    fi
+    case "$relay_snapshot_state" in
+      present)
+        relay_snapshot_path="$relay_snapshot_dir/files$relay_path"
+        relay_restore_path="$relay_path.relay-rollback.new"
+        if [ ! -e "$relay_snapshot_path" ] && [ ! -L "$relay_snapshot_path" ]; then
+          echo "Relay rollback snapshot is missing $relay_path" >&2
+          relay_restore_failed=1
+          continue
+        fi
+        if ! mkdir -p "$(dirname "$relay_path")" \
+          || ! rm -f "$relay_restore_path" \
+          || ! cp -a -- "$relay_snapshot_path" "$relay_restore_path" \
+          || ! mv -f -- "$relay_restore_path" "$relay_path"; then
+          echo "Unable to restore Relay path $relay_path" >&2
+          rm -f "$relay_restore_path"
+          relay_restore_failed=1
+        fi
+        ;;
+      absent)
+        if ! rm -f "$relay_path" "$relay_path.relay-rollback.new"; then
+          echo "Unable to restore absent Relay path $relay_path" >&2
+          relay_restore_failed=1
+        fi
+        ;;
+      *)
+        echo "Invalid Relay rollback state for $relay_path" >&2
+        relay_restore_failed=1
+        ;;
+    esac
+  done <"$relay_snapshot_manifest"
+  if ! remove_relay_transaction_temporary_files; then
+    relay_restore_failed=1
+  fi
+  if ! restore_relay_transaction_directories; then
+    relay_restore_failed=1
+  fi
+  [ "$relay_restore_failed" -eq 0 ]
+}
+
+begin_relay_autopilot_transaction() {
+  relay_autopilot_timer_enable_state=$(
+    systemd_unit_enable_state heteronetwork-relay-autopilot.timer
+  )
+  relay_agent_enable_state=$(
+    systemd_unit_enable_state heteronetwork-agent.service
+  )
+  relay_autopilot_timer_was_active=0
+  relay_autopilot_service_was_active=0
+  relay_service_was_active=0
+  relay_agent_was_active=0
+  if systemctl is-active --quiet heteronetwork-relay-autopilot.timer; then
+    relay_autopilot_timer_was_active=1
+  fi
+  if systemctl is-active --quiet heteronetwork-relay-autopilot.service; then
+    relay_autopilot_service_was_active=1
+  fi
+  if systemctl is-active --quiet heteronetwork-relay.service; then
+    relay_service_was_active=1
+  fi
+  if systemctl is-active --quiet heteronetwork-agent.service; then
+    relay_agent_was_active=1
+  fi
+  relay_autopilot_transaction_active=1
+  stop_systemd_unit_with_kill heteronetwork-relay-autopilot.timer
+  stop_systemd_unit_with_kill heteronetwork-relay-autopilot.service
+  remove_relay_transaction_temporary_files
+  snapshot_relay_transaction_files
+}
+
+restore_relay_autopilot_transaction() {
+  relay_mutators_quiesced=1
+  if ! stop_systemd_unit_with_kill heteronetwork-relay-autopilot.timer; then
+    relay_mutators_quiesced=0
+  fi
+  if ! stop_systemd_unit_with_kill heteronetwork-relay-autopilot.service; then
+    relay_mutators_quiesced=0
+  fi
+  if [ "$relay_mutators_quiesced" -ne 1 ]; then
+    echo "Refusing Relay rollback because an autopilot mutator could not be stopped" >&2
+    return 1
+  fi
+  if ! stop_systemd_unit_with_kill heteronetwork-agent.service; then
+    echo "Refusing Relay rollback because the Agent advertisement could not be quiesced" >&2
+    return 1
+  fi
+  if ! stop_systemd_unit_with_kill heteronetwork-relay.service; then
+    echo "Refusing Relay rollback because the Relay runtime could not be stopped" >&2
+    return 1
+  fi
+
+  relay_rollback_failed=0
+  systemctl disable heteronetwork-relay-autopilot.timer >/dev/null 2>&1 || true
+  systemctl disable heteronetwork-agent.service >/dev/null 2>&1 || true
+  if ! restore_relay_transaction_files; then
+    echo "Unable to restore the previous Relay files" >&2
+    return 1
+  fi
+  if ! restore_iparsd_binary; then
+    return 1
+  fi
+  if ! systemctl daemon-reload; then
+    echo "Unable to reload systemd after restoring Relay files" >&2
+    return 1
+  fi
+  if ! restore_systemd_unit_enable_state \
+    heteronetwork-relay-autopilot.timer \
+    "$relay_autopilot_timer_enable_state"; then
+    relay_rollback_failed=1
+  fi
+  if ! restore_systemd_unit_enable_state \
+    heteronetwork-agent.service \
+    "$relay_agent_enable_state"; then
+    relay_rollback_failed=1
+  fi
+  if [ "$relay_rollback_failed" -ne 0 ]; then
+    return 1
+  fi
+
+  if [ "$relay_service_was_active" -eq 1 ]; then
+    if ! systemctl start heteronetwork-relay.service; then
+      echo "Unable to restore the previously active Relay service" >&2
+      return 1
+    fi
+  fi
+
+  if [ "$relay_agent_was_active" -eq 1 ]; then
+    if ! systemctl start heteronetwork-agent.service; then
+      echo "Unable to restore the previously active HeteroNetwork Agent" >&2
+      return 1
+    fi
+  fi
+
+  if [ "$relay_autopilot_timer_was_active" -eq 1 ]; then
+    if ! systemctl start heteronetwork-relay-autopilot.timer; then
+      echo "Unable to restore the active Relay autopilot timer" >&2
+      return 1
+    fi
+  fi
+  if [ "$relay_autopilot_service_was_active" -eq 1 ]; then
+    if ! systemctl start --no-block heteronetwork-relay-autopilot.service; then
+      echo "Unable to restart the previously active Relay autopilot reconciliation" >&2
+      return 1
+    fi
+  fi
+  relay_autopilot_transaction_active=0
+}
+
+commit_installer_transaction() {
+  relay_autopilot_transaction_active=0
+  discard_iparsd_snapshot
+}
+
+installer_exit_cleanup() {
+  installer_status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ "$installer_status" -ne 0 ] \
+    && [ "$relay_autopilot_transaction_active" -eq 1 ]; then
+    if ! restore_relay_autopilot_transaction; then
+      echo "Relay upgrade rollback did not fully restore the previous state" >&2
+    fi
+  elif [ "$installer_status" -ne 0 ] && [ "$iparsd_replaced" -eq 1 ]; then
+    if ! restore_iparsd_binary; then
+      echo "Installer rollback could not restore the previous HeteroNetwork binary" >&2
+    fi
+  fi
+  rm -rf "$tmp_dir"
+  exit "$installer_status"
+}
+trap installer_exit_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 auth='__AUTH__'
 binary="$tmp_dir/iparsd"
 download_bases='__DOWNLOAD_BASES__'
@@ -2239,8 +2762,10 @@ if [ -z "$downloaded" ]; then
   exit 1
 fi
 chmod 0755 "$binary"
-install -m 0755 "$binary" /opt/heteronetwork/bin/.iparsd.new
-mv -f /opt/heteronetwork/bin/.iparsd.new /opt/heteronetwork/bin/iparsd
+snapshot_iparsd_binary
+install -m 0755 "$binary" "$iparsd_path.new"
+mv -f "$iparsd_path.new" "$iparsd_path"
+iparsd_replaced=1
 
 caddy_archive="$tmp_dir/caddy.tar.gz"
 curl --proto '=https' --proto-redir '=https' -fsSL \
@@ -2361,6 +2886,7 @@ systemctl restart heteronetwork-agent.service
 __RELAY_AUTOPILOT_START__
 __DATABASE_INSTALL__
 __SETUP_INSTALL__
+commit_installer_transaction
 echo "HeteroNetwork node enrolled and started"
 "#;
     let download_bases = node_enrollment_download_bases(enrollment, bootstrap_endpoints)
@@ -2408,17 +2934,112 @@ fn relay_admission_install_script(
     enrollment: &NodeEnrollmentConfig,
     token: &SignedJoinToken,
 ) -> String {
-    const CLEANUP: &str = r#"systemctl disable --now heteronetwork-relay-autopilot.timer heteronetwork-relay.service >/dev/null 2>&1 || true
-systemctl stop heteronetwork-relay-autopilot.service heteronetwork-relay.service >/dev/null 2>&1 || true
-rm -f \
+    const CLEANUP: &str = r#"relay_cleanup_failed=0
+relay_advertisement_drop_in=/etc/systemd/system/heteronetwork-agent.service.d/20-relay-autopilot.conf
+relay_admission_drop_in=/etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf
+relay_runtime_env=/etc/heteronetwork/relay-autopilot/relay.env
+
+refresh_agent_after_relay_config_change() {
+  relay_config_change_ready=$1
+  relay_config_change_description=$2
+  relay_config_reloaded=0
+  if [ "$relay_config_change_ready" -eq 1 ]; then
+    if systemctl daemon-reload; then
+      relay_config_reloaded=1
+    else
+      echo "Unable to reload systemd after $relay_config_change_description" >&2
+    fi
+  fi
+  if [ "$relay_config_reloaded" -eq 1 ]; then
+    if systemctl is-active --quiet heteronetwork-agent.service; then
+      if systemctl restart heteronetwork-agent.service; then
+        return 0
+      fi
+      echo "Unable to restart heteronetwork-agent.service after $relay_config_change_description" >&2
+    elif verify_systemd_unit_stopped heteronetwork-agent.service; then
+      return 0
+    fi
+  fi
+  if stop_systemd_unit_with_kill heteronetwork-agent.service; then
+    return 0
+  fi
+  echo "Unable to apply $relay_config_change_description or verify a stopped HeteroNetwork Agent" >&2
+  return 1
+}
+
+if ! systemctl disable heteronetwork-relay-autopilot.timer \
+  heteronetwork-relay.service >/dev/null 2>&1; then
+  echo "Relay cleanup disable command reported an error; verifying final state" >&2
+fi
+if systemctl is-enabled --quiet heteronetwork-relay-autopilot.timer \
+  || systemctl is-enabled --quiet heteronetwork-relay.service; then
+  echo "A Relay unit remains enabled; refusing destructive cleanup" >&2
+  exit 1
+fi
+if ! stop_systemd_unit_with_kill heteronetwork-relay-autopilot.timer; then
+  echo "Unable to stop the Relay autopilot timer; preserving Relay state" >&2
+  exit 1
+fi
+if ! stop_systemd_unit_with_kill heteronetwork-relay-autopilot.service; then
+  echo "Unable to stop the Relay autopilot mutator; preserving Relay state" >&2
+  exit 1
+fi
+if ! remove_relay_transaction_temporary_files; then
+  relay_cleanup_failed=1
+fi
+
+relay_advertisement_removed=1
+if [ -e "$relay_advertisement_drop_in" ] || [ -L "$relay_advertisement_drop_in" ]; then
+  if ! rm -f "$relay_advertisement_drop_in"; then
+    echo "Unable to remove the Relay advertisement after stopping its autopilot" >&2
+    relay_advertisement_removed=0
+    relay_cleanup_failed=1
+  fi
+fi
+if ! refresh_agent_after_relay_config_change \
+  "$relay_advertisement_removed" \
+  "withdrawing Relay advertisement"; then
+  echo "Preserving the running Relay and its environment because advertisement withdrawal is unconfirmed" >&2
+  exit 1
+fi
+if [ "$relay_advertisement_removed" -ne 1 ]; then
+  echo "Preserving the running Relay and its environment because the advertisement remains on disk" >&2
+  exit 1
+fi
+
+relay_admission_removed=1
+if [ -e "$relay_admission_drop_in" ] || [ -L "$relay_admission_drop_in" ]; then
+  if ! rm -f "$relay_admission_drop_in"; then
+    echo "Unable to remove Relay admission configuration from heteronetwork-agent.service" >&2
+    relay_admission_removed=0
+    relay_cleanup_failed=1
+  fi
+fi
+if ! refresh_agent_after_relay_config_change \
+  "$relay_admission_removed" \
+  "removing Relay admission configuration"; then
+  echo "Preserving the running Relay, its environment, and admission tokens because Agent refresh is unconfirmed" >&2
+  exit 1
+fi
+if [ "$relay_admission_removed" -ne 1 ]; then
+  echo "Preserving the running Relay, its environment, and admission tokens because admission configuration remains on disk" >&2
+  exit 1
+fi
+
+if ! stop_systemd_unit_with_kill heteronetwork-relay.service; then
+  echo "Preserving Relay runtime environment and admission tokens because the service remains active" >&2
+  exit 1
+fi
+
+if ! rm -f \
+  "$relay_runtime_env" \
   /etc/heteronetwork/relay-admission.token \
   /etc/heteronetwork/.relay-admission.token.new \
   /etc/heteronetwork/relay-server-admission.token \
   /etc/heteronetwork/.relay-server-admission.token.new \
-  /etc/heteronetwork/relay-autopilot/relay.env \
-  /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf \
+  "$relay_admission_drop_in" \
   /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new \
-  /etc/systemd/system/heteronetwork-agent.service.d/20-relay-autopilot.conf \
+  "$relay_advertisement_drop_in" \
   /etc/systemd/system/heteronetwork-relay.service \
   /etc/systemd/system/.heteronetwork-relay.service.new \
   /etc/systemd/system/heteronetwork-relay-autopilot.service \
@@ -2428,13 +3049,25 @@ rm -f \
   /etc/sysusers.d/.heteronetwork-relay.conf.new \
   /etc/sysusers.d/heteronetwork-relay.conf \
   /opt/heteronetwork/libexec/.relay-autopilot.sh.new \
-  /opt/heteronetwork/libexec/relay-autopilot.sh
+  /opt/heteronetwork/libexec/relay-autopilot.sh; then
+  relay_cleanup_failed=1
+fi
+if ! remove_relay_transaction_temporary_files; then
+  relay_cleanup_failed=1
+fi
 rmdir /etc/heteronetwork/relay-autopilot >/dev/null 2>&1 || true
+if ! systemctl daemon-reload; then
+  echo "Unable to reload systemd after removing stopped Relay units" >&2
+  relay_cleanup_failed=1
+fi
+
+if [ "$relay_cleanup_failed" -ne 0 ]; then
+  exit 1
+fi
 "#;
-    const TEMPLATE: &str = r#"relay_restart_required=0
+    const TEMPLATE: &str = r#"relay_restart_required=$iparsd_replaced
 if [ "$relay_enabled" -eq 1 ]; then
-  systemctl stop heteronetwork-relay-autopilot.timer \
-    heteronetwork-relay-autopilot.service >/dev/null 2>&1 || true
+  begin_relay_autopilot_transaction
   install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
   install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
 
@@ -2470,7 +3103,6 @@ HETERONETWORK_RELAY_SYSUSERS
 [Service]
 Environment=HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token
 Environment=HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=127.0.0.1:0
-Environment=HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT=127.0.0.1:51820
 HETERONETWORK_RELAY_ADMISSION_UNIT
   install -o root -g root -m 0644 "$tmp_dir/10-relay-admission.conf" \
     /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new
@@ -2492,36 +3124,274 @@ agent_drop_in="$agent_drop_in_dir/20-relay-autopilot.conf"
 status_file=
 relay_env_tmp=
 agent_drop_in_tmp=
+runtime_transaction_active=0
+runtime_transaction_dir=
+runtime_relay_env_state=absent
+runtime_agent_drop_in_state=absent
+runtime_relay_was_active=0
+runtime_agent_was_active=0
 
 cleanup_temporary_files() {
   [ -z "$status_file" ] || rm -f "$status_file"
   [ -z "$relay_env_tmp" ] || rm -f "$relay_env_tmp"
   [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
+  [ -z "$runtime_transaction_dir" ] || rm -rf "$runtime_transaction_dir"
 }
-trap cleanup_temporary_files EXIT HUP INT TERM
+
+cleanup_random_temporary_files() {
+  rm -f \
+    "$relay_env_dir"/.relay.env.* \
+    "$agent_drop_in_dir"/.20-relay-autopilot.conf.*
+}
+
+verify_systemd_unit_stopped() (
+  unit_name=$1
+  unit_load_state=
+  unit_state=
+  if ! unit_load_state=$(systemctl show \
+    --property=LoadState --value "$unit_name" 2>/dev/null); then
+    echo "Unable to inspect $unit_name" >&2
+    return 1
+  fi
+  if [ "$unit_load_state" = "not-found" ]; then
+    return 0
+  fi
+  if ! unit_state=$(systemctl show \
+    --property=ActiveState --value "$unit_name" 2>/dev/null); then
+    echo "Unable to verify that $unit_name stopped" >&2
+    return 1
+  fi
+  case "$unit_state" in
+    inactive|failed)
+      return 0
+      ;;
+    *)
+      echo "$unit_name remains in $unit_state state" >&2
+      return 1
+      ;;
+  esac
+)
+
+stop_systemd_unit_with_kill() {
+  unit_name=$1
+  stop_reported_error=0
+  if ! systemctl stop "$unit_name"; then
+    stop_reported_error=1
+  fi
+  if verify_systemd_unit_stopped "$unit_name"; then
+    if [ "$stop_reported_error" -eq 1 ]; then
+      echo "$unit_name reported a stop error but is no longer active" >&2
+    fi
+    return 0
+  fi
+
+  echo "$unit_name did not stop normally; forcing its remaining processes down" >&2
+  if ! systemctl kill --kill-whom=all --signal=SIGKILL "$unit_name"; then
+    echo "Unable to send SIGKILL to $unit_name" >&2
+  fi
+  if ! systemctl stop "$unit_name"; then
+    echo "Unable to complete the forced stop job for $unit_name" >&2
+  fi
+  verify_systemd_unit_stopped "$unit_name"
+}
+
+refresh_agent_after_relay_config_change() {
+  relay_config_change_ready=$1
+  relay_config_change_description=$2
+  relay_config_reloaded=0
+  if [ "$relay_config_change_ready" -eq 1 ]; then
+    if systemctl daemon-reload; then
+      relay_config_reloaded=1
+    else
+      echo "Unable to reload systemd after $relay_config_change_description" >&2
+    fi
+  fi
+  if [ "$relay_config_reloaded" -eq 1 ]; then
+    if systemctl is-active --quiet "$agent_service"; then
+      if systemctl restart "$agent_service"; then
+        return 0
+      fi
+      echo "Unable to restart $agent_service after $relay_config_change_description" >&2
+    elif verify_systemd_unit_stopped "$agent_service"; then
+      return 0
+    fi
+  fi
+  if stop_systemd_unit_with_kill "$agent_service"; then
+    return 0
+  fi
+  echo "Unable to apply $relay_config_change_description or verify a stopped HeteroNetwork Agent" >&2
+  return 1
+}
+
+snapshot_runtime_relay_transaction() {
+  runtime_transaction_dir=$(mktemp -d \
+    /run/heteronetwork-relay-autopilot/rollback.XXXXXX)
+  runtime_relay_env_state=absent
+  runtime_agent_drop_in_state=absent
+  if [ -e "$relay_env" ] || [ -L "$relay_env" ]; then
+    if [ ! -f "$relay_env" ] && [ ! -L "$relay_env" ]; then
+      echo "Refusing to snapshot non-file Relay runtime environment" >&2
+      return 1
+    fi
+    cp -a -- "$relay_env" "$runtime_transaction_dir/relay.env"
+    runtime_relay_env_state=present
+  fi
+  if [ -e "$agent_drop_in" ] || [ -L "$agent_drop_in" ]; then
+    if [ ! -f "$agent_drop_in" ] && [ ! -L "$agent_drop_in" ]; then
+      echo "Refusing to snapshot non-file Relay advertisement" >&2
+      return 1
+    fi
+    cp -a -- "$agent_drop_in" "$runtime_transaction_dir/agent.conf"
+    runtime_agent_drop_in_state=present
+  fi
+  runtime_relay_was_active=0
+  runtime_agent_was_active=0
+  if systemctl is-active --quiet "$relay_service"; then
+    runtime_relay_was_active=1
+  fi
+  if systemctl is-active --quiet "$agent_service"; then
+    runtime_agent_was_active=1
+  fi
+}
+
+restore_runtime_relay_path() {
+  runtime_restore_path=$1
+  runtime_snapshot_path=$2
+  runtime_snapshot_state=$3
+  runtime_restore_tmp="$runtime_restore_path.relay-rollback.new"
+  case "$runtime_snapshot_state" in
+    present)
+      if ! rm -f "$runtime_restore_tmp" \
+        || ! cp -a -- "$runtime_snapshot_path" "$runtime_restore_tmp" \
+        || ! mv -f -- "$runtime_restore_tmp" "$runtime_restore_path"; then
+        rm -f "$runtime_restore_tmp"
+        return 1
+      fi
+      ;;
+    absent)
+      rm -f "$runtime_restore_path" "$runtime_restore_tmp"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+begin_runtime_relay_transaction() {
+  snapshot_runtime_relay_transaction
+  if ! stop_systemd_unit_with_kill "$agent_service"; then
+    echo "Unable to quiesce the Agent before changing Relay endpoint state" >&2
+    return 1
+  fi
+  runtime_transaction_active=1
+}
+
+rollback_runtime_relay_transaction() {
+  if ! stop_systemd_unit_with_kill "$agent_service"; then
+    echo "Refusing runtime Relay rollback because the Agent advertisement remains active" >&2
+    return 1
+  fi
+  if ! stop_systemd_unit_with_kill "$relay_service"; then
+    echo "Refusing runtime Relay rollback because the Relay runtime remains active" >&2
+    return 1
+  fi
+  if ! restore_runtime_relay_path \
+    "$relay_env" \
+    "$runtime_transaction_dir/relay.env" \
+    "$runtime_relay_env_state"; then
+    echo "Unable to restore the previous Relay runtime environment" >&2
+    return 1
+  fi
+  if ! restore_runtime_relay_path \
+    "$agent_drop_in" \
+    "$runtime_transaction_dir/agent.conf" \
+    "$runtime_agent_drop_in_state"; then
+    echo "Unable to restore the previous Relay advertisement" >&2
+    return 1
+  fi
+  cleanup_random_temporary_files
+  if ! systemctl daemon-reload; then
+    echo "Unable to reload systemd after restoring Relay runtime state" >&2
+    return 1
+  fi
+  if [ "$runtime_relay_was_active" -eq 1 ] \
+    && ! systemctl start "$relay_service"; then
+    echo "Unable to restore the previously active Relay runtime" >&2
+    return 1
+  fi
+  if [ "$runtime_agent_was_active" -eq 1 ] \
+    && ! systemctl start "$agent_service"; then
+    echo "Unable to restore the previously active Agent" >&2
+    return 1
+  fi
+  runtime_transaction_active=0
+}
+
+commit_runtime_relay_transaction() {
+  runtime_transaction_active=0
+  rm -rf "$runtime_transaction_dir"
+  runtime_transaction_dir=
+}
+
+autopilot_exit_cleanup() {
+  autopilot_status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ "$autopilot_status" -ne 0 ] \
+    && [ "$runtime_transaction_active" -eq 1 ]; then
+    if ! rollback_runtime_relay_transaction; then
+      echo "Relay autopilot rollback did not restore the previous endpoint state" >&2
+    fi
+  fi
+  cleanup_temporary_files
+  exit "$autopilot_status"
+}
+trap autopilot_exit_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 withdraw_relay() {
-  agent_changed=0
+  relay_advertisement_removed=1
   if [ -e "$agent_drop_in" ] || [ -L "$agent_drop_in" ]; then
-    rm -f "$agent_drop_in"
-    agent_changed=1
+    if ! rm -f "$agent_drop_in"; then
+      echo "Unable to remove the Relay advertisement from $agent_service" >&2
+      relay_advertisement_removed=0
+    fi
   fi
-  rm -f "$relay_env"
-  if systemctl is-active --quiet "$relay_service"; then
-    systemctl stop "$relay_service" || true
+  if ! refresh_agent_after_relay_config_change \
+    "$relay_advertisement_removed" \
+    "withdrawing Relay capability"; then
+    echo "Preserving the Relay runtime because advertisement withdrawal is unconfirmed" >&2
+    return 1
   fi
-  if [ "$agent_changed" -eq 1 ]; then
-    systemctl daemon-reload
-    systemctl try-restart "$agent_service" || true
+  if [ "$relay_advertisement_removed" -ne 1 ]; then
+    echo "Preserving the Relay runtime because its advertisement remains on disk" >&2
+    return 1
   fi
+  if ! stop_systemd_unit_with_kill "$relay_service"; then
+    echo "Preserving the Relay runtime configuration because its service is still active" >&2
+    return 1
+  fi
+  if ! rm -f "$relay_env"; then
+    echo "Unable to remove the stopped Relay runtime configuration" >&2
+    return 1
+  fi
+}
+
+withdraw_relay_and_exit() {
+  if withdraw_relay; then
+    exit 0
+  fi
+  exit 1
 }
 
 install -d -o root -g root -m 0755 /run/heteronetwork-relay-autopilot
+cleanup_random_temporary_files
 status_file=$(mktemp /run/heteronetwork-relay-autopilot/status.XXXXXX)
 if ! curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
   "$agent_status_url" >"$status_file"; then
-  withdraw_relay
-  exit 0
+  withdraw_relay_and_exit
 fi
 
 if ! jq -e '
@@ -2554,8 +3424,7 @@ if ! jq -e '
     and ($assessed <= (now + 5))
     and ($assessed >= (now - __RELAY_CLASSIFICATION_MAX_AGE_SECONDS__))
 ' "$status_file" >/dev/null; then
-  withdraw_relay
-  exit 0
+  withdraw_relay_and_exit
 fi
 
 node_id=$(jq -r '.node_id' "$status_file")
@@ -2568,21 +3437,20 @@ public_ip=$(jq -er '
       capture("^(?<host>[0-9.]+):[0-9]+$").host
     end
 ' "$status_file") || {
-  withdraw_relay
-  exit 0
+  withdraw_relay_and_exit
 }
 
 case "$public_ip" in
   *:*)
     case "$public_ip" in
-      ''|*[!0-9A-Fa-f:.]*) withdraw_relay; exit 0 ;;
+      ''|*[!0-9A-Fa-f:.]*) withdraw_relay_and_exit ;;
     esac
     relay_udp_listen="[::]:__RELAY_UDP_PORT__"
     relay_public_endpoint="[$public_ip]:__RELAY_UDP_PORT__"
     ;;
   *)
     case "$public_ip" in
-      ''|*[!0-9.]*) withdraw_relay; exit 0 ;;
+      ''|*[!0-9.]*) withdraw_relay_and_exit ;;
     esac
     relay_udp_listen="0.0.0.0:__RELAY_UDP_PORT__"
     relay_public_endpoint="$public_ip:__RELAY_UDP_PORT__"
@@ -2592,14 +3460,14 @@ esac
 case "$vpn_ip" in
   *:*)
     case "$vpn_ip" in
-      ''|*[!0-9A-Fa-f:.]*) withdraw_relay; exit 0 ;;
+      ''|*[!0-9A-Fa-f:.]*) withdraw_relay_and_exit ;;
     esac
     relay_http_listen="[$vpn_ip]:__RELAY_HTTP_PORT__"
     relay_http_url="http://[$vpn_ip]:__RELAY_HTTP_PORT__"
     ;;
   *)
     case "$vpn_ip" in
-      ''|*[!0-9.]*) withdraw_relay; exit 0 ;;
+      ''|*[!0-9.]*) withdraw_relay_and_exit ;;
     esac
     relay_http_listen="$vpn_ip:__RELAY_HTTP_PORT__"
     relay_http_url="http://$vpn_ip:__RELAY_HTTP_PORT__"
@@ -2623,22 +3491,7 @@ if [ -f "$relay_env" ] && cmp -s "$relay_env_tmp" "$relay_env"; then
   rm -f "$relay_env_tmp"
   relay_env_tmp=
 else
-  mv -f "$relay_env_tmp" "$relay_env"
-  relay_env_tmp=
   relay_changed=1
-fi
-
-relay_action=start
-if systemctl is-active --quiet "$relay_service"; then
-  if [ "$relay_changed" -eq 1 ]; then
-    relay_action=restart
-  else
-    relay_action=
-  fi
-fi
-if [ -n "$relay_action" ] && ! systemctl "$relay_action" "$relay_service"; then
-  withdraw_relay
-  exit 1
 fi
 
 install -d -o root -g root -m 0755 "$agent_drop_in_dir"
@@ -2656,21 +3509,37 @@ if [ -f "$agent_drop_in" ] && cmp -s "$agent_drop_in_tmp" "$agent_drop_in"; then
   rm -f "$agent_drop_in_tmp"
   agent_drop_in_tmp=
 else
-  mv -f "$agent_drop_in_tmp" "$agent_drop_in"
-  agent_drop_in_tmp=
   agent_changed=1
 fi
 
-if [ "$agent_changed" -eq 1 ]; then
-  systemctl daemon-reload
-  if systemctl is-active --quiet "$agent_service" \
-    && ! systemctl restart "$agent_service"; then
-    rm -f "$agent_drop_in" "$relay_env"
-    systemctl daemon-reload
-    systemctl restart "$agent_service" || true
-    systemctl stop "$relay_service" || true
-    exit 1
+relay_was_active_now=0
+if systemctl is-active --quiet "$relay_service"; then
+  relay_was_active_now=1
+fi
+if [ "$relay_changed" -eq 1 ] \
+  || [ "$agent_changed" -eq 1 ] \
+  || [ "$relay_was_active_now" -ne 1 ]; then
+  begin_runtime_relay_transaction
+  if [ "$relay_changed" -eq 1 ]; then
+    mv -f "$relay_env_tmp" "$relay_env"
+    relay_env_tmp=
   fi
+  if [ "$runtime_relay_was_active" -eq 1 ]; then
+    if [ "$relay_changed" -eq 1 ]; then
+      systemctl restart "$relay_service"
+    fi
+  else
+    systemctl start "$relay_service"
+  fi
+  if [ "$agent_changed" -eq 1 ]; then
+    mv -f "$agent_drop_in_tmp" "$agent_drop_in"
+    agent_drop_in_tmp=
+    systemctl daemon-reload
+  fi
+  if [ "$runtime_agent_was_active" -eq 1 ]; then
+    systemctl start "$agent_service"
+  fi
+  commit_runtime_relay_transaction
 fi
 HETERONETWORK_RELAY_AUTOPILOT
   install -o root -g root -m 0755 "$tmp_dir/relay-autopilot.sh" \
@@ -2829,6 +3698,24 @@ fn postgres_ha_install_script(
     let helper = STANDARD.encode(POSTGRES_HA_NODE_SCRIPT.as_bytes());
     let autopilot = STANDARD.encode(POSTGRES_HA_AUTOPILOT_SCRIPT.as_bytes());
     let cluster_id = STANDARD.encode(token.claims.cluster_id.as_str().as_bytes());
+    let mut seen_control_plane_bases = BTreeSet::new();
+    let control_plane_urls_b64 = std::iter::once(enrollment.install_base_url.as_ref())
+        .chain(
+            token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.as_str()),
+        )
+        .filter_map(|base| {
+            let base = base.trim_end_matches('/');
+            seen_control_plane_bases
+                .insert(base.to_string())
+                .then(|| STANDARD.encode(base.as_bytes()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let bearer_token = derive_node_enrollment_cluster_secret(
         enrollment,
         &token.claims.cluster_id,
@@ -2845,6 +3732,7 @@ cat >/etc/heteronetwork/postgres-autopilot/autopilot.env <<'POSTGRES_AUTOPILOT_E
 HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN={bearer_token}
 HETERONETWORK_DB_CLUSTER_ID_B64={cluster_id}
 HETERONETWORK_DB_LOCAL_ROLE={role}
+HETERONETWORK_DB_CONTROL_PLANE_URLS_B64='{control_plane_urls_b64}'
 POSTGRES_AUTOPILOT_ENV
 chown root:root /etc/heteronetwork/postgres-autopilot/autopilot.env
 chmod 0600 /etc/heteronetwork/postgres-autopilot/autopilot.env
@@ -2877,6 +3765,7 @@ echo "Automatic PostgreSQL HA placement scheduled"
         bearer_token = bearer_token,
         cluster_id = cluster_id,
         role = token.claims.role.as_str(),
+        control_plane_urls_b64 = control_plane_urls_b64,
     )
 }
 
@@ -3011,6 +3900,80 @@ fn node_enrollment_download_bases(
         }
     }
     bases
+}
+
+#[derive(Debug, Serialize)]
+struct DatabaseAutopilotRegistryNode {
+    node_id: String,
+    vpn_ip: String,
+    role: String,
+    active: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DatabaseAutopilotRegistryResponse {
+    cluster_id: String,
+    nodes: Vec<DatabaseAutopilotRegistryNode>,
+    generated_at: DateTime<Utc>,
+}
+
+fn database_autopilot_node_is_active(
+    node: &NodeRecord,
+    health: Option<&NodeHealth>,
+    generated_at: DateTime<Utc>,
+    ttl: Duration,
+) -> bool {
+    if node.role.is_client() {
+        return false;
+    }
+    let last_seen_at = match health {
+        Some(health) if health.state == HealthState::Unhealthy => return false,
+        Some(health) => health.last_seen_at,
+        None => node.registered_at,
+    };
+    match generated_at.signed_duration_since(last_seen_at).to_std() {
+        Ok(age) => age <= ttl,
+        Err(_) => true,
+    }
+}
+
+async fn database_autopilot_nodes<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<DatabaseAutopilotRegistryResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let generated_at = Utc::now();
+    let config = state.plane.config();
+    let cluster_id = config.cluster_id.clone();
+    let policy = state.plane.current_cluster_policy().await?;
+    let ttl = Duration::from_secs(policy.relay_health_ttl_seconds);
+    let (nodes, health_by_node) = state.plane.registered_nodes_with_health().await?;
+    let mut nodes = nodes
+        .into_iter()
+        .filter(|node| node.cluster_id == cluster_id)
+        .map(|node| {
+            let active = database_autopilot_node_is_active(
+                &node,
+                health_by_node.get(&node.node_id),
+                generated_at,
+                ttl,
+            );
+            DatabaseAutopilotRegistryNode {
+                node_id: node.node_id.to_string(),
+                vpn_ip: node.vpn_ip.to_string(),
+                role: node.role.to_string(),
+                active,
+            }
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    Ok(Json(DatabaseAutopilotRegistryResponse {
+        cluster_id: cluster_id.to_string(),
+        nodes,
+        generated_at,
+    }))
 }
 
 async fn admin_node_snapshot<S>(
@@ -3179,6 +4142,25 @@ async fn require_operator_api_bearer(
             [(header::WWW_AUTHENTICATE, "Bearer")],
             Json(ErrorResponse {
                 error: "control-plane operator API bearer token was rejected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn require_database_autopilot_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = bearer_token_from_headers(request.headers());
+    if !provided.is_some_and(|provided| operator_api_token_matches(&expected, provided)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "database autopilot API bearer token was rejected".to_string(),
             }),
         )
             .into_response();
@@ -4865,6 +5847,11 @@ mod tests {
             RELAY_ADMISSION_BEARER_TOKEN.to_string(),
         )?;
         let expected_sha256 = enrollment.binary_sha256.to_string();
+        let database_autopilot_bearer = derive_node_enrollment_cluster_secret(
+            &enrollment,
+            &cluster_id,
+            b"heteronetwork-postgres-ha-autopilot-v1",
+        );
         let app = router(
             ControlPlaneHttpState::new(plane.clone(), join_service)
                 .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string())
@@ -4877,6 +5864,38 @@ mod tests {
             "reusable": false,
             "max_uses": 1
         });
+
+        let unauthenticated_registry = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/database-autopilot/nodes")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(unauthenticated_registry.status(), StatusCode::UNAUTHORIZED);
+        let authenticated_registry = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/database-autopilot/nodes")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {database_autopilot_bearer}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(authenticated_registry.status(), StatusCode::OK);
+        let authenticated_registry =
+            axum::body::to_bytes(authenticated_registry.into_body(), usize::MAX).await?;
+        let authenticated_registry: Value = serde_json::from_slice(&authenticated_registry)?;
+        assert_eq!(authenticated_registry["cluster_id"], cluster_id.as_str());
+        assert_eq!(
+            authenticated_registry["nodes"][0]["node_id"],
+            gateway.node_id.as_str()
+        );
+        assert_eq!(authenticated_registry["nodes"][0]["active"], true);
 
         let unauthenticated = app
             .clone()
@@ -5003,6 +6022,7 @@ mod tests {
         assert!(generated_script.contains("heteronetwork-postgres-autopilot.service"));
         assert!(generated_script.contains("postgres-ha-node.sh"));
         assert!(generated_script.contains("postgres-ha-autopilot.sh"));
+        assert!(generated_script.contains("HETERONETWORK_DB_CONTROL_PLANE_URLS_B64='"));
         assert!(generated_script.contains("Automatic PostgreSQL HA placement scheduled"));
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
@@ -5020,18 +6040,44 @@ mod tests {
             "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
         ));
         assert!(generated_script.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=127.0.0.1:0"));
-        assert!(generated_script
-            .contains("HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT=127.0.0.1:51820"));
+        assert!(
+            !generated_script.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT=")
+        );
         assert!(generated_script.contains(
             "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-server-admission.token"
         ));
         assert!(!generated_script.lines().any(|line| {
             line == "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
         }));
-        assert!(generated_script.contains("relay_restart_required=0"));
+        assert!(generated_script.contains("iparsd_replaced=0"));
+        assert!(generated_script.contains(
+            "snapshot_iparsd_binary\ninstall -m 0755 \"$binary\" \"$iparsd_path.new\"\nmv -f \"$iparsd_path.new\" \"$iparsd_path\"\niparsd_replaced=1"
+        ));
+        assert!(generated_script.contains("restore_iparsd_binary"));
+        assert!(generated_script.contains("discard_iparsd_snapshot"));
+        assert!(generated_script.contains("commit_installer_transaction"));
+        assert!(generated_script.contains("relay_restart_required=$iparsd_replaced"));
         assert!(generated_script
             .contains("cmp -s /etc/heteronetwork/.relay-server-admission.token.new"));
         assert!(generated_script.contains("if [ \"$relay_restart_required\" -eq 1 ]"));
+        assert!(generated_script.contains("relay_autopilot_transaction_active=1"));
+        assert!(generated_script.contains("relay_autopilot_transaction_active=0"));
+        assert!(generated_script.contains("relay_autopilot_timer_enable_state"));
+        assert!(generated_script.contains("relay_agent_enable_state"));
+        assert!(generated_script.contains("relay_autopilot_service_was_active"));
+        assert!(generated_script.contains("enabled-runtime"));
+        assert!(generated_script.contains("masked-runtime"));
+        assert!(
+            generated_script.contains("if [ \"$relay_autopilot_timer_was_active\" -eq 1 ]; then")
+        );
+        assert!(generated_script.contains("snapshot_relay_transaction_files"));
+        assert!(generated_script.contains("restore_relay_transaction_files"));
+        assert!(generated_script.contains("systemctl enable \"$unit_name\""));
+        assert!(generated_script.contains("systemctl enable --runtime \"$unit_name\""));
+        assert!(generated_script.contains("systemctl disable heteronetwork-relay-autopilot.timer"));
+        assert!(generated_script
+            .contains("Refusing Relay rollback because an autopilot mutator could not be stopped"));
+        assert!(generated_script.contains("exit \"$installer_status\""));
         assert!(generated_script
             .contains("u heteronetwork-relay - \"HeteroNetwork Relay\" /nonexistent"));
         assert!(generated_script.contains("User=heteronetwork-relay"));
@@ -5061,9 +6107,22 @@ mod tests {
             .contains("Environment=\"HETERONETWORK_AGENT_RELAY_STATUS_URL=$relay_http_url\""));
         assert!(generated_script.contains("cmp -s \"$relay_env_tmp\" \"$relay_env\""));
         assert!(generated_script.contains("cmp -s \"$agent_drop_in_tmp\" \"$agent_drop_in\""));
+        assert!(generated_script.contains("begin_runtime_relay_transaction"));
+        assert!(generated_script.contains("rollback_runtime_relay_transaction"));
+        assert!(generated_script.contains("commit_runtime_relay_transaction"));
+        assert!(generated_script.contains("\"$relay_env_dir\"/.relay.env.*"));
+        assert!(generated_script.contains("\"$agent_drop_in_dir\"/.20-relay-autopilot.conf.*"));
+        assert!(generated_script.contains("if ! systemctl disable"));
         assert!(generated_script
-            .contains("systemctl disable --now heteronetwork-relay-autopilot.timer"));
-        assert!(generated_script.contains("rm -f \"$agent_drop_in\" \"$relay_env\""));
+            .contains("stop_systemd_unit_with_kill heteronetwork-relay-autopilot.timer"));
+        assert!(
+            generated_script.contains("stop_systemd_unit_with_kill heteronetwork-relay.service")
+        );
+        assert!(generated_script
+            .contains("if [ \"$unit_load_state\" = \"not-found\" ]; then\n    return 0"));
+        assert!(generated_script.contains("stop_systemd_unit_with_kill \"$relay_service\""));
+        assert!(generated_script.contains("systemctl kill --kill-whom=all --signal=SIGKILL"));
+        assert!(!generated_script.contains("systemctl stop \"$relay_service\" || true"));
         assert!(
             generated_script.contains("systemctl enable --now heteronetwork-relay-autopilot.timer")
         );
@@ -5099,6 +6158,902 @@ mod tests {
             "generated relay autopilot is not valid POSIX shell: {}",
             String::from_utf8_lossy(&relay_syntax.stderr)
         );
+
+        let installer_transaction_support = generated_script
+            .split_once("iparsd_path=/opt/heteronetwork/bin/iparsd\n")
+            .and_then(|(_, tail)| {
+                tail.split_once("auth='").map(|(support, _)| {
+                    format!("iparsd_path=/opt/heteronetwork/bin/iparsd\n{support}")
+                })
+            })
+            .ok_or("generated installer omitted its Relay transaction support")?;
+        for (timer_enable_state, agent_enable_state, timer_was_active, autopilot_was_active) in [
+            ("enabled", "disabled", false, true),
+            ("enabled-runtime", "enabled-runtime", true, true),
+            ("masked", "masked", false, false),
+            ("masked-runtime", "masked-runtime", false, false),
+            ("disabled", "enabled", true, false),
+        ] {
+            let case_id = random_oidc_value(12);
+            let cleanup_dir =
+                std::env::temp_dir().join(format!("heteronetwork-installer-cleanup-{case_id}"));
+            let target_dir =
+                std::env::temp_dir().join(format!("heteronetwork-installer-target-{case_id}"));
+            let systemctl_state = std::env::temp_dir()
+                .join(format!("heteronetwork-installer-systemctl-{case_id}.state"));
+            let systemctl_log = std::env::temp_dir()
+                .join(format!("heteronetwork-installer-systemctl-{case_id}.log"));
+            std::fs::create_dir(&cleanup_dir)?;
+            std::fs::create_dir(&target_dir)?;
+            std::fs::write(target_dir.join("existing"), b"before-upgrade")?;
+            let cleanup_harness = format!(
+                r#"set -eu
+tmp_dir=$1
+target_dir=$2
+systemctl_state=$3
+systemctl_log=$4
+timer_enable_state=$5
+timer_active=$6
+agent_enable_state=$7
+autopilot_active=$8
+relay_active=1
+agent_active=1
+fail_mutator_stop=0
+
+persist_systemd_state() {{
+  printf '%s %s %s %s %s %s\n' \
+    "$timer_enable_state" "$timer_active" "$relay_active" \
+    "$agent_enable_state" "$agent_active" "$autopilot_active" \
+    >"$systemctl_state"
+}}
+
+unit_is_active() {{
+  case "$1" in
+    heteronetwork-relay-autopilot.timer)
+      [ "$timer_active" -eq 1 ]
+      ;;
+    heteronetwork-relay-autopilot.service)
+      [ "$autopilot_active" -eq 1 ]
+      ;;
+    heteronetwork-relay.service)
+      [ "$relay_active" -eq 1 ]
+      ;;
+    heteronetwork-agent.service)
+      [ "$agent_active" -eq 1 ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}}
+
+set_unit_active() {{
+  case "$1" in
+    heteronetwork-relay-autopilot.timer)
+      timer_active=$2
+      ;;
+    heteronetwork-relay-autopilot.service)
+      autopilot_active=$2
+      ;;
+    heteronetwork-relay.service)
+      relay_active=$2
+      ;;
+    heteronetwork-agent.service)
+      agent_active=$2
+      ;;
+  esac
+  persist_systemd_state
+}}
+
+unit_enable_state() {{
+  case "$1" in
+    heteronetwork-relay-autopilot.timer)
+      printf '%s\n' "$timer_enable_state"
+      ;;
+    heteronetwork-agent.service)
+      printf '%s\n' "$agent_enable_state"
+      ;;
+    *)
+      printf '%s\n' not-found
+      ;;
+  esac
+}}
+
+set_unit_enable_state() {{
+  case "$1" in
+    heteronetwork-relay-autopilot.timer)
+      timer_enable_state=$2
+      ;;
+    heteronetwork-agent.service)
+      agent_enable_state=$2
+      ;;
+  esac
+  persist_systemd_state
+}}
+
+systemctl() {{
+  printf '%s\n' "$*" >>"$systemctl_log"
+  systemctl_command=$1
+  shift
+  systemctl_unit=
+  systemctl_runtime=0
+  for systemctl_argument in "$@"; do
+    [ "$systemctl_argument" != --runtime ] || systemctl_runtime=1
+    systemctl_unit=$systemctl_argument
+  done
+  case "$systemctl_command" in
+    is-enabled)
+      current_enable_state=$(unit_enable_state "$systemctl_unit")
+      printf '%s\n' "$current_enable_state"
+      case "$current_enable_state" in
+        enabled|enabled-runtime|linked|linked-runtime|alias) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    is-active)
+      unit_is_active "$systemctl_unit"
+      ;;
+    show)
+      case "$1" in
+        --property=LoadState)
+          if [ "$(unit_enable_state "$systemctl_unit")" = not-found ]; then
+            printf '%s\n' not-found
+          else
+            printf '%s\n' loaded
+          fi
+          ;;
+        --property=ActiveState)
+          if unit_is_active "$systemctl_unit"; then
+            printf '%s\n' active
+          else
+            printf '%s\n' inactive
+          fi
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    stop|kill)
+      if [ "$systemctl_unit" = heteronetwork-relay-autopilot.service ] \
+        && [ "$fail_mutator_stop" -eq 1 ]; then
+        return 1
+      fi
+      set_unit_active "$systemctl_unit" 0
+      ;;
+    start|restart)
+      set_unit_active "$systemctl_unit" 1
+      ;;
+    enable)
+      if [ "$systemctl_runtime" -eq 1 ]; then
+        set_unit_enable_state "$systemctl_unit" enabled-runtime
+      else
+        set_unit_enable_state "$systemctl_unit" enabled
+      fi
+      ;;
+    disable)
+      set_unit_enable_state "$systemctl_unit" disabled
+      ;;
+    mask)
+      if [ "$systemctl_runtime" -eq 1 ]; then
+        set_unit_enable_state "$systemctl_unit" masked-runtime
+      else
+        set_unit_enable_state "$systemctl_unit" masked
+      fi
+      ;;
+    unmask)
+      case "$(unit_enable_state "$systemctl_unit")" in
+        masked)
+          [ "$systemctl_runtime" -eq 1 ] \
+            || set_unit_enable_state "$systemctl_unit" disabled
+          ;;
+        masked-runtime)
+          [ "$systemctl_runtime" -ne 1 ] \
+            || set_unit_enable_state "$systemctl_unit" disabled
+          ;;
+      esac
+      ;;
+    daemon-reload)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}}
+persist_systemd_state
+{installer_transaction_support}
+iparsd_path="$target_dir/iparsd"
+iparsd_previous_snapshot="$tmp_dir/iparsd.previous"
+relay_transaction_paths="$target_dir/existing $target_dir/created"
+relay_transaction_temporary_paths="$target_dir/temporary.new"
+relay_transaction_random_temporary_globs="$target_dir/.relay.env.* $target_dir/.agent.conf.*"
+relay_transaction_directories="$target_dir/existing-dir $target_dir/created-dir"
+relay_snapshot_dir="$tmp_dir/relay-rollback"
+relay_snapshot_manifest="$relay_snapshot_dir/manifest"
+relay_snapshot_directory_manifest="$relay_snapshot_dir/directories"
+mkdir "$target_dir/existing-dir"
+chmod 0750 "$target_dir/existing-dir"
+printf '%s\n' old-binary >"$iparsd_path"
+snapshot_iparsd_binary
+printf '%s\n' new-binary >"$iparsd_path"
+iparsd_replaced=1
+begin_relay_autopilot_transaction
+printf '%s\n' after-upgrade >"$target_dir/existing"
+printf '%s\n' created-during-upgrade >"$target_dir/created"
+printf '%s\n' partial-temporary >"$target_dir/temporary.new"
+printf '%s\n' stale-random >"$target_dir/.relay.env.orphan"
+chmod 0777 "$target_dir/existing-dir"
+mkdir "$target_dir/created-dir"
+systemctl enable heteronetwork-relay-autopilot.timer
+systemctl enable heteronetwork-agent.service
+exit 37
+"#
+            );
+            let cleanup_result = std::process::Command::new("sh")
+                .args(["-c", &cleanup_harness, "sh"])
+                .arg(&cleanup_dir)
+                .arg(&target_dir)
+                .arg(&systemctl_state)
+                .arg(&systemctl_log)
+                .arg(timer_enable_state)
+                .arg(if timer_was_active { "1" } else { "0" })
+                .arg(agent_enable_state)
+                .arg(if autopilot_was_active { "1" } else { "0" })
+                .output()?;
+            assert_eq!(
+                cleanup_result.status.code(),
+                Some(37),
+                "installer cleanup changed the original failure status: {}",
+                String::from_utf8_lossy(&cleanup_result.stderr)
+            );
+            assert!(
+                !cleanup_dir.exists(),
+                "installer cleanup left its temporary directory behind"
+            );
+            assert_eq!(
+                std::fs::read(target_dir.join("existing"))?,
+                b"before-upgrade"
+            );
+            assert_eq!(
+                std::fs::read(target_dir.join("iparsd"))?,
+                b"old-binary\n",
+                "rollback did not restore the previous binary"
+            );
+            assert!(!target_dir.join("created").exists());
+            assert!(!target_dir.join("temporary.new").exists());
+            assert!(!target_dir.join(".relay.env.orphan").exists());
+            assert!(!target_dir.join("created-dir").exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(target_dir.join("existing-dir"))?
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o750
+                );
+            }
+            let expected_state = format!(
+                "{} {} 1 {} 1 {}\n",
+                timer_enable_state,
+                u8::from(timer_was_active),
+                agent_enable_state,
+                u8::from(autopilot_was_active)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&systemctl_state)?,
+                expected_state,
+                "rollback did not restore exact systemd state"
+            );
+            std::fs::remove_dir_all(target_dir)?;
+            std::fs::remove_file(systemctl_state)?;
+            std::fs::remove_file(systemctl_log)?;
+        }
+
+        let mutator_case_id = random_oidc_value(12);
+        let mutator_cleanup_dir = std::env::temp_dir().join(format!(
+            "heteronetwork-installer-mutator-cleanup-{mutator_case_id}"
+        ));
+        let mutator_target_dir = std::env::temp_dir().join(format!(
+            "heteronetwork-installer-mutator-target-{mutator_case_id}"
+        ));
+        let mutator_state = std::env::temp_dir().join(format!(
+            "heteronetwork-installer-mutator-{mutator_case_id}.state"
+        ));
+        let mutator_log = std::env::temp_dir().join(format!(
+            "heteronetwork-installer-mutator-{mutator_case_id}.log"
+        ));
+        std::fs::create_dir(&mutator_cleanup_dir)?;
+        std::fs::create_dir(&mutator_target_dir)?;
+        std::fs::write(mutator_target_dir.join("existing"), b"before-upgrade")?;
+        let mutator_harness = format!(
+            r#"set -eu
+tmp_dir=$1
+target_dir=$2
+systemctl_state=$3
+systemctl_log=$4
+timer_enable_state=enabled
+timer_active=1
+agent_enable_state=enabled
+autopilot_active=1
+relay_active=1
+agent_active=1
+fail_mutator_stop=0
+
+persist_systemd_state() {{
+  printf '%s\n' "$autopilot_active" >"$systemctl_state"
+}}
+unit_is_active() {{
+  case "$1" in
+    heteronetwork-relay-autopilot.timer) [ "$timer_active" -eq 1 ] ;;
+    heteronetwork-relay-autopilot.service) [ "$autopilot_active" -eq 1 ] ;;
+    heteronetwork-relay.service) [ "$relay_active" -eq 1 ] ;;
+    heteronetwork-agent.service) [ "$agent_active" -eq 1 ] ;;
+    *) return 1 ;;
+  esac
+}}
+set_unit_active() {{
+  case "$1" in
+    heteronetwork-relay-autopilot.timer) timer_active=$2 ;;
+    heteronetwork-relay-autopilot.service) autopilot_active=$2 ;;
+    heteronetwork-relay.service) relay_active=$2 ;;
+    heteronetwork-agent.service) agent_active=$2 ;;
+  esac
+  persist_systemd_state
+}}
+systemctl() {{
+  printf '%s\n' "$*" >>"$systemctl_log"
+  command=$1
+  shift
+  unit=
+  for argument in "$@"; do unit=$argument; done
+  case "$command" in
+    is-enabled) printf '%s\n' enabled ;;
+    is-active) unit_is_active "$unit" ;;
+    show)
+      case "$1" in
+        --property=LoadState) printf '%s\n' loaded ;;
+        --property=ActiveState)
+          if unit_is_active "$unit"; then printf '%s\n' active; else printf '%s\n' inactive; fi
+          ;;
+      esac
+      ;;
+    stop|kill)
+      if [ "$unit" = heteronetwork-relay-autopilot.service ] \
+        && [ "$fail_mutator_stop" -eq 1 ]; then
+        return 1
+      fi
+      set_unit_active "$unit" 0
+      ;;
+    start|restart) set_unit_active "$unit" 1 ;;
+    enable|disable|mask|unmask|daemon-reload) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+{installer_transaction_support}
+iparsd_path="$target_dir/iparsd"
+iparsd_previous_snapshot="$tmp_dir/iparsd.previous"
+relay_transaction_paths="$target_dir/existing"
+relay_transaction_temporary_paths="$target_dir/temporary.new"
+relay_transaction_random_temporary_globs="$target_dir/.relay.env.*"
+relay_transaction_directories="$target_dir"
+relay_snapshot_dir="$tmp_dir/relay-rollback"
+relay_snapshot_manifest="$relay_snapshot_dir/manifest"
+relay_snapshot_directory_manifest="$relay_snapshot_dir/directories"
+printf '%s\n' old-binary >"$iparsd_path"
+snapshot_iparsd_binary
+printf '%s\n' new-binary >"$iparsd_path"
+iparsd_replaced=1
+begin_relay_autopilot_transaction
+printf '%s\n' after-upgrade >"$target_dir/existing"
+autopilot_active=1
+fail_mutator_stop=1
+exit 41
+"#
+        );
+        let mutator_result = std::process::Command::new("sh")
+            .args(["-c", &mutator_harness, "sh"])
+            .arg(&mutator_cleanup_dir)
+            .arg(&mutator_target_dir)
+            .arg(&mutator_state)
+            .arg(&mutator_log)
+            .output()?;
+        assert_eq!(mutator_result.status.code(), Some(41));
+        assert_eq!(
+            std::fs::read(mutator_target_dir.join("existing"))?,
+            b"after-upgrade\n",
+            "rollback restored files while a mutator remained active"
+        );
+        assert_eq!(
+            std::fs::read(mutator_target_dir.join("iparsd"))?,
+            b"new-binary\n",
+            "rollback restored the executable while a mutator remained active"
+        );
+        std::fs::remove_dir_all(mutator_target_dir)?;
+        std::fs::remove_file(mutator_state)?;
+        std::fs::remove_file(mutator_log)?;
+
+        let disable_cleanup = generated_script
+            .split_once("relay_cleanup_failed=0\n")
+            .and_then(|(_, tail)| {
+                tail.split_once("\nif [ \"$relay_cleanup_failed\" -ne 0 ]; then")
+                    .map(|(cleanup, _)| format!("relay_cleanup_failed=0\n{cleanup}"))
+            })
+            .ok_or("generated installer omitted its Relay disable cleanup")?;
+        let disable_advertisement_remove = disable_cleanup
+            .find("rm -f \"$relay_advertisement_drop_in\"")
+            .ok_or("Relay disable cleanup does not remove its advertisement")?;
+        let disable_admission_remove =
+            disable_cleanup
+                .find("rm -f \"$relay_admission_drop_in\"")
+                .ok_or("Relay disable cleanup does not remove Agent admission configuration")?;
+        let disable_relay_stop = disable_cleanup
+            .find("stop_systemd_unit_with_kill heteronetwork-relay.service")
+            .ok_or("Relay disable cleanup does not stop its service")?;
+        let disable_env_remove = disable_cleanup
+            .find("\"$relay_runtime_env\"")
+            .ok_or("Relay disable cleanup does not remove its runtime environment")?;
+        assert!(disable_advertisement_remove < disable_relay_stop);
+        assert!(disable_advertisement_remove < disable_admission_remove);
+        assert!(disable_admission_remove < disable_relay_stop);
+        assert!(disable_relay_stop < disable_env_remove);
+        assert!(disable_cleanup.contains("\"withdrawing Relay advertisement\""));
+        assert!(disable_cleanup.contains("\"removing Relay admission configuration\""));
+        assert!(disable_cleanup.contains(
+            "Preserving the running Relay and its environment because advertisement withdrawal is unconfirmed"
+        ));
+        assert!(disable_cleanup.contains(
+            "Preserving the running Relay, its environment, and admission tokens because Agent refresh is unconfirmed"
+        ));
+
+        let disable_failure_dir = std::env::temp_dir().join(format!(
+            "heteronetwork-relay-disable-failure-{}",
+            random_oidc_value(12)
+        ));
+        std::fs::create_dir(&disable_failure_dir)?;
+        let disable_agent_drop_in = disable_failure_dir.join("agent-advertisement.conf");
+        let disable_admission_drop_in = disable_failure_dir.join("agent-admission.conf");
+        let disable_relay_env = disable_failure_dir.join("relay.env");
+        let disable_log = disable_failure_dir.join("systemctl.log");
+        std::fs::write(&disable_agent_drop_in, b"old-advertisement")?;
+        std::fs::write(&disable_admission_drop_in, b"old-admission")?;
+        std::fs::write(&disable_relay_env, b"old-runtime")?;
+        let disable_failure_script = disable_cleanup
+            .replace(
+                "/etc/systemd/system/heteronetwork-agent.service.d/20-relay-autopilot.conf",
+                &disable_agent_drop_in.display().to_string(),
+            )
+            .replace(
+                "/etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf",
+                &disable_admission_drop_in.display().to_string(),
+            )
+            .replace(
+                "/etc/heteronetwork/relay-autopilot/relay.env",
+                &disable_relay_env.display().to_string(),
+            );
+        let disable_failure_harness = format!(
+            r#"set -eu
+relay_active=1
+agent_active=1
+systemctl_log=$1
+agent_drop_in_path=$2
+admission_drop_in_path=$3
+relay_env_path=$4
+restart_fail_on=$5
+restart_count=0
+
+verify_systemd_unit_stopped() {{
+  [ "$1" != heteronetwork-agent.service ] || [ "$agent_active" -eq 0 ]
+}}
+stop_systemd_unit_with_kill() {{
+  printf 'stop %s\n' "$1" >>"$systemctl_log"
+  case "$1" in
+    heteronetwork-agent.service)
+      return 1
+      ;;
+    heteronetwork-relay.service)
+      relay_active=0
+      ;;
+  esac
+}}
+remove_relay_transaction_temporary_files() {{
+  return 0
+}}
+systemctl() {{
+  printf '%s\n' "$*" >>"$systemctl_log"
+  command_name=$1
+  shift
+  unit=
+  for argument in "$@"; do unit=$argument; done
+  case "$command_name" in
+    disable|daemon-reload)
+      return 0
+      ;;
+    is-enabled)
+      return 1
+      ;;
+    is-active)
+      [ "$unit" = heteronetwork-agent.service ] && [ "$agent_active" -eq 1 ]
+      ;;
+    restart)
+      restart_count=$((restart_count + 1))
+      [ "$restart_count" -ne "$restart_fail_on" ] || return 1
+      return 0
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}}
+rm() {{
+  remove_status=0
+  for remove_path in "$@"; do
+    case "$remove_path" in
+      -*)
+        ;;
+      "$agent_drop_in_path"|"$admission_drop_in_path"|"$relay_env_path")
+        /bin/rm -f "$remove_path" || remove_status=1
+        ;;
+    esac
+  done
+  return "$remove_status"
+}}
+rmdir() {{
+  return 0
+}}
+{disable_failure_script}
+[ "$relay_active" -eq 1 ]
+[ -e "$relay_env_path" ]
+"#
+        );
+        for restart_fail_on in [1, 2] {
+            std::fs::write(&disable_agent_drop_in, b"old-advertisement")?;
+            std::fs::write(&disable_admission_drop_in, b"old-admission")?;
+            std::fs::write(&disable_relay_env, b"old-runtime")?;
+            let _ = std::fs::remove_file(&disable_log);
+            let disable_failure = std::process::Command::new("sh")
+                .args(["-c", &disable_failure_harness, "sh"])
+                .arg(&disable_log)
+                .arg(&disable_agent_drop_in)
+                .arg(&disable_admission_drop_in)
+                .arg(&disable_relay_env)
+                .arg(restart_fail_on.to_string())
+                .output()?;
+            assert_eq!(
+                disable_failure.status.code(),
+                Some(1),
+                "disable should fail when Agent refresh {restart_fail_on} and stop both fail: {}",
+                String::from_utf8_lossy(&disable_failure.stderr)
+            );
+            assert!(disable_relay_env.exists());
+            assert!(!std::fs::read_to_string(&disable_log)?
+                .contains("stop heteronetwork-relay.service"));
+        }
+        std::fs::remove_dir_all(disable_failure_dir)?;
+
+        let relay_withdrawal_functions = relay_autopilot
+            .split_once("verify_systemd_unit_stopped() (\n")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\ninstall -d -o root -g root -m 0755 /run/heteronetwork-relay-autopilot",
+                )
+                .map(|(functions, _)| format!("verify_systemd_unit_stopped() (\n{functions}"))
+            })
+            .ok_or("generated Relay autopilot omitted its withdrawal functions")?;
+        for (
+            relay_forced_kill_succeeds,
+            agent_restart_succeeds,
+            agent_stop_succeeds,
+            withdrawal_should_succeed,
+        ) in [
+            (true, true, true, true),
+            (false, true, true, false),
+            (true, false, false, false),
+        ] {
+            let withdrawal_dir = std::env::temp_dir().join(format!(
+                "heteronetwork-relay-withdrawal-{}",
+                random_oidc_value(12)
+            ));
+            let systemctl_log = withdrawal_dir.join("systemctl.log");
+            std::fs::create_dir(&withdrawal_dir)?;
+            let agent_drop_in = withdrawal_dir.join("agent.conf");
+            let relay_env = withdrawal_dir.join("relay.env");
+            std::fs::write(&agent_drop_in, b"advertised")?;
+            std::fs::write(&relay_env, b"configured")?;
+            let withdrawal_harness = format!(
+                r#"set -eu
+relay_service=heteronetwork-relay.service
+agent_service=heteronetwork-agent.service
+agent_drop_in=$1
+relay_env=$2
+systemctl_log=$3
+relay_forced_kill_succeeds=$4
+agent_restart_succeeds=$5
+agent_stop_succeeds=$6
+withdrawal_should_succeed=$7
+relay_active=1
+agent_active=1
+runtime_transaction_active=0
+status_file=
+relay_env_tmp=
+agent_drop_in_tmp=
+runtime_transaction_dir=
+
+cleanup_temporary_files() {{
+  return 0
+}}
+cleanup_random_temporary_files() {{
+  return 0
+}}
+
+systemctl() {{
+  printf '%s\n' "$*" >>"$systemctl_log"
+  systemctl_command=$1
+  shift
+  systemctl_unit=
+  for systemctl_argument in "$@"; do
+    systemctl_unit=$systemctl_argument
+  done
+  if [ "$systemctl_command" = show ]; then
+    case "$1" in
+      --property=LoadState)
+        printf '%s\n' loaded
+        return 0
+        ;;
+      --property=ActiveState)
+        if [ "$systemctl_unit" = "$relay_service" ] \
+          && [ "$relay_active" -eq 1 ]; then
+          printf '%s\n' active
+        elif [ "$systemctl_unit" = "$agent_service" ] \
+          && [ "$agent_active" -eq 1 ]; then
+          printf '%s\n' active
+        else
+          printf '%s\n' inactive
+        fi
+        return 0
+        ;;
+    esac
+  fi
+  if [ "$systemctl_command" = is-active ]; then
+    [ "$systemctl_unit" = "$agent_service" ] && [ "$agent_active" -eq 1 ]
+    return
+  fi
+  if [ "$systemctl_command" = daemon-reload ]; then
+    return 0
+  fi
+  if [ "$systemctl_command" = restart ] && [ "$systemctl_unit" = "$agent_service" ]; then
+    [ "$agent_restart_succeeds" -eq 1 ] || return 1
+    agent_active=1
+    return
+  fi
+  if [ "$systemctl_command" = stop ] && [ "$systemctl_unit" = "$agent_service" ]; then
+    [ "$agent_stop_succeeds" -eq 1 ] || return 1
+    agent_active=0
+    return
+  fi
+  if [ "$systemctl_command" = kill ] && [ "$systemctl_unit" = "$agent_service" ]; then
+    [ "$agent_stop_succeeds" -eq 1 ] || return 1
+    agent_active=0
+    return
+  fi
+  if [ "$systemctl_command" = stop ] && [ "$systemctl_unit" = "$relay_service" ]; then
+    [ ! -e "$agent_drop_in" ] || printf '%s\n' advertisement-order-violation >>"$systemctl_log"
+    [ -e "$relay_env" ] || printf '%s\n' env-order-violation >>"$systemctl_log"
+    [ "$relay_active" -eq 0 ]
+    return
+  fi
+  if [ "$systemctl_command" = kill ] && [ "$systemctl_unit" = "$relay_service" ]; then
+    if [ "$relay_forced_kill_succeeds" -eq 1 ]; then
+      relay_active=0
+      return 0
+    fi
+    return 1
+  fi
+  return 0
+}}
+{relay_withdrawal_functions}
+if [ "$withdrawal_should_succeed" -eq 1 ]; then
+  withdraw_relay
+  [ ! -e "$relay_env" ]
+else
+  if withdraw_relay; then
+    echo "withdrawal unexpectedly succeeded while Relay remained active" >&2
+    exit 1
+  fi
+  [ -e "$relay_env" ]
+fi
+[ ! -e "$agent_drop_in" ]
+"#
+            );
+            let withdrawal_result = std::process::Command::new("sh")
+                .args(["-c", &withdrawal_harness, "sh"])
+                .arg(&agent_drop_in)
+                .arg(&relay_env)
+                .arg(&systemctl_log)
+                .arg(if relay_forced_kill_succeeds { "1" } else { "0" })
+                .arg(if agent_restart_succeeds { "1" } else { "0" })
+                .arg(if agent_stop_succeeds { "1" } else { "0" })
+                .arg(if withdrawal_should_succeed { "1" } else { "0" })
+                .output()?;
+            assert!(
+                withdrawal_result.status.success(),
+                "Relay withdrawal ordering/fallback failed: {}",
+                String::from_utf8_lossy(&withdrawal_result.stderr)
+            );
+            let systemctl_calls = std::fs::read_to_string(&systemctl_log)?;
+            assert!(!systemctl_calls.contains("order-violation"));
+            if agent_restart_succeeds {
+                let agent_restart = systemctl_calls
+                    .find("restart heteronetwork-agent.service")
+                    .ok_or("Relay withdrawal did not restart the Agent")?;
+                let relay_stop = systemctl_calls
+                    .find("stop heteronetwork-relay.service")
+                    .ok_or("Relay withdrawal did not stop the Relay")?;
+                assert!(agent_restart < relay_stop);
+            } else {
+                assert!(
+                    !systemctl_calls.contains("stop heteronetwork-relay.service"),
+                    "Relay stopped while Agent advertisement withdrawal was unconfirmed"
+                );
+            }
+            if agent_restart_succeeds {
+                assert!(systemctl_calls
+                    .contains("kill --kill-whom=all --signal=SIGKILL heteronetwork-relay.service"));
+            }
+            std::fs::remove_dir_all(withdrawal_dir)?;
+        }
+
+        for rollback_can_quiesce in [true, false] {
+            let transaction_dir = std::env::temp_dir().join(format!(
+                "heteronetwork-relay-runtime-transaction-{}",
+                random_oidc_value(12)
+            ));
+            std::fs::create_dir(&transaction_dir)?;
+            let runtime_relay_env = transaction_dir.join("relay.env");
+            let runtime_agent_drop_in = transaction_dir.join("agent.conf");
+            let runtime_state = transaction_dir.join("systemctl.state");
+            let runtime_log = transaction_dir.join("systemctl.log");
+            std::fs::write(&runtime_relay_env, b"old-endpoint")?;
+            std::fs::write(&runtime_agent_drop_in, b"old-endpoint")?;
+            let runtime_transaction_harness = format!(
+                r#"set -eu
+transaction_root=$1
+relay_env=$2
+agent_drop_in=$3
+systemctl_state=$4
+systemctl_log=$5
+rollback_can_quiesce=$6
+relay_service=heteronetwork-relay.service
+agent_service=heteronetwork-agent.service
+relay_active=1
+agent_active=1
+runtime_transaction_active=0
+runtime_transaction_dir=
+runtime_relay_env_state=absent
+runtime_agent_drop_in_state=absent
+runtime_relay_was_active=0
+runtime_agent_was_active=0
+status_file=
+relay_env_tmp=
+agent_drop_in_tmp=
+
+persist_runtime_state() {{
+  printf '%s %s\n' "$relay_active" "$agent_active" >"$systemctl_state"
+}}
+cleanup_temporary_files() {{
+  [ -z "$runtime_transaction_dir" ] || /bin/rm -rf "$runtime_transaction_dir"
+}}
+cleanup_random_temporary_files() {{
+  return 0
+}}
+mktemp() {{
+  command mktemp -d "$transaction_root/rollback.XXXXXX"
+}}
+systemctl() {{
+  printf '%s\n' "$*" >>"$systemctl_log"
+  command_name=$1
+  shift
+  unit=
+  for argument in "$@"; do unit=$argument; done
+  case "$command_name" in
+    show)
+      case "$1" in
+        --property=LoadState) printf '%s\n' loaded ;;
+        --property=ActiveState)
+          if [ "$unit" = "$relay_service" ] && [ "$relay_active" -eq 1 ]; then
+            printf '%s\n' active
+          elif [ "$unit" = "$agent_service" ] && [ "$agent_active" -eq 1 ]; then
+            printf '%s\n' active
+          else
+            printf '%s\n' inactive
+          fi
+          ;;
+      esac
+      ;;
+    is-active)
+      if [ "$unit" = "$relay_service" ]; then
+        [ "$relay_active" -eq 1 ]
+      else
+        [ "$agent_active" -eq 1 ]
+      fi
+      ;;
+    stop|kill)
+      if [ "$unit" = "$agent_service" ]; then
+        [ "$rollback_can_quiesce" -eq 1 ] || return 1
+        agent_active=0
+      else
+        relay_active=0
+      fi
+      persist_runtime_state
+      ;;
+    start|restart)
+      if [ "$unit" = "$agent_service" ]; then
+        agent_active=1
+      else
+        relay_active=1
+      fi
+      persist_runtime_state
+      ;;
+    daemon-reload)
+      return 0
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}}
+{relay_withdrawal_functions}
+rollback_can_quiesce=1
+begin_runtime_relay_transaction
+printf '%s\n' new-endpoint >"$relay_env"
+printf '%s\n' new-endpoint >"$agent_drop_in"
+relay_active=1
+if [ "$6" -eq 0 ]; then
+  agent_active=1
+  rollback_can_quiesce=0
+fi
+persist_runtime_state
+exit 47
+"#
+            );
+            let runtime_result = std::process::Command::new("sh")
+                .args(["-c", &runtime_transaction_harness, "sh"])
+                .arg(&transaction_dir)
+                .arg(&runtime_relay_env)
+                .arg(&runtime_agent_drop_in)
+                .arg(&runtime_state)
+                .arg(&runtime_log)
+                .arg(if rollback_can_quiesce { "1" } else { "0" })
+                .output()?;
+            assert_eq!(
+                runtime_result.status.code(),
+                Some(47),
+                "runtime rollback changed original failure status: {}",
+                String::from_utf8_lossy(&runtime_result.stderr)
+            );
+            let expected_endpoint = if rollback_can_quiesce {
+                b"old-endpoint".as_slice()
+            } else {
+                b"new-endpoint\n".as_slice()
+            };
+            assert_eq!(std::fs::read(&runtime_relay_env)?, expected_endpoint);
+            assert_eq!(std::fs::read(&runtime_agent_drop_in)?, expected_endpoint);
+            assert_eq!(
+                std::fs::read_to_string(&runtime_state)?,
+                "1 1\n",
+                "runtime rollback did not preserve service state"
+            );
+            if !rollback_can_quiesce {
+                assert!(
+                    !std::fs::read_to_string(&runtime_log)?
+                        .contains("stop heteronetwork-relay.service"),
+                    "runtime rollback stopped Relay while Agent advertisement remained active"
+                );
+            }
+            std::fs::remove_dir_all(transaction_dir)?;
+        }
 
         let kubernetes_request_body = serde_json::json!({
             "expires_in_seconds": 86_400,

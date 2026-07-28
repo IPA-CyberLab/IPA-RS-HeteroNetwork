@@ -2683,9 +2683,8 @@ fn validate_relay_forwarder_config(args: &AgentArgs) -> anyhow::Result<()> {
     }
 
     if args.relay_forwarder_bind.is_some() {
-        let wireguard_endpoint = args.relay_forwarder_wireguard_endpoint.context(
-            "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind",
-        )?;
+        let wireguard_endpoint = relay_forwarder_wireguard_endpoint(args)?
+            .context("relay forwarder WireGuard endpoint could not be derived")?;
         validate_usable_socket_endpoint(
             wireguard_endpoint,
             "--relay-forwarder-wireguard-endpoint",
@@ -2721,6 +2720,44 @@ fn validate_relay_forwarder_config(args: &AgentArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn relay_forwarder_wireguard_endpoint(args: &AgentArgs) -> anyhow::Result<Option<SocketAddr>> {
+    let Some(bind_addr) = args.relay_forwarder_bind else {
+        return Ok(None);
+    };
+    let namespaces_differ = relay_forwarder_namespaces_differ(args);
+    if let Some(endpoint) = args.relay_forwarder_wireguard_endpoint {
+        anyhow::ensure!(
+            !namespaces_differ || !endpoint.ip().is_loopback(),
+            "--relay-forwarder-wireguard-endpoint must not use a loopback address when the Relay forwarder and WireGuard select different namespaces"
+        );
+        return Ok(Some(endpoint));
+    }
+    if namespaces_differ {
+        anyhow::bail!(
+            "--relay-forwarder-wireguard-endpoint is required when the Relay forwarder and WireGuard select different namespaces"
+        );
+    }
+    let loopback_ip = match bind_addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    Ok(Some(SocketAddr::new(
+        loopback_ip,
+        args.wireguard_listen_port,
+    )))
+}
+
+fn relay_forwarder_namespaces_differ(args: &AgentArgs) -> bool {
+    match (
+        args.relay_forwarder_netns.as_deref(),
+        args.linux_netns.as_deref(),
+    ) {
+        (Some(forwarder), Some(wireguard)) => forwarder != wireguard,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 fn validate_usable_socket_endpoint(endpoint: SocketAddr, label: &str) -> anyhow::Result<()> {
@@ -12794,9 +12831,8 @@ fn relay_forwarder_supervisor(
     let Some(bind_addr) = args.relay_forwarder_bind else {
         return Ok(None);
     };
-    let wireguard_endpoint = args
-        .relay_forwarder_wireguard_endpoint
-        .context("--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind")?;
+    let wireguard_endpoint = relay_forwarder_wireguard_endpoint(args)?
+        .context("relay forwarder WireGuard endpoint could not be derived")?;
     let placement = relay_forwarder_placement(args)?;
     Ok(Some(Arc::new(RelayForwarderSupervisor::new(
         RelayForwarderConfig {
@@ -30137,7 +30173,7 @@ exec sleep 60
             "--relay-forwarder-bind",
             "127.0.0.1:0",
             "--relay-forwarder-wireguard-endpoint",
-            "127.0.0.1:51820",
+            "10.0.0.1:51820",
             "--relay-forwarder-netns",
             "relay-a",
         ])?;
@@ -31022,6 +31058,206 @@ exec sleep 60
     }
 
     #[test]
+    fn relay_forwarder_derives_wireguard_loopback_from_bind_family_and_listen_port(
+    ) -> anyhow::Result<()> {
+        for (bind, expected) in [
+            ("127.0.0.1:0", "127.0.0.1:51999"),
+            ("[::1]:0", "[::1]:51999"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--relay-forwarder-bind",
+                bind,
+                "--wireguard-listen-port",
+                "51999",
+            ])?;
+            let Command::Agent(args) = cli.command else {
+                anyhow::bail!("expected agent command");
+            };
+            validate_relay_forwarder_config(&args)?;
+            assert_eq!(
+                relay_forwarder_wireguard_endpoint(&args)?,
+                Some(expected.parse()?)
+            );
+            let supervisor = relay_forwarder_supervisor(&args)?.context("expected supervisor")?;
+            assert_eq!(supervisor.config.wireguard_endpoint, expected.parse()?);
+        }
+
+        let explicit = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--wireguard-listen-port",
+            "51999",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:52000",
+        ])?;
+        let Command::Agent(explicit) = explicit.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_relay_forwarder_config(&explicit)?;
+        assert_eq!(
+            relay_forwarder_wireguard_endpoint(&explicit)?,
+            Some("127.0.0.1:52000".parse()?)
+        );
+
+        let zero_port = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--wireguard-listen-port",
+            "0",
+        ])?;
+        let Command::Agent(zero_port) = zero_port.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = test_error(
+            validate_relay_forwarder_config(&zero_port),
+            "derived zero-port Relay forwarder endpoint should fail",
+        );
+        assert!(error
+            .to_string()
+            .contains("--relay-forwarder-wireguard-endpoint"));
+        assert!(error.to_string().contains("usable nonzero"));
+        Ok(())
+    }
+
+    #[test]
+    fn relay_forwarder_requires_explicit_endpoint_across_network_namespaces() -> anyhow::Result<()>
+    {
+        let mismatched = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-netns",
+            "forwarder-ns",
+            "--linux-netns",
+            "wireguard-ns",
+        ])?;
+        let Command::Agent(mismatched) = mismatched.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = test_error(
+            validate_relay_forwarder_config(&mismatched),
+            "different explicit namespaces must not derive a loopback endpoint",
+        );
+        assert!(error
+            .to_string()
+            .contains("--relay-forwarder-wireguard-endpoint is required"));
+        assert!(error.to_string().contains("different namespaces"));
+
+        let forwarder_only = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-netns",
+            "forwarder-ns",
+        ])?;
+        let Command::Agent(forwarder_only) = forwarder_only.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = test_error(
+            validate_relay_forwarder_config(&forwarder_only),
+            "an isolated forwarder namespace must not derive a loopback endpoint",
+        );
+        assert!(error
+            .to_string()
+            .contains("--relay-forwarder-wireguard-endpoint is required"));
+
+        let matching = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-netns",
+            "shared-ns",
+            "--linux-netns",
+            "shared-ns",
+        ])?;
+        let Command::Agent(matching) = matching.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_relay_forwarder_config(&matching)?;
+        assert_eq!(
+            relay_forwarder_wireguard_endpoint(&matching)?,
+            Some("127.0.0.1:51820".parse()?)
+        );
+
+        let explicit = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "192.0.2.10:0",
+            "--relay-forwarder-netns",
+            "forwarder-ns",
+            "--linux-netns",
+            "wireguard-ns",
+            "--relay-forwarder-wireguard-endpoint",
+            "192.0.2.20:51820",
+        ])?;
+        let Command::Agent(explicit) = explicit.command else {
+            anyhow::bail!("expected agent command");
+        };
+        validate_relay_forwarder_config(&explicit)?;
+        assert_eq!(
+            relay_forwarder_wireguard_endpoint(&explicit)?,
+            Some("192.0.2.20:51820".parse()?)
+        );
+
+        for loopback in ["127.0.0.1:51820", "[::1]:51820"] {
+            let invalid = Cli::try_parse_from([
+                "iparsd",
+                "agent",
+                "--relay-forwarder-bind",
+                "127.0.0.1:0",
+                "--relay-forwarder-netns",
+                "forwarder-ns",
+                "--linux-netns",
+                "wireguard-ns",
+                "--relay-forwarder-wireguard-endpoint",
+                loopback,
+            ])?;
+            let Command::Agent(invalid) = invalid.command else {
+                anyhow::bail!("expected agent command");
+            };
+            let error = test_error(
+                validate_relay_forwarder_config(&invalid),
+                "cross-namespace loopback endpoint must be rejected",
+            );
+            assert!(error
+                .to_string()
+                .contains("must not use a loopback address"));
+        }
+
+        let forwarder_only_loopback = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--relay-forwarder-bind",
+            "127.0.0.1:0",
+            "--relay-forwarder-netns",
+            "forwarder-ns",
+            "--relay-forwarder-wireguard-endpoint",
+            "127.0.0.1:51820",
+        ])?;
+        let Command::Agent(forwarder_only_loopback) = forwarder_only_loopback.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let error = test_error(
+            validate_relay_forwarder_config(&forwarder_only_loopback),
+            "isolated forwarder loopback endpoint must be rejected",
+        );
+        assert!(error
+            .to_string()
+            .contains("must not use a loopback address"));
+        Ok(())
+    }
+
+    #[test]
     fn runtime_config_validation_survives_skipped_runtime_preflight() -> anyhow::Result<()> {
         let invalid_docker_host_interface = Cli::try_parse_from([
             "iparsd",
@@ -31111,27 +31347,6 @@ exec sleep 60
             };
             assert!(error.to_string().contains("--relay-forwarder-endpoint"));
             assert!(error.to_string().contains("usable nonzero"));
-        } else {
-            anyhow::bail!("expected agent command");
-        }
-
-        let missing_forwarder_wireguard_endpoint = Cli::try_parse_from([
-            "iparsd",
-            "agent",
-            "--runtime-backend",
-            "dry-run",
-            "--skip-runtime-preflight",
-            "--relay-forwarder-bind",
-            "127.0.0.1:0",
-        ])?;
-        if let Command::Agent(args) = missing_forwarder_wireguard_endpoint.command {
-            let error = match preflight_agent_runtime_with_path(&args, Some(OsStr::new(""))) {
-                Ok(()) => anyhow::bail!("unexpected successful preflight"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains(
-                "--relay-forwarder-wireguard-endpoint is required with --relay-forwarder-bind"
-            ));
         } else {
             anyhow::bail!("expected agent command");
         }
