@@ -1385,10 +1385,11 @@ install_proxy() {
 }
 
 activate_reconfigured_services() {
-  # A hard proxy restart releases listeners retained by older HAProxy workers
-  # before Patroni moves its REST API onto the underlay address.
-  systemctl restart heteronetwork-db-proxy.service
-  systemctl reload-or-restart heteronetwork-db.service
+  # Release the future REST listener, move Patroni to it, then reclaim the
+  # legacy health endpoint with the newly rendered proxy configuration.
+  systemctl stop heteronetwork-db-proxy.service
+  systemctl restart heteronetwork-db.service
+  systemctl start heteronetwork-db-proxy.service
 }
 
 reconfigure_node() {
@@ -1904,9 +1905,11 @@ self_test() {
   }
   activate_reconfigured_services
   [[ "$(sed -n '1p' "$service_action_log")" == \
-    "restart heteronetwork-db-proxy.service" ]]
+    "stop heteronetwork-db-proxy.service" ]]
   [[ "$(sed -n '2p' "$service_action_log")" == \
-    "reload-or-restart heteronetwork-db.service" ]]
+    "restart heteronetwork-db.service" ]]
+  [[ "$(sed -n '3p' "$service_action_log")" == \
+    "start heteronetwork-db-proxy.service" ]]
   if (
     dcs_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
     validate_common_config >/dev/null 2>&1
