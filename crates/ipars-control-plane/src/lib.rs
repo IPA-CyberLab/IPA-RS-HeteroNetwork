@@ -44,10 +44,12 @@ use ipars_types::{
     TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
     LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
-    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
+    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
+    MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
@@ -62,6 +64,7 @@ const PATH_STATE_METRIC_ORDER: [PathState; 5] = [
 ];
 const MAX_PATH_SCORE_REASON_BYTES: usize = 256;
 const MAX_PATH_SCORE_TOTAL_REASON_BYTES: usize = 2048;
+const MAX_HEARTBEAT_PATH_STATES: usize = 4_096;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
 const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
 const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
@@ -69,6 +72,7 @@ const MAX_CLIENT_GATEWAYS: usize = 4;
 const CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW: Duration = Duration::from_secs(60);
 const OVERLAY_NODE_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES: usize = 4;
+const MAX_ROUTE_CATALOG_UPDATE_RETRIES: usize = 8;
 pub const MAX_NODE_ENROLLMENT_TOKEN_USES: u32 = 1_000;
 pub const NODE_ENROLLMENT_ALLOWED_ROLES: [&str; 3] = ["edge", "worker", "gateway"];
 
@@ -124,6 +128,12 @@ pub enum ControlPlaneError {
     BoundedTopology(String),
     #[error("cluster policy rejected: {0}")]
     InvalidClusterPolicy(String),
+    #[error("cluster policy changed while validating a route update")]
+    ClusterPolicyChanged,
+    #[error("overlay route catalog changed while validating a route update")]
+    OverlayRouteCatalogChanged,
+    #[error("node {0} changed while applying a registration update")]
+    NodeStateChanged(NodeId),
     #[error("no available VPN IP in pool")]
     VpnPoolExhausted,
     #[error("route {0} is not permitted by token policy")]
@@ -179,19 +189,48 @@ impl ControlPlaneConfig {
 pub trait ControlPlaneStore: Send + Sync {
     async fn get_cluster_policy(
         &self,
-        _cluster_id: &ClusterId,
-    ) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
-        Ok(None)
-    }
+        cluster_id: &ClusterId,
+    ) -> Result<Option<ClusterPolicy>, ControlPlaneError>;
+    async fn initialize_cluster_policy_if_absent(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<ClusterPolicy, ControlPlaneError>;
+    async fn get_overlay_routing_epoch(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<u64, ControlPlaneError>;
     async fn upsert_cluster_policy(
         &self,
-        _cluster_id: &ClusterId,
-        _policy: ClusterPolicy,
-    ) -> Result<(), ControlPlaneError> {
-        Ok(())
-    }
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<(), ControlPlaneError>;
+    async fn upsert_cluster_policy_if_route_catalog_epoch(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+        expected_route_catalog_epoch: u64,
+    ) -> Result<bool, ControlPlaneError>;
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError>;
+    async fn insert_node_if_cluster_policy(
+        &self,
+        node: NodeRecord,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError>;
     async fn get_node(&self, node_id: &NodeId) -> Result<Option<NodeRecord>, ControlPlaneError>;
+    async fn get_nodes_by_ids(
+        &self,
+        node_ids: &BTreeSet<NodeId>,
+    ) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+        let mut nodes = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            if let Some(node) = self.get_node(node_id).await? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError>;
     async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError>;
     async fn update_node_candidates(
@@ -209,6 +248,18 @@ pub trait ControlPlaneStore: Send + Sync {
         node_id: &NodeId,
         routes: Vec<Route>,
     ) -> Result<(), ControlPlaneError>;
+    async fn update_node_routes_if_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError>;
+    async fn rejoin_node_if_cluster_policy(
+        &self,
+        update: RejoinNodeStoreUpdate,
+    ) -> Result<NodeRecord, ControlPlaneError>;
     async fn rotate_node_wireguard_public_key(
         &self,
         node_id: &NodeId,
@@ -221,6 +272,18 @@ pub trait ControlPlaneStore: Send + Sync {
         health: NodeHealth,
     ) -> Result<(), ControlPlaneError>;
     async fn get_health(&self, node_id: &NodeId) -> Result<Option<NodeHealth>, ControlPlaneError>;
+    async fn get_health_by_node_ids(
+        &self,
+        node_ids: &BTreeSet<NodeId>,
+    ) -> Result<BTreeMap<NodeId, NodeHealth>, ControlPlaneError> {
+        let mut health_by_node = BTreeMap::new();
+        for node_id in node_ids {
+            if let Some(health) = self.get_health(node_id).await? {
+                health_by_node.insert(node_id.clone(), health);
+            }
+        }
+        Ok(health_by_node)
+    }
     async fn get_heartbeat_signature_timestamp(
         &self,
         node_id: &NodeId,
@@ -233,6 +296,11 @@ pub trait ControlPlaneStore: Send + Sync {
             }
         }
         Ok(health_by_node)
+    }
+    async fn list_nodes_and_health(
+        &self,
+    ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
+        tokio::try_join!(self.list_nodes(), self.list_health())
     }
     async fn upsert_nat_classification(
         &self,
@@ -320,7 +388,12 @@ pub struct RemovedNode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeartbeatStoreUpdate {
+    pub cluster_id: ClusterId,
+    pub expected_cluster_policy: Option<ClusterPolicy>,
+    pub expected_route_catalog_epoch: Option<u64>,
     pub node_id: NodeId,
+    pub expected_identity_public_key: String,
+    pub expected_registered_at: chrono::DateTime<Utc>,
     pub accepted_signature_at: Option<chrono::DateTime<Utc>>,
     pub candidates: Vec<EndpointCandidate>,
     pub nat_classification: Option<NatClassification>,
@@ -328,6 +401,37 @@ pub struct HeartbeatStoreUpdate {
     pub routes: Option<Vec<Route>>,
     pub health: NodeHealth,
     pub paths: Vec<PathRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejoinNodeStoreUpdate {
+    pub cluster_id: ClusterId,
+    pub expected_cluster_policy: Option<ClusterPolicy>,
+    pub expected_route_catalog_epoch: Option<u64>,
+    pub expected_node: NodeRecord,
+    pub candidates: Vec<EndpointCandidate>,
+    pub relay_capability: Option<RelayCapability>,
+    pub routes: Vec<Route>,
+}
+
+impl HeartbeatStoreUpdate {
+    pub fn ensure_matches_node_generation(
+        &self,
+        node: &NodeRecord,
+    ) -> Result<(), ControlPlaneError> {
+        if node.node_id != self.node_id || node.cluster_id != self.cluster_id {
+            return Err(ControlPlaneError::NodeNotFound(self.node_id.clone()));
+        }
+        if node.identity_public_key != self.expected_identity_public_key
+            || node.registered_at != self.expected_registered_at
+        {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: self.node_id.clone(),
+                reason: "node generation changed while heartbeat was being validated".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -360,6 +464,7 @@ pub trait TokenLedger: Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     cluster_policies: RwLock<BTreeMap<ClusterId, ClusterPolicy>>,
+    overlay_routing_epochs: RwLock<BTreeMap<ClusterId, u64>>,
     nodes: RwLock<BTreeMap<NodeId, NodeRecord>>,
     health: RwLock<BTreeMap<NodeId, NodeHealth>>,
     heartbeat_signature_timestamps: RwLock<BTreeMap<NodeId, chrono::DateTime<Utc>>>,
@@ -367,6 +472,19 @@ pub struct InMemoryStore {
     paths: RwLock<Vec<PathRecord>>,
     service_instances: RwLock<BTreeMap<(ClusterId, String), ServiceInstance>>,
     client_gateway_selections: RwLock<BTreeMap<NodeId, ClientGatewaySelection>>,
+}
+
+fn advance_in_memory_overlay_routing_epoch(
+    epochs: &mut BTreeMap<ClusterId, u64>,
+    cluster_id: &ClusterId,
+) -> Result<(), ControlPlaneError> {
+    let epoch = epochs.entry(cluster_id.clone()).or_default();
+    *epoch = epoch.checked_add(1).ok_or_else(|| {
+        ControlPlaneError::Store(format!(
+            "overlay routing epoch exhausted for cluster {cluster_id}"
+        ))
+    })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -378,23 +496,114 @@ impl ControlPlaneStore for InMemoryStore {
         Ok(self.cluster_policies.read().await.get(cluster_id).cloned())
     }
 
+    async fn initialize_cluster_policy_if_absent(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<ClusterPolicy, ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let mut policies = self.cluster_policies.write().await;
+        if let Some(stored) = policies.get(cluster_id) {
+            return Ok(stored.clone());
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, cluster_id)?;
+        policies.insert(cluster_id.clone(), policy.clone());
+        Ok(policy)
+    }
+
+    async fn get_overlay_routing_epoch(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<u64, ControlPlaneError> {
+        Ok(*self
+            .overlay_routing_epochs
+            .read()
+            .await
+            .get(cluster_id)
+            .unwrap_or(&0))
+    }
+
     async fn upsert_cluster_policy(
         &self,
         cluster_id: &ClusterId,
         policy: ClusterPolicy,
     ) -> Result<(), ControlPlaneError> {
-        self.cluster_policies
-            .write()
-            .await
-            .insert(cluster_id.clone(), policy);
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let mut policies = self.cluster_policies.write().await;
+        if policies.get(cluster_id) == Some(&policy) {
+            return Ok(());
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, cluster_id)?;
+        policies.insert(cluster_id.clone(), policy);
         Ok(())
     }
 
+    async fn upsert_cluster_policy_if_route_catalog_epoch(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+        expected_route_catalog_epoch: u64,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let mut policies = self.cluster_policies.write().await;
+        let nodes = self.nodes.read().await;
+        let catalog = nodes
+            .values()
+            .filter(|node| node.cluster_id == *cluster_id && !node.role.is_client())
+            .cloned()
+            .collect::<Vec<_>>();
+        if overlay_route_catalog_epoch(&catalog)? != expected_route_catalog_epoch {
+            return Ok(false);
+        }
+        if policies.get(cluster_id) == Some(&policy) {
+            return Ok(true);
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, cluster_id)?;
+        policies.insert(cluster_id.clone(), policy);
+        Ok(true)
+    }
+
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let cluster_id = node.cluster_id.clone();
         let mut nodes = self.nodes.write().await;
         if nodes.contains_key(&node.node_id) {
             return Err(ControlPlaneError::NodeAlreadyExists(node.node_id));
         }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, &cluster_id)?;
+        nodes.insert(node.node_id.clone(), node);
+        Ok(())
+    }
+
+    async fn insert_node_if_cluster_policy(
+        &self,
+        node: NodeRecord,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let cluster_id = node.cluster_id.clone();
+        let policies = self.cluster_policies.read().await;
+        if policies.get(&node.cluster_id).cloned() != expected_cluster_policy {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        let mut nodes = self.nodes.write().await;
+        if let Some(expected) = expected_route_catalog_epoch {
+            let catalog = nodes
+                .values()
+                .filter(|existing| {
+                    existing.cluster_id == node.cluster_id && !existing.role.is_client()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        if nodes.contains_key(&node.node_id) {
+            return Err(ControlPlaneError::NodeAlreadyExists(node.node_id));
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, &cluster_id)?;
         nodes.insert(node.node_id.clone(), node);
         Ok(())
     }
@@ -407,27 +616,37 @@ impl ControlPlaneStore for InMemoryStore {
         Ok(self.nodes.read().await.values().cloned().collect())
     }
 
+    async fn list_nodes_and_health(
+        &self,
+    ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
+        let nodes = self.nodes.read().await;
+        let health = self.health.read().await;
+        Ok((nodes.values().cloned().collect(), health.clone()))
+    }
+
     async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
-        let node = self
-            .nodes
-            .write()
-            .await
-            .remove(node_id)
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get(node_id)
+            .cloned()
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        let removed_health = self.health.write().await.remove(node_id).is_some();
-        self.heartbeat_signature_timestamps
-            .write()
-            .await
-            .remove(node_id);
-        self.nat_classifications.write().await.remove(node_id);
-        self.client_gateway_selections
-            .write()
-            .await
-            .retain(|client_id, selection| {
-                client_id != node_id && &selection.gateway_node_id != node_id
-            });
+        let mut health = self.health.write().await;
+        let mut heartbeat_signature_timestamps = self.heartbeat_signature_timestamps.write().await;
+        let mut nat_classifications = self.nat_classifications.write().await;
+        let mut client_gateway_selections = self.client_gateway_selections.write().await;
+        let mut paths = self.paths.write().await;
+        advance_in_memory_overlay_routing_epoch(&mut epochs, &node.cluster_id)?;
+
+        nodes.remove(node_id);
+        let removed_health = health.remove(node_id).is_some();
+        heartbeat_signature_timestamps.remove(node_id);
+        nat_classifications.remove(node_id);
+        client_gateway_selections.retain(|client_id, selection| {
+            client_id != node_id && &selection.gateway_node_id != node_id
+        });
         let mut removed_path_count = 0;
-        self.paths.write().await.retain(|path| {
+        paths.retain(|path| {
             let keep = &path.key.local != node_id && &path.key.remote != node_id;
             if !keep {
                 removed_path_count += 1;
@@ -472,12 +691,92 @@ impl ControlPlaneStore for InMemoryStore {
         node_id: &NodeId,
         routes: Vec<Route>,
     ) -> Result<(), ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
         let mut nodes = self.nodes.write().await;
         let node = nodes
             .get_mut(node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.routes == routes {
+            return Ok(());
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, &node.cluster_id)?;
         node.routes = routes;
         Ok(())
+    }
+
+    async fn update_node_routes_if_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let policies = self.cluster_policies.read().await;
+        if policies.get(cluster_id).cloned() != expected_cluster_policy {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        let mut nodes = self.nodes.write().await;
+        if let Some(expected) = expected_route_catalog_epoch {
+            let catalog = nodes
+                .values()
+                .filter(|node| node.cluster_id == *cluster_id && !node.role.is_client())
+                .cloned()
+                .collect::<Vec<_>>();
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.cluster_id != *cluster_id {
+            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        }
+        if node.routes == routes {
+            return Ok(());
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, cluster_id)?;
+        node.routes = routes;
+        Ok(())
+    }
+
+    async fn rejoin_node_if_cluster_policy(
+        &self,
+        update: RejoinNodeStoreUpdate,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
+        let policies = self.cluster_policies.read().await;
+        if policies.get(&update.cluster_id).cloned() != update.expected_cluster_policy {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        let mut nodes = self.nodes.write().await;
+        if let Some(expected) = update.expected_route_catalog_epoch {
+            let catalog = nodes
+                .values()
+                .filter(|node| node.cluster_id == update.cluster_id && !node.role.is_client())
+                .cloned()
+                .collect::<Vec<_>>();
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let node = nodes
+            .get_mut(&update.expected_node.node_id)
+            .filter(|node| node.cluster_id == update.cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(update.expected_node.node_id.clone()))?;
+        if node != &update.expected_node {
+            return Err(ControlPlaneError::NodeStateChanged(node.node_id.clone()));
+        }
+        let routes_changed = node.routes != update.routes;
+        if routes_changed {
+            advance_in_memory_overlay_routing_epoch(&mut epochs, &update.cluster_id)?;
+        }
+        node.endpoint_candidates = update.candidates;
+        node.relay_capability = update.relay_capability;
+        node.routes = update.routes;
+        Ok(node.clone())
     }
 
     async fn rotate_node_wireguard_public_key(
@@ -486,6 +785,7 @@ impl ControlPlaneStore for InMemoryStore {
         expected_current_public_key: &str,
         next_public_key: String,
     ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut epochs = self.overlay_routing_epochs.write().await;
         let mut nodes = self.nodes.write().await;
         let node = nodes
             .get_mut(node_id)
@@ -496,6 +796,10 @@ impl ControlPlaneStore for InMemoryStore {
                 reason: "wireguard public key changed before rotation completed".to_string(),
             });
         }
+        if node.wireguard_public_key == next_public_key {
+            return Ok(node.clone());
+        }
+        advance_in_memory_overlay_routing_epoch(&mut epochs, &node.cluster_id)?;
         node.wireguard_public_key = next_public_key;
         Ok(node.clone())
     }
@@ -555,18 +859,52 @@ impl ControlPlaneStore for InMemoryStore {
     }
 
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
+        let updates_routes = update.routes.is_some();
+        let mut epochs = if updates_routes {
+            Some(self.overlay_routing_epochs.write().await)
+        } else {
+            None
+        };
+        let policies = self.cluster_policies.read().await;
+        if policies.get(&update.cluster_id).cloned() != update.expected_cluster_policy {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
         let mut nodes = self.nodes.write().await;
-        let mut health = self.health.write().await;
-        let mut heartbeat_signature_timestamps = self.heartbeat_signature_timestamps.write().await;
-        let mut paths = self.paths.write().await;
+        if let Some(expected) = update.expected_route_catalog_epoch {
+            let catalog = nodes
+                .values()
+                .filter(|node| node.cluster_id == update.cluster_id && !node.role.is_client())
+                .cloned()
+                .collect::<Vec<_>>();
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
         let node = nodes
             .get_mut(&update.node_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
+        update.ensure_matches_node_generation(node)?;
+        let mut health = self.health.write().await;
+        let mut heartbeat_signature_timestamps = self.heartbeat_signature_timestamps.write().await;
+        let mut nat_classifications = self.nat_classifications.write().await;
+        let mut paths = self.paths.write().await;
         ensure_heartbeat_is_newer(
             &update,
             heartbeat_signature_timestamps.get(&update.node_id).copied(),
             health.get(&update.node_id),
         )?;
+        let routes_changed = update
+            .routes
+            .as_ref()
+            .is_some_and(|routes| routes != &node.routes);
+        if routes_changed {
+            let Some(epochs) = epochs.as_deref_mut() else {
+                return Err(ControlPlaneError::Store(
+                    "route-changing heartbeat did not acquire the routing epoch lock".to_string(),
+                ));
+            };
+            advance_in_memory_overlay_routing_epoch(epochs, &update.cluster_id)?;
+        }
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
@@ -574,10 +912,7 @@ impl ControlPlaneStore for InMemoryStore {
             node.routes = routes;
         }
         if let Some(classification) = update.nat_classification {
-            self.nat_classifications
-                .write()
-                .await
-                .insert(update.node_id.clone(), classification);
+            nat_classifications.insert(update.node_id.clone(), classification);
         }
         if let Some(accepted_signature_at) = update.accepted_signature_at {
             heartbeat_signature_timestamps.insert(update.node_id.clone(), accepted_signature_at);
@@ -1212,9 +1547,179 @@ type OverlayTopologyCache = BTreeMap<OverlayTopologyCacheKey, OverlayTopologyCac
 #[derive(Debug)]
 struct OverlayNodeSnapshot {
     loaded_at: Instant,
+    generated_at: chrono::DateTime<Utc>,
     nodes: Vec<NodeRecord>,
+    nodes_by_id: BTreeMap<NodeId, usize>,
     clients: Vec<NodeRecord>,
     health_by_node: BTreeMap<NodeId, NodeHealth>,
+    active_nodes: Vec<NodeRecord>,
+    active_nodes_by_id: BTreeMap<NodeId, usize>,
+    health_ttl_seconds: u64,
+    topology_cache_key: Arc<OverlayTopologyCacheKey>,
+    aggregate_routes: Vec<AggregateOverlayRoute>,
+    route_index: OverlayRouteIndex,
+    routing_epoch: u64,
+}
+
+#[derive(Clone)]
+enum OverlayTopologyNodeSource {
+    Snapshot(Arc<OverlayNodeSnapshot>),
+    #[cfg(test)]
+    Owned(Arc<Vec<NodeRecord>>),
+}
+
+impl OverlayTopologyNodeSource {
+    fn nodes(&self) -> &[NodeRecord] {
+        match self {
+            Self::Snapshot(snapshot) => &snapshot.active_nodes,
+            #[cfg(test)]
+            Self::Owned(nodes) => nodes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedOverlayRoute {
+    node_id: NodeId,
+    route: Route,
+}
+
+#[derive(Debug)]
+struct OverlayRouteIndex {
+    vpn_owner_by_ip: BTreeMap<IpAddr, NodeId>,
+    ipv4_by_prefix: Vec<BTreeMap<u32, Vec<IndexedOverlayRoute>>>,
+    ipv6_by_prefix: Vec<BTreeMap<u128, Vec<IndexedOverlayRoute>>>,
+}
+
+impl OverlayRouteIndex {
+    fn build(nodes: &[NodeRecord]) -> Self {
+        let mut vpn_owner_by_ip = BTreeMap::new();
+        let mut ipv4_by_prefix = (0..=32_u8)
+            .map(|_| BTreeMap::<u32, Vec<IndexedOverlayRoute>>::new())
+            .collect::<Vec<_>>();
+        let mut ipv6_by_prefix = (0..=128_u8)
+            .map(|_| BTreeMap::<u128, Vec<IndexedOverlayRoute>>::new())
+            .collect::<Vec<_>>();
+        let mut ordered_nodes = nodes.iter().collect::<Vec<_>>();
+        ordered_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+
+        for node in ordered_nodes {
+            vpn_owner_by_ip
+                .entry(node.vpn_ip.0)
+                .or_insert_with(|| node.node_id.clone());
+            for route in node
+                .routes
+                .iter()
+                .filter(|route| overlay_route_is_self_owned(node, route))
+            {
+                let mut canonical_route = route.clone();
+                canonical_route.cidr = canonical_route.cidr.trunc();
+                let indexed = IndexedOverlayRoute {
+                    node_id: node.node_id.clone(),
+                    route: canonical_route,
+                };
+                match indexed.route.cidr {
+                    IpNet::V4(cidr) => {
+                        ipv4_by_prefix[usize::from(cidr.prefix_len())]
+                            .entry(u32::from(cidr.network()))
+                            .or_default()
+                            .push(indexed);
+                    }
+                    IpNet::V6(cidr) => {
+                        ipv6_by_prefix[usize::from(cidr.prefix_len())]
+                            .entry(u128::from(cidr.network()))
+                            .or_default()
+                            .push(indexed);
+                    }
+                }
+            }
+        }
+
+        for candidates in ipv4_by_prefix
+            .iter_mut()
+            .flat_map(BTreeMap::values_mut)
+            .chain(ipv6_by_prefix.iter_mut().flat_map(BTreeMap::values_mut))
+        {
+            candidates.sort_by(|left, right| {
+                (left.route.metric, &left.node_id, left.route.id.as_str()).cmp(&(
+                    right.route.metric,
+                    &right.node_id,
+                    right.route.id.as_str(),
+                ))
+            });
+        }
+
+        Self {
+            vpn_owner_by_ip,
+            ipv4_by_prefix,
+            ipv6_by_prefix,
+        }
+    }
+
+    fn resolve_destination(
+        &self,
+        source: &NodeRecord,
+        active_nodes: &[NodeRecord],
+        active_nodes_by_id: &BTreeMap<NodeId, usize>,
+        destination: IpAddr,
+        policy: &ClusterPolicy,
+    ) -> Option<NodeRecord> {
+        if let Some(target_id) = self.vpn_owner_by_ip.get(&destination) {
+            let target = active_nodes.get(*active_nodes_by_id.get(target_id)?)?;
+            if target.node_id == source.node_id {
+                return None;
+            }
+            if policy.acl_rules.is_empty() {
+                return Some(target.clone());
+            }
+            if acl_allows_peer(source, target, policy) {
+                return acl_filter_peer(source, target, policy);
+            }
+            return None;
+        }
+
+        match destination {
+            IpAddr::V4(destination) => {
+                for prefix_len in (0..=32_u8).rev() {
+                    let key = ipv4_prefix_key(destination, prefix_len);
+                    let Some(candidates) = self.ipv4_by_prefix[usize::from(prefix_len)].get(&key)
+                    else {
+                        continue;
+                    };
+                    if let Some(target) = resolve_indexed_route(
+                        source,
+                        active_nodes,
+                        active_nodes_by_id,
+                        candidates,
+                        destination.into(),
+                        policy,
+                    ) {
+                        return Some(target);
+                    }
+                }
+            }
+            IpAddr::V6(destination) => {
+                for prefix_len in (0..=128_u8).rev() {
+                    let key = ipv6_prefix_key(destination, prefix_len);
+                    let Some(candidates) = self.ipv6_by_prefix[usize::from(prefix_len)].get(&key)
+                    else {
+                        continue;
+                    };
+                    if let Some(target) = resolve_indexed_route(
+                        source,
+                        active_nodes,
+                        active_nodes_by_id,
+                        candidates,
+                        destination.into(),
+                        policy,
+                    ) {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -1233,7 +1738,8 @@ pub struct ControlPlane<S> {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OverlayTopologyCacheKey {
-    node_ids: Vec<NodeId>,
+    membership_epoch: u64,
+    node_count: usize,
     block_size: u16,
     max_degree: u16,
     permutation_seed: String,
@@ -1313,23 +1819,78 @@ where
     }
 
     pub fn cluster_policy(&self) -> Result<ClusterPolicy, ControlPlaneError> {
-        self.cluster_policy
+        let policy = self
+            .cluster_policy
             .read()
             .map(|policy| policy.clone())
-            .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))
+            .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))?;
+        validate_cluster_policy(&policy)?;
+        validate_overlay_route_scopes_against_vpn_pool(&policy, self.config.vpn_pool)?;
+        Ok(policy)
     }
 
     pub async fn current_cluster_policy(&self) -> Result<ClusterPolicy, ControlPlaneError> {
-        if let Some(policy) = self
+        Ok(self.current_cluster_policy_state().await?.0)
+    }
+
+    async fn current_cluster_policy_state(
+        &self,
+    ) -> Result<(ClusterPolicy, Option<ClusterPolicy>), ControlPlaneError> {
+        let persisted = self
             .store
             .get_cluster_policy(&self.config.cluster_id)
-            .await?
-        {
+            .await?;
+        if let Some(policy) = persisted {
             validate_cluster_policy(&policy)?;
+            validate_overlay_route_scopes_against_vpn_pool(&policy, self.config.vpn_pool)?;
             self.cache_cluster_policy(policy.clone())?;
-            return Ok(policy);
+            return Ok((policy.clone(), Some(policy)));
         }
-        self.cluster_policy()
+        let policy = self
+            .store
+            .initialize_cluster_policy_if_absent(&self.config.cluster_id, self.cluster_policy()?)
+            .await?;
+        validate_cluster_policy(&policy)?;
+        validate_overlay_route_scopes_against_vpn_pool(&policy, self.config.vpn_pool)?;
+        self.cache_cluster_policy(policy.clone())?;
+        Ok((policy.clone(), Some(policy)))
+    }
+
+    async fn current_cluster_routing_state(
+        &self,
+    ) -> Result<(ClusterPolicy, Option<ClusterPolicy>, u64), ControlPlaneError> {
+        for _ in 0..MAX_ROUTE_CATALOG_UPDATE_RETRIES {
+            let before = self
+                .store
+                .get_overlay_routing_epoch(&self.config.cluster_id)
+                .await?;
+            let (policy, persisted) = self.current_cluster_policy_state().await?;
+            let after = self
+                .store
+                .get_overlay_routing_epoch(&self.config.cluster_id)
+                .await?;
+            if before == after {
+                return Ok((policy, persisted, after));
+            }
+        }
+        Err(ControlPlaneError::ClusterPolicyChanged)
+    }
+
+    async fn current_overlay_snapshot(
+        &self,
+    ) -> Result<(ClusterPolicy, Arc<OverlayNodeSnapshot>), ControlPlaneError> {
+        for _ in 0..MAX_ROUTE_CATALOG_UPDATE_RETRIES {
+            let (policy, _, routing_epoch) = self.current_cluster_routing_state().await?;
+            match self.overlay_node_snapshot(&policy, routing_epoch).await {
+                Ok(snapshot) => return Ok((policy, snapshot)),
+                Err(
+                    ControlPlaneError::ClusterPolicyChanged
+                    | ControlPlaneError::OverlayRouteCatalogChanged,
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ControlPlaneError::OverlayRouteCatalogChanged)
     }
 
     pub async fn advertise_service_instance(
@@ -1441,11 +2002,44 @@ where
         policy: ClusterPolicy,
     ) -> Result<ClusterPolicy, ControlPlaneError> {
         validate_cluster_policy(&policy)?;
-        self.store
-            .upsert_cluster_policy(&self.config.cluster_id, policy.clone())
-            .await?;
-        self.cache_cluster_policy(policy.clone())?;
-        Ok(policy)
+        validate_overlay_route_scopes_against_vpn_pool(&policy, self.config.vpn_pool)?;
+        for _ in 0..3 {
+            let nodes = self
+                .store
+                .list_nodes()
+                .await?
+                .into_iter()
+                .filter(|node| node.cluster_id == self.config.cluster_id)
+                .filter(|node| !node.role.is_client())
+                .collect::<Vec<_>>();
+            if !policy.overlay_route_scopes.is_empty() {
+                for node in &nodes {
+                    validate_routes_within_overlay_scopes(&node.routes, &policy).map_err(
+                        |reason| {
+                            ControlPlaneError::InvalidClusterPolicy(format!(
+                                "node {} has an advertised route outside overlay_route_scopes: \
+                                 {reason}",
+                                node.node_id
+                            ))
+                        },
+                    )?;
+                }
+            }
+            let expected_route_catalog_epoch = overlay_route_catalog_epoch(&nodes)?;
+            if self
+                .store
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    &self.config.cluster_id,
+                    policy.clone(),
+                    expected_route_catalog_epoch,
+                )
+                .await?
+            {
+                self.cache_cluster_policy(policy.clone())?;
+                return Ok(policy);
+            }
+        }
+        Err(ControlPlaneError::ClusterPolicyChanged)
     }
 
     fn cache_cluster_policy(&self, policy: ClusterPolicy) -> Result<(), ControlPlaneError> {
@@ -1455,10 +2049,6 @@ where
             .map_err(|_| ControlPlaneError::Store("cluster policy lock is poisoned".to_string()))?;
         *current = policy;
         Ok(())
-    }
-
-    fn policy_snapshot(&self) -> Result<ClusterPolicy, ControlPlaneError> {
-        self.cluster_policy()
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
@@ -1474,7 +2064,7 @@ where
     pub async fn registered_nodes_with_health(
         &self,
     ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
-        let snapshot = self.overlay_node_snapshot().await?;
+        let (_, snapshot) = self.current_overlay_snapshot().await?;
         Ok((snapshot.nodes.clone(), snapshot.health_by_node.clone()))
     }
 
@@ -1694,22 +2284,75 @@ where
 
         let relay_capability =
             relay_capability_allowed(&request.node_id, request.relay_capability.clone(), &claims)?;
-        let node = match self
-            .insert_node_with_fresh_vpn_ip(
-                claims.clone(),
-                request.clone(),
-                relay_capability.clone(),
-                now,
-            )
-            .await
-        {
-            Ok(node) => node,
-            Err(ControlPlaneError::NodeAlreadyExists(_)) => {
-                self.rejoin_existing_node(claims, request, relay_capability)
-                    .await?
+        let mut node = None;
+        let mut last_conflict = None;
+        for _ in 0..MAX_ROUTE_CATALOG_UPDATE_RETRIES {
+            let (cluster_policy, persisted_cluster_policy) =
+                self.current_cluster_policy_state().await?;
+            validate_routes_within_overlay_scopes(&request.requested_routes, &cluster_policy)
+                .map_err(|reason| ControlPlaneError::NodeRegistrationRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                })?;
+            let expected_route_catalog_epoch = if request.requested_routes.is_empty() {
+                None
+            } else {
+                let (violation, expected_epoch) = self
+                    .overlay_route_catalog_update_validation(
+                        &request.node_id,
+                        &request.requested_routes,
+                        &cluster_policy,
+                    )
+                    .await?;
+                if let Some(reason) = violation {
+                    return Err(ControlPlaneError::NodeRegistrationRejected {
+                        node_id: request.node_id.clone(),
+                        reason,
+                    });
+                }
+                expected_epoch
+            };
+
+            let registration = match self
+                .insert_node_with_fresh_vpn_ip(
+                    claims.clone(),
+                    request.clone(),
+                    relay_capability.clone(),
+                    now,
+                    persisted_cluster_policy.clone(),
+                    expected_route_catalog_epoch,
+                )
+                .await
+            {
+                Ok(node) => Ok(node),
+                Err(ControlPlaneError::NodeAlreadyExists(_)) => {
+                    self.rejoin_existing_node(
+                        claims.clone(),
+                        request.clone(),
+                        relay_capability.clone(),
+                        persisted_cluster_policy,
+                        expected_route_catalog_epoch,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match registration {
+                Ok(registered) => {
+                    node = Some(registered);
+                    break;
+                }
+                Err(
+                    error @ (ControlPlaneError::ClusterPolicyChanged
+                    | ControlPlaneError::OverlayRouteCatalogChanged
+                    | ControlPlaneError::NodeStateChanged(_)),
+                ) => last_conflict = Some(error),
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        };
+        }
+        let node = node.ok_or_else(|| {
+            last_conflict.unwrap_or(ControlPlaneError::OverlayRouteCatalogChanged)
+        })?;
         if let Some(classification) = nat_classification {
             self.store
                 .upsert_nat_classification(node.node_id.clone(), classification)
@@ -1756,6 +2399,8 @@ where
         claims: JoinTokenClaims,
         request: RegisterNodeRequest,
         relay_capability: Option<RelayCapability>,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
     ) -> Result<NodeRecord, ControlPlaneError> {
         let existing = self
             .store
@@ -1771,21 +2416,17 @@ where
             return Err(ControlPlaneError::NodeAlreadyExists(request.node_id));
         }
 
-        if existing.routes != request.requested_routes {
-            self.store
-                .update_node_routes(&request.node_id, request.requested_routes)
-                .await?;
-        }
         self.store
-            .update_node_candidates(&request.node_id, request.candidates)
-            .await?;
-        self.store
-            .update_node_relay_capability(&request.node_id, relay_capability)
-            .await?;
-        self.store
-            .get_node(&request.node_id)
-            .await?
-            .ok_or(ControlPlaneError::NodeNotFound(request.node_id))
+            .rejoin_node_if_cluster_policy(RejoinNodeStoreUpdate {
+                cluster_id: claims.cluster_id,
+                expected_cluster_policy,
+                expected_route_catalog_epoch,
+                expected_node: existing,
+                candidates: request.candidates,
+                relay_capability,
+                routes: request.requested_routes,
+            })
+            .await
     }
 
     async fn insert_node_with_fresh_vpn_ip(
@@ -1794,6 +2435,8 @@ where
         request: RegisterNodeRequest,
         relay_capability: Option<RelayCapability>,
         registered_at: chrono::DateTime<Utc>,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
     ) -> Result<NodeRecord, ControlPlaneError> {
         loop {
             let existing_nodes = self.store.list_nodes().await?;
@@ -1818,7 +2461,15 @@ where
                 registered_at,
             };
 
-            match self.store.insert_node(node.clone()).await {
+            match self
+                .store
+                .insert_node_if_cluster_policy(
+                    node.clone(),
+                    expected_cluster_policy.clone(),
+                    expected_route_catalog_epoch,
+                )
+                .await
+            {
                 Ok(()) => return Ok(node),
                 Err(ControlPlaneError::VpnIpAlreadyAllocated(_)) => continue,
                 Err(error) => return Err(error),
@@ -2104,10 +2755,13 @@ where
         &self,
         node_id: &NodeId,
     ) -> Result<NeighborMap, ControlPlaneError> {
-        let source = self
-            .store
-            .get_node(node_id)
-            .await?
+        let (policy, snapshot) = self.current_overlay_snapshot().await?;
+        let now = Utc::now();
+        let source = snapshot
+            .nodes_by_id
+            .get(node_id)
+            .and_then(|index| snapshot.nodes.get(*index))
+            .cloned()
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         if source.role.is_client() {
             return Err(ControlPlaneError::NodeUpdateRejected {
@@ -2116,14 +2770,26 @@ where
             });
         }
 
-        let nodes = self.overlay_nodes().await?;
-        let policy = self.current_cluster_policy().await?;
-        let topology = self.overlay_topology(&nodes, &policy).await?;
-        let now = Utc::now();
-        let nodes_by_id = nodes
-            .iter()
-            .map(|node| (node.node_id.clone(), node))
-            .collect::<BTreeMap<_, _>>();
+        let aggregate_routes = if policy.overlay_route_scopes.is_empty() {
+            snapshot.aggregate_routes.clone()
+        } else {
+            policy
+                .overlay_route_scopes
+                .iter()
+                .copied()
+                .map(|cidr| AggregateOverlayRoute { cidr })
+                .collect()
+        };
+        if aggregate_routes.len() > MAX_OVERLAY_ROUTE_SCOPES {
+            return Err(ControlPlaneError::BoundedTopology(format!(
+                "exact aggregate overlay route count {} exceeds the neighbor-map limit {}; configure route scopes instead of widening advertised networks",
+                aggregate_routes.len(),
+                MAX_OVERLAY_ROUTE_SCOPES
+            )));
+        }
+        let topology = self
+            .overlay_topology_for_snapshot(&snapshot, &policy)
+            .await?;
         let neighbor_ids = topology.neighbors(node_id).ok_or_else(|| {
             ControlPlaneError::BoundedTopology(format!(
                 "source node {node_id} is absent from topology"
@@ -2134,78 +2800,55 @@ where
             .iter()
             .enumerate()
             .filter_map(|(index, neighbor_id)| {
-                nodes_by_id
+                snapshot
+                    .active_nodes_by_id
                     .get(neighbor_id)
-                    .map(|neighbor| OverlayNeighbor {
-                        node: filter_served_endpoint_candidates((*neighbor).clone(), now, &policy),
-                        kind: if index < primary_neighbor_count {
-                            OverlayNeighborKind::BackbonePrimary
-                        } else {
-                            OverlayNeighborKind::BackboneSecondary
-                        },
+                    .and_then(|index| snapshot.active_nodes.get(*index))
+                    .map(|neighbor| {
+                        let mut node =
+                            filter_served_endpoint_candidates(neighbor.clone(), now, &policy);
+                        // Backbone membership authorizes the peer's VPN host route only.
+                        // Advertised routes are issued lazily by overlay_path_for after
+                        // destination-specific ACL evaluation.
+                        node.routes.clear();
+                        OverlayNeighbor {
+                            node,
+                            kind: if index < primary_neighbor_count {
+                                OverlayNeighborKind::BackbonePrimary
+                            } else {
+                                OverlayNeighborKind::BackboneSecondary
+                            },
+                        }
                     })
             })
             .collect::<Vec<_>>();
-        let mut selected_routes =
-            BTreeMap::<IpNet, ((u32, NodeId, String), AggregateOverlayRoute)>::new();
-        for target in &nodes {
-            if target.node_id == source.node_id {
-                continue;
-            }
-            let Some(filtered_target) = acl_filter_peer(&source, target, &policy) else {
-                continue;
-            };
-            for route in filtered_target.routes.iter().filter(|route| {
-                route.advertised_by == filtered_target.node_id
-                    && route
-                        .via
-                        .as_ref()
-                        .is_none_or(|via| via == &filtered_target.node_id)
-            }) {
-                let rank = (
-                    route.metric,
-                    filtered_target.node_id.clone(),
-                    route.id.clone(),
-                );
-                if selected_routes
-                    .get(&route.cidr)
-                    .is_some_and(|(selected_rank, _)| selected_rank <= &rank)
-                {
-                    continue;
-                }
-                selected_routes.insert(
-                    route.cidr,
-                    (rank, AggregateOverlayRoute { cidr: route.cidr }),
-                );
-            }
-        }
-
-        let snapshot = self.overlay_node_snapshot().await?;
-        let client_gateway_selections = self.store.list_client_gateway_selections().await?;
-        let client_route_peers = node_client_route_projection(
-            &source,
-            &snapshot.nodes,
-            &snapshot.clients,
-            &snapshot.health_by_node,
-            &client_gateway_selections,
-            &policy,
-            now,
-        );
+        let client_route_peers = if snapshot.clients.is_empty() {
+            Vec::new()
+        } else {
+            let client_gateway_selections = self.store.list_client_gateway_selections().await?;
+            node_client_route_projection(
+                &source,
+                &snapshot.nodes,
+                &snapshot.clients,
+                &snapshot.health_by_node,
+                &client_gateway_selections,
+                &policy,
+                now,
+            )
+        };
         let directory = self.service_directory_at(now).await?;
         let response = NeighborMap {
             cluster_id: self.config.cluster_id.clone(),
             node_id: source.node_id,
             topology_epoch: topology.topology_epoch(),
+            routing_epoch: snapshot.routing_epoch,
             max_degree: policy.overlay_max_degree,
             vpn_cidr: IpNet::V4(self.config.vpn_pool),
             neighbors,
-            aggregate_routes: selected_routes
-                .into_values()
-                .map(|(_, route)| route)
-                .collect(),
+            aggregate_routes,
             client_route_peers,
             bootstrap_endpoints: directory.bootstrap_endpoints,
-            generated_at: now,
+            generated_at: snapshot.generated_at,
         };
         response
             .validate()
@@ -2217,11 +2860,13 @@ where
         &self,
     ) -> Result<ControlPlaneTopologyResponse, ControlPlaneError> {
         let generated_at = Utc::now();
-        let mut nodes = self.overlay_nodes().await?;
+        let (policy, snapshot) = self.current_overlay_snapshot().await?;
+        let mut nodes = snapshot.active_nodes.clone();
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-        let policy = self.current_cluster_policy().await?;
-        let topology = self.overlay_topology(&nodes, &policy).await?;
-        let health_by_node = self.health_by_node(&nodes).await?;
+        let topology = self
+            .overlay_topology_for_snapshot(&snapshot, &policy)
+            .await?;
+        let health_by_node = &snapshot.health_by_node;
         let observed_path_pairs = topology
             .edge_placements()
             .keys()
@@ -2442,33 +3087,43 @@ where
         &self,
         request: &OverlayPathQuery,
     ) -> Result<OverlayPath, ControlPlaneError> {
-        let nodes = self.overlay_nodes().await?;
-        let source = nodes
-            .iter()
-            .find(|node| node.node_id == request.source)
-            .cloned()
+        let (policy, snapshot) = self.current_overlay_snapshot().await?;
+        let now = Utc::now();
+        let source = snapshot
+            .active_nodes_by_id
+            .get(&request.source)
+            .and_then(|index| snapshot.active_nodes.get(*index))
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.source.clone()))?;
-        let policy = self.current_cluster_policy().await?;
-        let target = overlay_target_for_destination(&source, &nodes, request.destination, &policy)
+        let target = snapshot
+            .route_index
+            .resolve_destination(
+                source,
+                &snapshot.active_nodes,
+                &snapshot.active_nodes_by_id,
+                request.destination,
+                &policy,
+            )
             .ok_or(ControlPlaneError::OverlayDestinationNotFound(
                 request.destination,
             ))?;
-        let topology = self.overlay_topology(&nodes, &policy).await?;
+        let topology = self
+            .overlay_topology_for_snapshot(&snapshot, &policy)
+            .await?;
         let paths = topology
             .paths(&source.node_id, &target.node_id)
             .ok_or_else(|| ControlPlaneError::OverlayPathUnavailable {
                 source_node: source.node_id.clone(),
                 destination_node: target.node_id.clone(),
             })?;
-        let now = Utc::now();
         let response = OverlayPath {
             topology_epoch: topology.topology_epoch(),
-            source: source.node_id,
+            routing_epoch: snapshot.routing_epoch,
+            source: source.node_id.clone(),
             destination: request.destination,
             target: filter_served_endpoint_candidates(target, now, &policy),
             ordered_nodes: paths.primary,
             secondary_ordered_nodes: paths.secondary.map(|path| path.nodes),
-            generated_at: now,
+            generated_at: snapshot.generated_at,
         };
         response
             .validate()
@@ -2476,50 +3131,108 @@ where
         Ok(response)
     }
 
+    #[cfg(test)]
     async fn overlay_nodes(&self) -> Result<Vec<NodeRecord>, ControlPlaneError> {
-        let policy = self.current_cluster_policy().await?;
-        let now = Utc::now();
-        let snapshot = self.overlay_node_snapshot().await?;
-        Ok(snapshot
-            .nodes
-            .iter()
-            .filter(|node| {
-                overlay_node_health_allows(
-                    node,
-                    snapshot.health_by_node.get(&node.node_id),
-                    now,
-                    policy.relay_health_ttl_seconds,
-                )
-            })
-            .cloned()
-            .collect())
+        let (_, snapshot) = self.current_overlay_snapshot().await?;
+        Ok(snapshot.active_nodes.clone())
     }
 
-    async fn overlay_node_snapshot(&self) -> Result<Arc<OverlayNodeSnapshot>, ControlPlaneError> {
+    async fn overlay_node_snapshot(
+        &self,
+        policy: &ClusterPolicy,
+        routing_epoch: u64,
+    ) -> Result<Arc<OverlayNodeSnapshot>, ControlPlaneError> {
         let mut cached = self.overlay_node_snapshot_cache.lock().await;
         if let Some(snapshot) = cached
             .as_ref()
-            .filter(|snapshot| snapshot.loaded_at.elapsed() <= OVERLAY_NODE_SNAPSHOT_CACHE_TTL)
+            .filter(|snapshot| {
+                snapshot.loaded_at.elapsed() <= OVERLAY_NODE_SNAPSHOT_CACHE_TTL
+                    && snapshot.health_ttl_seconds == policy.relay_health_ttl_seconds
+                    && snapshot.topology_cache_key.block_size == policy.overlay_block_size
+                    && snapshot.topology_cache_key.max_degree == policy.overlay_max_degree
+                    && snapshot.routing_epoch == routing_epoch
+            })
+            .map(Arc::clone)
         {
-            return Ok(Arc::clone(snapshot));
+            drop(cached);
+            if self
+                .store
+                .get_overlay_routing_epoch(&self.config.cluster_id)
+                .await?
+                != routing_epoch
+            {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+            return Ok(snapshot);
         }
 
-        let (nodes, mut health_by_node) =
-            tokio::try_join!(self.store.list_nodes(), self.store.list_health())?;
+        let (nodes, mut health_by_node) = self.store.list_nodes_and_health().await?;
+        let loaded_at = Instant::now();
+        let generated_at = Utc::now();
         let (nodes, clients) = nodes
             .into_iter()
             .filter(|node| node.cluster_id == self.config.cluster_id)
             .partition::<Vec<_>, _>(|node| !node.role.is_client());
+        let nodes_by_id = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.node_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
         let node_ids = nodes
             .iter()
             .map(|node| node.node_id.clone())
             .collect::<BTreeSet<_>>();
         health_by_node.retain(|node_id, _| node_ids.contains(node_id));
+        let active_nodes = nodes
+            .iter()
+            .filter(|node| {
+                overlay_node_health_allows(
+                    node,
+                    health_by_node.get(&node.node_id),
+                    generated_at,
+                    policy.relay_health_ttl_seconds,
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_nodes_by_id = active_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.node_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let membership_epoch =
+            overlay_membership_epoch(active_nodes_by_id.keys().map(NodeId::as_str));
+        let topology_cache_key = Arc::new(OverlayTopologyCacheKey {
+            membership_epoch,
+            node_count: active_nodes.len(),
+            block_size: policy.overlay_block_size,
+            max_degree: policy.overlay_max_degree,
+            permutation_seed: self.config.cluster_id.as_str().to_string(),
+        });
+        let aggregate_routes = aggregate_overlay_routes(&nodes);
+        let route_index = OverlayRouteIndex::build(&nodes);
+        if self
+            .store
+            .get_overlay_routing_epoch(&self.config.cluster_id)
+            .await?
+            != routing_epoch
+        {
+            return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+        }
         let snapshot = Arc::new(OverlayNodeSnapshot {
-            loaded_at: Instant::now(),
+            loaded_at,
+            generated_at,
             nodes,
+            nodes_by_id,
             clients,
             health_by_node,
+            active_nodes,
+            active_nodes_by_id,
+            health_ttl_seconds: policy.relay_health_ttl_seconds,
+            topology_cache_key,
+            aggregate_routes,
+            route_index,
+            routing_epoch,
         });
         *cached = Some(Arc::clone(&snapshot));
         Ok(snapshot)
@@ -2529,6 +3242,20 @@ where
         self.overlay_node_snapshot_cache.lock().await.take();
     }
 
+    async fn overlay_topology_for_snapshot(
+        &self,
+        snapshot: &Arc<OverlayNodeSnapshot>,
+        policy: &ClusterPolicy,
+    ) -> Result<Arc<BoundedTopology>, ControlPlaneError> {
+        self.overlay_topology_cached(
+            Arc::clone(&snapshot.topology_cache_key),
+            policy,
+            OverlayTopologyNodeSource::Snapshot(Arc::clone(snapshot)),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn overlay_topology(
         &self,
         nodes: &[NodeRecord],
@@ -2536,45 +3263,65 @@ where
     ) -> Result<Arc<BoundedTopology>, ControlPlaneError> {
         let mut node_ids = nodes
             .iter()
-            .map(|node| node.node_id.clone())
+            .map(|node| node.node_id.as_str())
             .collect::<Vec<_>>();
         node_ids.sort();
-        let key = OverlayTopologyCacheKey {
-            node_ids,
-            block_size: policy.overlay_block_size,
-            max_degree: policy.overlay_max_degree,
-            permutation_seed: self.config.cluster_id.as_str().to_string(),
-        };
+        self.overlay_topology_cached(
+            Arc::new(OverlayTopologyCacheKey {
+                membership_epoch: overlay_membership_epoch(node_ids),
+                node_count: nodes.len(),
+                block_size: policy.overlay_block_size,
+                max_degree: policy.overlay_max_degree,
+                permutation_seed: self.config.cluster_id.as_str().to_string(),
+            }),
+            policy,
+            OverlayTopologyNodeSource::Owned(Arc::new(nodes.to_vec())),
+        )
+        .await
+    }
+
+    async fn overlay_topology_cached(
+        &self,
+        key: Arc<OverlayTopologyCacheKey>,
+        policy: &ClusterPolicy,
+        nodes: OverlayTopologyNodeSource,
+    ) -> Result<Arc<BoundedTopology>, ControlPlaneError> {
         let cell = {
             let mut cache = self.overlay_topology_cache.lock().await;
-            cache.retain(|cached_key, cell| cached_key == &key || cell.initialized());
-            while cache.len() >= MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES && !cache.contains_key(&key) {
+            cache.retain(|cached_key, cell| cached_key == key.as_ref() || cell.initialized());
+            while cache.len() >= MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES
+                && !cache.contains_key(key.as_ref())
+            {
                 let Some(evicted_key) = cache.keys().next().cloned() else {
                     break;
                 };
                 cache.remove(&evicted_key);
             }
             while cache.len() > MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES {
-                let Some(evicted_key) =
-                    cache.keys().find(|cached_key| *cached_key != &key).cloned()
+                let Some(evicted_key) = cache
+                    .keys()
+                    .find(|cached_key| *cached_key != key.as_ref())
+                    .cloned()
                 else {
                     break;
                 };
                 cache.remove(&evicted_key);
             }
-            cache
-                .entry(key)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+            if let Some(cell) = cache.get(key.as_ref()) {
+                Arc::clone(cell)
+            } else {
+                let cell = Arc::new(OnceCell::new());
+                cache.insert((*key).clone(), Arc::clone(&cell));
+                cell
+            }
         };
         let config = BoundedTopologyConfig::new(usize::from(policy.overlay_max_degree))
             .with_block_size(usize::from(policy.overlay_block_size))
             .with_permutation_seed(self.config.cluster_id.as_str());
-        let topology_nodes = nodes.to_vec();
         let topology = cell
             .get_or_init(|| async move {
                 match tokio::task::spawn_blocking(move || {
-                    BoundedTopology::synthesize(&topology_nodes, &config)
+                    BoundedTopology::synthesize(nodes.nodes(), &config)
                 })
                 .await
                 {
@@ -2792,27 +3539,59 @@ where
             .get_node(&request.node_id)
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(request.node_id.clone()))?;
+        if node.cluster_id != self.config.cluster_id {
+            return Err(ControlPlaneError::NodeNotFound(request.node_id.clone()));
+        }
         if node.role.is_client() {
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: request.node_id.clone(),
                 reason: "clients cannot submit node heartbeats".to_string(),
             });
         }
-        let policy = self.current_cluster_policy().await?;
+        let (policy, persisted_cluster_policy) = self.current_cluster_policy_state().await?;
         let previous_signature_at = self
             .store
             .get_heartbeat_signature_timestamp(&request.node_id)
             .await?;
         let now = Utc::now();
-        self.validate_heartbeat_request(&request, &node, previous_signature_at, now)?;
+        self.validate_heartbeat_request(&request, &node, &policy, previous_signature_at, now)?;
+        let route_catalog_update_requested = request
+            .routes
+            .as_ref()
+            .is_some_and(|routes| routes != &node.routes);
+        let expected_route_catalog_epoch = if route_catalog_update_requested {
+            let (violation, expected_epoch) = self
+                .overlay_route_catalog_update_validation(
+                    &request.node_id,
+                    request.routes.as_deref().unwrap_or_default(),
+                    &policy,
+                )
+                .await?;
+            if let Some(reason) = violation {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                });
+            }
+            expected_epoch
+        } else {
+            request.routes = None;
+            None
+        };
         self.validate_heartbeat_path_relay_shape(&request)?;
-        let path_nodes = if request.path_state.is_empty() {
+        let path_node_ids = request
+            .path_state
+            .iter()
+            .flat_map(|path| std::iter::once(&path.key.remote).chain(path.relay_node.as_ref()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let path_nodes = if path_node_ids.is_empty() {
             None
         } else {
-            Some(self.store.list_nodes().await?)
+            Some(self.store.get_nodes_by_ids(&path_node_ids).await?)
         };
         if let Some(nodes) = path_nodes.as_ref() {
-            self.validate_heartbeat_path_peers_visible(&request, &node, nodes)?;
+            self.validate_heartbeat_path_peers_visible(&request, &node, nodes, &policy)?;
             if request
                 .path_state
                 .iter()
@@ -2825,6 +3604,7 @@ where
                     nodes,
                     &health_by_node,
                     now,
+                    &policy,
                 )?;
             }
         }
@@ -2870,7 +3650,12 @@ where
             .transpose()?;
         self.store
             .apply_heartbeat(HeartbeatStoreUpdate {
+                cluster_id: self.config.cluster_id.clone(),
+                expected_cluster_policy: persisted_cluster_policy,
+                expected_route_catalog_epoch,
                 node_id: request.node_id,
+                expected_identity_public_key: node.identity_public_key,
+                expected_registered_at: node.registered_at,
                 accepted_signature_at,
                 candidates: request.candidates,
                 nat_classification: request.nat_classification,
@@ -2880,6 +3665,9 @@ where
                 paths: request.path_state,
             })
             .await?;
+        if route_catalog_update_requested {
+            self.invalidate_overlay_node_snapshot().await;
+        }
 
         self.notify_connection_intent_waiters(&connection_intent_targets)
             .await;
@@ -2995,31 +3783,47 @@ where
         node_id: &NodeId,
         now: chrono::DateTime<Utc>,
     ) -> Result<Vec<PeerConnectionIntent>, ControlPlaneError> {
-        let idle_timeout_seconds = self.current_cluster_policy().await?.idle_timeout_seconds;
-        let nodes_by_id = self
+        let policy = self.current_cluster_policy().await?;
+        let target = self
             .store
-            .list_nodes()
+            .get_node(node_id)
             .await?
-            .into_iter()
-            .map(|node| (node.node_id.clone(), node))
-            .collect::<BTreeMap<_, _>>();
-        let mut intents = self
-            .paths_for(node_id)
+            .filter(|node| node.cluster_id == self.config.cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        let paths = self
+            .store
+            .list_paths_for(node_id)
             .await?
-            .paths
             .into_iter()
             .filter(|path| path.key.remote == *node_id)
-            .filter(|path| path_is_fresh(path, now, idle_timeout_seconds))
+            .filter(|path| path_is_fresh(path, now, policy.path_state_ttl_seconds))
             .filter_map(|path| {
                 let observed_at = lazy_connect_local_activity_at(&path).ok().flatten()?;
-                let peer_vpn_ip = nodes_by_id.get(&path.key.local)?.vpn_ip;
-                timestamp_is_fresh(observed_at, now, idle_timeout_seconds).then_some(
-                    PeerConnectionIntent {
-                        peer: path.key.local,
-                        peer_vpn_ip,
-                        observed_at,
-                    },
-                )
+                timestamp_is_fresh(observed_at, now, policy.idle_timeout_seconds)
+                    .then_some((path, observed_at))
+            })
+            .collect::<Vec<_>>();
+        let peer_ids = paths
+            .iter()
+            .map(|(path, _)| path.key.local.clone())
+            .collect::<BTreeSet<_>>();
+        let peers_by_id = self
+            .store
+            .get_nodes_by_ids(&peer_ids)
+            .await?
+            .into_iter()
+            .filter(|node| node.cluster_id == self.config.cluster_id)
+            .map(|node| (node.node_id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut intents = paths
+            .into_iter()
+            .filter_map(|(path, observed_at)| {
+                let peer = peers_by_id.get(&path.key.local)?;
+                acl_filter_peer(&target, peer, &policy).map(|visible| PeerConnectionIntent {
+                    peer: visible.node_id,
+                    peer_vpn_ip: visible.vpn_ip,
+                    observed_at,
+                })
             })
             .collect::<Vec<_>>();
         intents.sort_by(|left, right| left.peer.cmp(&right.peer));
@@ -3157,10 +3961,10 @@ where
         &self,
         request: &HeartbeatRequest,
         node: &NodeRecord,
+        policy: &ClusterPolicy,
         previous_signature_at: Option<chrono::DateTime<Utc>>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), ControlPlaneError> {
-        let policy = self.policy_snapshot()?;
         validate_node_health_shape(
             &request.health,
             now,
@@ -3231,6 +4035,12 @@ where
                     reason,
                 }
             })?;
+            validate_routes_within_overlay_scopes(routes, policy).map_err(|reason| {
+                ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason,
+                }
+            })?;
             for route in routes {
                 if route.advertised_by != request.node_id {
                     return Err(ControlPlaneError::NodeUpdateRejected {
@@ -3245,6 +4055,15 @@ where
                     return Err(ControlPlaneError::RouteDenied(route.id.clone()));
                 }
             }
+        }
+        if request.path_state.len() > MAX_HEARTBEAT_PATH_STATES {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: request.node_id.clone(),
+                reason: format!(
+                    "heartbeat path_state contains {} entries; maximum is {MAX_HEARTBEAT_PATH_STATES}",
+                    request.path_state.len()
+                ),
+            });
         }
         let mut seen_path_keys = BTreeSet::new();
         for path in &request.path_state {
@@ -3428,6 +4247,64 @@ where
         Ok(())
     }
 
+    async fn overlay_route_catalog_update_validation(
+        &self,
+        node_id: &NodeId,
+        routes: &[Route],
+        policy: &ClusterPolicy,
+    ) -> Result<(Option<String>, Option<u64>), ControlPlaneError> {
+        if let Err(reason) = validate_routes_against_vpn_pool(routes, self.config.vpn_pool) {
+            return Ok((Some(reason), None));
+        }
+        if !policy.overlay_route_scopes.is_empty() || routes.is_empty() {
+            return Ok((None, None));
+        }
+
+        let nodes = self
+            .store
+            .list_nodes()
+            .await?
+            .into_iter()
+            .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
+            .collect::<Vec<_>>();
+        let expected_route_catalog_epoch = overlay_route_catalog_epoch(&nodes)?;
+        let mut cidrs = nodes
+            .into_iter()
+            .filter(|node| node.node_id != *node_id)
+            .flat_map(|node| {
+                let owner = node.node_id;
+                node.routes
+                    .into_iter()
+                    .filter(move |route| {
+                        route.advertised_by == owner
+                            && route.via.as_ref().is_none_or(|via| via == &owner)
+                    })
+                    .map(|route| route.cidr.trunc())
+            })
+            .collect::<Vec<_>>();
+        cidrs.extend(
+            routes
+                .iter()
+                .filter(|route| {
+                    route.advertised_by == *node_id
+                        && route.via.as_ref().is_none_or(|via| via == node_id)
+                })
+                .map(|route| route.cidr.trunc()),
+        );
+        let aggregate_count = IpNet::aggregate(&cidrs).len();
+        if aggregate_count > MAX_OVERLAY_ROUTE_SCOPES {
+            return Ok((
+                Some(format!(
+                    "advertised routes would require {aggregate_count} aggregate capture scopes, \
+                     exceeding the maximum {MAX_OVERLAY_ROUTE_SCOPES}; configure \
+                     overlay_route_scopes before advertising fragmented routes"
+                )),
+                Some(expected_route_catalog_epoch),
+            ));
+        }
+        Ok((None, Some(expected_route_catalog_epoch)))
+    }
+
     fn validate_heartbeat_path_relay_shape(
         &self,
         request: &HeartbeatRequest,
@@ -3493,8 +4370,8 @@ where
         request: &HeartbeatRequest,
         reporter: &NodeRecord,
         nodes: &[NodeRecord],
+        policy: &ClusterPolicy,
     ) -> Result<(), ControlPlaneError> {
-        let policy = self.policy_snapshot()?;
         let nodes_by_id = nodes
             .iter()
             .map(|node| (node.node_id.clone(), node))
@@ -3509,7 +4386,7 @@ where
                     ),
                 });
             };
-            if acl_filter_peer(reporter, remote, &policy).is_none() {
+            if acl_filter_peer(reporter, remote, policy).is_none() {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!(
@@ -3529,8 +4406,8 @@ where
         nodes: &[NodeRecord],
         health_by_node: &BTreeMap<NodeId, NodeHealth>,
         now: chrono::DateTime<Utc>,
+        policy: &ClusterPolicy,
     ) -> Result<(), ControlPlaneError> {
-        let policy = self.policy_snapshot()?;
         let nodes_by_id = nodes
             .iter()
             .map(|node| (node.node_id.clone(), node))
@@ -3548,13 +4425,13 @@ where
                     reason: format!("relay node {relay_node} is not registered"),
                 });
             };
-            if !relay_candidate_allowed(relay, health_by_node.get(relay_node), now, &policy) {
+            if !relay_candidate_allowed(relay, health_by_node.get(relay_node), now, policy) {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!("relay node {relay_node} is not an eligible relay candidate"),
                 });
             }
-            if acl_filter_peer(reporter, relay, &policy).is_none() {
+            if acl_filter_peer(reporter, relay, policy).is_none() {
                 return Err(ControlPlaneError::NodeUpdateRejected {
                     node_id: request.node_id.clone(),
                     reason: format!("relay node {relay_node} is not visible to reporting node"),
@@ -3713,9 +4590,7 @@ where
             .iter()
             .map(|node| node.node_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut health_by_node = self.store.list_health().await?;
-        health_by_node.retain(|node_id, _| node_ids.contains(node_id));
-        Ok(health_by_node)
+        self.store.get_health_by_node_ids(&node_ids).await
     }
 
     fn filtered_peer_map_for_node(
@@ -3953,6 +4828,9 @@ fn node_client_route_projection(
     policy: &ClusterPolicy,
     generated_at: chrono::DateTime<Utc>,
 ) -> Vec<NodeRecord> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
     let gateways = select_client_gateways(backbone_nodes, health_by_node, generated_at, policy);
     let gateway_ids = gateways
         .iter()
@@ -4267,6 +5145,34 @@ fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneErr
             "overlay_direct_shortcut_limit must be at most {MAX_OVERLAY_DEGREE}"
         )));
     }
+    if policy.overlay_route_scopes.len() > MAX_OVERLAY_ROUTE_SCOPES {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "overlay_route_scopes must contain at most {MAX_OVERLAY_ROUTE_SCOPES} CIDRs"
+        )));
+    }
+    let mut accepted_scopes = Vec::new();
+    for scope in &policy.overlay_route_scopes {
+        if let Some(reason) = restricted_advertised_route_cidr_reason(scope) {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "overlay route scope {scope} includes {reason} addresses"
+            )));
+        }
+        let canonical = scope.trunc();
+        if scope != &canonical {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "overlay route scope {scope} must be canonical {canonical}"
+            )));
+        }
+        if let Some(existing) = accepted_scopes
+            .iter()
+            .find(|existing| ipnets_overlap(existing, scope))
+        {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "overlay route scope {scope} overlaps {existing}"
+            )));
+        }
+        accepted_scopes.push(*scope);
+    }
     for (name, value) in [
         ("idle_timeout_seconds", policy.idle_timeout_seconds),
         ("relay_health_ttl_seconds", policy.relay_health_ttl_seconds),
@@ -4303,6 +5209,12 @@ fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneErr
 
     let mut rule_ids = BTreeSet::new();
     for rule in &policy.acl_rules {
+        if rule.protocol != TransportProtocol::Any {
+            return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+                "ACL rule {:?} uses protocol {:?}; the WireGuard dataplane currently supports only protocol=any ACL rules",
+                rule.id, rule.protocol
+            )));
+        }
         if rule.id.is_empty() || rule.id.len() > 128 {
             return Err(ControlPlaneError::InvalidClusterPolicy(format!(
                 "ACL rule IDs must be 1 to 128 bytes: {:?}",
@@ -4674,59 +5586,158 @@ fn relay_health_allows(
     }
 }
 
-fn overlay_target_for_destination(
+fn overlay_route_is_self_owned(node: &NodeRecord, route: &Route) -> bool {
+    route.advertised_by == node.node_id && route.via.as_ref().is_none_or(|via| via == &node.node_id)
+}
+
+fn aggregate_overlay_routes(nodes: &[NodeRecord]) -> Vec<AggregateOverlayRoute> {
+    let canonical_cidrs = nodes
+        .iter()
+        .flat_map(|node| {
+            node.routes
+                .iter()
+                .filter(|route| overlay_route_is_self_owned(node, route))
+                .map(|route| route.cidr.trunc())
+        })
+        .collect::<Vec<_>>();
+    IpNet::aggregate(&canonical_cidrs)
+        .into_iter()
+        .map(|cidr| AggregateOverlayRoute { cidr })
+        .collect()
+}
+
+pub fn overlay_route_catalog_epoch(nodes: &[NodeRecord]) -> Result<u64, ControlPlaneError> {
+    let mut ordered = nodes.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let material = ordered
+        .into_iter()
+        .map(|node| {
+            (
+                &node.node_id,
+                node.vpn_ip,
+                &node.role,
+                &node.tags,
+                &node.wireguard_public_key,
+                &node.routes,
+            )
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&material).map_err(|error| {
+        ControlPlaneError::Store(format!("failed to encode overlay route catalog: {error}"))
+    })?;
+    Ok(overlay_epoch_digest(
+        b"HeteroNetwork overlay route catalog v1",
+        &encoded,
+    ))
+}
+
+#[cfg(test)]
+fn overlay_routing_epoch(
+    route_catalog_epoch: u64,
+    policy: &ClusterPolicy,
+) -> Result<u64, ControlPlaneError> {
+    let policy_material = serde_json::to_vec(&(&policy.acl_rules, &policy.overlay_route_scopes))
+        .map_err(|error| {
+            ControlPlaneError::Store(format!("failed to encode overlay routing policy: {error}"))
+        })?;
+    let mut material = route_catalog_epoch.to_be_bytes().to_vec();
+    material.extend_from_slice(&policy_material);
+    Ok(overlay_epoch_digest(
+        b"HeteroNetwork overlay routing epoch v1",
+        &material,
+    ))
+}
+
+fn overlay_membership_epoch<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> u64 {
+    let mut material = Vec::new();
+    for node_id in node_ids {
+        material.extend_from_slice(&(node_id.len() as u64).to_be_bytes());
+        material.extend_from_slice(node_id.as_bytes());
+    }
+    overlay_epoch_digest(b"HeteroNetwork overlay membership v1", &material)
+}
+
+fn overlay_epoch_digest(domain: &[u8], material: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    hasher.update((material.len() as u64).to_be_bytes());
+    hasher.update(material);
+    let digest = hasher.finalize();
+    let mut epoch = [0_u8; 8];
+    epoch.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(epoch)
+}
+
+fn ipv4_prefix_key(address: Ipv4Addr, prefix_len: u8) -> u32 {
+    let address = u32::from(address);
+    if prefix_len == 0 {
+        0
+    } else {
+        address & (u32::MAX << (u32::BITS - u32::from(prefix_len)))
+    }
+}
+
+fn ipv6_prefix_key(address: Ipv6Addr, prefix_len: u8) -> u128 {
+    let address = u128::from(address);
+    if prefix_len == 0 {
+        0
+    } else {
+        address & (u128::MAX << (u128::BITS - u32::from(prefix_len)))
+    }
+}
+
+fn resolve_indexed_route(
     source: &NodeRecord,
-    nodes: &[NodeRecord],
+    active_nodes: &[NodeRecord],
+    active_nodes_by_id: &BTreeMap<NodeId, usize>,
+    candidates: &[IndexedOverlayRoute],
     destination: IpAddr,
     policy: &ClusterPolicy,
 ) -> Option<NodeRecord> {
-    if let Some(target) = nodes.iter().find(|target| target.vpn_ip.0 == destination) {
-        if target.node_id == source.node_id {
-            return None;
-        }
-        if policy.acl_rules.is_empty() || acl_allows_peer(source, target, policy) {
-            return Some(acl_filter_peer(source, target, policy).unwrap_or_else(|| target.clone()));
-        }
-        return None;
-    }
-
-    let mut selected: Option<(u8, u32, NodeId, String, NodeRecord)> = None;
-    for target in nodes
-        .iter()
-        .filter(|target| target.node_id != source.node_id)
-    {
-        let Some(filtered_target) = acl_filter_peer(source, target, policy) else {
+    for candidate in candidates {
+        let Some(target) = active_nodes_by_id
+            .get(&candidate.node_id)
+            .and_then(|index| active_nodes.get(*index))
+        else {
             continue;
         };
-        for route in filtered_target.routes.iter().filter(|route| {
-            route.cidr.contains(&destination)
-                && route.advertised_by == filtered_target.node_id
-                && route
-                    .via
-                    .as_ref()
-                    .is_none_or(|via| via == &filtered_target.node_id)
-        }) {
-            let candidate = (
-                route.cidr.prefix_len(),
-                route.metric,
-                filtered_target.node_id.clone(),
-                route.id.clone(),
-                filtered_target.clone(),
-            );
-            let replace = selected
-                .as_ref()
-                .is_none_or(|(prefix, metric, node_id, route_id, _)| {
-                    candidate.0 > *prefix
-                        || (candidate.0 == *prefix
-                            && (&candidate.1, &candidate.2, &candidate.3)
-                                < (metric, node_id, route_id))
-                });
-            if replace {
-                selected = Some(candidate);
-            }
+        if target.node_id == source.node_id
+            || (!policy.acl_rules.is_empty()
+                && !acl_allows_route_destination(
+                    source,
+                    target,
+                    &candidate.route,
+                    destination,
+                    policy,
+                ))
+        {
+            continue;
         }
+        let mut target = target.clone();
+        let mut route = candidate.route.clone();
+        if !policy.acl_rules.is_empty() {
+            route.id = overlay_destination_route_id(destination);
+            route.cidr = overlay_destination_host_cidr(destination);
+        }
+        target.routes = vec![route];
+        return Some(target);
     }
-    selected.map(|(_, _, _, _, target)| target)
+    None
+}
+
+fn overlay_destination_route_id(destination: IpAddr) -> String {
+    match destination {
+        IpAddr::V4(destination) => format!("overlay-v4-{:08x}", u32::from(destination)),
+        IpAddr::V6(destination) => format!("overlay-v6-{:032x}", u128::from(destination)),
+    }
+}
+
+fn overlay_destination_host_cidr(destination: IpAddr) -> IpNet {
+    match destination {
+        IpAddr::V4(destination) => IpNet::V4(ipnet::Ipv4Net::new_assert(destination, 32)),
+        IpAddr::V6(destination) => IpNet::V6(ipnet::Ipv6Net::new_assert(destination, 128)),
+    }
 }
 
 fn acl_filter_peer(
@@ -4768,6 +5779,26 @@ fn acl_allows_route(
     acl_decision(source, target, Some(route), policy).unwrap_or(false)
 }
 
+fn acl_allows_route_destination(
+    source: &NodeRecord,
+    target: &NodeRecord,
+    _route: &Route,
+    destination: IpAddr,
+    policy: &ClusterPolicy,
+) -> bool {
+    let mut allowed = None;
+    for rule in &policy.acl_rules {
+        if !acl_rule_matches_destination(rule, source, target, destination) {
+            continue;
+        }
+        match rule.action {
+            AclAction::Deny => return false,
+            AclAction::Allow => allowed = Some(true),
+        }
+    }
+    allowed.unwrap_or(false)
+}
+
 fn acl_decision(
     source: &NodeRecord,
     target: &NodeRecord,
@@ -4793,6 +5824,40 @@ fn acl_rule_matches(
     target: &NodeRecord,
     route: Option<&Route>,
 ) -> bool {
+    if !acl_rule_matches_node_selectors(rule, source, target) {
+        return false;
+    }
+    match route {
+        Some(route) => {
+            rule.routes.is_empty()
+                || rule.routes.iter().any(|rule_route| match rule.action {
+                    AclAction::Allow => ipnet_contains(rule_route, &route.cidr),
+                    AclAction::Deny => ipnets_overlap(rule_route, &route.cidr),
+                })
+        }
+        None => rule.routes.is_empty(),
+    }
+}
+
+fn acl_rule_matches_destination(
+    rule: &AclRule,
+    source: &NodeRecord,
+    target: &NodeRecord,
+    destination: IpAddr,
+) -> bool {
+    acl_rule_matches_node_selectors(rule, source, target)
+        && (rule.routes.is_empty()
+            || rule
+                .routes
+                .iter()
+                .any(|rule_route| rule_route.contains(&destination)))
+}
+
+fn acl_rule_matches_node_selectors(
+    rule: &AclRule,
+    source: &NodeRecord,
+    target: &NodeRecord,
+) -> bool {
     if rule.protocol != TransportProtocol::Any {
         return false;
     }
@@ -4808,16 +5873,7 @@ fn acl_rule_matches(
     if !rule.to_tags.is_empty() && rule.to_tags.is_disjoint(&target.tags) {
         return false;
     }
-    match route {
-        Some(route) => {
-            rule.routes.is_empty()
-                || rule
-                    .routes
-                    .iter()
-                    .any(|allowed| ipnet_contains(allowed, &route.cidr))
-        }
-        None => rule.routes.is_empty(),
-    }
+    true
 }
 
 fn ipnet_contains(outer: &IpNet, inner: &IpNet) -> bool {
@@ -4830,6 +5886,62 @@ fn ipnet_contains(outer: &IpNet, inner: &IpNet) -> bool {
         }
         _ => false,
     }
+}
+
+fn ipnets_overlap(left: &IpNet, right: &IpNet) -> bool {
+    ipnet_contains(left, right) || ipnet_contains(right, left)
+}
+
+fn validate_overlay_route_scopes_against_vpn_pool(
+    policy: &ClusterPolicy,
+    vpn_pool: Ipv4Net,
+) -> Result<(), ControlPlaneError> {
+    let vpn_pool = IpNet::V4(vpn_pool);
+    if let Some(scope) = policy
+        .overlay_route_scopes
+        .iter()
+        .find(|scope| ipnets_overlap(scope, &vpn_pool))
+    {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "overlay route scope {scope} overlaps VPN pool {vpn_pool}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_routes_within_overlay_scopes(
+    routes: &[Route],
+    policy: &ClusterPolicy,
+) -> Result<(), String> {
+    if policy.overlay_route_scopes.is_empty() {
+        return Ok(());
+    }
+    if let Some(route) = routes.iter().find(|route| {
+        !policy
+            .overlay_route_scopes
+            .iter()
+            .any(|scope| ipnet_contains(scope, &route.cidr))
+    }) {
+        return Err(format!(
+            "route {} CIDR {} is not fully contained in any configured overlay route scope",
+            route.id, route.cidr
+        ));
+    }
+    Ok(())
+}
+
+fn validate_routes_against_vpn_pool(routes: &[Route], vpn_pool: Ipv4Net) -> Result<(), String> {
+    let vpn_pool = IpNet::V4(vpn_pool);
+    if let Some(route) = routes
+        .iter()
+        .find(|route| ipnets_overlap(&route.cidr, &vpn_pool))
+    {
+        return Err(format!(
+            "route {} CIDR {} overlaps VPN pool {vpn_pool}",
+            route.id, route.cidr
+        ));
+    }
+    Ok(())
 }
 
 fn route_allowed(route: &Route, claims: &JoinTokenClaims) -> bool {
@@ -5055,6 +6167,12 @@ fn validate_nat_classification_shape(
 }
 
 fn validate_advertised_routes_shape(node_id: &NodeId, routes: &[Route]) -> Result<(), String> {
+    if routes.len() > MAX_OVERLAY_NODE_ROUTES {
+        return Err(format!(
+            "route list for node {node_id} contains {} routes; maximum is {MAX_OVERLAY_NODE_ROUTES}",
+            routes.len()
+        ));
+    }
     let mut seen_route_ids = BTreeSet::new();
     let mut seen_route_cidrs = BTreeSet::new();
     for route in routes {
@@ -5824,17 +6942,732 @@ mod tests {
             store,
         );
 
-        let first = plane.overlay_node_snapshot().await?;
+        let policy = plane.current_cluster_policy().await?;
+        let routing_epoch = plane
+            .store
+            .get_overlay_routing_epoch(&plane.config.cluster_id)
+            .await?;
+        let first = plane.overlay_node_snapshot(&policy, routing_epoch).await?;
         assert_eq!(first.nodes.len(), 1_000);
+        assert_eq!(first.nodes_by_id.len(), 1_000);
         assert_eq!(first.clients.len(), 1);
+        assert_eq!(first.topology_cache_key.node_count, 1_000);
         for _ in 0..1_000 {
-            let cached = plane.overlay_node_snapshot().await?;
+            let cached = plane.overlay_node_snapshot(&policy, routing_epoch).await?;
             assert!(Arc::ptr_eq(&first, &cached));
         }
 
         plane.invalidate_overlay_node_snapshot().await;
-        let refreshed = plane.overlay_node_snapshot().await?;
+        let refreshed = plane.overlay_node_snapshot(&policy, routing_epoch).await?;
         assert!(!Arc::ptr_eq(&first, &refreshed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_routing_epoch_invalidates_another_replicas_cached_map_and_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-shared-routing-epoch");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane_a = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let plane_b = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let mut source = node_record("routing-epoch-source");
+        source.cluster_id = cluster_id.clone();
+        source.vpn_ip = VpnIp("100.64.0.2".parse()?);
+        let mut target = node_record("routing-epoch-target");
+        target.cluster_id = cluster_id;
+        target.vpn_ip = VpnIp("100.64.0.3".parse()?);
+        target.token_policy.allowed_routes = vec!["10.0.0.0/8".parse()?];
+        target.routes = vec![route("old-route", "10.42.1.0/24", "routing-epoch-target")?];
+        store.insert_node(source.clone()).await?;
+        store.insert_node(target.clone()).await?;
+
+        let old_map = plane_a.neighbor_map_for(&source.node_id).await?;
+        let old_epoch = old_map.routing_epoch;
+        assert_eq!(
+            old_map.aggregate_routes,
+            vec![AggregateOverlayRoute {
+                cidr: "10.42.1.0/24".parse()?
+            }]
+        );
+        let query = |destination| OverlayPathQuery {
+            source: source.node_id.clone(),
+            destination,
+            source_identity_proof: ipars_types::api::NodeApiRequestSignature {
+                signed_at: Utc::now(),
+                nonce: format!("shared-routing-epoch-{destination}"),
+                signature: String::new(),
+            },
+        };
+        let old_path = plane_a
+            .overlay_path_for(&query("10.42.1.10".parse()?))
+            .await?;
+        assert_eq!(old_path.routing_epoch, old_epoch);
+
+        let accepted_at = Utc::now();
+        plane_b
+            .heartbeat(signed_heartbeat_at(
+                "routing-epoch-target",
+                HeartbeatRequest {
+                    node_id: target.node_id.clone(),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: accepted_at,
+                        latency_ms: Some(1.0),
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    nat_classification: None,
+                    relay_capability: None,
+                    routes: Some(vec![route(
+                        "new-route",
+                        "10.43.1.0/24",
+                        "routing-epoch-target",
+                    )?]),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                accepted_at,
+            ))
+            .await?;
+        let shared_epoch = store.get_overlay_routing_epoch(&target.cluster_id).await?;
+        assert!(shared_epoch > old_epoch);
+
+        let policy = plane_a.current_cluster_policy().await?;
+        assert!(matches!(
+            plane_a.overlay_node_snapshot(&policy, old_epoch).await,
+            Err(ControlPlaneError::OverlayRouteCatalogChanged)
+        ));
+
+        let refreshed_map = plane_a.neighbor_map_for(&source.node_id).await?;
+        assert_eq!(refreshed_map.routing_epoch, shared_epoch);
+        assert_eq!(
+            refreshed_map.aggregate_routes,
+            vec![AggregateOverlayRoute {
+                cidr: "10.43.1.0/24".parse()?
+            }]
+        );
+        assert!(matches!(
+            plane_a
+                .overlay_path_for(&query("10.42.1.10".parse()?))
+                .await,
+            Err(ControlPlaneError::OverlayDestinationNotFound(_))
+        ));
+        let refreshed_path = plane_a
+            .overlay_path_for(&query("10.43.1.10".parse()?))
+            .await?;
+        assert_eq!(refreshed_path.routing_epoch, shared_epoch);
+        assert_eq!(refreshed_path.target.node_id, target.node_id);
+        let replica_b_path = plane_b
+            .overlay_path_for(&query("10.43.1.10".parse()?))
+            .await?;
+        assert_eq!(replica_b_path.routing_epoch, shared_epoch);
+        assert_eq!(replica_b_path.target, refreshed_path.target);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_overlay_routes_collapses_1024_contiguous_pod_cidrs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut provider = node_record("aggregate-provider");
+        for index in 0..1_024_u32 {
+            let cidr = Ipv4Net::new(
+                Ipv4Addr::new(10, u8::try_from(index >> 8)?, index as u8, 0),
+                24,
+            )?;
+            provider.routes.push(Route {
+                id: format!("pod-cidr-{index:04}"),
+                cidr: IpNet::V4(cidr),
+                advertised_by: provider.node_id.clone(),
+                via: None,
+                metric: 100,
+                tags: BTreeSet::new(),
+            });
+        }
+        provider.routes.push(Route {
+            id: "covered-noncanonical-route".to_string(),
+            cidr: "10.0.0.1/25".parse()?,
+            advertised_by: provider.node_id.clone(),
+            via: None,
+            metric: 1,
+            tags: BTreeSet::new(),
+        });
+
+        assert_eq!(
+            aggregate_overlay_routes(&[provider]),
+            vec![AggregateOverlayRoute {
+                cidr: "10.0.0.0/14".parse()?
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_routing_epoch_tracks_route_catalog_and_acl_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut provider = node_record("routing-epoch-provider");
+        provider.routes = vec![route(
+            "routing-epoch-route",
+            "10.42.0.0/16",
+            "routing-epoch-provider",
+        )?];
+        let base_catalog = overlay_route_catalog_epoch(&[provider.clone()])?;
+        let base_policy = ClusterPolicy::default();
+        let base_epoch = overlay_routing_epoch(base_catalog, &base_policy)?;
+
+        provider
+            .endpoint_candidates
+            .push(candidate("routing-epoch-provider"));
+        assert_eq!(
+            overlay_route_catalog_epoch(&[provider.clone()])?,
+            base_catalog
+        );
+
+        provider.routes[0].metric += 1;
+        let changed_catalog = overlay_route_catalog_epoch(&[provider])?;
+        assert_ne!(changed_catalog, base_catalog);
+        assert_ne!(
+            overlay_routing_epoch(changed_catalog, &base_policy)?,
+            base_epoch
+        );
+
+        let mut acl_policy = base_policy.clone();
+        acl_policy.acl_rules.push(AclRule {
+            id: "routing-epoch-deny".to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: vec!["10.42.1.0/24".parse()?],
+            protocol: TransportProtocol::Any,
+            action: AclAction::Deny,
+        });
+        assert_ne!(
+            overlay_routing_epoch(base_catalog, &acl_policy)?,
+            base_epoch
+        );
+
+        let mut timeout_policy = base_policy.clone();
+        timeout_policy.idle_timeout_seconds += 1;
+        assert_eq!(
+            overlay_routing_epoch(base_catalog, &timeout_policy)?,
+            base_epoch
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_policy_rejects_protocol_acl_without_dataplane_enforcement() {
+        let mut policy = ClusterPolicy::default();
+        policy.acl_rules.push(AclRule {
+            id: "tcp-only".to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Tcp,
+            action: AclAction::Allow,
+        });
+
+        assert!(matches!(
+            validate_cluster_policy(&policy),
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("only protocol=any")
+        ));
+    }
+
+    #[test]
+    fn cluster_policy_validates_overlay_route_scope_shape() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut policy = ClusterPolicy {
+            overlay_route_scopes: (0..MAX_OVERLAY_ROUTE_SCOPES)
+                .map(|index| format!("10.{index}.0.0/16").parse())
+                .collect::<Result<Vec<_>, _>>()?,
+            ..ClusterPolicy::default()
+        };
+        validate_cluster_policy(&policy)?;
+
+        policy.overlay_route_scopes.push("10.64.0.0/16".parse()?);
+        assert!(matches!(
+            validate_cluster_policy(&policy),
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("at most 64")
+        ));
+
+        policy.overlay_route_scopes = vec!["10.42.0.1/16".parse()?];
+        assert!(matches!(
+            validate_cluster_policy(&policy),
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("must be canonical")
+        ));
+
+        policy.overlay_route_scopes = vec!["10.42.0.0/16".parse()?, "10.42.1.0/24".parse()?];
+        assert!(matches!(
+            validate_cluster_policy(&policy),
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("overlaps")
+        ));
+
+        policy.overlay_route_scopes = vec!["::/0".parse()?];
+        assert!(matches!(
+            validate_cluster_policy(&policy),
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("unrestricted")
+        ));
+
+        policy.overlay_route_scopes = vec!["fe80::/10".parse()?];
+        assert!(matches!(
+            validate_cluster_policy(&policy),
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("link-local")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setting_overlay_route_scopes_rejects_vpn_overlap_and_uncovered_existing_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?),
+            store.clone(),
+        );
+        let mut provider = node_record("scope-existing-provider");
+        provider.routes = vec![route(
+            "existing-pod-cidr",
+            "10.43.1.0/24",
+            "scope-existing-provider",
+        )?];
+        store.insert_node(provider).await?;
+
+        let vpn_overlap = ClusterPolicy {
+            overlay_route_scopes: vec!["100.64.0.0/25".parse()?],
+            ..ClusterPolicy::default()
+        };
+        assert!(matches!(
+            plane.set_cluster_policy(vpn_overlap).await,
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("overlaps VPN pool")
+        ));
+
+        let uncovered = ClusterPolicy {
+            overlay_route_scopes: vec!["10.42.0.0/16".parse()?],
+            ..ClusterPolicy::default()
+        };
+        assert!(matches!(
+            plane.set_cluster_policy(uncovered).await,
+            Err(ControlPlaneError::InvalidClusterPolicy(reason))
+                if reason.contains("existing-pod-cidr")
+        ));
+
+        let covering = ClusterPolicy {
+            overlay_route_scopes: vec!["10.0.0.0/8".parse()?],
+            ..ClusterPolicy::default()
+        };
+        assert_eq!(plane.set_cluster_policy(covering.clone()).await?, covering);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_routes_outside_configured_overlay_scopes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
+        );
+        config.cluster_policy.overlay_route_scopes = vec!["10.42.0.0/16".parse()?];
+        let plane = ControlPlane::new(config, Arc::new(InMemoryStore::default()));
+        let mut token_claims = claims(cluster_id);
+        token_claims.policy.allowed_routes = vec!["10.0.0.0/8".parse()?];
+        let mut request = registration_request("scoped-registration");
+        request.requested_routes = vec![route(
+            "outside-scope",
+            "10.43.1.0/24",
+            "scoped-registration",
+        )?];
+
+        assert!(matches!(
+            plane
+                .register_with_claims(token_claims.clone(), request.clone())
+                .await,
+            Err(ControlPlaneError::NodeRegistrationRejected { reason, .. })
+                if reason.contains("not fully contained")
+        ));
+
+        request.requested_routes = vec![route(
+            "inside-scope",
+            "10.42.1.0/24",
+            "scoped-registration",
+        )?];
+        let registered = plane.register_with_claims(token_claims, request).await?;
+        assert_eq!(registered.node.routes[0].id, "inside-scope");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_vpn_overlap_and_excess_automatic_route_scopes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
+            ),
+            Arc::new(InMemoryStore::default()),
+        );
+        let mut request = registration_request("bounded-route-registration");
+        request.requested_routes = vec![route(
+            "vpn-overlap",
+            "100.64.0.0/25",
+            "bounded-route-registration",
+        )?];
+        let mut token_claims = claims(cluster_id.clone());
+        token_claims.policy.allowed_routes = vec!["100.64.0.0/10".parse()?];
+        assert!(matches!(
+            plane
+                .register_with_claims(token_claims, request.clone())
+                .await,
+            Err(ControlPlaneError::NodeRegistrationRejected { reason, .. })
+                if reason.contains("overlaps VPN pool")
+        ));
+
+        let first_address = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        request.requested_routes = (0..=MAX_OVERLAY_ROUTE_SCOPES)
+            .map(|index| {
+                route(
+                    &format!("fragmented-route-{index:02}"),
+                    &format!("{}/32", Ipv4Addr::from(first_address + (index as u32 * 2))),
+                    "bounded-route-registration",
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut token_claims = claims(cluster_id);
+        token_claims.policy.allowed_routes = vec!["10.0.0.0/8".parse()?];
+        assert!(matches!(
+            plane.register_with_claims(token_claims, request).await,
+            Err(ControlPlaneError::NodeRegistrationRejected { reason, .. })
+                if reason.contains("65 aggregate capture scopes")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_route_index_prefers_longest_prefix_then_metric_node_and_route_id(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = node_record("indexed-source");
+        let mut broad = node_record("indexed-broad");
+        let mut broad_route = route("broad", "10.42.0.0/16", "indexed-broad")?;
+        broad_route.metric = 0;
+        broad.routes = vec![broad_route];
+
+        let mut exact = vec![
+            node_record("indexed-exact-a"),
+            node_record("indexed-exact-b"),
+        ];
+        exact.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let exact_cidr = "10.42.1.0/24".parse()?;
+        for node in &mut exact {
+            node.routes = ["z-route", "a-route"]
+                .into_iter()
+                .map(|route_id| Route {
+                    id: route_id.to_string(),
+                    cidr: exact_cidr,
+                    advertised_by: node.node_id.clone(),
+                    via: None,
+                    metric: 10,
+                    tags: BTreeSet::new(),
+                })
+                .collect();
+        }
+        let expected_node_id = exact[0].node_id.clone();
+
+        let mut worse_metric = node_record("indexed-worse-metric");
+        let mut worse_route = route(
+            "lower-priority-exact",
+            "10.42.1.0/24",
+            "indexed-worse-metric",
+        )?;
+        worse_route.metric = 50;
+        worse_metric.routes = vec![worse_route];
+
+        let mut nodes = vec![source.clone(), broad, worse_metric];
+        nodes.extend(exact);
+        let index = OverlayRouteIndex::build(&nodes);
+        let active_nodes_by_id = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.node_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+
+        let target = index
+            .resolve_destination(
+                &source,
+                &nodes,
+                &active_nodes_by_id,
+                "10.42.1.99".parse()?,
+                &ClusterPolicy::default(),
+            )
+            .ok_or("indexed route should resolve")?;
+
+        assert_eq!(target.node_id, expected_node_id);
+        assert_eq!(target.routes.len(), 1);
+        assert_eq!(target.routes[0].id, "a-route");
+        assert_eq!(target.routes[0].cidr, "10.42.1.0/24".parse()?);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_route_index_uses_acl_allowed_less_specific_fallback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = node_record("acl-index-source");
+        let mut denied = node_record("acl-index-denied");
+        denied.tags.insert(Tag::from_string("blocked"));
+        let mut denied_route = route("denied-specific", "10.42.1.0/24", "acl-index-denied")?;
+        denied_route.metric = 1;
+        denied.routes = vec![denied_route];
+
+        let mut allowed = node_record("acl-index-allowed");
+        allowed.tags.insert(Tag::from_string("allowed"));
+        let mut allowed_route = route("allowed-fallback", "10.42.0.0/16", "acl-index-allowed")?;
+        allowed_route.metric = 100;
+        allowed.routes = vec![allowed_route];
+
+        let nodes = vec![source.clone(), denied, allowed.clone()];
+        let index = OverlayRouteIndex::build(&nodes);
+        let active_nodes_by_id = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.node_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                AclRule {
+                    id: "deny-blocked".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::from([Tag::from_string("blocked")]),
+                    routes: Vec::new(),
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Deny,
+                },
+                AclRule {
+                    id: "allow-route-provider".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::from([Tag::from_string("allowed")]),
+                    routes: vec!["10.42.0.0/16".parse()?],
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Allow,
+                },
+            ],
+            ..ClusterPolicy::default()
+        };
+
+        let target = index
+            .resolve_destination(
+                &source,
+                &nodes,
+                &active_nodes_by_id,
+                "10.42.1.99".parse()?,
+                &policy,
+            )
+            .ok_or("ACL-allowed fallback should resolve")?;
+
+        assert_eq!(target.node_id, allowed.node_id);
+        assert_eq!(target.routes.len(), 1);
+        assert_eq!(target.routes[0].id, "overlay-v4-0a2a0163");
+        assert_eq!(target.routes[0].cidr, "10.42.1.99/32".parse()?);
+        assert_eq!(target.routes[0].advertised_by, allowed.node_id);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_route_index_does_not_bypass_specific_deny_with_broad_allow(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = node_record("acl-prefix-source");
+        let mut provider = node_record("acl-prefix-provider");
+        provider.routes = vec![route(
+            "broad-provider-route",
+            "10.42.0.0/16",
+            "acl-prefix-provider",
+        )?];
+        let nodes = vec![source.clone(), provider.clone()];
+        let index = OverlayRouteIndex::build(&nodes);
+        let active_nodes_by_id = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.node_id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                AclRule {
+                    id: "allow-broad".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::new(),
+                    routes: vec!["10.42.0.0/16".parse()?],
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Allow,
+                },
+                AclRule {
+                    id: "deny-specific".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::new(),
+                    routes: vec!["10.42.1.0/24".parse()?],
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Deny,
+                },
+            ],
+            ..ClusterPolicy::default()
+        };
+
+        assert!(index
+            .resolve_destination(
+                &source,
+                &nodes,
+                &active_nodes_by_id,
+                "10.42.1.99".parse()?,
+                &policy,
+            )
+            .is_none());
+        let target = index
+            .resolve_destination(
+                &source,
+                &nodes,
+                &active_nodes_by_id,
+                "10.42.2.99".parse()?,
+                &policy,
+            )
+            .ok_or("destination outside the deny prefix should resolve")?;
+        assert_eq!(target.node_id, provider.node_id);
+        assert_eq!(target.routes[0].cidr, "10.42.2.99/32".parse()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn neighbor_map_uses_configured_acl_independent_route_scopes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
+        );
+        config.cluster_policy.overlay_route_scopes = vec!["10.0.0.0/8".parse()?];
+        config.cluster_policy.acl_rules = vec![AclRule {
+            id: "deny-all".to_string(),
+            from_roles: BTreeSet::new(),
+            from_tags: BTreeSet::new(),
+            to_roles: BTreeSet::new(),
+            to_tags: BTreeSet::new(),
+            routes: Vec::new(),
+            protocol: TransportProtocol::Any,
+            action: AclAction::Deny,
+        }];
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut source = node_record("aggregate-source");
+        source.vpn_ip = VpnIp("100.64.0.2".parse()?);
+        let mut provider = node_record("aggregate-denied-provider");
+        provider.vpn_ip = VpnIp("100.64.0.3".parse()?);
+        provider.routes = vec![route(
+            "denied-pod-cidr",
+            "10.42.1.0/24",
+            "aggregate-denied-provider",
+        )?];
+        store.insert_node(source.clone()).await?;
+        store.insert_node(provider).await?;
+
+        let neighbor_map = plane.neighbor_map_for(&source.node_id).await?;
+        assert!(neighbor_map
+            .neighbors
+            .iter()
+            .all(|neighbor| neighbor.node.routes.is_empty()));
+        assert_eq!(
+            neighbor_map.aggregate_routes,
+            vec![AggregateOverlayRoute {
+                cidr: "10.0.0.0/8".parse()?
+            }]
+        );
+
+        let query = OverlayPathQuery {
+            source: source.node_id,
+            destination: "10.42.1.10".parse()?,
+            source_identity_proof: ipars_types::api::NodeApiRequestSignature {
+                signed_at: Utc::now(),
+                nonce: "acl-authoritative-route-query".to_string(),
+                signature: String::new(),
+            },
+        };
+        assert!(matches!(
+            plane.overlay_path_for(&query).await,
+            Err(ControlPlaneError::OverlayDestinationNotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn neighbor_map_rejects_more_than_64_exact_aggregates_without_widening(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?),
+            store.clone(),
+        );
+        let mut source = node_record("aggregate-limit-source");
+        source.vpn_ip = VpnIp("100.64.0.2".parse()?);
+        let mut provider = node_record("aggregate-limit-provider");
+        provider.vpn_ip = VpnIp("100.64.0.3".parse()?);
+        let first_address = u32::from(Ipv4Addr::new(10, 0, 0, 0));
+        for index in 0..65_u32 {
+            provider.routes.push(Route {
+                id: format!("disjoint-route-{index:02}"),
+                cidr: IpNet::V4(Ipv4Net::new(Ipv4Addr::from(first_address + index * 2), 32)?),
+                advertised_by: provider.node_id.clone(),
+                via: None,
+                metric: 100,
+                tags: BTreeSet::new(),
+            });
+        }
+        store.insert_node(source.clone()).await?;
+        store.insert_node(provider).await?;
+
+        let policy = plane.current_cluster_policy().await?;
+        let routing_epoch = plane
+            .store
+            .get_overlay_routing_epoch(&plane.config.cluster_id)
+            .await?;
+        let snapshot = plane.overlay_node_snapshot(&policy, routing_epoch).await?;
+        assert_eq!(snapshot.aggregate_routes.len(), 65);
+        assert!(snapshot
+            .aggregate_routes
+            .iter()
+            .all(|route| route.cidr.prefix_len() == 32));
+
+        let error = match plane.neighbor_map_for(&source.node_id).await {
+            Ok(_) => return Err("65 exact aggregates were unexpectedly accepted".into()),
+            Err(error) => error,
+        };
+        let ControlPlaneError::BoundedTopology(reason) = error else {
+            return Err(format!("unexpected error: {error}").into());
+        };
+        assert!(reason.contains("count 65"));
+        assert!(reason.contains("limit 64"));
         Ok(())
     }
 
@@ -5934,7 +7767,8 @@ mod tests {
             for index in 0..32 {
                 cache.insert(
                     OverlayTopologyCacheKey {
-                        node_ids: vec![node_id(&format!("abandoned-{index}"))],
+                        membership_epoch: index,
+                        node_count: 1,
                         block_size: DEFAULT_OVERLAY_BLOCK_SIZE,
                         max_degree: ClusterPolicy::default().overlay_max_degree,
                         permutation_seed: cluster_id.as_str().to_string(),
@@ -5975,6 +7809,53 @@ mod tests {
 
     #[async_trait]
     impl ControlPlaneStore for RacingVpnIpStore {
+        async fn get_cluster_policy(
+            &self,
+            cluster_id: &ClusterId,
+        ) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+            self.inner.get_cluster_policy(cluster_id).await
+        }
+
+        async fn initialize_cluster_policy_if_absent(
+            &self,
+            cluster_id: &ClusterId,
+            policy: ClusterPolicy,
+        ) -> Result<ClusterPolicy, ControlPlaneError> {
+            self.inner
+                .initialize_cluster_policy_if_absent(cluster_id, policy)
+                .await
+        }
+
+        async fn get_overlay_routing_epoch(
+            &self,
+            cluster_id: &ClusterId,
+        ) -> Result<u64, ControlPlaneError> {
+            self.inner.get_overlay_routing_epoch(cluster_id).await
+        }
+
+        async fn upsert_cluster_policy(
+            &self,
+            cluster_id: &ClusterId,
+            policy: ClusterPolicy,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner.upsert_cluster_policy(cluster_id, policy).await
+        }
+
+        async fn upsert_cluster_policy_if_route_catalog_epoch(
+            &self,
+            cluster_id: &ClusterId,
+            policy: ClusterPolicy,
+            expected_route_catalog_epoch: u64,
+        ) -> Result<bool, ControlPlaneError> {
+            self.inner
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    cluster_id,
+                    policy,
+                    expected_route_catalog_epoch,
+                )
+                .await
+        }
+
         async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
             if node.vpn_ip.0 == IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
                 && !self.race_once.swap(true, Ordering::SeqCst)
@@ -5986,6 +7867,30 @@ mod tests {
                 return Err(ControlPlaneError::VpnIpAlreadyAllocated(node.vpn_ip));
             }
             self.inner.insert_node(node).await
+        }
+
+        async fn insert_node_if_cluster_policy(
+            &self,
+            node: NodeRecord,
+            expected_cluster_policy: Option<ClusterPolicy>,
+            expected_route_catalog_epoch: Option<u64>,
+        ) -> Result<(), ControlPlaneError> {
+            if node.vpn_ip.0 == IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))
+                && !self.race_once.swap(true, Ordering::SeqCst)
+            {
+                let mut competing_node = node_record("node-racing-peer");
+                competing_node.cluster_id = node.cluster_id.clone();
+                competing_node.vpn_ip = node.vpn_ip;
+                self.inner.insert_node(competing_node).await?;
+                return Err(ControlPlaneError::VpnIpAlreadyAllocated(node.vpn_ip));
+            }
+            self.inner
+                .insert_node_if_cluster_policy(
+                    node,
+                    expected_cluster_policy,
+                    expected_route_catalog_epoch,
+                )
+                .await
         }
 
         async fn get_node(
@@ -6027,6 +7932,32 @@ mod tests {
             routes: Vec<Route>,
         ) -> Result<(), ControlPlaneError> {
             self.inner.update_node_routes(node_id, routes).await
+        }
+
+        async fn update_node_routes_if_cluster_policy(
+            &self,
+            cluster_id: &ClusterId,
+            node_id: &NodeId,
+            routes: Vec<Route>,
+            expected_cluster_policy: Option<ClusterPolicy>,
+            expected_route_catalog_epoch: Option<u64>,
+        ) -> Result<(), ControlPlaneError> {
+            self.inner
+                .update_node_routes_if_cluster_policy(
+                    cluster_id,
+                    node_id,
+                    routes,
+                    expected_cluster_policy,
+                    expected_route_catalog_epoch,
+                )
+                .await
+        }
+
+        async fn rejoin_node_if_cluster_policy(
+            &self,
+            update: RejoinNodeStoreUpdate,
+        ) -> Result<NodeRecord, ControlPlaneError> {
+            self.inner.rejoin_node_if_cluster_policy(update).await
         }
 
         async fn rotate_node_wireguard_public_key(
@@ -6262,6 +8193,65 @@ mod tests {
             score: PathScore::calculate(PathState::Relay, &PathMetrics::default(), true, 0),
             ..path(local, remote)
         }
+    }
+
+    fn heartbeat_store_update(
+        node: &NodeRecord,
+        accepted_at: chrono::DateTime<Utc>,
+    ) -> HeartbeatStoreUpdate {
+        HeartbeatStoreUpdate {
+            cluster_id: node.cluster_id.clone(),
+            expected_cluster_policy: None,
+            expected_route_catalog_epoch: None,
+            node_id: node.node_id.clone(),
+            expected_identity_public_key: node.identity_public_key.clone(),
+            expected_registered_at: node.registered_at,
+            accepted_signature_at: Some(accepted_at),
+            candidates: vec![EndpointCandidate {
+                node_id: node.node_id.clone(),
+                kind: EndpointCandidateKind::StunReflexive,
+                addr: std::net::SocketAddr::from(([203, 0, 113, 42], 51820)),
+                observed_at: accepted_at,
+                priority: 100,
+                cost: 10,
+                source: CandidateSource::StunProbe,
+            }],
+            nat_classification: None,
+            relay_capability: None,
+            routes: None,
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: accepted_at,
+                latency_ms: Some(1.0),
+                relay_load: None,
+                message: Some("generation-cas".to_string()),
+            },
+            paths: Vec::new(),
+        }
+    }
+
+    async fn set_in_memory_routing_epoch(
+        store: &InMemoryStore,
+        cluster_id: &ClusterId,
+        epoch: u64,
+    ) {
+        store
+            .overlay_routing_epochs
+            .write()
+            .await
+            .insert(cluster_id.clone(), epoch);
+    }
+
+    fn assert_routing_epoch_exhausted<T>(
+        result: Result<T, ControlPlaneError>,
+        cluster_id: &ClusterId,
+    ) {
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::Store(reason))
+                if reason
+                    == format!("overlay routing epoch exhausted for cluster {cluster_id}")
+        ));
     }
 
     #[test]
@@ -6853,6 +8843,508 @@ mod tests {
         let stored_paths = store.list_paths_for(&node_id("node-a")).await?;
         assert_eq!(stored_paths.len(), 1);
         assert_eq!(stored_paths[0].updated_at, new_at);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_heartbeat_generation_cas_rejects_aba_replacements(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = InMemoryStore::default();
+        let original = node_record("node-a");
+        store.insert_node(original.clone()).await?;
+        let update = heartbeat_store_update(&original, Utc::now());
+
+        store.remove_node(&original.node_id).await?;
+        let mut newer_registration = original.clone();
+        newer_registration.registered_at = original.registered_at + Duration::seconds(1);
+        store.insert_node(newer_registration.clone()).await?;
+        assert!(matches!(
+            store.apply_heartbeat(update.clone()).await,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("node generation changed")
+        ));
+        assert_eq!(
+            store.get_node(&original.node_id).await?,
+            Some(newer_registration.clone())
+        );
+        assert_eq!(store.get_health(&original.node_id).await?, None);
+
+        store.remove_node(&original.node_id).await?;
+        let mut replacement_identity = original.clone();
+        replacement_identity.identity_public_key =
+            identity_for_node("replacement-identity").public_key_b64();
+        store.insert_node(replacement_identity.clone()).await?;
+        assert!(matches!(
+            store.apply_heartbeat(update).await,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("node generation changed")
+        ));
+        assert_eq!(
+            store.get_node(&original.node_id).await?,
+            Some(replacement_identity)
+        );
+        assert_eq!(store.get_health(&original.node_id).await?, None);
+        assert!(store.list_paths_for(&original.node_id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_routing_epoch_advances_only_for_effective_routing_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let store = InMemoryStore::default();
+        let base_policy = ClusterPolicy::default();
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 0);
+        assert_eq!(
+            store
+                .initialize_cluster_policy_if_absent(&cluster_id, base_policy.clone())
+                .await?,
+            base_policy
+        );
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 1);
+        store
+            .upsert_cluster_policy(&cluster_id, base_policy.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 1);
+
+        let mut policy = base_policy;
+        policy.idle_timeout_seconds += 1;
+        store
+            .upsert_cluster_policy(&cluster_id, policy.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 2);
+        store
+            .upsert_cluster_policy(&cluster_id, policy.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 2);
+
+        let mut node = node_record("node-a");
+        node.routes = vec![route("route-a", "10.42.1.0/24", "node-a")?];
+        store.insert_node(node.clone()).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 3);
+        let catalog_epoch = overlay_route_catalog_epoch(&[node.clone()])?;
+        assert!(
+            store
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    &cluster_id,
+                    policy.clone(),
+                    catalog_epoch,
+                )
+                .await?
+        );
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 3);
+
+        store
+            .update_node_routes(&node.node_id, node.routes.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 3);
+        let route_b = route("route-b", "10.43.1.0/24", "node-a")?;
+        store
+            .update_node_routes(&node.node_id, vec![route_b.clone()])
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+        let catalog_epoch = overlay_route_catalog_epoch(&store.list_nodes().await?)?;
+        store
+            .update_node_routes_if_cluster_policy(
+                &cluster_id,
+                &node.node_id,
+                vec![route_b.clone()],
+                Some(policy.clone()),
+                Some(catalog_epoch),
+            )
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+
+        let previous_key = node.wireguard_public_key.clone();
+        let next_key = wireguard_public_key_for_node("node-a-next-key");
+        store
+            .rotate_node_wireguard_public_key(&node.node_id, &previous_key, next_key.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 5);
+        store
+            .rotate_node_wireguard_public_key(&node.node_id, &next_key, next_key.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 5);
+
+        let expected_node = store
+            .get_node(&node.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node.node_id.clone()))?;
+        let catalog_epoch = overlay_route_catalog_epoch(std::slice::from_ref(&expected_node))?;
+        let rejoined = store
+            .rejoin_node_if_cluster_policy(RejoinNodeStoreUpdate {
+                cluster_id: cluster_id.clone(),
+                expected_cluster_policy: Some(policy.clone()),
+                expected_route_catalog_epoch: Some(catalog_epoch),
+                expected_node,
+                candidates: vec![candidate("node-a")],
+                relay_capability: None,
+                routes: vec![route_b.clone()],
+            })
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 5);
+
+        let accepted_at = Utc::now();
+        let mut same_route_heartbeat = heartbeat_store_update(&rejoined, accepted_at);
+        same_route_heartbeat.expected_cluster_policy = Some(policy.clone());
+        same_route_heartbeat.expected_route_catalog_epoch = Some(overlay_route_catalog_epoch(
+            std::slice::from_ref(&rejoined),
+        )?);
+        same_route_heartbeat.routes = Some(rejoined.routes.clone());
+        store.apply_heartbeat(same_route_heartbeat).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 5);
+
+        let current_node = store
+            .get_node(&node.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node.node_id.clone()))?;
+        let route_c = route("route-c", "10.44.1.0/24", "node-a")?;
+        let mut changed_route_heartbeat =
+            heartbeat_store_update(&current_node, accepted_at + Duration::seconds(1));
+        changed_route_heartbeat.expected_cluster_policy = Some(policy.clone());
+        changed_route_heartbeat.expected_route_catalog_epoch = Some(overlay_route_catalog_epoch(
+            std::slice::from_ref(&current_node),
+        )?);
+        changed_route_heartbeat.routes = Some(vec![route_c.clone()]);
+        store.apply_heartbeat(changed_route_heartbeat).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 6);
+
+        set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+        store
+            .upsert_cluster_policy(&cluster_id, policy.clone())
+            .await?;
+        let current_node = store
+            .get_node(&node.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node.node_id.clone()))?;
+        store
+            .update_node_routes(&node.node_id, current_node.routes.clone())
+            .await?;
+        store
+            .rotate_node_wireguard_public_key(
+                &node.node_id,
+                &current_node.wireguard_public_key,
+                current_node.wireguard_public_key.clone(),
+            )
+            .await?;
+        let mut final_heartbeat =
+            heartbeat_store_update(&current_node, accepted_at + Duration::seconds(2));
+        final_heartbeat.expected_cluster_policy = Some(policy);
+        final_heartbeat.expected_route_catalog_epoch = Some(overlay_route_catalog_epoch(
+            std::slice::from_ref(&current_node),
+        )?);
+        final_heartbeat.routes = Some(vec![route_c]);
+        store.apply_heartbeat(final_heartbeat).await?;
+        assert_eq!(
+            store.get_overlay_routing_epoch(&cluster_id).await?,
+            u64::MAX
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_routing_epoch_overflow_preserves_policies_and_insertions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let policy = ClusterPolicy::default();
+
+        {
+            let store = InMemoryStore::default();
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .initialize_cluster_policy_if_absent(&cluster_id, policy.clone())
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_cluster_policy(&cluster_id).await?, None);
+            assert_eq!(
+                store.get_overlay_routing_epoch(&cluster_id).await?,
+                u64::MAX
+            );
+        }
+
+        let mut changed_policy = policy.clone();
+        changed_policy.idle_timeout_seconds += 1;
+        {
+            let store = InMemoryStore::default();
+            store
+                .initialize_cluster_policy_if_absent(&cluster_id, policy.clone())
+                .await?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .upsert_cluster_policy(&cluster_id, changed_policy.clone())
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(
+                store.get_cluster_policy(&cluster_id).await?,
+                Some(policy.clone())
+            );
+        }
+
+        {
+            let store = InMemoryStore::default();
+            store
+                .initialize_cluster_policy_if_absent(&cluster_id, policy.clone())
+                .await?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .upsert_cluster_policy_if_route_catalog_epoch(
+                        &cluster_id,
+                        changed_policy,
+                        overlay_route_catalog_epoch(&[])?,
+                    )
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_cluster_policy(&cluster_id).await?, Some(policy));
+        }
+
+        {
+            let store = InMemoryStore::default();
+            let node = node_record("overflow-direct-insert");
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(store.insert_node(node.clone()).await, &cluster_id);
+            assert_eq!(store.get_node(&node.node_id).await?, None);
+        }
+
+        {
+            let store = InMemoryStore::default();
+            let node = node_record("overflow-guarded-insert");
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .insert_node_if_cluster_policy(
+                        node.clone(),
+                        None,
+                        Some(overlay_route_catalog_epoch(&[])?),
+                    )
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_node(&node.node_id).await?, None);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_routing_epoch_overflow_preserves_node_mutations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+
+        {
+            let store = InMemoryStore::default();
+            let mut node = node_record("overflow-direct-routes");
+            node.routes = vec![route("route-a", "10.42.1.0/24", "overflow-direct-routes")?];
+            store.insert_node(node.clone()).await?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .update_node_routes(
+                        &node.node_id,
+                        vec![route("route-b", "10.43.1.0/24", "overflow-direct-routes")?],
+                    )
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_node(&node.node_id).await?, Some(node));
+        }
+
+        {
+            let store = InMemoryStore::default();
+            let mut node = node_record("overflow-guarded-routes");
+            node.routes = vec![route("route-a", "10.42.1.0/24", "overflow-guarded-routes")?];
+            store.insert_node(node.clone()).await?;
+            let catalog_epoch = overlay_route_catalog_epoch(&[node.clone()])?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .update_node_routes_if_cluster_policy(
+                        &cluster_id,
+                        &node.node_id,
+                        vec![route("route-b", "10.43.1.0/24", "overflow-guarded-routes")?],
+                        None,
+                        Some(catalog_epoch),
+                    )
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_node(&node.node_id).await?, Some(node));
+        }
+
+        {
+            let store = InMemoryStore::default();
+            let node = node_record("overflow-remove");
+            let health = NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: Utc::now(),
+                latency_ms: Some(1.0),
+                relay_load: None,
+                message: Some("preserve".to_string()),
+            };
+            let observed_path = path("overflow-remove", "overflow-remove-peer");
+            store.insert_node(node.clone()).await?;
+            store
+                .upsert_health(node.node_id.clone(), health.clone())
+                .await?;
+            store.upsert_path(observed_path.clone()).await?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(store.remove_node(&node.node_id).await, &cluster_id);
+            assert_eq!(store.get_node(&node.node_id).await?, Some(node.clone()));
+            assert_eq!(store.get_health(&node.node_id).await?, Some(health));
+            assert_eq!(
+                store.list_paths_for(&node.node_id).await?,
+                vec![observed_path]
+            );
+        }
+
+        {
+            let store = InMemoryStore::default();
+            let mut node = node_record("overflow-rejoin");
+            node.routes = vec![route("route-a", "10.42.1.0/24", "overflow-rejoin")?];
+            store.insert_node(node.clone()).await?;
+            let catalog_epoch = overlay_route_catalog_epoch(&[node.clone()])?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .rejoin_node_if_cluster_policy(RejoinNodeStoreUpdate {
+                        cluster_id: cluster_id.clone(),
+                        expected_cluster_policy: None,
+                        expected_route_catalog_epoch: Some(catalog_epoch),
+                        expected_node: node.clone(),
+                        candidates: vec![candidate("overflow-rejoin")],
+                        relay_capability: Some(relay_capability()),
+                        routes: vec![route("route-b", "10.43.1.0/24", "overflow-rejoin")?],
+                    })
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_node(&node.node_id).await?, Some(node));
+        }
+
+        {
+            let store = InMemoryStore::default();
+            let node = node_record("overflow-key");
+            store.insert_node(node.clone()).await?;
+            set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+            assert_routing_epoch_exhausted(
+                store
+                    .rotate_node_wireguard_public_key(
+                        &node.node_id,
+                        &node.wireguard_public_key,
+                        wireguard_public_key_for_node("overflow-next-key"),
+                    )
+                    .await,
+                &cluster_id,
+            );
+            assert_eq!(store.get_node(&node.node_id).await?, Some(node));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_routing_epoch_overflow_preserves_complete_heartbeat_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let store = InMemoryStore::default();
+        let mut node = node_record("overflow-heartbeat");
+        node.routes = vec![route("route-a", "10.42.1.0/24", "overflow-heartbeat")?];
+        store.insert_node(node.clone()).await?;
+        set_in_memory_routing_epoch(&store, &cluster_id, u64::MAX).await;
+
+        let accepted_at = Utc::now();
+        let mut update = heartbeat_store_update(&node, accepted_at);
+        update.routes = Some(vec![route(
+            "route-b",
+            "10.43.1.0/24",
+            "overflow-heartbeat",
+        )?]);
+        update.paths = vec![path("overflow-heartbeat", "overflow-heartbeat-peer")];
+        assert_routing_epoch_exhausted(store.apply_heartbeat(update).await, &cluster_id);
+
+        assert_eq!(store.get_node(&node.node_id).await?, Some(node.clone()));
+        assert_eq!(store.get_health(&node.node_id).await?, None);
+        assert_eq!(
+            store
+                .get_heartbeat_signature_timestamp(&node.node_id)
+                .await?,
+            None
+        );
+        assert_eq!(store.get_nat_classification(&node.node_id).await?, None);
+        assert!(store.list_paths_for(&node.node_id).await?.is_empty());
+        assert_eq!(
+            store.get_overlay_routing_epoch(&cluster_id).await?,
+            u64::MAX
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_cluster_boundary_rejects_heartbeat_and_route_mutation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_a = ClusterId::from_string("cluster-a");
+        let cluster_b = ClusterId::from_string("cluster-b");
+        let store = Arc::new(InMemoryStore::default());
+        let mut foreign = node_record("node-a");
+        foreign.cluster_id = cluster_b;
+        store.insert_node(foreign.clone()).await?;
+
+        let mut update = heartbeat_store_update(&foreign, Utc::now());
+        update.cluster_id = cluster_a.clone();
+        assert!(matches!(
+            store.apply_heartbeat(update).await,
+            Err(ControlPlaneError::NodeNotFound(node_id)) if node_id == foreign.node_id
+        ));
+        assert!(matches!(
+            store
+                .update_node_routes_if_cluster_policy(
+                    &cluster_a,
+                    &foreign.node_id,
+                    vec![route("foreign-route", "10.42.0.0/16", "node-a")?],
+                    None,
+                    None,
+                )
+                .await,
+            Err(ControlPlaneError::NodeNotFound(node_id)) if node_id == foreign.node_id
+        ));
+        assert_eq!(
+            store.get_node(&foreign.node_id).await?,
+            Some(foreign.clone())
+        );
+        assert_eq!(store.get_health(&foreign.node_id).await?, None);
+
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_a, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?),
+            store,
+        );
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: foreign.node_id.clone(),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    nat_classification: None,
+                    relay_capability: None,
+                    routes: None,
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+            ))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeNotFound(node_id)) if node_id == foreign.node_id
+        ));
         Ok(())
     }
 
@@ -7508,7 +10000,7 @@ mod tests {
 
         let mut zero_metric = route("route-zero-metric", "10.42.1.0/24", "node-a")?;
         zero_metric.metric = 0;
-        let cases = vec![
+        let mut cases = vec![
             (
                 vec![route("", "10.42.1.0/24", "node-a")?],
                 "route ID cannot be empty",
@@ -7552,6 +10044,18 @@ mod tests {
                 "route route-zero-metric metric must be greater than zero",
             ),
         ];
+        cases.push((
+            (0..=MAX_OVERLAY_NODE_ROUTES)
+                .map(|index| {
+                    route(
+                        &format!("route-{index}"),
+                        &format!("10.42.{}.{}/32", index / 256, index % 256),
+                        "node-a",
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            "maximum is 256",
+        ));
 
         for (routes, expected) in cases {
             let mut request = registration_request("node-a");
@@ -8626,6 +11130,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_rejects_routes_outside_configured_overlay_scopes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.cluster_policy.overlay_route_scopes = vec!["10.42.0.0/16".parse()?];
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        let mut claims = claims(cluster_id);
+        claims.policy.allowed_routes = vec!["10.0.0.0/8".parse()?];
+        plane
+            .register_with_claims(claims, registration_request("node-a"))
+            .await?;
+        let outside_scope = route("outside-scope", "10.43.1.0/24", "node-a")?;
+
+        let error = match plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: Some(12.0),
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: Some(vec![outside_scope]),
+                    path_state: Vec::new(),
+                    nat_classification: None,
+                    node_signature: None,
+                },
+            ))
+            .await
+        {
+            Ok(_) => return Err("out-of-scope heartbeat route was unexpectedly accepted".into()),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeUpdateRejected { reason, .. }
+                if reason.contains("not fully contained")
+        ));
+        assert!(store
+            .get_node(&node_id("node-a"))
+            .await?
+            .ok_or("registered node should remain")?
+            .routes
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_rejects_routes_outside_token_policy(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -9082,6 +11644,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_rejects_unbounded_path_state_before_persistence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::new();
+        let config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(config, store.clone());
+        plane
+            .register_with_claims(claims(cluster_id), registration_request("node-a"))
+            .await?;
+
+        let result = plane
+            .heartbeat(signed_heartbeat(
+                "node-a",
+                HeartbeatRequest {
+                    node_id: node_id("node-a"),
+                    health: NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: Utc::now(),
+                        latency_ms: None,
+                        relay_load: None,
+                        message: None,
+                    },
+                    candidates: Vec::new(),
+                    relay_capability: None,
+                    routes: None,
+                    path_state: vec![path("node-a", "node-b"); MAX_HEARTBEAT_PATH_STATES + 1],
+                    nat_classification: None,
+                    node_signature: None,
+                },
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("heartbeat path_state contains 4097 entries")
+                    && reason.contains("maximum is 4096")
+        ));
+        assert_eq!(store.get_health(&node_id("node-a")).await?, None);
+        assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn heartbeat_rejects_path_state_for_unregistered_peer_before_persistence(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
@@ -9195,6 +11804,128 @@ mod tests {
                 if reason.contains("remote node is not visible")
         ));
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_policy_generation_remains_bound_after_cache_is_replaced(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-policy-generation");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        let acquired_policy = ClusterPolicy {
+            acl_rules: vec![
+                AclRule {
+                    id: "deny-hidden".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::from([Tag::from_string("hidden")]),
+                    routes: Vec::new(),
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Deny,
+                },
+                AclRule {
+                    id: "allow-visible".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::new(),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::new(),
+                    routes: Vec::new(),
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Allow,
+                },
+            ],
+            ..ClusterPolicy::default()
+        };
+        store
+            .upsert_cluster_policy(&cluster_id, acquired_policy.clone())
+            .await?;
+        let acquired_policy = plane.current_cluster_policy().await?;
+
+        // Model an older request overwriting the process-local cache after this
+        // heartbeat has already acquired the persisted policy generation.
+        plane.cache_cluster_policy(ClusterPolicy::default())?;
+        assert!(plane.cluster_policy()?.acl_rules.is_empty());
+
+        let mut reporter = node_record("node-a");
+        reporter.cluster_id = cluster_id.clone();
+        let mut visible_peer = node_record("node-b");
+        visible_peer.cluster_id = cluster_id.clone();
+        let mut hidden_relay = node_record("relay-a");
+        hidden_relay.cluster_id = cluster_id;
+        hidden_relay.tags.insert(Tag::from_string("hidden"));
+        hidden_relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            ..relay_capability()
+        });
+        let nodes = vec![reporter.clone(), visible_peer.clone(), hidden_relay.clone()];
+
+        let hidden_peer_request = HeartbeatRequest {
+            node_id: reporter.node_id.clone(),
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: Utc::now(),
+                latency_ms: None,
+                relay_load: None,
+                message: None,
+            },
+            candidates: Vec::new(),
+            nat_classification: None,
+            relay_capability: None,
+            routes: None,
+            path_state: vec![path("node-a", "relay-a")],
+            node_signature: None,
+        };
+        assert!(matches!(
+            plane.validate_heartbeat_path_peers_visible(
+                &hidden_peer_request,
+                &reporter,
+                &nodes,
+                &acquired_policy,
+            ),
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("is not visible")
+        ));
+
+        let relay_request = HeartbeatRequest {
+            path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
+            ..hidden_peer_request
+        };
+        plane.validate_heartbeat_path_peers_visible(
+            &relay_request,
+            &reporter,
+            &nodes,
+            &acquired_policy,
+        )?;
+        let health_by_node = BTreeMap::from([(
+            hidden_relay.node_id.clone(),
+            NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: Utc::now(),
+                latency_ms: Some(1.0),
+                relay_load: Some(0.1),
+                message: None,
+            },
+        )]);
+        assert!(matches!(
+            plane.validate_heartbeat_path_relay_eligibility(
+                &relay_request,
+                &reporter,
+                &nodes,
+                &health_by_node,
+                Utc::now(),
+                &acquired_policy,
+            ),
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("is not visible")
+        ));
         Ok(())
     }
 

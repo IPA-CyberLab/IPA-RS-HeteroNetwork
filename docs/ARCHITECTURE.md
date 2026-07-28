@@ -285,6 +285,28 @@ their proxy tasks expire after the idle timeout even when route ownership keeps
 the destination discoverable. Thus advertising one PodCIDR per node does not
 recreate either an `N x N` direct mesh or permanently retained all-pairs proxy
 state.
+The `NeighborMap` carries at most 64 aggregate capture scopes instead of the
+complete route-owner directory. An empty `ClusterPolicy.overlay_route_scopes`
+asks the Control Plane to aggregate the exact advertised CIDRs; an explicit
+scope list provides stable Kubernetes PodCIDR allocation ranges and every
+advertised route must remain inside one of those scopes. The Control Plane
+rejects overlap between scopes, the VPN pool, and restricted address ranges.
+It also rejects an automatically derived result above 64 scopes rather than
+widening a scope across unadvertised address space. Packet demand is resolved
+against a cached longest-prefix route index, with metric and stable identity
+tie-breaking plus per-request ACL checks, so a broad capture scope is not an
+authorization grant. Each Agent retains at most 4,096 resolved peer paths and
+4,096 exact route leases, with at most 256 leases per route owner, evicting the
+least recently used unpinned state. Backbone neighbor records never carry
+advertised routes; a directly adjacent route owner receives the authorized
+route on its existing peer without starting a forwarding proxy. A
+transactional, monotonically increasing routing epoch covers node identity,
+route ownership, and policy changes. Agents drop every resolved route lease
+immediately when that epoch changes, while a topology-only change retains the
+previous forwarding graph for migration. Policy and route updates use
+store-level compare-and-swap guards, including a content-derived route-catalog
+guard in automatic-scope mode, so active-active Control Planes cannot commit a
+policy or route update validated against conflicting state.
 Path resolution runs in its own Control Plane failover loop and therefore does
 not depend on Signal or direct-path negotiation being enabled. Its bounded
 deduplicating FIFO retries failed destinations at the tail and resolves up to

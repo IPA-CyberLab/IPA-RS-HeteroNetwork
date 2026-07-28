@@ -1256,6 +1256,8 @@ pub struct ClusterPolicy {
     pub overlay_max_degree: u16,
     #[serde(default = "default_overlay_direct_shortcut_limit")]
     pub overlay_direct_shortcut_limit: u16,
+    #[serde(default)]
+    pub overlay_route_scopes: Vec<IpNet>,
     #[serde(default = "default_relay_health_ttl_seconds")]
     pub relay_health_ttl_seconds: u64,
     #[serde(default = "default_endpoint_candidate_ttl_seconds")]
@@ -1289,6 +1291,7 @@ impl Default for ClusterPolicy {
             overlay_block_size: default_overlay_block_size(),
             overlay_max_degree: default_overlay_max_degree(),
             overlay_direct_shortcut_limit: default_overlay_direct_shortcut_limit(),
+            overlay_route_scopes: Vec::new(),
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
             path_state_ttl_seconds: default_path_state_ttl_seconds(),
@@ -1424,7 +1427,8 @@ pub struct NodeRecord {
 
 pub const MAX_OVERLAY_DEGREE: u16 = 64;
 pub const MAX_OVERLAY_NEIGHBORS: usize = MAX_OVERLAY_DEGREE as usize;
-pub const MAX_AGGREGATE_OVERLAY_ROUTES: usize = 4096;
+pub const MAX_OVERLAY_ROUTE_SCOPES: usize = 64;
+pub const MAX_AGGREGATE_OVERLAY_ROUTES: usize = MAX_OVERLAY_ROUTE_SCOPES;
 pub const MAX_OVERLAY_CLIENT_ROUTE_PEERS: usize = 4096;
 // The multihop envelope stores at most 512 intermediate nodes. Source and
 // destination are encoded separately in the overlay path.
@@ -1478,6 +1482,7 @@ pub struct NeighborMap {
     pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub topology_epoch: u64,
+    pub routing_epoch: u64,
     pub max_degree: u16,
     pub vpn_cidr: IpNet,
     pub neighbors: Vec<OverlayNeighbor>,
@@ -1602,6 +1607,15 @@ impl NeighborMap {
                     ),
                 ));
             }
+            if !neighbor.node.routes.is_empty() {
+                return Err(OverlayValidationError::new(
+                    "neighbors",
+                    format!(
+                        "backbone neighbor {} must not include advertised routes",
+                        neighbor.node.node_id
+                    ),
+                ));
+            }
         }
 
         let mut client_route_peer_ids = BTreeSet::new();
@@ -1676,6 +1690,7 @@ impl NeighborMap {
         }
 
         let mut route_cidrs = BTreeSet::new();
+        let mut accepted_route_cidrs = Vec::new();
         for (index, route) in self.aggregate_routes.iter().enumerate() {
             route.validate().map_err(|error| {
                 OverlayValidationError::new(
@@ -1683,14 +1698,51 @@ impl NeighborMap {
                     format!("aggregate route {index} is invalid: {}", error.reason()),
                 )
             })?;
+            if route.cidr.prefix_len() == 0 {
+                return Err(OverlayValidationError::new(
+                    "aggregate_routes",
+                    format!("aggregate route {} must not be a default route", route.cidr),
+                ));
+            }
+            if aggregate_overlay_route_cidrs_overlap(&self.vpn_cidr, &route.cidr) {
+                return Err(OverlayValidationError::new(
+                    "aggregate_routes",
+                    format!(
+                        "aggregate route {} overlaps VPN CIDR {}",
+                        route.cidr, self.vpn_cidr
+                    ),
+                ));
+            }
             if !route_cidrs.insert(route.cidr) {
                 return Err(OverlayValidationError::new(
                     "aggregate_routes",
                     format!("aggregate route {} is duplicated", route.cidr),
                 ));
             }
+            if let Some(overlap) = accepted_route_cidrs
+                .iter()
+                .find(|existing| aggregate_overlay_route_cidrs_overlap(existing, &route.cidr))
+            {
+                return Err(OverlayValidationError::new(
+                    "aggregate_routes",
+                    format!("aggregate route {} overlaps {}", route.cidr, overlap),
+                ));
+            }
+            accepted_route_cidrs.push(route.cidr);
         }
         Ok(())
+    }
+}
+
+fn aggregate_overlay_route_cidrs_overlap(left: &IpNet, right: &IpNet) -> bool {
+    match (left, right) {
+        (IpNet::V4(left), IpNet::V4(right)) => {
+            left.contains(&right.network()) || right.contains(&left.network())
+        }
+        (IpNet::V6(left), IpNet::V6(right)) => {
+            left.contains(&right.network()) || right.contains(&left.network())
+        }
+        _ => false,
     }
 }
 
@@ -1752,6 +1804,7 @@ impl OverlayPathQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlayPath {
     pub topology_epoch: u64,
+    pub routing_epoch: u64,
     pub source: NodeId,
     pub destination: IpAddr,
     pub target: NodeRecord,
@@ -19139,6 +19192,38 @@ mod tests {
     }
 
     #[test]
+    fn cluster_policy_defaults_missing_overlay_route_scopes() -> Result<(), serde_json::Error> {
+        let mut encoded = serde_json::to_value(ClusterPolicy::default())?;
+        let Some(object) = encoded.as_object_mut() else {
+            panic!("cluster policy must serialize as an object");
+        };
+        object.remove("overlay_route_scopes");
+
+        let decoded: ClusterPolicy = serde_json::from_value(encoded)?;
+        assert!(decoded.overlay_route_scopes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_policy_round_trips_overlay_route_scopes() -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy = ClusterPolicy {
+            overlay_route_scopes: vec!["10.244.0.0/16".parse()?, "2001:db8:42::/48".parse()?],
+            ..ClusterPolicy::default()
+        };
+        let encoded = serde_json::to_value(&policy)?;
+        assert_eq!(
+            encoded["overlay_route_scopes"],
+            serde_json::json!(["10.244.0.0/16", "2001:db8:42::/48"])
+        );
+
+        let decoded: ClusterPolicy = serde_json::from_value(encoded)?;
+        assert_eq!(decoded, policy);
+        policy.overlay_route_scopes.clear();
+        assert_eq!(policy, ClusterPolicy::default());
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_candidate_ipv6_kind_requires_ipv6_address() {
         let mut candidate = EndpointCandidate {
             node_id: NodeId::from_string("node-a"),
@@ -19657,6 +19742,7 @@ mod tests {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: NodeId::from_string("node-a"),
             topology_epoch: 42,
+            routing_epoch: 42,
             max_degree: 4,
             vpn_cidr: "10.250.0.0/24".parse()?,
             neighbors: vec![
@@ -19734,6 +19820,25 @@ mod tests {
         assert!(error.reason().contains("is duplicated"));
 
         invalid = valid.clone();
+        let neighbor_id = invalid.neighbors[0].node.node_id.clone();
+        invalid.neighbors[0].node.routes.push(Route {
+            id: "eager-neighbor-route".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: neighbor_id.clone(),
+            via: Some(neighbor_id),
+            metric: 10,
+            tags: BTreeSet::new(),
+        });
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("eager backbone route should be rejected")?;
+        assert_eq!(error.field(), "neighbors");
+        assert!(error
+            .reason()
+            .contains("must not include advertised routes"));
+
+        invalid = valid.clone();
         invalid
             .client_route_peers
             .push(invalid.client_route_peers[0].clone());
@@ -19799,6 +19904,99 @@ mod tests {
     }
 
     #[test]
+    fn neighbor_map_accepts_at_most_64_aggregate_routes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut neighbor_map = valid_neighbor_map()?;
+        neighbor_map.aggregate_routes.clear();
+        for index in 0..MAX_AGGREGATE_OVERLAY_ROUTES {
+            neighbor_map.aggregate_routes.push(AggregateOverlayRoute {
+                cidr: format!("10.{index}.0.0/16").parse()?,
+            });
+        }
+        neighbor_map.validate()?;
+
+        neighbor_map.aggregate_routes.push(AggregateOverlayRoute {
+            cidr: "10.64.0.0/16".parse()?,
+        });
+        let error = neighbor_map
+            .validate()
+            .err()
+            .ok_or("65 aggregate routes should be rejected")?;
+        assert_eq!(error.field(), "aggregate_routes");
+        assert!(error.reason().contains("count 65 exceeds maximum 64"));
+        Ok(())
+    }
+
+    #[test]
+    fn neighbor_map_rejects_duplicate_and_overlapping_aggregate_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut neighbor_map = valid_neighbor_map()?;
+        neighbor_map
+            .aggregate_routes
+            .push(neighbor_map.aggregate_routes[0].clone());
+        let error = neighbor_map
+            .validate()
+            .err()
+            .ok_or("duplicate aggregate routes should be rejected")?;
+        assert_eq!(error.field(), "aggregate_routes");
+        assert!(error.reason().contains("is duplicated"));
+
+        neighbor_map.aggregate_routes = vec![
+            AggregateOverlayRoute {
+                cidr: "10.42.0.0/16".parse()?,
+            },
+            AggregateOverlayRoute {
+                cidr: "10.42.1.0/24".parse()?,
+            },
+        ];
+        let error = neighbor_map
+            .validate()
+            .err()
+            .ok_or("contained aggregate route should be rejected")?;
+        assert_eq!(error.field(), "aggregate_routes");
+        assert!(error
+            .reason()
+            .contains("10.42.1.0/24 overlaps 10.42.0.0/16"));
+
+        neighbor_map.aggregate_routes.reverse();
+        let error = neighbor_map
+            .validate()
+            .err()
+            .ok_or("containing aggregate route should be rejected")?;
+        assert_eq!(error.field(), "aggregate_routes");
+        assert!(error
+            .reason()
+            .contains("10.42.0.0/16 overlaps 10.42.1.0/24"));
+        Ok(())
+    }
+
+    #[test]
+    fn neighbor_map_rejects_default_and_vpn_overlapping_aggregate_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut neighbor_map = valid_neighbor_map()?;
+        neighbor_map.aggregate_routes = vec![AggregateOverlayRoute {
+            cidr: "0.0.0.0/0".parse()?,
+        }];
+        let error = neighbor_map
+            .validate()
+            .err()
+            .ok_or("default aggregate route should be rejected")?;
+        assert_eq!(error.field(), "aggregate_routes");
+        assert!(error.reason().contains("must not be a default route"));
+
+        neighbor_map.aggregate_routes = vec![AggregateOverlayRoute {
+            cidr: "10.250.0.0/25".parse()?,
+        }];
+        let error = neighbor_map
+            .validate()
+            .err()
+            .ok_or("VPN-overlapping aggregate route should be rejected")?;
+        assert_eq!(error.field(), "aggregate_routes");
+        assert!(error.reason().contains("overlaps VPN CIDR 10.250.0.0/24"));
+        Ok(())
+    }
+
+    #[test]
     fn overlay_path_query_binds_and_validates_signed_source_identity(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let signed_at = Utc::now();
@@ -19846,6 +20044,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut path = OverlayPath {
             topology_epoch: 42,
+            routing_epoch: 42,
             source: NodeId::from_string("node-a"),
             destination: "10.250.0.9".parse()?,
             target: overlay_test_node("node-d", "cluster-a", "10.250.0.9".parse()?),

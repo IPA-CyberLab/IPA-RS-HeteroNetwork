@@ -1508,6 +1508,7 @@ mod tests {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: node(local),
             topology_epoch: epoch,
+            routing_epoch: epoch,
             max_degree: neighbors.len() as u16,
             vpn_cidr: "10.250.0.0/24"
                 .parse()
@@ -1542,6 +1543,7 @@ mod tests {
         let target = node_record(primary[primary.len() - 1]);
         OverlayPath {
             topology_epoch: epoch,
+            routing_epoch: epoch,
             source: node(primary[0]),
             destination: target.vpn_ip.0,
             target,

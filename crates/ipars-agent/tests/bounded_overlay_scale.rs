@@ -72,6 +72,7 @@ fn neighbor_map(index: usize, topology_epoch: u64) -> NeighborMap {
         cluster_id: ClusterId::from_string("bounded-overlay-scale"),
         node_id: node_id(index),
         topology_epoch,
+        routing_epoch: topology_epoch,
         max_degree: 4,
         vpn_cidr: "10.250.0.0/16"
             .parse()
@@ -131,6 +132,7 @@ fn secondary_indices() -> Vec<usize> {
 fn overlay_path(epoch: u64) -> OverlayPath {
     OverlayPath {
         topology_epoch: epoch,
+        routing_epoch: epoch,
         source: node_id(SOURCE_INDEX),
         destination: vpn_ip(DESTINATION_INDEX).0,
         target: node_record(DESTINATION_INDEX),

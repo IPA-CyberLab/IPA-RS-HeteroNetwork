@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipars_control_plane::{
-    ensure_token_definition_matches, ControlPlaneError, ControlPlaneStore, HeartbeatStoreUpdate,
-    RemovedNode, TokenLedger,
+    ensure_token_definition_matches, overlay_route_catalog_epoch, ControlPlaneError,
+    ControlPlaneStore, HeartbeatStoreUpdate, RejoinNodeStoreUpdate, RemovedNode, TokenLedger,
 };
 use ipars_types::api::ClientGatewaySelection;
 use ipars_types::{
@@ -42,6 +42,17 @@ impl SqliteControlPlaneStore {
                 CREATE TABLE IF NOT EXISTS cluster_policies (
                     cluster_id TEXT PRIMARY KEY NOT NULL,
                     record_json TEXT NOT NULL
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS overlay_routing_epochs (
+                    cluster_id TEXT PRIMARY KEY NOT NULL,
+                    epoch INTEGER NOT NULL CHECK(epoch >= 0)
                 );
                 "#,
             )
@@ -202,11 +213,72 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         row.map(row_to_cluster_policy).transpose()
     }
 
+    async fn initialize_cluster_policy_if_absent(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<ClusterPolicy, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let insert_result = sqlx::query(
+            "INSERT OR IGNORE INTO cluster_policies (cluster_id, record_json) VALUES (?1, ?2)",
+        )
+        .bind(cluster_id.as_str())
+        .bind(serde_json::to_string(&policy).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if insert_result.rows_affected() > 0 {
+            bump_sqlite_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        }
+        let stored = sqlite_cluster_policy(&mut transaction, cluster_id)
+            .await?
+            .ok_or_else(|| {
+                ControlPlaneError::Store(format!(
+                    "cluster policy initialization did not persist cluster {cluster_id}"
+                ))
+            })?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(stored)
+    }
+
+    async fn get_overlay_routing_epoch(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<u64, ControlPlaneError> {
+        let epoch = sqlx::query_scalar::<_, i64>(
+            "SELECT epoch FROM overlay_routing_epochs WHERE cluster_id = ?1",
+        )
+        .bind(cluster_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sql_error)?
+        .unwrap_or(0);
+        u64::try_from(epoch)
+            .map_err(|_| ControlPlaneError::Store("overlay routing epoch is negative".to_string()))
+    }
+
     async fn upsert_cluster_policy(
         &self,
         cluster_id: &ClusterId,
         policy: ClusterPolicy,
     ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        if sqlite_cluster_policy(&mut transaction, cluster_id)
+            .await?
+            .as_ref()
+            == Some(&policy)
+        {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(());
+        }
         sqlx::query(
             r#"
             INSERT INTO cluster_policies (cluster_id, record_json)
@@ -216,21 +288,106 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         )
         .bind(cluster_id.as_str())
         .bind(serde_json::to_string(&policy).map_err(json_error)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
+    }
+
+    async fn upsert_cluster_policy_if_route_catalog_epoch(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+        expected_route_catalog_epoch: u64,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let catalog = sqlite_cluster_route_catalog(&mut transaction, cluster_id).await?;
+        if overlay_route_catalog_epoch(&catalog)? != expected_route_catalog_epoch {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(false);
+        }
+        if sqlite_cluster_policy(&mut transaction, cluster_id)
+            .await?
+            .as_ref()
+            == Some(&policy)
+        {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(true);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_policies (cluster_id, record_json)
+            VALUES (?1, ?2)
+            ON CONFLICT(cluster_id) DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(serde_json::to_string(&policy).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(true)
     }
 
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
         let node_id = node.node_id.clone();
         let vpn_ip = node.vpn_ip;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
         sqlx::query("INSERT INTO nodes (node_id, record_json) VALUES (?1, ?2)")
             .bind(node.node_id.as_str())
             .bind(serde_json::to_string(&node).map_err(json_error)?)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| node_insert_error(error, &node_id, &vpn_ip))?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn insert_node_if_cluster_policy(
+        &self,
+        node: NodeRecord,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        if sqlite_cluster_policy(&mut transaction, &node.cluster_id).await?
+            != expected_cluster_policy
+        {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = expected_route_catalog_epoch {
+            let catalog = sqlite_cluster_route_catalog(&mut transaction, &node.cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let node_id = node.node_id.clone();
+        let vpn_ip = node.vpn_ip;
+        sqlx::query("INSERT INTO nodes (node_id, record_json) VALUES (?1, ?2)")
+            .bind(node.node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| node_insert_error(error, &node_id, &vpn_ip))?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
 
@@ -254,7 +411,11 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 
     async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
-        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
         let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
             .bind(node_id.as_str())
             .fetch_optional(&mut *transaction)
@@ -297,6 +458,7 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
         transaction.commit().await.map_err(sql_error)?;
         Ok(RemovedNode {
             node,
@@ -348,18 +510,134 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         node_id: &NodeId,
         routes: Vec<Route>,
     ) -> Result<(), ControlPlaneError> {
-        let result = sqlx::query(
-            "UPDATE nodes SET record_json = json_set(record_json, '$.routes', json(?2)) WHERE node_id = ?1",
-        )
-            .bind(node_id.as_str())
-            .bind(serde_json::to_string(&routes).map_err(json_error)?)
-            .execute(&self.pool)
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(sql_error)?;
-        if result.rows_affected() == 0 {
-            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.routes == routes {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(());
         }
+        node.routes = routes;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
+    }
+
+    async fn update_node_routes_if_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        if sqlite_cluster_policy(&mut transaction, cluster_id).await? != expected_cluster_policy {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = expected_route_catalog_epoch {
+            let catalog = sqlite_cluster_route_catalog(&mut transaction, cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == *cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.routes == routes {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(());
+        }
+        node.routes = routes;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn rejoin_node_if_cluster_policy(
+        &self,
+        update: RejoinNodeStoreUpdate,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        if sqlite_cluster_policy(&mut transaction, &update.cluster_id).await?
+            != update.expected_cluster_policy
+        {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = update.expected_route_catalog_epoch {
+            let catalog =
+                sqlite_cluster_route_catalog(&mut transaction, &update.cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let node_id = update.expected_node.node_id.clone();
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == update.cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node != update.expected_node {
+            return Err(ControlPlaneError::NodeStateChanged(node_id));
+        }
+        let routes_changed = node.routes != update.routes;
+        node.endpoint_candidates = update.candidates;
+        node.relay_capability = update.relay_capability;
+        node.routes = update.routes;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node.node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        if routes_changed {
+            bump_sqlite_overlay_routing_epoch(&mut transaction, &update.cluster_id).await?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(node)
     }
 
     async fn rotate_node_wireguard_public_key(
@@ -368,32 +646,40 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         expected_current_public_key: &str,
         next_public_key: String,
     ) -> Result<NodeRecord, ControlPlaneError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE nodes
-            SET record_json = json_set(record_json, '$.wireguard_public_key', ?3)
-            WHERE node_id = ?1
-              AND json_extract(record_json, '$.wireguard_public_key') = ?2
-            "#,
-        )
-        .bind(node_id.as_str())
-        .bind(expected_current_public_key)
-        .bind(next_public_key)
-        .execute(&self.pool)
-        .await
-        .map_err(sql_error)?;
-        if result.rows_affected() == 0 {
-            if self.get_node(node_id).await?.is_none() {
-                return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
-            }
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.wireguard_public_key != expected_current_public_key {
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: node_id.clone(),
                 reason: "wireguard public key changed before rotation completed".to_string(),
             });
         }
-        self.get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))
+        if node.wireguard_public_key == next_public_key {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(node);
+        }
+        node.wireguard_public_key = next_public_key;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_sqlite_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(node)
     }
 
     async fn upsert_health(
@@ -454,6 +740,32 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         Ok(health_by_node)
     }
 
+    async fn list_nodes_and_health(
+        &self,
+    ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let node_rows = sqlx::query("SELECT record_json FROM nodes ORDER BY node_id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let health_rows = sqlx::query("SELECT node_id, record_json FROM health ORDER BY node_id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+
+        let nodes = node_rows
+            .into_iter()
+            .map(row_to_node)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut health_by_node = BTreeMap::new();
+        for row in health_rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            health_by_node.insert(node_id, row_to_health(row)?);
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok((nodes, health_by_node))
+    }
+
     async fn upsert_nat_classification(
         &self,
         node_id: NodeId,
@@ -504,12 +816,25 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
     }
 
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
-        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
-        sqlx::query("UPDATE nodes SET record_json = record_json WHERE node_id = ?1")
-            .bind(update.node_id.as_str())
-            .execute(&mut *transaction)
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(sql_error)?;
+        if sqlite_cluster_policy(&mut transaction, &update.cluster_id)
+            .await?
+            .as_ref()
+            != update.expected_cluster_policy.as_ref()
+        {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = update.expected_route_catalog_epoch {
+            let catalog =
+                sqlite_cluster_route_catalog(&mut transaction, &update.cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
         let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
             .bind(update.node_id.as_str())
             .fetch_optional(&mut *transaction)
@@ -519,6 +844,11 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .map(row_to_node)
             .transpose()?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
+        update.ensure_matches_node_generation(&node)?;
+        let routes_changed = update
+            .routes
+            .as_ref()
+            .is_some_and(|routes| node.routes != *routes);
         let previous_health = sqlx::query("SELECT record_json FROM health WHERE node_id = ?1")
             .bind(update.node_id.as_str())
             .fetch_optional(&mut *transaction)
@@ -611,6 +941,9 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        }
+        if routes_changed {
+            bump_sqlite_overlay_routing_epoch(&mut transaction, &update.cluster_id).await?;
         }
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
@@ -1101,6 +1434,17 @@ impl PostgresControlPlaneStore {
         transaction
             .execute(
                 r#"
+                CREATE TABLE IF NOT EXISTS overlay_routing_epochs (
+                    cluster_id TEXT PRIMARY KEY NOT NULL,
+                    epoch BIGINT NOT NULL CHECK(epoch >= 0)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
                 CREATE TABLE IF NOT EXISTS nodes (
                     node_id TEXT PRIMARY KEY NOT NULL,
                     record_json JSONB NOT NULL
@@ -1253,11 +1597,70 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         row.map(pg_row_to_cluster_policy).transpose()
     }
 
+    async fn initialize_cluster_policy_if_absent(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+    ) -> Result<ClusterPolicy, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, cluster_id).await?;
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO cluster_policies (cluster_id, record_json)
+            VALUES ($1, $2)
+            ON CONFLICT(cluster_id) DO NOTHING
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(serde_json::to_value(&policy).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        if insert_result.rows_affected() > 0 {
+            bump_postgres_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        }
+        let stored = postgres_cluster_policy(&mut transaction, cluster_id)
+            .await?
+            .ok_or_else(|| {
+                ControlPlaneError::Store(format!(
+                    "cluster policy initialization did not persist cluster {cluster_id}"
+                ))
+            })?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(stored)
+    }
+
+    async fn get_overlay_routing_epoch(
+        &self,
+        cluster_id: &ClusterId,
+    ) -> Result<u64, ControlPlaneError> {
+        let epoch = sqlx::query_scalar::<_, i64>(
+            "SELECT epoch FROM overlay_routing_epochs WHERE cluster_id = $1",
+        )
+        .bind(cluster_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sql_error)?
+        .unwrap_or(0);
+        u64::try_from(epoch)
+            .map_err(|_| ControlPlaneError::Store("overlay routing epoch is negative".to_string()))
+    }
+
     async fn upsert_cluster_policy(
         &self,
         cluster_id: &ClusterId,
         policy: ClusterPolicy,
     ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, cluster_id).await?;
+        if postgres_cluster_policy(&mut transaction, cluster_id)
+            .await?
+            .as_ref()
+            == Some(&policy)
+        {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(());
+        }
         sqlx::query(
             r#"
             INSERT INTO cluster_policies (cluster_id, record_json)
@@ -1267,21 +1670,98 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         )
         .bind(cluster_id.as_str())
         .bind(serde_json::to_value(&policy).map_err(json_error)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
+    }
+
+    async fn upsert_cluster_policy_if_route_catalog_epoch(
+        &self,
+        cluster_id: &ClusterId,
+        policy: ClusterPolicy,
+        expected_route_catalog_epoch: u64,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, cluster_id).await?;
+        let catalog = postgres_cluster_route_catalog(&mut transaction, cluster_id).await?;
+        if overlay_route_catalog_epoch(&catalog)? != expected_route_catalog_epoch {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(false);
+        }
+        if postgres_cluster_policy(&mut transaction, cluster_id)
+            .await?
+            .as_ref()
+            == Some(&policy)
+        {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(true);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_policies (cluster_id, record_json)
+            VALUES ($1, $2)
+            ON CONFLICT(cluster_id) DO UPDATE SET record_json = excluded.record_json
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(serde_json::to_value(&policy).map_err(json_error)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(true)
     }
 
     async fn insert_node(&self, node: NodeRecord) -> Result<(), ControlPlaneError> {
         let node_id = node.node_id.clone();
         let vpn_ip = node.vpn_ip;
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, &node.cluster_id).await?;
         sqlx::query("INSERT INTO nodes (node_id, record_json) VALUES ($1, $2)")
             .bind(node.node_id.as_str())
             .bind(serde_json::to_value(&node).map_err(json_error)?)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| node_insert_error(error, &node_id, &vpn_ip))?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn insert_node_if_cluster_policy(
+        &self,
+        node: NodeRecord,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, &node.cluster_id).await?;
+        if postgres_cluster_policy(&mut transaction, &node.cluster_id).await?
+            != expected_cluster_policy
+        {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = expected_route_catalog_epoch {
+            let catalog =
+                postgres_cluster_route_catalog(&mut transaction, &node.cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let node_id = node.node_id.clone();
+        let vpn_ip = node.vpn_ip;
+        sqlx::query("INSERT INTO nodes (node_id, record_json) VALUES ($1, $2)")
+            .bind(node.node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| node_insert_error(error, &node_id, &vpn_ip))?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, &node.cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
 
@@ -1306,7 +1786,11 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
 
     async fn remove_node(&self, node_id: &NodeId) -> Result<RemovedNode, ControlPlaneError> {
         let mut transaction = self.pool.begin().await.map_err(sql_error)?;
-        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1")
+        let cluster_id = postgres_node_cluster_id(&mut transaction, node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        lock_postgres_cluster(&mut transaction, &cluster_id).await?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
             .bind(node_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
@@ -1314,13 +1798,14 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         let node = row
             .map(pg_row_to_node)
             .transpose()?
+            .filter(|node| node.cluster_id == cluster_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
-        let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
+        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = $1")
             .bind(node_id.as_str())
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
-        sqlx::query("DELETE FROM heartbeat_signatures WHERE node_id = $1")
+        let health_result = sqlx::query("DELETE FROM health WHERE node_id = $1")
             .bind(node_id.as_str())
             .execute(&mut *transaction)
             .await
@@ -1348,6 +1833,7 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, &cluster_id).await?;
         transaction.commit().await.map_err(sql_error)?;
         Ok(RemovedNode {
             node,
@@ -1399,18 +1885,129 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         node_id: &NodeId,
         routes: Vec<Route>,
     ) -> Result<(), ControlPlaneError> {
-        let result = sqlx::query(
-            "UPDATE nodes SET record_json = jsonb_set(record_json, '{routes}', $2) WHERE node_id = $1",
-        )
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let cluster_id = postgres_node_cluster_id(&mut transaction, node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        lock_postgres_cluster(&mut transaction, &cluster_id).await?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
             .bind(node_id.as_str())
-            .bind(serde_json::to_value(&routes).map_err(json_error)?)
-            .execute(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(sql_error)?;
-        if result.rows_affected() == 0 {
-            return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
+        let mut node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.routes == routes {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(());
         }
+        node.routes = routes;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, &cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
         Ok(())
+    }
+
+    async fn update_node_routes_if_cluster_policy(
+        &self,
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+        routes: Vec<Route>,
+        expected_cluster_policy: Option<ClusterPolicy>,
+        expected_route_catalog_epoch: Option<u64>,
+    ) -> Result<(), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, cluster_id).await?;
+        if postgres_cluster_policy(&mut transaction, cluster_id).await? != expected_cluster_policy {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = expected_route_catalog_epoch {
+            let catalog = postgres_cluster_route_catalog(&mut transaction, cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == *cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.routes == routes {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(());
+        }
+        node.routes = routes;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn rejoin_node_if_cluster_policy(
+        &self,
+        update: RejoinNodeStoreUpdate,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        lock_postgres_cluster(&mut transaction, &update.cluster_id).await?;
+        if postgres_cluster_policy(&mut transaction, &update.cluster_id).await?
+            != update.expected_cluster_policy
+        {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if let Some(expected) = update.expected_route_catalog_epoch {
+            let catalog =
+                postgres_cluster_route_catalog(&mut transaction, &update.cluster_id).await?;
+            if overlay_route_catalog_epoch(&catalog)? != expected {
+                return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+            }
+        }
+        let node_id = update.expected_node.node_id.clone();
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == update.cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node != update.expected_node {
+            return Err(ControlPlaneError::NodeStateChanged(node_id));
+        }
+        let routes_changed = node.routes != update.routes;
+        node.endpoint_candidates = update.candidates;
+        node.relay_capability = update.relay_capability;
+        node.routes = update.routes;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node.node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        if routes_changed {
+            bump_postgres_overlay_routing_epoch(&mut transaction, &update.cluster_id).await?;
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(node)
     }
 
     async fn rotate_node_wireguard_public_key(
@@ -1419,32 +2016,41 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         expected_current_public_key: &str,
         next_public_key: String,
     ) -> Result<NodeRecord, ControlPlaneError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE nodes
-            SET record_json = jsonb_set(record_json, '{wireguard_public_key}', $3)
-            WHERE node_id = $1
-              AND record_json->>'wireguard_public_key' = $2
-            "#,
-        )
-        .bind(node_id.as_str())
-        .bind(expected_current_public_key)
-        .bind(serde_json::Value::String(next_public_key))
-        .execute(&self.pool)
-        .await
-        .map_err(sql_error)?;
-        if result.rows_affected() == 0 {
-            if self.get_node(node_id).await?.is_none() {
-                return Err(ControlPlaneError::NodeNotFound(node_id.clone()));
-            }
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let cluster_id = postgres_node_cluster_id(&mut transaction, node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        lock_postgres_cluster(&mut transaction, &cluster_id).await?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .filter(|node| node.cluster_id == cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.wireguard_public_key != expected_current_public_key {
             return Err(ControlPlaneError::NodeUpdateRejected {
                 node_id: node_id.clone(),
                 reason: "wireguard public key changed before rotation completed".to_string(),
             });
         }
-        self.get_node(node_id)
-            .await?
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))
+        if node.wireguard_public_key == next_public_key {
+            transaction.commit().await.map_err(sql_error)?;
+            return Ok(node);
+        }
+        node.wireguard_public_key = next_public_key;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        bump_postgres_overlay_routing_epoch(&mut transaction, &cluster_id).await?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(node)
     }
 
     async fn upsert_health(
@@ -1505,6 +2111,36 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         Ok(health_by_node)
     }
 
+    async fn list_nodes_and_health(
+        &self,
+    ) -> Result<(Vec<NodeRecord>, BTreeMap<NodeId, NodeHealth>), ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let node_rows = sqlx::query("SELECT record_json FROM nodes ORDER BY node_id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let health_rows = sqlx::query("SELECT node_id, record_json FROM health ORDER BY node_id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+
+        let nodes = node_rows
+            .into_iter()
+            .map(pg_row_to_node)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut health_by_node = BTreeMap::new();
+        for row in health_rows {
+            let node_id = NodeId::from_string(row.get::<String, _>("node_id"));
+            health_by_node.insert(node_id, pg_row_to_health(row)?);
+        }
+        transaction.commit().await.map_err(sql_error)?;
+        Ok((nodes, health_by_node))
+    }
+
     async fn upsert_nat_classification(
         &self,
         node_id: NodeId,
@@ -1556,6 +2192,28 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
 
     async fn apply_heartbeat(&self, update: HeartbeatStoreUpdate) -> Result<(), ControlPlaneError> {
         let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let updates_routes = update.routes.is_some();
+        if updates_routes {
+            lock_postgres_cluster(&mut transaction, &update.cluster_id).await?;
+        } else {
+            lock_postgres_cluster_shared(&mut transaction, &update.cluster_id).await?;
+        }
+        if postgres_cluster_policy(&mut transaction, &update.cluster_id)
+            .await?
+            .as_ref()
+            != update.expected_cluster_policy.as_ref()
+        {
+            return Err(ControlPlaneError::ClusterPolicyChanged);
+        }
+        if updates_routes {
+            if let Some(expected) = update.expected_route_catalog_epoch {
+                let catalog =
+                    postgres_cluster_route_catalog(&mut transaction, &update.cluster_id).await?;
+                if overlay_route_catalog_epoch(&catalog)? != expected {
+                    return Err(ControlPlaneError::OverlayRouteCatalogChanged);
+                }
+            }
+        }
         let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
             .bind(update.node_id.as_str())
             .fetch_optional(&mut *transaction)
@@ -1564,14 +2222,13 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         let mut node = row
             .map(pg_row_to_node)
             .transpose()?
+            .filter(|node| node.cluster_id == update.cluster_id)
             .ok_or_else(|| ControlPlaneError::NodeNotFound(update.node_id.clone()))?;
-        let previous_health = sqlx::query("SELECT record_json FROM health WHERE node_id = $1")
-            .bind(update.node_id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(sql_error)?
-            .map(pg_row_to_health)
-            .transpose()?;
+        update.ensure_matches_node_generation(&node)?;
+        let routes_changed = update
+            .routes
+            .as_ref()
+            .is_some_and(|routes| node.routes != *routes);
         let previous_signature_at = sqlx::query(
             "SELECT accepted_signature_at FROM heartbeat_signatures WHERE node_id = $1",
         )
@@ -1581,6 +2238,13 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .map_err(sql_error)?
         .map(|row| parse_utc_timestamp(&row.get::<String, _>("accepted_signature_at")))
         .transpose()?;
+        let previous_health = sqlx::query("SELECT record_json FROM health WHERE node_id = $1")
+            .bind(update.node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?
+            .map(pg_row_to_health)
+            .transpose()?;
         ensure_heartbeat_is_newer(&update, previous_signature_at, previous_health.as_ref())?;
 
         node.endpoint_candidates = update.candidates;
@@ -1657,6 +2321,9 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
             .execute(&mut *transaction)
             .await
             .map_err(sql_error)?;
+        }
+        if routes_changed {
+            bump_postgres_overlay_routing_epoch(&mut transaction, &update.cluster_id).await?;
         }
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
@@ -2106,6 +2773,180 @@ impl TokenLedger for PostgresControlPlaneStore {
     }
 }
 
+async fn sqlite_cluster_policy(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    cluster_id: &ClusterId,
+) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+    sqlx::query("SELECT record_json FROM cluster_policies WHERE cluster_id = ?1")
+        .bind(cluster_id.as_str())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(sql_error)?
+        .map(row_to_cluster_policy)
+        .transpose()
+}
+
+async fn bump_sqlite_overlay_routing_epoch(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    cluster_id: &ClusterId,
+) -> Result<(), ControlPlaneError> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO overlay_routing_epochs (cluster_id, epoch)
+        VALUES (?1, 1)
+        ON CONFLICT(cluster_id) DO UPDATE
+        SET epoch = overlay_routing_epochs.epoch + 1
+        WHERE overlay_routing_epochs.epoch < 9223372036854775807
+        "#,
+    )
+    .bind(cluster_id.as_str())
+    .execute(&mut **transaction)
+    .await
+    .map_err(sql_error)?;
+    if result.rows_affected() != 1 {
+        return Err(ControlPlaneError::Store(format!(
+            "overlay routing epoch exhausted for cluster {cluster_id}"
+        )));
+    }
+    Ok(())
+}
+
+async fn sqlite_cluster_route_catalog(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    cluster_id: &ClusterId,
+) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+    Ok(sqlx::query(
+        r#"
+        SELECT record_json
+        FROM nodes
+        WHERE json_extract(record_json, '$.cluster_id') = ?1
+        ORDER BY node_id
+        "#,
+    )
+    .bind(cluster_id.as_str())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(sql_error)?
+    .into_iter()
+    .map(row_to_node)
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .filter(|node| !node.role.is_client())
+    .collect())
+}
+
+async fn lock_postgres_cluster(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    cluster_id: &ClusterId,
+) -> Result<(), ControlPlaneError> {
+    let lock_key = postgres_cluster_lock_key(cluster_id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+async fn lock_postgres_cluster_shared(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    cluster_id: &ClusterId,
+) -> Result<(), ControlPlaneError> {
+    let lock_key = postgres_cluster_lock_key(cluster_id);
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+fn postgres_cluster_lock_key(cluster_id: &ClusterId) -> String {
+    format!(
+        "ipars-control-plane:{}:{}",
+        cluster_id.as_str().len(),
+        cluster_id.as_str()
+    )
+}
+
+async fn postgres_node_cluster_id(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    node_id: &NodeId,
+) -> Result<Option<ClusterId>, ControlPlaneError> {
+    Ok(
+        sqlx::query(
+            "SELECT record_json->>'cluster_id' AS cluster_id FROM nodes WHERE node_id = $1",
+        )
+        .bind(node_id.as_str())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(sql_error)?
+        .map(|row| ClusterId::from_string(row.get::<String, _>("cluster_id"))),
+    )
+}
+
+async fn postgres_cluster_policy(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    cluster_id: &ClusterId,
+) -> Result<Option<ClusterPolicy>, ControlPlaneError> {
+    sqlx::query("SELECT record_json FROM cluster_policies WHERE cluster_id = $1")
+        .bind(cluster_id.as_str())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(sql_error)?
+        .map(pg_row_to_cluster_policy)
+        .transpose()
+}
+
+async fn bump_postgres_overlay_routing_epoch(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    cluster_id: &ClusterId,
+) -> Result<(), ControlPlaneError> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO overlay_routing_epochs (cluster_id, epoch)
+        VALUES ($1, 1)
+        ON CONFLICT(cluster_id) DO UPDATE
+        SET epoch = overlay_routing_epochs.epoch + 1
+        WHERE overlay_routing_epochs.epoch < 9223372036854775807
+        "#,
+    )
+    .bind(cluster_id.as_str())
+    .execute(&mut **transaction)
+    .await
+    .map_err(sql_error)?;
+    if result.rows_affected() != 1 {
+        return Err(ControlPlaneError::Store(format!(
+            "overlay routing epoch exhausted for cluster {cluster_id}"
+        )));
+    }
+    Ok(())
+}
+
+async fn postgres_cluster_route_catalog(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    cluster_id: &ClusterId,
+) -> Result<Vec<NodeRecord>, ControlPlaneError> {
+    Ok(sqlx::query(
+        r#"
+        SELECT record_json
+        FROM nodes
+        WHERE record_json->>'cluster_id' = $1
+        ORDER BY node_id
+        "#,
+    )
+    .bind(cluster_id.as_str())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(sql_error)?
+    .into_iter()
+    .map(pg_row_to_node)
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .filter(|node| !node.role.is_client())
+    .collect())
+}
+
 fn row_to_cluster_policy(row: sqlx::sqlite::SqliteRow) -> Result<ClusterPolicy, ControlPlaneError> {
     let record_json: String = row.get("record_json");
     serde_json::from_str(&record_json).map_err(json_error)
@@ -2443,7 +3284,12 @@ mod tests {
             pinned: false,
         };
         Ok(HeartbeatStoreUpdate {
+            cluster_id: local.cluster_id.clone(),
+            expected_cluster_policy: None,
+            expected_route_catalog_epoch: None,
             node_id: local.node_id.clone(),
+            expected_identity_public_key: local.identity_public_key.clone(),
+            expected_registered_at: local.registered_at,
             accepted_signature_at: Some(accepted_at),
             candidates: vec![candidate],
             nat_classification: None,
@@ -2701,6 +3547,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_list_nodes_and_health_preserves_cluster_independent_results(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let cluster_a_node = node("node-a", Ipv4Addr::new(100, 64, 0, 1));
+        let mut cluster_b_node = node("node-b", Ipv4Addr::new(100, 64, 0, 2));
+        cluster_b_node.cluster_id = ClusterId::from_string("cluster-b");
+        store.insert_node(cluster_a_node.clone()).await?;
+        store.insert_node(cluster_b_node.clone()).await?;
+
+        let observed_at = Utc::now();
+        let cluster_a_health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: observed_at,
+            latency_ms: Some(11.0),
+            relay_load: None,
+            message: Some("cluster-a".to_string()),
+        };
+        let cluster_b_health = NodeHealth {
+            state: HealthState::Degraded,
+            last_seen_at: observed_at,
+            latency_ms: Some(22.0),
+            relay_load: None,
+            message: Some("cluster-b".to_string()),
+        };
+        let orphan_node_id = NodeId::from_string("orphan-node");
+        let orphan_health = NodeHealth {
+            state: HealthState::Unhealthy,
+            last_seen_at: observed_at,
+            latency_ms: None,
+            relay_load: None,
+            message: Some("orphan".to_string()),
+        };
+        store
+            .upsert_health(cluster_a_node.node_id.clone(), cluster_a_health.clone())
+            .await?;
+        store
+            .upsert_health(cluster_b_node.node_id.clone(), cluster_b_health.clone())
+            .await?;
+        store
+            .upsert_health(orphan_node_id.clone(), orphan_health.clone())
+            .await?;
+
+        let (nodes, health_by_node) = store.list_nodes_and_health().await?;
+
+        assert_eq!(nodes, vec![cluster_a_node.clone(), cluster_b_node.clone()]);
+        assert_eq!(
+            health_by_node,
+            BTreeMap::from([
+                (cluster_a_node.node_id, cluster_a_health),
+                (cluster_b_node.node_id, cluster_b_health),
+                (orphan_node_id, orphan_health),
+            ])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sqlite_cluster_policy_is_shared_across_store_instances(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (database_url, database_path) = temp_sqlite_url("cluster-policy");
@@ -2738,6 +3642,502 @@ mod tests {
         drop(store_b);
         drop(reopened);
         let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_cluster_policy_initialization_is_first_writer_wins(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("cluster-policy-init");
+        let cluster_id = ClusterId::from_string("cluster-ha-init");
+        let store_a = SqliteControlPlaneStore::connect(&database_url).await?;
+        let store_b = SqliteControlPlaneStore::connect(&database_url).await?;
+        let policy_a = ClusterPolicy {
+            overlay_block_size: 8,
+            ..ClusterPolicy::default()
+        };
+        let policy_b = ClusterPolicy {
+            overlay_block_size: 12,
+            ..ClusterPolicy::default()
+        };
+
+        let (result_a, result_b) = tokio::join!(
+            store_a.initialize_cluster_policy_if_absent(&cluster_id, policy_a),
+            store_b.initialize_cluster_policy_if_absent(&cluster_id, policy_b),
+        );
+        let result_a = result_a?;
+        let result_b = result_b?;
+
+        assert_eq!(result_a, result_b);
+        assert_eq!(
+            store_a.get_cluster_policy(&cluster_id).await?,
+            Some(result_a)
+        );
+
+        drop(store_a);
+        drop(store_b);
+        let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_overlay_routing_epoch_tracks_only_committed_routing_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let initial_policy = ClusterPolicy::default();
+        let current_policy = ClusterPolicy {
+            overlay_block_size: 12,
+            ..initial_policy.clone()
+        };
+
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 0);
+        assert_eq!(
+            store
+                .initialize_cluster_policy_if_absent(&cluster_id, initial_policy.clone())
+                .await?,
+            initial_policy
+        );
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 1);
+
+        assert_eq!(
+            store
+                .initialize_cluster_policy_if_absent(&cluster_id, current_policy.clone())
+                .await?,
+            initial_policy
+        );
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 1);
+        store
+            .upsert_cluster_policy(&cluster_id, initial_policy.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 1);
+        store
+            .upsert_cluster_policy(&cluster_id, current_policy.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 2);
+        store
+            .upsert_cluster_policy(&cluster_id, current_policy.clone())
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 2);
+
+        let empty_catalog_epoch = overlay_route_catalog_epoch(&[])?;
+        assert!(
+            !store
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    &cluster_id,
+                    initial_policy.clone(),
+                    empty_catalog_epoch ^ 1,
+                )
+                .await?
+        );
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 2);
+        assert!(
+            store
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    &cluster_id,
+                    current_policy.clone(),
+                    empty_catalog_epoch,
+                )
+                .await?
+        );
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 2);
+
+        let local = node("epoch-node", Ipv4Addr::new(100, 64, 0, 1));
+        store.insert_node(local.clone()).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 3);
+        assert!(store.insert_node(local.clone()).await.is_err());
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 3);
+
+        store
+            .update_node_candidates(&local.node_id, vec![candidate(local.node_id.as_str())])
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 3);
+
+        let route = Route {
+            id: "epoch-route".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        store
+            .update_node_routes(&local.node_id, vec![route.clone()])
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+        store
+            .update_node_routes(&local.node_id, vec![route.clone()])
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+
+        assert!(matches!(
+            store
+                .update_node_routes_if_cluster_policy(
+                    &cluster_id,
+                    &local.node_id,
+                    Vec::new(),
+                    Some(initial_policy),
+                    None,
+                )
+                .await,
+            Err(ControlPlaneError::ClusterPolicyChanged)
+        ));
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+
+        store
+            .rotate_node_wireguard_public_key(
+                &local.node_id,
+                &local.wireguard_public_key,
+                local.wireguard_public_key.clone(),
+            )
+            .await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+
+        let remote = node("heartbeat-peer", Ipv4Addr::new(100, 64, 0, 2));
+        let heartbeat_at = Utc::now() + Duration::seconds(1);
+        let mut candidate_only =
+            heartbeat_update(&local, &remote, heartbeat_at, "candidate-only", 43)?;
+        candidate_only.expected_cluster_policy = Some(current_policy.clone());
+        candidate_only.routes = None;
+        store.apply_heartbeat(candidate_only).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+
+        let mut same_route = heartbeat_update(
+            &local,
+            &remote,
+            heartbeat_at + Duration::seconds(1),
+            "same",
+            44,
+        )?;
+        same_route.expected_cluster_policy = Some(current_policy.clone());
+        same_route.routes = Some(vec![route]);
+        store.apply_heartbeat(same_route.clone()).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 4);
+
+        let mut changed_route = heartbeat_update(
+            &local,
+            &remote,
+            heartbeat_at + Duration::seconds(2),
+            "changed",
+            45,
+        )?;
+        changed_route.expected_cluster_policy = Some(current_policy);
+        store.apply_heartbeat(changed_route).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 5);
+        assert!(store.apply_heartbeat(same_route).await.is_err());
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 5);
+
+        store.remove_node(&local.node_id).await?;
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 6);
+        assert!(matches!(
+            store.remove_node(&local.node_id).await,
+            Err(ControlPlaneError::NodeNotFound(_))
+        ));
+        assert_eq!(store.get_overlay_routing_epoch(&cluster_id).await?, 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_epoch_exhaustion_rolls_back_routing_change(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool.clone()).await?;
+        let local = node("epoch-overflow", Ipv4Addr::new(100, 64, 0, 1));
+        let cluster_id = local.cluster_id.clone();
+        store.insert_node(local.clone()).await?;
+        sqlx::query("UPDATE overlay_routing_epochs SET epoch = ?2 WHERE cluster_id = ?1")
+            .bind(cluster_id.as_str())
+            .bind(i64::MAX)
+            .execute(&pool)
+            .await?;
+
+        let route = Route {
+            id: "overflow-route".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        assert!(matches!(
+            store.update_node_routes(&local.node_id, vec![route]).await,
+            Err(ControlPlaneError::Store(message))
+                if message.contains("overlay routing epoch exhausted")
+        ));
+        assert_eq!(
+            store.get_overlay_routing_epoch(&cluster_id).await?,
+            i64::MAX as u64
+        );
+        assert!(store
+            .get_node(&local.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+            .routes
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_guarded_node_mutations_reject_stale_cluster_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let current_policy = ClusterPolicy {
+            overlay_block_size: 12,
+            ..ClusterPolicy::default()
+        };
+        let stale_policy = ClusterPolicy::default();
+        store
+            .upsert_cluster_policy(&cluster_id, current_policy.clone())
+            .await?;
+
+        let local = node("node-a", Ipv4Addr::new(100, 64, 0, 1));
+        assert!(matches!(
+            store
+                .insert_node_if_cluster_policy(local.clone(), Some(stale_policy.clone()), None)
+                .await,
+            Err(ControlPlaneError::ClusterPolicyChanged)
+        ));
+        assert_eq!(store.get_node(&local.node_id).await?, None);
+        store
+            .insert_node_if_cluster_policy(local.clone(), Some(current_policy.clone()), None)
+            .await?;
+        let remote = node("node-b", Ipv4Addr::new(100, 64, 0, 2));
+        store
+            .insert_node_if_cluster_policy(remote.clone(), Some(current_policy.clone()), None)
+            .await?;
+
+        let route = Route {
+            id: "route-stale".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        assert!(matches!(
+            store
+                .update_node_routes_if_cluster_policy(
+                    &cluster_id,
+                    &local.node_id,
+                    vec![route],
+                    Some(stale_policy.clone()),
+                    None,
+                )
+                .await,
+            Err(ControlPlaneError::ClusterPolicyChanged)
+        ));
+        assert!(store
+            .get_node(&local.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+            .routes
+            .is_empty());
+
+        let accepted_at = Utc::now();
+        let mut heartbeat = heartbeat_update(&local, &remote, accepted_at, "stale-policy", 42)?;
+        heartbeat.expected_cluster_policy = Some(stale_policy);
+        assert!(matches!(
+            store.apply_heartbeat(heartbeat).await,
+            Err(ControlPlaneError::ClusterPolicyChanged)
+        ));
+        assert_eq!(store.get_health(&local.node_id).await?, None);
+        assert!(store.list_paths_for(&local.node_id).await?.is_empty());
+        assert!(store
+            .get_node(&local.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+            .routes
+            .is_empty());
+
+        let mut accepted = heartbeat_update(&local, &remote, accepted_at, "current-policy", 43)?;
+        accepted.expected_cluster_policy = Some(current_policy);
+        store.apply_heartbeat(accepted.clone()).await?;
+        assert_eq!(
+            store.get_health(&local.node_id).await?,
+            Some(accepted.health)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejoin_rejects_concurrent_node_state_change_atomically(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let policy = ClusterPolicy::default();
+        store
+            .upsert_cluster_policy(&cluster_id, policy.clone())
+            .await?;
+        let original = node("rejoin-node", Ipv4Addr::new(100, 64, 0, 1));
+        store.insert_node(original.clone()).await?;
+
+        let mut concurrent_candidate = candidate("rejoin-node");
+        concurrent_candidate.addr = SocketAddr::from(([203, 0, 113, 99], 51820));
+        store
+            .update_node_candidates(&original.node_id, vec![concurrent_candidate.clone()])
+            .await?;
+
+        assert!(matches!(
+            store
+                .rejoin_node_if_cluster_policy(RejoinNodeStoreUpdate {
+                    cluster_id,
+                    expected_cluster_policy: Some(policy),
+                    expected_route_catalog_epoch: None,
+                    expected_node: original.clone(),
+                    candidates: vec![candidate("rejoin-node")],
+                    relay_capability: Some(relay_capability()),
+                    routes: Vec::new(),
+                })
+                .await,
+            Err(ControlPlaneError::NodeStateChanged(node_id))
+                if node_id == original.node_id
+        ));
+
+        let stored = store
+            .get_node(&original.node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(original.node_id.clone()))?;
+        assert_eq!(stored.endpoint_candidates, vec![concurrent_candidate]);
+        assert_eq!(stored.relay_capability, None);
+        assert!(stored.routes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_guarded_route_mutations_reject_stale_catalog_epoch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let local = node("route-node-a", Ipv4Addr::new(100, 64, 0, 1));
+        let remote = node("route-node-b", Ipv4Addr::new(100, 64, 0, 2));
+        store.insert_node(local.clone()).await?;
+        store.insert_node(remote.clone()).await?;
+        let initial_epoch = overlay_route_catalog_epoch(&[local.clone(), remote.clone()])?;
+
+        let local_route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: local.node_id.clone(),
+            via: Some(local.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        store
+            .update_node_routes_if_cluster_policy(
+                &cluster_id,
+                &local.node_id,
+                vec![local_route.clone()],
+                None,
+                Some(initial_epoch),
+            )
+            .await?;
+
+        let remote_route = Route {
+            id: "route-b".to_string(),
+            cidr: "10.43.0.0/16".parse()?,
+            advertised_by: remote.node_id.clone(),
+            via: Some(remote.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        assert!(matches!(
+            store
+                .update_node_routes_if_cluster_policy(
+                    &cluster_id,
+                    &remote.node_id,
+                    vec![remote_route],
+                    None,
+                    Some(initial_epoch),
+                )
+                .await,
+            Err(ControlPlaneError::OverlayRouteCatalogChanged)
+        ));
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or(ControlPlaneError::NodeNotFound(local.node_id))?
+                .routes,
+            vec![local_route]
+        );
+        assert!(store
+            .get_node(&remote.node_id)
+            .await?
+            .ok_or(ControlPlaneError::NodeNotFound(remote.node_id))?
+            .routes
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_cluster_policy_catalog_cas_rejects_stale_epoch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let mut provider = node("provider", Ipv4Addr::new(100, 64, 0, 1));
+        provider.routes = vec![Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: provider.node_id.clone(),
+            via: Some(provider.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        }];
+        store.insert_node(provider.clone()).await?;
+        let stale_epoch = overlay_route_catalog_epoch(&[provider.clone()])?;
+
+        let replacement_route = Route {
+            id: "route-b".to_string(),
+            cidr: "10.43.0.0/16".parse()?,
+            advertised_by: provider.node_id.clone(),
+            via: Some(provider.node_id.clone()),
+            metric: 50,
+            tags: BTreeSet::new(),
+        };
+        store
+            .update_node_routes(&provider.node_id, vec![replacement_route])
+            .await?;
+        let next_policy = ClusterPolicy {
+            overlay_block_size: 16,
+            ..ClusterPolicy::default()
+        };
+        assert!(
+            !store
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    &cluster_id,
+                    next_policy.clone(),
+                    stale_epoch,
+                )
+                .await?
+        );
+        assert_eq!(store.get_cluster_policy(&cluster_id).await?, None);
+
+        let current_catalog = store
+            .list_nodes()
+            .await?
+            .into_iter()
+            .filter(|node| node.cluster_id == cluster_id && !node.role.is_client())
+            .collect::<Vec<_>>();
+        let current_epoch = overlay_route_catalog_epoch(&current_catalog)?;
+        assert!(
+            store
+                .upsert_cluster_policy_if_route_catalog_epoch(
+                    &cluster_id,
+                    next_policy.clone(),
+                    current_epoch,
+                )
+                .await?
+        );
+        assert_eq!(
+            store.get_cluster_policy(&cluster_id).await?,
+            Some(next_policy)
+        );
         Ok(())
     }
 
@@ -2850,6 +4250,69 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_heartbeat_rejects_aba_generation_and_foreign_cluster(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let store = SqliteControlPlaneStore::from_pool(pool).await?;
+        let original = node("node-a", Ipv4Addr::new(100, 64, 0, 1));
+        let remote = node("node-b", Ipv4Addr::new(100, 64, 0, 2));
+        store.insert_node(original.clone()).await?;
+        store.insert_node(remote.clone()).await?;
+        let stale_update = heartbeat_update(&original, &remote, Utc::now(), "stale", 42)?;
+
+        store.remove_node(&original.node_id).await?;
+        let mut replacement = original.clone();
+        replacement.identity_public_key = "replacement-identity".to_string();
+        replacement.registered_at = original.registered_at + Duration::seconds(1);
+        store.insert_node(replacement.clone()).await?;
+        assert!(matches!(
+            store.apply_heartbeat(stale_update).await,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("node generation changed")
+        ));
+        assert_eq!(
+            store.get_node(&original.node_id).await?,
+            Some(replacement.clone())
+        );
+        assert_eq!(store.get_health(&original.node_id).await?, None);
+        assert!(store.list_paths_for(&original.node_id).await?.is_empty());
+
+        store.remove_node(&original.node_id).await?;
+        let mut foreign = replacement;
+        foreign.cluster_id = ClusterId::from_string("cluster-b");
+        store.insert_node(foreign.clone()).await?;
+        let mut foreign_update = heartbeat_update(&foreign, &remote, Utc::now(), "foreign", 43)?;
+        foreign_update.cluster_id = ClusterId::from_string("cluster-a");
+        assert!(matches!(
+            store.apply_heartbeat(foreign_update).await,
+            Err(ControlPlaneError::NodeNotFound(node_id)) if node_id == foreign.node_id
+        ));
+        let foreign_route = Route {
+            id: "foreign-route".to_string(),
+            cidr: "10.43.0.0/16".parse()?,
+            advertised_by: foreign.node_id.clone(),
+            via: Some(foreign.node_id.clone()),
+            metric: 100,
+            tags: BTreeSet::new(),
+        };
+        assert!(matches!(
+            store
+                .update_node_routes_if_cluster_policy(
+                    &ClusterId::from_string("cluster-a"),
+                    &foreign.node_id,
+                    vec![foreign_route],
+                    None,
+                    None,
+                )
+                .await,
+            Err(ControlPlaneError::NodeNotFound(node_id)) if node_id == foreign.node_id
+        ));
+        assert_eq!(store.get_node(&foreign.node_id).await?, Some(foreign));
+        assert_eq!(store.get_health(&original.node_id).await?, None);
         Ok(())
     }
 

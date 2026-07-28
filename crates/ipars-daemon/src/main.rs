@@ -30,15 +30,16 @@ use ipars_agent::overlay_transit::{
     OverlayTransitClient, OverlayWireGuardPeerForwarder, OverlayWireGuardPeerForwarderConfig,
 };
 use ipars_agent::{
-    preferred_peer_local_udp_candidate, AgentError, AgentRuntime, BoringTunWireGuardBackend,
-    CommandWireGuardPeerTelemetrySource, FileAgentStateStore, KernelWireGuardBackend,
-    KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner, LinuxWireGuardBackend,
-    MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector, PeerMapApplier,
-    PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig, PendingDirectPathProbe,
-    RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver, TimedSystemCommandRunner,
-    UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder, UdpRelayFrameForwarder,
-    UserspaceWireGuardBackend, WireGuardBackend, WireGuardPeerInventorySource,
-    WireGuardPeerTelemetry, WireGuardPeerTelemetrySource, DEFAULT_PEER_PROBE_PORT,
+    merge_resolved_overlay_peer, preferred_peer_local_udp_candidate, AgentError, AgentRuntime,
+    BoringTunWireGuardBackend, CommandWireGuardPeerTelemetrySource, FileAgentStateStore,
+    KernelWireGuardBackend, KernelWireGuardPeerTelemetrySource, LinuxCommand, LinuxCommandRunner,
+    LinuxWireGuardBackend, MemoryWireGuardBackend, NamespacedLinuxCommandRunner, PathSelector,
+    PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig,
+    PendingDirectPathProbe, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
+    TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder,
+    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
+    WireGuardPeerInventorySource, WireGuardPeerTelemetry, WireGuardPeerTelemetrySource,
+    DEFAULT_PEER_PROBE_PORT,
 };
 use ipars_agent_http::{
     overlay_web_ui_router, router as agent_router, AgentHttpState, PublicWebGatewayPhase,
@@ -149,6 +150,9 @@ const MAX_AGENT_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_STUN_SERVERS: usize = MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND;
 const MAX_PENDING_OVERLAY_PATH_RESOLUTIONS_PER_ROUND: usize = 64;
 const MAX_CONCURRENT_OVERLAY_PATH_RESOLUTIONS: usize = 16;
+const MAX_OVERLAY_PATH_NEGATIVE_CACHE_ENTRIES: usize = 4_096;
+const OVERLAY_PATH_NEGATIVE_BACKOFF_INITIAL_SECONDS: u64 = 2;
+const OVERLAY_PATH_NEGATIVE_BACKOFF_MAX_SECONDS: u64 = 300;
 const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
     "udp://stun.cloudflare.com:3478",
     "udp://stun.cloudflare.com:53",
@@ -4718,6 +4722,10 @@ where
     config.cluster_policy.path_state_ttl_seconds = args.path_state_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
     let plane = Arc::new(ControlPlane::new(config, store));
+    plane
+        .current_cluster_policy()
+        .await
+        .context("failed to initialize or load the cluster policy")?;
     plane
         .advertise_service_instance(service_lease.instance())
         .await
@@ -12499,6 +12507,7 @@ impl ActiveBoundedOverlayTransit {
         let mut desired = BTreeMap::new();
         for path in runtime.resolved_overlay_paths().await {
             if path.topology_epoch != self.neighbor_map.topology_epoch
+                || path.routing_epoch != self.neighbor_map.routing_epoch
                 || path.ordered_nodes.len() < 3
             {
                 continue;
@@ -12523,7 +12532,13 @@ impl ActiveBoundedOverlayTransit {
             .peer_tasks
             .iter()
             .filter(|(peer, task)| {
-                !desired.contains_key(*peer) && !retained_epochs.contains(&task.path.topology_epoch)
+                bounded_overlay_peer_task_is_stale(
+                    desired.contains_key(*peer),
+                    task.path.topology_epoch,
+                    task.path.routing_epoch,
+                    &retained_epochs,
+                    self.neighbor_map.routing_epoch,
+                )
             })
             .map(|(peer, _)| peer.clone())
             .collect::<Vec<_>>();
@@ -12657,6 +12672,18 @@ impl Drop for ActiveBoundedOverlayTransit {
             task.task.abort();
         }
     }
+}
+
+fn bounded_overlay_peer_task_is_stale(
+    desired: bool,
+    task_topology_epoch: u64,
+    task_routing_epoch: u64,
+    retained_topology_epochs: &BTreeSet<u64>,
+    current_routing_epoch: u64,
+) -> bool {
+    !desired
+        && (task_routing_epoch != current_routing_epoch
+            || !retained_topology_epochs.contains(&task_topology_epoch))
 }
 
 fn start_bounded_overlay_transit(
@@ -19582,6 +19609,9 @@ impl PeerMapSource for HttpPeerMapSource {
         self.runtime
             .record_neighbor_map_snapshot(neighbor_map.clone())
             .await?;
+        self.runtime
+            .expire_idle_overlay_route_leases(chrono::Utc::now())
+            .await;
         let mut peers = neighbor_map
             .neighbors
             .iter()
@@ -19597,14 +19627,11 @@ impl PeerMapSource for HttpPeerMapSource {
             }
         }
         merge_control_client_projection(&mut peers, neighbor_map.client_route_peers);
-        peer_ids.extend(peers.iter().map(|peer| peer.node_id.clone()));
         for peer in self.runtime.resolved_overlay_peers().await {
             if peer.node_id == *node_id {
                 continue;
             }
-            if peer_ids.insert(peer.node_id.clone()) {
-                peers.push(peer);
-            }
+            merge_resolved_overlay_peer(&mut peers, peer);
         }
         Ok(PeerMap {
             cluster_id: neighbor_map.cluster_id,
@@ -19727,6 +19754,162 @@ async fn fetch_neighbor_map_from_control_planes(
     )
 }
 
+#[derive(Debug)]
+struct OverlayPathDestinationNotFound {
+    destination: IpAddr,
+    failures: String,
+}
+
+impl fmt::Display for OverlayPathDestinationNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "overlay destination {} was not found: {}",
+            self.destination, self.failures
+        )
+    }
+}
+
+impl std::error::Error for OverlayPathDestinationNotFound {}
+
+#[derive(Debug, Clone, Copy)]
+struct OverlayPathNegativeRetry {
+    failure_count: u8,
+    retry_at: Instant,
+}
+
+#[derive(Debug)]
+struct OverlayPathNegativeRetryCache {
+    entries: BTreeMap<IpAddr, OverlayPathNegativeRetry>,
+    schedule: BTreeSet<(Instant, IpAddr)>,
+    routing_epoch: Option<u64>,
+    jitter_seed: u64,
+}
+
+impl OverlayPathNegativeRetryCache {
+    fn new(node_id: &NodeId) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            schedule: BTreeSet::new(),
+            routing_epoch: None,
+            jitter_seed: stable_overlay_path_retry_hash(
+                0xcbf2_9ce4_8422_2325,
+                node_id.as_str().as_bytes(),
+            ),
+        }
+    }
+
+    fn reset_for_routing_epoch(&mut self, routing_epoch: Option<u64>) {
+        if self.routing_epoch == routing_epoch {
+            return;
+        }
+        self.entries.clear();
+        self.schedule.clear();
+        self.routing_epoch = routing_epoch;
+    }
+
+    fn due_destinations(&self, now: Instant, maximum: usize) -> Vec<IpAddr> {
+        self.schedule
+            .iter()
+            .take_while(|(retry_at, _)| *retry_at <= now)
+            .take(maximum)
+            .map(|(_, destination)| *destination)
+            .collect()
+    }
+
+    fn begin_attempt(&mut self, destination: IpAddr, now: Instant) -> bool {
+        let Some(retry) = self.entries.get(&destination).copied() else {
+            return true;
+        };
+        if retry.retry_at > now {
+            return false;
+        }
+        self.schedule.remove(&(retry.retry_at, destination));
+        true
+    }
+
+    fn clear(&mut self, destination: IpAddr) {
+        if let Some(retry) = self.entries.remove(&destination) {
+            self.schedule.remove(&(retry.retry_at, destination));
+        }
+    }
+
+    fn record_destination_not_found(&mut self, destination: IpAddr, now: Instant) -> Duration {
+        let failure_count = self
+            .entries
+            .get(&destination)
+            .map_or(1, |retry| retry.failure_count.saturating_add(1));
+        self.clear(destination);
+        if self.entries.len() >= MAX_OVERLAY_PATH_NEGATIVE_CACHE_ENTRIES {
+            let evicted = self
+                .schedule
+                .last()
+                .map(|(_, destination)| *destination)
+                .or_else(|| self.entries.keys().next().copied());
+            if let Some(evicted) = evicted {
+                self.clear(evicted);
+            }
+        }
+
+        let delay = overlay_path_negative_retry_delay(self.jitter_seed, destination, failure_count);
+        let retry_at = now + delay;
+        self.entries.insert(
+            destination,
+            OverlayPathNegativeRetry {
+                failure_count,
+                retry_at,
+            },
+        );
+        self.schedule.insert((retry_at, destination));
+        delay
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn overlay_path_negative_retry_delay(
+    jitter_seed: u64,
+    destination: IpAddr,
+    failure_count: u8,
+) -> Duration {
+    let exponent = u32::from(failure_count.saturating_sub(1).min(8));
+    let base_seconds = OVERLAY_PATH_NEGATIVE_BACKOFF_INITIAL_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(OVERLAY_PATH_NEGATIVE_BACKOFF_MAX_SECONDS);
+    let base_millis = base_seconds.saturating_mul(1_000);
+    let jitter_span_millis = base_millis / 4;
+    let lower_bound_millis = base_millis.saturating_sub(jitter_span_millis);
+    let destination_bytes = match destination {
+        IpAddr::V4(address) => address.octets().to_vec(),
+        IpAddr::V6(address) => address.octets().to_vec(),
+    };
+    let hash = stable_overlay_path_retry_hash(
+        stable_overlay_path_retry_hash(jitter_seed, &[failure_count]),
+        &destination_bytes,
+    );
+    let jitter_millis = if jitter_span_millis == 0 {
+        0
+    } else {
+        hash % (jitter_span_millis + 1)
+    };
+    Duration::from_millis(
+        lower_bound_millis
+            .saturating_add(jitter_millis)
+            .min(OVERLAY_PATH_NEGATIVE_BACKOFF_MAX_SECONDS * 1_000),
+    )
+}
+
+fn stable_overlay_path_retry_hash(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 async fn fetch_overlay_path_from_control_planes(
     client: &reqwest::Client,
     control_plane_urls: &[String],
@@ -19739,6 +19922,7 @@ async fn fetch_overlay_path_from_control_planes(
     );
     let node_id = identity.node_id();
     let mut failures = Vec::new();
+    let mut destination_not_found = false;
     for control_plane_url in control_plane_urls_for_node(control_plane_urls, &node_id) {
         let url = overlay_path_url(control_plane_url);
         let request = identity
@@ -19751,6 +19935,11 @@ async fn fetch_overlay_path_from_control_planes(
                 continue;
             }
         };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            destination_not_found = true;
+            failures.push(format!("{url}: destination not found"));
+            continue;
+        }
         let response = match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {
@@ -19786,6 +19975,13 @@ async fn fetch_overlay_path_from_control_planes(
         );
         return Ok(path);
     }
+    if destination_not_found {
+        return Err(OverlayPathDestinationNotFound {
+            destination,
+            failures: failures.join("; "),
+        }
+        .into());
+    }
     anyhow::bail!(
         "all control-plane overlay-path endpoints failed: {}",
         failures.join("; ")
@@ -19796,10 +19992,29 @@ async fn resolve_pending_overlay_paths(
     client: &reqwest::Client,
     runtime: &AgentRuntime,
     control_plane_urls: &[String],
+    negative_retries: &mut OverlayPathNegativeRetryCache,
 ) {
+    runtime
+        .expire_idle_overlay_route_leases(chrono::Utc::now())
+        .await;
+    negative_retries.reset_for_routing_epoch(
+        runtime
+            .neighbor_map_snapshot()
+            .await
+            .map(|neighbor_map| neighbor_map.routing_epoch),
+    );
+    let now = Instant::now();
+    for destination in
+        negative_retries.due_destinations(now, MAX_PENDING_OVERLAY_PATH_RESOLUTIONS_PER_ROUND)
+    {
+        runtime.requeue_overlay_destination(destination).await;
+    }
     let destinations = runtime
         .take_pending_overlay_destinations(MAX_PENDING_OVERLAY_PATH_RESOLUTIONS_PER_ROUND)
-        .await;
+        .await
+        .into_iter()
+        .filter(|destination| negative_retries.begin_attempt(*destination, now))
+        .collect::<Vec<_>>();
     if destinations.is_empty() {
         return;
     }
@@ -19807,6 +20022,7 @@ async fn resolve_pending_overlay_paths(
         Ok(identity) => identity,
         Err(error) => {
             for destination in destinations {
+                negative_retries.clear(destination);
                 runtime.requeue_overlay_destination(destination).await;
             }
             tracing::warn!(%error, "failed to load identity for overlay-path resolution");
@@ -19834,6 +20050,7 @@ async fn resolve_pending_overlay_paths(
     for (destination, resolution) in resolutions {
         match resolution {
             Ok(path) => {
+                negative_retries.clear(destination);
                 if let Err(error) = runtime
                     .record_resolved_overlay_path(path, chrono::Utc::now())
                     .await
@@ -19846,12 +20063,27 @@ async fn resolve_pending_overlay_paths(
                 }
             }
             Err(error) => {
-                runtime.requeue_overlay_destination(destination).await;
-                tracing::warn!(
-                    %error,
-                    %destination,
-                    "failed to resolve bounded-overlay path; will retry"
-                );
+                if error
+                    .downcast_ref::<OverlayPathDestinationNotFound>()
+                    .is_some()
+                {
+                    let retry_after =
+                        negative_retries.record_destination_not_found(destination, Instant::now());
+                    tracing::warn!(
+                        %error,
+                        %destination,
+                        retry_after_seconds = retry_after.as_secs_f64(),
+                        "bounded-overlay destination was not found; backing off"
+                    );
+                } else {
+                    negative_retries.clear(destination);
+                    runtime.requeue_overlay_destination(destination).await;
+                    tracing::warn!(
+                        %error,
+                        %destination,
+                        "failed to resolve bounded-overlay path; will retry"
+                    );
+                }
             }
         }
     }
@@ -19863,6 +20095,7 @@ fn start_overlay_path_resolution(
     control_plane_urls: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut negative_retries = OverlayPathNegativeRetryCache::new(&runtime.state().node_id);
         loop {
             let active_control_plane_urls =
                 runtime_control_plane_urls(runtime.as_ref(), &control_plane_urls).unwrap_or_else(
@@ -19874,8 +20107,13 @@ fn start_overlay_path_resolution(
                         control_plane_urls.clone()
                     },
                 );
-            resolve_pending_overlay_paths(&client, runtime.as_ref(), &active_control_plane_urls)
-                .await;
+            resolve_pending_overlay_paths(
+                &client,
+                runtime.as_ref(),
+                &active_control_plane_urls,
+                &mut negative_retries,
+            )
+            .await;
             tokio::time::sleep(OVERLAY_PATH_RESOLUTION_INTERVAL).await;
         }
     })
@@ -21440,6 +21678,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlay_path_fetch_classifies_not_found_for_negative_retry() -> anyhow::Result<()> {
+        let response =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (url, server) = spawn_raw_http_response(response).await?;
+        let identity = IdentityKeyPair::generate();
+        let destination = IpAddr::V4(Ipv4Addr::new(10, 244, 99, 10));
+
+        let error = test_error(
+            fetch_overlay_path_from_control_planes(
+                &reqwest::Client::new(),
+                &[url],
+                &identity,
+                destination,
+            )
+            .await,
+            "missing overlay destination should be classified for negative retry",
+        );
+
+        assert!(error
+            .downcast_ref::<OverlayPathDestinationNotFound>()
+            .is_some());
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .context("timed out waiting for overlay-path 404 test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn neighbor_map_fetch_times_out_stalled_endpoint_and_fails_over() -> anyhow::Result<()> {
         let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
         let identity = IdentityKeyPair::generate();
@@ -21447,6 +21713,7 @@ mod tests {
             cluster_id: ClusterId::from_string("cluster-timeout-failover"),
             node_id: identity.node_id(),
             topology_epoch: 1,
+            routing_epoch: 1,
             max_degree: 4,
             vpn_cidr: "100.64.0.0/10".parse()?,
             neighbors: Vec::new(),
@@ -21513,6 +21780,7 @@ mod tests {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 node_id: local_node.clone(),
                 topology_epoch: 6,
+                routing_epoch: 6,
                 max_degree: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: vec![ipars_types::OverlayNeighbor {
@@ -21529,6 +21797,7 @@ mod tests {
             cluster_id: ClusterId::from_string("cluster-a"),
             node_id: local_node.clone(),
             topology_epoch: 7,
+            routing_epoch: 7,
             max_degree: 4,
             vpn_cidr: "100.64.0.0/10".parse()?,
             neighbors: vec![ipars_types::OverlayNeighbor {
@@ -21930,6 +22199,7 @@ mod tests {
                 cluster_id: ClusterId::from_string("cluster-a"),
                 node_id: local_node.clone(),
                 topology_epoch: 7,
+                routing_epoch: 7,
                 max_degree: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: direct_neighbor
@@ -21950,6 +22220,7 @@ mod tests {
                 .record_resolved_overlay_path(
                     OverlayPath {
                         topology_epoch: 7,
+                        routing_epoch: 7,
                         source: local_node.clone(),
                         destination: peer.vpn_ip.0,
                         target: peer.clone(),
@@ -35655,6 +35926,136 @@ exec sleep 60
         Ok(())
     }
 
+    #[test]
+    fn bounded_overlay_forwarder_stops_a_retained_topology_task_on_routing_change() {
+        let retained_topology_epochs = BTreeSet::from([7]);
+
+        assert!(!bounded_overlay_peer_task_is_stale(
+            false,
+            7,
+            11,
+            &retained_topology_epochs,
+            11,
+        ));
+        assert!(bounded_overlay_peer_task_is_stale(
+            false,
+            7,
+            11,
+            &retained_topology_epochs,
+            12,
+        ));
+        assert!(!bounded_overlay_peer_task_is_stale(
+            true,
+            7,
+            11,
+            &retained_topology_epochs,
+            12,
+        ));
+    }
+
+    #[test]
+    fn overlay_path_negative_retry_is_exponential_bounded_and_epoch_scoped() {
+        let mut cache =
+            OverlayPathNegativeRetryCache::new(&NodeId::from_string("negative-cache-node"));
+        cache.reset_for_routing_epoch(Some(7));
+        let destination = IpAddr::V4(Ipv4Addr::new(10, 244, 1, 10));
+        let mut attempt_at = Instant::now();
+        let mut previous_delay = Duration::ZERO;
+
+        for failure in 1_u8..=8 {
+            let delay = cache.record_destination_not_found(destination, attempt_at);
+            let base = Duration::from_secs(
+                OVERLAY_PATH_NEGATIVE_BACKOFF_INITIAL_SECONDS * (1_u64 << u32::from(failure - 1)),
+            );
+            assert!(delay >= base.mul_f64(0.75));
+            assert!(delay <= base);
+            assert!(delay > previous_delay);
+            assert!(!cache.begin_attempt(destination, attempt_at));
+            let retry_at = attempt_at + delay;
+            assert_eq!(cache.due_destinations(retry_at, 1), vec![destination]);
+            assert!(cache.begin_attempt(destination, retry_at));
+            previous_delay = delay;
+            attempt_at = retry_at;
+        }
+        let capped_delay = cache.record_destination_not_found(destination, attempt_at);
+        assert!(capped_delay <= Duration::from_secs(OVERLAY_PATH_NEGATIVE_BACKOFF_MAX_SECONDS));
+        assert!(
+            capped_delay >= Duration::from_secs(OVERLAY_PATH_NEGATIVE_BACKOFF_MAX_SECONDS * 3 / 4)
+        );
+
+        cache.reset_for_routing_epoch(Some(8));
+        assert_eq!(cache.len(), 0);
+        for index in 1..=MAX_OVERLAY_PATH_NEGATIVE_CACHE_ENTRIES + 1 {
+            cache.record_destination_not_found(
+                IpAddr::V6(Ipv6Addr::from(index as u128)),
+                attempt_at,
+            );
+        }
+        assert_eq!(cache.len(), MAX_OVERLAY_PATH_NEGATIVE_CACHE_ENTRIES);
+        assert_eq!(
+            cache.schedule.len(),
+            MAX_OVERLAY_PATH_NEGATIVE_CACHE_ENTRIES
+        );
+        cache.reset_for_routing_epoch(Some(9));
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn overlay_path_negative_retry_prevents_one_thousand_agents_from_sustaining_full_rate() {
+        const AGENT_COUNT: usize = 1_000;
+        let started_at = Instant::now();
+        let mut caches = (0..AGENT_COUNT)
+            .map(|index| {
+                let mut cache = OverlayPathNegativeRetryCache::new(&NodeId::from_string(format!(
+                    "negative-scale-node-{index:04}"
+                )));
+                cache.reset_for_routing_epoch(Some(7));
+                for destination in 1_u128..=64 {
+                    cache.record_destination_not_found(
+                        IpAddr::V6(Ipv6Addr::from(destination)),
+                        started_at,
+                    );
+                }
+                cache
+            })
+            .collect::<Vec<_>>();
+
+        let one_second_later = started_at + Duration::from_secs(1);
+        assert_eq!(
+            caches
+                .iter()
+                .map(|cache| cache.due_destinations(one_second_later, 64).len())
+                .sum::<usize>(),
+            0
+        );
+
+        let first_retry = started_at + Duration::from_secs(2);
+        assert_eq!(
+            caches
+                .iter()
+                .map(|cache| cache.due_destinations(first_retry, 64).len())
+                .sum::<usize>(),
+            AGENT_COUNT * 64
+        );
+        for cache in &mut caches {
+            for destination in cache.due_destinations(first_retry, 64) {
+                assert!(cache.begin_attempt(destination, first_retry));
+                cache.record_destination_not_found(destination, first_retry);
+            }
+        }
+        assert_eq!(
+            caches
+                .iter()
+                .map(|cache| {
+                    cache
+                        .due_destinations(first_retry + Duration::from_secs(1), 64)
+                        .len()
+                })
+                .sum::<usize>(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn bounded_overlay_supervisor_proxies_wireguard_datagrams_across_representative(
     ) -> anyhow::Result<()> {
@@ -35680,6 +36081,7 @@ exec sleep 60
                 cluster_id: local.cluster_id.clone(),
                 node_id: local.node_id.clone(),
                 topology_epoch: 7,
+                routing_epoch: 7,
                 max_degree: 4,
                 vpn_cidr: "127.0.0.0/8".parse().unwrap_or_else(|error| {
                     panic!("static loopback test CIDR must parse: {error}")
@@ -35706,6 +36108,7 @@ exec sleep 60
         ) -> OverlayPath {
             OverlayPath {
                 topology_epoch: 7,
+                routing_epoch: 7,
                 source: source.node_id.clone(),
                 destination: target.vpn_ip.0,
                 target: target.clone(),

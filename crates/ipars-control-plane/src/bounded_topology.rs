@@ -9,7 +9,7 @@
 //! representative as a path.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use ipars_crypto::node_id_from_public_key;
 use ipars_types::{
@@ -245,6 +245,7 @@ pub struct BoundedTopology {
     routing_node_indexes: BTreeMap<NodeId, usize>,
     indexed_adjacency: Vec<Vec<usize>>,
     next_hop_cache: Arc<NextHopCache>,
+    path_cache: Arc<SourcePathCache>,
 }
 
 impl PartialEq for BoundedTopology {
@@ -274,6 +275,73 @@ struct CompactNextHops {
 #[derive(Debug, Default)]
 struct NextHopCache {
     by_source: StdMutex<BTreeMap<usize, Arc<Vec<Option<CompactNextHops>>>>>,
+}
+
+#[derive(Debug)]
+struct SourcePathCache {
+    by_source: Vec<OnceLock<Arc<CachedSourcePaths>>>,
+    #[cfg(test)]
+    source_build_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pair_build_count: std::sync::atomic::AtomicUsize,
+}
+
+impl SourcePathCache {
+    fn new(node_count: usize) -> Self {
+        Self {
+            by_source: std::iter::repeat_with(OnceLock::new)
+                .take(node_count)
+                .collect(),
+            #[cfg(test)]
+            source_build_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            pair_build_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedSourcePaths {
+    predecessors: Box<[Option<usize>]>,
+    by_destination: Vec<OnceLock<Option<IndexedTopologyPaths>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedTopologyPaths {
+    primary: Box<[usize]>,
+    secondary: Option<IndexedSecondaryPath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedSecondaryPath {
+    kind: SecondaryPathKind,
+    nodes: Box<[usize]>,
+}
+
+impl IndexedTopologyPaths {
+    fn from_paths(paths: TopologyPaths, node_indexes: &BTreeMap<NodeId, usize>) -> Option<Self> {
+        let primary = index_path(&paths.primary, node_indexes)?;
+        let secondary = match paths.secondary {
+            Some(secondary) => Some(IndexedSecondaryPath {
+                kind: secondary.kind,
+                nodes: index_path(&secondary.nodes, node_indexes)?,
+            }),
+            None => None,
+        };
+        Some(Self { primary, secondary })
+    }
+
+    fn materialize(&self, node_ids: &[NodeId]) -> Option<TopologyPaths> {
+        let primary = materialize_indexed_path(&self.primary, node_ids)?;
+        let secondary = match self.secondary.as_ref() {
+            Some(secondary) => Some(SecondaryPath {
+                kind: secondary.kind,
+                nodes: materialize_indexed_path(&secondary.nodes, node_ids)?,
+            }),
+            None => None,
+        };
+        Some(TopologyPaths { primary, secondary })
+    }
 }
 
 pub(crate) struct TopologyNextHopTable<'a> {
@@ -387,6 +455,7 @@ impl BoundedTopology {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let routing_node_count = routing_node_ids.len();
 
         Ok(Self {
             topology_epoch,
@@ -401,6 +470,7 @@ impl BoundedTopology {
             routing_node_indexes,
             indexed_adjacency,
             next_hop_cache: Arc::new(NextHopCache::default()),
+            path_cache: Arc::new(SourcePathCache::new(routing_node_count)),
         })
     }
 
@@ -484,12 +554,40 @@ impl BoundedTopology {
     }
 
     pub fn paths(&self, source: &NodeId, destination: &NodeId) -> Option<TopologyPaths> {
+        let source_index = *self.routing_node_indexes.get(source)?;
+        let destination_index = *self.routing_node_indexes.get(destination)?;
+        let source_paths = self.cached_paths_from(source_index)?;
+        source_paths
+            .by_destination
+            .get(destination_index)?
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.path_cache
+                    .pair_build_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.compute_pair_paths(source_index, destination_index, &source_paths.predecessors)
+            })
+            .as_ref()?
+            .materialize(&self.routing_node_ids)
+    }
+
+    #[cfg(test)]
+    fn uncached_paths(&self, source: &NodeId, destination: &NodeId) -> Option<TopologyPaths> {
         let primary = self.shortest_path(source, destination)?;
+        Some(self.paths_from_primary(source, destination, primary))
+    }
+
+    fn paths_from_primary(
+        &self,
+        source: &NodeId,
+        destination: &NodeId,
+        primary: Vec<NodeId>,
+    ) -> TopologyPaths {
         if source == destination {
-            return Some(TopologyPaths {
+            return TopologyPaths {
                 primary,
                 secondary: None,
-            });
+            };
         }
 
         let secondary = self.secondary_path(source, destination, &primary);
@@ -497,21 +595,85 @@ impl BoundedTopology {
             .as_ref()
             .is_some_and(|path| path.kind == SecondaryPathKind::VertexDisjoint)
         {
-            return Some(TopologyPaths { primary, secondary });
+            return TopologyPaths { primary, secondary };
         }
         if let Some((primary, secondary)) =
             two_internally_vertex_disjoint_paths(&self.adjacency, source, destination)
         {
-            return Some(TopologyPaths {
+            return TopologyPaths {
                 primary,
                 secondary: Some(SecondaryPath {
                     kind: SecondaryPathKind::VertexDisjoint,
                     nodes: secondary,
                 }),
-            });
+            };
         }
 
-        Some(TopologyPaths { primary, secondary })
+        TopologyPaths { primary, secondary }
+    }
+
+    fn cached_paths_from(&self, source_index: usize) -> Option<Arc<CachedSourcePaths>> {
+        let slot = self.path_cache.by_source.get(source_index)?;
+        Some(
+            slot.get_or_init(|| {
+                #[cfg(test)]
+                self.path_cache
+                    .source_build_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Arc::new(self.compute_paths_from(source_index))
+            })
+            .clone(),
+        )
+    }
+
+    fn compute_paths_from(&self, source_index: usize) -> CachedSourcePaths {
+        let predecessors = self
+            .indexed_shortest_path_predecessors(source_index)
+            .unwrap_or_default()
+            .into_boxed_slice();
+        let by_destination = std::iter::repeat_with(OnceLock::new)
+            .take(self.routing_node_ids.len())
+            .collect();
+        CachedSourcePaths {
+            predecessors,
+            by_destination,
+        }
+    }
+
+    fn compute_pair_paths(
+        &self,
+        source_index: usize,
+        destination_index: usize,
+        predecessors: &[Option<usize>],
+    ) -> Option<IndexedTopologyPaths> {
+        let source = self.routing_node_ids.get(source_index)?;
+        let destination = self.routing_node_ids.get(destination_index)?;
+        let primary = reconstruct_indexed_path(source_index, destination_index, predecessors)?;
+        let primary = materialize_indexed_path(&primary, &self.routing_node_ids)?;
+        IndexedTopologyPaths::from_paths(
+            self.paths_from_primary(source, destination, primary),
+            &self.routing_node_indexes,
+        )
+    }
+
+    fn indexed_shortest_path_predecessors(
+        &self,
+        source_index: usize,
+    ) -> Option<Vec<Option<usize>>> {
+        self.indexed_adjacency.get(source_index)?;
+        let mut predecessors = vec![None; self.indexed_adjacency.len()];
+        predecessors[source_index] = Some(source_index);
+        let mut queue = VecDeque::from([source_index]);
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in &self.indexed_adjacency[current] {
+                if predecessors[neighbor].is_some() {
+                    continue;
+                }
+                predecessors[neighbor] = Some(current);
+                queue.push_back(neighbor);
+            }
+        }
+        Some(predecessors)
     }
 
     fn secondary_path(
@@ -713,6 +875,50 @@ impl BoundedTopology {
             .by_source
             .lock()
             .map(|cache| cache.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn cached_path_source_count(&self) -> usize {
+        self.path_cache
+            .by_source
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .count()
+    }
+
+    #[cfg(test)]
+    fn path_cache_slot_count(&self) -> usize {
+        self.path_cache.by_source.len()
+    }
+
+    #[cfg(test)]
+    fn path_cache_build_count(&self) -> usize {
+        self.path_cache
+            .source_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn path_cache_pair_build_count(&self) -> usize {
+        self.path_cache
+            .pair_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn cached_path_destination_count(&self, source: &NodeId) -> usize {
+        self.routing_node_indexes
+            .get(source)
+            .and_then(|source_index| self.path_cache.by_source.get(*source_index))
+            .and_then(OnceLock::get)
+            .map(|source_paths| {
+                source_paths
+                    .by_destination
+                    .iter()
+                    .filter(|slot| slot.get().is_some())
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -1398,6 +1604,34 @@ fn reconstruct_path(
     Some(reversed)
 }
 
+fn index_path(path: &[NodeId], node_indexes: &BTreeMap<NodeId, usize>) -> Option<Box<[usize]>> {
+    path.iter()
+        .map(|node_id| node_indexes.get(node_id).copied())
+        .collect::<Option<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn materialize_indexed_path(path: &[usize], node_ids: &[NodeId]) -> Option<Vec<NodeId>> {
+    path.iter()
+        .map(|index| node_ids.get(*index).cloned())
+        .collect()
+}
+
+fn reconstruct_indexed_path(
+    source_index: usize,
+    destination_index: usize,
+    predecessors: &[Option<usize>],
+) -> Option<Vec<usize>> {
+    let mut reversed = vec![destination_index];
+    let mut cursor = destination_index;
+    while cursor != source_index {
+        cursor = predecessors.get(cursor).copied().flatten()?;
+        reversed.push(cursor);
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
 #[derive(Debug, Clone)]
 struct ResidualEdge {
     to: usize,
@@ -1581,7 +1815,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
 
     use chrono::Utc;
     use ipars_types::{ClusterId, Role, TokenPolicy, VpnIp};
@@ -2141,6 +2376,141 @@ mod tests {
     }
 
     #[test]
+    fn thousand_node_same_source_queries_build_only_requested_pairs() {
+        let nodes = records(1_000);
+        let topology = Arc::new(topology(&nodes, 4));
+        let source = Arc::new(nodes[17].node_id.clone());
+        let sampled_destinations = [999, 111, 444, 777]
+            .into_iter()
+            .map(|destination_index| {
+                (
+                    destination_index,
+                    topology
+                        .uncached_paths(source.as_ref(), &nodes[destination_index].node_id)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{} must reach {}",
+                                source.as_ref(),
+                                nodes[destination_index].node_id
+                            )
+                        }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(topology.path_cache_slot_count(), nodes.len());
+        assert_eq!(topology.cached_path_source_count(), 0);
+        assert_eq!(topology.path_cache_build_count(), 0);
+        assert_eq!(topology.path_cache_pair_build_count(), 0);
+        assert_eq!(topology.cached_path_destination_count(source.as_ref()), 0);
+
+        let worker_count = 32;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let first_destination_index = sampled_destinations[0].0;
+        let first_lookup_started = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let topology = Arc::clone(&topology);
+                let source = Arc::clone(&source);
+                let barrier = Arc::clone(&barrier);
+                let nodes = &nodes;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let destination = &nodes[first_destination_index].node_id;
+                    let paths = topology
+                        .paths(source.as_ref(), destination)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{} must reach {destination} through the cached topology",
+                                source.as_ref()
+                            )
+                        });
+                    assert_eq!(paths.primary.first(), Some(source.as_ref()));
+                    assert_eq!(paths.primary.last(), Some(destination));
+                });
+            }
+        });
+        let first_lookup_elapsed = first_lookup_started.elapsed();
+
+        assert_eq!(topology.cached_path_source_count(), 1);
+        assert_eq!(topology.path_cache_build_count(), 1);
+        assert_eq!(topology.path_cache_pair_build_count(), 1);
+        assert_eq!(topology.cached_path_destination_count(source.as_ref()), 1);
+        assert!(
+            first_lookup_elapsed < Duration::from_secs(5),
+            "one 1,000-node source/pair build took {first_lookup_elapsed:?}"
+        );
+
+        let additional_lookup_started = Instant::now();
+        for (destination_index, expected) in &sampled_destinations {
+            let actual = topology
+                .paths(source.as_ref(), &nodes[*destination_index].node_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} must reach {}",
+                        source.as_ref(),
+                        nodes[*destination_index].node_id
+                    )
+                });
+            assert_eq!(&actual, expected);
+            let secondary = actual.secondary.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "{} to {} must retain a secondary path",
+                    source.as_ref(),
+                    nodes[*destination_index].node_id
+                )
+            });
+            assert_eq!(secondary.kind, SecondaryPathKind::VertexDisjoint);
+            let primary_internal = actual
+                .primary
+                .iter()
+                .skip(1)
+                .take(actual.primary.len().saturating_sub(2))
+                .collect::<BTreeSet<_>>();
+            let secondary_internal = secondary
+                .nodes
+                .iter()
+                .skip(1)
+                .take(secondary.nodes.len().saturating_sub(2))
+                .collect::<BTreeSet<_>>();
+            assert!(primary_internal.is_disjoint(&secondary_internal));
+        }
+        let additional_lookup_elapsed = additional_lookup_started.elapsed();
+        assert!(
+            additional_lookup_elapsed < Duration::from_secs(5),
+            "four 1,000-node source/pair lookups took {additional_lookup_elapsed:?}"
+        );
+        assert_eq!(
+            topology.path_cache_pair_build_count(),
+            sampled_destinations.len()
+        );
+        assert_eq!(
+            topology.cached_path_destination_count(source.as_ref()),
+            sampled_destinations.len()
+        );
+
+        for _ in 0..1_000 {
+            for (destination_index, expected) in &sampled_destinations {
+                assert_eq!(
+                    topology.paths(source.as_ref(), &nodes[*destination_index].node_id),
+                    Some(expected.clone())
+                );
+            }
+        }
+        assert_eq!(topology.path_cache_build_count(), 1);
+        assert_eq!(
+            topology.path_cache_pair_build_count(),
+            sampled_destinations.len()
+        );
+        for (destination_index, expected) in sampled_destinations {
+            assert_eq!(
+                topology.paths(source.as_ref(), &nodes[destination_index].node_id),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn alternate_next_hops_survive_primary_neighbor_failure_for_every_pair() {
         let nodes = records(64);
         let topology = topology(&nodes, 4);
@@ -2241,11 +2611,21 @@ mod tests {
         let topology = topology(&nodes, 4);
         for (source_index, source) in nodes.iter().enumerate() {
             for destination in nodes.iter().skip(source_index + 1) {
+                let expected = topology
+                    .uncached_paths(&source.node_id, &destination.node_id)
+                    .unwrap_or_else(|| {
+                        panic!("{} must reach {}", source.node_id, destination.node_id)
+                    });
                 let paths = topology
                     .paths(&source.node_id, &destination.node_id)
                     .unwrap_or_else(|| {
                         panic!("{} must reach {}", source.node_id, destination.node_id)
                     });
+                assert_eq!(
+                    paths, expected,
+                    "cached path selection changed for {} to {}",
+                    source.node_id, destination.node_id
+                );
                 let secondary = paths.secondary.unwrap_or_else(|| {
                     panic!(
                         "{} to {} has no secondary path; primary={:?}",

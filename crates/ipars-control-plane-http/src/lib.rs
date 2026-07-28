@@ -5299,7 +5299,10 @@ impl IntoResponse for ApiError {
             }
             ControlPlaneError::NodeSignatureRequired(_)
             | ControlPlaneError::NodeSignatureRejected { .. } => StatusCode::UNAUTHORIZED,
-            ControlPlaneError::NodeRequestReplay(_) => StatusCode::CONFLICT,
+            ControlPlaneError::NodeRequestReplay(_)
+            | ControlPlaneError::ClusterPolicyChanged
+            | ControlPlaneError::OverlayRouteCatalogChanged
+            | ControlPlaneError::NodeStateChanged(_) => StatusCode::CONFLICT,
             ControlPlaneError::NodeRequestAuthenticationCapacity => StatusCode::SERVICE_UNAVAILABLE,
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_)

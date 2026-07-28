@@ -545,6 +545,40 @@ direct bounded-overlay degree. Client-to-gateway sessions are separate, and
 non-neighbor Kubernetes PodCIDR owners stay passive until traffic resolves a
 path through the hierarchy.
 
+For clusters with many advertised routes, set
+`ClusterPolicy.overlay_route_scopes` to the stable PodCIDR allocation ranges.
+The list is limited to 64 canonical, non-overlapping CIDRs. Scopes must not
+overlap the VPN pool or restricted address ranges, and every existing and
+future advertised route must be fully contained by one scope. Preserve the
+rest of the policy while setting the scopes:
+
+```bash
+curl -fsS \
+  -H 'Authorization: Bearer <operator-token>' \
+  "${CONTROL_PLANE}/v1/admin/policy" |
+  jq '.cluster_policy.overlay_route_scopes = ["10.244.0.0/16"] | {cluster_policy}' |
+  curl -fsS -X PUT \
+    -H 'Authorization: Bearer <operator-token>' \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    "${CONTROL_PLANE}/v1/admin/policy"
+```
+
+An empty list uses exact automatic aggregation. A registration or heartbeat
+that would produce more than 64 scopes is rejected atomically; defensive
+neighbor-map generation also fails if the store already contains such state.
+The Control Plane does not route across holes by widening the result. Scopes
+only trigger packet capture.
+The destination owner is selected on demand from the exact longest-prefix
+route index and remains subject to destination-specific ACL checks. Each Agent
+keeps no more than 4,096 resolved peer paths and 4,096 exact route leases, with
+at most 256 routes per owner and least-recently-used unpinned entries evicted
+as new demand arrives. Node identity, route, and policy changes atomically
+advance a shared monotonic routing epoch and immediately discard existing route
+leases on every Agent that receives the new map. Active-active policy and route
+writes use transactional compare-and-swap guards; a concurrent stale write
+returns HTTP `409` and is retried by normal Agent control loops.
+
 The accepted policy is persisted under the cluster ID in the Control Plane
 store. Active-active replicas sharing the same SQLite database or PostgreSQL
 deployment refresh that record before serving policy-dependent responses, and
