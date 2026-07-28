@@ -47,7 +47,11 @@ pub struct RelaySessionId(String);
 
 impl RelaySessionId {
     pub fn new(left: &NodeId, right: &NodeId) -> Self {
-        Self(format!("{left}:{right}"))
+        if left <= right {
+            Self(format!("{left}:{right}"))
+        } else {
+            Self(format!("{right}:{left}"))
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -1188,6 +1192,17 @@ mod tests {
     }
 
     #[test]
+    fn relay_session_id_is_direction_independent() {
+        let left = NodeId::from_string("node-a");
+        let right = NodeId::from_string("node-b");
+
+        assert_eq!(
+            RelaySessionId::new(&left, &right),
+            RelaySessionId::new(&right, &left)
+        );
+    }
+
+    #[test]
     fn relay_forwards_only_known_opaque_session_payloads() -> Result<(), RelayError> {
         let mut table = RelayTable::default();
         let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
@@ -2079,6 +2094,36 @@ mod tests {
                 .get(&RelayAdmissionFailureReason::AdmissionDenied),
             Some(&1)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_relay_allows_reverse_endpoint_to_join_existing_pair(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        capability.max_sessions = 1;
+        let service = RelayService::new(NodeId::from_string("relay"), capability);
+        let first = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("node-a"),
+                right: NodeId::from_string("node-b"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await?;
+
+        let reverse = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("node-b"),
+                right: NodeId::from_string("node-a"),
+                left_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+            })
+            .await?;
+
+        assert_eq!(reverse.session_id, first.session_id);
+        assert_eq!(reverse.session_token, first.session_token);
+        assert_eq!(service.status().await.capability.active_sessions, 1);
         Ok(())
     }
 

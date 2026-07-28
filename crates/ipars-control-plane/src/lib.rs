@@ -4585,7 +4585,7 @@ fn relay_candidate_allowed(
 ) -> bool {
     node.relay_capability
         .as_ref()
-        .is_some_and(|capability| capability.can_admit())
+        .is_some_and(|capability| capability.is_eligible_relay())
         && relay_health_allows(health, now, policy.relay_health_ttl_seconds)
 }
 

@@ -9,11 +9,11 @@ use ipars_types::api::{
     SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
 };
 use ipars_types::{
-    endpoint_addr_is_usable, private_ip_addrs_share_subnet, socket_addr_is_globally_routable,
-    AclAction, AclRule, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, HealthState,
-    NatClassification, NatMappingBehavior, NatTraversalStrategy, NodeHealth, NodeId, NodeRecord,
-    PathMetrics, PathQualityObservation, PathScore, PathState, PeerPathKey, Route,
-    TransportProtocol,
+    endpoint_addr_is_usable, private_ip_addrs_share_subnet, relay_pair_rendezvous_ordering,
+    socket_addr_is_globally_routable, AclAction, AclRule, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, HealthState, NatClassification, NatMappingBehavior,
+    NatTraversalStrategy, NodeHealth, NodeId, NodeRecord, PathMetrics, PathQualityObservation,
+    PathScore, PathState, PeerPathKey, Route, TransportProtocol,
 };
 use ipnet::IpNet;
 use thiserror::Error;
@@ -286,7 +286,8 @@ impl SignalRegistry {
             .await
             .into_iter()
             .filter(|relay| {
-                let allowed = acl_allows_peer(&source_node, relay, &self.coordinator.policy);
+                let allowed = acl_allows_peer(&source_node, relay, &self.coordinator.policy)
+                    && acl_allows_peer(&target, relay, &self.coordinator.policy);
                 if !allowed {
                     relay_acl_denials += 1;
                 }
@@ -648,7 +649,7 @@ fn normalize_relay_capability(node: &mut NodeRecord) {
     if node
         .relay_capability
         .as_ref()
-        .is_some_and(|capability| capability.can_admit())
+        .is_some_and(|capability| capability.is_eligible_relay())
     {
         return;
     }
@@ -734,12 +735,19 @@ impl SignalCoordinator {
                 relay
                     .relay_capability
                     .as_ref()
-                    .map(|capability| capability.can_admit())
+                    .map(|capability| capability.is_eligible_relay())
                     .unwrap_or(false)
             })
             .cloned()
             .collect::<Vec<_>>();
-        relay_candidates.sort_by(compare_relay_candidates);
+        relay_candidates.sort_by(|left, right| {
+            relay_pair_rendezvous_ordering(
+                &request.source,
+                &request.target,
+                &left.node_id,
+                &right.node_id,
+            )
+        });
 
         let usable_state = if preferred_state == PathState::Unreachable
             && self.policy.allow_relay_fallback
@@ -749,15 +757,6 @@ impl SignalCoordinator {
         } else {
             preferred_state
         };
-
-        if usable_state == PathState::Relay {
-            prioritize_observed_relay(
-                &mut relay_candidates,
-                path_observation,
-                now,
-                self.policy.path_quality_observation_ttl_seconds,
-            );
-        }
 
         let mut metrics = matching_path_observation_metrics(
             usable_state,
@@ -1080,30 +1079,6 @@ fn path_quality_observation_is_fresh(
         .to_std()
         .map(|age| age <= Duration::from_secs(ttl_seconds))
         .unwrap_or(true)
-}
-
-fn prioritize_observed_relay(
-    relay_candidates: &mut Vec<NodeRecord>,
-    observation: Option<&PathQualityObservation>,
-    now: chrono::DateTime<Utc>,
-    ttl_seconds: u64,
-) {
-    let Some(observation) = observation.filter(|observation| {
-        observation.selected_state == PathState::Relay
-            && path_quality_observation_is_fresh(observation, now, ttl_seconds)
-    }) else {
-        return;
-    };
-    let Some(relay_node) = observation.relay_node.as_ref() else {
-        return;
-    };
-    if let Some(index) = relay_candidates
-        .iter()
-        .position(|relay| relay.node_id == *relay_node)
-    {
-        let relay = relay_candidates.remove(index);
-        relay_candidates.insert(0, relay);
-    }
 }
 
 fn matching_path_observation_metrics(
@@ -1793,7 +1768,7 @@ fn relay_candidate_allowed(
 ) -> bool {
     node.relay_capability
         .as_ref()
-        .is_some_and(|capability| capability.can_admit())
+        .is_some_and(|capability| capability.is_eligible_relay())
         && relay_health_allows(health, now, policy.relay_health_ttl_seconds)
 }
 
@@ -1809,38 +1784,6 @@ fn relay_health_allows(
         return false;
     }
     health_report_is_fresh(health, now, ttl_seconds)
-}
-
-fn compare_relay_candidates(left: &NodeRecord, right: &NodeRecord) -> std::cmp::Ordering {
-    match (
-        left.relay_capability.as_ref(),
-        right.relay_capability.as_ref(),
-    ) {
-        (Some(left_capability), Some(right_capability)) => {
-            compare_relay_load(left_capability, right_capability)
-                .then_with(|| {
-                    right_capability
-                        .available_capacity()
-                        .cmp(&left_capability.available_capacity())
-                })
-                .then_with(|| right_capability.max_mbps.cmp(&left_capability.max_mbps))
-                .then_with(|| left.node_id.cmp(&right.node_id))
-        }
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => left.node_id.cmp(&right.node_id),
-    }
-}
-
-fn compare_relay_load(
-    left: &ipars_types::RelayCapability,
-    right: &ipars_types::RelayCapability,
-) -> std::cmp::Ordering {
-    let left_denominator = left.max_sessions.max(1) as u64;
-    let right_denominator = right.max_sessions.max(1) as u64;
-    let left_scaled = left.active_sessions as u64 * right_denominator;
-    let right_scaled = right.active_sessions as u64 * left_denominator;
-    left_scaled.cmp(&right_scaled)
 }
 
 fn path_candidate_cost(
@@ -2736,9 +2679,9 @@ mod tests {
     }
 
     #[test]
-    fn relay_candidates_are_sorted_by_load_capacity_and_bandwidth() {
+    fn relay_candidates_use_direction_independent_pair_rendezvous_order() {
         let coordinator = SignalCoordinator::new(ClusterPolicy::default());
-        let response = coordinator.negotiate(
+        let forward = coordinator.negotiate(
             SignalPathRequest {
                 source: NodeId::from_string("node-a"),
                 target: NodeId::from_string("node-b"),
@@ -2755,26 +2698,43 @@ mod tests {
                 relay_with_capacity("relay-more-bandwidth", 10, 1, 2_000),
             ],
         );
+        let reverse = coordinator.negotiate(
+            SignalPathRequest {
+                source: NodeId::from_string("node-b"),
+                target: NodeId::from_string("node-a"),
+                source_candidates: Vec::new(),
+                source_nat_classification: None,
+                desired_routes: Vec::new(),
+            },
+            &source(Vec::new()),
+            None,
+            &[
+                relay_with_capacity("relay-more-bandwidth", 10, 9, 2_000),
+                relay_with_capacity("relay-more-capacity", 20, 19, 500),
+                relay_with_capacity("relay-less-bandwidth", 10, 8, 1_000),
+                relay_with_capacity("relay-busy", 10, 1, 10_000),
+            ],
+        );
 
-        assert_eq!(response.preferred_state, PathState::Relay);
+        assert_eq!(forward.preferred_state, PathState::Relay);
+        assert_eq!(reverse.preferred_state, PathState::Relay);
         assert_eq!(
-            response
+            forward
                 .relay_candidates
                 .iter()
                 .map(|relay| relay.node_id.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "relay-more-capacity",
-                "relay-more-bandwidth",
-                "relay-less-bandwidth",
-                "relay-busy",
-            ]
+            reverse
+                .relay_candidates
+                .iter()
+                .map(|relay| relay.node_id.as_str())
+                .collect::<Vec<_>>()
         );
-        assert!(response
+        assert!(forward
             .score
             .reasons
             .iter()
-            .any(|reason| reason == "relay_load=0.10"));
+            .any(|reason| reason.starts_with("relay_load=")));
     }
 
     #[tokio::test]
@@ -3063,6 +3023,57 @@ mod tests {
         );
         let metrics = registry.metrics().await;
         assert_eq!(metrics.relay_candidate_acl_denied_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_requires_relay_acl_for_both_path_endpoints() -> Result<(), SignalError> {
+        let endpoint_tag = Tag::from_string("relay-denied");
+        let relay_tag = Tag::from_string("relay");
+        let policy = ClusterPolicy {
+            acl_rules: vec![
+                AclRule {
+                    id: "deny-endpoint-to-relay".to_string(),
+                    from_roles: BTreeSet::new(),
+                    from_tags: BTreeSet::from([endpoint_tag.clone()]),
+                    to_roles: BTreeSet::new(),
+                    to_tags: BTreeSet::from([relay_tag.clone()]),
+                    routes: Vec::new(),
+                    protocol: TransportProtocol::Any,
+                    action: AclAction::Deny,
+                },
+                allow_peer_acl("allow-rest"),
+            ],
+            ..ClusterPolicy::default()
+        };
+        let registry = SignalRegistry::new(policy);
+        let source = source(Vec::new());
+        let mut target = target(Vec::new());
+        target.tags.insert(endpoint_tag);
+        let mut relay = relay();
+        relay.tags.insert(relay_tag);
+        registry.upsert_node(source.clone()).await?;
+        registry.upsert_node(target.clone()).await?;
+        registry
+            .upsert_node_with_nat_and_health(relay, None, Some(healthy_health()))
+            .await?;
+
+        for (left, right) in [
+            (source.node_id.clone(), target.node_id.clone()),
+            (target.node_id.clone(), source.node_id.clone()),
+        ] {
+            let response = registry
+                .negotiate(SignalPathRequest {
+                    source: left,
+                    target: right,
+                    source_candidates: Vec::new(),
+                    source_nat_classification: None,
+                    desired_routes: Vec::new(),
+                })
+                .await?;
+            assert_eq!(response.preferred_state, PathState::Unreachable);
+            assert!(response.relay_candidates.is_empty());
+        }
         Ok(())
     }
 
@@ -3396,8 +3407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_clears_non_admissible_relay_capability_on_upsert() -> Result<(), SignalError>
-    {
+    async fn registry_clears_ineligible_relay_capability_on_upsert() -> Result<(), SignalError> {
         let registry = SignalRegistry::new(ClusterPolicy::default());
         let mut invalid_capabilities = Vec::new();
 
@@ -3420,10 +3430,6 @@ mod tests {
         let mut invalid_admission_url = relay_capability();
         invalid_admission_url.admission_url = Some("udp://203.0.113.20:9580".to_string());
         invalid_capabilities.push(invalid_admission_url);
-
-        let mut full_capacity = relay_capability();
-        full_capacity.active_sessions = full_capacity.max_sessions;
-        invalid_capabilities.push(full_capacity);
 
         let mut zero_bandwidth = relay_capability();
         zero_bandwidth.max_mbps = 0;
@@ -3449,6 +3455,16 @@ mod tests {
             assert!(stored.relay_capability.is_none());
             assert!(registry.relay_candidates().await.is_empty());
         }
+
+        let mut full_relay = relay();
+        let mut full_capacity = relay_capability();
+        full_capacity.active_sessions = full_capacity.max_sessions;
+        full_relay.relay_capability = Some(full_capacity);
+        let response = registry
+            .upsert_node_with_nat_and_health(full_relay, None, Some(healthy_health()))
+            .await?;
+        assert!(response.node.relay_capability.is_some());
+        assert_eq!(registry.relay_candidates().await.len(), 1);
 
         Ok(())
     }

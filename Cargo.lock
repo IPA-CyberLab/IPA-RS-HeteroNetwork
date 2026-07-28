@@ -1541,6 +1541,7 @@ dependencies = [
  "ipnet",
  "serde",
  "serde_json",
+ "sha2",
  "url",
  "uuid",
 ]

@@ -7,6 +7,7 @@ use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub mod ebpf;
@@ -67,6 +68,35 @@ impl Display for NodeId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+pub fn relay_pair_rendezvous_ordering(
+    first: &NodeId,
+    second: &NodeId,
+    left_relay: &NodeId,
+    right_relay: &NodeId,
+) -> std::cmp::Ordering {
+    relay_pair_rendezvous_score(first, second, right_relay)
+        .cmp(&relay_pair_rendezvous_score(first, second, left_relay))
+        .then_with(|| left_relay.cmp(right_relay))
+}
+
+fn relay_pair_rendezvous_score(first: &NodeId, second: &NodeId, relay: &NodeId) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"heteronetwork-relay-pair-rendezvous-v1";
+
+    let (first, second) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN);
+    for node in [first, second, relay] {
+        let value = node.as_str().as_bytes();
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1176,7 +1206,7 @@ impl RelayCapability {
         self.max_sessions.saturating_sub(self.active_sessions)
     }
 
-    pub fn can_admit(&self) -> bool {
+    pub fn is_eligible_relay(&self) -> bool {
         self.enabled_by_policy
             && self.public_endpoint.is_some_and(endpoint_addr_is_usable)
             && self
@@ -1184,8 +1214,12 @@ impl RelayCapability {
                 .as_deref()
                 .is_some_and(relay_admission_url_is_usable)
             && self.e2e_only
-            && self.available_capacity() > 0
+            && self.max_sessions > 0
             && self.max_mbps > 0
+    }
+
+    pub fn can_admit(&self) -> bool {
+        self.is_eligible_relay() && self.available_capacity() > 0
     }
 }
 
@@ -19013,6 +19047,66 @@ mod tests {
     const MYSQL_CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
     const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
+    fn ranked_relays(first: &NodeId, second: &NodeId, relays: &[NodeId]) -> Vec<NodeId> {
+        let mut ranked = relays.to_vec();
+        ranked.sort_by(|left, right| relay_pair_rendezvous_ordering(first, second, left, right));
+        ranked
+    }
+
+    #[test]
+    fn relay_pair_rendezvous_order_is_direction_independent() {
+        let node_a = NodeId::from_string("node-a");
+        let node_b = NodeId::from_string("node-b");
+        let relays = (0..8)
+            .map(|index| NodeId::from_string(format!("relay-{index}")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ranked_relays(&node_a, &node_b, &relays),
+            ranked_relays(&node_b, &node_a, &relays)
+        );
+    }
+
+    #[test]
+    fn relay_pair_rendezvous_minimizes_remapping_and_distributes_pairs() {
+        let relays = (0..4)
+            .map(|index| NodeId::from_string(format!("relay-{index}")))
+            .collect::<Vec<_>>();
+        let removed = relays[1].clone();
+        let remaining = relays
+            .iter()
+            .filter(|relay| **relay != removed)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut assignments = BTreeMap::<NodeId, usize>::new();
+        let mut removed_assignments = 0usize;
+
+        for index in 0..1_000 {
+            let first = NodeId::from_string(format!("node-{index}"));
+            let second = NodeId::from_string(format!("node-{}", index + 1_000));
+            let original = ranked_relays(&first, &second, &relays);
+            let after_removal = ranked_relays(&first, &second, &remaining);
+            let Some(original_primary) = original.first() else {
+                panic!("test relay set must not be empty");
+            };
+            let Some(remaining_primary) = after_removal.first() else {
+                panic!("remaining test relay set must not be empty");
+            };
+            *assignments.entry(original_primary.clone()).or_default() += 1;
+            if original_primary == &removed {
+                removed_assignments += 1;
+            } else {
+                assert_eq!(remaining_primary, original_primary);
+            }
+        }
+
+        assert!(removed_assignments > 0);
+        assert_eq!(assignments.len(), relays.len());
+        assert!(assignments
+            .values()
+            .all(|count| (150..=350).contains(count)));
+    }
+
     #[test]
     fn cluster_policy_defaults_missing_overlay_block_size() -> Result<(), serde_json::Error> {
         let mut encoded = serde_json::to_value(ClusterPolicy::default())?;
@@ -19909,7 +20003,7 @@ mod tests {
 
     #[test]
     fn relay_requires_policy_endpoint_and_capacity() {
-        let relay = RelayCapability {
+        let mut relay = RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(std::net::SocketAddr::from(([203, 0, 113, 10], 51820))),
             admission_url: Some("http://203.0.113.10:9580".to_string()),
@@ -19919,8 +20013,13 @@ mod tests {
             e2e_only: true,
         };
 
+        assert!(relay.is_eligible_relay());
         assert!(relay.can_admit());
         assert_eq!(relay.available_capacity(), 1);
+
+        relay.active_sessions = relay.max_sessions;
+        assert!(relay.is_eligible_relay());
+        assert!(!relay.can_admit());
     }
 
     #[test]

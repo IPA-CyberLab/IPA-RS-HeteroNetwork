@@ -109,7 +109,7 @@ use ipars_types::ebpf::{
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, endpoint_addr_is_usable,
-    http_url_is_usable_endpoint, socket_addr_is_globally_routable,
+    http_url_is_usable_endpoint, relay_pair_rendezvous_ordering, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
     ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatConnectivityState,
     NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics,
@@ -12950,9 +12950,7 @@ impl RelayForwarderSupervisor {
         let existing_endpoint = {
             let handles = self.handles.lock().await;
             handles.get(&session.peer).and_then(|handle| {
-                if handle.session_id == session.session_id
-                    && handle.relay_endpoint == session.relay_endpoint
-                {
+                if handle.session == session {
                     Some(handle.local_endpoint)
                 } else {
                     None
@@ -12995,8 +12993,7 @@ impl RelayForwarderSupervisor {
         self.handles.lock().await.insert(
             session.peer.clone(),
             RelayForwarderTask {
-                session_id: session.session_id.clone(),
-                relay_endpoint: session.relay_endpoint,
+                session: session.clone(),
                 local_endpoint,
                 shutdown_tx,
                 forwarding_enabled,
@@ -13303,8 +13300,7 @@ fn control_plane_urls_for_node<'a>(
 
 #[derive(Debug)]
 struct RelayForwarderTask {
-    session_id: String,
-    relay_endpoint: SocketAddr,
+    session: RelaySessionState,
     local_endpoint: SocketAddr,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     forwarding_enabled: Arc<AtomicBool>,
@@ -15229,8 +15225,7 @@ async fn negotiate_signal_paths(
                     continue;
                 }
             };
-        let mut relay_candidates = selected_relay_candidates(&response);
-        promote_active_relay_candidate(runtime, &peer.node_id, &mut relay_candidates).await;
+        let relay_candidates = selected_relay_candidates(&response);
         let candidate_record = signal_path_record_with_local_candidates(
             response,
             chrono::Utc::now(),
@@ -16562,7 +16557,7 @@ async fn admit_relay_session_from_candidates(
         if candidate
             .relay_capability
             .as_ref()
-            .map(|capability| capability.can_admit())
+            .map(|capability| capability.is_eligible_relay())
             .unwrap_or(false)
             && !known_relay_candidates
                 .iter()
@@ -16775,53 +16770,20 @@ fn selected_relay_candidates(response: &SignalPathResponse) -> Vec<NodeRecord> {
             relay
                 .relay_capability
                 .as_ref()
-                .map(|capability| capability.can_admit())
+                .map(|capability| capability.is_eligible_relay())
                 .unwrap_or(false)
         })
         .cloned()
         .collect::<Vec<_>>();
-    candidates.sort_by(relay_candidate_ordering);
+    candidates.sort_by(|left, right| {
+        relay_pair_rendezvous_ordering(
+            &response.key.local,
+            &response.key.remote,
+            &left.node_id,
+            &right.node_id,
+        )
+    });
     candidates
-}
-
-fn relay_candidate_ordering(left: &NodeRecord, right: &NodeRecord) -> std::cmp::Ordering {
-    match (
-        left.relay_capability.as_ref(),
-        right.relay_capability.as_ref(),
-    ) {
-        (Some(left), Some(right)) => relay_utilization_ordering(left, right)
-            .then_with(|| right.available_capacity().cmp(&left.available_capacity()))
-            .then_with(|| right.max_mbps.cmp(&left.max_mbps))
-            .then_with(|| left.active_sessions.cmp(&right.active_sessions)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    }
-}
-
-fn relay_utilization_ordering(
-    left: &RelayCapability,
-    right: &RelayCapability,
-) -> std::cmp::Ordering {
-    let left_numerator = u64::from(left.active_sessions) * u64::from(right.max_sessions);
-    let right_numerator = u64::from(right.active_sessions) * u64::from(left.max_sessions);
-    left_numerator.cmp(&right_numerator)
-}
-
-async fn promote_active_relay_candidate(
-    runtime: &AgentRuntime,
-    peer: &NodeId,
-    candidates: &mut Vec<NodeRecord>,
-) -> Option<NodeId> {
-    let session = active_relay_session(runtime, peer).await?;
-    let position = candidates
-        .iter()
-        .position(|relay| relay.node_id == session.relay_node)?;
-    if position > 0 {
-        let relay = candidates.remove(position);
-        candidates.insert(0, relay);
-    }
-    Some(session.relay_node)
 }
 
 fn unreachable_path_record(
@@ -23845,8 +23807,16 @@ mod tests {
         supervisor.handles.lock().await.insert(
             peer.clone(),
             RelayForwarderTask {
-                session_id: session_id.to_string(),
-                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                session: RelaySessionState {
+                    peer: peer.clone(),
+                    relay_node: NodeId::from_string("relay-a"),
+                    relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                    admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+                    admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+                    session_id: session_id.to_string(),
+                    session_token: "token-dead".to_string(),
+                    expires_at: Utc::now() + ChronoDuration::minutes(5),
+                },
                 local_endpoint,
                 shutdown_tx,
                 forwarding_enabled: Arc::new(AtomicBool::new(true)),
@@ -31751,6 +31721,49 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn relay_forwarder_supervisor_applies_renewed_session_expiry() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 1,
+            restart_backoff: Duration::ZERO,
+            crash_policy: test_crash_policy(),
+        });
+        let peer = NodeId::from_string("peer-renewed");
+        let session = RelaySessionState {
+            peer: peer.clone(),
+            relay_node: NodeId::from_string("relay-a"),
+            relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+            session_id: "session-renewed".to_string(),
+            session_token: "token-renewed".to_string(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        };
+        supervisor.upsert(&runtime, session.clone()).await?;
+        let renewed = RelaySessionState {
+            expires_at: session.expires_at + ChronoDuration::minutes(5),
+            ..session
+        };
+
+        supervisor.upsert(&runtime, renewed.clone()).await?;
+
+        let handles = supervisor.handles.lock().await;
+        let active = handles
+            .get(&peer)
+            .context("renewed relay forwarder should exist")?;
+        assert_eq!(active.session, renewed);
+        drop(handles);
+        supervisor.shutdown_all(&runtime).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_probe_timeout_restores_relay_forwarding_before_retry() -> anyhow::Result<()> {
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
@@ -31861,8 +31874,16 @@ exec sleep 60
         supervisor.handles.lock().await.insert(
             peer.clone(),
             RelayForwarderTask {
-                session_id: "session-dead".to_string(),
-                relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                session: RelaySessionState {
+                    peer: peer.clone(),
+                    relay_node: NodeId::from_string("relay-a"),
+                    relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+                    admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+                    admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+                    session_id: "session-dead".to_string(),
+                    session_token: "token-dead".to_string(),
+                    expires_at: Utc::now() + ChronoDuration::minutes(5),
+                },
                 local_endpoint,
                 shutdown_tx,
                 forwarding_enabled: Arc::new(AtomicBool::new(true)),
@@ -35973,9 +35994,9 @@ exec sleep 60
     }
 
     #[test]
-    fn selected_relay_candidates_prefer_capacity_tie_breaker() {
-        let mut low_bandwidth = node_record("relay-low");
-        low_bandwidth.relay_capability = Some(RelayCapability {
+    fn selected_relay_candidates_are_direction_independent_and_load_stable() {
+        let mut relay_a = node_record("relay-a");
+        relay_a.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
             admission_url: Some("http://203.0.113.31:9580".to_string()),
@@ -35984,20 +36005,36 @@ exec sleep 60
             max_mbps: 100,
             e2e_only: true,
         });
-        let mut high_bandwidth = node_record("relay-high");
-        high_bandwidth.relay_capability = Some(RelayCapability {
+        let mut relay_b = node_record("relay-b");
+        relay_b.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
             admission_url: Some("http://203.0.113.32:9580".to_string()),
             max_sessions: 100,
-            active_sessions: 1,
+            active_sessions: 90,
             max_mbps: 1000,
             e2e_only: true,
         });
-        let response = SignalPathResponse {
+        let forward = SignalPathResponse {
             key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
             target_candidates: Vec::new(),
-            relay_candidates: vec![low_bandwidth, high_bandwidth],
+            relay_candidates: vec![relay_a.clone(), relay_b.clone()],
+            preferred_state: PathState::Relay,
+            score: PathScore {
+                value: 70.0,
+                reasons: Vec::new(),
+            },
+        };
+        if let Some(capability) = relay_a.relay_capability.as_mut() {
+            capability.active_sessions = 99;
+        }
+        if let Some(capability) = relay_b.relay_capability.as_mut() {
+            capability.active_sessions = 0;
+        }
+        let reverse = SignalPathResponse {
+            key: PeerPathKey::new(NodeId::from_string("peer-a"), NodeId::from_string("local")),
+            target_candidates: Vec::new(),
+            relay_candidates: vec![relay_b, relay_a],
             preferred_state: PathState::Relay,
             score: PathScore {
                 value: 70.0,
@@ -36005,40 +36042,44 @@ exec sleep 60
             },
         };
 
-        let selected = selected_relay_candidates(&response).into_iter().next();
+        let forward = selected_relay_candidates(&forward)
+            .into_iter()
+            .map(|relay| relay.node_id)
+            .collect::<Vec<_>>();
+        let reverse = selected_relay_candidates(&reverse)
+            .into_iter()
+            .map(|relay| relay.node_id)
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            selected.map(|relay| relay.node_id),
-            Some(NodeId::from_string("relay-high"))
-        );
+        assert_eq!(forward, reverse);
     }
 
     #[test]
-    fn selected_relay_candidates_prefer_lower_utilization_over_raw_session_count() {
-        let mut nearly_full_small = node_record("relay-nearly-full-small");
-        nearly_full_small.relay_capability = Some(RelayCapability {
+    fn selected_relay_candidates_keep_full_relays_for_existing_pairs() {
+        let mut full = node_record("relay-full");
+        full.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
             admission_url: Some("http://203.0.113.31:9580".to_string()),
             max_sessions: 10,
-            active_sessions: 9,
+            active_sessions: 10,
             max_mbps: 1000,
             e2e_only: true,
         });
-        let mut lightly_loaded_large = node_record("relay-lightly-loaded-large");
-        lightly_loaded_large.relay_capability = Some(RelayCapability {
-            enabled_by_policy: true,
+        let mut disabled = node_record("relay-disabled");
+        disabled.relay_capability = Some(RelayCapability {
+            enabled_by_policy: false,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
             admission_url: Some("http://203.0.113.32:9580".to_string()),
             max_sessions: 1000,
-            active_sessions: 20,
+            active_sessions: 0,
             max_mbps: 1000,
             e2e_only: true,
         });
         let response = SignalPathResponse {
             key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
             target_candidates: Vec::new(),
-            relay_candidates: vec![nearly_full_small, lightly_loaded_large],
+            relay_candidates: vec![full, disabled],
             preferred_state: PathState::Relay,
             score: PathScore {
                 value: 70.0,
@@ -36046,12 +36087,9 @@ exec sleep 60
             },
         };
 
-        let selected = selected_relay_candidates(&response).into_iter().next();
-
-        assert_eq!(
-            selected.map(|relay| relay.node_id),
-            Some(NodeId::from_string("relay-lightly-loaded-large"))
-        );
+        let selected = selected_relay_candidates(&response);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].node_id, NodeId::from_string("relay-full"));
     }
 
     #[test]
@@ -36088,9 +36126,9 @@ exec sleep 60
     }
 
     #[tokio::test]
-    async fn active_relay_candidate_is_promoted_for_path_stability() {
-        let mut low_load = node_record("relay-low-load");
-        low_load.relay_capability = Some(RelayCapability {
+    async fn divergent_active_relay_migrates_to_pair_preferred_candidate() -> anyhow::Result<()> {
+        let mut relay_a = node_record("relay-a");
+        relay_a.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
             admission_url: Some("http://203.0.113.31:9580".to_string()),
@@ -36099,37 +36137,33 @@ exec sleep 60
             max_mbps: 1000,
             e2e_only: true,
         });
-        let mut current = node_record("relay-current");
-        current.relay_capability = Some(RelayCapability {
+        let mut relay_b = node_record("relay-b");
+        relay_b.relay_capability = Some(RelayCapability {
             enabled_by_policy: true,
             public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
             admission_url: Some("http://203.0.113.32:9580".to_string()),
             max_sessions: 100,
-            active_sessions: 50,
+            active_sessions: 1,
             max_mbps: 1000,
             e2e_only: true,
         });
         let response = SignalPathResponse {
             key: PeerPathKey::new(NodeId::from_string("local"), NodeId::from_string("peer-a")),
             target_candidates: Vec::new(),
-            relay_candidates: vec![current.clone(), low_load.clone()],
+            relay_candidates: vec![relay_a, relay_b],
             preferred_state: PathState::Relay,
             score: PathScore {
                 value: 70.0,
                 reasons: Vec::new(),
             },
         };
-        let mut selected = selected_relay_candidates(&response);
-        assert_eq!(
-            selected
-                .iter()
-                .map(|relay| relay.node_id.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                NodeId::from_string("relay-low-load"),
-                NodeId::from_string("relay-current")
-            ]
-        );
+        let selected = selected_relay_candidates(&response);
+        let preferred = selected
+            .first()
+            .context("preferred relay candidate should exist")?;
+        let divergent = selected
+            .get(1)
+            .context("fallback relay candidate should exist")?;
         let runtime = AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -36138,8 +36172,12 @@ exec sleep 60
         runtime
             .upsert_relay_session(RelaySessionState {
                 peer: peer.clone(),
-                relay_node: NodeId::from_string("relay-current"),
-                relay_endpoint: SocketAddr::from(([203, 0, 113, 32], 51820)),
+                relay_node: divergent.node_id.clone(),
+                relay_endpoint: divergent
+                    .relay_capability
+                    .as_ref()
+                    .and_then(|capability| capability.public_endpoint)
+                    .context("fallback relay endpoint should exist")?,
                 admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40000)),
                 admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40000)),
                 session_id: "session-current".to_string(),
@@ -36148,19 +36186,25 @@ exec sleep 60
             })
             .await;
 
-        let promoted = promote_active_relay_candidate(&runtime, &peer, &mut selected).await;
-
-        assert_eq!(promoted, Some(NodeId::from_string("relay-current")));
-        assert_eq!(
-            selected
-                .iter()
-                .map(|relay| relay.node_id.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                NodeId::from_string("relay-current"),
-                NodeId::from_string("relay-low-load")
-            ]
+        assert!(
+            relay_session_needs_renewal(
+                &runtime,
+                &peer,
+                &preferred.node_id,
+                Duration::from_secs(5),
+            )
+            .await
         );
+        assert!(
+            !relay_session_needs_renewal(
+                &runtime,
+                &peer,
+                &divergent.node_id,
+                Duration::from_secs(5),
+            )
+            .await
+        );
+        Ok(())
     }
 
     #[test]
