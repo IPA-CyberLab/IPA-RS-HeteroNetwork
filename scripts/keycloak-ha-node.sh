@@ -297,6 +297,7 @@ EOF
 prepare_edge() {
   require_root
   install_edge_dependencies
+  install -d -o root -g root -m 0755 /etc/heteronetwork
   install -d -o root -g haproxy -m 0750 "$edge_config_dir"
 }
 
@@ -306,6 +307,7 @@ prepare_release() {
   ensure_service_account
 
   install -d -o root -g root -m 0755 /opt/heteronetwork /opt/heteronetwork/libexec
+  install -d -o root -g root -m 0755 /etc/heteronetwork
   install -d -o keycloak -g keycloak -m 0750 \
     "$keycloak_data_dir" "$keycloak_data_dir/import"
   install -d -o root -g keycloak -m 0750 "$keycloak_config_dir"

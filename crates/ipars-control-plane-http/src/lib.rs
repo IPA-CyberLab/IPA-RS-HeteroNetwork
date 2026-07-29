@@ -4893,7 +4893,7 @@ fn keycloak_autopilot_install_script(
     format!(
         r#"if [ "$public_services_enabled" -eq 1 ]; then
   install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
-  install -d -o root -g root -m 0700 /etc/heteronetwork
+  install -d -o root -g root -m 0755 /etc/heteronetwork
   printf '%s' '{helper}' | base64 -d >/opt/heteronetwork/libexec/.keycloak-ha-node.sh.new
   printf '%s' '{autopilot}' | base64 -d >/opt/heteronetwork/libexec/.keycloak-autopilot.sh.new
   chown root:root \
