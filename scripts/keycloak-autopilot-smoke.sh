@@ -538,6 +538,8 @@ grep -Fq '"http://127.0.0.1:${management_port}/health/ready"' "$helper_contract"
 if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract"; then
   fail "helper restarts an already-active Keycloak replica"
 fi
+grep -Fq 'systemctl reset-failed \' "$helper_contract" \
+  || fail "helper leaves intentionally stopped replicas in a failed state"
 if grep -Fq 'start --optimized --import-realm' "$helper_contract"; then
   fail "normal Keycloak restart still imports realms"
 fi

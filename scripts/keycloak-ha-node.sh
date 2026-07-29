@@ -605,6 +605,11 @@ deactivate_replica() {
     && ! systemctl stop heteronetwork-keycloak.service; then
     failed=1
   fi
+  if ((failed == 0)); then
+    systemctl reset-failed \
+      heteronetwork-keycloak-backchannel.service \
+      heteronetwork-keycloak.service
+  fi
   ((failed == 0))
 }
 
