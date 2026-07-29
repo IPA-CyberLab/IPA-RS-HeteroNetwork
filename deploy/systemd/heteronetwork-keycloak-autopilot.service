@@ -1,0 +1,36 @@
+[Unit]
+Description=Reconcile automatic HeteroNetwork Keycloak HA placement
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service heteronetwork-keycloak-prepare.service
+Requires=heteronetwork-agent.service
+ConditionPathExists=/etc/heteronetwork/keycloak-autopilot.env
+ConditionPathExists=/opt/heteronetwork/libexec/keycloak-autopilot.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/keycloak-autopilot.sh reconcile
+RuntimeDirectory=heteronetwork-keycloak-autopilot
+RuntimeDirectoryMode=0700
+StateDirectory=heteronetwork-keycloak-autopilot
+StateDirectoryMode=0700
+TimeoutStartSec=240s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/etc/heteronetwork/keycloak
+ReadWritePaths=/etc/heteronetwork/keycloak-backchannel
+ReadWritePaths=/etc/heteronetwork/keycloak-edge-proxy
+ReadWritePaths=/etc/systemd/system
+ReadWritePaths=/opt/heteronetwork/keycloak-26.6.4/conf
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

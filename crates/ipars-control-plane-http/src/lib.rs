@@ -95,6 +95,14 @@ const POSTGRES_HA_AUTOPILOT_SCRIPT: &str =
     include_str!("../../../scripts/postgres-ha-autopilot.sh");
 const POSTGRES_HA_AUTOPILOT_UNIT: &str =
     include_str!("../../../deploy/systemd/heteronetwork-postgres-autopilot.service");
+const KEYCLOAK_HA_NODE_SCRIPT: &str = include_str!("../../../scripts/keycloak-ha-node.sh");
+const KEYCLOAK_AUTOPILOT_SCRIPT: &str = include_str!("../../../scripts/keycloak-autopilot.sh");
+const KEYCLOAK_AUTOPILOT_UNIT: &str =
+    include_str!("../../../deploy/systemd/heteronetwork-keycloak-autopilot.service");
+const KEYCLOAK_AUTOPILOT_TIMER: &str =
+    include_str!("../../../deploy/systemd/heteronetwork-keycloak-autopilot.timer");
+const KEYCLOAK_PREPARE_UNIT: &str =
+    include_str!("../../../deploy/systemd/heteronetwork-keycloak-prepare.service");
 const PUBLIC_SERVICES_AUTOPILOT_SCRIPT: &str =
     include_str!("../../../scripts/public-services-autopilot.sh");
 const PUBLIC_SERVICES_CONTROL_PLANE_UNIT: &str =
@@ -112,6 +120,10 @@ const MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES: u64 = 256 * 1024;
 const NODE_ENROLLMENT_CADDY_VERSION: &str = "2.11.4";
 const NODE_ENROLLMENT_CADDY_SHA256: &str =
     "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9";
+const KEYCLOAK_AUTOPILOT_ARCHIVE_URL: &str =
+    "https://github.com/keycloak/keycloak/releases/download/26.6.4/keycloak-26.6.4.tar.gz";
+const KEYCLOAK_AUTOPILOT_ARCHIVE_SHA256: &str =
+    "386b566bbea05527226e275c43e5cf6f218896ad2441ac4be5c39f1226772e8f";
 const NODE_ENROLLMENT_RELAY_UDP_PORT: u16 = 18_445;
 const NODE_ENROLLMENT_RELAY_HTTP_PORT: u16 = 18_447;
 const NODE_ENROLLMENT_RELAY_CLASSIFICATION_MAX_AGE_SECONDS: u64 = 45;
@@ -3678,12 +3690,14 @@ UNIT
 
 __RELAY_ADMISSION_INSTALL__
 __PUBLIC_SERVICES_INSTALL__
+__KEYCLOAK_INSTALL__
 systemctl daemon-reload
 systemctl enable heteronetwork-gateway.service heteronetwork-agent.service
 systemctl restart heteronetwork-gateway.service
 systemctl restart heteronetwork-agent.service
 __RELAY_AUTOPILOT_START__
 __DATABASE_INSTALL__
+__KEYCLOAK_START__
 __PUBLIC_SERVICES_START__
 __SETUP_INSTALL__
 commit_installer_transaction
@@ -3703,6 +3717,8 @@ echo "HeteroNetwork node enrolled and started"
     let public_services_install =
         public_services_install_script(enrollment, token, bootstrap_endpoints);
     let public_services_start = public_services_start_script(enrollment);
+    let keycloak_install = keycloak_autopilot_install_script(enrollment, token);
+    let keycloak_start = keycloak_autopilot_start_script(enrollment);
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
@@ -3711,8 +3727,10 @@ echo "HeteroNetwork node enrolled and started"
         .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
         .replace("__RELAY_ADMISSION_INSTALL__", &relay_admission_install)
         .replace("__PUBLIC_SERVICES_INSTALL__", &public_services_install)
+        .replace("__KEYCLOAK_INSTALL__", &keycloak_install)
         .replace("__RELAY_AUTOPILOT_START__", &relay_autopilot_start)
         .replace("__DATABASE_INSTALL__", &database_install)
+        .replace("__KEYCLOAK_START__", &keycloak_start)
         .replace("__PUBLIC_SERVICES_START__", &public_services_start)
         .replace("__SETUP_INSTALL__", &setup_install)
 }
@@ -4720,6 +4738,139 @@ echo "Automatic PostgreSQL HA placement scheduled"
         role = token.claims.role.as_str(),
         control_plane_urls_b64 = control_plane_urls_b64,
     )
+}
+
+fn keycloak_autopilot_install_script(
+    enrollment: &NodeEnrollmentConfig,
+    token: &SignedJoinToken,
+) -> String {
+    let Some(public_services) = enrollment.public_services.as_deref() else {
+        return String::new();
+    };
+    let Ok(issuer_url) = Url::parse(&public_services.oidc_issuer_url) else {
+        return String::new();
+    };
+    let issuer_path = issuer_url.path().trim_end_matches('/');
+    let oidc_probe_path = format!("{issuer_path}/.well-known/openid-configuration");
+    let helper = STANDARD.encode(KEYCLOAK_HA_NODE_SCRIPT.as_bytes());
+    let autopilot = STANDARD.encode(KEYCLOAK_AUTOPILOT_SCRIPT.as_bytes());
+    let cluster_id = STANDARD.encode(token.claims.cluster_id.as_str().as_bytes());
+    let archive_url = STANDARD.encode(KEYCLOAK_AUTOPILOT_ARCHIVE_URL.as_bytes());
+    let oidc_probe_path = STANDARD.encode(oidc_probe_path.as_bytes());
+    let mut seen_control_plane_bases = BTreeSet::new();
+    let control_plane_urls_b64 = std::iter::once(enrollment.install_base_url.as_ref())
+        .chain(
+            token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.as_str()),
+        )
+        .filter_map(|base| {
+            let base = base.trim_end_matches('/');
+            seen_control_plane_bases
+                .insert(base.to_string())
+                .then(|| STANDARD.encode(base.as_bytes()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let bearer_token = derive_node_enrollment_cluster_secret(
+        enrollment,
+        &token.claims.cluster_id,
+        b"heteronetwork-keycloak-autopilot-v1",
+    );
+    format!(
+        r#"if [ "$public_services_enabled" -eq 1 ]; then
+  install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+  install -d -o root -g root -m 0700 /etc/heteronetwork
+  printf '%s' '{helper}' | base64 -d >/opt/heteronetwork/libexec/.keycloak-ha-node.sh.new
+  printf '%s' '{autopilot}' | base64 -d >/opt/heteronetwork/libexec/.keycloak-autopilot.sh.new
+  chown root:root \
+    /opt/heteronetwork/libexec/.keycloak-ha-node.sh.new \
+    /opt/heteronetwork/libexec/.keycloak-autopilot.sh.new
+  chmod 0755 \
+    /opt/heteronetwork/libexec/.keycloak-ha-node.sh.new \
+    /opt/heteronetwork/libexec/.keycloak-autopilot.sh.new
+  mv -f /opt/heteronetwork/libexec/.keycloak-ha-node.sh.new \
+    /opt/heteronetwork/libexec/keycloak-ha-node.sh
+  mv -f /opt/heteronetwork/libexec/.keycloak-autopilot.sh.new \
+    /opt/heteronetwork/libexec/keycloak-autopilot.sh
+  cat >/etc/heteronetwork/.keycloak-autopilot.env.new <<'KEYCLOAK_AUTOPILOT_ENV'
+HETERONETWORK_KEYCLOAK_AUTOPILOT_BEARER_TOKEN={bearer_token}
+HETERONETWORK_KEYCLOAK_CLUSTER_ID_B64={cluster_id}
+HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='{control_plane_urls_b64}'
+HETERONETWORK_KEYCLOAK_VERSION={keycloak_version}
+HETERONETWORK_KEYCLOAK_ARCHIVE_URL_B64={archive_url}
+HETERONETWORK_KEYCLOAK_ARCHIVE_SHA256={archive_sha256}
+HETERONETWORK_KEYCLOAK_OIDC_PROBE_PATH_B64={oidc_probe_path}
+KEYCLOAK_AUTOPILOT_ENV
+  chown root:root /etc/heteronetwork/.keycloak-autopilot.env.new
+  chmod 0600 /etc/heteronetwork/.keycloak-autopilot.env.new
+  mv -f /etc/heteronetwork/.keycloak-autopilot.env.new \
+    /etc/heteronetwork/keycloak-autopilot.env
+  cat >/etc/systemd/system/heteronetwork-keycloak-prepare.service <<'KEYCLOAK_PREPARE_UNIT'
+{prepare_unit}
+KEYCLOAK_PREPARE_UNIT
+  cat >/etc/systemd/system/heteronetwork-keycloak-autopilot.service <<'KEYCLOAK_AUTOPILOT_UNIT'
+{autopilot_unit}
+KEYCLOAK_AUTOPILOT_UNIT
+  cat >/etc/systemd/system/heteronetwork-keycloak-autopilot.timer <<'KEYCLOAK_AUTOPILOT_TIMER'
+{autopilot_timer}
+KEYCLOAK_AUTOPILOT_TIMER
+  chown root:root \
+    /etc/systemd/system/heteronetwork-keycloak-prepare.service \
+    /etc/systemd/system/heteronetwork-keycloak-autopilot.service \
+    /etc/systemd/system/heteronetwork-keycloak-autopilot.timer
+  chmod 0644 \
+    /etc/systemd/system/heteronetwork-keycloak-prepare.service \
+    /etc/systemd/system/heteronetwork-keycloak-autopilot.service \
+    /etc/systemd/system/heteronetwork-keycloak-autopilot.timer
+else
+  systemctl disable heteronetwork-keycloak-prepare.service \
+    heteronetwork-keycloak-autopilot.timer >/dev/null 2>&1 || true
+  stop_systemd_unit_with_kill heteronetwork-keycloak-autopilot.timer
+  stop_systemd_unit_with_kill heteronetwork-keycloak-autopilot.service
+  stop_systemd_unit_with_kill heteronetwork-keycloak.service
+  stop_systemd_unit_with_kill heteronetwork-keycloak-backchannel.service
+  stop_systemd_unit_with_kill heteronetwork-keycloak-edge-proxy.service
+  rm -f \
+    /etc/systemd/system/heteronetwork-agent.service.d/30-keycloak-gateway.conf \
+    /etc/heteronetwork/keycloak-autopilot.env \
+    /opt/heteronetwork/libexec/keycloak-autopilot.sh \
+    /opt/heteronetwork/libexec/keycloak-ha-node.sh \
+    /etc/systemd/system/heteronetwork-keycloak-prepare.service \
+    /etc/systemd/system/heteronetwork-keycloak-autopilot.service \
+    /etc/systemd/system/heteronetwork-keycloak-autopilot.timer
+fi
+"#,
+        helper = helper,
+        autopilot = autopilot,
+        bearer_token = bearer_token,
+        cluster_id = cluster_id,
+        control_plane_urls_b64 = control_plane_urls_b64,
+        keycloak_version = KEYCLOAK_AUTOPILOT_VERSION,
+        archive_url = archive_url,
+        archive_sha256 = KEYCLOAK_AUTOPILOT_ARCHIVE_SHA256,
+        oidc_probe_path = oidc_probe_path,
+        prepare_unit = KEYCLOAK_PREPARE_UNIT,
+        autopilot_unit = KEYCLOAK_AUTOPILOT_UNIT,
+        autopilot_timer = KEYCLOAK_AUTOPILOT_TIMER,
+    )
+}
+
+fn keycloak_autopilot_start_script(enrollment: &NodeEnrollmentConfig) -> String {
+    if enrollment.public_services.is_none() {
+        return String::new();
+    }
+    r#"if [ "$public_services_enabled" -eq 1 ]; then
+  systemctl enable heteronetwork-keycloak-prepare.service heteronetwork-keycloak-autopilot.timer
+  systemctl restart --no-block heteronetwork-keycloak-prepare.service
+  systemctl start heteronetwork-keycloak-autopilot.timer
+  echo "Automatic Keycloak HA placement scheduled"
+fi
+"#
+    .to_string()
 }
 
 fn kubernetes_ha_cohort_tag(nonce: &str) -> String {
@@ -7888,6 +8039,7 @@ mod tests {
             oidc_scopes: "openid profile email".to_string(),
         });
         let expected_sha256 = enrollment.binary_sha256.to_string();
+        let enrollment_signing_key = enrollment.issuer.signing_key_b64().to_string();
         let database_autopilot_bearer = derive_node_enrollment_cluster_secret(
             &enrollment,
             &cluster_id,
@@ -8210,6 +8362,23 @@ mod tests {
         let generated_script = response_body["install_script"]
             .as_str()
             .ok_or("node enrollment response omitted the install script")?;
+        let mut installer_shell = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        installer_shell
+            .stdin
+            .take()
+            .ok_or("node installer shell syntax checker stdin is unavailable")?
+            .write_all(generated_script.as_bytes())?;
+        let installer_syntax = installer_shell.wait_with_output()?;
+        assert!(
+            installer_syntax.status.success(),
+            "generated node installer is not valid POSIX shell: {}",
+            String::from_utf8_lossy(&installer_syntax.stderr)
+        );
         for expected_base in [
             "https://public-a.example:8443",
             "https://public-b.example:8443",
@@ -8250,6 +8419,22 @@ mod tests {
         assert!(generated_script.contains("postgres-ha-autopilot.sh"));
         assert!(generated_script.contains("HETERONETWORK_DB_CONTROL_PLANE_URLS_B64='"));
         assert!(generated_script.contains("Automatic PostgreSQL HA placement scheduled"));
+        assert!(generated_script.contains("heteronetwork-keycloak-prepare.service"));
+        assert!(generated_script.contains("heteronetwork-keycloak-autopilot.service"));
+        assert!(generated_script.contains("heteronetwork-keycloak-autopilot.timer"));
+        assert!(generated_script.contains("keycloak-ha-node.sh"));
+        assert!(generated_script.contains("keycloak-autopilot.sh"));
+        assert!(generated_script.contains("HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='"));
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_KEYCLOAK_VERSION={KEYCLOAK_AUTOPILOT_VERSION}"
+        )));
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_KEYCLOAK_ARCHIVE_SHA256={KEYCLOAK_AUTOPILOT_ARCHIVE_SHA256}"
+        )));
+        assert!(generated_script
+            .contains("systemctl restart --no-block heteronetwork-keycloak-prepare.service"));
+        assert!(generated_script.contains("Automatic Keycloak HA placement scheduled"));
+        assert!(!generated_script.contains(&enrollment_signing_key));
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
         assert!(

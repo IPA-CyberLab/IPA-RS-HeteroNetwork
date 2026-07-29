@@ -1,0 +1,16 @@
+[Unit]
+Description=Prepare the pinned HeteroNetwork Keycloak release
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service heteronetwork-postgres-autopilot.service
+Before=heteronetwork-keycloak-autopilot.service
+ConditionPathExists=/etc/heteronetwork/keycloak-autopilot.env
+ConditionPathExists=/opt/heteronetwork/libexec/keycloak-autopilot.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/keycloak-autopilot.sh prepare
+TimeoutStartSec=900s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

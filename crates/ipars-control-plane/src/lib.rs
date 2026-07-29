@@ -5441,7 +5441,6 @@ fn select_keycloak_candidates(
     let placement_id = digest
         .finalize()
         .iter()
-        .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect();
     KeycloakPlacement {

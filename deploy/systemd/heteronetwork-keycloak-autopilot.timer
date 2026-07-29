@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile HeteroNetwork Keycloak HA placement
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=15s
+RandomizedDelaySec=2s
+AccuracySec=1s
+Unit=heteronetwork-keycloak-autopilot.service
+
+[Install]
+WantedBy=timers.target
