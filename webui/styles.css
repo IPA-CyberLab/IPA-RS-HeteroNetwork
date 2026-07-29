@@ -2946,6 +2946,12 @@ textarea:focus-visible {
   color: var(--cyan);
 }
 
+.status-pill.neutral {
+  background: var(--surface-deep);
+  border-color: var(--line-strong);
+  color: var(--muted);
+}
+
 .app-frame {
   background: var(--bg);
   min-height: calc(100vh - var(--topbar-height));
@@ -3346,11 +3352,49 @@ tbody tr.selected {
   min-width: 1120px;
 }
 
+.node-service-matrix {
+  min-width: 1380px;
+}
+
 .service-endpoint {
   display: grid;
   gap: 7px;
   max-width: 230px;
   min-width: 150px;
+}
+
+.service-endpoint-list,
+.service-agent-health,
+.service-lease-list,
+.service-lease {
+  display: grid;
+  gap: 6px;
+}
+
+.service-agent-health,
+.service-lease-list {
+  min-width: 150px;
+}
+
+.service-agent-health small,
+.service-lease small {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.service-lease + .service-lease {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.service-lease code {
+  color: var(--muted);
+  display: block;
+  font-size: 11px;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .service-endpoint code {
@@ -3361,6 +3405,18 @@ tbody tr.selected {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.service-host {
+  min-width: 250px;
+}
+
+.service-host-copy {
+  min-width: 0;
+}
+
+.service-host-copy small + small {
+  margin-top: 3px;
 }
 
 .table-primary {
