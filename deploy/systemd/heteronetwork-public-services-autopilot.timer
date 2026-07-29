@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile HeteroNetwork public-service promotion
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=15s
+RandomizedDelaySec=2s
+AccuracySec=1s
+Unit=heteronetwork-public-services-autopilot.service
+
+[Install]
+WantedBy=timers.target

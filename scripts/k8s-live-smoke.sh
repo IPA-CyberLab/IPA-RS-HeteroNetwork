@@ -828,6 +828,8 @@ spec:
             - ${service_instance_id}
             - --service-owner-host-id
             - ${service_instance_id}
+            - --service-owner-node-id
+            - ${service_instance_id}
             - --advertise-control-plane-url
             - ${control_plane_url}
             - --advertise-signal-url

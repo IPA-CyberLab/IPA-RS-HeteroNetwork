@@ -3027,9 +3027,6 @@
     else showAuth("");
   });
 
-  document.querySelectorAll('[data-view="services"]').forEach(function (navigationItem) {
-    navigationItem.remove();
-  });
   document.documentElement.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
   $("locale-select").value = state.locale;
   applyStaticTranslations();

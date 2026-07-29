@@ -1,0 +1,34 @@
+[Unit]
+Description=HeteroNetwork automatically promoted Control Plane
+Wants=network-online.target
+Requires=heteronetwork-agent.service heteronetwork-gateway.service heteronetwork-relay.service heteronetwork-signal.service heteronetwork-stun.service
+After=network-online.target heteronetwork-agent.service heteronetwork-gateway.service heteronetwork-relay.service heteronetwork-signal.service heteronetwork-stun.service
+BindsTo=heteronetwork-agent.service heteronetwork-gateway.service heteronetwork-relay.service heteronetwork-signal.service heteronetwork-stun.service
+ConditionPathExists=/etc/heteronetwork/public-services/services.env
+ConditionPathExists=/etc/heteronetwork/public-services/database-url
+
+[Service]
+Type=simple
+User=heteronetwork-services
+Group=heteronetwork-services
+EnvironmentFile=/etc/heteronetwork/public-services/services.env
+ExecStart=/opt/heteronetwork/bin/iparsd control-plane
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+

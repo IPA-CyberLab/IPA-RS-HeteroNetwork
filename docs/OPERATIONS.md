@@ -34,7 +34,7 @@ Signal must be able to reach at least one control-plane API to authenticate node
 
 ## Deploy Active-Active Public Nodes
 
-Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance, required `HETERONETWORK_SERVICE_OWNER_HOST_ID`, and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. When that host is also an enrolled overlay node, set both `HETERONETWORK_SERVICE_OWNER_HOST_ID` and `HETERONETWORK_SERVICE_OWNER_NODE_ID` to the registered Node ID so the Web UI joins its service status to the device row without changing the physical failure domain. Infrastructure-only hosts omit the Node ID and appear as explicit infrastructure rows. A Control Plane refuses to start unless its lease includes Control Plane, Signal, and STUN endpoints, preventing a running replica from silently failing to distribute the replacement directory. Keep the issuer private key offline; public nodes need only the public key.
+Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable, enrolled machines. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each machine uses a unique service instance and Relay node ID, sets both `HETERONETWORK_SERVICE_OWNER_HOST_ID` and `HETERONETWORK_SERVICE_OWNER_NODE_ID` to its registered Node ID, and advertises its own reachable Control Plane, Signal, STUN, Relay, and Web UI URLs. Leases without a healthy, publicly reachable registered owner are excluded from the service directory and HA counts. A Control Plane refuses to start unless its lease includes Control Plane, Signal, and STUN endpoints, preventing a running replica from silently failing to distribute the replacement directory. Keep the issuer private key offline; public nodes need only the public key.
 
 To expose **Add device** in the Web UI, create a separate enrollment signer and
 install the same root-owned key as
@@ -82,6 +82,12 @@ expired, revoked, exhausted, or unknown tokens are rejected.
 Relay admission is configured by default. To opt a node out explicitly, append
 `--disable-relay` to the returned command, or run a downloaded script as
 `sudo sh install-heteronetwork.sh --disable-relay`.
+Automatic public-service promotion is also enabled by default. A joined node
+advertises Control Plane, Signal, STUN, Relay, and Web UI services only while
+its Agent reports a fresh directly reachable public classification and its
+local gateway, Relay, and PostgreSQL HA dependencies are healthy. The
+reconciler withdraws all five services when those conditions stop holding.
+Append `--disable-public-services` only for an explicit node opt-out.
 
 An idle ACL-visible peer remains installed in WireGuard as a passive quarantine
 entry with its overlay `/32` AllowedIP and host route, a loopback discard hold

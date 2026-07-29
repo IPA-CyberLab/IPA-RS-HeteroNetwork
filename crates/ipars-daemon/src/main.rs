@@ -50,8 +50,8 @@ use ipars_control_plane::{
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{
-    router, ControlPlaneHttpState, DynamicWebGatewayConfig, NodeEnrollmentConfig, WebAuthProvider,
-    WebUiAuthConfig,
+    router, ControlPlaneHttpState, DynamicWebGatewayConfig, NodeEnrollmentConfig,
+    NodePublicServicesConfig, WebAuthProvider, WebUiAuthConfig,
 };
 #[cfg(test)]
 use ipars_crypto::verify_signal_node_upsert_signature;
@@ -116,7 +116,8 @@ use ipars_types::{
     NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics,
     PathRecord, PathScore, PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken,
     TokenLedgerMetrics, TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_PATH_SCORE_REASONS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
+    MAX_PATH_SCORE_REASONS,
 };
 use ipnet::IpNet;
 use netlink_sys::{
@@ -376,6 +377,50 @@ fn parse_trusted_issuer_key(value: &str) -> Result<TrustedIssuerKeyArg, String> 
     })
 }
 
+fn parse_trusted_node_enrollment_issuer_key(
+    value: &str,
+) -> Result<TrustedNodeEnrollmentIssuerKeyArg, String> {
+    let mut parts = value.splitn(4, ',').map(str::trim);
+    let issuer_node_id = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted node-enrollment issuer key must use issuer_node_id,key_id,public_key,max_ttl_seconds"
+                .to_string()
+        })?;
+    let key_id = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted node-enrollment issuer key must use issuer_node_id,key_id,public_key,max_ttl_seconds"
+                .to_string()
+        })?;
+    let public_key = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted node-enrollment issuer key must use issuer_node_id,key_id,public_key,max_ttl_seconds"
+                .to_string()
+        })?;
+    let max_ttl_seconds = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "trusted node-enrollment issuer key must use issuer_node_id,key_id,public_key,max_ttl_seconds"
+                .to_string()
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            "trusted node-enrollment issuer maximum TTL must be an integer".to_string()
+        })?;
+    Ok(TrustedNodeEnrollmentIssuerKeyArg {
+        issuer_node_id: issuer_node_id.to_string(),
+        key_id: key_id.to_string(),
+        public_key: public_key.to_string(),
+        max_ttl_seconds,
+    })
+}
+
 fn parse_acl_rule(value: &str) -> Result<AclRule, String> {
     serde_json::from_str(value).map_err(|error| format!("ACL rule must be JSON AclRule: {error}"))
 }
@@ -592,6 +637,13 @@ struct ControlPlaneArgs {
     )]
     trusted_issuer_keys: Vec<TrustedIssuerKeyArg>,
     #[arg(
+        long = "trusted-node-enrollment-issuer-key",
+        env = "HETERONETWORK_TRUSTED_NODE_ENROLLMENT_ISSUER_KEYS",
+        value_delimiter = ';',
+        value_parser = parse_trusted_node_enrollment_issuer_key
+    )]
+    trusted_node_enrollment_issuer_keys: Vec<TrustedNodeEnrollmentIssuerKeyArg>,
+    #[arg(
         long = "acl-rule",
         env = "HETERONETWORK_ACL_RULES",
         value_delimiter = ';',
@@ -605,6 +657,14 @@ struct TrustedIssuerKeyArg {
     issuer_node_id: String,
     key_id: String,
     public_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedNodeEnrollmentIssuerKeyArg {
+    issuer_node_id: String,
+    key_id: String,
+    public_key: String,
+    max_ttl_seconds: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -4764,6 +4824,14 @@ where
             trusted.public_key,
         );
     }
+    for trusted in args.trusted_node_enrollment_issuer_keys {
+        key_ring.insert_node_enrollment_key(
+            NodeId::from_string(trusted.issuer_node_id),
+            KeyId::from_string(trusted.key_id),
+            trusted.public_key,
+            trusted.max_ttl_seconds as i64,
+        );
+    }
     if let Some(enrollment) = node_enrollment.as_ref() {
         key_ring.insert_node_enrollment_key(
             enrollment.issuer_node_id(),
@@ -4879,12 +4947,14 @@ fn control_plane_service_lease_config(
         .service_owner_host_id
         .clone()
         .context("--service-owner-host-id is required when advertising HA services")?;
-    let owner_node_id = args.service_owner_node_id.clone().map(NodeId::from_string);
+    let owner_node_id = NodeId::from_string(
+        args.service_owner_node_id
+            .clone()
+            .context("--service-owner-node-id is required when advertising HA services")?,
+    );
     anyhow::ensure!(
-        owner_node_id
-            .as_ref()
-            .is_none_or(|node_id| node_id.as_str() == owner_host_id),
-        "--service-owner-host-id must equal --service-owner-node-id when an overlay owner is set"
+        owner_node_id.as_str() == owner_host_id,
+        "--service-owner-host-id must equal --service-owner-node-id"
     );
     Ok(Some(ControlPlaneServiceLeaseConfig {
         cluster_id: ClusterId::from_string(args.cluster_id.clone()),
@@ -4893,7 +4963,7 @@ fn control_plane_service_lease_config(
             .clone()
             .context("--service-instance-id is required when advertising HA services")?,
         owner_host_id,
-        owner_node_id,
+        owner_node_id: Some(owner_node_id),
         endpoints,
         ttl: Duration::from_secs(args.service_lease_ttl_seconds),
         renew_interval: Duration::from_secs(args.service_lease_renew_interval_seconds),
@@ -4904,7 +4974,7 @@ fn required_control_plane_service_lease_config(
     args: &ControlPlaneArgs,
 ) -> anyhow::Result<ControlPlaneServiceLeaseConfig> {
     control_plane_service_lease_config(args)?.context(
-        "control-plane service advertisement is required; configure --service-instance-id, --service-owner-host-id, --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url",
+        "control-plane service advertisement is required; configure --service-instance-id, --service-owner-host-id, --service-owner-node-id, --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url",
     )
 }
 
@@ -4943,6 +5013,21 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
             "--trusted-issuer-key issuer_node_id",
         )?;
         validate_daemon_identifier(&trusted.key_id, "--trusted-issuer-key key_id")?;
+    }
+    for trusted in &args.trusted_node_enrollment_issuer_keys {
+        validate_daemon_identifier(
+            &trusted.issuer_node_id,
+            "--trusted-node-enrollment-issuer-key issuer_node_id",
+        )?;
+        validate_daemon_identifier(
+            &trusted.key_id,
+            "--trusted-node-enrollment-issuer-key key_id",
+        )?;
+        anyhow::ensure!(
+            (5 * 60..=MAX_JOIN_TOKEN_TTL_SECONDS as u64)
+                .contains(&trusted.max_ttl_seconds),
+            "--trusted-node-enrollment-issuer-key maximum TTL must be between 300 and {MAX_JOIN_TOKEN_TTL_SECONDS} seconds"
+        );
     }
     validate_positive_seconds(args.relay_health_ttl_seconds, "--relay-health-ttl-seconds")?;
     validate_positive_seconds(
@@ -5037,6 +5122,41 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
             )
         })?;
     }
+    for trusted in &args.trusted_node_enrollment_issuer_keys {
+        validate_identity_public_key_b64(&trusted.public_key).with_context(|| {
+            format!(
+                "--trusted-node-enrollment-issuer-key public key for issuer {} key {} must be a canonical non-weak Ed25519 public key",
+                trusted.issuer_node_id, trusted.key_id
+            )
+        })?;
+        anyhow::ensure!(
+            !(trusted.issuer_node_id == args.issuer_node_id
+                && trusted.key_id == args.issuer_key_id)
+                && args.trusted_issuer_keys.iter().all(|unrestricted| {
+                    unrestricted.issuer_node_id != trusted.issuer_node_id
+                        || unrestricted.key_id != trusted.key_id
+                }),
+            "restricted node-enrollment issuer/key ID conflicts with an unrestricted trusted issuer entry"
+        );
+        anyhow::ensure!(
+            trusted.public_key != args.issuer_public_key
+                && args
+                    .trusted_issuer_keys
+                    .iter()
+                    .all(|unrestricted| unrestricted.public_key != trusted.public_key),
+            "restricted node-enrollment issuer must not reuse an unrestricted trusted issuer key"
+        );
+    }
+    let restricted_key_count = args
+        .trusted_node_enrollment_issuer_keys
+        .iter()
+        .map(|trusted| (&trusted.issuer_node_id, &trusted.key_id))
+        .collect::<BTreeSet<_>>()
+        .len();
+    anyhow::ensure!(
+        restricted_key_count == args.trusted_node_enrollment_issuer_keys.len(),
+        "trusted node-enrollment issuer entries must use unique issuer/key IDs"
+    );
     Ok(())
 }
 
@@ -5077,6 +5197,15 @@ fn control_plane_node_enrollment_config(
             }),
         "node enrollment issuer/key ID conflicts with an unrestricted trusted issuer entry"
     );
+    anyhow::ensure!(
+        args.trusted_node_enrollment_issuer_keys
+            .iter()
+            .all(|trusted| {
+                trusted.issuer_node_id != issuer_node_id.as_str()
+                    || trusted.key_id != args.node_enrollment_issuer_key_id
+            }),
+        "node enrollment private signer conflicts with a public-only trusted node-enrollment issuer entry"
+    );
     let public_url = args
         .web_public_url
         .clone()
@@ -5094,6 +5223,41 @@ fn control_plane_node_enrollment_config(
         relay_admission_bearer_token_path,
         "node enrollment relay admission",
     )?;
+    let public_services = NodePublicServicesConfig {
+        vpn_pool: args.vpn_pool.to_string(),
+        issuer_node_id: args.issuer_node_id.clone(),
+        issuer_key_id: args.issuer_key_id.clone(),
+        issuer_public_key: args.issuer_public_key.clone(),
+        trusted_issuer_keys: args
+            .trusted_issuer_keys
+            .iter()
+            .map(|trusted| {
+                format!(
+                    "{},{},{}",
+                    trusted.issuer_node_id, trusted.key_id, trusted.public_key
+                )
+            })
+            .collect(),
+        trusted_node_enrollment_issuer_keys: args
+            .trusted_node_enrollment_issuer_keys
+            .iter()
+            .map(|trusted| {
+                format!(
+                    "{},{},{},{}",
+                    trusted.issuer_node_id,
+                    trusted.key_id,
+                    trusted.public_key,
+                    trusted.max_ttl_seconds
+                )
+            })
+            .collect(),
+        oidc_issuer_url: args.web_oidc_issuer_url.clone(),
+        oidc_client_id: args.web_oidc_client_id.clone(),
+        oidc_auth_base_url: args.web_oidc_auth_base_url.clone(),
+        oidc_backchannel_base_url: args.web_oidc_backchannel_base_url.clone(),
+        oidc_backchannel_fallback_base_urls: args.web_oidc_backchannel_fallback_base_urls.clone(),
+        oidc_scopes: args.web_oidc_scopes.clone(),
+    };
     NodeEnrollmentConfig::new(
         issuer,
         args.node_enrollment_issuer_key_id.clone(),
@@ -5102,6 +5266,7 @@ fn control_plane_node_enrollment_config(
         args.node_enrollment_max_ttl_seconds,
         relay_admission_bearer_token,
     )
+    .map(|enrollment| enrollment.with_public_services(public_services))
     .map(Some)
     .map_err(anyhow::Error::msg)
     .context("node enrollment configuration")
@@ -22905,6 +23070,8 @@ mod tests {
             "issuer-a,root-next,pub-b",
             "--trusted-issuer-key",
             " issuer-b , root , pub-c ",
+            "--trusted-node-enrollment-issuer-key",
+            "enrollment-a,web-enrollment,pub-d,604800",
         ])?;
 
         let Command::ControlPlane(args) = cli.command else {
@@ -22926,6 +23093,15 @@ mod tests {
             ]
         );
         assert_eq!(args.vpn_pool, "10.250.0.0/16".parse()?);
+        assert_eq!(
+            args.trusted_node_enrollment_issuer_keys,
+            vec![TrustedNodeEnrollmentIssuerKeyArg {
+                issuer_node_id: "enrollment-a".to_string(),
+                key_id: "web-enrollment".to_string(),
+                public_key: "pub-d".to_string(),
+                max_ttl_seconds: 604_800,
+            }]
+        );
         Ok(())
     }
 
@@ -23031,6 +23207,42 @@ mod tests {
             config.instance().owner_node_id,
             Some(NodeId::from_string("node-owner-a"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_requires_service_owner_node_id() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--service-instance-id",
+            "public-a",
+            "--service-owner-host-id",
+            "node-owner-a",
+            "--advertise-control-plane-url",
+            "https://public.example:8443",
+            "--advertise-signal-url",
+            "https://public.example:9443",
+            "--advertise-stun-url",
+            "udp://public.example:3478",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+
+        let error = match control_plane_service_lease_config(&args) {
+            Ok(_) => anyhow::bail!("service owner node ID must be required"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--service-owner-node-id"));
         Ok(())
     }
 

@@ -2750,14 +2750,16 @@ fn validate_service_directory_for_token(
     for instance in &directory.instances {
         validate_token_identifier(&instance.instance_id, "service instance ID")?;
         validate_token_identifier(&instance.owner_host_id, "service owner host ID")?;
-        if let Some(owner_node_id) = instance.owner_node_id.as_ref() {
-            validate_token_identifier(owner_node_id.as_str(), "service owner node ID")?;
-            anyhow::ensure!(
-                owner_node_id.as_str() == instance.owner_host_id,
-                "service instance {} owner host ID must equal owner node ID",
-                instance.instance_id
-            );
-        }
+        let owner_node_id = instance
+            .owner_node_id
+            .as_ref()
+            .context("service owner node ID is required")?;
+        validate_token_identifier(owner_node_id.as_str(), "service owner node ID")?;
+        anyhow::ensure!(
+            owner_node_id.as_str() == instance.owner_host_id,
+            "service instance {} owner host ID must equal owner node ID",
+            instance.instance_id
+        );
         anyhow::ensure!(
             instance_ids.insert(instance.instance_id.as_str()),
             "HA service directory contains duplicate service instance ID {}",
@@ -10816,31 +10818,34 @@ mod tests {
         let cluster_id = ClusterId::from_string("cluster-a");
         let instances = [10, 11]
             .into_iter()
-            .map(|host| ServiceInstance {
-                cluster_id: cluster_id.clone(),
-                instance_id: format!("public-{host}"),
-                owner_host_id: format!("host-{host}"),
-                owner_node_id: None,
-                endpoints: vec![
-                    BootstrapEndpoint {
-                        url: format!("https://203.0.113.{host}:8443"),
-                        kind: BootstrapEndpointKind::ControlPlane,
-                    },
-                    BootstrapEndpoint {
-                        url: format!("https://203.0.113.{host}:9443"),
-                        kind: BootstrapEndpointKind::Signal,
-                    },
-                    BootstrapEndpoint {
-                        url: format!("udp://203.0.113.{host}:3478"),
-                        kind: BootstrapEndpointKind::Stun,
-                    },
-                    BootstrapEndpoint {
-                        url: format!("udp://203.0.113.{host}:51820"),
-                        kind: BootstrapEndpointKind::Relay,
-                    },
-                ],
-                lease_expires_at: now + Duration::seconds(15),
-                updated_at: now,
+            .map(|host| {
+                let owner_node_id = NodeId::from_string(format!("node-{host}"));
+                ServiceInstance {
+                    cluster_id: cluster_id.clone(),
+                    instance_id: format!("public-{host}"),
+                    owner_host_id: owner_node_id.to_string(),
+                    owner_node_id: Some(owner_node_id),
+                    endpoints: vec![
+                        BootstrapEndpoint {
+                            url: format!("https://203.0.113.{host}:8443"),
+                            kind: BootstrapEndpointKind::ControlPlane,
+                        },
+                        BootstrapEndpoint {
+                            url: format!("https://203.0.113.{host}:9443"),
+                            kind: BootstrapEndpointKind::Signal,
+                        },
+                        BootstrapEndpoint {
+                            url: format!("udp://203.0.113.{host}:3478"),
+                            kind: BootstrapEndpointKind::Stun,
+                        },
+                        BootstrapEndpoint {
+                            url: format!("udp://203.0.113.{host}:51820"),
+                            kind: BootstrapEndpointKind::Relay,
+                        },
+                    ],
+                    lease_expires_at: now + Duration::seconds(15),
+                    updated_at: now,
+                }
             })
             .collect::<Vec<_>>();
         ServiceDirectory {
@@ -10862,6 +10867,7 @@ mod tests {
 
         let mut same_host = directory.clone();
         same_host.instances[1].owner_host_id = same_host.instances[0].owner_host_id.clone();
+        same_host.instances[1].owner_node_id = same_host.instances[0].owner_node_id.clone();
         let error = test_error(
             validate_service_directory_for_token(&same_host, true, false),
             "two leases from one host must not count as HA",

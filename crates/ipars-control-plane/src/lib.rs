@@ -1908,21 +1908,6 @@ where
         instance: ServiceInstance,
     ) -> Result<(), ControlPlaneError> {
         validate_service_instance(&instance, &self.config.cluster_id, Utc::now())?;
-        let owner_node_id = instance.owner_node_id.as_ref().ok_or_else(|| {
-            ControlPlaneError::Store("service owner node ID is required".to_string())
-        })?;
-        let owner = self
-            .store
-            .get_node(owner_node_id)
-            .await?
-            .filter(|node| node.cluster_id == self.config.cluster_id)
-            .ok_or_else(|| ControlPlaneError::NodeNotFound(owner_node_id.clone()))?;
-        if owner.role.is_client() {
-            return Err(ControlPlaneError::NodeUpdateRejected {
-                node_id: owner.node_id,
-                reason: "clients cannot own cluster service leases".to_string(),
-            });
-        }
         self.store.upsert_service_instance(instance).await
     }
 
@@ -8802,7 +8787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregistered_and_foreign_service_owners_are_rejected_or_ignored(
+    async fn unregistered_and_foreign_service_owners_are_ignored(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-service-owner");
         let store = Arc::new(InMemoryStore::default());
@@ -8821,30 +8806,24 @@ mod tests {
             now,
             now + Duration::seconds(30),
         );
-        assert!(matches!(
-            plane.advertise_service_instance(unregistered.clone()).await,
-            Err(ControlPlaneError::NodeNotFound(_))
-        ));
-
-        store.upsert_service_instance(unregistered).await?;
+        plane.advertise_service_instance(unregistered).await?;
         assert!(plane.service_directory().await?.instances.is_empty());
         assert_eq!(plane.metrics().await?.active_service_instance_count, 0);
 
         let mut foreign = node_record("foreign-owner");
         foreign.cluster_id = ClusterId::from_string("other-cluster");
         store.insert_node(foreign).await?;
-        assert!(matches!(
-            plane
-                .advertise_service_instance(service_instance(
-                    &cluster_id,
-                    "foreign-owner",
-                    "foreign.example",
-                    now,
-                    now + Duration::seconds(30),
-                ))
-                .await,
-            Err(ControlPlaneError::NodeNotFound(_))
-        ));
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "foreign-owner",
+                "foreign.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
+        assert!(plane.service_directory().await?.instances.is_empty());
+        assert_eq!(plane.metrics().await?.active_service_instance_count, 0);
         Ok(())
     }
 

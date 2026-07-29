@@ -247,6 +247,14 @@ Agent systemd drop-in by default; pass `--disable-relay` to the downloaded
 installer only for nodes that must not receive it. Joining nodes need no manual
 Relay configuration.
 
+The same installer enables automatic public-service promotion by default.
+Every joined node continuously reconciles its authenticated Agent state and
+starts Control Plane, Signal, STUN, Relay, and Web UI service advertisement
+only while it has a fresh directly reachable public classification and healthy
+database, gateway, and Relay dependencies. Losing any prerequisite withdraws
+the service lease and stops the promoted services. Use
+`--disable-public-services` only for an explicit per-node opt-out.
+
 This signer is distinct from the offline root issuer. The verifier limits it to
 non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,
 and redundant bootstrap endpoints. The management endpoint requires the same

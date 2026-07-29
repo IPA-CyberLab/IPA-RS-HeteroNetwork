@@ -1,0 +1,29 @@
+[Unit]
+Description=Reconcile automatic HeteroNetwork public-service promotion
+Wants=heteronetwork-agent.service
+After=heteronetwork-agent.service
+ConditionPathExists=/etc/heteronetwork/public-services/bootstrap.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/heteronetwork/public-services/bootstrap.env
+ExecStart=/opt/heteronetwork/libexec/public-services-autopilot.sh
+RuntimeDirectory=heteronetwork-public-services-autopilot
+RuntimeDirectoryMode=0700
+TimeoutStartSec=45s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/etc/heteronetwork/public-services /etc/systemd/system/heteronetwork-agent.service.d
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+

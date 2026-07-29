@@ -45,13 +45,11 @@ random 32-byte-or-longer printable tokens in the five referenced token files,
 owned by `ipars:ipars` with mode `0400`. The daemon intentionally rejects
 group/world-readable credential files. The issuer private key is not installed
 on public nodes; only its public key belongs in this environment file.
-`HETERONETWORK_SERVICE_OWNER_HOST_ID` must identify this failure-domain host and
-must differ between replicas. If the host also runs an enrolled Agent, set
-both `HETERONETWORK_SERVICE_OWNER_HOST_ID` and
-`HETERONETWORK_SERVICE_OWNER_NODE_ID` to that Agent's registered Node ID; omit
-the Node ID for an infrastructure-only host. The daemon rejects mismatched
-host and Node IDs. These ownership fields drive host-level HA counting and the
-node-services matrix. When the
+Every service replica must run on an enrolled Agent machine. Set both
+`HETERONETWORK_SERVICE_OWNER_HOST_ID` and
+`HETERONETWORK_SERVICE_OWNER_NODE_ID` to that machine's registered Node ID.
+The daemon rejects missing or mismatched owner IDs, and excludes leases from
+unhealthy or non-public owners from the service directory and HA counts. When the
 Web UI **Add device** workflow is enabled, generate a separate Ed25519 enrollment
 signing key and install the same key as
 `/etc/credstore/node-enrollment-issuer.key` on every Control Plane replica with
@@ -72,6 +70,14 @@ with the Agent systemd configuration, in each Add device install script. Run an
 installer with `--disable-relay` only when that node must not receive Relay
 admission configuration. Do not configure Relay admission manually on joining
 nodes.
+The installer also enables `heteronetwork-public-services-autopilot.timer` by
+default. On every enrolled machine it promotes all five node services only
+while the Agent has a fresh directly reachable public classification and the
+gateway, Relay, and PostgreSQL HA dependencies are healthy; otherwise it
+withdraws the lease and stops those services. Pass
+`--disable-public-services` only for an explicit per-node opt-out. Automatically
+promoted Control Planes receive the root and enrollment public verification
+keys but never an enrollment private signing key.
 Install the local database proxy and place its complete TLS-verifying
 PostgreSQL URL in `/etc/credstore/database-url`, owned by `root:root` with mode
 `0400`. The unit imports that URL as a separate systemd credential, keeping the
