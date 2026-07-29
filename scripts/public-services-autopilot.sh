@@ -564,7 +564,6 @@ prepare_runtime_files() {
     write_environment_entry \
       HETERONETWORK_TRUSTED_NODE_ENROLLMENT_ISSUER_KEYS \
       "$enrollment_trusted_issuer_keys"
-    write_environment_entry HETERONETWORK_DATABASE_URL_PATH "$database_url_file"
     write_environment_entry HETERONETWORK_LISTEN "$vpn_ip:19088"
     write_environment_entry HETERONETWORK_SIGNAL_LISTEN "127.0.0.1:19443"
     write_environment_entry \
@@ -617,7 +616,7 @@ prepare_runtime_files() {
     "postgresql://heteronetwork:$database_password@postgres.heteronetwork.internal:25432/heteronetwork?sslmode=verify-full&sslrootcert=$postgres_ca_file" \
     >"$database_url_tmp" || return 1
   install_candidate "$database_url_tmp" "$database_url_file" \
-    "root:$service_group" 0640 || return 1
+    root:root 0400 || return 1
   database_url_tmp=
   database_url_changed=$CANDIDATE_CHANGED
 

@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 autopilot=$script_dir/public-services-autopilot.sh
+control_plane_unit=$script_dir/../deploy/systemd/heteronetwork-control-plane.service
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-public-services-smoke.XXXXXX")
 fake_bin=$test_root/fake-bin
 fake_state=$test_root/fake-state
@@ -268,14 +269,20 @@ run_reconciler
 [ -f "$agent_drop_in" ] || fail "Agent drop-in was not generated"
 [ "$(stat -c '%a' "$services_env")" = 640 ] ||
   fail "service environment mode is not 0640"
-[ "$(stat -c '%a' "$database_url")" = 640 ] ||
-  fail "database URL mode is not 0640"
+[ "$(stat -c '%a' "$database_url")" = 400 ] ||
+  fail "database URL mode is not 0400"
 [ "$(stat -c '%a' "$agent_drop_in")" = 644 ] ||
   fail "Agent drop-in mode is not 0644"
 assert_active heteronetwork-signal.service
 assert_active heteronetwork-stun.service
 assert_active heteronetwork-control-plane.service
 
+if grep -q '^HETERONETWORK_DATABASE_URL_PATH=' "$services_env"; then
+  fail "database URL path bypassed the systemd credential"
+fi
+grep -Fqx \
+  'LoadCredential=database-url:/etc/heteronetwork/public-services/database-url' \
+  "$control_plane_unit" || fail "Control Plane database credential is not loaded by systemd"
 grep -q '^HETERONETWORK_LISTEN="10.250.0.4:19088"$' "$services_env" ||
   fail "automatic Control Plane listen address is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://10.250.0.4:19088"$' \

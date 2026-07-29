@@ -12,6 +12,7 @@ Type=simple
 User=heteronetwork-services
 Group=heteronetwork-services
 EnvironmentFile=/etc/heteronetwork/public-services/services.env
+LoadCredential=database-url:/etc/heteronetwork/public-services/database-url
 ExecStart=/opt/heteronetwork/bin/iparsd control-plane
 Restart=on-failure
 RestartSec=5s
@@ -31,4 +32,3 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-
