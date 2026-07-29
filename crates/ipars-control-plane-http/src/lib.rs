@@ -2010,9 +2010,9 @@ fn node_enrollment_bootstrap_endpoints(
             }
         }
     }
-    if bootstrap_endpoints.is_empty() {
+    if bootstrap_endpoints.len() < 2 {
         return Err(NodeEnrollmentApiError::unavailable(
-            "node enrollment requires an HTTP(S) public Gateway outside the HeteroNetwork VPN pool",
+            "node enrollment requires at least two HTTP(S) public Gateways outside the HeteroNetwork VPN pool",
         ));
     }
 
@@ -2052,13 +2052,27 @@ fn node_enrollment_gateway_url(url: &str, vpn_pool: &ipnet::Ipv4Net) -> Option<S
         return None;
     }
     match parsed.host()? {
-        url::Host::Ipv4(ip) if vpn_pool.contains(&ip) => return None,
-        url::Host::Ipv6(ip)
-            if ip
-                .to_ipv4_mapped()
-                .is_some_and(|mapped| vpn_pool.contains(&mapped)) =>
+        url::Host::Ipv4(ip)
+            if vpn_pool.contains(&ip)
+                || ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip == std::net::Ipv4Addr::BROADCAST =>
         {
             return None;
+        }
+        url::Host::Ipv6(ip) => {
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.segments()[0] & 0xffc0 == 0xfe80
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| vpn_pool.contains(&mapped))
+            {
+                return None;
+            }
         }
         _ => {}
     }
@@ -6759,7 +6773,6 @@ mod tests {
             .as_str()
             .ok_or("node enrollment response omitted the install script")?;
         for expected_base in [
-            "http://127.0.0.1:8443",
             "https://public-a.example:8443",
             "https://public-b.example:8443",
         ] {
@@ -6776,7 +6789,7 @@ mod tests {
             String::from_utf8_lossy(&command_syntax.stderr)
         );
         let token: SignedJoinToken = serde_json::from_value(response_body["token"].clone())?;
-        assert_eq!(token.claims.bootstrap_endpoints.len(), 11);
+        assert_eq!(token.claims.bootstrap_endpoints.len(), 10);
         assert_eq!(
             token
                 .claims
@@ -6786,7 +6799,6 @@ mod tests {
                 .map(|endpoint| endpoint.url.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "http://127.0.0.1:8443",
                 "https://public-a.example:8443",
                 "https://public-b.example:8443",
             ]
@@ -8096,7 +8108,7 @@ exit 47
         let degraded_response: Value = serde_json::from_slice(&degraded_response)?;
         let degraded_token: SignedJoinToken =
             serde_json::from_value(degraded_response["token"].clone())?;
-        assert_eq!(degraded_token.claims.bootstrap_endpoints.len(), 11);
+        assert_eq!(degraded_token.claims.bootstrap_endpoints.len(), 10);
         for host in ["public-a.example", "public-b.example"] {
             assert!(degraded_token
                 .claims
