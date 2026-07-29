@@ -38,6 +38,8 @@ public_services_dir=$filesystem_root/etc/heteronetwork/public-services
 bootstrap_env=$public_services_dir/bootstrap.env
 services_env=$public_services_dir/services.env
 database_url_file=$public_services_dir/database-url
+database_autopilot_token_file=$public_services_dir/database-autopilot.token
+keycloak_autopilot_token_file=$public_services_dir/keycloak-autopilot.token
 postgres_password_file=$filesystem_root/etc/heteronetwork/postgres-autopilot/bundle/secrets/application.password
 postgres_ca_file=$filesystem_root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
 agent_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-agent.service.d
@@ -49,6 +51,8 @@ relay_status_file=
 gateway_status_file=
 services_env_tmp=
 database_url_tmp=
+database_autopilot_token_tmp=
+keycloak_autopilot_token_tmp=
 agent_drop_in_tmp=
 reconcile_finished=0
 
@@ -62,6 +66,10 @@ cleanup() {
   [ -z "$gateway_status_file" ] || rm -f "$gateway_status_file"
   [ -z "$services_env_tmp" ] || rm -f "$services_env_tmp"
   [ -z "$database_url_tmp" ] || rm -f "$database_url_tmp"
+  [ -z "$database_autopilot_token_tmp" ] ||
+    rm -f "$database_autopilot_token_tmp"
+  [ -z "$keycloak_autopilot_token_tmp" ] ||
+    rm -f "$keycloak_autopilot_token_tmp"
   [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
 }
 
@@ -130,6 +138,16 @@ demote() {
   if [ -e "$database_url_file" ] || [ -L "$database_url_file" ]; then
     demote_changed=1
     rm -f "$database_url_file" || demote_failed=1
+  fi
+  if [ -e "$database_autopilot_token_file" ] ||
+    [ -L "$database_autopilot_token_file" ]; then
+    demote_changed=1
+    rm -f "$database_autopilot_token_file" || demote_failed=1
+  fi
+  if [ -e "$keycloak_autopilot_token_file" ] ||
+    [ -L "$keycloak_autopilot_token_file" ]; then
+    demote_changed=1
+    rm -f "$keycloak_autopilot_token_file" || demote_failed=1
   fi
 
   if [ "$drop_in_removed" -eq 1 ]; then
@@ -226,6 +244,14 @@ valid_positive_integer() {
     ''|*[!0-9]*) return 1 ;;
   esac
   [ "$valid_integer_value" -ge 1 ] && [ "$valid_integer_value" -le "$valid_integer_max" ]
+}
+
+valid_autopilot_bearer_token() {
+  valid_token_value=$1
+  [ "${#valid_token_value}" -eq 64 ] || return 1
+  case "$valid_token_value" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
 }
 
 valid_ipv4() {
@@ -419,6 +445,8 @@ load_bootstrap() {
     HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64 \
     HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64 \
     HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 \
+    HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN \
+    HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN \
     HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS \
     HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS
 
@@ -458,6 +486,8 @@ load_bootstrap() {
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 || return 1
   bootstrap_control_plane_urls=$DECODED_VALUE
 
+  database_autopilot_bearer_token=${HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN-}
+  keycloak_autopilot_bearer_token=${HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN-}
   reconcile_interval_seconds=${HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS-}
   classification_max_age_seconds=${HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS-}
 
@@ -481,6 +511,8 @@ load_bootstrap() {
     ''|*[!A-Za-z0-9_.:\ -]*) return 1 ;;
   esac
   valid_url_csv "$bootstrap_control_plane_urls" 0 || return 1
+  valid_autopilot_bearer_token "$database_autopilot_bearer_token" || return 1
+  valid_autopilot_bearer_token "$keycloak_autopilot_bearer_token" || return 1
   valid_positive_integer "$reconcile_interval_seconds" 300 || return 1
   valid_positive_integer "$classification_max_age_seconds" 300 || return 1
 }
@@ -581,6 +613,46 @@ install_candidate() {
   CANDIDATE_CHANGED=1
 }
 
+install_root_credential_candidate() {
+  credential_tmp=$1
+  credential_path=$2
+
+  chown root:root "$credential_tmp" || return 1
+  chmod 0400 "$credential_tmp" || return 1
+
+  if [ -n "$filesystem_root" ]; then
+    credential_expected_uid=$(id -u)
+    credential_expected_gid=$(id -g)
+  else
+    credential_expected_uid=0
+    credential_expected_gid=0
+  fi
+  credential_expected_metadata="$credential_expected_uid $credential_expected_gid 400 1"
+
+  if [ -L "$credential_path" ]; then
+    return 1
+  fi
+  if [ -e "$credential_path" ] && [ ! -f "$credential_path" ]; then
+    return 1
+  fi
+  if [ -f "$credential_path" ]; then
+    credential_metadata=$(stat -c '%u %g %a %h' "$credential_path" 2>/dev/null) ||
+      return 1
+    if [ "$credential_metadata" = "$credential_expected_metadata" ] &&
+      cmp -s "$credential_tmp" "$credential_path"; then
+      rm -f "$credential_tmp"
+      CANDIDATE_CHANGED=0
+      return 0
+    fi
+  fi
+
+  mv -fT "$credential_tmp" "$credential_path" || return 1
+  credential_metadata=$(stat -c '%u %g %a %h' "$credential_path" 2>/dev/null) ||
+    return 1
+  [ "$credential_metadata" = "$credential_expected_metadata" ] || return 1
+  CANDIDATE_CHANGED=1
+}
+
 prepare_runtime_files() {
   mkdir -p "$public_services_dir" "$agent_drop_in_dir" || return 1
   chown root:"$service_group" "$public_services_dir" || return 1
@@ -658,6 +730,28 @@ prepare_runtime_files() {
   database_url_tmp=
   database_url_changed=$CANDIDATE_CHANGED
 
+  database_autopilot_token_tmp=$(
+    mktemp "$public_services_dir/.database-autopilot.token.XXXXXX"
+  ) || return 1
+  printf '%s\n' "$database_autopilot_bearer_token" \
+    >"$database_autopilot_token_tmp" || return 1
+  install_root_credential_candidate \
+    "$database_autopilot_token_tmp" \
+    "$database_autopilot_token_file" || return 1
+  database_autopilot_token_tmp=
+  database_autopilot_token_changed=$CANDIDATE_CHANGED
+
+  keycloak_autopilot_token_tmp=$(
+    mktemp "$public_services_dir/.keycloak-autopilot.token.XXXXXX"
+  ) || return 1
+  printf '%s\n' "$keycloak_autopilot_bearer_token" \
+    >"$keycloak_autopilot_token_tmp" || return 1
+  install_root_credential_candidate \
+    "$keycloak_autopilot_token_tmp" \
+    "$keycloak_autopilot_token_file" || return 1
+  keycloak_autopilot_token_tmp=
+  keycloak_autopilot_token_changed=$CANDIDATE_CHANGED
+
   agent_drop_in_tmp=$(mktemp "$agent_drop_in_dir/.30-public-services.conf.XXXXXX") ||
     return 1
   cat >"$agent_drop_in_tmp" <<EOF || return 1
@@ -673,7 +767,9 @@ EOF
 promote() {
   runtime_configuration_changed=0
   if [ "$services_env_changed" -eq 1 ] ||
-    [ "$database_url_changed" -eq 1 ]; then
+    [ "$database_url_changed" -eq 1 ] ||
+    [ "$database_autopilot_token_changed" -eq 1 ] ||
+    [ "$keycloak_autopilot_token_changed" -eq 1 ]; then
     runtime_configuration_changed=1
   fi
 

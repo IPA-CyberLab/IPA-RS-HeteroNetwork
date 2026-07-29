@@ -13,6 +13,8 @@ gateway_fixture=$test_root/gateway-status.json
 systemctl_log=$test_root/systemctl.log
 output_log=$test_root/output.log
 secret='DatabaseSecret_DoNotPrint_473921'
+database_autopilot_token='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+keycloak_autopilot_token='fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
 
 cleanup() {
   rm -rf "$test_root"
@@ -134,6 +136,8 @@ password_file=$test_root/root/etc/heteronetwork/postgres-autopilot/bundle/secret
 ca_file=$test_root/root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
 services_env=$public_services_dir/services.env
 database_url=$public_services_dir/database-url
+database_autopilot_token_file=$public_services_dir/database-autopilot.token
+keycloak_autopilot_token_file=$public_services_dir/keycloak-autopilot.token
 agent_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/30-public-services.conf
 
 b64() {
@@ -161,6 +165,8 @@ HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64=$(b64 http://127.0.0
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64=$(b64 '')
 HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64=$(b64 'openid profile email')
 HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64=$(b64 'https://seed-a.example,https://seed-b.example')
+HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=$database_autopilot_token
+HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=$keycloak_autopilot_token
 HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS=15
 HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS=45
 EOF
@@ -255,7 +261,12 @@ reset_auto_services() {
   set_inactive heteronetwork-control-plane.service
   set_inactive heteronetwork-signal.service
   set_inactive heteronetwork-stun.service
-  rm -f "$services_env" "$database_url" "$agent_drop_in"
+  rm -f \
+    "$services_env" \
+    "$database_url" \
+    "$database_autopilot_token_file" \
+    "$keycloak_autopilot_token_file" \
+    "$agent_drop_in"
 }
 
 run_reconciler() {
@@ -279,6 +290,12 @@ assert_demoted() {
   assert_inactive heteronetwork-stun.service
   [ ! -e "$services_env" ] || fail "service environment survived demotion"
   [ ! -e "$database_url" ] || fail "database URL survived demotion"
+  { [ ! -e "$database_autopilot_token_file" ] &&
+    [ ! -L "$database_autopilot_token_file" ]; } ||
+    fail "database autopilot credential survived demotion"
+  { [ ! -e "$keycloak_autopilot_token_file" ] &&
+    [ ! -L "$keycloak_autopilot_token_file" ]; } ||
+    fail "Keycloak autopilot credential survived demotion"
   [ ! -e "$agent_drop_in" ] || fail "Agent routes survived demotion"
 }
 
@@ -290,13 +307,27 @@ run_reconciler
 
 [ -f "$services_env" ] || fail "service environment was not generated"
 [ -f "$database_url" ] || fail "database URL was not generated"
+[ -f "$database_autopilot_token_file" ] ||
+  fail "database autopilot credential was not generated"
+[ -f "$keycloak_autopilot_token_file" ] ||
+  fail "Keycloak autopilot credential was not generated"
 [ -f "$agent_drop_in" ] || fail "Agent drop-in was not generated"
 [ "$(stat -c '%a' "$services_env")" = 640 ] ||
   fail "service environment mode is not 0640"
 [ "$(stat -c '%a' "$database_url")" = 400 ] ||
   fail "database URL mode is not 0400"
+[ "$(stat -c '%a' "$database_autopilot_token_file")" = 400 ] ||
+  fail "database autopilot credential mode is not 0400"
+[ "$(stat -c '%a' "$keycloak_autopilot_token_file")" = 400 ] ||
+  fail "Keycloak autopilot credential mode is not 0400"
 [ "$(stat -c '%a' "$agent_drop_in")" = 644 ] ||
   fail "Agent drop-in mode is not 0644"
+[ "$(tr -d '\r\n' <"$database_autopilot_token_file")" = \
+    "$database_autopilot_token" ] ||
+  fail "database autopilot credential content is wrong"
+[ "$(tr -d '\r\n' <"$keycloak_autopilot_token_file")" = \
+    "$keycloak_autopilot_token" ] ||
+  fail "Keycloak autopilot credential content is wrong"
 assert_active heteronetwork-signal.service
 assert_active heteronetwork-stun.service
 assert_active heteronetwork-control-plane.service
@@ -307,6 +338,14 @@ fi
 grep -Fqx \
   'LoadCredential=database-url:/etc/heteronetwork/public-services/database-url' \
   "$control_plane_unit" || fail "Control Plane database credential is not loaded by systemd"
+grep -Fqx \
+  'LoadCredential=database-autopilot.token:/etc/heteronetwork/public-services/database-autopilot.token' \
+  "$control_plane_unit" ||
+  fail "Control Plane database autopilot credential is not loaded by systemd"
+grep -Fqx \
+  'LoadCredential=keycloak-autopilot.token:/etc/heteronetwork/public-services/keycloak-autopilot.token' \
+  "$control_plane_unit" ||
+  fail "Control Plane Keycloak autopilot credential is not loaded by systemd"
 grep -q '^HETERONETWORK_LISTEN="10.250.0.4:19088"$' "$services_env" ||
   fail "automatic Control Plane listen address is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://10.250.0.4:19088"$' \
@@ -343,6 +382,10 @@ fi
 if grep -q 'NODE_ENROLLMENT_ISSUER_PRIVATE_KEY' "$services_env"; then
   fail "automatic Control Plane received a private enrollment signer"
 fi
+if grep -Fq "$database_autopilot_token" "$services_env" ||
+  grep -Fq "$keycloak_autopilot_token" "$services_env"; then
+  fail "an autopilot credential was written to the service environment"
+fi
 
 signal_start_line=$(grep -n '^start heteronetwork-signal.service$' "$systemctl_log" |
   cut -d: -f1)
@@ -365,6 +408,8 @@ fi
 
 services_checksum=$(cksum "$services_env")
 database_checksum=$(cksum "$database_url")
+database_autopilot_token_checksum=$(cksum "$database_autopilot_token_file")
+keycloak_autopilot_token_checksum=$(cksum "$keycloak_autopilot_token_file")
 drop_in_checksum=$(cksum "$agent_drop_in")
 chmod 0640 "$database_url"
 run_reconciler
@@ -374,12 +419,61 @@ run_reconciler
   fail "idempotent run rewrote the database URL"
 [ "$(stat -c '%a' "$database_url")" = 400 ] ||
   fail "idempotent run did not repair database URL permissions"
+[ "$(cksum "$database_autopilot_token_file")" = \
+    "$database_autopilot_token_checksum" ] ||
+  fail "idempotent run rewrote the database autopilot credential"
+[ "$(cksum "$keycloak_autopilot_token_file")" = \
+    "$keycloak_autopilot_token_checksum" ] ||
+  fail "idempotent run rewrote the Keycloak autopilot credential"
 [ "$(cksum "$agent_drop_in")" = "$drop_in_checksum" ] ||
   fail "idempotent run rewrote the Agent drop-in"
 if grep -Eq '^(start|stop|restart|kill) ' "$systemctl_log"; then
   fail "idempotent run changed a service"
 fi
 
+chmod 0640 "$database_autopilot_token_file" "$keycloak_autopilot_token_file"
+run_reconciler
+[ "$(stat -c '%a' "$database_autopilot_token_file")" = 400 ] ||
+  fail "database autopilot credential permissions were not repaired"
+[ "$(stat -c '%a' "$keycloak_autopilot_token_file")" = 400 ] ||
+  fail "Keycloak autopilot credential permissions were not repaired"
+
+sed -i \
+  's/^HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/' \
+  "$public_services_dir/bootstrap.env"
+run_reconciler
+assert_demoted
+sed -i \
+  "s/^HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=$database_autopilot_token/" \
+  "$public_services_dir/bootstrap.env"
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+run_reconciler
+sed -i \
+  "s/^HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=${keycloak_autopilot_token%?}/" \
+  "$public_services_dir/bootstrap.env"
+run_reconciler
+assert_demoted
+sed -i \
+  "s/^HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=$keycloak_autopilot_token/" \
+  "$public_services_dir/bootstrap.env"
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+ln -s "$test_root/credential-symlink-target" "$database_autopilot_token_file"
+run_reconciler
+assert_demoted
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+run_reconciler
 write_status private "$fresh_time"
 run_reconciler
 assert_demoted
@@ -468,8 +562,13 @@ run_reconciler
 rm -f "$fake_state/fail-start-heteronetwork-control-plane.service"
 assert_demoted
 
-if grep -Fq "$secret" "$output_log" || grep -Fq "$secret" "$systemctl_log"; then
-  fail "a database secret was printed"
+if grep -Fq "$secret" "$output_log" ||
+  grep -Fq "$secret" "$systemctl_log" ||
+  grep -Fq "$database_autopilot_token" "$output_log" ||
+  grep -Fq "$database_autopilot_token" "$systemctl_log" ||
+  grep -Fq "$keycloak_autopilot_token" "$output_log" ||
+  grep -Fq "$keycloak_autopilot_token" "$systemctl_log"; then
+  fail "a secret was printed"
 fi
 
 printf '%s\n' 'public-services autopilot smoke: ok'

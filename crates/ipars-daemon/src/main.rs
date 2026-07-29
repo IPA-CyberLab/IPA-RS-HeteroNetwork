@@ -166,6 +166,7 @@ const MAX_OVERLAY_DNS_TCP_CONNECTIONS: usize = 64;
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
+const AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES: usize = 64;
 const MAX_KUBERNETES_SERVICE_ACCOUNT_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KUBERNETES_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_KUBERNETES_SERVICES_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
@@ -248,6 +249,8 @@ const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID: &str = "node-enrollment-issuer.key";
+const DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID: &str = "database-autopilot.token";
+const KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID: &str = "keycloak-autopilot.token";
 const DATABASE_URL_CREDENTIAL_ID: &str = "database-url";
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
@@ -468,6 +471,10 @@ struct ControlPlaneArgs {
         env = "HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN_PATH"
     )]
     operator_api_bearer_token_path: Option<PathBuf>,
+    #[arg(long, env = "HETERONETWORK_DATABASE_AUTOPILOT_BEARER_TOKEN_PATH")]
+    database_autopilot_bearer_token_path: Option<PathBuf>,
+    #[arg(long, env = "HETERONETWORK_KEYCLOAK_AUTOPILOT_BEARER_TOKEN_PATH")]
+    keycloak_autopilot_bearer_token_path: Option<PathBuf>,
     #[arg(
         long,
         env = "HETERONETWORK_WEB_UI_ENABLED",
@@ -2566,6 +2573,17 @@ fn validate_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
     if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         anyhow::bail!("{label} must contain only printable non-whitespace ASCII characters");
     }
+    Ok(())
+}
+
+fn validate_autopilot_api_bearer_token(token: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        token.len() == AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} must contain exactly {AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES} lowercase hexadecimal characters"
+    );
     Ok(())
 }
 
@@ -4763,6 +4781,7 @@ where
         .map_err(anyhow::Error::msg)
         .context("dynamic Web gateway configuration")?;
     let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
+    let autopilot_api_bearer_tokens = control_plane_autopilot_api_bearer_tokens(&args)?;
     let node_enrollment = control_plane_node_enrollment_config(&args)?;
     let web_ui_auth = if args.web_ui_enabled {
         let provider = WebAuthProvider::parse(&args.web_auth_provider)
@@ -4855,6 +4874,18 @@ where
     let mut http_state = ControlPlaneHttpState::new(plane, join_service);
     if let Some(token) = operator_api_bearer_token {
         http_state = http_state.require_operator_api_bearer_token(token);
+    }
+    if let Some(token) = autopilot_api_bearer_tokens.database {
+        http_state = http_state
+            .require_database_autopilot_bearer_token(token)
+            .map_err(anyhow::Error::msg)
+            .context("database autopilot API bearer token configuration")?;
+    }
+    if let Some(token) = autopilot_api_bearer_tokens.keycloak {
+        http_state = http_state
+            .require_keycloak_autopilot_bearer_token(token)
+            .map_err(anyhow::Error::msg)
+            .context("Keycloak autopilot API bearer token configuration")?;
     }
     if let Some(auth) = web_ui_auth {
         http_state = http_state.enable_web_ui(auth);
@@ -5310,6 +5341,55 @@ fn control_plane_operator_api_bearer_token(
         return Ok(None);
     };
     read_api_bearer_token_file(path, "control-plane operator API").map(Some)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ControlPlaneAutopilotApiBearerTokens {
+    database: Option<String>,
+    keycloak: Option<String>,
+}
+
+fn control_plane_autopilot_api_bearer_tokens(
+    args: &ControlPlaneArgs,
+) -> anyhow::Result<ControlPlaneAutopilotApiBearerTokens> {
+    let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from);
+    Ok(ControlPlaneAutopilotApiBearerTokens {
+        database: control_plane_autopilot_api_bearer_token_from_sources(
+            args.database_autopilot_bearer_token_path.as_deref(),
+            credential_directory.as_deref(),
+            DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID,
+            "database autopilot API",
+        )?,
+        keycloak: control_plane_autopilot_api_bearer_token_from_sources(
+            args.keycloak_autopilot_bearer_token_path.as_deref(),
+            credential_directory.as_deref(),
+            KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID,
+            "Keycloak autopilot API",
+        )?,
+    })
+}
+
+fn control_plane_autopilot_api_bearer_token_from_sources(
+    explicit_path: Option<&Path>,
+    credential_directory: Option<&Path>,
+    credential_id: &str,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    let token = if let Some(path) = explicit_path {
+        read_bounded_bearer_token_file(path, label)?
+    } else {
+        let Some(path) = credential_directory.map(|directory| directory.join(credential_id)) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_systemd_credential_file(&path, label)?
+    };
+    validate_autopilot_api_bearer_token(&token, &format!("{label} bearer token file"))?;
+    Ok(Some(token))
 }
 
 async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
@@ -23355,6 +23435,91 @@ mod tests {
             Some(token)
         );
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_autopilot_auth_loads_separate_file_backed_tokens() -> anyhow::Result<()> {
+        let database_token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let keycloak_token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let directory = unique_test_dir("control-plane-autopilot-tokens")?;
+        let database_path = directory.join(DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID);
+        let keycloak_path = directory.join(KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID);
+        write_private_test_secret(&database_path, format!("{database_token}\n"))?;
+        write_private_test_secret(&keycloak_path, format!("{keycloak_token}\n"))?;
+        let issuer_public_key = IdentityKeyPair::generate().public_key_b64();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            issuer_public_key.as_str(),
+            "--database-autopilot-bearer-token-path",
+            database_path
+                .to_str()
+                .context("database token path must be UTF-8")?,
+            "--keycloak-autopilot-bearer-token-path",
+            keycloak_path
+                .to_str()
+                .context("Keycloak token path must be UTF-8")?,
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        let tokens = control_plane_autopilot_api_bearer_tokens(&args)?;
+        assert_eq!(tokens.database.as_deref(), Some(database_token));
+        assert_eq!(tokens.keycloak.as_deref(), Some(keycloak_token));
+
+        assert_eq!(
+            control_plane_autopilot_api_bearer_token_from_sources(
+                Some(&database_path),
+                None,
+                DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID,
+                "database autopilot API",
+            )?
+            .as_deref(),
+            Some(database_token)
+        );
+        assert_eq!(
+            control_plane_autopilot_api_bearer_token_from_sources(
+                None,
+                None,
+                KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID,
+                "Keycloak autopilot API",
+            )?,
+            None
+        );
+
+        write_private_test_secret(
+            &keycloak_path,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbB",
+        )?;
+        let invalid = control_plane_autopilot_api_bearer_token_from_sources(
+            Some(&keycloak_path),
+            None,
+            KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID,
+            "Keycloak autopilot API",
+        )
+        .expect_err("uppercase hexadecimal token must be rejected");
+        assert!(invalid.to_string().contains("lowercase hexadecimal"));
+
+        let systemd_policy_error = control_plane_autopilot_api_bearer_token_from_sources(
+            None,
+            Some(&directory),
+            DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID,
+            "database autopilot API",
+        )
+        .expect_err("owner-only file must not bypass systemd credential validation");
+        assert!(systemd_policy_error
+            .to_string()
+            .contains("systemd credential"));
+
+        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 

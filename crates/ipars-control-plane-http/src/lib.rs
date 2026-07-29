@@ -50,6 +50,7 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 
 const MAX_OPERATOR_API_BEARER_TOKEN_BYTES: usize = 512;
+const AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES: usize = 64;
 const MIN_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_RELAY_ADMISSION_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_WEB_OIDC_LOGIN_STATES: usize = 1024;
@@ -395,10 +396,25 @@ fn validate_relay_admission_bearer_token(value: &str, label: &str) -> Result<(),
     Ok(())
 }
 
+fn validate_autopilot_api_bearer_token(value: &str, label: &str) -> Result<(), String> {
+    if value.len() != AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{label} must contain exactly {AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES} lowercase hexadecimal characters"
+        ));
+    }
+    Ok(())
+}
+
 pub struct ControlPlaneHttpState<S, L> {
     plane: Arc<ControlPlane<S>>,
     join_service: Arc<ControlPlaneJoinService<S, L>>,
     operator_api_bearer_token: Option<Arc<str>>,
+    database_autopilot_bearer_token: Option<Arc<str>>,
+    keycloak_autopilot_bearer_token: Option<Arc<str>>,
     web_ui_auth: Option<Arc<WebUiAuthConfig>>,
     node_enrollment: Option<Arc<NodeEnrollmentConfig>>,
     dynamic_web_gateway: Option<Arc<DynamicWebGatewayConfig>>,
@@ -458,6 +474,8 @@ impl<S, L> Clone for ControlPlaneHttpState<S, L> {
             plane: self.plane.clone(),
             join_service: self.join_service.clone(),
             operator_api_bearer_token: self.operator_api_bearer_token.clone(),
+            database_autopilot_bearer_token: self.database_autopilot_bearer_token.clone(),
+            keycloak_autopilot_bearer_token: self.keycloak_autopilot_bearer_token.clone(),
             web_ui_auth: self.web_ui_auth.clone(),
             node_enrollment: self.node_enrollment.clone(),
             dynamic_web_gateway: self.dynamic_web_gateway.clone(),
@@ -475,6 +493,8 @@ impl<S, L> ControlPlaneHttpState<S, L> {
             plane,
             join_service,
             operator_api_bearer_token: None,
+            database_autopilot_bearer_token: None,
+            keycloak_autopilot_bearer_token: None,
             web_ui_auth: None,
             node_enrollment: None,
             dynamic_web_gateway: None,
@@ -485,6 +505,24 @@ impl<S, L> ControlPlaneHttpState<S, L> {
     pub fn require_operator_api_bearer_token(mut self, token: String) -> Self {
         self.operator_api_bearer_token = Some(Arc::from(token));
         self
+    }
+
+    pub fn require_database_autopilot_bearer_token(
+        mut self,
+        token: String,
+    ) -> Result<Self, String> {
+        validate_autopilot_api_bearer_token(&token, "database autopilot API bearer token")?;
+        self.database_autopilot_bearer_token = Some(Arc::from(token));
+        Ok(self)
+    }
+
+    pub fn require_keycloak_autopilot_bearer_token(
+        mut self,
+        token: String,
+    ) -> Result<Self, String> {
+        validate_autopilot_api_bearer_token(&token, "Keycloak autopilot API bearer token")?;
+        self.keycloak_autopilot_bearer_token = Some(Arc::from(token));
+        Ok(self)
     }
 
     pub fn enable_web_ui(mut self, auth: WebUiAuthConfig) -> Self {
@@ -500,6 +538,36 @@ impl<S, L> ControlPlaneHttpState<S, L> {
     pub fn enable_dynamic_web_gateway(mut self, config: DynamicWebGatewayConfig) -> Self {
         self.dynamic_web_gateway = Some(Arc::new(config));
         self
+    }
+
+    fn resolved_database_autopilot_bearer_token(&self) -> Option<Arc<str>>
+    where
+        S: ControlPlaneStore,
+    {
+        self.database_autopilot_bearer_token.clone().or_else(|| {
+            self.node_enrollment.as_deref().map(|enrollment| {
+                Arc::from(derive_node_enrollment_cluster_secret(
+                    enrollment,
+                    &self.plane.config().cluster_id,
+                    b"heteronetwork-postgres-ha-autopilot-v1",
+                ))
+            })
+        })
+    }
+
+    fn resolved_keycloak_autopilot_bearer_token(&self) -> Option<Arc<str>>
+    where
+        S: ControlPlaneStore,
+    {
+        self.keycloak_autopilot_bearer_token.clone().or_else(|| {
+            self.node_enrollment.as_deref().map(|enrollment| {
+                Arc::from(derive_node_enrollment_cluster_secret(
+                    enrollment,
+                    &self.plane.config().cluster_id,
+                    b"heteronetwork-keycloak-autopilot-v1",
+                ))
+            })
+        })
     }
 }
 
@@ -537,12 +605,8 @@ where
             "/v1/install/iparsd-linux-amd64",
             get(node_enrollment_binary::<S, L>),
         );
-    let protocol = if let Some(enrollment) = state.node_enrollment.as_deref() {
-        let bearer_token: Arc<str> = Arc::from(derive_node_enrollment_cluster_secret(
-            enrollment,
-            &state.plane.config().cluster_id,
-            b"heteronetwork-postgres-ha-autopilot-v1",
-        ));
+    let database_autopilot_bearer_token = state.resolved_database_autopilot_bearer_token();
+    let protocol = if let Some(bearer_token) = database_autopilot_bearer_token {
         let database_autopilot = Router::new()
             .route(
                 "/v1/database-autopilot/nodes",
@@ -553,11 +617,12 @@ where
                 bearer_token,
                 require_database_autopilot_bearer,
             ));
-        let keycloak_bearer_token: Arc<str> = Arc::from(derive_node_enrollment_cluster_secret(
-            enrollment,
-            &state.plane.config().cluster_id,
-            b"heteronetwork-keycloak-autopilot-v1",
-        ));
+        protocol.merge(database_autopilot)
+    } else {
+        protocol
+    };
+    let keycloak_autopilot_bearer_token = state.resolved_keycloak_autopilot_bearer_token();
+    let protocol = if let Some(bearer_token) = keycloak_autopilot_bearer_token {
         let keycloak_autopilot = Router::new()
             .route(
                 "/v1/keycloak-autopilot/reconcile",
@@ -565,10 +630,10 @@ where
                     .layer(DefaultBodyLimit::max(MAX_KEYCLOAK_AUTOPILOT_REQUEST_BYTES)),
             )
             .route_layer(middleware::from_fn_with_state(
-                keycloak_bearer_token,
+                bearer_token,
                 require_keycloak_autopilot_bearer,
             ));
-        protocol.merge(database_autopilot).merge(keycloak_autopilot)
+        protocol.merge(keycloak_autopilot)
     } else {
         protocol
     };
@@ -2463,8 +2528,28 @@ where
         .await
         .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     let encoded_token = encode_node_enrollment_authorization(&token)?;
-    let install_script =
-        node_enrollment_install_script(enrollment, &token, &encoded_token, &bootstrap_endpoints);
+    let database_autopilot_bearer_token = state
+        .resolved_database_autopilot_bearer_token()
+        .ok_or_else(|| {
+            NodeEnrollmentApiError::unavailable(
+                "database autopilot API bearer token is not configured",
+            )
+        })?;
+    let keycloak_autopilot_bearer_token = state
+        .resolved_keycloak_autopilot_bearer_token()
+        .ok_or_else(|| {
+            NodeEnrollmentApiError::unavailable(
+                "Keycloak autopilot API bearer token is not configured",
+            )
+        })?;
+    let install_script = node_enrollment_install_script(
+        enrollment,
+        &token,
+        &encoded_token,
+        &bootstrap_endpoints,
+        &database_autopilot_bearer_token,
+        &keycloak_autopilot_bearer_token,
+    );
     let install_command =
         node_enrollment_install_command(enrollment, &encoded_token, &bootstrap_endpoints);
     let payload = AdminNodeEnrollmentResponse {
@@ -2901,11 +2986,27 @@ where
     let enrollment = authorize_node_enrollment(&state, &headers).await?;
     let token = decode_node_enrollment_authorization(&headers)?;
     let encoded_token = encode_node_enrollment_authorization(&token)?;
+    let database_autopilot_bearer_token = state
+        .resolved_database_autopilot_bearer_token()
+        .ok_or_else(|| {
+            NodeEnrollmentApiError::unavailable(
+                "database autopilot API bearer token is not configured",
+            )
+        })?;
+    let keycloak_autopilot_bearer_token = state
+        .resolved_keycloak_autopilot_bearer_token()
+        .ok_or_else(|| {
+            NodeEnrollmentApiError::unavailable(
+                "Keycloak autopilot API bearer token is not configured",
+            )
+        })?;
     let script = node_enrollment_install_script(
         &enrollment,
         &token,
         &encoded_token,
         &token.claims.bootstrap_endpoints,
+        &database_autopilot_bearer_token,
+        &keycloak_autopilot_bearer_token,
     );
     let mut response = (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
@@ -2976,6 +3077,8 @@ fn node_enrollment_install_script(
     token: &SignedJoinToken,
     encoded_token: &str,
     bootstrap_endpoints: &[BootstrapEndpoint],
+    database_autopilot_bearer_token: &str,
+    keycloak_autopilot_bearer_token: &str,
 ) -> String {
     const TEMPLATE: &str = r#"#!/bin/sh
 set -eu
@@ -3711,13 +3814,20 @@ echo "HeteroNetwork node enrolled and started"
     let setup_install = kubernetes_ha_enrollment_setup(token, encoded_token)
         .map(kubernetes_ha_install_script)
         .unwrap_or_default();
-    let database_install = postgres_ha_install_script(enrollment, token);
+    let database_install =
+        postgres_ha_install_script(enrollment, token, database_autopilot_bearer_token);
     let relay_admission_install = relay_admission_install_script(enrollment, token);
     let relay_autopilot_start = relay_autopilot_start_script(token);
-    let public_services_install =
-        public_services_install_script(enrollment, token, bootstrap_endpoints);
+    let public_services_install = public_services_install_script(
+        enrollment,
+        token,
+        bootstrap_endpoints,
+        database_autopilot_bearer_token,
+        keycloak_autopilot_bearer_token,
+    );
     let public_services_start = public_services_start_script(enrollment);
-    let keycloak_install = keycloak_autopilot_install_script(enrollment, token);
+    let keycloak_install =
+        keycloak_autopilot_install_script(enrollment, token, keycloak_autopilot_bearer_token);
     let keycloak_start = keycloak_autopilot_start_script(enrollment);
     TEMPLATE
         .replace("__AUTH__", encoded_token)
@@ -4518,6 +4628,8 @@ fn public_services_install_script(
     enrollment: &NodeEnrollmentConfig,
     token: &SignedJoinToken,
     bootstrap_endpoints: &[BootstrapEndpoint],
+    database_autopilot_bearer_token: &str,
+    keycloak_autopilot_bearer_token: &str,
 ) -> String {
     let Some(config) = enrollment.public_services.as_deref() else {
         return String::new();
@@ -4581,6 +4693,8 @@ HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64={oidc_backchannel_ba
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64={oidc_backchannel_fallback_base_urls}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64={oidc_scopes}
 HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64={control_plane_urls}
+HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN={database_autopilot_bearer_token}
+HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN={keycloak_autopilot_bearer_token}
 HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS={reconcile_interval}
 HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS={classification_max_age}
 HETERONETWORK_PUBLIC_SERVICES_ENV
@@ -4628,6 +4742,8 @@ else
     /etc/heteronetwork/public-services/bootstrap.env \
     /etc/heteronetwork/public-services/services.env \
     /etc/heteronetwork/public-services/database-url \
+    /etc/heteronetwork/public-services/database-autopilot.token \
+    /etc/heteronetwork/public-services/keycloak-autopilot.token \
     /opt/heteronetwork/libexec/public-services-autopilot.sh \
     /etc/systemd/system/heteronetwork-control-plane.service \
     /etc/systemd/system/heteronetwork-signal.service \
@@ -4651,6 +4767,8 @@ fi
         oidc_backchannel_fallback_base_urls = encode(&oidc_backchannel_fallback_base_urls),
         oidc_scopes = encode(&config.oidc_scopes),
         control_plane_urls = encode(&control_plane_urls),
+        database_autopilot_bearer_token = database_autopilot_bearer_token,
+        keycloak_autopilot_bearer_token = keycloak_autopilot_bearer_token,
         reconcile_interval = NODE_ENROLLMENT_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS,
         classification_max_age = NODE_ENROLLMENT_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS,
         control_plane_unit = PUBLIC_SERVICES_CONTROL_PLANE_UNIT,
@@ -4680,6 +4798,7 @@ fi
 fn postgres_ha_install_script(
     enrollment: &NodeEnrollmentConfig,
     token: &SignedJoinToken,
+    bearer_token: &str,
 ) -> String {
     let helper = STANDARD.encode(POSTGRES_HA_NODE_SCRIPT.as_bytes());
     let autopilot = STANDARD.encode(POSTGRES_HA_AUTOPILOT_SCRIPT.as_bytes());
@@ -4702,11 +4821,6 @@ fn postgres_ha_install_script(
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let bearer_token = derive_node_enrollment_cluster_secret(
-        enrollment,
-        &token.claims.cluster_id,
-        b"heteronetwork-postgres-ha-autopilot-v1",
-    );
     format!(
         r#"install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
 install -d -o root -g root -m 0700 /etc/heteronetwork/postgres-autopilot
@@ -4743,6 +4857,7 @@ echo "Automatic PostgreSQL HA placement scheduled"
 fn keycloak_autopilot_install_script(
     enrollment: &NodeEnrollmentConfig,
     token: &SignedJoinToken,
+    bearer_token: &str,
 ) -> String {
     let Some(public_services) = enrollment.public_services.as_deref() else {
         return String::new();
@@ -4775,11 +4890,6 @@ fn keycloak_autopilot_install_script(
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let bearer_token = derive_node_enrollment_cluster_secret(
-        enrollment,
-        &token.claims.cluster_id,
-        b"heteronetwork-keycloak-autopilot-v1",
-    );
     format!(
         r#"if [ "$public_services_enabled" -eq 1 ]; then
   install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
@@ -6639,6 +6749,10 @@ mod tests {
 
     const OPERATOR_API_BEARER_TOKEN: &str = "control-plane-test-operator-token-32-bytes";
     const RELAY_ADMISSION_BEARER_TOKEN: &str = "control-plane-test-relay-admission-token-32-bytes";
+    const DATABASE_AUTOPILOT_BEARER_TOKEN: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEYCLOAK_AUTOPILOT_BEARER_TOKEN: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     use super::*;
 
@@ -7897,6 +8011,153 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn explicit_autopilot_bearer_builders_require_lowercase_sha256_hex(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemoryStore::default());
+        let plane = Arc::new(ControlPlane::new(
+            ControlPlaneConfig::new(
+                ClusterId::from_string("cluster-autopilot-auth"),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store,
+        ));
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            Arc::new(InMemoryTokenLedger::default()),
+            IssuerKeyRing::default(),
+        ));
+        let state = ControlPlaneHttpState::new(plane, join_service);
+
+        assert!(state
+            .clone()
+            .require_database_autopilot_bearer_token(DATABASE_AUTOPILOT_BEARER_TOKEN.to_string())
+            .is_ok());
+        assert!(state
+            .clone()
+            .require_keycloak_autopilot_bearer_token(KEYCLOAK_AUTOPILOT_BEARER_TOKEN.to_string())
+            .is_ok());
+        for invalid in [
+            "a".repeat(AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES - 1),
+            "a".repeat(AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES + 1),
+            format!("{}A", "a".repeat(AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES - 1)),
+            format!("{}g", "a".repeat(AUTOPILOT_API_BEARER_TOKEN_HEX_BYTES - 1)),
+        ] {
+            assert!(state
+                .clone()
+                .require_database_autopilot_bearer_token(invalid.clone())
+                .is_err());
+            assert!(state
+                .clone()
+                .require_keycloak_autopilot_bearer_token(invalid)
+                .is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_autopilot_bearers_work_without_node_enrollment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = IdentityKeyPair::generate();
+        let key_id = KeyId::from_string("root");
+        let cluster_id = ClusterId::from_string("cluster-explicit-autopilot-auth");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = Arc::new(ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        ));
+        let node = plane
+            .register_with_claims(
+                claims(cluster_id.clone(), issuer.node_id(), key_id),
+                registration("explicit-autopilot-node"),
+            )
+            .await?
+            .node;
+        store
+            .upsert_health(
+                node.node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.0),
+                    message: None,
+                },
+            )
+            .await?;
+        let join_service = Arc::new(ControlPlaneJoinService::new(
+            plane.clone(),
+            Arc::new(InMemoryTokenLedger::default()),
+            IssuerKeyRing::default(),
+        ));
+        let state = ControlPlaneHttpState::new(plane, join_service)
+            .require_database_autopilot_bearer_token(DATABASE_AUTOPILOT_BEARER_TOKEN.to_string())
+            .map_err(std::io::Error::other)?
+            .require_keycloak_autopilot_bearer_token(KEYCLOAK_AUTOPILOT_BEARER_TOKEN.to_string())
+            .map_err(std::io::Error::other)?;
+        assert!(state.node_enrollment.is_none());
+        let app = router(state);
+
+        let database_request = serde_json::to_vec(&serde_json::json!({
+            "selection_epoch": 1,
+            "member_node_ids": [node.node_id.as_str()]
+        }))?;
+        for (authorization, expected_status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (
+                Some(KEYCLOAK_AUTOPILOT_BEARER_TOKEN),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (Some(DATABASE_AUTOPILOT_BEARER_TOKEN), StatusCode::OK),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/database-autopilot/nodes")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = authorization {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(database_request.clone()))?)
+                .await?;
+            assert_eq!(response.status(), expected_status);
+        }
+
+        let keycloak_request = serde_json::to_vec(&serde_json::json!({
+            "node_id": node.node_id.as_str(),
+            "vpn_ip": node.vpn_ip.to_string(),
+            "eligible": true,
+            "ready": false,
+            "version": KEYCLOAK_AUTOPILOT_VERSION
+        }))?;
+        for (authorization, expected_status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (
+                Some(DATABASE_AUTOPILOT_BEARER_TOKEN),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (Some(KEYCLOAK_AUTOPILOT_BEARER_TOKEN), StatusCode::OK),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/keycloak-autopilot/reconcile")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = authorization {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(keycloak_request.clone()))?)
+                .await?;
+            assert_eq!(response.status(), expected_status);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn node_enrollment_issues_ha_single_use_token_and_protects_artifacts(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8455,6 +8716,16 @@ mod tests {
             .contains("HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS=45"));
         assert!(generated_script
             .contains("HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS=15"));
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN={database_autopilot_bearer}"
+        )));
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN={keycloak_autopilot_bearer}"
+        )));
+        assert!(generated_script
+            .contains("/etc/heteronetwork/public-services/database-autopilot.token"));
+        assert!(generated_script
+            .contains("/etc/heteronetwork/public-services/keycloak-autopilot.token"));
         assert!(generated_script.contains("Automatic public-service promotion scheduled"));
         assert!(generated_script.contains("if [ \"$relay_enabled\" -eq 1 ]; then"));
         assert!(generated_script.contains(
