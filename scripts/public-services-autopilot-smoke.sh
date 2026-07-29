@@ -7,6 +7,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-public-services-smoke.XXXXX
 fake_bin=$test_root/fake-bin
 fake_state=$test_root/fake-state
 fixture=$test_root/status.json
+relay_fixture=$test_root/relay-status.json
 systemctl_log=$test_root/systemctl.log
 output_log=$test_root/output.log
 secret='DatabaseSecret_DoNotPrint_473921'
@@ -25,7 +26,19 @@ mkdir -p "$fake_bin" "$fake_state/active"
 
 cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-cat "$HETERONETWORK_SMOKE_STATUS_FIXTURE"
+last_argument=
+for last_argument do :; done
+case "$last_argument" in
+  http://127.0.0.1:9780/v1/status)
+    cat "$HETERONETWORK_SMOKE_STATUS_FIXTURE"
+    ;;
+  http://*/v1/status)
+    cat "$HETERONETWORK_SMOKE_RELAY_STATUS_FIXTURE"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
 EOF
 
 cat >"$fake_bin/pg_isready" <<'EOF'
@@ -106,13 +119,13 @@ export PATH=$fake_bin:/usr/bin:/bin
 export HETERONETWORK_PUBLIC_SERVICES_TESTING=1
 export HETERONETWORK_PUBLIC_SERVICES_TEST_ROOT=$test_root/root
 export HETERONETWORK_SMOKE_STATUS_FIXTURE=$fixture
+export HETERONETWORK_SMOKE_RELAY_STATUS_FIXTURE=$relay_fixture
 export HETERONETWORK_SMOKE_STATE=$fake_state
 export HETERONETWORK_SMOKE_SYSTEMCTL_LOG=$systemctl_log
 
 public_services_dir=$test_root/root/etc/heteronetwork/public-services
 password_file=$test_root/root/etc/heteronetwork/postgres-autopilot/bundle/secrets/application.password
 ca_file=$test_root/root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
-relay_env=$test_root/root/etc/heteronetwork/relay-autopilot/relay.env
 services_env=$public_services_dir/services.env
 database_url=$public_services_dir/database-url
 agent_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/30-public-services.conf
@@ -177,6 +190,22 @@ write_status() {
 EOF
 }
 
+write_relay_status() {
+  relay_status_endpoint=$1
+  relay_status_health=${2:-healthy}
+  cat >"$relay_fixture" <<EOF
+{
+  "relay_node": "node-0e1c0dadf2fab64e23dfe42c9a073f1b",
+  "health": "$relay_status_health",
+  "capability": {
+    "enabled_by_policy": true,
+    "public_endpoint": "$relay_status_endpoint",
+    "admission_url": "http://10.250.0.4:18447"
+  }
+}
+EOF
+}
+
 set_active() {
   : >"$fake_state/active/$1"
 }
@@ -187,11 +216,10 @@ set_inactive() {
 
 prepare_dependencies() {
   dependency_relay_endpoint=${1:-163.220.236.51:18445}
-  mkdir -p "$(dirname "$password_file")" "$(dirname "$ca_file")" "$(dirname "$relay_env")"
+  mkdir -p "$(dirname "$password_file")" "$(dirname "$ca_file")"
   printf '%s\n' "$secret" >"$password_file"
   printf '%s\n' 'test-ca' >"$ca_file"
-  printf '%s\n' \
-    "HETERONETWORK_RELAY_PUBLIC_ENDPOINT=$dependency_relay_endpoint" >"$relay_env"
+  write_relay_status "$dependency_relay_endpoint"
   rm -f "$fake_state/postgres-down"
   set_active heteronetwork-agent.service
   set_active heteronetwork-gateway.service
@@ -339,8 +367,7 @@ reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time"
 run_reconciler
-printf '%s\n' \
-  'HETERONETWORK_RELAY_PUBLIC_ENDPOINT=163.220.236.52:18445' >"$relay_env"
+write_relay_status '163.220.236.52:18445'
 run_reconciler
 assert_demoted
 

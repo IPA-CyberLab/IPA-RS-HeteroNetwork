@@ -40,12 +40,12 @@ services_env=$public_services_dir/services.env
 database_url_file=$public_services_dir/database-url
 postgres_password_file=$filesystem_root/etc/heteronetwork/postgres-autopilot/bundle/secrets/application.password
 postgres_ca_file=$filesystem_root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
-relay_env=$filesystem_root/etc/heteronetwork/relay-autopilot/relay.env
 agent_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-agent.service.d
 agent_drop_in=$agent_drop_in_dir/30-public-services.conf
 runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
 
 status_file=
+relay_status_file=
 services_env_tmp=
 database_url_tmp=
 agent_drop_in_tmp=
@@ -57,6 +57,7 @@ log() {
 
 cleanup() {
   [ -z "$status_file" ] || rm -f "$status_file"
+  [ -z "$relay_status_file" ] || rm -f "$relay_status_file"
   [ -z "$services_env_tmp" ] || rm -f "$services_env_tmp"
   [ -z "$database_url_tmp" ] || rm -f "$database_url_tmp"
   [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
@@ -495,11 +496,27 @@ postgres_proxy_is_ready() {
   return 1
 }
 
-relay_endpoint_matches() {
-  [ -f "$relay_env" ] && [ ! -L "$relay_env" ] || return 1
-  configured_relay_endpoint=$(sed -n \
-    's/^HETERONETWORK_RELAY_PUBLIC_ENDPOINT=//p' "$relay_env")
-  [ "$configured_relay_endpoint" = "$relay_public_endpoint" ]
+relay_is_ready() {
+  relay_status_file=$(mktemp "$runtime_dir/relay-status.XXXXXX") || return 1
+  if ! curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
+    "$relay_status_url" >"$relay_status_file"; then
+    return 1
+  fi
+  if ! jq -e \
+    --arg node_id "$node_id" \
+    --arg public_endpoint "$relay_public_endpoint" \
+    --arg admission_url "$relay_admission_url" '
+      (.relay_node == $node_id)
+      and (.health == "healthy")
+      and (.capability | type == "object")
+      and (.capability.enabled_by_policy == true)
+      and (.capability.public_endpoint == $public_endpoint)
+      and (.capability.admission_url == $admission_url)
+    ' "$relay_status_file" >/dev/null; then
+    return 1
+  fi
+  rm -f "$relay_status_file"
+  relay_status_file=
 }
 
 write_environment_entry() {
@@ -635,7 +652,7 @@ promote() {
   unit_is_active "$agent_service" || return 1
   unit_is_active "$gateway_service" || return 1
   unit_is_active "$relay_service" || return 1
-  relay_endpoint_matches || return 1
+  relay_is_ready || return 1
 
   if ! unit_is_active "$signal_service"; then
     systemctl start "$signal_service" || return 1
@@ -774,9 +791,11 @@ fi
 public_https_url="https://$public_url_host"
 stun_public_url="udp://$public_url_host:19444"
 relay_public_url="udp://$public_url_host:18445"
+relay_admission_url="http://$vpn_ip:18447"
+relay_status_url="$relay_admission_url/v1/status"
 
-if ! relay_endpoint_matches; then
-  demote_and_exit "Relay endpoint does not match the current public IPv4 address"
+if ! relay_is_ready; then
+  demote_and_exit "Relay health or advertised endpoint does not match this node"
 fi
 if [ ! -f "$postgres_password_file" ] || [ -L "$postgres_password_file" ] ||
   [ ! -f "$postgres_ca_file" ] || [ -L "$postgres_ca_file" ]; then
