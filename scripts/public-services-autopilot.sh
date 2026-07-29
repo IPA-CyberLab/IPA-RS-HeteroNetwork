@@ -46,6 +46,7 @@ runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
 
 status_file=
 relay_status_file=
+gateway_status_file=
 services_env_tmp=
 database_url_tmp=
 agent_drop_in_tmp=
@@ -58,6 +59,7 @@ log() {
 cleanup() {
   [ -z "$status_file" ] || rm -f "$status_file"
   [ -z "$relay_status_file" ] || rm -f "$relay_status_file"
+  [ -z "$gateway_status_file" ] || rm -f "$gateway_status_file"
   [ -z "$services_env_tmp" ] || rm -f "$services_env_tmp"
   [ -z "$database_url_tmp" ] || rm -f "$database_url_tmp"
   [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
@@ -519,6 +521,39 @@ relay_is_ready() {
   relay_status_file=
 }
 
+gateway_is_ready() {
+  gateway_status_file=$(mktemp "$runtime_dir/gateway-status.XXXXXX") || return 1
+  if ! curl --fail --silent --show-error --max-time 3 --max-filesize 1048576 \
+    http://127.0.0.1:9780/v1/web-ui/endpoints >"$gateway_status_file"; then
+    rm -f "$gateway_status_file"
+    gateway_status_file=
+    return 1
+  fi
+  if ! jq -e --arg public_ip "$public_ip" '
+    (.public_gateway.phase == "ready")
+    and (.public_gateway.public_ip == $public_ip)
+    and (.public_gateway.url | type == "string" and startswith("https://"))
+  ' "$gateway_status_file" >/dev/null; then
+    rm -f "$gateway_status_file"
+    gateway_status_file=
+    return 1
+  fi
+  rm -f "$gateway_status_file"
+  gateway_status_file=
+}
+
+wait_gateway_ready() {
+  gateway_wait_attempt=1
+  while [ "$gateway_wait_attempt" -le 6 ]; do
+    if gateway_is_ready; then
+      return 0
+    fi
+    gateway_wait_attempt=$((gateway_wait_attempt + 1))
+    sleep 1
+  done
+  return 1
+}
+
 write_environment_entry() {
   environment_name=$1
   environment_value=$2
@@ -653,6 +688,7 @@ promote() {
   unit_is_active "$agent_service" || return 1
   unit_is_active "$gateway_service" || return 1
   unit_is_active "$relay_service" || return 1
+  wait_gateway_ready || return 1
   relay_is_ready || return 1
 
   if ! unit_is_active "$signal_service"; then
@@ -795,6 +831,9 @@ relay_public_url="udp://$public_url_host:18445"
 relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 
+if ! gateway_is_ready; then
+  demote_and_exit "public Web gateway is not ready for the current public address"
+fi
 if ! relay_is_ready; then
   demote_and_exit "Relay health or advertised endpoint does not match this node"
 fi

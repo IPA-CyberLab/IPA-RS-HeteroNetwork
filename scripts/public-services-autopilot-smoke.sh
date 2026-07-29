@@ -9,6 +9,7 @@ fake_bin=$test_root/fake-bin
 fake_state=$test_root/fake-state
 fixture=$test_root/status.json
 relay_fixture=$test_root/relay-status.json
+gateway_fixture=$test_root/gateway-status.json
 systemctl_log=$test_root/systemctl.log
 output_log=$test_root/output.log
 secret='DatabaseSecret_DoNotPrint_473921'
@@ -32,6 +33,9 @@ for last_argument do :; done
 case "$last_argument" in
   http://127.0.0.1:9780/v1/status)
     cat "$HETERONETWORK_SMOKE_STATUS_FIXTURE"
+    ;;
+  http://127.0.0.1:9780/v1/web-ui/endpoints)
+    cat "$HETERONETWORK_SMOKE_GATEWAY_STATUS_FIXTURE"
     ;;
   http://*/v1/status)
     cat "$HETERONETWORK_SMOKE_RELAY_STATUS_FIXTURE"
@@ -121,6 +125,7 @@ export HETERONETWORK_PUBLIC_SERVICES_TESTING=1
 export HETERONETWORK_PUBLIC_SERVICES_TEST_ROOT=$test_root/root
 export HETERONETWORK_SMOKE_STATUS_FIXTURE=$fixture
 export HETERONETWORK_SMOKE_RELAY_STATUS_FIXTURE=$relay_fixture
+export HETERONETWORK_SMOKE_GATEWAY_STATUS_FIXTURE=$gateway_fixture
 export HETERONETWORK_SMOKE_STATE=$fake_state
 export HETERONETWORK_SMOKE_SYSTEMCTL_LOG=$systemctl_log
 
@@ -207,6 +212,24 @@ write_relay_status() {
 EOF
 }
 
+write_gateway_status() {
+  gateway_status_ip=$1
+  gateway_status_phase=${2:-ready}
+  case "$gateway_status_ip" in
+    *:*) gateway_status_host="[$gateway_status_ip]" ;;
+    *) gateway_status_host=$gateway_status_ip ;;
+  esac
+  cat >"$gateway_fixture" <<EOF
+{
+  "public_gateway": {
+    "phase": "$gateway_status_phase",
+    "public_ip": "$gateway_status_ip",
+    "url": "https://$gateway_status_host/"
+  }
+}
+EOF
+}
+
 set_active() {
   : >"$fake_state/active/$1"
 }
@@ -221,6 +244,7 @@ prepare_dependencies() {
   printf '%s\n' "$secret" >"$password_file"
   printf '%s\n' 'test-ca' >"$ca_file"
   write_relay_status "$dependency_relay_endpoint"
+  write_gateway_status 163.220.236.51
   rm -f "$fake_state/postgres-down"
   set_active heteronetwork-agent.service
   set_active heteronetwork-gateway.service
@@ -392,6 +416,14 @@ assert_demoted
 prepare_dependencies
 reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+write_gateway_status 163.220.236.51 error
+run_reconciler
+assert_demoted
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time" '[2001:::8888]:51820'
 run_reconciler
 assert_demoted
@@ -400,6 +432,7 @@ prepare_dependencies '[2001:4860:4860::8888]:18445'
 reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time" '[2001:4860:4860::8888]:51820'
+write_gateway_status '2001:4860:4860::8888'
 run_reconciler
 assert_active heteronetwork-signal.service
 assert_active heteronetwork-stun.service
