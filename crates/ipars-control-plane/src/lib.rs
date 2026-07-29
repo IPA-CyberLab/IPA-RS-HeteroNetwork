@@ -82,6 +82,7 @@ const CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW: Duration = Duration::from_secs(6
 const OVERLAY_NODE_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_OVERLAY_TOPOLOGY_CACHE_ENTRIES: usize = 4;
 const MAX_ROUTE_CATALOG_UPDATE_RETRIES: usize = 8;
+const KEYCLOAK_CANDIDATE_PAGE_SIZE: usize = 64;
 pub const MAX_NODE_ENROLLMENT_TOKEN_USES: u32 = 1_000;
 pub const NODE_ENROLLMENT_ALLOWED_ROLES: [&str; 3] = ["edge", "worker", "gateway"];
 
@@ -100,8 +101,16 @@ pub struct KeycloakCandidateLease {
     pub vpn_ip: VpnIp,
     pub version: String,
     pub ready: bool,
+    #[serde(default = "default_keycloak_candidate_eligible")]
+    pub eligible: bool,
+    #[serde(default)]
+    pub generation: i64,
     pub lease_expires_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
+}
+
+fn default_keycloak_candidate_eligible() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +169,8 @@ pub enum ControlPlaneError {
     OverlayRouteCatalogChanged,
     #[error("node {0} changed while applying a registration update")]
     NodeStateChanged(NodeId),
+    #[error("Keycloak candidate {node_id} generation {generation} is stale")]
+    KeycloakCandidateGenerationConflict { node_id: NodeId, generation: i64 },
     #[error("no available VPN IP in pool")]
     VpnPoolExhausted,
     #[error("route {0} is not permitted by token policy")]
@@ -394,15 +405,6 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn upsert_keycloak_candidate(
         &self,
         _candidate: KeycloakCandidateLease,
-    ) -> Result<(), ControlPlaneError> {
-        Err(ControlPlaneError::Store(
-            "keycloak candidate leases are unsupported by this store".to_string(),
-        ))
-    }
-    async fn remove_keycloak_candidate(
-        &self,
-        _cluster_id: &ClusterId,
-        _node_id: &NodeId,
     ) -> Result<bool, ControlPlaneError> {
         Err(ControlPlaneError::Store(
             "keycloak candidate leases are unsupported by this store".to_string(),
@@ -412,6 +414,7 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         _cluster_id: &ClusterId,
         _lease_cutoff: chrono::DateTime<Utc>,
+        _after_node_id: Option<&NodeId>,
         _limit: usize,
     ) -> Result<Vec<KeycloakCandidateLease>, ControlPlaneError> {
         Err(ControlPlaneError::Store(
@@ -1070,31 +1073,24 @@ impl ControlPlaneStore for InMemoryStore {
     async fn upsert_keycloak_candidate(
         &self,
         candidate: KeycloakCandidateLease,
-    ) -> Result<(), ControlPlaneError> {
-        self.keycloak_candidates.write().await.insert(
-            (candidate.cluster_id.clone(), candidate.node_id.clone()),
-            candidate,
-        );
-        Ok(())
-    }
-
-    async fn remove_keycloak_candidate(
-        &self,
-        cluster_id: &ClusterId,
-        node_id: &NodeId,
     ) -> Result<bool, ControlPlaneError> {
-        Ok(self
-            .keycloak_candidates
-            .write()
-            .await
-            .remove(&(cluster_id.clone(), node_id.clone()))
-            .is_some())
+        let key = (candidate.cluster_id.clone(), candidate.node_id.clone());
+        let mut candidates = self.keycloak_candidates.write().await;
+        if candidates.get(&key).is_some_and(|current| {
+            current.lease_expires_at > candidate.updated_at
+                && current.generation >= candidate.generation
+        }) {
+            return Ok(false);
+        }
+        candidates.insert(key, candidate);
+        Ok(true)
     }
 
     async fn list_keycloak_candidates(
         &self,
         cluster_id: &ClusterId,
         lease_cutoff: chrono::DateTime<Utc>,
+        after_node_id: Option<&NodeId>,
         limit: usize,
     ) -> Result<Vec<KeycloakCandidateLease>, ControlPlaneError> {
         let mut candidates = self
@@ -1103,7 +1099,10 @@ impl ControlPlaneStore for InMemoryStore {
             .await
             .values()
             .filter(|candidate| {
-                &candidate.cluster_id == cluster_id && candidate.lease_expires_at > lease_cutoff
+                &candidate.cluster_id == cluster_id
+                    && candidate.eligible
+                    && candidate.lease_expires_at > lease_cutoff
+                    && after_node_id.is_none_or(|after| candidate.node_id > *after)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2019,6 +2018,7 @@ where
         version: &str,
         eligible: bool,
         ready: bool,
+        generation: i64,
         lease_ttl: Duration,
         desired_replicas: usize,
         max_candidates: usize,
@@ -2029,6 +2029,12 @@ where
         {
             return Err(ControlPlaneError::InvalidClusterPolicy(
                 "Keycloak placement must request 1 to 9 replicas from at most 64 candidates"
+                    .to_string(),
+            ));
+        }
+        if generation <= 0 {
+            return Err(ControlPlaneError::InvalidClusterPolicy(
+                "Keycloak candidate generation must be a positive signed 63-bit integer"
                     .to_string(),
             ));
         }
@@ -2076,33 +2082,36 @@ where
             });
         }
 
-        if eligible {
-            let lease_expires_at = now
-                .checked_add_signed(chrono::Duration::from_std(lease_ttl).map_err(|error| {
-                    ControlPlaneError::Store(format!(
-                        "invalid Keycloak candidate lease duration: {error}"
-                    ))
-                })?)
-                .ok_or_else(|| {
-                    ControlPlaneError::Store(
-                        "Keycloak candidate lease expiration is out of range".to_string(),
-                    )
-                })?;
-            self.store
-                .upsert_keycloak_candidate(KeycloakCandidateLease {
-                    cluster_id: self.config.cluster_id.clone(),
-                    node_id: node_id.clone(),
-                    vpn_ip,
-                    version: version.to_string(),
-                    ready,
-                    lease_expires_at,
-                    updated_at: now,
-                })
-                .await?;
-        } else {
-            self.store
-                .remove_keycloak_candidate(&self.config.cluster_id, node_id)
-                .await?;
+        let lease_expires_at = now
+            .checked_add_signed(chrono::Duration::from_std(lease_ttl).map_err(|error| {
+                ControlPlaneError::Store(format!(
+                    "invalid Keycloak candidate lease duration: {error}"
+                ))
+            })?)
+            .ok_or_else(|| {
+                ControlPlaneError::Store(
+                    "Keycloak candidate lease expiration is out of range".to_string(),
+                )
+            })?;
+        let applied = self
+            .store
+            .upsert_keycloak_candidate(KeycloakCandidateLease {
+                cluster_id: self.config.cluster_id.clone(),
+                node_id: node_id.clone(),
+                vpn_ip,
+                version: version.to_string(),
+                ready,
+                eligible,
+                generation,
+                lease_expires_at,
+                updated_at: now,
+            })
+            .await?;
+        if !applied {
+            return Err(ControlPlaneError::KeycloakCandidateGenerationConflict {
+                node_id: node_id.clone(),
+                generation,
+            });
         }
 
         self.keycloak_placement(version, desired_replicas, max_candidates, now)
@@ -2123,25 +2132,39 @@ where
             .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
             .map(|node| (&node.node_id, node))
             .collect::<BTreeMap<_, _>>();
-        let candidates = self
-            .store
-            .list_keycloak_candidates(&self.config.cluster_id, now, max_candidates)
-            .await?
-            .into_iter()
-            .filter(|candidate| candidate.version == version)
-            .filter(|candidate| {
-                registered_by_id
-                    .get(&candidate.node_id)
-                    .is_some_and(|node| node.vpn_ip == candidate.vpn_ip)
-            })
-            .filter(|candidate| {
-                relay_health_allows(
-                    health_by_node.get(&candidate.node_id),
+        let mut candidates = Vec::with_capacity(max_candidates);
+        let mut after_node_id = None;
+        while candidates.len() < max_candidates {
+            let page = self
+                .store
+                .list_keycloak_candidates(
+                    &self.config.cluster_id,
                     now,
-                    policy.relay_health_ttl_seconds,
+                    after_node_id.as_ref(),
+                    KEYCLOAK_CANDIDATE_PAGE_SIZE,
                 )
-            })
-            .collect::<Vec<_>>();
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after_node_id = page.last().map(|candidate| candidate.node_id.clone());
+            let page_was_full = page.len() == KEYCLOAK_CANDIDATE_PAGE_SIZE;
+            candidates.extend(page.into_iter().filter(|candidate| {
+                candidate.version == version
+                    && registered_by_id
+                        .get(&candidate.node_id)
+                        .is_some_and(|node| node.vpn_ip == candidate.vpn_ip)
+                    && relay_health_allows(
+                        health_by_node.get(&candidate.node_id),
+                        now,
+                        policy.relay_health_ttl_seconds,
+                    )
+            }));
+            candidates.truncate(max_candidates);
+            if !page_was_full {
+                break;
+            }
+        }
         Ok(select_keycloak_candidates(
             &self.config.cluster_id,
             candidates,
@@ -5419,9 +5442,11 @@ fn select_keycloak_candidates(
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left.node_id.cmp(&right.node_id))
+        right.ready.cmp(&left.ready).then_with(|| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        })
     });
     let mut replicas = ranked
         .into_iter()
@@ -6954,19 +6979,29 @@ mod tests {
     fn keycloak_placement_is_bounded_stable_and_replaces_only_failed_replica() {
         let cluster_id = ClusterId::from_string("cluster-keycloak");
         let now = Utc::now();
-        let candidates = (1..=5)
+        let candidates = (1..=6)
             .map(|index| KeycloakCandidateLease {
                 cluster_id: cluster_id.clone(),
                 node_id: NodeId::from_string(format!("keycloak-{index}")),
                 vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, index))),
                 version: "26.6.4".to_string(),
-                ready: index % 2 == 0,
+                ready: index <= 3,
+                eligible: true,
+                generation: i64::from(index),
                 lease_expires_at: now + Duration::seconds(45),
                 updated_at: now,
             })
             .collect::<Vec<_>>();
         let first = select_keycloak_candidates(&cluster_id, candidates.clone(), 3);
         assert_eq!(first.replicas.len(), 3);
+        assert_eq!(
+            first
+                .replicas
+                .iter()
+                .filter(|candidate| candidate.ready)
+                .count(),
+            3
+        );
 
         let mut reversed = candidates.clone();
         reversed.reverse();
@@ -7009,6 +7044,89 @@ mod tests {
             2
         );
         assert_ne!(after_failure.placement_id, first.placement_id);
+    }
+
+    #[tokio::test]
+    async fn keycloak_placement_scans_past_full_invalid_page(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-keycloak-pages");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?,
+            ),
+            store.clone(),
+        );
+        let now = Utc::now();
+        for index in 0..64_u8 {
+            assert!(
+                store
+                    .upsert_keycloak_candidate(KeycloakCandidateLease {
+                        cluster_id: cluster_id.clone(),
+                        node_id: NodeId::from_string(format!("000-invalid-{index:02}")),
+                        vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 1, index + 1,))),
+                        version: "wrong-version".to_string(),
+                        ready: true,
+                        eligible: true,
+                        generation: 1,
+                        lease_expires_at: now + Duration::seconds(45),
+                        updated_at: now,
+                    })
+                    .await?
+            );
+        }
+
+        let mut expected = Vec::new();
+        for index in 0..3 {
+            let node = plane
+                .register_with_claims(
+                    claims(cluster_id.clone()),
+                    registration_request(&format!("valid-keycloak-{index}")),
+                )
+                .await?
+                .node;
+            store
+                .upsert_health(
+                    node.node_id.clone(),
+                    NodeHealth {
+                        state: HealthState::Healthy,
+                        last_seen_at: now,
+                        latency_ms: Some(1.0),
+                        relay_load: Some(0.0),
+                        message: None,
+                    },
+                )
+                .await?;
+            assert!(
+                store
+                    .upsert_keycloak_candidate(KeycloakCandidateLease {
+                        cluster_id: cluster_id.clone(),
+                        node_id: node.node_id.clone(),
+                        vpn_ip: node.vpn_ip,
+                        version: "26.6.4".to_string(),
+                        ready: true,
+                        eligible: true,
+                        generation: 1,
+                        lease_expires_at: now + Duration::seconds(45),
+                        updated_at: now,
+                    })
+                    .await?
+            );
+            expected.push(node.node_id);
+        }
+        expected.sort();
+
+        let placement = plane.keycloak_placement("26.6.4", 3, 64, now).await?;
+        assert_eq!(
+            placement
+                .replicas
+                .iter()
+                .map(|candidate| candidate.node_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        Ok(())
     }
 
     fn signed_heartbeat(label: &str, request: HeartbeatRequest) -> HeartbeatRequest {

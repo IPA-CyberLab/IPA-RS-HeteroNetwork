@@ -622,7 +622,11 @@ where
         protocol
     };
     let keycloak_autopilot_bearer_token = state.resolved_keycloak_autopilot_bearer_token();
-    let protocol = if let Some(bearer_token) = keycloak_autopilot_bearer_token {
+    let protocol = if let Some(base_secret) = keycloak_autopilot_bearer_token {
+        let auth = Arc::new(KeycloakAutopilotAuth {
+            base_secret,
+            cluster_id: state.plane.config().cluster_id.clone(),
+        });
         let keycloak_autopilot = Router::new()
             .route(
                 "/v1/keycloak-autopilot/reconcile",
@@ -630,7 +634,7 @@ where
                     .layer(DefaultBodyLimit::max(MAX_KEYCLOAK_AUTOPILOT_REQUEST_BYTES)),
             )
             .route_layer(middleware::from_fn_with_state(
-                bearer_token,
+                auth,
                 require_keycloak_autopilot_bearer,
             ));
         protocol.merge(keycloak_autopilot)
@@ -3698,6 +3702,16 @@ token_file="$tmp_dir/join-token.json"
 printf '%s' "$auth" | base64 -d >"$token_file"
 chmod 0600 "$token_file"
 /opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only
+heteronetwork_enrolled_node_id=$(
+  jq -er '.node_id | select(type == "string" and length > 0 and length <= 255)' \
+    /var/lib/heteronetwork/agent.json
+)
+case "$heteronetwork_enrolled_node_id" in
+  *[!A-Za-z0-9_.-]*)
+    echo "Enrolled HeteroNetwork node ID is invalid" >&2
+    exit 1
+    ;;
+esac
 rm -f "$token_file"
 
 install -d -o root -g root -m 0755 /etc/heteronetwork
@@ -4892,6 +4906,15 @@ fn keycloak_autopilot_install_script(
         .join(" ");
     format!(
         r#"if [ "$public_services_enabled" -eq 1 ]; then
+  heteronetwork_keycloak_cluster_id=$(printf '%s' '{cluster_id}' | base64 -d)
+  keycloak_autopilot_bearer_token=$(
+    {{
+      printf '%s\0' 'heteronetwork-keycloak-autopilot-node-v1'
+      printf '%s\0' '{bearer_token}'
+      printf '%s\0' "$heteronetwork_keycloak_cluster_id"
+      printf '%s' "$heteronetwork_enrolled_node_id"
+    }} | sha256sum | awk '{{print $1}}'
+  )
   install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
   install -d -o root -g root -m 0755 /etc/heteronetwork
   printf '%s' '{helper}' | base64 -d >/opt/heteronetwork/libexec/.keycloak-ha-node.sh.new
@@ -4906,8 +4929,10 @@ fn keycloak_autopilot_install_script(
     /opt/heteronetwork/libexec/keycloak-ha-node.sh
   mv -f /opt/heteronetwork/libexec/.keycloak-autopilot.sh.new \
     /opt/heteronetwork/libexec/keycloak-autopilot.sh
-  cat >/etc/heteronetwork/.keycloak-autopilot.env.new <<'KEYCLOAK_AUTOPILOT_ENV'
-HETERONETWORK_KEYCLOAK_AUTOPILOT_BEARER_TOKEN={bearer_token}
+  printf 'HETERONETWORK_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=%s\n' \
+    "$keycloak_autopilot_bearer_token" \
+    >/etc/heteronetwork/.keycloak-autopilot.env.new
+  cat >>/etc/heteronetwork/.keycloak-autopilot.env.new <<'KEYCLOAK_AUTOPILOT_ENV'
 HETERONETWORK_KEYCLOAK_CLUSTER_ID_B64={cluster_id}
 HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='{control_plane_urls_b64}'
 HETERONETWORK_KEYCLOAK_VERSION={keycloak_version}
@@ -5152,6 +5177,7 @@ struct KeycloakAutopilotRequest {
     eligible: bool,
     ready: bool,
     version: String,
+    generation: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -5170,6 +5196,7 @@ struct KeycloakAutopilotResponse {
     desired_replicas: usize,
     lease_ttl_seconds: u64,
     reconcile_after_seconds: u64,
+    generation: i64,
     assigned: bool,
     replicas: Vec<KeycloakAutopilotReplica>,
     generated_at: DateTime<Utc>,
@@ -5394,6 +5421,7 @@ where
             &request.version,
             request.eligible,
             request.ready,
+            request.generation,
             Duration::from_secs(KEYCLOAK_AUTOPILOT_LEASE_SECONDS),
             KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
             KEYCLOAK_AUTOPILOT_MAX_CANDIDATES,
@@ -5421,6 +5449,7 @@ where
         desired_replicas: KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
         lease_ttl_seconds: KEYCLOAK_AUTOPILOT_LEASE_SECONDS,
         reconcile_after_seconds: KEYCLOAK_AUTOPILOT_RECONCILE_SECONDS,
+        generation: request.generation,
         assigned,
         replicas,
         generated_at,
@@ -5655,12 +5684,45 @@ async fn require_database_autopilot_bearer(
     next.run(request).await
 }
 
+#[derive(Debug)]
+struct KeycloakAutopilotAuth {
+    base_secret: Arc<str>,
+    cluster_id: ClusterId,
+}
+
 async fn require_keycloak_autopilot_bearer(
-    State(expected): State<Arc<str>>,
+    State(auth): State<Arc<KeycloakAutopilotAuth>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let provided = bearer_token_from_headers(request.headers());
+    let (parts, body) = request.into_parts();
+    let body = match axum::body::to_bytes(body, MAX_KEYCLOAK_AUTOPILOT_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Keycloak autopilot request body is invalid or too large".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let claimed_node_id = match serde_json::from_slice::<KeycloakAutopilotRequest>(&body) {
+        Ok(request) => request.node_id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Keycloak autopilot request body is invalid".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let expected =
+        derive_keycloak_node_bearer(&auth.base_secret, &auth.cluster_id, &claimed_node_id);
+    let provided = bearer_token_from_headers(&parts.headers);
     if !provided.is_some_and(|provided| operator_api_token_matches(&expected, provided)) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -5671,7 +5733,27 @@ async fn require_keycloak_autopilot_bearer(
         )
             .into_response();
     }
-    next.run(request).await
+    next.run(Request::from_parts(parts, Body::from(body))).await
+}
+
+fn derive_keycloak_node_bearer(
+    base_secret: &str,
+    cluster_id: &ClusterId,
+    node_id: &NodeId,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"heteronetwork-keycloak-autopilot-node-v1");
+    digest.update(b"\0");
+    digest.update(base_secret.as_bytes());
+    digest.update(b"\0");
+    digest.update(cluster_id.as_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(node_id.as_str().as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -6684,7 +6766,8 @@ impl IntoResponse for ApiError {
             ControlPlaneError::NodeRequestReplay(_)
             | ControlPlaneError::ClusterPolicyChanged
             | ControlPlaneError::OverlayRouteCatalogChanged
-            | ControlPlaneError::NodeStateChanged(_) => StatusCode::CONFLICT,
+            | ControlPlaneError::NodeStateChanged(_)
+            | ControlPlaneError::KeycloakCandidateGenerationConflict { .. } => StatusCode::CONFLICT,
             ControlPlaneError::NodeRequestAuthenticationCapacity => StatusCode::SERVICE_UNAVAILABLE,
             ControlPlaneError::TokenVerification(_) => StatusCode::UNAUTHORIZED,
             ControlPlaneError::NodeAlreadyExists(_)
@@ -8055,6 +8138,21 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn keycloak_node_bearer_derivation_is_stable_and_identity_bound() {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let node_a = NodeId::from_string("node-a");
+        let node_b = NodeId::from_string("node-b");
+        assert_eq!(
+            derive_keycloak_node_bearer("base-secret", &cluster_id, &node_a),
+            "4419de1b821a1e4f6b651995ec5268f59104c394b79eb544ed7fbca04b48bde1"
+        );
+        assert_ne!(
+            derive_keycloak_node_bearer("base-secret", &cluster_id, &node_a),
+            derive_keycloak_node_bearer("base-secret", &cluster_id, &node_b)
+        );
+    }
+
     #[tokio::test]
     async fn explicit_autopilot_bearers_work_without_node_enrollment(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8076,9 +8174,32 @@ mod tests {
             )
             .await?
             .node;
+        let other_node = plane
+            .register_with_claims(
+                claims(
+                    cluster_id.clone(),
+                    issuer.node_id(),
+                    KeyId::from_string("root"),
+                ),
+                registration("explicit-autopilot-other-node"),
+            )
+            .await?
+            .node;
         store
             .upsert_health(
                 node.node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.0),
+                    message: None,
+                },
+            )
+            .await?;
+        store
+            .upsert_health(
+                other_node.node_id.clone(),
                 NodeHealth {
                     state: HealthState::Healthy,
                     last_seen_at: Utc::now(),
@@ -8100,6 +8221,11 @@ mod tests {
             .map_err(std::io::Error::other)?;
         assert!(state.node_enrollment.is_none());
         let app = router(state);
+        let keycloak_node_bearer = derive_keycloak_node_bearer(
+            KEYCLOAK_AUTOPILOT_BEARER_TOKEN,
+            &cluster_id,
+            &node.node_id,
+        );
 
         let database_request = serde_json::to_vec(&serde_json::json!({
             "selection_epoch": 1,
@@ -8108,7 +8234,7 @@ mod tests {
         for (authorization, expected_status) in [
             (None, StatusCode::UNAUTHORIZED),
             (
-                Some(KEYCLOAK_AUTOPILOT_BEARER_TOKEN),
+                Some(keycloak_node_bearer.as_str()),
                 StatusCode::UNAUTHORIZED,
             ),
             (Some(DATABASE_AUTOPILOT_BEARER_TOKEN), StatusCode::OK),
@@ -8132,7 +8258,8 @@ mod tests {
             "vpn_ip": node.vpn_ip.to_string(),
             "eligible": true,
             "ready": false,
-            "version": KEYCLOAK_AUTOPILOT_VERSION
+            "version": KEYCLOAK_AUTOPILOT_VERSION,
+            "generation": 1
         }))?;
         for (authorization, expected_status) in [
             (None, StatusCode::UNAUTHORIZED),
@@ -8140,7 +8267,11 @@ mod tests {
                 Some(DATABASE_AUTOPILOT_BEARER_TOKEN),
                 StatusCode::UNAUTHORIZED,
             ),
-            (Some(KEYCLOAK_AUTOPILOT_BEARER_TOKEN), StatusCode::OK),
+            (
+                Some(KEYCLOAK_AUTOPILOT_BEARER_TOKEN),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (Some(keycloak_node_bearer.as_str()), StatusCode::OK),
         ] {
             let mut request = Request::builder()
                 .method("POST")
@@ -8155,6 +8286,72 @@ mod tests {
                 .await?;
             assert_eq!(response.status(), expected_status);
         }
+        let withdrawal = serde_json::to_vec(&serde_json::json!({
+            "node_id": node.node_id.as_str(),
+            "vpn_ip": node.vpn_ip.to_string(),
+            "eligible": false,
+            "ready": false,
+            "version": KEYCLOAK_AUTOPILOT_VERSION,
+            "generation": 2
+        }))?;
+        let withdrawal_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {keycloak_node_bearer}"),
+                    )
+                    .body(Body::from(withdrawal))?,
+            )
+            .await?;
+        assert_eq!(withdrawal_response.status(), StatusCode::OK);
+        let withdrawal_response =
+            axum::body::to_bytes(withdrawal_response.into_body(), usize::MAX).await?;
+        let withdrawal_response: Value = serde_json::from_slice(&withdrawal_response)?;
+        assert_eq!(withdrawal_response["generation"], 2);
+
+        let delayed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {keycloak_node_bearer}"),
+                    )
+                    .body(Body::from(keycloak_request))?,
+            )
+            .await?;
+        assert_eq!(delayed_response.status(), StatusCode::CONFLICT);
+
+        let cross_node_request = serde_json::to_vec(&serde_json::json!({
+            "node_id": other_node.node_id.as_str(),
+            "vpn_ip": other_node.vpn_ip.to_string(),
+            "eligible": true,
+            "ready": false,
+            "version": KEYCLOAK_AUTOPILOT_VERSION,
+            "generation": 1
+        }))?;
+        let cross_node_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {keycloak_node_bearer}"),
+                    )
+                    .body(Body::from(cross_node_request))?,
+            )
+            .await?;
+        assert_eq!(cross_node_response.status(), StatusCode::UNAUTHORIZED);
         Ok(())
     }
 
@@ -8371,8 +8568,11 @@ mod tests {
             "vpn_ip": gateway.vpn_ip.to_string(),
             "eligible": true,
             "ready": false,
-            "version": KEYCLOAK_AUTOPILOT_VERSION
+            "version": KEYCLOAK_AUTOPILOT_VERSION,
+            "generation": 1
         }))?;
+        let keycloak_node_bearer =
+            derive_keycloak_node_bearer(&keycloak_autopilot_bearer, &cluster_id, &gateway.node_id);
         let unauthenticated_keycloak = app
             .clone()
             .oneshot(
@@ -8393,7 +8593,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(
                         header::AUTHORIZATION,
-                        format!("Bearer {keycloak_autopilot_bearer}"),
+                        format!("Bearer {keycloak_node_bearer}"),
                     )
                     .body(Body::from(keycloak_request))?,
             )
@@ -8408,6 +8608,7 @@ mod tests {
             KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS
         );
         assert_eq!(authenticated_keycloak["assigned"], true);
+        assert_eq!(authenticated_keycloak["generation"], 1);
         assert_eq!(
             authenticated_keycloak["replicas"][0]["node_id"],
             gateway.node_id.as_str()
@@ -8685,6 +8886,12 @@ mod tests {
         assert!(generated_script.contains("heteronetwork-keycloak-autopilot.timer"));
         assert!(generated_script.contains("keycloak-ha-node.sh"));
         assert!(generated_script.contains("keycloak-autopilot.sh"));
+        assert!(generated_script.contains(
+            "jq -er '.node_id | select(type == \"string\" and length > 0 and length <= 255)'"
+        ));
+        assert!(generated_script.contains("heteronetwork-keycloak-autopilot-node-v1"));
+        assert!(generated_script
+            .contains("printf 'HETERONETWORK_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=%s\\n'"));
         assert!(generated_script.contains("HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='"));
         assert!(generated_script.contains(&format!(
             "HETERONETWORK_KEYCLOAK_VERSION={KEYCLOAK_AUTOPILOT_VERSION}"
