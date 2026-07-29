@@ -781,7 +781,9 @@ promote() {
 
   if [ "$agent_drop_in_changed" -eq 1 ]; then
     systemctl daemon-reload || return 1
-    systemctl restart "$agent_service" || return 1
+    systemctl restart --no-block "$agent_service" || return 1
+    log "staged automatic public-service Agent routes; activation continues next cycle"
+    return 0
   fi
 
   unit_is_active "$agent_service" || return 1

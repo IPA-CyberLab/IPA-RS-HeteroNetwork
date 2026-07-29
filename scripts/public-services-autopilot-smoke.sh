@@ -97,6 +97,9 @@ case "$command_name" in
     [ -e "$HETERONETWORK_SMOKE_STATE/active/${1-}" ]
     ;;
   start|restart)
+    while [ "${1-}" = --no-block ]; do
+      shift
+    done
     unit_name=${1-}
     if [ -e "$HETERONETWORK_SMOKE_STATE/fail-$command_name-$unit_name" ]; then
       exit 1
@@ -303,6 +306,17 @@ fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 prepare_dependencies
 reset_auto_services
 write_status public "$fresh_time"
+run_reconciler
+
+grep -q '^restart --no-block heteronetwork-agent.service$' "$systemctl_log" ||
+  fail "initial promotion did not defer the Agent restart"
+[ -f "$agent_drop_in" ] ||
+  fail "deferred Agent activation rolled back the staged routes"
+[ "$(grep -c 'restart .*heteronetwork-agent.service$' "$systemctl_log")" -eq 1 ] ||
+  fail "deferred Agent activation triggered a restart loop"
+assert_inactive heteronetwork-signal.service
+assert_inactive heteronetwork-stun.service
+assert_inactive heteronetwork-control-plane.service
 run_reconciler
 
 [ -f "$services_env" ] || fail "service environment was not generated"
@@ -537,6 +551,7 @@ fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time" '[2001:4860:4860::8888]:51820'
 write_gateway_status '2001:4860:4860::8888'
 run_reconciler
+run_reconciler
 assert_active heteronetwork-signal.service
 assert_active heteronetwork-stun.service
 assert_active heteronetwork-control-plane.service
@@ -558,6 +573,7 @@ reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time"
 : >"$fake_state/fail-start-heteronetwork-control-plane.service"
+run_reconciler
 run_reconciler
 rm -f "$fake_state/fail-start-heteronetwork-control-plane.service"
 assert_demoted
