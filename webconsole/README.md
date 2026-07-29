@@ -13,11 +13,11 @@ console and the embedded console use the same management API.
 ```sh
 HOST=0.0.0.0 \
 PORT=18088 \
-HETERONETWORK_WEB_PUBLIC_URL=http://100.105.153.15:18088 \
-HETERONETWORK_WEB_OIDC_ISSUER_URL=http://100.105.153.15:18080/realms/heteronetwork \
+HETERONETWORK_WEB_PUBLIC_URL=https://163.220.236.51 \
+HETERONETWORK_WEB_OIDC_ISSUER_URL=https://163.220.236.51/realms/kakurizai \
 HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web \
 HETERONETWORK_WEB_ALLOWED_EMAILS=hello@mizuame.works \
-HETERONETWORK_CONTROL_PLANE_URL=http://192.168.0.205:8443 \
+HETERONETWORK_CONTROL_PLANE_URL=https://hn-a.163-220-236-51.sslip.io \
 node webconsole/server.mjs
 ```
 

@@ -357,7 +357,7 @@ def run_self_test() -> None:
     manifest = build_manifest(
         app_name="HeteroNetwork Kakurizai Login",
         homepage_url="https://163.220.236.51",
-        redirect_url="http://100.105.153.15:39090/callback/test",
+        redirect_url="http://192.168.0.10:39090/callback/test",
         keycloak_realm="kakurizai",
         callback_urls=[
             "https://163.220.236.51/realms/kakurizai/broker/github/endpoint",
@@ -374,10 +374,10 @@ def run_self_test() -> None:
     private_manifest = build_manifest(
         app_name="KakuriZai Login",
         homepage_url="https://github.com/IPA-CyberLab/IPA-RS-KakuriZai",
-        redirect_url="http://100.105.153.15:39091/callback/test",
+        redirect_url="http://192.168.0.10:39091/callback/test",
         keycloak_realm="kakurizai",
         callback_urls=[
-            "http://100.105.153.15:18080/realms/kakurizai/broker/github/endpoint"
+            "http://192.168.0.10:18080/realms/kakurizai/broker/github/endpoint"
         ],
     )
     assert len(private_manifest["callback_urls"]) == 1

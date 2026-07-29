@@ -75,7 +75,7 @@ final class EnrollmentTests: XCTestCase {
         let urls = EnrollmentParser.managementURLs(
             from: [
                 BootstrapEndpoint(
-                    url: "http://100.105.153.15:8080",
+                    url: "http://192.0.2.10:8080",
                     kind: .controlPlane
                 ),
                 BootstrapEndpoint(
