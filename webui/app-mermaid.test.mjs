@@ -130,7 +130,7 @@ test("the pinned Mermaid bundle renders the topology source offline in strict mo
   assert.ok(result.svg.length > 1_000);
 });
 
-test("node services group leases by owner host and retain nodes without services", async (t) => {
+test("devices join service leases by owner node and retain nodes without services", async (t) => {
   const dom = new JSDOM(indexHtml, {
     runScripts: "outside-only",
     url: "http://127.0.0.1:18088/ui/",
@@ -196,6 +196,12 @@ test("node services group leases by owner host and retain nodes without services
       ["relay", "udp://infra-b.example:3479"],
       ["web_ui", "https://infra-b.example"],
     ]),
+    serviceInstance("host-only-b", "node-b", null, [
+      ["control_plane", "https://host-only-b.example:8443"],
+    ]),
+    serviceInstance("missing-node", "infra-c", "node-missing", [
+      ["web_ui", "https://infra-c.example"],
+    ]),
   ];
 
   window.fetch = async (input) => {
@@ -211,29 +217,40 @@ test("node services group leases by owner host and retain nodes without services
 
   window.eval(appSource);
   await waitFor(() => !window.document.querySelector("#dashboard").hidden);
-  window.document.querySelector('[data-view="services"]').click();
-  await waitFor(() => window.document.querySelectorAll("[data-host-key]").length === 3);
+  assert.equal(window.document.querySelector('[data-view="services"]'), null);
+  assert.equal(window.document.querySelector("#nav-service-count"), null);
+  window.document.querySelector('[data-view="nodes"]').click();
+  await waitFor(() => window.document.querySelectorAll("[data-node-row]").length === 2);
 
-  const nodeA = window.document.querySelector('[data-host-key="node:node-a"]');
-  const nodeB = window.document.querySelector('[data-host-key="node:node-b"]');
-  const infrastructure = window.document.querySelector('[data-host-key="host:infra-b"]');
+  const headings = Array.from(window.document.querySelectorAll("#view-content thead th")).map(
+    (heading) => heading.textContent.trim(),
+  );
+  assert.deepEqual(headings.slice(0, -1), [
+    "Device",
+    "VPN address",
+    "Agent",
+    "Role",
+    "Connectivity",
+    "Tags",
+    "Control Plane",
+    "Signal",
+    "STUN",
+    "Relay",
+    "Web UI",
+    "Last seen",
+  ]);
+
+  const nodeA = window.document.querySelector('[data-node-row="node-a"]');
+  const nodeB = window.document.querySelector('[data-node-row="node-b"]');
   assert.ok(nodeA);
   assert.ok(nodeB);
-  assert.ok(infrastructure);
   assert.match(nodeA.textContent, /node-a/);
-  assert.match(nodeA.textContent, /public-a/);
-  assert.match(nodeA.textContent, /web-a/);
-  assert.match(nodeA.textContent, /Host ID: node-a/);
   assert.equal(nodeA.textContent.match(/Lease active/g)?.length, 5);
-  assert.match(nodeB.textContent, /No lease/);
+  assert.match(nodeA.textContent, /Healthy/);
   assert.equal(nodeB.textContent.match(/No active lease/g)?.length, 5);
-  assert.match(infrastructure.textContent, /Infrastructure host/);
-  assert.equal(window.document.querySelector("#nav-service-count").textContent, "3");
-  const controlPlaneCard = Array.from(window.document.querySelectorAll(".metric-card")).find(
-    (card) => card.textContent.includes("Control Plane"),
-  );
-  assert.ok(controlPlaneCard);
-  assert.match(controlPlaneCard.textContent, /Single host/);
+  assert.equal(window.document.querySelectorAll("[data-node-row]").length, 2);
+  assert.doesNotMatch(window.document.querySelector("#view-content").textContent, /infra-b|infra-c|node-missing/);
+  assert.doesNotMatch(window.document.querySelector("#view-content").innerHTML, /host-only-b\.example/);
 });
 
 function jsonResponse(body) {

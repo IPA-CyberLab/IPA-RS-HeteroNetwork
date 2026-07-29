@@ -65,7 +65,6 @@
     "Devices": "デバイス",
     "Add device": "デバイスを追加",
     "Public nodes": "公開ノード",
-    "Node services": "ノードサービス",
     "Connections": "接続",
     "Connection": "接続",
     "Overlay topology": "オーバーレイトポロジー",
@@ -73,6 +72,7 @@
     "Security": "セキュリティ",
     "Access control": "アクセス制御",
     "API online": "API 稼働中",
+    "Agent": "エージェント",
     "Control plane": "コントロールプレーン",
     "Control Plane": "コントロールプレーン",
     "Stun": "STUN",
@@ -96,8 +96,6 @@
     "Refresh": "更新",
     "Network health at a glance.": "ネットワーク全体の状態を確認します。",
     "Registered nodes and their current health.": "登録済みノードと現在の状態を確認します。",
-    "Lease-backed control and traversal services.": "リースで冗長化された制御・トラバーサルサービスです。",
-    "Active service leases on registered nodes and infrastructure hosts.": "登録済みノードとインフラホスト上の有効なサービスリースを確認します。",
     "Selected paths and operator controls.": "選択中の経路とオペレーター制御です。",
     "Recursive groups and forwarding links.": "再帰グループと転送リンクを確認します。",
     "Advertised networks and their owners.": "広報されたネットワークと所有ノードです。",
@@ -189,24 +187,10 @@
     "Unavailable": "利用不可",
     "Missing": "未設定",
     "Leased": "リース中",
-    "Public node": "公開ノード",
-    "Lease": "リース",
-    "Node / host": "ノード / ホスト",
-    "Agent health": "エージェント状態",
-    "Hosts": "ホスト",
     "Lease active": "リース有効",
     "No active lease": "有効なリースなし",
     "Not advertised": "未広報",
-    "Not registered": "未登録",
-    "No lease": "リースなし",
     "Single host": "単一ホスト",
-    "Infrastructure host": "インフラホスト",
-    "Host ID": "ホスト ID",
-    "Unmatched owner": "未対応の所有ノード",
-    "Node service leases": "ノード別サービスリース",
-    "Registered nodes and unmatched infrastructure hosts.": "登録済みノードと、登録ノードに対応しないインフラホストを表示します。",
-    "No nodes or infrastructure hosts": "ノードまたはインフラホストはありません",
-    "Register a node or advertise an infrastructure service lease.": "ノードを登録するか、インフラサービスのリースを広報してください。",
     "No public nodes": "公開ノードはありません",
     "No active public service lease is registered.": "有効な公開サービスリースは登録されていません。",
     "Service matrix": "サービスマトリクス",
@@ -1154,104 +1138,43 @@
     });
   }
 
-  function buildServiceHostRows(overview) {
+  var NODE_SERVICE_KINDS = [
+    { kind: "control_plane", label: "Control Plane" },
+    { kind: "signal", label: "Signal" },
+    { kind: "stun", label: "STUN" },
+    { kind: "relay", label: "Relay" },
+    { kind: "web_ui", label: "Web UI" }
+  ];
+
+  function activeServiceLeasesByNodeId(overview) {
     var nodeEntries = Array.isArray(overview && overview.nodes) ? overview.nodes : [];
     var directory = overview && overview.service_directory || {};
     var instances = Array.isArray(directory.instances) ? directory.instances : [];
-    var nodesById = Object.create(null);
+    var leasesByNodeId = Object.create(null);
     nodeEntries.forEach(function (entry) {
       var node = entry && entry.node || {};
       var nodeId = String(node.node_id || "");
-      if (nodeId) nodesById[nodeId] = entry;
+      if (nodeId) leasesByNodeId[nodeId] = [];
     });
-    var hostGroupsById = Object.create(null);
-    var hostGroups = [];
     instances.forEach(function (instance) {
-      var ownerHostId = String(instance.owner_host_id || "legacy-unowned");
-      var group = hostGroupsById[ownerHostId];
-      if (!group) {
-        group = {
-          hostId: ownerHostId,
-          leases: [],
-          ownerNodeIds: []
-        };
-        hostGroupsById[ownerHostId] = group;
-        hostGroups.push(group);
-      }
-      group.leases.push(instance);
       var ownerNodeId = typeof instance.owner_node_id === "string" && instance.owner_node_id
         ? instance.owner_node_id
         : null;
-      if (ownerNodeId && group.ownerNodeIds.indexOf(ownerNodeId) === -1) {
-        group.ownerNodeIds.push(ownerNodeId);
+      if (ownerNodeId && leasesByNodeId[ownerNodeId]) {
+        leasesByNodeId[ownerNodeId].push(instance);
       }
     });
-    hostGroups.forEach(function (group) {
-      group.matchedNodeId = group.ownerNodeIds.find(function (nodeId) {
-        return Boolean(nodesById[nodeId]);
-      }) || null;
-    });
-    var matchedGroupsByNodeId = Object.create(null);
-    hostGroups.forEach(function (group) {
-      if (!group.matchedNodeId) return;
-      if (!matchedGroupsByNodeId[group.matchedNodeId]) matchedGroupsByNodeId[group.matchedNodeId] = [];
-      matchedGroupsByNodeId[group.matchedNodeId].push(group);
-    });
-    var nodeRows = [];
-    nodeEntries.forEach(function (entry, index) {
-      var node = entry && entry.node || {};
-      var nodeId = String(node.node_id || "");
-      var matchedGroups = matchedGroupsByNodeId[nodeId] || [];
-      if (!matchedGroups.length) {
-        nodeRows.push({
-          entry: entry || { node: {}, health: {} },
-          hostId: null,
-          hostIds: [],
-          key: "node:" + (nodeId || index),
-          leases: [],
-          nodeId: nodeId || "node-" + (index + 1),
-          type: "node"
-        });
-        return;
-      }
-      var hostIds = matchedGroups.map(function (group) {
-        return group.hostId;
-      });
-      nodeRows.push({
-        entry: entry || { node: {}, health: {} },
-        hostId: hostIds[0],
-        hostIds: hostIds,
-        key: "node:" + nodeId,
-        leases: matchedGroups.reduce(function (leases, group) {
-          return leases.concat(group.leases);
-        }, []),
-        nodeId: nodeId,
-        type: "node"
-      });
-    });
-    var infrastructureRows = hostGroups.filter(function (group) {
-      return !group.matchedNodeId;
-    }).map(function (group) {
-      return {
-        hostId: group.hostId,
-        hostIds: [group.hostId],
-        key: "host:" + group.hostId,
-        leases: group.leases,
-        ownerNodeId: group.ownerNodeIds[0] || null,
-        type: "infrastructure"
-      };
-    });
-    return nodeRows.concat(infrastructureRows);
+    return leasesByNodeId;
   }
 
-  function serviceEndpointsForHost(row, kind) {
+  function serviceEndpointsForNode(leasesByNodeId, nodeId, kind) {
     var seen = Object.create(null);
     var endpoints = [];
-    row.leases.forEach(function (instance) {
+    (leasesByNodeId[nodeId] || []).forEach(function (instance) {
       (Array.isArray(instance.endpoints) ? instance.endpoints : []).forEach(function (endpoint) {
         if (!endpoint || endpoint.kind !== kind) return;
         var url = String(endpoint.url || "");
-        if (seen[url]) return;
+        if (!url || seen[url]) return;
         seen[url] = true;
         endpoints.push(url);
       });
@@ -1259,71 +1182,24 @@
     return endpoints;
   }
 
-  function serviceHostSummary(registeredCount, infrastructureCount) {
-    if (state.locale === "ja") {
-      return "登録済みノード " + registeredCount + " 台 · インフラホスト " + infrastructureCount + " 台";
-    }
-    return registeredCount + " registered node" + (registeredCount === 1 ? "" : "s")
-      + " · " + infrastructureCount + " infrastructure host" + (infrastructureCount === 1 ? "" : "s");
-  }
-
-  function renderServiceHostIdentity(row) {
-    if (row.type === "node") {
-      var node = row.entry.node || {};
-      return '<span class="table-primary service-host"><span class="peer-avatar">'
-        + escapeHtml(initials(row.nodeId)) + '</span><span class="service-host-copy"><strong data-no-i18n title="'
-        + escapeHtml(row.nodeId) + '">' + escapeHtml(shortId(row.nodeId))
-        + '</strong><small class="mono" data-no-i18n title="' + escapeHtml(row.nodeId) + '">'
-        + escapeHtml(row.nodeId) + '</small><small><span>Registered node</span> · <span class="mono" data-no-i18n>'
-        + escapeHtml(node.vpn_ip || "-") + "</span></small>"
-        + (row.hostIds.length ? '<small><span>Host ID</span>: <span class="mono" data-no-i18n title="'
-          + escapeHtml(row.hostIds.join(", ")) + '">' + escapeHtml(row.hostIds.join(", ")) + "</span></small>" : "")
-        + "</span></span>";
-    }
-    return '<span class="table-primary service-host"><span class="peer-avatar cyan">IH</span><span class="service-host-copy"><strong data-no-i18n title="'
-      + escapeHtml(row.hostId) + '">' + escapeHtml(shortId(row.hostId))
-      + '</strong><small class="mono" data-no-i18n title="' + escapeHtml(row.hostId) + '">'
-      + escapeHtml(row.hostId) + '</small><small>Infrastructure host</small>'
-      + (row.ownerNodeId ? '<small><span>Unmatched owner</span>: <span class="mono" data-no-i18n title="'
-        + escapeHtml(row.ownerNodeId) + '">' + escapeHtml(shortId(row.ownerNodeId)) + "</span></small>" : "")
-      + "</span></span>";
-  }
-
-  function renderAgentHealth(row) {
-    if (row.type !== "node") return statusPill("not_registered", "Not registered");
-    var node = row.entry.node || {};
-    var health = row.entry.health || {};
-    var lastSeenAt = health.last_seen_at || node.registered_at;
-    return '<span class="service-agent-health">' + statusPill(health.state || "unknown")
-      + (lastSeenAt ? '<small><span>Last seen</span>: <time>' + escapeHtml(age(lastSeenAt)) + "</time></small>" : "")
-      + "</span>";
-  }
-
-  function renderHostService(row, kind) {
-    var endpoints = serviceEndpointsForHost(row, kind);
+  function renderNodeServiceStatus(leasesByNodeId, nodeId, kind) {
+    var endpoints = serviceEndpointsForNode(leasesByNodeId, nodeId, kind);
     if (!endpoints.length) return statusPill("not_running", "No active lease");
-    return '<span class="service-endpoint"><span>' + statusPill("healthy", "Lease active")
-      + '</span><span class="service-endpoint-list">' + endpoints.map(function (endpoint) {
-        return '<code data-no-i18n title="' + escapeHtml(endpoint) + '">' + escapeHtml(endpoint || "-") + "</code>";
-      }).join("") + "</span></span>";
+    return '<span title="' + escapeHtml(endpoints.join("\n")) + '">' + statusPill("healthy", "Lease active") + "</span>";
   }
 
-  function renderHostLeases(row) {
-    if (!row.leases.length) return statusPill("no_lease", "No lease");
-    return '<span class="service-lease-list">' + row.leases.map(function (instance) {
-      var instanceId = String(instance.instance_id || "-");
-      return '<span class="service-lease"><span>' + statusPill("healthy", "Leased")
-        + '</span><code data-no-i18n title="' + escapeHtml(instanceId) + '">' + escapeHtml(instanceId)
-        + '</code><small class="faint"><span>Expires</span>: <time>'
-        + escapeHtml(formatTime(instance.lease_expires_at)) + "</time></small></span>";
-    }).join("") + "</span>";
+  function nodeTableHeader() {
+    return "<tr><th>Device</th><th>VPN address</th><th>Agent</th><th>Role</th><th>Connectivity</th><th>Tags</th>"
+      + NODE_SERVICE_KINDS.map(function (service) {
+        return "<th>" + escapeHtml(service.label) + "</th>";
+      }).join("")
+      + "<th>Last seen</th><th></th></tr>";
   }
 
   function updateNavigationCounts() {
     if (!state.overview) return;
     var metrics = state.overview.metrics || {};
     $("nav-node-count").textContent = metrics.node_count == null ? "-" : metrics.node_count;
-    $("nav-service-count").textContent = buildServiceHostRows(state.overview).length;
     $("nav-path-count").textContent = metrics.path_count == null ? "-" : metrics.path_count;
     $("nav-block-count").textContent = state.topology.data ? normalizedOverlayTopology().groups.length : "-";
     $("nav-rule-count").textContent = (state.overview.cluster_policy.acl_rules || []).length;
@@ -1446,22 +1322,25 @@
   }
 
   function nodeTableRows(entries, limit) {
+    var leasesByNodeId = activeServiceLeasesByNodeId(state.overview);
     var rows = (limit ? entries.slice(0, limit) : entries).map(function (entry) {
       var node = entry.node;
       var health = entry.health || {};
       var label = shortId(node.node_id);
       var connectivity = connectivityInfo(entry);
-      return '<tr class="' + (state.selectedNodeId === node.node_id ? "selected" : "") + '"><td><button class="primary-link" data-node-id="'
+      return '<tr data-node-row="' + escapeHtml(node.node_id) + '" class="' + (state.selectedNodeId === node.node_id ? "selected" : "") + '"><td><button class="primary-link" data-node-id="'
         + escapeHtml(node.node_id) + '" type="button"><span class="table-primary"><span class="peer-avatar">'
         + escapeHtml(initials(node.node_id)) + '</span><span data-no-i18n><strong>' + escapeHtml(label)
         + '</strong><small title="' + escapeHtml(node.node_id) + '">' + escapeHtml(node.node_id) + '</small></span></span></button></td><td class="mono">'
         + escapeHtml(node.vpn_ip) + '</td><td>' + statusPill(health.state || "unknown") + '</td><td><span class="role-badge" data-no-i18n>'
         + escapeHtml(localizedRole(node.role)) + '</span></td><td>' + statusPill(connectivity.state, connectivity.label) + '</td><td>' + listTags(node.tags) + '</td><td>'
-        + escapeHtml(node.relay_capability ? "Available" : "No") + '</td><td class="faint">' + escapeHtml(age(health.last_seen_at || node.registered_at)) + '</td><td><button class="detail-link" data-node-id="'
+        + NODE_SERVICE_KINDS.map(function (service) {
+          return renderNodeServiceStatus(leasesByNodeId, node.node_id, service.kind);
+        }).join("</td><td>") + '</td><td class="faint">' + escapeHtml(age(health.last_seen_at || node.registered_at)) + '</td><td><button class="detail-link" data-node-id="'
         + escapeHtml(node.node_id) + '" type="button" aria-label="Open device details" title="Open device details">'
         + icon("arrow-up-right") + "</button></td></tr>";
     }).join("");
-    return rows || '<tr><td colspan="9"><div class="filter-empty"><strong>No devices found</strong><span>Try changing the search or status filter.</span></div></td></tr>';
+    return rows || '<tr><td colspan="13"><div class="filter-empty"><strong>No devices found</strong><span>Try changing the search or status filter.</span></div></td></tr>';
   }
 
   function emptyState(title, message, iconName) {
@@ -2254,7 +2133,7 @@
     });
     var staleClass = metrics.stale_path_count ? "warn" : "";
     var recentContent = recent.length
-      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Connectivity</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
+      ? '<div class="table-wrap"><table class="service-matrix node-service-matrix"><thead>' + nodeTableHeader() + '</thead><tbody>' + nodeTableRows(recent, 6) + "</tbody></table></div>"
       : emptyState("No devices registered", "Connect a device to see it here.", "server");
     var derivedWebUiCount = (directory.instances || []).filter(function (instance) {
       return (instance.endpoints || []).some(function (endpoint) { return endpoint.kind === "web_ui"; });
@@ -2304,46 +2183,6 @@
       + recentContent + "</section>";
   }
 
-  function renderServices() {
-    var overview = state.overview;
-    var metrics = overview.metrics || {};
-    var hostRows = buildServiceHostRows(overview);
-    var registeredNodeCount = Array.isArray(overview.nodes) ? overview.nodes.length : 0;
-    var infrastructureHostCount = hostRows.filter(function (row) { return row.type === "infrastructure"; }).length;
-    var kinds = [
-      ["control_plane", "Control Plane", "active_control_plane_count"],
-      ["signal", "Signal", "active_signal_count"],
-      ["stun", "STUN", "active_stun_count"],
-      ["relay", "Relay", "active_relay_count"],
-      ["web_ui", "Web UI", "active_web_ui_count"]
-    ];
-    kinds.forEach(function (kind) {
-      var observedCount = hostRows.filter(function (row) {
-        return serviceEndpointsForHost(row, kind[0]).length > 0;
-      }).length;
-      kind.push(metrics[kind[2]] == null ? observedCount : Number(metrics[kind[2]]) || 0);
-    });
-    var endpointRows = hostRows.map(function (row) {
-      return '<tr data-host-key="' + escapeHtml(row.key) + '"><td>' + renderServiceHostIdentity(row)
-        + '</td><td>' + renderAgentHealth(row) + '</td>'
-        + kinds.map(function (kind) { return "<td>" + renderHostService(row, kind[0]) + "</td>"; }).join("")
-        + "<td>" + renderHostLeases(row) + "</td></tr>";
-    }).join("");
-    var table = endpointRows
-      ? '<div class="table-wrap"><table class="service-matrix node-service-matrix"><thead><tr><th>Node / host</th><th>Agent health</th>'
-        + kinds.map(function (kind) { return '<th>' + escapeHtml(kind[1]) + '</th>'; }).join("")
-        + '<th>Lease</th></tr></thead><tbody>' + endpointRows + '</tbody></table></div>'
-      : emptyState("No nodes or infrastructure hosts", "Register a node or advertise an infrastructure service lease.", "server");
-    return '<div class="metric-grid">'
-      + metricCard("Hosts", hostRows.length, serviceHostSummary(registeredNodeCount, infrastructureHostCount), "server", "", "")
-      + kinds.map(function (kind) {
-        return metricCard(kind[1], kind[3], kind[3] >= 2 ? "Redundant" : kind[3] === 1 ? "Single host" : "Not advertised", kind[3] >= 2 ? "circle-check" : "circle-alert", "", kind[3] >= 2 ? "" : "warn");
-      }).join("")
-      + '</div><section class="section-panel"><div class="section-header"><div><h2>Node service leases</h2><p>Registered nodes and unmatched infrastructure hosts.</p></div>'
-      + statusPill(metrics.ha_ready ? "healthy" : "degraded", metrics.ha_ready ? "HA ready" : "HA degraded")
-      + '</div>' + table + '</section>';
-  }
-
   function filteredNodes() {
     var query = state.filters.nodes.toLowerCase();
     var healthFilter = state.filters.nodeHealth;
@@ -2371,7 +2210,7 @@
       { value: "unreachable", label: "Unreachable" }
     ];
     var tableBody = entries.length
-      ? '<div class="table-wrap"><table><thead><tr><th>Device</th><th>VPN address</th><th>Status</th><th>Role</th><th>Connectivity</th><th>Tags</th><th>Relay</th><th>Last seen</th><th></th></tr></thead><tbody>' + nodeTableRows(entries) + "</tbody></table></div>"
+      ? '<div class="table-wrap"><table class="service-matrix node-service-matrix"><thead>' + nodeTableHeader() + '</thead><tbody>' + nodeTableRows(entries) + "</tbody></table></div>"
       : emptyState("No devices found", "Try changing the search or status filter.", "server");
     var table = '<section class="section-panel">' + tableToolbar("nodes", "Search devices", "nodeHealth", options, entries.length) + tableBody + "</section>";
     return table;
@@ -2647,7 +2486,6 @@
     var metadata = {
       overview: ["Overview", "Network health at a glance."],
       nodes: ["Devices", "Registered nodes and their current health."],
-      services: ["Node services", "Active service leases on registered nodes and infrastructure hosts."],
       paths: ["Connections", "Selected paths and operator controls."],
       topology: ["Overlay topology", "Recursive groups and forwarding links."],
       routes: ["Network routes", "Advertised networks and their owners."],
@@ -2663,7 +2501,6 @@
     $("view-content").innerHTML = {
       overview: renderOverview,
       nodes: renderNodes,
-      services: renderServices,
       paths: renderPaths,
       topology: renderOverlayTopology,
       routes: renderRoutes,
@@ -3190,6 +3027,9 @@
     else showAuth("");
   });
 
+  document.querySelectorAll('[data-view="services"]').forEach(function (navigationItem) {
+    navigationItem.remove();
+  });
   document.documentElement.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
   $("locale-select").value = state.locale;
   applyStaticTranslations();
