@@ -35,8 +35,8 @@ use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, JoinTokenClaims, KeyId,
     NatConnectivityState, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath,
     OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag,
-    TokenLedgerMetrics, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_TAGS,
-    MAX_JOIN_TOKEN_TTL_SECONDS,
+    TokenLedgerMetrics, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -1767,7 +1767,11 @@ where
     let expires_at = now
         .checked_add_signed(ChronoDuration::seconds(request.expires_in_seconds as i64))
         .ok_or_else(|| NodeEnrollmentApiError::bad_request("token expiration is out of range"))?;
-    let bootstrap_endpoints = directory.bootstrap_endpoints;
+    let bootstrap_endpoints = node_enrollment_bootstrap_endpoints(
+        enrollment.install_base_url.as_ref(),
+        &directory.bootstrap_endpoints,
+        &state.plane.config().vpn_pool,
+    )?;
     let nonce = format!("enroll-{}", random_oidc_value(24));
     if request.setup == NodeEnrollmentSetup::KubernetesHaControlPlane {
         tags.insert(Tag::kubernetes_control_plane());
@@ -1860,9 +1864,14 @@ where
     let expires_at = now
         .checked_add_signed(ChronoDuration::seconds(request.expires_in_seconds as i64))
         .ok_or_else(|| NodeEnrollmentApiError::bad_request("token expiration is out of range"))?;
+    let bootstrap_endpoints = node_enrollment_bootstrap_endpoints(
+        enrollment.install_base_url.as_ref(),
+        &directory.bootstrap_endpoints,
+        &state.plane.config().vpn_pool,
+    )?;
     let claims = JoinTokenClaims {
         cluster_id: state.plane.config().cluster_id.clone(),
-        bootstrap_endpoints: directory.bootstrap_endpoints,
+        bootstrap_endpoints,
         expires_at,
         not_before: now - ChronoDuration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
         role: Role::client(),
@@ -1975,6 +1984,85 @@ fn require_ha_client_enrollment_directory(
         ));
     }
     Ok(())
+}
+
+fn node_enrollment_bootstrap_endpoints(
+    install_base_url: &str,
+    service_endpoints: &[BootstrapEndpoint],
+    vpn_pool: &ipnet::Ipv4Net,
+) -> Result<Vec<BootstrapEndpoint>, NodeEnrollmentApiError> {
+    let mut bootstrap_endpoints = Vec::new();
+    let mut seen = BTreeSet::new();
+    let gateway_urls = std::iter::once(install_base_url).chain(
+        service_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
+            .map(|endpoint| endpoint.url.as_str()),
+    );
+    for url in gateway_urls.filter_map(|url| node_enrollment_gateway_url(url, vpn_pool)) {
+        if seen.insert((BootstrapEndpointKind::ControlPlane, url.clone())) {
+            bootstrap_endpoints.push(BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url,
+            });
+            if bootstrap_endpoints.len() == MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND {
+                break;
+            }
+        }
+    }
+    if bootstrap_endpoints.is_empty() {
+        return Err(NodeEnrollmentApiError::unavailable(
+            "node enrollment requires an HTTP(S) public Gateway outside the HeteroNetwork VPN pool",
+        ));
+    }
+
+    for endpoint in service_endpoints {
+        if endpoint.kind == BootstrapEndpointKind::ControlPlane {
+            continue;
+        }
+        let endpoint = if endpoint.kind == BootstrapEndpointKind::WebUi {
+            let Some(url) = node_enrollment_gateway_url(&endpoint.url, vpn_pool) else {
+                continue;
+            };
+            BootstrapEndpoint {
+                kind: endpoint.kind,
+                url,
+            }
+        } else {
+            endpoint.clone()
+        };
+        let canonical_url = ipars_types::canonical_bootstrap_endpoint_url(&endpoint.url)
+            .unwrap_or_else(|| endpoint.url.clone());
+        if seen.insert((endpoint.kind, canonical_url)) {
+            bootstrap_endpoints.push(endpoint);
+        }
+    }
+    Ok(bootstrap_endpoints)
+}
+
+fn node_enrollment_gateway_url(url: &str, vpn_pool: &ipnet::Ipv4Net) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !matches!(parsed.path(), "" | "/")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    match parsed.host()? {
+        url::Host::Ipv4(ip) if vpn_pool.contains(&ip) => return None,
+        url::Host::Ipv6(ip)
+            if ip
+                .to_ipv4_mapped()
+                .is_some_and(|mapped| vpn_pool.contains(&mapped)) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    Some(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 fn required_node_enrollment_service_kinds(require_relay: bool) -> Vec<BootstrapEndpointKind> {
@@ -2232,6 +2320,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --disable-relay)
       relay_enabled=0
+      public_services_enabled=0
       ;;
     --disable-public-services)
       public_services_enabled=0
@@ -3341,11 +3430,15 @@ restore_runtime_relay_path() {
 
 begin_runtime_relay_transaction() {
   snapshot_runtime_relay_transaction
+  runtime_transaction_active=1
   if ! stop_systemd_unit_with_kill "$agent_service"; then
     echo "Unable to quiesce the Agent before changing Relay endpoint state" >&2
     return 1
   fi
-  runtime_transaction_active=1
+  if ! stop_systemd_unit_with_kill "$relay_service"; then
+    echo "Unable to quiesce the Relay before changing its endpoint state" >&2
+    return 1
+  fi
 }
 
 rollback_runtime_relay_transaction() {
@@ -3376,14 +3469,14 @@ rollback_runtime_relay_transaction() {
     echo "Unable to reload systemd after restoring Relay runtime state" >&2
     return 1
   fi
-  if [ "$runtime_relay_was_active" -eq 1 ] \
-    && ! systemctl start "$relay_service"; then
-    echo "Unable to restore the previously active Relay runtime" >&2
-    return 1
-  fi
   if [ "$runtime_agent_was_active" -eq 1 ] \
     && ! systemctl start "$agent_service"; then
     echo "Unable to restore the previously active Agent" >&2
+    return 1
+  fi
+  if [ "$runtime_relay_was_active" -eq 1 ] \
+    && ! systemctl start "$relay_service"; then
+    echo "Unable to restore the previously active Relay runtime" >&2
     return 1
   fi
   runtime_transaction_active=0
@@ -3586,20 +3679,16 @@ if [ "$relay_changed" -eq 1 ] \
     mv -f "$relay_env_tmp" "$relay_env"
     relay_env_tmp=
   fi
-  if [ "$runtime_relay_was_active" -eq 1 ]; then
-    if [ "$relay_changed" -eq 1 ]; then
-      systemctl restart "$relay_service"
-    fi
-  else
-    systemctl start "$relay_service"
-  fi
   if [ "$agent_changed" -eq 1 ]; then
     mv -f "$agent_drop_in_tmp" "$agent_drop_in"
     agent_drop_in_tmp=
-    systemctl daemon-reload
   fi
-  if [ "$runtime_agent_was_active" -eq 1 ]; then
-    systemctl start "$agent_service"
+  systemctl daemon-reload
+  systemctl restart "$agent_service"
+  if [ "$runtime_relay_was_active" -eq 1 ]; then
+    systemctl restart "$relay_service"
+  else
+    systemctl start "$relay_service"
   fi
   commit_runtime_relay_transaction
 fi
@@ -4093,17 +4182,21 @@ fn node_enrollment_download_bases(
 ) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut bases = Vec::new();
-    for base in std::iter::once(enrollment.install_base_url.as_ref()).chain(
-        bootstrap_endpoints
-            .iter()
-            .filter(|endpoint| {
-                matches!(
-                    endpoint.kind,
-                    BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::WebUi
-                )
-            })
-            .map(|endpoint| endpoint.url.as_str()),
-    ) {
+    let install_base_url = enrollment.install_base_url.trim_end_matches('/');
+    let install_base_is_allowed = bootstrap_endpoints.iter().any(|endpoint| {
+        endpoint.kind == BootstrapEndpointKind::ControlPlane
+            && endpoint.url.trim_end_matches('/') == install_base_url
+    });
+    for base in install_base_is_allowed
+        .then_some(install_base_url)
+        .into_iter()
+        .chain(
+            bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
+                .map(|endpoint| endpoint.url.as_str()),
+        )
+    {
         let base = base.trim_end_matches('/').to_string();
         if seen.insert(base.clone()) {
             bases.push(base);
@@ -6098,6 +6191,70 @@ mod tests {
     }
 
     #[test]
+    fn node_enrollment_bootstrap_uses_gateways_without_mutating_service_directory(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service_endpoints = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "http://10.250.0.4:19088".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://direct-control.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "http://10.250.0.4:19443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://203.0.113.10:19444".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Relay,
+                url: "udp://203.0.113.10:18445".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "https://gateway.example".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::WebUi,
+                url: "http://10.250.0.4:18088".to_string(),
+            },
+        ];
+        let enrollment_endpoints = node_enrollment_bootstrap_endpoints(
+            "https://enroll.example",
+            &service_endpoints,
+            &Ipv4Net::new(Ipv4Addr::new(10, 250, 0, 0), 16)?,
+        )
+        .map_err(|error| error.message)?;
+
+        let enrollment_control_planes = enrollment_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            enrollment_control_planes,
+            vec!["https://enroll.example", "https://gateway.example"]
+        );
+        assert!(enrollment_endpoints.iter().any(|endpoint| {
+            endpoint.kind == BootstrapEndpointKind::Signal
+                && endpoint.url == "http://10.250.0.4:19443"
+        }));
+        assert!(!enrollment_endpoints.iter().any(|endpoint| {
+            endpoint.kind == BootstrapEndpointKind::WebUi
+                && endpoint.url == "http://10.250.0.4:18088"
+        }));
+        assert!(service_endpoints.iter().any(|endpoint| {
+            endpoint.kind == BootstrapEndpointKind::ControlPlane
+                && endpoint.url == "http://10.250.0.4:19088"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn node_enrollment_downloads_through_dynamic_web_gateways(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let binary_path = std::env::temp_dir().join(format!(
@@ -6116,7 +6273,15 @@ mod tests {
         let endpoints = vec![
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://static.example".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
                 url: "https://control.example:8443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "http://10.250.0.4:19088".to_string(),
             },
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::WebUi,
@@ -6135,7 +6300,6 @@ mod tests {
             node_enrollment_download_bases(&enrollment, &endpoints),
             vec![
                 "https://static.example".to_string(),
-                "https://control.example:8443".to_string(),
                 "https://203.0.113.10".to_string(),
             ]
         );
@@ -6612,7 +6776,21 @@ mod tests {
             String::from_utf8_lossy(&command_syntax.stderr)
         );
         let token: SignedJoinToken = serde_json::from_value(response_body["token"].clone())?;
-        assert_eq!(token.claims.bootstrap_endpoints.len(), 10);
+        assert_eq!(token.claims.bootstrap_endpoints.len(), 11);
+        assert_eq!(
+            token
+                .claims
+                .bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+                .map(|endpoint| endpoint.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "http://127.0.0.1:8443",
+                "https://public-a.example:8443",
+                "https://public-b.example:8443",
+            ]
+        );
         assert_eq!(token.claims.policy.max_token_uses, Some(1));
         assert!(token.claims.policy.allow_relay);
         assert_eq!(response_body["setup"], "network_only");
@@ -6629,6 +6807,9 @@ mod tests {
         );
         assert!(generated_script.contains("public_services_enabled=1"));
         assert!(generated_script.contains("--disable-public-services"));
+        assert!(generated_script.contains(
+            "--disable-relay)\n      relay_enabled=0\n      public_services_enabled=0\n      ;;"
+        ));
         assert!(generated_script.contains("heteronetwork-public-services-autopilot.service"));
         assert!(generated_script.contains("heteronetwork-public-services-autopilot.timer"));
         assert!(generated_script.contains("u heteronetwork-services -"));
@@ -6754,6 +6935,45 @@ mod tests {
                     .map(|(script, _)| script)
             })
             .ok_or("generated installer omitted the relay autopilot helper")?;
+        let runtime_reconcile = relay_autopilot
+            .split_once("relay_was_active_now=0\n")
+            .map(|(_, transaction)| transaction)
+            .ok_or("generated Relay autopilot omitted its runtime reconciliation")?;
+        let begin_transaction = relay_autopilot
+            .split_once("begin_runtime_relay_transaction() {\n")
+            .and_then(|(_, tail)| tail.split_once("\n}\n").map(|(transaction, _)| transaction))
+            .ok_or("generated Relay autopilot omitted its transaction begin function")?;
+        let agent_stop = begin_transaction
+            .find("stop_systemd_unit_with_kill \"$agent_service\"")
+            .ok_or("Relay transaction did not stop the Agent")?;
+        let relay_stop = begin_transaction
+            .find("stop_systemd_unit_with_kill \"$relay_service\"")
+            .ok_or("Relay transaction did not stop the Relay")?;
+        assert!(agent_stop < relay_stop);
+        let relay_env_install = runtime_reconcile
+            .find("mv -f \"$relay_env_tmp\" \"$relay_env\"")
+            .ok_or("Relay reconciliation omitted its runtime environment install")?;
+        let agent_drop_in_install = runtime_reconcile
+            .find("mv -f \"$agent_drop_in_tmp\" \"$agent_drop_in\"")
+            .ok_or("Relay reconciliation omitted its Agent drop-in install")?;
+        let daemon_reload = runtime_reconcile
+            .find("systemctl daemon-reload")
+            .ok_or("Relay reconciliation omitted daemon-reload")?;
+        let agent_restart = runtime_reconcile
+            .find("systemctl restart \"$agent_service\"")
+            .ok_or("Relay reconciliation omitted the Agent restart")?;
+        let relay_restart = runtime_reconcile
+            .find("systemctl restart \"$relay_service\"")
+            .ok_or("Relay reconciliation omitted the Relay restart")?;
+        let relay_start = runtime_reconcile
+            .find("systemctl start \"$relay_service\"")
+            .ok_or("Relay reconciliation omitted the Relay start")?;
+        assert!(relay_env_install < agent_drop_in_install);
+        assert!(agent_drop_in_install < daemon_reload);
+        assert!(daemon_reload < agent_restart);
+        assert!(agent_restart < relay_restart);
+        assert!(agent_restart < relay_start);
+        assert!(!runtime_reconcile.contains("systemctl start \"$agent_service\""));
         let mut relay_shell = std::process::Command::new("sh")
             .arg("-n")
             .stdin(Stdio::piped())
@@ -7620,6 +7840,7 @@ systemctl() {{
 {relay_withdrawal_functions}
 rollback_can_quiesce=1
 begin_runtime_relay_transaction
+: >"$systemctl_log"
 printf '%s\n' new-endpoint >"$relay_env"
 printf '%s\n' new-endpoint >"$agent_drop_in"
 relay_active=1
@@ -7875,7 +8096,7 @@ exit 47
         let degraded_response: Value = serde_json::from_slice(&degraded_response)?;
         let degraded_token: SignedJoinToken =
             serde_json::from_value(degraded_response["token"].clone())?;
-        assert_eq!(degraded_token.claims.bootstrap_endpoints.len(), 10);
+        assert_eq!(degraded_token.claims.bootstrap_endpoints.len(), 11);
         for host in ["public-a.example", "public-b.example"] {
             assert!(degraded_token
                 .claims
