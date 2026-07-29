@@ -360,11 +360,14 @@ fi
 services_checksum=$(cksum "$services_env")
 database_checksum=$(cksum "$database_url")
 drop_in_checksum=$(cksum "$agent_drop_in")
+chmod 0640 "$database_url"
 run_reconciler
 [ "$(cksum "$services_env")" = "$services_checksum" ] ||
   fail "idempotent run rewrote the service environment"
 [ "$(cksum "$database_url")" = "$database_checksum" ] ||
   fail "idempotent run rewrote the database URL"
+[ "$(stat -c '%a' "$database_url")" = 400 ] ||
+  fail "idempotent run did not repair database URL permissions"
 [ "$(cksum "$agent_drop_in")" = "$drop_in_checksum" ] ||
   fail "idempotent run rewrote the Agent drop-in"
 if grep -Eq '^(start|stop|restart|kill) ' "$systemctl_log"; then

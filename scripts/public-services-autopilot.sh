@@ -571,6 +571,8 @@ install_candidate() {
   chmod "$candidate_mode" "$candidate_tmp" || return 1
   if [ -f "$candidate_path" ] && [ ! -L "$candidate_path" ] &&
     cmp -s "$candidate_tmp" "$candidate_path"; then
+    chown "$candidate_owner" "$candidate_path" || return 1
+    chmod "$candidate_mode" "$candidate_path" || return 1
     rm -f "$candidate_tmp"
     CANDIDATE_CHANGED=0
     return 0
