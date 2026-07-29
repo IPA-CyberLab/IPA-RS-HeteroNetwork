@@ -217,6 +217,7 @@ pub const MAX_JOIN_TOKEN_VALIDITY_SECONDS: i64 =
     MAX_JOIN_TOKEN_TTL_SECONDS + JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 pub const ED25519_SIGNATURE_BASE64_BYTES: usize = 88;
+pub const LEGACY_UNOWNED_SERVICE_HOST_ID: &str = "legacy-unowned";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,13 +239,52 @@ pub fn bootstrap_endpoints_include_core_services(endpoints: &[BootstrapEndpoint]
     .all(|kind| endpoints.iter().any(|endpoint| endpoint.kind == kind))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceInstance {
     pub cluster_id: ClusterId,
     pub instance_id: String,
+    /// Stable identity of the physical or virtual host running the service.
+    pub owner_host_id: String,
+    /// Registered overlay node that owns this service instance.
+    ///
+    /// Infrastructure-only hosts do not have an overlay node identity.
+    pub owner_node_id: Option<NodeId>,
     pub endpoints: Vec<BootstrapEndpoint>,
     pub lease_expires_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for ServiceInstance {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ServiceInstanceFields {
+            cluster_id: ClusterId,
+            instance_id: String,
+            #[serde(default)]
+            owner_host_id: Option<String>,
+            #[serde(default)]
+            owner_node_id: Option<NodeId>,
+            endpoints: Vec<BootstrapEndpoint>,
+            lease_expires_at: DateTime<Utc>,
+            updated_at: DateTime<Utc>,
+        }
+
+        let fields = ServiceInstanceFields::deserialize(deserializer)?;
+        Ok(Self {
+            cluster_id: fields.cluster_id,
+            instance_id: fields.instance_id,
+            owner_host_id: fields
+                .owner_host_id
+                .unwrap_or_else(|| LEGACY_UNOWNED_SERVICE_HOST_ID.to_string()),
+            owner_node_id: fields.owner_node_id,
+            endpoints: fields.endpoints,
+            lease_expires_at: fields.lease_expires_at,
+            updated_at: fields.updated_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3035,6 +3075,8 @@ pub mod api {
         pub relay_candidate_count: usize,
         #[serde(default)]
         pub active_service_instance_count: usize,
+        #[serde(default)]
+        pub active_service_host_count: usize,
         #[serde(default)]
         pub active_control_plane_count: usize,
         #[serde(default)]
@@ -19118,6 +19160,40 @@ mod tests {
     const MYSQL_CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
     const MYSQL_CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
     const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+
+    #[test]
+    fn legacy_service_instance_without_owner_uses_one_unowned_failure_domain(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let instance = ServiceInstance {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            instance_id: "public-a".to_string(),
+            owner_host_id: "host-a".to_string(),
+            owner_node_id: None,
+            endpoints: vec![BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://public-a.example:8443".to_string(),
+            }],
+            lease_expires_at: now + ChronoDuration::seconds(30),
+            updated_at: now,
+        };
+        let mut legacy = serde_json::to_value(&instance)?;
+        let Some(fields) = legacy.as_object_mut() else {
+            return Err("service instance must serialize as an object".into());
+        };
+        fields.remove("owner_host_id");
+        fields.remove("owner_node_id");
+
+        let restored: ServiceInstance = serde_json::from_value(legacy)?;
+        assert_eq!(restored.owner_host_id, LEGACY_UNOWNED_SERVICE_HOST_ID);
+        assert!(restored.owner_node_id.is_none());
+
+        let mut invalid = serde_json::to_value(instance)?;
+        invalid["owner_host_id"] = serde_json::Value::String(String::new());
+        let invalid: ServiceInstance = serde_json::from_value(invalid)?;
+        assert!(invalid.owner_host_id.is_empty());
+        Ok(())
+    }
 
     fn ranked_relays(first: &NodeId, second: &NodeId, relays: &[NodeId]) -> Vec<NodeId> {
         let mut ranked = relays.to_vec();

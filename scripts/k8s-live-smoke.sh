@@ -826,6 +826,8 @@ spec:
             - /run/secrets/control-plane/operator-api-token
             - --service-instance-id
             - ${service_instance_id}
+            - --service-owner-host-id
+            - ${service_instance_id}
             - --advertise-control-plane-url
             - ${control_plane_url}
             - --advertise-signal-url

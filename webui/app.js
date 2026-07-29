@@ -97,7 +97,7 @@
     "Network health at a glance.": "ネットワーク全体の状態を確認します。",
     "Registered nodes and their current health.": "登録済みノードと現在の状態を確認します。",
     "Lease-backed control and traversal services.": "リースで冗長化された制御・トラバーサルサービスです。",
-    "Services running on registered nodes and infrastructure hosts.": "登録済みノードとインフラホスト上のサービス稼働状況を確認します。",
+    "Active service leases on registered nodes and infrastructure hosts.": "登録済みノードとインフラホスト上の有効なサービスリースを確認します。",
     "Selected paths and operator controls.": "選択中の経路とオペレーター制御です。",
     "Recursive groups and forwarding links.": "再帰グループと転送リンクを確認します。",
     "Advertised networks and their owners.": "広報されたネットワークと所有ノードです。",
@@ -194,15 +194,16 @@
     "Node / host": "ノード / ホスト",
     "Agent health": "エージェント状態",
     "Hosts": "ホスト",
-    "Running": "稼働中",
-    "Not running": "非稼働",
+    "Lease active": "リース有効",
+    "No active lease": "有効なリースなし",
+    "Not advertised": "未広報",
     "Not registered": "未登録",
     "No lease": "リースなし",
     "Single host": "単一ホスト",
     "Infrastructure host": "インフラホスト",
     "Host ID": "ホスト ID",
     "Unmatched owner": "未対応の所有ノード",
-    "Node service status": "ノードサービス稼働状況",
+    "Node service leases": "ノード別サービスリース",
     "Registered nodes and unmatched infrastructure hosts.": "登録済みノードと、登録ノードに対応しないインフラホストを表示します。",
     "No nodes or infrastructure hosts": "ノードまたはインフラホストはありません",
     "Register a node or advertise an infrastructure service lease.": "ノードを登録するか、インフラサービスのリースを広報してください。",
@@ -1166,7 +1167,7 @@
     var hostGroupsById = Object.create(null);
     var hostGroups = [];
     instances.forEach(function (instance) {
-      var ownerHostId = String(instance.owner_host_id || "");
+      var ownerHostId = String(instance.owner_host_id || "legacy-unowned");
       var group = hostGroupsById[ownerHostId];
       if (!group) {
         group = {
@@ -1205,6 +1206,7 @@
         nodeRows.push({
           entry: entry || { node: {}, health: {} },
           hostId: null,
+          hostIds: [],
           key: "node:" + (nodeId || index),
           leases: [],
           nodeId: nodeId || "node-" + (index + 1),
@@ -1212,15 +1214,19 @@
         });
         return;
       }
-      matchedGroups.forEach(function (group) {
-        nodeRows.push({
-          entry: entry || { node: {}, health: {} },
-          hostId: group.hostId,
-          key: "host:" + group.hostId,
-          leases: group.leases,
-          nodeId: nodeId,
-          type: "node"
-        });
+      var hostIds = matchedGroups.map(function (group) {
+        return group.hostId;
+      });
+      nodeRows.push({
+        entry: entry || { node: {}, health: {} },
+        hostId: hostIds[0],
+        hostIds: hostIds,
+        key: "node:" + nodeId,
+        leases: matchedGroups.reduce(function (leases, group) {
+          return leases.concat(group.leases);
+        }, []),
+        nodeId: nodeId,
+        type: "node"
       });
     });
     var infrastructureRows = hostGroups.filter(function (group) {
@@ -1228,6 +1234,7 @@
     }).map(function (group) {
       return {
         hostId: group.hostId,
+        hostIds: [group.hostId],
         key: "host:" + group.hostId,
         leases: group.leases,
         ownerNodeId: group.ownerNodeIds[0] || null,
@@ -1269,8 +1276,8 @@
         + '</strong><small class="mono" data-no-i18n title="' + escapeHtml(row.nodeId) + '">'
         + escapeHtml(row.nodeId) + '</small><small><span>Registered node</span> · <span class="mono" data-no-i18n>'
         + escapeHtml(node.vpn_ip || "-") + "</span></small>"
-        + (row.hostId ? '<small><span>Host ID</span>: <span class="mono" data-no-i18n title="'
-          + escapeHtml(row.hostId) + '">' + escapeHtml(row.hostId) + "</span></small>" : "")
+        + (row.hostIds.length ? '<small><span>Host ID</span>: <span class="mono" data-no-i18n title="'
+          + escapeHtml(row.hostIds.join(", ")) + '">' + escapeHtml(row.hostIds.join(", ")) + "</span></small>" : "")
         + "</span></span>";
     }
     return '<span class="table-primary service-host"><span class="peer-avatar cyan">IH</span><span class="service-host-copy"><strong data-no-i18n title="'
@@ -1294,8 +1301,8 @@
 
   function renderHostService(row, kind) {
     var endpoints = serviceEndpointsForHost(row, kind);
-    if (!endpoints.length) return statusPill("not_running", "Not running");
-    return '<span class="service-endpoint"><span>' + statusPill("healthy", "Running")
+    if (!endpoints.length) return statusPill("not_running", "No active lease");
+    return '<span class="service-endpoint"><span>' + statusPill("healthy", "Lease active")
       + '</span><span class="service-endpoint-list">' + endpoints.map(function (endpoint) {
         return '<code data-no-i18n title="' + escapeHtml(endpoint) + '">' + escapeHtml(endpoint || "-") + "</code>";
       }).join("") + "</span></span>";
@@ -2304,16 +2311,17 @@
     var registeredNodeCount = Array.isArray(overview.nodes) ? overview.nodes.length : 0;
     var infrastructureHostCount = hostRows.filter(function (row) { return row.type === "infrastructure"; }).length;
     var kinds = [
-      ["control_plane", "Control Plane"],
-      ["signal", "Signal"],
-      ["stun", "STUN"],
-      ["relay", "Relay"],
-      ["web_ui", "Web UI"]
+      ["control_plane", "Control Plane", "active_control_plane_count"],
+      ["signal", "Signal", "active_signal_count"],
+      ["stun", "STUN", "active_stun_count"],
+      ["relay", "Relay", "active_relay_count"],
+      ["web_ui", "Web UI", "active_web_ui_count"]
     ];
     kinds.forEach(function (kind) {
-      kind.push(hostRows.filter(function (row) {
+      var observedCount = hostRows.filter(function (row) {
         return serviceEndpointsForHost(row, kind[0]).length > 0;
-      }).length);
+      }).length;
+      kind.push(metrics[kind[2]] == null ? observedCount : Number(metrics[kind[2]]) || 0);
     });
     var endpointRows = hostRows.map(function (row) {
       return '<tr data-host-key="' + escapeHtml(row.key) + '"><td>' + renderServiceHostIdentity(row)
@@ -2329,9 +2337,9 @@
     return '<div class="metric-grid">'
       + metricCard("Hosts", hostRows.length, serviceHostSummary(registeredNodeCount, infrastructureHostCount), "server", "", "")
       + kinds.map(function (kind) {
-        return metricCard(kind[1], kind[2], kind[2] >= 2 ? "Redundant" : kind[2] === 1 ? "Single host" : "Not running", kind[2] >= 2 ? "circle-check" : "circle-alert", "", kind[2] >= 2 ? "" : "warn");
+        return metricCard(kind[1], kind[3], kind[3] >= 2 ? "Redundant" : kind[3] === 1 ? "Single host" : "Not advertised", kind[3] >= 2 ? "circle-check" : "circle-alert", "", kind[3] >= 2 ? "" : "warn");
       }).join("")
-      + '</div><section class="section-panel"><div class="section-header"><div><h2>Node service status</h2><p>Registered nodes and unmatched infrastructure hosts.</p></div>'
+      + '</div><section class="section-panel"><div class="section-header"><div><h2>Node service leases</h2><p>Registered nodes and unmatched infrastructure hosts.</p></div>'
       + statusPill(metrics.ha_ready ? "healthy" : "degraded", metrics.ha_ready ? "HA ready" : "HA degraded")
       + '</div>' + table + '</section>';
   }
@@ -2639,7 +2647,7 @@
     var metadata = {
       overview: ["Overview", "Network health at a glance."],
       nodes: ["Devices", "Registered nodes and their current health."],
-      services: ["Node services", "Services running on registered nodes and infrastructure hosts."],
+      services: ["Node services", "Active service leases on registered nodes and infrastructure hosts."],
       paths: ["Connections", "Selected paths and operator controls."],
       topology: ["Overlay topology", "Recursive groups and forwarding links."],
       routes: ["Network routes", "Advertised networks and their owners."],

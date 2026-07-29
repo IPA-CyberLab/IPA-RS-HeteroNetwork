@@ -76,8 +76,10 @@ cargo test --locked --workspace
 
 The control-plane daemon serves an operations UI at `/ui/`. It shows registered
 devices, health, selected paths, relay/candidate state, advertised routes, the
-active ACL policy, and a public-node service matrix with lease expiry and HA
-readiness. The admin endpoints behind the UI are authenticated; node removal,
+active ACL policy, and a node-services matrix with lease expiry and HA
+readiness. The node-services view uses registered nodes as rows, joins leases
+through their owning host and optional overlay-node identities, and lists
+infrastructure-only service hosts separately. The admin endpoints behind the UI are authenticated; node removal,
 path pinning, and policy updates are available from the browser. The UI is
 embedded in the Rust binary and does not require a Node.js build.
 

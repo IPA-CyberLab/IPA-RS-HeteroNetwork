@@ -34,7 +34,7 @@ Signal must be able to reach at least one control-plane API to authenticate node
 
 ## Deploy Active-Active Public Nodes
 
-Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. A Control Plane refuses to start unless its lease includes Control Plane, Signal, and STUN endpoints, preventing a running replica from silently failing to distribute the replacement directory. Keep the issuer private key offline; public nodes need only the public key.
+Use the units and environment contract in [`deploy/systemd`](../deploy/systemd/README.md) on at least two independently reachable hosts. Both Control Planes must use the same cluster ID, issuer public key, policy, and PostgreSQL database. Each host uses a unique service instance, required `HETERONETWORK_SERVICE_OWNER_HOST_ID`, and Relay node ID and advertises its own externally reachable Control Plane, Signal, STUN, and Relay URLs. When that host is also an enrolled overlay node, set both `HETERONETWORK_SERVICE_OWNER_HOST_ID` and `HETERONETWORK_SERVICE_OWNER_NODE_ID` to the registered Node ID so the Web UI joins its service status to the device row without changing the physical failure domain. Infrastructure-only hosts omit the Node ID and appear as explicit infrastructure rows. A Control Plane refuses to start unless its lease includes Control Plane, Signal, and STUN endpoints, preventing a running replica from silently failing to distribute the replacement directory. Keep the issuer private key offline; public nodes need only the public key.
 
 To expose **Add device** in the Web UI, create a separate enrollment signer and
 install the same root-owned key as
@@ -284,7 +284,7 @@ issuance and transient upstream failures can recover without listener churn;
 the Control Plane still withholds the `web_ui` lease until its external probe
 passes. Inspect the current phase in the Web UI endpoint control or with
 `ipars_agent_public_web_gateway_phase{phase="ready"}`. Control Plane
-`ipars_control_plane_active_services{kind="web_ui"}` and the Public nodes view
+`ipars_control_plane_active_services{kind="web_ui"}` and the Node services view
 show only gateways that passed an external TLS/config probe. Generated node
 install commands include those active gateways and can fetch the
 join-token-protected script and binary through a surviving gateway. Public

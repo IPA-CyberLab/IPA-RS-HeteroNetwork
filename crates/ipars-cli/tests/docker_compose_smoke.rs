@@ -600,6 +600,7 @@ fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Resul
     );
     for expected in [
         "HETERONETWORK_SERVICE_INSTANCE_ID: compose-smoke".to_string(),
+        "HETERONETWORK_SERVICE_OWNER_HOST_ID: compose-smoke".to_string(),
         format!("HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}"),
         format!("HETERONETWORK_ADVERTISE_SIGNAL_URL: http://127.0.0.1:{signal_port}"),
         format!("HETERONETWORK_ADVERTISE_STUN_URL: udp://127.0.0.1:{stun_port}"),
@@ -1105,6 +1106,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         |value| {
             ensure_json_bool_equals(value, "ha_ready", true)?;
             ensure_json_u64_at_least(value, "active_service_instance_count", 2)?;
+            ensure_json_u64_at_least(value, "active_service_host_count", 2)?;
             ensure_json_u64_at_least(value, "active_control_plane_count", 2)?;
             ensure_json_u64_at_least(value, "active_signal_count", 2)?;
             ensure_json_u64_at_least(value, "active_stun_count", 2)?;
@@ -1443,6 +1445,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         |value| {
             ensure_json_bool_equals(value, "ha_ready", false)?;
             ensure_json_u64_equals(value, "active_service_instance_count", 1)?;
+            ensure_json_u64_equals(value, "active_service_host_count", 1)?;
             ensure_json_u64_equals(value, "active_control_plane_count", 1)?;
             ensure_json_u64_equals(value, "active_signal_count", 1)?;
             ensure_json_u64_equals(value, "active_stun_count", 1)?;
@@ -1720,6 +1723,7 @@ fn compose_override(config: &ComposeOverrideConfig<'_>) -> String {
       HETERONETWORK_ROLE: control-plane
       HETERONETWORK_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: {control_plane_operator_api_bearer_token}
       HETERONETWORK_SERVICE_INSTANCE_ID: compose-smoke
+      HETERONETWORK_SERVICE_OWNER_HOST_ID: compose-smoke
       HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL: http://127.0.0.1:{control_plane_port}
       HETERONETWORK_ADVERTISE_SIGNAL_URL: http://127.0.0.1:{signal_port}
       HETERONETWORK_ADVERTISE_STUN_URL: udp://127.0.0.1:{stun_port}

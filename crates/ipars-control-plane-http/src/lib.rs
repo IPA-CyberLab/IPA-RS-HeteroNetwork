@@ -1904,9 +1904,7 @@ fn require_ha_node_enrollment_directory(
 
     let mut missing = Vec::new();
     for kind in required_kinds {
-        if service_instance_count(directory, kind) < 2
-            || service_endpoint_count(directory, kind) < 2
-        {
+        if service_host_count(directory, kind) < 2 || service_endpoint_count(directory, kind) < 2 {
             missing.push(kind.to_string());
         }
     }
@@ -1914,7 +1912,7 @@ fn require_ha_node_enrollment_directory(
         Ok(())
     } else {
         Err(NodeEnrollmentApiError::unavailable(format!(
-            "cannot issue an HA enrollment token until at least two active or recently advertised service instances provide distinct endpoints for each required kind; insufficient: {}",
+            "cannot issue an HA enrollment token until at least two active or recently advertised service hosts provide distinct endpoints for each required kind; insufficient: {}",
             missing.join(", ")
         )))
     }
@@ -1932,16 +1930,11 @@ fn require_ha_client_enrollment_directory(
             "client enrollment requires an active control-plane endpoint",
         ));
     }
-    let count = directory
-        .bootstrap_endpoints
-        .iter()
-        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
-        .filter_map(|endpoint| ipars_types::canonical_bootstrap_endpoint_url(&endpoint.url))
-        .collect::<BTreeSet<_>>()
-        .len();
-    if count < 2 {
+    if service_host_count(directory, BootstrapEndpointKind::ControlPlane) < 2
+        || service_endpoint_count(directory, BootstrapEndpointKind::ControlPlane) < 2
+    {
         return Err(NodeEnrollmentApiError::unavailable(
-            "client enrollment requires at least two active or recently advertised control-plane endpoints",
+            "client enrollment requires at least two independently owned active or recently advertised control-plane endpoints",
         ));
     }
     Ok(())
@@ -1971,7 +1964,7 @@ fn service_instance_has_kinds(
     })
 }
 
-fn service_instance_count(
+fn service_host_count(
     directory: &ipars_types::ServiceDirectory,
     kind: BootstrapEndpointKind,
 ) -> usize {
@@ -1984,7 +1977,7 @@ fn service_instance_count(
                 .iter()
                 .any(|endpoint| endpoint.kind == kind)
         })
-        .map(|instance| instance.instance_id.as_str())
+        .map(|instance| instance.owner_host_id.as_str())
         .collect::<BTreeSet<_>>()
         .len()
 }
@@ -1998,7 +1991,7 @@ fn service_endpoint_count(
         .iter()
         .flat_map(|instance| instance.endpoints.iter())
         .filter(|endpoint| endpoint.kind == kind)
-        .map(|endpoint| endpoint.url.trim_end_matches('/'))
+        .filter_map(|endpoint| ipars_types::canonical_bootstrap_endpoint_url(&endpoint.url))
         .collect::<BTreeSet<_>>()
         .len()
 }
@@ -4811,6 +4804,8 @@ where
         .advertise_service_instance(ServiceInstance {
             cluster_id: state.plane.config().cluster_id.clone(),
             instance_id,
+            owner_host_id: node_id.as_str().to_string(),
+            owner_node_id: Some(node_id.clone()),
             endpoints: vec![BootstrapEndpoint {
                 kind: BootstrapEndpointKind::WebUi,
                 url,
@@ -4932,7 +4927,7 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_control_plane_ha_ready Whether every required public service has at least two active instances."
+        "# HELP ipars_control_plane_ha_ready Whether every required public service has at least two independent active hosts."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_ha_ready gauge");
     prometheus_line!(
@@ -4955,7 +4950,17 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_control_plane_service_endpoints Active leased instances by public service kind."
+        "# HELP ipars_control_plane_service_hosts Number of hosts with active public service leases."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_control_plane_service_hosts gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_control_plane_service_hosts{{cluster_id=\"{cluster_id}\"}} {}",
+        metrics.active_service_host_count
+    );
+    prometheus_line!(
+        &mut body,
+        "# HELP ipars_control_plane_service_endpoints Independent active service hosts with distinct endpoints by public service kind."
     );
     prometheus_line!(
         &mut body,
@@ -5851,6 +5856,8 @@ mod tests {
         ServiceInstance {
             cluster_id: cluster_id.clone(),
             instance_id: instance_id.to_string(),
+            owner_host_id: instance_id.to_string(),
+            owner_node_id: None,
             endpoints: vec![
                 BootstrapEndpoint {
                     kind: BootstrapEndpointKind::ControlPlane,
@@ -8049,6 +8056,32 @@ exit 47
         };
         assert_eq!(duplicate_error.status, StatusCode::SERVICE_UNAVAILABLE);
 
+        let same_host_instance =
+            enrollment_service_instance(&directory.cluster_id, "public-b", "public-b.example");
+        let same_host_directory = ipars_types::ServiceDirectory {
+            instances: vec![
+                directory.instances[0].clone(),
+                ServiceInstance {
+                    owner_host_id: directory.instances[0].owner_host_id.clone(),
+                    ..same_host_instance.clone()
+                },
+            ],
+            bootstrap_endpoints: directory.instances[0]
+                .endpoints
+                .iter()
+                .chain(same_host_instance.endpoints.iter())
+                .cloned()
+                .collect(),
+            ..directory.clone()
+        };
+        let same_host_error = match require_ha_node_enrollment_directory(&same_host_directory, true)
+        {
+            Ok(_) => return Err("two leases on one host counted as HA".into()),
+            Err(error) => error,
+        };
+        assert_eq!(same_host_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(require_ha_client_enrollment_directory(&same_host_directory).is_err());
+
         let generated_at = Utc::now();
         let mut recently_expired =
             enrollment_service_instance(&directory.cluster_id, "public-a", "public-a.example");
@@ -9025,7 +9058,7 @@ exit 47
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
         assert!(body.contains("HeteroNetwork"));
-        assert!(body.contains("Public nodes"));
+        assert!(body.contains("Node services"));
         let Some(mermaid_script) = body.find("/ui/vendor/mermaid.min.js") else {
             return Err("Web UI must load the self-origin Mermaid bundle".into());
         };
@@ -9541,6 +9574,7 @@ exit 47
         assert!(body.contains("ipars_control_plane_nodes"));
         assert!(body.contains("ipars_control_plane_ha_ready"));
         assert!(body.contains("ipars_control_plane_service_instances"));
+        assert!(body.contains("ipars_control_plane_service_hosts"));
         assert!(body.contains("ipars_control_plane_service_endpoints"));
         assert!(body.contains("ipars_control_plane_stale_endpoint_candidates"));
         assert!(body.contains("ipars_control_plane_endpoint_candidate_ttl_seconds"));

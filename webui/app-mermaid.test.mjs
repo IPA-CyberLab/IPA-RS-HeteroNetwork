@@ -130,6 +130,112 @@ test("the pinned Mermaid bundle renders the topology source offline in strict mo
   assert.ok(result.svg.length > 1_000);
 });
 
+test("node services group leases by owner host and retain nodes without services", async (t) => {
+  const dom = new JSDOM(indexHtml, {
+    runScripts: "outside-only",
+    url: "http://127.0.0.1:18088/ui/",
+  });
+  t.after(() => dom.window.close());
+  const { window } = dom;
+  window.console.error = () => {};
+  window.confirm = () => true;
+  window.Headers = globalThis.Headers;
+  window.Response = globalThis.Response;
+  window.sessionStorage.setItem("heteronetwork_operator_token", "test-token");
+  window.mermaid = {
+    initialize() {},
+    render: async () => ({ svg: '<svg viewBox="0 0 800 400"></svg>' }),
+  };
+
+  const serviceOverview = overview();
+  serviceOverview.metrics.node_count = 2;
+  serviceOverview.metrics.active_control_plane_count = 1;
+  serviceOverview.metrics.active_signal_count = 2;
+  serviceOverview.metrics.active_stun_count = 2;
+  serviceOverview.metrics.active_relay_count = 2;
+  serviceOverview.metrics.active_web_ui_count = 2;
+  serviceOverview.nodes = [{
+    node: {
+      node_id: "node-a",
+      registered_at: "2026-07-28T12:00:00Z",
+      role: "edge",
+      tags: [],
+      vpn_ip: "10.250.0.1",
+    },
+    health: {
+      last_seen_at: "2026-07-28T12:00:00Z",
+      state: "healthy",
+    },
+  }, {
+    node: {
+      node_id: "node-b",
+      registered_at: "2026-07-28T12:00:00Z",
+      role: "worker",
+      tags: [],
+      vpn_ip: "10.250.0.2",
+    },
+    health: {
+      last_seen_at: "2026-07-28T12:00:00Z",
+      state: "healthy",
+    },
+  }];
+  serviceOverview.service_directory.instances = [
+    serviceInstance("public-a", "node-a", "node-a", [
+      ["control_plane", "https://host-a.example:8443"],
+      ["signal", "https://host-a.example:9443"],
+      ["stun", "udp://host-a.example:3478"],
+      ["relay", "udp://host-a.example:3479"],
+    ]),
+    serviceInstance("web-a", "node-a", "node-a", [
+      ["web_ui", "https://host-a.example"],
+    ]),
+    serviceInstance("public-infra", "infra-b", null, [
+      ["control_plane", "https://infra-b.example:8443"],
+      ["signal", "https://infra-b.example:9443"],
+      ["stun", "udp://infra-b.example:3478"],
+      ["relay", "udp://infra-b.example:3479"],
+      ["web_ui", "https://infra-b.example"],
+    ]),
+  ];
+
+  window.fetch = async (input) => {
+    const pathname = new URL(String(input), window.location.href).pathname;
+    if (pathname === "/ui/config") return jsonResponse(uiConfig());
+    if (pathname === "/v1/admin/overview") return jsonResponse(serviceOverview);
+    if (pathname === "/v1/admin/topology") return jsonResponse(topology());
+    if (pathname === "/v1/admin/policy") {
+      return jsonResponse({ cluster_policy: clusterPolicy() });
+    }
+    throw new Error(`unexpected fetch: ${pathname}`);
+  };
+
+  window.eval(appSource);
+  await waitFor(() => !window.document.querySelector("#dashboard").hidden);
+  window.document.querySelector('[data-view="services"]').click();
+  await waitFor(() => window.document.querySelectorAll("[data-host-key]").length === 3);
+
+  const nodeA = window.document.querySelector('[data-host-key="node:node-a"]');
+  const nodeB = window.document.querySelector('[data-host-key="node:node-b"]');
+  const infrastructure = window.document.querySelector('[data-host-key="host:infra-b"]');
+  assert.ok(nodeA);
+  assert.ok(nodeB);
+  assert.ok(infrastructure);
+  assert.match(nodeA.textContent, /node-a/);
+  assert.match(nodeA.textContent, /public-a/);
+  assert.match(nodeA.textContent, /web-a/);
+  assert.match(nodeA.textContent, /Host ID: node-a/);
+  assert.equal(nodeA.textContent.match(/Lease active/g)?.length, 5);
+  assert.match(nodeB.textContent, /No lease/);
+  assert.equal(nodeB.textContent.match(/No active lease/g)?.length, 5);
+  assert.match(infrastructure.textContent, /Infrastructure host/);
+  assert.equal(window.document.querySelector("#nav-service-count").textContent, "3");
+  const controlPlaneCard = Array.from(window.document.querySelectorAll(".metric-card")).find(
+    (card) => card.textContent.includes("Control Plane"),
+  );
+  assert.ok(controlPlaneCard);
+  assert.match(controlPlaneCard.textContent, /Single host/);
+});
+
 function jsonResponse(body) {
   return {
     headers: new Headers(),
@@ -162,6 +268,18 @@ function clusterPolicy() {
     overlay_direct_shortcut_limit: 0,
     overlay_max_degree: 4,
     path_state_ttl_seconds: 90,
+  };
+}
+
+function serviceInstance(instanceId, ownerHostId, ownerNodeId, endpoints) {
+  return {
+    cluster_id: "cluster-test",
+    endpoints: endpoints.map(([kind, url]) => ({ kind, url })),
+    instance_id: instanceId,
+    lease_expires_at: "2026-07-28T12:01:00Z",
+    owner_host_id: ownerHostId,
+    owner_node_id: ownerNodeId,
+    updated_at: "2026-07-28T12:00:00Z",
   };
 }
 

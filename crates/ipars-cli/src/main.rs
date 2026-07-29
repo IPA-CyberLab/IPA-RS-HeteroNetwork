@@ -1794,6 +1794,10 @@ fn init_daemon_specs(
         control_plane_database_url,
         "--service-instance-id".to_string(),
         node_id.as_str().to_string(),
+        "--service-owner-host-id".to_string(),
+        node_id.as_str().to_string(),
+        "--service-owner-node-id".to_string(),
+        node_id.as_str().to_string(),
         "--advertise-control-plane-url".to_string(),
         format!(
             "{}://{}",
@@ -2745,6 +2749,15 @@ fn validate_service_directory_for_token(
     let mut active_endpoints = BTreeSet::new();
     for instance in &directory.instances {
         validate_token_identifier(&instance.instance_id, "service instance ID")?;
+        validate_token_identifier(&instance.owner_host_id, "service owner host ID")?;
+        if let Some(owner_node_id) = instance.owner_node_id.as_ref() {
+            validate_token_identifier(owner_node_id.as_str(), "service owner node ID")?;
+            anyhow::ensure!(
+                owner_node_id.as_str() == instance.owner_host_id,
+                "service instance {} owner host ID must equal owner node ID",
+                instance.instance_id
+            );
+        }
         anyhow::ensure!(
             instance_ids.insert(instance.instance_id.as_str()),
             "HA service directory contains duplicate service instance ID {}",
@@ -2778,7 +2791,7 @@ fn validate_service_directory_for_token(
             );
             let canonical = canonical_bootstrap_endpoint_url(&endpoint.url)
                 .context("validated service endpoint has no canonical URL")?;
-            active_endpoints.insert((endpoint.kind, canonical, instance.instance_id.as_str()));
+            active_endpoints.insert((endpoint.kind, canonical, instance.owner_host_id.as_str()));
         }
         anyhow::ensure!(
             instance.updated_at <= now + future_skew,
@@ -2833,17 +2846,17 @@ fn validate_service_directory_for_token(
                 .iter()
                 .filter_map(|(endpoint_kind, url)| (*endpoint_kind == kind).then_some(url))
                 .collect::<BTreeSet<_>>();
-            let endpoint_instances = active_endpoints
+            let endpoint_hosts = active_endpoints
                 .iter()
-                .filter_map(|(endpoint_kind, url, instance_id)| {
+                .filter_map(|(endpoint_kind, url, owner_host_id)| {
                     (*endpoint_kind == kind && bootstrap.contains(&(*endpoint_kind, url.clone())))
-                        .then_some(*instance_id)
+                        .then_some(*owner_host_id)
                 })
                 .collect::<BTreeSet<_>>();
-            let count = endpoint_urls.len().min(endpoint_instances.len());
+            let count = endpoint_urls.len().min(endpoint_hosts.len());
             anyhow::ensure!(
                 count >= 2,
-                "HA service directory has only {count} independent active {kind} instance(s); use --allow-degraded-service-directory only for an intentional non-HA token"
+                "HA service directory has only {count} independent active {kind} host(s); use --allow-degraded-service-directory only for an intentional non-HA token"
             );
         }
     }
@@ -10806,6 +10819,8 @@ mod tests {
             .map(|host| ServiceInstance {
                 cluster_id: cluster_id.clone(),
                 instance_id: format!("public-{host}"),
+                owner_host_id: format!("host-{host}"),
+                owner_node_id: None,
                 endpoints: vec![
                     BootstrapEndpoint {
                         url: format!("https://203.0.113.{host}:8443"),
@@ -10845,6 +10860,16 @@ mod tests {
         let directory = test_service_directory();
         validate_service_directory_for_token(&directory, true, false)?;
 
+        let mut same_host = directory.clone();
+        same_host.instances[1].owner_host_id = same_host.instances[0].owner_host_id.clone();
+        let error = test_error(
+            validate_service_directory_for_token(&same_host, true, false),
+            "two leases from one host must not count as HA",
+        );
+        assert!(error
+            .to_string()
+            .contains("only 1 independent active control_plane host(s)"));
+
         let mut duplicate_url = directory.clone();
         let duplicate = duplicate_url.instances[0].endpoints[0].url.clone();
         let replaced = duplicate_url.instances[1].endpoints[0].url.clone();
@@ -10854,11 +10879,11 @@ mod tests {
             .retain(|endpoint| endpoint.url != replaced);
         let error = test_error(
             validate_service_directory_for_token(&duplicate_url, true, false),
-            "two instance IDs sharing one URL must not count as HA",
+            "two hosts sharing one URL must not count as HA",
         );
         assert!(error
             .to_string()
-            .contains("only 1 independent active control_plane instance(s)"));
+            .contains("only 1 independent active control_plane host(s)"));
 
         let mut expired = directory.clone();
         expired.instances[0].lease_expires_at = Utc::now() - Duration::seconds(1);
@@ -12570,6 +12595,8 @@ mod tests {
             .contains(&output.issuer_public_key.to_string()));
         for (flag, value) in [
             ("--service-instance-id", output.issuer_node_id.as_str()),
+            ("--service-owner-host-id", output.issuer_node_id.as_str()),
+            ("--service-owner-node-id", output.issuer_node_id.as_str()),
             ("--advertise-control-plane-url", "http://203.0.113.10:18443"),
             ("--advertise-signal-url", "http://203.0.113.10:19443"),
             ("--advertise-stun-url", "udp://203.0.113.10:13478"),

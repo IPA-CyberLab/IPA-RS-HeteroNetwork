@@ -44,7 +44,14 @@ Replace every example value in `/etc/ipars/public-node.env`. Store independent,
 random 32-byte-or-longer printable tokens in the five referenced token files,
 owned by `ipars:ipars` with mode `0400`. The daemon intentionally rejects
 group/world-readable credential files. The issuer private key is not installed
-on public nodes; only its public key belongs in this environment file. When the
+on public nodes; only its public key belongs in this environment file.
+`HETERONETWORK_SERVICE_OWNER_HOST_ID` must identify this failure-domain host and
+must differ between replicas. If the host also runs an enrolled Agent, set
+both `HETERONETWORK_SERVICE_OWNER_HOST_ID` and
+`HETERONETWORK_SERVICE_OWNER_NODE_ID` to that Agent's registered Node ID; omit
+the Node ID for an infrastructure-only host. The daemon rejects mismatched
+host and Node IDs. These ownership fields drive host-level HA counting and the
+node-services matrix. When the
 Web UI **Add device** workflow is enabled, generate a separate Ed25519 enrollment
 signing key and install the same key as
 `/etc/credstore/node-enrollment-issuer.key` on every Control Plane replica with

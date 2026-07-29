@@ -186,6 +186,26 @@ impl SqliteControlPlaneStore {
         self.pool
             .execute(
                 r#"
+                UPDATE service_instances
+                SET record_json = json_set(record_json, '$.owner_host_id', 'legacy-unowned')
+                WHERE json_type(record_json, '$.owner_host_id') IS NULL;
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                UPDATE service_instances
+                SET record_json = json_set(record_json, '$.owner_node_id', NULL)
+                WHERE json_type(record_json, '$.owner_node_id') IS NULL;
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
                 CREATE TABLE IF NOT EXISTS client_gateway_selections (
                     client_id TEXT PRIMARY KEY NOT NULL,
                     gateway_node_id TEXT NOT NULL,
@@ -1562,6 +1582,26 @@ impl PostgresControlPlaneStore {
                     record_json JSONB NOT NULL,
                     PRIMARY KEY (cluster_id, instance_id)
                 );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                UPDATE service_instances
+                SET record_json = record_json || jsonb_build_object('owner_host_id', 'legacy-unowned')
+                WHERE NOT (record_json ? 'owner_host_id');
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                UPDATE service_instances
+                SET record_json = record_json || '{"owner_node_id": null}'::jsonb
+                WHERE NOT (record_json ? 'owner_node_id');
                 "#,
             )
             .await
@@ -4150,6 +4190,8 @@ mod tests {
         let first = ServiceInstance {
             cluster_id: cluster_id.clone(),
             instance_id: "public-a".to_string(),
+            owner_host_id: "host-public-a".to_string(),
+            owner_node_id: None,
             endpoints: vec![BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
                 url: "https://public-a.example:8443".to_string(),
@@ -4201,6 +4243,65 @@ mod tests {
 
         drop(store_a);
         drop(store_b);
+        let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_service_directory_migrates_legacy_ownerless_records(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("service-owner-migration");
+        let cluster_id = ClusterId::from_string("cluster-legacy");
+        let now = Utc::now();
+        let expected = ServiceInstance {
+            cluster_id: cluster_id.clone(),
+            instance_id: "legacy-public".to_string(),
+            owner_host_id: ipars_types::LEGACY_UNOWNED_SERVICE_HOST_ID.to_string(),
+            owner_node_id: None,
+            endpoints: vec![BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "https://legacy.example:8443".to_string(),
+            }],
+            lease_expires_at: now + Duration::seconds(30),
+            updated_at: now,
+        };
+        let store = SqliteControlPlaneStore::connect(&database_url).await?;
+        let mut legacy = serde_json::to_value(&expected)?;
+        let Some(legacy) = legacy.as_object_mut() else {
+            return Err("service instance must serialize as an object".into());
+        };
+        legacy.remove("owner_host_id");
+        legacy.remove("owner_node_id");
+        sqlx::query(
+            "INSERT INTO service_instances (cluster_id, instance_id, record_json) VALUES (?1, ?2, ?3)",
+        )
+        .bind(cluster_id.as_str())
+        .bind(expected.instance_id.as_str())
+        .bind(serde_json::to_string(legacy)?)
+        .execute(&store.pool)
+        .await?;
+        drop(store);
+
+        let migrated = SqliteControlPlaneStore::connect(&database_url).await?;
+        assert_eq!(
+            migrated.list_service_instances(&cluster_id).await?,
+            vec![expected.clone()]
+        );
+
+        sqlx::query(
+            "UPDATE service_instances SET record_json = ?1 WHERE cluster_id = ?2 AND instance_id = ?3",
+        )
+        .bind(serde_json::to_string(legacy)?)
+        .bind(cluster_id.as_str())
+        .bind(expected.instance_id.as_str())
+        .execute(&migrated.pool)
+        .await?;
+        assert_eq!(
+            migrated.list_service_instances(&cluster_id).await?,
+            vec![expected]
+        );
+
+        drop(migrated);
         let _ = std::fs::remove_file(database_path);
         Ok(())
     }

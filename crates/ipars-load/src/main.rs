@@ -5754,6 +5754,8 @@ fn daemon_control_plane_service_lease_args(
     let mut args = vec![
         "--service-instance-id".to_string(),
         instance_id.to_string(),
+        "--service-owner-host-id".to_string(),
+        instance_id.to_string(),
         "--service-lease-ttl-seconds".to_string(),
         "6".to_string(),
         "--service-lease-renew-interval-seconds".to_string(),
@@ -11155,6 +11157,8 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             vec![
                 "--service-instance-id".to_string(),
                 "control-plane-0".to_string(),
+                "--service-owner-host-id".to_string(),
+                "control-plane-0".to_string(),
                 "--service-lease-ttl-seconds".to_string(),
                 "6".to_string(),
                 "--service-lease-renew-interval-seconds".to_string(),
@@ -12573,6 +12577,7 @@ fi
             client_count: 0,
             relay_candidate_count,
             active_service_instance_count: 0,
+            active_service_host_count: 0,
             active_control_plane_count: 0,
             active_signal_count: 0,
             active_stun_count: 0,

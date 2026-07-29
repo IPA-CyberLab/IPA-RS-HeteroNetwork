@@ -4459,6 +4459,12 @@ where
         let mut unhealthy_node_count = 0;
         let now = Utc::now();
         let service_directory = self.service_directory_at(now).await?;
+        let active_service_host_count = service_directory
+            .instances
+            .iter()
+            .map(|instance| instance.owner_host_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
         let active_control_plane_count = service_instance_kind_count(
             &service_directory.instances,
             BootstrapEndpointKind::ControlPlane,
@@ -4536,6 +4542,7 @@ where
             client_count,
             relay_candidate_count,
             active_service_instance_count: service_directory.instances.len(),
+            active_service_host_count,
             active_control_plane_count,
             active_signal_count,
             active_stun_count,
@@ -5043,15 +5050,35 @@ fn validate_service_instance(
             instance.instance_id, instance.cluster_id, cluster_id
         )));
     }
-    if instance.instance_id.is_empty()
-        || instance.instance_id.len() > 255
-        || !instance
-            .instance_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    {
+    if !valid_service_instance_identifier(&instance.instance_id) {
         return Err(ControlPlaneError::Store(
             "service instance ID must be 1 to 255 ASCII letters, digits, '_', '.' or '-'"
+                .to_string(),
+        ));
+    }
+    if !valid_service_instance_identifier(&instance.owner_host_id) {
+        return Err(ControlPlaneError::Store(
+            "service owner host ID must be 1 to 255 ASCII letters, digits, '_', '.' or '-'"
+                .to_string(),
+        ));
+    }
+    if instance
+        .owner_node_id
+        .as_ref()
+        .is_some_and(|node_id| !valid_service_instance_identifier(node_id.as_str()))
+    {
+        return Err(ControlPlaneError::Store(
+            "service owner node ID must be 1 to 255 ASCII letters, digits, '_', '.' or '-'"
+                .to_string(),
+        ));
+    }
+    if instance
+        .owner_node_id
+        .as_ref()
+        .is_some_and(|node_id| node_id.as_str() != instance.owner_host_id)
+    {
+        return Err(ControlPlaneError::Store(
+            "service owner host ID must equal owner node ID when an overlay owner is set"
                 .to_string(),
         ));
     }
@@ -5099,11 +5126,19 @@ fn validate_service_instance(
     Ok(())
 }
 
+fn valid_service_instance_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
 fn service_instance_kind_count(
     instances: &[ServiceInstance],
     kind: BootstrapEndpointKind,
 ) -> usize {
-    let instance_count = instances
+    let host_count = instances
         .iter()
         .filter(|instance| {
             instance
@@ -5111,7 +5146,9 @@ fn service_instance_kind_count(
                 .iter()
                 .any(|endpoint| endpoint.kind == kind)
         })
-        .count();
+        .map(|instance| instance.owner_host_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
     let endpoint_count = instances
         .iter()
         .filter_map(|instance| {
@@ -5125,7 +5162,7 @@ fn service_instance_kind_count(
         })
         .collect::<BTreeSet<_>>()
         .len();
-    instance_count.min(endpoint_count)
+    host_count.min(endpoint_count)
 }
 
 fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
@@ -6605,6 +6642,8 @@ mod tests {
         ServiceInstance {
             cluster_id: cluster_id.clone(),
             instance_id: instance_id.to_string(),
+            owner_host_id: instance_id.to_string(),
+            owner_node_id: None,
             endpoints: vec![
                 BootstrapEndpoint {
                     kind: BootstrapEndpointKind::ControlPlane,
@@ -8387,12 +8426,36 @@ mod tests {
 
         let metrics = plane.metrics().await?;
         assert_eq!(metrics.active_service_instance_count, 2);
+        assert_eq!(metrics.active_service_host_count, 2);
         assert_eq!(metrics.active_control_plane_count, 2);
         assert_eq!(metrics.active_signal_count, 2);
         assert_eq!(metrics.active_stun_count, 2);
         assert_eq!(metrics.active_relay_count, 2);
         assert_eq!(metrics.active_web_ui_count, 2);
         assert!(metrics.ha_ready);
+
+        let mut colocated_public_b = service_instance(
+            &cluster_id,
+            "public-b",
+            "public-b.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        colocated_public_b.owner_host_id = "public-a".to_string();
+        plane.advertise_service_instance(colocated_public_b).await?;
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.active_service_host_count, 1);
+        assert_eq!(metrics.active_control_plane_count, 1);
+        assert!(!metrics.ha_ready);
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "public-b",
+                "public-b.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
 
         let mut duplicate_kind = service_instance(
             &cluster_id,
@@ -8406,6 +8469,45 @@ mod tests {
             .push(duplicate_kind.endpoints[0].clone());
         assert!(plane
             .advertise_service_instance(duplicate_kind)
+            .await
+            .is_err());
+
+        let mut invalid_owner = service_instance(
+            &cluster_id,
+            "invalid-owner",
+            "invalid-owner.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        invalid_owner.owner_node_id = Some(NodeId::from_string("invalid owner"));
+        assert!(plane
+            .advertise_service_instance(invalid_owner)
+            .await
+            .is_err());
+
+        let mut mismatched_owner = service_instance(
+            &cluster_id,
+            "mismatched-owner",
+            "mismatched-owner.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        mismatched_owner.owner_node_id = Some(NodeId::from_string("different-node"));
+        assert!(plane
+            .advertise_service_instance(mismatched_owner)
+            .await
+            .is_err());
+
+        let mut invalid_host = service_instance(
+            &cluster_id,
+            "invalid-host",
+            "invalid-host.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        invalid_host.owner_host_id = "invalid host".to_string();
+        assert!(plane
+            .advertise_service_instance(invalid_host)
             .await
             .is_err());
 

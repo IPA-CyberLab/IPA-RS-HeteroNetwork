@@ -552,6 +552,10 @@ struct ControlPlaneArgs {
     database_url_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_SERVICE_INSTANCE_ID")]
     service_instance_id: Option<String>,
+    #[arg(long, env = "HETERONETWORK_SERVICE_OWNER_HOST_ID")]
+    service_owner_host_id: Option<String>,
+    #[arg(long, env = "HETERONETWORK_SERVICE_OWNER_NODE_ID")]
+    service_owner_node_id: Option<String>,
     #[arg(long, env = "HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL")]
     advertise_control_plane_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_ADVERTISE_SIGNAL_URL")]
@@ -4805,6 +4809,8 @@ where
 struct ControlPlaneServiceLeaseConfig {
     cluster_id: ClusterId,
     instance_id: String,
+    owner_host_id: String,
+    owner_node_id: Option<NodeId>,
     endpoints: Vec<BootstrapEndpoint>,
     ttl: Duration,
     renew_interval: Duration,
@@ -4816,6 +4822,8 @@ impl ControlPlaneServiceLeaseConfig {
         ServiceInstance {
             cluster_id: self.cluster_id.clone(),
             instance_id: self.instance_id.clone(),
+            owner_host_id: self.owner_host_id.clone(),
+            owner_node_id: self.owner_node_id.clone(),
             endpoints: self.endpoints.clone(),
             lease_expires_at: updated_at
                 + chrono::Duration::from_std(self.ttl)
@@ -4867,12 +4875,25 @@ fn control_plane_service_lease_config(
         bootstrap_endpoints_include_core_services(&endpoints),
         "advertised HA service instance must include --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url"
     );
+    let owner_host_id = args
+        .service_owner_host_id
+        .clone()
+        .context("--service-owner-host-id is required when advertising HA services")?;
+    let owner_node_id = args.service_owner_node_id.clone().map(NodeId::from_string);
+    anyhow::ensure!(
+        owner_node_id
+            .as_ref()
+            .is_none_or(|node_id| node_id.as_str() == owner_host_id),
+        "--service-owner-host-id must equal --service-owner-node-id when an overlay owner is set"
+    );
     Ok(Some(ControlPlaneServiceLeaseConfig {
         cluster_id: ClusterId::from_string(args.cluster_id.clone()),
         instance_id: args
             .service_instance_id
             .clone()
             .context("--service-instance-id is required when advertising HA services")?,
+        owner_host_id,
+        owner_node_id,
         endpoints,
         ttl: Duration::from_secs(args.service_lease_ttl_seconds),
         renew_interval: Duration::from_secs(args.service_lease_renew_interval_seconds),
@@ -4883,7 +4904,7 @@ fn required_control_plane_service_lease_config(
     args: &ControlPlaneArgs,
 ) -> anyhow::Result<ControlPlaneServiceLeaseConfig> {
     control_plane_service_lease_config(args)?.context(
-        "control-plane service advertisement is required; configure --service-instance-id, --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url",
+        "control-plane service advertisement is required; configure --service-instance-id, --service-owner-host-id, --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url",
     )
 }
 
@@ -4970,6 +4991,12 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
     }
     if let Some(instance_id) = args.service_instance_id.as_deref() {
         validate_daemon_identifier(instance_id, "--service-instance-id")?;
+    }
+    if let Some(owner_host_id) = args.service_owner_host_id.as_deref() {
+        validate_daemon_identifier(owner_host_id, "--service-owner-host-id")?;
+    }
+    if let Some(owner_node_id) = args.service_owner_node_id.as_deref() {
+        validate_daemon_identifier(owner_node_id, "--service-owner-node-id")?;
     }
     let _ = control_plane_service_lease_config(args)?;
     if let Some(token) = args.operator_api_bearer_token.as_deref() {
@@ -5881,6 +5908,7 @@ struct ControlPlaneOtelMetrics {
     relay_candidates: Gauge<u64>,
     ha_ready: Gauge<u64>,
     service_instances: Gauge<u64>,
+    service_hosts: Gauge<u64>,
     service_endpoints: Gauge<u64>,
     stale_endpoint_candidates: Gauge<u64>,
     endpoint_candidate_ttl_seconds: Gauge<u64>,
@@ -5921,16 +5949,22 @@ impl ControlPlaneOtelMetrics {
             ha_ready: meter
                 .u64_gauge("ipars.control_plane.ha.ready")
                 .with_description(
-                    "One when at least two distinct control-plane, signal, STUN, and relay endpoints have active leases.",
+                    "One when at least two independent hosts provide distinct control-plane, signal, STUN, and relay endpoints.",
                 )
                 .build(),
             service_instances: meter
                 .u64_gauge("ipars.control_plane.service_instances")
                 .with_description("Public service instances with active leases.")
                 .build(),
+            service_hosts: meter
+                .u64_gauge("ipars.control_plane.service_hosts")
+                .with_description("Hosts with active public service leases.")
+                .build(),
             service_endpoints: meter
                 .u64_gauge("ipars.control_plane.service_endpoints")
-                .with_description("Distinct active public service endpoints by service kind.")
+                .with_description(
+                    "Independent active service hosts with distinct endpoints by service kind.",
+                )
                 .build(),
             stale_endpoint_candidates: meter
                 .u64_gauge("ipars.control_plane.stale_endpoint_candidates")
@@ -6047,6 +6081,8 @@ impl ControlPlaneOtelMetrics {
             .record(u64::from(metrics.ha_ready), &cluster_attrs);
         self.service_instances
             .record(metrics.active_service_instance_count as u64, &cluster_attrs);
+        self.service_hosts
+            .record(metrics.active_service_host_count as u64, &cluster_attrs);
         for (service, count) in [
             ("control_plane", metrics.active_control_plane_count),
             ("signal", metrics.active_signal_count),
@@ -22480,6 +22516,7 @@ mod tests {
             client_count: 0,
             relay_candidate_count: 1,
             active_service_instance_count: 2,
+            active_service_host_count: 2,
             active_control_plane_count: 2,
             active_signal_count: 2,
             active_stun_count: 2,
@@ -22921,6 +22958,119 @@ mod tests {
         assert!(error.to_string().contains(
             "--advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_requires_service_owner_host_id() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--service-instance-id",
+            "public-a",
+            "--advertise-control-plane-url",
+            "https://public.example:8443",
+            "--advertise-signal-url",
+            "https://public.example:9443",
+            "--advertise-stun-url",
+            "udp://public.example:3478",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+
+        let error = match control_plane_service_lease_config(&args) {
+            Ok(_) => anyhow::bail!("service owner host ID must be required"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--service-owner-host-id"));
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_service_lease_tracks_overlay_owner() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--service-instance-id",
+            "public-a",
+            "--service-owner-host-id",
+            "node-owner-a",
+            "--service-owner-node-id",
+            "node-owner-a",
+            "--advertise-control-plane-url",
+            "https://public.example:8443",
+            "--advertise-signal-url",
+            "https://public.example:9443",
+            "--advertise-stun-url",
+            "udp://public.example:3478",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+
+        let config = required_control_plane_service_lease_config(&args)?;
+        assert_eq!(config.instance().owner_host_id, "node-owner-a");
+        assert_eq!(
+            config.instance().owner_node_id,
+            Some(NodeId::from_string("node-owner-a"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_service_lease_rejects_mismatched_overlay_owner() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            "pub-a",
+            "--service-instance-id",
+            "public-a",
+            "--service-owner-host-id",
+            "host-a",
+            "--service-owner-node-id",
+            "node-owner-a",
+            "--advertise-control-plane-url",
+            "https://public.example:8443",
+            "--advertise-signal-url",
+            "https://public.example:9443",
+            "--advertise-stun-url",
+            "udp://public.example:3478",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+
+        let error = match control_plane_service_lease_config(&args) {
+            Ok(_) => anyhow::bail!("mismatched host and node owners must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("--service-owner-host-id must equal --service-owner-node-id"));
         Ok(())
     }
 
