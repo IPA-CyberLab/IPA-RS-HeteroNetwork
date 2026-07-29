@@ -5123,6 +5123,7 @@ where
             instance_id,
             owner_host_id: node_id.as_str().to_string(),
             owner_node_id: Some(node_id.clone()),
+            enrollment_signer: false,
             endpoints: vec![BootstrapEndpoint {
                 kind: BootstrapEndpointKind::WebUi,
                 url,
@@ -6176,6 +6177,7 @@ mod tests {
             instance_id: instance_id.to_string(),
             owner_host_id: owner_node_id.to_string(),
             owner_node_id: Some(owner_node_id),
+            enrollment_signer: true,
             endpoints: vec![
                 BootstrapEndpoint {
                     kind: BootstrapEndpointKind::ControlPlane,
@@ -8590,6 +8592,7 @@ exit 47
                 directory.instances[0].clone(),
                 ServiceInstance {
                     owner_host_id: directory.instances[0].owner_host_id.clone(),
+                    enrollment_signer: true,
                     ..same_host_instance.clone()
                 },
             ],

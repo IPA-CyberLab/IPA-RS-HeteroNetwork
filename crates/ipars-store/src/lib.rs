@@ -4192,6 +4192,7 @@ mod tests {
             instance_id: "public-a".to_string(),
             owner_host_id: "host-public-a".to_string(),
             owner_node_id: None,
+            enrollment_signer: true,
             endpoints: vec![BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
                 url: "https://public-a.example:8443".to_string(),
@@ -4258,6 +4259,7 @@ mod tests {
             instance_id: "legacy-public".to_string(),
             owner_host_id: ipars_types::LEGACY_UNOWNED_SERVICE_HOST_ID.to_string(),
             owner_node_id: None,
+            enrollment_signer: false,
             endpoints: vec![BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
                 url: "https://legacy.example:8443".to_string(),
@@ -4272,6 +4274,7 @@ mod tests {
         };
         legacy.remove("owner_host_id");
         legacy.remove("owner_node_id");
+        legacy.remove("enrollment_signer");
         sqlx::query(
             "INSERT INTO service_instances (cluster_id, instance_id, record_json) VALUES (?1, ?2, ?3)",
         )

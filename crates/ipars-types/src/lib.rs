@@ -249,6 +249,8 @@ pub struct ServiceInstance {
     ///
     /// Infrastructure-only hosts do not have an overlay node identity.
     pub owner_node_id: Option<NodeId>,
+    /// Whether this control-plane instance can sign node enrollment credentials.
+    pub enrollment_signer: bool,
     pub endpoints: Vec<BootstrapEndpoint>,
     pub lease_expires_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -267,6 +269,8 @@ impl<'de> Deserialize<'de> for ServiceInstance {
             owner_host_id: Option<String>,
             #[serde(default)]
             owner_node_id: Option<NodeId>,
+            #[serde(default)]
+            enrollment_signer: bool,
             endpoints: Vec<BootstrapEndpoint>,
             lease_expires_at: DateTime<Utc>,
             updated_at: DateTime<Utc>,
@@ -280,6 +284,7 @@ impl<'de> Deserialize<'de> for ServiceInstance {
                 .owner_host_id
                 .unwrap_or_else(|| LEGACY_UNOWNED_SERVICE_HOST_ID.to_string()),
             owner_node_id: fields.owner_node_id,
+            enrollment_signer: fields.enrollment_signer,
             endpoints: fields.endpoints,
             lease_expires_at: fields.lease_expires_at,
             updated_at: fields.updated_at,
@@ -19162,7 +19167,7 @@ mod tests {
     const MYSQL_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
     #[test]
-    fn legacy_service_instance_without_owner_uses_one_unowned_failure_domain(
+    fn legacy_service_instance_defaults_missing_owner_and_enrollment_signer(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let now = Utc::now();
         let instance = ServiceInstance {
@@ -19170,6 +19175,7 @@ mod tests {
             instance_id: "public-a".to_string(),
             owner_host_id: "host-a".to_string(),
             owner_node_id: None,
+            enrollment_signer: true,
             endpoints: vec![BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
                 url: "https://public-a.example:8443".to_string(),
@@ -19183,15 +19189,18 @@ mod tests {
         };
         fields.remove("owner_host_id");
         fields.remove("owner_node_id");
+        fields.remove("enrollment_signer");
 
         let restored: ServiceInstance = serde_json::from_value(legacy)?;
         assert_eq!(restored.owner_host_id, LEGACY_UNOWNED_SERVICE_HOST_ID);
         assert!(restored.owner_node_id.is_none());
+        assert!(!restored.enrollment_signer);
 
         let mut invalid = serde_json::to_value(instance)?;
         invalid["owner_host_id"] = serde_json::Value::String(String::new());
         let invalid: ServiceInstance = serde_json::from_value(invalid)?;
         assert!(invalid.owner_host_id.is_empty());
+        assert!(invalid.enrollment_signer);
         Ok(())
     }
 

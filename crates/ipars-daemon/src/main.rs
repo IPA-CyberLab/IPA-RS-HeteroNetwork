@@ -4879,6 +4879,7 @@ struct ControlPlaneServiceLeaseConfig {
     instance_id: String,
     owner_host_id: String,
     owner_node_id: Option<NodeId>,
+    enrollment_signer: bool,
     endpoints: Vec<BootstrapEndpoint>,
     ttl: Duration,
     renew_interval: Duration,
@@ -4892,6 +4893,7 @@ impl ControlPlaneServiceLeaseConfig {
             instance_id: self.instance_id.clone(),
             owner_host_id: self.owner_host_id.clone(),
             owner_node_id: self.owner_node_id.clone(),
+            enrollment_signer: self.enrollment_signer,
             endpoints: self.endpoints.clone(),
             lease_expires_at: updated_at
                 + chrono::Duration::from_std(self.ttl)
@@ -4964,6 +4966,7 @@ fn control_plane_service_lease_config(
             .context("--service-instance-id is required when advertising HA services")?,
         owner_host_id,
         owner_node_id: Some(owner_node_id),
+        enrollment_signer: args.node_enrollment_enabled,
         endpoints,
         ttl: Duration::from_secs(args.service_lease_ttl_seconds),
         renew_interval: Duration::from_secs(args.service_lease_renew_interval_seconds),
@@ -23172,7 +23175,8 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_service_lease_tracks_overlay_owner() -> anyhow::Result<()> {
+    fn control_plane_service_lease_tracks_overlay_owner_and_enrollment_signer() -> anyhow::Result<()>
+    {
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -23197,16 +23201,24 @@ mod tests {
             "--advertise-stun-url",
             "udp://public.example:3478",
         ])?;
-        let Command::ControlPlane(args) = cli.command else {
+        let Command::ControlPlane(mut args) = cli.command else {
             anyhow::bail!("expected control-plane command");
         };
 
         let config = required_control_plane_service_lease_config(&args)?;
-        assert_eq!(config.instance().owner_host_id, "node-owner-a");
+        let instance = config.instance();
+        assert_eq!(instance.owner_host_id, "node-owner-a");
         assert_eq!(
-            config.instance().owner_node_id,
+            instance.owner_node_id,
             Some(NodeId::from_string("node-owner-a"))
         );
+        assert!(!config.enrollment_signer);
+        assert!(!instance.enrollment_signer);
+
+        args.node_enrollment_enabled = true;
+        let signer_config = required_control_plane_service_lease_config(&args)?;
+        assert!(signer_config.enrollment_signer);
+        assert!(signer_config.instance().enrollment_signer);
         Ok(())
     }
 

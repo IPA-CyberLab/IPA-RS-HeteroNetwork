@@ -1983,8 +1983,10 @@ where
         instances.sort_by(|left, right| {
             let left_has_core = bootstrap_endpoints_include_core_services(&left.endpoints);
             let right_has_core = bootstrap_endpoints_include_core_services(&right.endpoints);
-            right_has_core
-                .cmp(&left_has_core)
+            right
+                .enrollment_signer
+                .cmp(&left.enrollment_signer)
+                .then_with(|| right_has_core.cmp(&left_has_core))
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
                 .then_with(|| left.instance_id.cmp(&right.instance_id))
         });
@@ -1994,22 +1996,32 @@ where
         let mut per_kind = BTreeMap::<BootstrapEndpointKind, usize>::new();
         let mut seen = BTreeSet::<(BootstrapEndpointKind, String)>::new();
         let mut bootstrap_endpoints = Vec::new();
-        for instance in &instances {
-            for endpoint in &instance.endpoints {
-                if bootstrap_endpoints.len() >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS {
-                    break;
-                }
-                let count = per_kind.entry(endpoint.kind).or_default();
-                let endpoint_key = canonical_bootstrap_endpoint_url(&endpoint.url)
-                    .unwrap_or_else(|| endpoint.url.clone());
-                if *count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND
-                    || !seen.insert((endpoint.kind, endpoint_key))
-                {
-                    continue;
-                }
-                bootstrap_endpoints.push(endpoint.clone());
-                *count += 1;
+        let signer_control_plane_endpoints = instances
+            .iter()
+            .filter(|instance| instance.enrollment_signer)
+            .flat_map(|instance| {
+                instance
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            });
+        let remaining_endpoints = instances
+            .iter()
+            .flat_map(|instance| instance.endpoints.iter());
+        for endpoint in signer_control_plane_endpoints.chain(remaining_endpoints) {
+            if bootstrap_endpoints.len() >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS {
+                break;
             }
+            let count = per_kind.entry(endpoint.kind).or_default();
+            let endpoint_key = canonical_bootstrap_endpoint_url(&endpoint.url)
+                .unwrap_or_else(|| endpoint.url.clone());
+            if *count >= MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND
+                || !seen.insert((endpoint.kind, endpoint_key))
+            {
+                continue;
+            }
+            bootstrap_endpoints.push(endpoint.clone());
+            *count += 1;
         }
         if !bootstrap_endpoints_include_core_services(&bootstrap_endpoints) {
             bootstrap_endpoints.clear();
@@ -5105,6 +5117,17 @@ fn validate_service_instance(
             instance.instance_id
         )));
     }
+    if instance.enrollment_signer
+        && !instance
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+    {
+        return Err(ControlPlaneError::Store(format!(
+            "enrollment signer service instance {} must advertise a control-plane endpoint",
+            instance.instance_id
+        )));
+    }
     let mut kinds = BTreeSet::new();
     if instance
         .endpoints
@@ -6728,6 +6751,7 @@ mod tests {
             instance_id: instance_id.to_string(),
             owner_host_id: owner_node_id.as_str().to_string(),
             owner_node_id: Some(owner_node_id),
+            enrollment_signer: false,
             endpoints: vec![
                 BootstrapEndpoint {
                     kind: BootstrapEndpointKind::ControlPlane,
@@ -8686,6 +8710,26 @@ mod tests {
             .await
             .is_err());
 
+        let mut signer_without_control_plane = service_instance(
+            &cluster_id,
+            "invalid-signer",
+            "invalid-signer.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        signer_without_control_plane.enrollment_signer = true;
+        signer_without_control_plane
+            .endpoints
+            .retain(|endpoint| endpoint.kind != BootstrapEndpointKind::ControlPlane);
+        assert!(matches!(
+            plane
+                .advertise_service_instance(signer_without_control_plane)
+                .await,
+            Err(ControlPlaneError::Store(reason))
+                if reason
+                    == "enrollment signer service instance invalid-signer must advertise a control-plane endpoint"
+        ));
+
         let mut duplicate_urls = service_instance(
             &cluster_id,
             "public-b",
@@ -9056,6 +9100,94 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.kind == kind && endpoint.url.contains("core-a.example")));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_directory_prioritizes_signers_across_instance_and_endpoint_limits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const INSTANCE_COUNT: usize = 1_000;
+        const SIGNER_COUNT: usize = 4;
+
+        let cluster_id = ClusterId::from_string("cluster-signer-retention");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        let now = Utc::now();
+        let owner_node_id = insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "shared-owner",
+            Ipv4Addr::new(8, 8, 8, 24),
+            now,
+        )
+        .await?;
+
+        for index in 0..(INSTANCE_COUNT - SIGNER_COUNT) {
+            let instance_id = format!("instance-{index:04}");
+            let mut instance = service_instance(
+                &cluster_id,
+                &instance_id,
+                &format!("{instance_id}.example"),
+                now,
+                now + Duration::seconds(30),
+            );
+            instance.owner_host_id = owner_node_id.as_str().to_string();
+            instance.owner_node_id = Some(owner_node_id.clone());
+            plane.advertise_service_instance(instance).await?;
+        }
+        for index in 0..SIGNER_COUNT {
+            let instance_id = format!("signer-{index:04}");
+            let mut signer = service_instance(
+                &cluster_id,
+                &instance_id,
+                &format!("{instance_id}.example"),
+                now - Duration::seconds(30),
+                now + Duration::seconds(30),
+            );
+            signer.owner_host_id = owner_node_id.as_str().to_string();
+            signer.owner_node_id = Some(owner_node_id.clone());
+            signer.enrollment_signer = true;
+            plane.advertise_service_instance(signer).await?;
+        }
+
+        let directory = plane.service_directory().await?;
+
+        assert_eq!(directory.instances.len(), MAX_ACTIVE_SERVICE_INSTANCES);
+        assert_eq!(
+            directory
+                .instances
+                .iter()
+                .filter(|instance| instance.enrollment_signer)
+                .map(|instance| instance.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["signer-0000", "signer-0001", "signer-0002", "signer-0003"]
+        );
+
+        let control_plane_urls = directory
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            control_plane_urls.len(),
+            MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND
+        );
+        assert_eq!(
+            &control_plane_urls[..SIGNER_COUNT],
+            [
+                "https://signer-0000.example:8443",
+                "https://signer-0001.example:8443",
+                "https://signer-0002.example:8443",
+                "https://signer-0003.example:8443",
+            ]
+        );
         Ok(())
     }
 

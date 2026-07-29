@@ -10825,6 +10825,7 @@ mod tests {
                     instance_id: format!("public-{host}"),
                     owner_host_id: owner_node_id.to_string(),
                     owner_node_id: Some(owner_node_id),
+                    enrollment_signer: false,
                     endpoints: vec![
                         BootstrapEndpoint {
                             url: format!("https://203.0.113.{host}:8443"),

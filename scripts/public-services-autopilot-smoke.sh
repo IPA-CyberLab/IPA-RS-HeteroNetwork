@@ -317,6 +317,12 @@ grep -q '^HETERONETWORK_STUN_LISTEN="0.0.0.0:19444"$' "$services_env" ||
   fail "automatic STUN listen address is wrong"
 grep -q '^HETERONETWORK_STUN_HTTP_LISTEN="10.250.0.4:19446"$' "$services_env" ||
   fail "automatic STUN HTTP listen address is wrong"
+grep -q '^HETERONETWORK_SERVICE_INSTANCE_ID="auto-services-node-0e1c0dadf2fab64e23dfe42c9a073f1b"$' \
+  "$services_env" || fail "automatic service instance ID can collide with the enrollment signer"
+grep -q '^HETERONETWORK_SERVICE_OWNER_HOST_ID="node-0e1c0dadf2fab64e23dfe42c9a073f1b"$' \
+  "$services_env" || fail "automatic service owner host ID is wrong"
+grep -q '^HETERONETWORK_SERVICE_OWNER_NODE_ID="node-0e1c0dadf2fab64e23dfe42c9a073f1b"$' \
+  "$services_env" || fail "automatic service owner node ID is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_STUN_URL="udp://163.220.236.51:19444"$' \
   "$services_env" || fail "automatic STUN advertisement is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL="udp://163.220.236.51:18445"$' \

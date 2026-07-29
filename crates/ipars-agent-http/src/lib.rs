@@ -4206,6 +4206,34 @@ mod tests {
         Ok((base_url, state, task))
     }
 
+    fn install_authoritative_test_directory(
+        runtime: &AgentRuntime,
+        control_plane_urls: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut endpoints = control_plane_urls
+            .iter()
+            .cloned()
+            .map(|url| BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url,
+            })
+            .collect::<Vec<_>>();
+        endpoints.extend([
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "http://127.0.0.1:19443".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://127.0.0.1:19444".to_string(),
+            },
+        ]);
+        runtime
+            .merge_active_bootstrap_endpoints(&endpoints, Utc::now())?
+            .ok_or("test active directory did not replace seed endpoints")?;
+        Ok(())
+    }
+
     #[test]
     fn web_ui_endpoint_normalization_requires_tls_for_public_addresses() {
         assert_eq!(
@@ -5167,9 +5195,13 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         ));
+        install_authoritative_test_directory(
+            runtime.as_ref(),
+            &[auto_url.clone(), signer_url.clone()],
+        )?;
         let state = AgentHttpState::with_control_plane_urls(
             runtime,
-            vec![auto_url.clone(), signer_url.clone()],
+            vec!["http://127.0.0.1:1".to_string()],
         )
         .enable_local_web_ui(true);
         record_web_ui_health(&state, auto_url.clone(), true).await;
@@ -5217,9 +5249,13 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         ));
+        install_authoritative_test_directory(
+            runtime.as_ref(),
+            &[auto_url.clone(), signer_url.clone()],
+        )?;
         let state = AgentHttpState::with_control_plane_urls(
             runtime,
-            vec![auto_url.clone(), signer_url.clone()],
+            vec!["http://127.0.0.1:1".to_string()],
         )
         .enable_local_web_ui(true);
         record_web_ui_health(&state, auto_url.clone(), true).await;
@@ -5331,9 +5367,12 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         ));
-        let state =
-            AgentHttpState::with_control_plane_urls(runtime, vec![auto_url.clone(), signer_url])
-                .enable_local_web_ui(true);
+        install_authoritative_test_directory(runtime.as_ref(), &[auto_url.clone(), signer_url])?;
+        let state = AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec!["http://127.0.0.1:1".to_string()],
+        )
+        .enable_local_web_ui(true);
         set_selected_web_ui(&state, Some(auto_url.clone())).await;
         let response = router(state)
             .oneshot(

@@ -608,7 +608,8 @@ prepare_runtime_files() {
       "$signal_control_plane_urls"
     write_environment_entry HETERONETWORK_STUN_LISTEN "$stun_listen"
     write_environment_entry HETERONETWORK_STUN_HTTP_LISTEN "$vpn_ip:19446"
-    write_environment_entry HETERONETWORK_SERVICE_INSTANCE_ID "$node_id"
+    write_environment_entry HETERONETWORK_SERVICE_INSTANCE_ID \
+      "auto-services-$node_id"
     write_environment_entry HETERONETWORK_SERVICE_OWNER_HOST_ID "$node_id"
     write_environment_entry HETERONETWORK_SERVICE_OWNER_NODE_ID "$node_id"
     write_environment_entry HETERONETWORK_SERVICE_LEASE_TTL_SECONDS 30
