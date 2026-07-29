@@ -8,8 +8,10 @@ readonly MIN_DATABASE_MEMBER_COUNT="3"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
 readonly MAX_DATABASE_CANDIDATE_COUNT="64"
 readonly TARGET_DCS_MEMBER_COUNT="5"
+readonly MAX_DCS_MEMBER_COUNT="9"
 readonly BUNDLE_PORT="17446"
 readonly DATABASE_NETWORK_PLANE="underlay-v1"
+readonly PROXY_BUNDLE_FORMAT_VERSION="1"
 readonly REQUIRED_CONVERGENCE_RECONCILES="3"
 readonly BUNDLE_HEALTH_RETRY_ATTEMPTS="6"
 readonly BUNDLE_HEALTH_RETRY_SECONDS="5"
@@ -28,6 +30,9 @@ helper="/opt/heteronetwork/libexec/postgres-ha-node.sh"
 bundle_dir="$state_dir/bundle"
 bundle_archive="$state_dir/bundle.tar.gz"
 bundle_member_vpn_path="$state_dir/bundle-member-vpn.txt"
+proxy_bundle_archive="$state_dir/proxy-bundle.tar.gz"
+proxy_bundle_vpn_path="$state_dir/proxy-bundle-vpn.txt"
+proxy_bundle_marker_name=".proxy-only"
 eligible_path="$state_dir/eligible.tsv"
 authoritative_path="$state_dir/authoritative.tsv"
 active_path="$state_dir/active.tsv"
@@ -40,6 +45,7 @@ authoritative_stability_path="$state_dir/authoritative-stability.tsv"
 reciprocal_stability_path="$state_dir/reciprocal-stability.tsv"
 applied_revision_path="$state_dir/applied-revision"
 configured_revision_path="$state_dir/configured-revision"
+proxy_applied_digest_path="$state_dir/proxy-applied-digest"
 curl_config_path="$state_dir/curl.conf"
 underlay_health_handler="${HETERONETWORK_DB_UNDERLAY_HEALTH_HANDLER:-/opt/heteronetwork/libexec/postgres-underlay-health.py}"
 underlay_health_handler_changed=0
@@ -141,6 +147,20 @@ agent_is_ready() {
 
 unmanaged_legacy_database_exists() {
   [[ -f "$legacy_database_service_path" && ! -d "$bundle_dir" ]]
+}
+
+full_database_bundle_exists() {
+  [[ -d "$bundle_dir" \
+    && ! -L "$bundle_dir" \
+    && ! -e "$bundle_dir/$proxy_bundle_marker_name" ]]
+}
+
+proxy_only_bundle_exists() {
+  [[ -d "$bundle_dir" \
+    && ! -L "$bundle_dir" \
+    && -f "$bundle_dir/$proxy_bundle_marker_name" \
+    && ! -L "$bundle_dir/$proxy_bundle_marker_name" \
+    && "$(<"$bundle_dir/$proxy_bundle_marker_name")" == "$PROXY_BUNDLE_FORMAT_VERSION" ]]
 }
 
 read_agent_status() {
@@ -326,8 +346,9 @@ select_underlay_candidate() {
 }
 
 local_identity_row() {
-  local status vpn_ip node_id underlay_ip underlay_interface
-  status="$(read_agent_status)" || return 1
+  local status="${1:-}"
+  local vpn_ip node_id underlay_ip underlay_interface
+  [[ -n "$status" ]] || status="$(read_agent_status)" || return 1
   vpn_ip="$(jq -er \
     '.vpn_ip | select(type == "string" and test("^[0-9]+(\\.[0-9]+){3}$"))' \
     <<<"$status")" || return 1
@@ -346,6 +367,40 @@ local_identity_row() {
   underlay_interface="$(interface_for_address "$underlay_ip")" || return 1
   [[ "$underlay_interface" != "heteronetwork0" ]] || return 1
   printf '%s\t%s\t%s\n' "$vpn_ip" "$node_id" "$underlay_ip"
+}
+
+agent_status_is_direct_public() {
+  local status="$1"
+  local max_age
+  max_age="$((10#$reconcile_interval_seconds * 3 + 30))"
+  ((max_age >= 90)) || max_age=90
+  jq -e --argjson max_age "$max_age" '
+    .nat_classification as $nat
+    | (try ($nat.assessed_at
+        | sub("\\.[0-9]+Z$"; "Z")
+        | fromdateiso8601) catch null) as $assessed
+    | (.node_id
+        | type == "string"
+          and length > 0
+          and length <= 255
+          and test("^[A-Za-z0-9._:-]+$"))
+      and (.vpn_ip
+        | type == "string"
+          and test("^[0-9]+(\\.[0-9]+){3}$"))
+      and ($nat | type == "object")
+      and ($nat.connectivity_state == "public")
+      and ($nat.mapping_behavior == "no_nat")
+      and ($nat.strategy == "direct_candidate")
+      and ($nat.local_addr | type == "string")
+      and ($nat.observed_endpoint == $nat.local_addr)
+      and ($nat.observations | type == "array" and length > 0)
+      and all($nat.observations[];
+        .local_addr == $nat.local_addr
+        and .reflexive_addr == $nat.local_addr)
+      and ($assessed != null)
+      and ($assessed <= (now + 5))
+      and ($assessed >= (now - $max_age))
+  ' <<<"$status" >/dev/null
 }
 
 address_for_interface() {
@@ -735,6 +790,10 @@ peer_autopilot_is_ready() {
 
 validate_eligible_snapshot() {
   local path="$1"
+  local maximum_count="${2:-$MAX_DATABASE_MEMBER_COUNT}"
+  [[ "$maximum_count" =~ ^[0-9]+$ \
+    && 10#$maximum_count -ge 1 \
+    && 10#$maximum_count -le MAX_DATABASE_CANDIDATE_COUNT ]] || return 1
   [[ -f "$registered_vpn_path" ]] || return 1
   local vpn_ip node_id underlay_ip extra count=0
   local -A seen_vpn_ips=()
@@ -756,7 +815,7 @@ validate_eligible_snapshot() {
     seen_underlay_ips["$underlay_ip"]=1
     count=$((count + 1))
   done <"$path"
-  ((count > 0 && count <= MAX_DATABASE_MEMBER_COUNT))
+  ((count > 0 && count <= 10#$maximum_count))
 }
 
 descriptor_is_current() {
@@ -835,7 +894,8 @@ write_local_reachability() {
     fi
     printf '%s\t%s\t%s\n' "$vpn_ip" "$node_id" "$underlay_ip" >>"$temporary"
   done <"$selected_path"
-  if ! validate_eligible_snapshot "$temporary"; then
+  if ! validate_eligible_snapshot \
+      "$temporary" "$MAX_DATABASE_CANDIDATE_COUNT"; then
     rm -f "$temporary"
     return 1
   fi
@@ -990,7 +1050,8 @@ PY
 write_reciprocal_eligible_snapshot() {
   local local_node_id="$1"
   local authoritative_digest="$2"
-  if ! validate_eligible_snapshot "$local_reachability_path"; then
+  if ! validate_eligible_snapshot \
+      "$local_reachability_path" "$MAX_DATABASE_CANDIDATE_COUNT"; then
     reset_reciprocal_snapshot
     return 1
   fi
@@ -1332,6 +1393,173 @@ validate_bundle_directory() {
   run_helper_for_bundle "$directory" validate-bundle "$directory" >/dev/null 2>&1
 }
 
+validate_proxy_bundle_directory() {
+  local directory="$1"
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  [[ -f "$directory/$proxy_bundle_marker_name" \
+    && ! -L "$directory/$proxy_bundle_marker_name" \
+    && "$(<"$directory/$proxy_bundle_marker_name")" == "$PROXY_BUNDLE_FORMAT_VERSION" ]] \
+    || return 1
+  load_bundle_manifest "$directory" || return 1
+  if ! python3 - \
+    "$directory" \
+    "$manifest_cluster_name" "$manifest_members" "$manifest_member_identities" \
+    "$manifest_dcs_members" "$manifest_dcs_bootstrap_members" \
+    "$manifest_service_name" "$manifest_postgres_port" "$manifest_rest_port" \
+    "$MAX_DATABASE_MEMBER_COUNT" "$MAX_DCS_MEMBER_COUNT" \
+    "$proxy_bundle_marker_name" <<'PY'
+import ipaddress
+import os
+import pathlib
+import re
+import stat
+import sys
+
+(
+    root_raw,
+    cluster_name,
+    members_raw,
+    identities_raw,
+    dcs_raw,
+    dcs_bootstrap_raw,
+    service_name,
+    postgres_port_raw,
+    rest_port_raw,
+    member_limit_raw,
+    dcs_limit_raw,
+    marker_name,
+) = sys.argv[1:]
+root = pathlib.Path(root_raw)
+member_limit = int(member_limit_raw)
+dcs_limit = int(dcs_limit_raw)
+expected_files = {
+    marker_name,
+    "manifest.env",
+    "cluster-id",
+    "ca/ca.crt",
+    "secrets/application.password",
+}
+expected_directories = {"ca", "secrets"}
+actual_files = set()
+actual_directories = set()
+for path in root.rglob("*"):
+    if path.is_symlink():
+        raise SystemExit("proxy bundle contains a symlink")
+    relative = path.relative_to(root).as_posix()
+    mode = path.stat().st_mode
+    if stat.S_ISREG(mode):
+        if path.stat().st_nlink != 1:
+            raise SystemExit("proxy bundle contains a hard-linked file")
+        actual_files.add(relative)
+    elif stat.S_ISDIR(mode):
+        actual_directories.add(relative)
+    else:
+        raise SystemExit("proxy bundle contains an unsupported object")
+if actual_files != expected_files or actual_directories != expected_directories:
+    raise SystemExit("proxy bundle file allowlist mismatch")
+for relative in (marker_name, "manifest.env", "cluster-id", "secrets/application.password"):
+    if os.stat(root / relative).st_mode & 0o077:
+        raise SystemExit("proxy bundle private file is group/world accessible")
+for relative in (".", "ca", "secrets"):
+    if os.stat(root / relative).st_mode & 0o077:
+        raise SystemExit("proxy bundle directory is group/world accessible")
+if os.stat(root / "ca/ca.crt").st_mode & 0o022:
+    raise SystemExit("proxy bundle CA is group/world writable")
+
+name_pattern = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+node_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+dns_pattern = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+if not 1 <= len(cluster_name) <= 63 or not name_pattern.fullmatch(cluster_name):
+    raise SystemExit("invalid proxy bundle cluster name")
+if (
+    not 1 <= len(service_name) <= 253
+    or not dns_pattern.fullmatch(service_name)
+    or ".." in service_name
+):
+    raise SystemExit("invalid proxy bundle service name")
+for port_raw in (postgres_port_raw, rest_port_raw):
+    if not port_raw.isdigit() or not 1024 <= int(port_raw) <= 65535:
+        raise SystemExit("invalid proxy bundle port")
+
+def parse_address_map(raw, label, minimum, maximum, require_odd=False):
+    entries = raw.split(",") if raw else []
+    if not minimum <= len(entries) <= maximum:
+        raise SystemExit(f"invalid {label} count")
+    if require_odd and len(entries) % 2 != 1:
+        raise SystemExit(f"{label} count must be odd")
+    result = {}
+    addresses = set()
+    order = []
+    for entry in entries:
+        name, separator, address = entry.partition("=")
+        if (
+            not separator
+            or not name_pattern.fullmatch(name)
+            or name in result
+            or any(character.isspace() for character in entry)
+        ):
+            raise SystemExit(f"invalid {label} entry")
+        try:
+            parsed = ipaddress.IPv4Address(address)
+        except ipaddress.AddressValueError as error:
+            raise SystemExit(f"invalid {label} address") from error
+        if parsed in addresses:
+            raise SystemExit(f"duplicate {label} address")
+        result[name] = address
+        addresses.add(parsed)
+        order.append(name)
+    return result, order
+
+members, member_order = parse_address_map(
+    members_raw, "database member", 3, member_limit
+)
+identities = {}
+identity_order = []
+node_ids = set()
+for entry in identities_raw.split(",") if identities_raw else []:
+    name, separator, node_id = entry.partition("=")
+    if (
+        not separator
+        or not name_pattern.fullmatch(name)
+        or not node_pattern.fullmatch(node_id)
+        or len(node_id) > 255
+        or name in identities
+        or node_id in node_ids
+        or any(character.isspace() for character in entry)
+    ):
+        raise SystemExit("invalid database member identity")
+    identities[name] = node_id
+    node_ids.add(node_id)
+    identity_order.append(name)
+if identity_order != member_order:
+    raise SystemExit("database member and identity orders differ")
+dcs, _ = parse_address_map(
+    dcs_raw, "DCS member", 3, dcs_limit, require_odd=True
+)
+dcs_bootstrap, _ = parse_address_map(
+    dcs_bootstrap_raw, "DCS bootstrap member", 3, dcs_limit
+)
+for name, address in dcs.items():
+    if members.get(name) != address:
+        raise SystemExit("DCS member is absent from database members")
+for name, address in dcs_bootstrap.items():
+    if dcs.get(name) != address:
+        raise SystemExit("DCS bootstrap member is absent from requested DCS members")
+PY
+  then
+    return 1
+  fi
+  local application_password
+  application_password="$(
+    tr -d '\r\n' <"$directory/secrets/application.password"
+  )" || return 1
+  [[ "$application_password" =~ ^[A-Za-z0-9]{32,128}$ ]] || return 1
+  openssl x509 -in "$directory/ca/ca.crt" -noout -checkend 0 >/dev/null 2>&1 \
+    || return 1
+  openssl verify \
+    -CAfile "$directory/ca/ca.crt" "$directory/ca/ca.crt" >/dev/null 2>&1
+}
+
 safe_extract_bundle() {
   local archive="$1"
   local destination="$2"
@@ -1402,12 +1630,11 @@ with tarfile.open(archive, "r:gz") as bundle:
 PY
 }
 
-install_bundle_directory() {
+exchange_bundle_directory() {
   local source="$1"
-  validate_bundle_directory "$source" || die "downloaded database bundle failed validation"
   if [[ ! -e "$bundle_dir" ]]; then
     mv "$source" "$bundle_dir" \
-      || die "failed to atomically install the initial database bundle"
+      || die "failed to atomically install the initial database material"
     return
   fi
   python3 - "$source" "$bundle_dir" <<'PY'
@@ -1453,6 +1680,19 @@ PY
   rm -rf "$source"
 }
 
+install_bundle_directory() {
+  local source="$1"
+  validate_bundle_directory "$source" || die "downloaded database bundle failed validation"
+  exchange_bundle_directory "$source"
+}
+
+install_proxy_bundle_directory() {
+  local source="$1"
+  validate_proxy_bundle_directory "$source" \
+    || die "downloaded database proxy bundle failed validation"
+  exchange_bundle_directory "$source"
+}
+
 publish_member_descriptor() {
   local node_id="$1"
   local underlay_ip="$2"
@@ -1466,7 +1706,7 @@ publish_member_descriptor() {
   [[ "$selection_epoch" =~ ^[0-9]+$ ]] \
     || die "invalid database candidate selection epoch"
   selection_digest="$(snapshot_digest "$selected_path")"
-  if [[ -d "$bundle_dir" ]] && load_bundle_manifest "$bundle_dir"; then
+  if full_database_bundle_exists && load_bundle_manifest "$bundle_dir"; then
     bundle_revision="$manifest_revision"
     bundle_digest="$(bundle_content_digest "$bundle_dir")" \
       || die "unable to digest the local database bundle"
@@ -1557,11 +1797,12 @@ if [ -z "$authorized" ]; then
     "${#body}" "$body"
   exit 0
 fi
-bundle_peer_is_member() {
+bundle_peer_is_authorized() {
+  authorization_path="$1"
   [ -n "${SOCAT_PEERADDR:-}" ] \
-    && [ -f "$BUNDLE_MEMBER_VPN_PATH" ] \
-    && [ ! -L "$BUNDLE_MEMBER_VPN_PATH" ] \
-    && grep -Fqx -- "$SOCAT_PEERADDR" "$BUNDLE_MEMBER_VPN_PATH"
+    && [ -f "$authorization_path" ] \
+    && [ ! -L "$authorization_path" ] \
+    && grep -Fqx -- "$SOCAT_PEERADDR" "$authorization_path"
 }
 case "$request" in
   "GET /health HTTP/1.1")
@@ -1582,7 +1823,7 @@ case "$request" in
     cat "$MEMBER_DESCRIPTOR"
     ;;
   "GET /v1/postgres-ha/bundle HTTP/1.1")
-    if ! bundle_peer_is_member; then
+    if ! bundle_peer_is_authorized "$BUNDLE_MEMBER_VPN_PATH"; then
       body=forbidden
       printf 'HTTP/1.1 403 Forbidden\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
         "${#body}" "$body"
@@ -1598,6 +1839,24 @@ case "$request" in
     printf 'HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: %s\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n' \
       "$length"
     cat "$BUNDLE_ARCHIVE"
+    ;;
+  "GET /v1/postgres-ha/proxy-bundle HTTP/1.1")
+    if ! bundle_peer_is_authorized "$PROXY_BUNDLE_VPN_PATH"; then
+      body=forbidden
+      printf 'HTTP/1.1 403 Forbidden\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+        "${#body}" "$body"
+      exit 0
+    fi
+    if [ ! -s "$PROXY_BUNDLE_ARCHIVE" ]; then
+      body=waiting
+      printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+        "${#body}" "$body"
+      exit 0
+    fi
+    length=$(wc -c <"$PROXY_BUNDLE_ARCHIVE" | tr -d ' ')
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: %s\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n' \
+      "$length"
+    cat "$PROXY_BUNDLE_ARCHIVE"
     ;;
   *)
     body='not found'
@@ -1861,10 +2120,15 @@ start_bundle_servers() {
   local node_id="$2"
   local underlay_ip="$3"
   ensure_member_descriptor "$node_id" "$underlay_ip"
+  write_proxy_bundle_vpn_snapshot \
+    || die "database proxy bundle authorization exceeds the bounded candidate set"
+  publish_proxy_bundle_archive
   cat >"$state_dir/bundle-server.env" <<EOF
 BUNDLE_BEARER_TOKEN=${HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN}
 BUNDLE_ARCHIVE=${bundle_archive}
 BUNDLE_MEMBER_VPN_PATH=${bundle_member_vpn_path}
+PROXY_BUNDLE_ARCHIVE=${proxy_bundle_archive}
+PROXY_BUNDLE_VPN_PATH=${proxy_bundle_vpn_path}
 MEMBER_DESCRIPTOR=${state_dir}/member.json
 EOF
   chmod 0600 "$state_dir/bundle-server.env"
@@ -1906,6 +2170,7 @@ bundle_contains_node_id() {
 }
 
 write_bundle_member_vpn_snapshot() {
+  full_database_bundle_exists || return 1
   load_bundle_manifest "$bundle_dir" || return 1
   local temporary
   temporary="$(mktemp "$state_dir/bundle-member-vpn.XXXXXX")"
@@ -1956,8 +2221,85 @@ PY
   rm -f "$temporary"
 }
 
+write_proxy_bundle_vpn_snapshot() {
+  local temporary
+  temporary="$(mktemp "$state_dir/proxy-bundle-vpn.XXXXXX")"
+  if ! python3 - \
+      "$selected_path" "$active_path" \
+      "$MAX_DATABASE_CANDIDATE_COUNT" >"$temporary" <<'PY'
+import ipaddress
+import sys
+
+selected_path, active_path, limit_raw = sys.argv[1:]
+limit = int(limit_raw)
+active = set()
+with open(active_path, encoding="utf-8") as source:
+    for line in source:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 2:
+            raise SystemExit("invalid active database peer row")
+        active.add(tuple(fields))
+
+allowed = []
+seen_node_ids = set()
+seen_vpn_ips = set()
+with open(selected_path, encoding="utf-8") as source:
+    for line in source:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 2:
+            raise SystemExit("invalid selected database peer row")
+        node_id, vpn_ip = fields
+        if node_id in seen_node_ids or vpn_ip in seen_vpn_ips:
+            raise SystemExit("duplicate selected proxy bundle recipient")
+        if (node_id, vpn_ip) in active:
+            if ipaddress.ip_address(vpn_ip).version != 4:
+                raise SystemExit("proxy bundle recipient VPN address must be IPv4")
+            allowed.append(vpn_ip)
+        seen_node_ids.add(node_id)
+        seen_vpn_ips.add(vpn_ip)
+if len(seen_node_ids) > limit or len(allowed) > limit:
+    raise SystemExit("proxy bundle authorization exceeds the candidate limit")
+for vpn_ip in sorted(allowed, key=lambda value: ipaddress.ip_address(value)):
+    print(vpn_ip)
+PY
+  then
+    rm -f "$temporary"
+    return 1
+  fi
+  install -m 0600 "$temporary" "$proxy_bundle_vpn_path"
+  rm -f "$temporary"
+}
+
+publish_proxy_bundle_archive() {
+  if ! full_database_bundle_exists && ! proxy_only_bundle_exists; then
+    rm -f "$proxy_bundle_archive"
+    return
+  fi
+  local stage temporary
+  stage="$state_dir/proxy-publish.$RANDOM.$RANDOM"
+  install -d -m 0700 "$stage" "$stage/ca" "$stage/secrets"
+  install -m 0600 "$bundle_dir/manifest.env" "$stage/manifest.env"
+  install -m 0600 "$bundle_dir/cluster-id" "$stage/cluster-id"
+  install -m 0644 "$bundle_dir/ca/ca.crt" "$stage/ca/ca.crt"
+  install -m 0600 \
+    "$bundle_dir/secrets/application.password" \
+    "$stage/secrets/application.password"
+  printf '%s\n' "$PROXY_BUNDLE_FORMAT_VERSION" \
+    >"$stage/$proxy_bundle_marker_name"
+  chmod 0600 "$stage/$proxy_bundle_marker_name"
+  if ! validate_proxy_bundle_directory "$stage"; then
+    rm -rf "$stage"
+    die "refusing to publish an invalid database proxy bundle"
+  fi
+  temporary="$(mktemp "$state_dir/proxy-bundle.tar.gz.XXXXXX")"
+  tar --format=ustar --create --gzip --file "$temporary" --directory "$stage" .
+  chmod 0600 "$temporary"
+  mv "$temporary" "$proxy_bundle_archive"
+  rm -rf "$stage"
+}
+
 publish_bundle_archive() {
-  [[ -d "$bundle_dir" ]] || return
+  full_database_bundle_exists || return
   write_bundle_member_vpn_snapshot \
     || die "database bundle members are absent from the authoritative registry"
   local temporary
@@ -1965,6 +2307,7 @@ publish_bundle_archive() {
   tar --format=ustar --create --gzip --file "$temporary" --directory "$bundle_dir" .
   chmod 0600 "$temporary"
   mv "$temporary" "$bundle_archive"
+  publish_proxy_bundle_archive
 }
 
 bundle_content_digest() {
@@ -2058,7 +2401,8 @@ bundle_replication_quorum_reached() {
 download_best_bundle() {
   local current_revision=0
   local current_digest=""
-  if load_bundle_manifest "$bundle_dir" 2>/dev/null; then
+  if full_database_bundle_exists \
+    && load_bundle_manifest "$bundle_dir" 2>/dev/null; then
     current_revision="$manifest_revision"
     current_digest="$(bundle_content_digest "$bundle_dir")" || return 1
   fi
@@ -2109,6 +2453,65 @@ download_best_bundle() {
     publish_bundle_archive
     log "installed replicated database topology revision $best_revision"
   fi
+}
+
+download_best_proxy_bundle() {
+  full_database_bundle_exists && return 0
+  local current_revision=0
+  local current_digest=""
+  if proxy_only_bundle_exists \
+    && validate_proxy_bundle_directory "$bundle_dir"; then
+    current_revision="$manifest_revision"
+    current_digest="$(bundle_content_digest "$bundle_dir")" || return 1
+  fi
+  local best_revision="$current_revision"
+  local best_digest="$current_digest"
+  local best_directory=""
+  local node_id vpn_ip archive extracted candidate_revision candidate_digest
+  while IFS=$'\t' read -r node_id vpn_ip; do
+    archive="$(mktemp "$state_dir/proxy-download.XXXXXX")"
+    if ! curl --config "$curl_config_path" \
+      "http://${vpn_ip}:${BUNDLE_PORT}/v1/postgres-ha/proxy-bundle" \
+      --output "$archive" 2>/dev/null; then
+      rm -f "$archive"
+      continue
+    fi
+    extracted="$state_dir/proxy-downloaded.$RANDOM.$RANDOM"
+    if ! safe_extract_bundle "$archive" "$extracted" >/dev/null 2>&1 \
+      || ! validate_proxy_bundle_directory "$extracted" \
+      || bundle_uses_registered_vpn_address "$extracted"; then
+      rm -f "$archive"
+      rm -rf "$extracted"
+      continue
+    fi
+    candidate_revision="$manifest_revision"
+    candidate_digest="$(bundle_content_digest "$extracted")" || {
+      rm -f "$archive"
+      rm -rf "$extracted"
+      continue
+    }
+    rm -f "$archive"
+    if ((10#$candidate_revision > 10#$best_revision)); then
+      [[ -z "$best_directory" ]] || rm -rf "$best_directory"
+      best_revision="$candidate_revision"
+      best_digest="$candidate_digest"
+      best_directory="$extracted"
+    elif ((10#$candidate_revision == 10#$best_revision)) \
+      && [[ -n "$best_digest" && "$candidate_digest" != "$best_digest" ]]; then
+      rm -rf "$extracted"
+      [[ -z "$best_directory" ]] || rm -rf "$best_directory"
+      die "divergent database proxy bundles share topology revision $candidate_revision"
+    else
+      rm -rf "$extracted"
+    fi
+  done <"$selected_path"
+
+  if [[ -n "$best_directory" ]]; then
+    install_proxy_bundle_directory "$best_directory"
+    publish_proxy_bundle_archive
+    log "installed database proxy bundle for topology revision $best_revision"
+  fi
+  proxy_only_bundle_exists && validate_proxy_bundle_directory "$bundle_dir"
 }
 
 member_name_for_index() {
@@ -2445,6 +2848,33 @@ apply_local_bundle() {
   chmod 0600 "$applied_revision_path"
 }
 
+apply_local_proxy_bundle() {
+  local local_underlay_ip="$1"
+  local local_underlay_interface="$2"
+  validate_proxy_bundle_directory "$bundle_dir" || return 1
+  bundle_routes_use_interface \
+    "$manifest_members" "$local_underlay_ip" "$local_underlay_interface" \
+    || {
+      log "database proxy backends are not reachable through $local_underlay_interface"
+      return 1
+    }
+  local digest applied_digest=""
+  digest="$(bundle_content_digest "$bundle_dir")" || return 1
+  [[ -f "$proxy_applied_digest_path" ]] \
+    && applied_digest="$(<"$proxy_applied_digest_path")"
+  if [[ "$applied_digest" == "$digest" \
+    && -f /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt \
+    && ! -L /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt ]] \
+    && systemctl is-active --quiet heteronetwork-db-proxy.service; then
+    return 0
+  fi
+  log "applying proxy-only database topology revision $manifest_revision"
+  run_helper_for_bundle "$bundle_dir" install-proxy
+  systemctl is-active --quiet heteronetwork-db-proxy.service || return 1
+  printf '%s\n' "$digest" >"$proxy_applied_digest_path"
+  chmod 0600 "$proxy_applied_digest_path"
+}
+
 bootstrap_bundle() {
   local members member_identities dcs_count dcs temporary
   members="$(initial_members_from_snapshot)"
@@ -2628,12 +3058,19 @@ reconcile_as_coordinator() {
 }
 
 reconcile_once() {
-  local identity local_vpn_ip local_node_id local_underlay_ip
-  identity="$(local_identity_row)" || {
+  local status identity local_vpn_ip local_node_id local_underlay_ip
+  local proxy_eligible=0
+  status="$(read_agent_status)" || {
+    reset_convergence_state
+    log "waiting for the local Agent status"
+    return
+  }
+  identity="$(local_identity_row "$status")" || {
     reset_convergence_state
     log "waiting for a non-overlay local UDP underlay candidate"
     return
   }
+  agent_status_is_direct_public "$status" && proxy_eligible=1
   IFS=$'\t' read -r local_vpn_ip local_node_id local_underlay_ip <<<"$identity"
   if unmanaged_legacy_database_exists; then
     reset_convergence_state
@@ -2645,17 +3082,31 @@ reconcile_once() {
     log "waiting for the authenticated control-plane node registry"
     return
   fi
-  if [[ -d "$bundle_dir" ]] && ! load_bundle_manifest "$bundle_dir"; then
+  if full_database_bundle_exists && ! load_bundle_manifest "$bundle_dir"; then
     reset_convergence_state
     log "existing database bundle lacks the ${DATABASE_NETWORK_PLANE} contract; refusing automatic migration"
     return
   fi
-  if [[ -d "$bundle_dir" ]] && bundle_uses_registered_vpn_address "$bundle_dir"; then
+  if proxy_only_bundle_exists \
+    && ! validate_proxy_bundle_directory "$bundle_dir"; then
+    reset_convergence_state
+    log "existing database proxy bundle is invalid"
+    return
+  fi
+  if [[ -e "$bundle_dir" || -L "$bundle_dir" ]] \
+    && ! full_database_bundle_exists \
+    && ! proxy_only_bundle_exists; then
+    reset_convergence_state
+    log "existing database material has an unknown bundle type"
+    return
+  fi
+  if [[ -d "$bundle_dir" ]] \
+    && bundle_uses_registered_vpn_address "$bundle_dir"; then
     reset_convergence_state
     log "database bundle contains an overlay VPN address; refusing to apply it"
     return
   fi
-  if [[ -d "$bundle_dir" ]] && ! write_bundle_member_vpn_snapshot; then
+  if full_database_bundle_exists && ! write_bundle_member_vpn_snapshot; then
     reset_convergence_state
     log "waiting to refresh the database bundle member authorization set"
     return
@@ -2669,7 +3120,20 @@ reconcile_once() {
     && ! bundle_contains_node_id "$local_node_id"; then
     stop_bundle_servers
     reset_convergence_state
-    log "node is outside the active database candidate pool"
+    if ((proxy_eligible == 1)) && proxy_only_bundle_exists; then
+      local outside_interface
+      outside_interface="$(interface_for_address "$local_underlay_ip")" || {
+        log "waiting for an unambiguous local host-underlay interface"
+        return
+      }
+      apply_local_proxy_bundle "$local_underlay_ip" "$outside_interface" \
+        || log "waiting to apply the retained database proxy bundle"
+      log "node is outside the active database candidate pool; retained proxy-only services"
+    elif ((proxy_eligible == 1)); then
+      log "public node is waiting for a rotating candidate window to receive the database proxy bundle"
+    else
+      log "node is outside the active database candidate pool"
+    fi
     return
   fi
   start_bundle_servers "$local_vpn_ip" "$local_node_id" "$local_underlay_ip"
@@ -2678,12 +3142,23 @@ reconcile_once() {
     log "waiting for a valid replicated database bundle"
     return
   fi
-  if [[ -d "$bundle_dir" ]] && ! load_bundle_manifest "$bundle_dir"; then
+  if ((proxy_eligible == 1)) && ! full_database_bundle_exists; then
+    download_best_proxy_bundle \
+      || log "waiting for a sanitized database proxy bundle"
+  fi
+  if full_database_bundle_exists && ! load_bundle_manifest "$bundle_dir"; then
     reset_convergence_state
     log "downloaded database bundle is invalid; refusing to apply it"
     return
   fi
-  if [[ -d "$bundle_dir" ]] && bundle_uses_registered_vpn_address "$bundle_dir"; then
+  if proxy_only_bundle_exists \
+    && ! validate_proxy_bundle_directory "$bundle_dir"; then
+    reset_convergence_state
+    log "downloaded database proxy bundle is invalid; refusing to apply it"
+    return
+  fi
+  if [[ -d "$bundle_dir" ]] \
+    && bundle_uses_registered_vpn_address "$bundle_dir"; then
     reset_convergence_state
     log "downloaded database bundle contains a registered VPN address"
     return
@@ -2697,7 +3172,18 @@ reconcile_once() {
     && ! bundle_contains_node_id "$local_node_id"; then
     stop_bundle_servers
     reset_convergence_state
-    log "node is outside the database candidate pool after bundle synchronization"
+    if ((proxy_eligible == 1)) && proxy_only_bundle_exists; then
+      local synchronized_interface
+      synchronized_interface="$(interface_for_address "$local_underlay_ip")" || {
+        log "waiting for an unambiguous local host-underlay interface"
+        return
+      }
+      apply_local_proxy_bundle "$local_underlay_ip" "$synchronized_interface" \
+        || log "waiting to apply the synchronized database proxy bundle"
+      log "node left the candidate window after synchronizing proxy-only services"
+    else
+      log "node is outside the database candidate pool after bundle synchronization"
+    fi
     return
   fi
 
@@ -2717,7 +3203,7 @@ reconcile_once() {
   fi
 
   local coordinator_bundle_ready=1
-  if [[ -d "$bundle_dir" ]]; then
+  if full_database_bundle_exists; then
     publish_bundle_archive
     load_bundle_manifest "$bundle_dir"
     local coordinator_node_id
@@ -2738,6 +3224,13 @@ reconcile_once() {
       coordinator_bundle_ready=0
       log "waiting for a DCS majority to persist topology revision $manifest_revision"
     fi
+  elif proxy_only_bundle_exists; then
+    if ((proxy_eligible == 1)); then
+      apply_local_proxy_bundle "$local_underlay_ip" "$local_underlay_interface" \
+        || log "waiting for the local proxy-only database service"
+    fi
+    reset_convergence_state
+    return
   elif [[ "$local_node_id" != "$(initial_coordinator_node_id)" ]]; then
     reset_convergence_state
     log "waiting for the initial database coordinator"
@@ -2757,7 +3250,7 @@ reconcile_once() {
     return
   fi
 
-  if [[ ! -d "$bundle_dir" ]]; then
+  if ! full_database_bundle_exists; then
     local count
     count="$(eligible_count)"
     if ((10#$count < MIN_DATABASE_MEMBER_COUNT)); then
@@ -2816,6 +3309,8 @@ self_test() {
   bundle_dir="$state_dir/bundle"
   bundle_archive="$state_dir/bundle.tar.gz"
   bundle_member_vpn_path="$state_dir/bundle-member-vpn.txt"
+  proxy_bundle_archive="$state_dir/proxy-bundle.tar.gz"
+  proxy_bundle_vpn_path="$state_dir/proxy-bundle-vpn.txt"
   eligible_path="$state_dir/eligible.tsv"
   authoritative_path="$state_dir/authoritative.tsv"
   active_path="$state_dir/active.tsv"
@@ -2828,6 +3323,7 @@ self_test() {
   reciprocal_stability_path="$state_dir/reciprocal-stability.tsv"
   applied_revision_path="$state_dir/applied-revision"
   configured_revision_path="$state_dir/configured-revision"
+  proxy_applied_digest_path="$state_dir/proxy-applied-digest"
   underlay_health_handler="$state_dir/postgres-underlay-health.py"
   install -d -m 0700 "$state_dir"
   legacy_database_service_path="$temporary/heteronetwork-db.service"
@@ -2880,6 +3376,30 @@ self_test() {
     "10.250.0.2" >/dev/null; then
     die "overlay-only database candidate was accepted"
   fi
+  local public_status
+  public_status="$(jq -cn --arg assessed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    node_id: "node-a",
+    vpn_ip: "10.250.0.2",
+    nat_classification: {
+      connectivity_state: "public",
+      mapping_behavior: "no_nat",
+      strategy: "direct_candidate",
+      local_addr: "203.0.113.10:51820",
+      observed_endpoint: "203.0.113.10:51820",
+      assessed_at: $assessed_at,
+      observations: [{
+        local_addr: "203.0.113.10:51820",
+        reflexive_addr: "203.0.113.10:51820"
+      }]
+    }
+  }')"
+  agent_status_is_direct_public "$public_status"
+  if agent_status_is_direct_public "$(
+    jq '.nat_classification.mapping_behavior = "endpoint_independent"' \
+      <<<"$public_status"
+  )"; then
+    die "NATed node was accepted for automatic database proxy credentials"
+  fi
   local descriptor
   descriptor='{
     "node_id":"node-a",
@@ -2906,15 +3426,21 @@ self_test() {
   python3 -m py_compile "$underlay_health_handler"
   grep -Fq 'GET /v1/postgres-ha/member HTTP/1.1' "$state_dir/serve-bundle.sh"
   grep -Fq 'GET /v1/postgres-ha/bundle HTTP/1.1' "$state_dir/serve-bundle.sh"
-  grep -Fq 'grep -Fqx -- "$SOCAT_PEERADDR" "$BUNDLE_MEMBER_VPN_PATH"' \
+  grep -Fq 'GET /v1/postgres-ha/proxy-bundle HTTP/1.1' \
+    "$state_dir/serve-bundle.sh"
+  grep -Fq 'grep -Fqx -- "$SOCAT_PEERADDR" "$authorization_path"' \
     "$state_dir/serve-bundle.sh"
   printf 'private-bundle' >"$state_dir/test-bundle.tar.gz"
+  printf 'sanitized-proxy-bundle' >"$state_dir/test-proxy-bundle.tar.gz"
   printf '{}\n' >"$state_dir/member.json"
   printf '10.250.0.2\n' >"$bundle_member_vpn_path"
+  printf '10.250.0.9\n' >"$proxy_bundle_vpn_path"
   cat >"$state_dir/test-bundle-server.env" <<EOF
 BUNDLE_BEARER_TOKEN=test-bearer
 BUNDLE_ARCHIVE=$state_dir/test-bundle.tar.gz
 BUNDLE_MEMBER_VPN_PATH=$bundle_member_vpn_path
+PROXY_BUNDLE_ARCHIVE=$state_dir/test-proxy-bundle.tar.gz
+PROXY_BUNDLE_VPN_PATH=$proxy_bundle_vpn_path
 MEMBER_DESCRIPTOR=$state_dir/member.json
 EOF
   printf 'GET /v1/postgres-ha/bundle HTTP/1.1\r\nAuthorization: Bearer test-bearer\r\n\r\n' \
@@ -2933,6 +3459,22 @@ EOF
   if grep -Fq 'private-bundle' "$state_dir/nonmember-response"; then
     die "nonmember source received the private database bundle"
   fi
+  printf 'GET /v1/postgres-ha/proxy-bundle HTTP/1.1\r\nAuthorization: Bearer test-bearer\r\n\r\n' \
+    | env \
+      HETERONETWORK_DB_BUNDLE_SERVER_ENV="$state_dir/test-bundle-server.env" \
+      SOCAT_PEERADDR=10.250.0.9 \
+      "$state_dir/serve-bundle.sh" >"$state_dir/proxy-recipient-response"
+  grep -Fq 'HTTP/1.1 200 OK' "$state_dir/proxy-recipient-response"
+  grep -Fq 'sanitized-proxy-bundle' "$state_dir/proxy-recipient-response"
+  if grep -Fq 'private-bundle' "$state_dir/proxy-recipient-response"; then
+    die "proxy-only recipient received private database material"
+  fi
+  printf 'GET /v1/postgres-ha/proxy-bundle HTTP/1.1\r\nAuthorization: Bearer test-bearer\r\n\r\n' \
+    | env \
+      HETERONETWORK_DB_BUNDLE_SERVER_ENV="$state_dir/test-bundle-server.env" \
+      SOCAT_PEERADDR=10.250.0.8 \
+      "$state_dir/serve-bundle.sh" >"$state_dir/nonrecipient-response"
+  grep -Fq 'HTTP/1.1 403 Forbidden' "$state_dir/nonrecipient-response"
   if grep -Fq 'GET /v1/postgres-ha/bundle HTTP/1.1' \
     "$underlay_health_handler"; then
     die "underlay health handler unexpectedly serves the private database bundle"
@@ -3003,6 +3545,18 @@ PY
   [[ "$(<"$vpn_cidr_path")" == "10.250.0.0/16" ]]
   write_selected_snapshot
   [[ "$(snapshot_count "$selected_path")" == "$MAX_DATABASE_CANDIDATE_COUNT" ]]
+  write_proxy_bundle_vpn_snapshot
+  [[ "$(snapshot_count "$proxy_bundle_vpn_path")" == \
+    "$MAX_DATABASE_CANDIDATE_COUNT" ]]
+  local bounded_reachability="$state_dir/bounded-reachability.tsv"
+  awk -F '\t' '{
+    printf "%s\t%s\t192.0.2.%d\n", $2, $1, NR
+  }' "$selected_path" >"$bounded_reachability"
+  validate_eligible_snapshot \
+    "$bounded_reachability" "$MAX_DATABASE_CANDIDATE_COUNT"
+  if validate_eligible_snapshot "$bounded_reachability"; then
+    die "database member limit accepted the wider candidate reachability set"
+  fi
   unset HETERONETWORK_DB_CANDIDATE_EPOCH
 
   cat >"$registry_fixture" <<'JSON'
@@ -3037,6 +3591,13 @@ JSON
   validate_selected_snapshot "$selected_path"
   if grep -Fq 'node-down' "$selected_path"; then
     die "inactive nonmember blocked the database candidate pool"
+  fi
+  write_proxy_bundle_vpn_snapshot
+  cmp -s "$proxy_bundle_vpn_path" <(
+    printf '%s\n' 10.250.0.2 10.250.0.3 10.250.0.10
+  )
+  if grep -Eq '10\.250\.0\.(20|99)' "$proxy_bundle_vpn_path"; then
+    die "inactive or client node received proxy bundle authorization"
   fi
   printf '%s\n' \
     $'10.250.0.2\tnode-a\t100.123.154.79' \
@@ -3165,6 +3726,85 @@ JSON
     "192.0.2.0/24,198.51.100.10/32" ]]
   [[ "$manifest_extra_hba_entries" == \
     "keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32" ]]
+  [[ -s "$proxy_bundle_archive" ]]
+  local proxy_extracted="$state_dir/proxy-extracted"
+  safe_extract_bundle "$proxy_bundle_archive" "$proxy_extracted"
+  validate_proxy_bundle_directory "$proxy_extracted"
+  [[ "$(<"$proxy_extracted/$proxy_bundle_marker_name")" == \
+    "$PROXY_BUNDLE_FORMAT_VERSION" ]]
+  [[ -f "$proxy_extracted/ca/ca.crt" ]]
+  [[ -f "$proxy_extracted/secrets/application.password" ]]
+  if [[ -e "$proxy_extracted/ca/ca.key" \
+    || -e "$proxy_extracted/nodes" \
+    || -e "$proxy_extracted/secrets/superuser.password" \
+    || -e "$proxy_extracted/secrets/replication.password" \
+    || -e "$proxy_extracted/secrets/rewind.password" \
+    || -e "$proxy_extracted/secrets/rest-api.password" ]]; then
+    die "proxy-only bundle contains database authority or replica credentials"
+  fi
+  cmp -s \
+    "$bundle_dir/secrets/application.password" \
+    "$proxy_extracted/secrets/application.password"
+  local invalid_proxy_bundle="$state_dir/invalid-proxy-bundle"
+  cp -a "$proxy_extracted" "$invalid_proxy_bundle"
+  printf 'forbidden\n' >"$invalid_proxy_bundle/secrets/superuser.password"
+  chmod 0600 "$invalid_proxy_bundle/secrets/superuser.password"
+  if validate_proxy_bundle_directory "$invalid_proxy_bundle" >/dev/null 2>&1; then
+    die "proxy bundle file allowlist accepted a superuser credential"
+  fi
+  rm -rf "$invalid_proxy_bundle"
+  cp -a "$proxy_extracted" "$invalid_proxy_bundle"
+  chmod 0644 "$invalid_proxy_bundle/secrets/application.password"
+  if validate_proxy_bundle_directory "$invalid_proxy_bundle" >/dev/null 2>&1; then
+    die "group/world-readable proxy application credential was accepted"
+  fi
+  rm -rf "$invalid_proxy_bundle"
+  (
+    bundle_dir="$state_dir/proxy-receiver"
+    proxy_bundle_archive="$state_dir/proxy-receiver.tar.gz"
+    proxy_applied_digest_path="$state_dir/proxy-receiver-applied-digest"
+    curl() {
+      local output=""
+      while (($# > 0)); do
+        if [[ "$1" == "--output" ]]; then
+          shift
+          output="$1"
+        fi
+        shift
+      done
+      [[ -n "$output" ]] || return 1
+      cp "$state_dir/proxy-bundle.tar.gz" "$output"
+    }
+    download_best_proxy_bundle
+    proxy_only_bundle_exists
+    validate_proxy_bundle_directory "$bundle_dir"
+    [[ ! -e "$bundle_dir/ca/ca.key" ]]
+    bundle_routes_use_interface() {
+      return 0
+    }
+    run_helper_for_bundle() {
+      [[ "${2:-}" == "install-proxy" ]]
+    }
+    systemctl() {
+      [[ "${1:-}" == "is-active" ]]
+    }
+    apply_local_proxy_bundle 100.123.154.79 tailscale0
+    [[ -s "$proxy_applied_digest_path" ]]
+  )
+  (
+    bundle_dir="$state_dir/proxy-upgrade-receiver"
+    local proxy_install="$state_dir/proxy-upgrade-initial"
+    local full_upgrade="$state_dir/proxy-upgrade-full"
+    cp -a "$proxy_extracted" "$proxy_install"
+    install_proxy_bundle_directory "$proxy_install"
+    proxy_only_bundle_exists
+    cp -a "$state_dir/bundle" "$full_upgrade"
+    install_bundle_directory "$full_upgrade"
+    full_database_bundle_exists
+    if proxy_only_bundle_exists; then
+      die "full database bundle upgrade retained proxy-only classification"
+    fi
+  )
   local empty_access_bundle="$state_dir/empty-access-bundle"
   cp -a "$bundle_dir" "$empty_access_bundle"
   sed -i \
