@@ -175,10 +175,9 @@ validate_archive_file() {
   [[ "$path" == /* ]] || die "Keycloak archive path must be absolute"
   [[ -f "$path" && ! -L "$path" ]] \
     || die "Keycloak archive must be a non-symlink regular file"
-  local size type
-  read -r size type < <(stat -c '%s %F' -- "$path") \
+  local size
+  size="$(stat -c '%s' -- "$path")" \
     || die "unable to inspect Keycloak archive"
-  [[ "$type" == "regular file" ]] || die "Keycloak archive is not a regular file"
   ((10#$size > 0 && 10#$size <= MAX_ARCHIVE_BYTES)) \
     || die "Keycloak archive size is invalid"
 }
@@ -189,10 +188,9 @@ validate_secret_file() {
   [[ -f "$path" && ! -L "$path" ]] \
     || die "$name must be a non-symlink regular file"
 
-  local uid links mode size type
-  read -r uid links mode size type < <(stat -c '%u %h %a %s %F' -- "$path") \
+  local uid links mode size
+  read -r uid links mode size < <(stat -c '%u %h %a %s' -- "$path") \
     || die "unable to inspect $name"
-  [[ "$type" == "regular file" ]] || die "$name must be a regular file"
   [[ "$uid" == "0" ]] || die "$name must be owned by root"
   [[ "$links" == "1" ]] || die "$name must have exactly one hard link"
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "$name has an invalid mode"

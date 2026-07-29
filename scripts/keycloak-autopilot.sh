@@ -72,11 +72,10 @@ trap cleanup EXIT HUP INT TERM
 secure_root_file() {
   local path="$1" maximum_size="$2"
   [[ "$path" == /* && -f "$path" && ! -L "$path" ]] || return 1
-  local uid links mode size type
-  read -r uid links mode size type < <(stat -c '%u %h %a %s %F' -- "$path") \
+  local uid links mode size
+  read -r uid links mode size < <(stat -c '%u %h %a %s' -- "$path") \
     || return 1
-  [[ "$type" == "regular file" \
-    && "$uid" == "$expected_root_uid" \
+  [[ "$uid" == "$expected_root_uid" \
     && "$links" == "1" \
     && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
   (( (8#$mode & 0400) != 0 && (8#$mode & 0077) == 0 )) || return 1
