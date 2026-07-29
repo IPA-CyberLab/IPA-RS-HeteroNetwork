@@ -381,6 +381,8 @@ prepare_release() {
     rmdir "$extract_dir"
   fi
 
+  chown root:root "$install_dir"
+  chmod 0755 "$install_dir"
   ln -sfn "$install_dir" "$current_link"
   if [[ -d "$install_dir/data" && ! -L "$install_dir/data" ]]; then
     rmdir "$install_dir/data"
