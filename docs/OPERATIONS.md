@@ -358,28 +358,27 @@ Advertise the resulting `https://PUBLIC_IP` origin as the Signal and Relay
 admission base URL. Private nodes then receive a usable TLS bootstrap route from
 the standard enrollment script without host-specific port forwarding.
 
-Install each Keycloak replica with `scripts/keycloak-ha-node.sh install` after
-`heteronetwork-db-proxy.service` is active. The script pins the Keycloak archive
-checksum, binds application HTTP to loopback, uses the HeteroNetwork address for
-JGroups, and stores runtime secrets in owner-restricted files. Its private
-HAProxy listener stops and starts with the Agent so an overlay restart cannot
-leave the Keycloak backchannel offline. It accepts only RFC1918 or CGNAT
-addresses:
+The standard node enrollment script installs the pinned Keycloak helper and
+automatic placement timer. Do not copy another node's PostgreSQL bundle,
+Keycloak passwords, or node identity. A node becomes an eligible candidate only
+after its local database member, database proxy, and protected credentials are
+ready. The Control Plane then selects at most three eligible replicas and every
+node configures an edge proxy for the selected HeteroNetwork addresses.
 
 ```bash
-sudo env \
-  HETERONETWORK_KEYCLOAK_ARCHIVE=/secure/keycloak.tar.gz \
-  HETERONETWORK_KEYCLOAK_CLUSTER_BIND_ADDRESS=10.250.0.10 \
-  HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES=10.250.0.10,100.64.0.10 \
-  HETERONETWORK_KEYCLOAK_DB_PASSWORD_FILE=/secure/db.password \
-  HETERONETWORK_KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD_FILE=/secure/admin.password \
-  scripts/keycloak-ha-node.sh install
+sudo systemctl enable heteronetwork-keycloak-prepare.service
+sudo systemctl enable --now heteronetwork-keycloak-autopilot.timer
+sudo systemctl restart --no-block heteronetwork-keycloak-prepare.service
+sudo systemctl start --no-block heteronetwork-keycloak-autopilot.service
 ```
 
-Use unique bind addresses on each replica. `install-backchannel` validates and
-reloads HAProxy without rebuilding Keycloak. Keep at least two replicas active
-and place their private realm URLs in the primary and fallback Control Plane
-settings.
+The helper binds application HTTP to loopback, uses the local HeteroNetwork
+address for JGroups, and stores runtime secrets in owner-restricted files.
+Inspect placement through the Web UI or
+`GET /v1/admin/keycloak-placement`. A healthy placement reports
+`desired_replicas=3` and three entries with `ready=true`. An unassigned prepared
+node remains an inactive standby while its edge proxy continues forwarding to
+the selected replicas.
 
 ### Restrict GitHub sign-in to one account
 

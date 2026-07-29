@@ -5847,6 +5847,21 @@ where
     L: TokenLedger,
 {
     let mut metrics = state.plane.metrics().await?;
+    let keycloak_placement = state
+        .plane
+        .keycloak_placement(
+            KEYCLOAK_AUTOPILOT_VERSION,
+            KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
+            KEYCLOAK_AUTOPILOT_MAX_CANDIDATES,
+            Utc::now(),
+        )
+        .await?;
+    metrics.ha_ready = metrics.ha_ready
+        && keycloak_placement.replicas.len() == KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS
+        && keycloak_placement
+            .replicas
+            .iter()
+            .all(|replica| replica.ready);
     let token_metrics = state
         .join_service
         .token_metrics(&metrics.cluster_id, Utc::now())
@@ -6386,7 +6401,7 @@ fn render_prometheus_metrics(metrics: &ControlPlaneMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
-        "# HELP ipars_control_plane_ha_ready Whether every required public service has at least two independent active hosts."
+        "# HELP ipars_control_plane_ha_ready Whether public services are redundant and every desired Keycloak replica is ready."
     );
     prometheus_line!(&mut body, "# TYPE ipars_control_plane_ha_ready gauge");
     prometheus_line!(
@@ -8636,6 +8651,29 @@ mod tests {
         assert_eq!(
             admin_keycloak["replicas"][0]["node_id"],
             gateway.node_id.as_str()
+        );
+        assert!(
+            plane.metrics().await?.ha_ready,
+            "public-service redundancy precondition was not established"
+        );
+        let gated_metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(gated_metrics.status(), StatusCode::OK);
+        let gated_metrics = axum::body::to_bytes(gated_metrics.into_body(), usize::MAX).await?;
+        let gated_metrics: ControlPlaneMetricsResponse = serde_json::from_slice(&gated_metrics)?;
+        assert!(
+            !gated_metrics.ha_ready,
+            "HTTP HA metrics ignored an unready Keycloak placement"
         );
 
         let too_many_member_ids = (0..=MAX_DATABASE_AUTOPILOT_MEMBER_IDS)
