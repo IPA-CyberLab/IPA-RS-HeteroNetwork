@@ -15,6 +15,7 @@ readonly MAX_REPLICAS="3"
 readonly REPLICA_PORT="18080"
 readonly EDGE_PORT="18079"
 readonly FAILURE_LIMIT="3"
+readonly ACTIVATION_TIMEOUT_SECONDS="90"
 readonly COOLDOWN_SECONDS="120"
 
 filesystem_root="${HETERONETWORK_KEYCLOAK_AUTOPILOT_TEST_ROOT:-}"
@@ -50,6 +51,7 @@ readonly bootstrap_admin_password_file="$bundle_dir/secrets/keycloak-bootstrap-a
 readonly agent_drop_in_dir="$filesystem_root/etc/systemd/system/heteronetwork-agent.service.d"
 readonly agent_drop_in="$agent_drop_in_dir/30-keycloak-gateway.conf"
 readonly failure_count_path="$state_dir/restart-failures"
+readonly activation_started_at_path="$state_dir/activation-started-at"
 readonly cooldown_until_path="$state_dir/cooldown-until"
 
 request_file=""
@@ -306,10 +308,12 @@ enter_cooldown() {
   now="$(date +%s)"
   write_state_value "$cooldown_until_path" "$((10#$now + COOLDOWN_SECONDS))"
   write_state_value "$failure_count_path" 0
+  rm -f "$activation_started_at_path"
 }
 
 reset_failures() {
   write_state_value "$failure_count_path" 0
+  rm -f "$activation_started_at_path"
 }
 
 record_activation_failure() {
@@ -318,6 +322,17 @@ record_activation_failure() {
   failures=$((10#$failures + 1))
   write_state_value "$failure_count_path" "$failures"
   ((failures >= FAILURE_LIMIT))
+}
+
+activation_timed_out() {
+  local now started
+  now="$(date +%s)"
+  started="$(read_nonnegative_state_value "$activation_started_at_path" 0)"
+  if ((10#$started == 0 || 10#$started > 10#$now)); then
+    write_state_value "$activation_started_at_path" "$now"
+    return 1
+  fi
+  ((10#$now - 10#$started >= ACTIVATION_TIMEOUT_SECONDS))
 }
 
 configure_candidate() {
@@ -471,6 +486,7 @@ reconcile_edge_proxy() {
 }
 
 deactivate_local_replica() {
+  rm -f "$activation_started_at_path"
   "$helper" deactivate >/dev/null 2>&1 \
     || log "unable to stop the unassigned Keycloak replica"
 }
@@ -517,6 +533,20 @@ apply_assignment() {
     reset_failures
     return
   fi
+  if systemctl is-active --quiet heteronetwork-keycloak.service; then
+    if ! activation_timed_out; then
+      log "Keycloak replica is still starting"
+      return
+    fi
+    deactivate_local_replica
+    if record_activation_failure; then
+      withdraw_after_failures
+    else
+      log "Keycloak replica activation timed out after 90 seconds"
+    fi
+    return
+  fi
+  rm -f "$activation_started_at_path"
   if record_activation_failure; then
     withdraw_after_failures
   else

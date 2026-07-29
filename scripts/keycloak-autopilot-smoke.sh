@@ -428,23 +428,32 @@ write_response "$fixture_dir/response.json" true "$node_id" "$vpn_ip"
 touch \
   "$fake_state/active/heteronetwork-keycloak.service" \
   "$fake_state/active/heteronetwork-keycloak-backchannel.service" \
+  "$fake_state/keycloak-ready" \
   "$fake_state/keycloak-health-down"
-rm -f \
-  "$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures" \
-  "$test_root/var/lib/heteronetwork-keycloak-autopilot/cooldown-until"
+printf '0\n' \
+  >"$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures"
+rm -f "$test_root/var/lib/heteronetwork-keycloak-autopilot/cooldown-until"
+run_autopilot reconcile
+[[ "$(<"$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures")" == "0" ]] \
+  || fail "starting Keycloak consumed a failure before its activation timeout"
+activation_started_at_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/activation-started-at"
+[[ -f "$activation_started_at_path" ]] \
+  || fail "starting Keycloak did not persist its activation window"
+printf '%s\n' "$(( $(date +%s) - 91 ))" >"$activation_started_at_path"
 run_autopilot reconcile
 [[ "$(<"$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures")" == "1" ]] \
-  || fail "active but unready Keycloak was accepted as activated"
+  || fail "timed-out Keycloak activation did not consume one failure"
+assert_inactive heteronetwork-keycloak.service
+assert_inactive heteronetwork-keycloak-backchannel.service
 rm -f "$fake_state/keycloak-health-down"
-touch "$fake_state/keycloak-ready"
 run_autopilot reconcile
 [[ "$(<"$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures")" == "0" ]] \
   || fail "healthy Keycloak did not reset the activation failure counter"
 
-touch \
+rm -f \
   "$fake_state/active/heteronetwork-keycloak.service" \
-  "$fake_state/active/heteronetwork-keycloak-backchannel.service" \
-  "$fake_state/fail-restart-heteronetwork-keycloak.service"
+  "$fake_state/active/heteronetwork-keycloak-backchannel.service"
+touch "$fake_state/fail-start-heteronetwork-keycloak.service"
 rm -f \
   "$fake_state/keycloak-ready" \
   "$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures" \
@@ -455,7 +464,7 @@ run_autopilot reconcile
 run_autopilot reconcile
 
 cooldown_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/cooldown-until"
-[[ -f "$cooldown_path" ]] || fail "three restart failures did not enter cooldown"
+[[ -f "$cooldown_path" ]] || fail "three activation failures did not enter cooldown"
 now="$(date +%s)"
 cooldown_until="$(<"$cooldown_path")"
 ((cooldown_until > now && cooldown_until <= now + 120)) \
@@ -466,7 +475,7 @@ jq -e '.eligible == false and .ready == false' "$(latest_request)" >/dev/null \
   || fail "failed candidate was not withdrawn"
 
 activations_before_cooldown_reconcile="$(count_helper_command activate)"
-rm -f "$fake_state/fail-restart-heteronetwork-keycloak.service"
+rm -f "$fake_state/fail-start-heteronetwork-keycloak.service"
 run_autopilot reconcile
 [[ "$(count_helper_command activate)" == "$activations_before_cooldown_reconcile" ]] \
   || fail "cooldown candidate was reactivated"
@@ -518,6 +527,8 @@ grep -Fq 'ACTIVATION_READY_INTERVAL_SECONDS="3"' "$helper_contract" \
   || fail "helper activation readiness interval is not lease-safe"
 grep -Fq 'ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS="2"' "$helper_contract" \
   || fail "helper activation readiness request is not lease-safe"
+grep -Fq 'readonly ACTIVATION_TIMEOUT_SECONDS="90"' "$autopilot" \
+  || fail "autopilot activation window is not bounded"
 grep -Fq '"http://127.0.0.1:${management_port}/health/ready"' "$helper_contract" \
   || fail "helper activation does not probe management readiness"
 if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract"; then
