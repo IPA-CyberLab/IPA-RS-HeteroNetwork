@@ -200,9 +200,10 @@
     "No lease": "リースなし",
     "Single host": "単一ホスト",
     "Infrastructure host": "インフラホスト",
+    "Host ID": "ホスト ID",
     "Unmatched owner": "未対応の所有ノード",
     "Node service status": "ノードサービス稼働状況",
-    "Registered nodes and unmatched infrastructure leases.": "登録済みノードと、登録ノードに対応しないインフラリースを表示します。",
+    "Registered nodes and unmatched infrastructure hosts.": "登録済みノードと、登録ノードに対応しないインフラホストを表示します。",
     "No nodes or infrastructure hosts": "ノードまたはインフラホストはありません",
     "Register a node or advertise an infrastructure service lease.": "ノードを登録するか、インフラサービスのリースを広報してください。",
     "No public nodes": "公開ノードはありません",
@@ -1156,37 +1157,82 @@
     var nodeEntries = Array.isArray(overview && overview.nodes) ? overview.nodes : [];
     var directory = overview && overview.service_directory || {};
     var instances = Array.isArray(directory.instances) ? directory.instances : [];
-    var nodeRowsById = Object.create(null);
-    var nodeRows = nodeEntries.map(function (entry, index) {
+    var nodesById = Object.create(null);
+    nodeEntries.forEach(function (entry) {
       var node = entry && entry.node || {};
       var nodeId = String(node.node_id || "");
-      var row = {
-        entry: entry || { node: {}, health: {} },
-        hostId: nodeId || "node-" + (index + 1),
-        key: "node:" + (nodeId || index),
-        leases: [],
-        type: "node"
-      };
-      if (nodeId) nodeRowsById[nodeId] = row;
-      return row;
+      if (nodeId) nodesById[nodeId] = entry;
     });
-    var infrastructureRows = [];
-    instances.forEach(function (instance, index) {
+    var hostGroupsById = Object.create(null);
+    var hostGroups = [];
+    instances.forEach(function (instance) {
+      var ownerHostId = String(instance.owner_host_id || "");
+      var group = hostGroupsById[ownerHostId];
+      if (!group) {
+        group = {
+          hostId: ownerHostId,
+          leases: [],
+          ownerNodeIds: []
+        };
+        hostGroupsById[ownerHostId] = group;
+        hostGroups.push(group);
+      }
+      group.leases.push(instance);
       var ownerNodeId = typeof instance.owner_node_id === "string" && instance.owner_node_id
         ? instance.owner_node_id
         : null;
-      if (ownerNodeId && nodeRowsById[ownerNodeId]) {
-        nodeRowsById[ownerNodeId].leases.push(instance);
+      if (ownerNodeId && group.ownerNodeIds.indexOf(ownerNodeId) === -1) {
+        group.ownerNodeIds.push(ownerNodeId);
+      }
+    });
+    hostGroups.forEach(function (group) {
+      group.matchedNodeId = group.ownerNodeIds.find(function (nodeId) {
+        return Boolean(nodesById[nodeId]);
+      }) || null;
+    });
+    var matchedGroupsByNodeId = Object.create(null);
+    hostGroups.forEach(function (group) {
+      if (!group.matchedNodeId) return;
+      if (!matchedGroupsByNodeId[group.matchedNodeId]) matchedGroupsByNodeId[group.matchedNodeId] = [];
+      matchedGroupsByNodeId[group.matchedNodeId].push(group);
+    });
+    var nodeRows = [];
+    nodeEntries.forEach(function (entry, index) {
+      var node = entry && entry.node || {};
+      var nodeId = String(node.node_id || "");
+      var matchedGroups = matchedGroupsByNodeId[nodeId] || [];
+      if (!matchedGroups.length) {
+        nodeRows.push({
+          entry: entry || { node: {}, health: {} },
+          hostId: null,
+          key: "node:" + (nodeId || index),
+          leases: [],
+          nodeId: nodeId || "node-" + (index + 1),
+          type: "node"
+        });
         return;
       }
-      var instanceId = String(instance.instance_id || "");
-      infrastructureRows.push({
-        hostId: instanceId || "infrastructure-" + (index + 1),
-        key: "infrastructure:" + (instanceId || index),
-        leases: [instance],
-        ownerNodeId: ownerNodeId,
-        type: "infrastructure"
+      matchedGroups.forEach(function (group) {
+        nodeRows.push({
+          entry: entry || { node: {}, health: {} },
+          hostId: group.hostId,
+          key: "host:" + group.hostId,
+          leases: group.leases,
+          nodeId: nodeId,
+          type: "node"
+        });
       });
+    });
+    var infrastructureRows = hostGroups.filter(function (group) {
+      return !group.matchedNodeId;
+    }).map(function (group) {
+      return {
+        hostId: group.hostId,
+        key: "host:" + group.hostId,
+        leases: group.leases,
+        ownerNodeId: group.ownerNodeIds[0] || null,
+        type: "infrastructure"
+      };
     });
     return nodeRows.concat(infrastructureRows);
   }
@@ -1218,11 +1264,14 @@
     if (row.type === "node") {
       var node = row.entry.node || {};
       return '<span class="table-primary service-host"><span class="peer-avatar">'
-        + escapeHtml(initials(row.hostId)) + '</span><span class="service-host-copy"><strong data-no-i18n title="'
-        + escapeHtml(row.hostId) + '">' + escapeHtml(shortId(row.hostId))
-        + '</strong><small class="mono" data-no-i18n title="' + escapeHtml(row.hostId) + '">'
-        + escapeHtml(row.hostId) + '</small><small><span>Registered node</span> · <span class="mono" data-no-i18n>'
-        + escapeHtml(node.vpn_ip || "-") + "</span></small></span></span>";
+        + escapeHtml(initials(row.nodeId)) + '</span><span class="service-host-copy"><strong data-no-i18n title="'
+        + escapeHtml(row.nodeId) + '">' + escapeHtml(shortId(row.nodeId))
+        + '</strong><small class="mono" data-no-i18n title="' + escapeHtml(row.nodeId) + '">'
+        + escapeHtml(row.nodeId) + '</small><small><span>Registered node</span> · <span class="mono" data-no-i18n>'
+        + escapeHtml(node.vpn_ip || "-") + "</span></small>"
+        + (row.hostId ? '<small><span>Host ID</span>: <span class="mono" data-no-i18n title="'
+          + escapeHtml(row.hostId) + '">' + escapeHtml(row.hostId) + "</span></small>" : "")
+        + "</span></span>";
     }
     return '<span class="table-primary service-host"><span class="peer-avatar cyan">IH</span><span class="service-host-copy"><strong data-no-i18n title="'
       + escapeHtml(row.hostId) + '">' + escapeHtml(shortId(row.hostId))
@@ -2252,8 +2301,8 @@
     var overview = state.overview;
     var metrics = overview.metrics || {};
     var hostRows = buildServiceHostRows(overview);
-    var registeredHostCount = hostRows.filter(function (row) { return row.type === "node"; }).length;
-    var infrastructureHostCount = hostRows.length - registeredHostCount;
+    var registeredNodeCount = Array.isArray(overview.nodes) ? overview.nodes.length : 0;
+    var infrastructureHostCount = hostRows.filter(function (row) { return row.type === "infrastructure"; }).length;
     var kinds = [
       ["control_plane", "Control Plane"],
       ["signal", "Signal"],
@@ -2278,11 +2327,11 @@
         + '<th>Lease</th></tr></thead><tbody>' + endpointRows + '</tbody></table></div>'
       : emptyState("No nodes or infrastructure hosts", "Register a node or advertise an infrastructure service lease.", "server");
     return '<div class="metric-grid">'
-      + metricCard("Hosts", hostRows.length, serviceHostSummary(registeredHostCount, infrastructureHostCount), "server", "", "")
+      + metricCard("Hosts", hostRows.length, serviceHostSummary(registeredNodeCount, infrastructureHostCount), "server", "", "")
       + kinds.map(function (kind) {
         return metricCard(kind[1], kind[2], kind[2] >= 2 ? "Redundant" : kind[2] === 1 ? "Single host" : "Not running", kind[2] >= 2 ? "circle-check" : "circle-alert", "", kind[2] >= 2 ? "" : "warn");
       }).join("")
-      + '</div><section class="section-panel"><div class="section-header"><div><h2>Node service status</h2><p>Registered nodes and unmatched infrastructure leases.</p></div>'
+      + '</div><section class="section-panel"><div class="section-header"><div><h2>Node service status</h2><p>Registered nodes and unmatched infrastructure hosts.</p></div>'
       + statusPill(metrics.ha_ready ? "healthy" : "degraded", metrics.ha_ready ? "HA ready" : "HA degraded")
       + '</div>' + table + '</section>';
   }
