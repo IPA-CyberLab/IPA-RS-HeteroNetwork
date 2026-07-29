@@ -402,7 +402,7 @@ prepare_release() {
     rmdir "$extract_dir"
   fi
 
-  chown root:root "$install_dir"
+  chown -R root:root "$install_dir"
   chmod 0755 "$install_dir"
   find "$install_dir" -type d -exec chmod 0755 {} +
   ln -sfn "$install_dir" "$current_link"

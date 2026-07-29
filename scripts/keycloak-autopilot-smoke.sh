@@ -679,6 +679,8 @@ grep -Fq 'SuccessExitStatus=143 SIGTERM' "$helper_contract" \
   || fail "controlled Keycloak SIGTERM shutdown is not treated as successful"
 grep -Fq 'RestartPreventExitStatus=143 SIGTERM' "$helper_contract" \
   || fail "controlled Keycloak shutdown can still trigger an automatic restart"
+grep -Fq 'chown -R root:root "$install_dir"' "$helper_contract" \
+  || fail "prepared Keycloak release ownership drift is not repaired"
 grep -Fq \
   '/etc/systemd/system/heteronetwork-agent.service.wants/heteronetwork-keycloak-backchannel.service' \
   "$helper_contract" \
