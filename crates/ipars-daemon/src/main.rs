@@ -13825,7 +13825,7 @@ fn public_web_gateway_caddyfile(
         }
         let _ = writeln!(
             caddyfile,
-            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/web-ui/auth/refresh /v1/web-ui/auth/logout /v1/install/* /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}",
+            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/web-ui/auth/refresh /v1/web-ui/auth/logout /v1/install/* /v1/database-autopilot/nodes /v1/keycloak-autopilot/reconcile /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}",
             config.upstream, config.proxy_token
         );
         if let (Some(oidc_upstream), Some(host)) =
@@ -21312,6 +21312,8 @@ mod tests {
         assert!(public.contains("/v1/web-ui/auth/refresh"));
         assert!(public.contains("/v1/web-ui/auth/logout"));
         assert!(public.contains("/v1/install/*"));
+        assert!(public.contains("/v1/database-autopilot/nodes"));
+        assert!(public.contains("/v1/keycloak-autopilot/reconcile"));
         assert!(public.contains("/v1/admin/*"));
         assert!(public.contains("/v1/clients/peers/query"));
         assert!(public.contains("@oidc path /realms/* /resources/* /robots.txt"));
