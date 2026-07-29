@@ -9,6 +9,8 @@ ConditionPathExists=/opt/heteronetwork/libexec/keycloak-autopilot.sh
 [Service]
 Type=oneshot
 ExecStart=/opt/heteronetwork/libexec/keycloak-autopilot.sh reconcile
+ConfigurationDirectory=heteronetwork/keycloak heteronetwork/keycloak-backchannel heteronetwork/keycloak-edge-proxy
+ConfigurationDirectoryMode=0750
 RuntimeDirectory=heteronetwork-keycloak-autopilot
 RuntimeDirectoryMode=0700
 StateDirectory=heteronetwork-keycloak-autopilot

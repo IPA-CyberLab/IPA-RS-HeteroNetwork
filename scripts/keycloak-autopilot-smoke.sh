@@ -504,6 +504,10 @@ grep -Fqx \
   'ExecStart=/opt/heteronetwork/libexec/keycloak-autopilot.sh reconcile' \
   "$systemd_dir/heteronetwork-keycloak-autopilot.service" \
   || fail "reconcile unit command contract is wrong"
+grep -Fqx \
+  'ConfigurationDirectory=heteronetwork/keycloak heteronetwork/keycloak-backchannel heteronetwork/keycloak-edge-proxy' \
+  "$systemd_dir/heteronetwork-keycloak-autopilot.service" \
+  || fail "reconcile unit does not create its protected configuration directories"
 grep -Fqx 'Unit=heteronetwork-keycloak-autopilot.service' \
   "$systemd_dir/heteronetwork-keycloak-autopilot.timer" \
   || fail "timer does not target the reconcile service"
