@@ -293,6 +293,9 @@ grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL="udp://163.220.236.51:18445"$' \
 grep -Fq \
   "HETERONETWORK_TRUSTED_NODE_ENROLLMENT_ISSUER_KEYS=\"issuer-enrollment,web-enrollment,$enrollment_public_key,604800;issuer-rotation,web-rotation,$rotation_public_key,2592000\"" \
   "$services_env" || fail "restricted enrollment verifier rotation list was not preserved"
+grep -Fqx \
+  "HETERONETWORK_TRUSTED_ISSUER_KEYS=\"issuer-next,root-next,$trusted_public_key\"" \
+  "$services_env" || fail "trusted root rotation key was not preserved"
 grep -q 'SIGNAL_UPSTREAM=127.0.0.1:19443' "$agent_drop_in" ||
   fail "Signal gateway route is missing"
 grep -q 'RELAY_ADMISSION_UPSTREAM=10.250.0.4:18447' "$agent_drop_in" ||
@@ -314,6 +317,14 @@ control_plane_start_line=$(grep -n '^start heteronetwork-control-plane.service$'
   fail "Control Plane started before Signal"
 [ "$stun_start_line" -lt "$control_plane_start_line" ] ||
   fail "Control Plane started before STUN"
+
+sed -i \
+  's/^HETERONETWORK_PUBLIC_SERVICES_TRUSTED_ISSUER_KEYS_B64=.*/HETERONETWORK_PUBLIC_SERVICES_TRUSTED_ISSUER_KEYS_B64=/' \
+  "$public_services_dir/bootstrap.env"
+run_reconciler
+if grep -q '^HETERONETWORK_TRUSTED_ISSUER_KEYS=' "$services_env"; then
+  fail "empty trusted root rotation list was emitted as an invalid CLI value"
+fi
 
 services_checksum=$(cksum "$services_env")
 database_checksum=$(cksum "$database_url")

@@ -558,7 +558,9 @@ prepare_runtime_files() {
     write_environment_entry HETERONETWORK_ISSUER_NODE_ID "$issuer_node_id"
     write_environment_entry HETERONETWORK_ISSUER_KEY_ID "$issuer_key_id"
     write_environment_entry HETERONETWORK_ISSUER_PUBLIC_KEY "$issuer_public_key"
-    write_environment_entry HETERONETWORK_TRUSTED_ISSUER_KEYS "$trusted_issuer_keys"
+    if [ -n "$trusted_issuer_keys" ]; then
+      write_environment_entry HETERONETWORK_TRUSTED_ISSUER_KEYS "$trusted_issuer_keys"
+    fi
     write_environment_entry \
       HETERONETWORK_TRUSTED_NODE_ENROLLMENT_ISSUER_KEYS \
       "$enrollment_trusted_issuer_keys"
