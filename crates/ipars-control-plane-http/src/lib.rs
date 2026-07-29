@@ -44,7 +44,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use url::Url;
@@ -57,6 +57,17 @@ const WEB_OIDC_LOGIN_STATE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const WEB_OIDC_STATE_COOKIE: &str = "heteronetwork_oidc_state";
 const WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY: &str = "heteronetwork_access_token";
+const WEB_OIDC_ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY: &str = "heteronetwork_access_token_expires_at";
+const WEB_OIDC_REFRESH_COOKIE: &str = "heteronetwork_web_refresh";
+const WEB_OIDC_REFRESH_COOKIE_PATH: &str = "/ui/auth";
+const MAX_WEB_OIDC_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_WEB_OIDC_REFRESH_TOKEN_BYTES: usize = 2_800;
+const MAX_WEB_OIDC_REFRESH_COOKIE_BYTES: usize = 4_096;
+const MAX_WEB_OIDC_SESSION_SECONDS: u64 = 30 * 24 * 60 * 60;
+const DEFAULT_WEB_OIDC_REFRESH_COOKIE_SECONDS: u64 = 24 * 60 * 60;
+const MAX_WEB_OIDC_REFRESH_CACHE_ENTRIES: usize = 256;
+const WEB_OIDC_REFRESH_REPLAY_TTL: Duration = Duration::from_secs(5);
+const WEB_OIDC_REFRESH_IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
@@ -583,6 +594,8 @@ where
         .route("/ui/", get(ui_index))
         .route("/ui/login", get(ui_login::<S, L>))
         .route("/ui/callback", get(ui_callback::<S, L>))
+        .route("/ui/auth/refresh", post(ui_session_refresh::<S, L>))
+        .route("/ui/auth/logout", post(ui_session_logout::<S, L>))
         .route("/ui/app.js", get(ui_app))
         .route("/ui/theme.js", get(ui_theme))
         .route("/ui/styles.css", get(ui_styles))
@@ -634,6 +647,7 @@ pub struct WebUiAuthConfig {
     logout_endpoint: String,
     client: Client,
     login_states: Arc<Mutex<HashMap<String, OidcLoginState>>>,
+    refresh_cache: Arc<Mutex<WebOidcRefreshCache>>,
 }
 
 #[derive(Debug)]
@@ -649,10 +663,35 @@ struct OidcLoginStart {
     state_cookie: header::HeaderValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WebAuthFlowError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct WebSessionRefreshError {
+    error: WebAuthFlowError,
+    clear_cookie: bool,
+}
+
+type WebOidcRefreshResult = Result<OidcTokenResponse, WebSessionRefreshError>;
+
+#[derive(Debug, Default)]
+struct WebOidcRefreshCache {
+    entries: HashMap<[u8; 32], WebOidcRefreshCacheEntry>,
+}
+
+#[derive(Debug)]
+enum WebOidcRefreshCacheEntry {
+    InFlight {
+        operation: Arc<OnceCell<WebOidcRefreshResult>>,
+        expires_at: Instant,
+    },
+    Ready {
+        tokens: Arc<OidcTokenResponse>,
+        expires_at: Instant,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -667,6 +706,22 @@ impl WebAuthFlowError {
         Self {
             status,
             message: message.into(),
+        }
+    }
+}
+
+impl WebSessionRefreshError {
+    fn preserve(error: WebAuthFlowError) -> Self {
+        Self {
+            error,
+            clear_cookie: false,
+        }
+    }
+
+    fn reject(message: impl Into<String>) -> Self {
+        Self {
+            error: WebAuthFlowError::new(StatusCode::UNAUTHORIZED, message),
+            clear_cookie: true,
         }
     }
 }
@@ -748,6 +803,7 @@ impl WebUiAuthConfig {
             logout_endpoint: endpoint_url(&auth_base_url, logout_suffix),
             client,
             login_states: Arc::new(Mutex::new(HashMap::new())),
+            refresh_cache: Arc::new(Mutex::new(WebOidcRefreshCache::default())),
         })
     }
 
@@ -924,7 +980,7 @@ impl WebUiAuthConfig {
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
-        let secure = public_url.starts_with("https://");
+        let secure = web_oidc_url_is_secure(public_url);
         let secure_attribute = if secure { "; Secure" } else { "" };
         let state_cookie = header::HeaderValue::from_str(&format!(
             "{WEB_OIDC_STATE_COOKIE}={state}; Path=/ui/callback; Max-Age={}; HttpOnly; SameSite=Lax{secure_attribute}",
@@ -946,7 +1002,7 @@ impl WebUiAuthConfig {
         &self,
         query: OidcCallbackQuery,
         state_cookie: Option<&str>,
-    ) -> Result<String, WebAuthFlowError> {
+    ) -> Result<OidcTokenResponse, WebAuthFlowError> {
         let state = query
             .state
             .as_deref()
@@ -1053,12 +1109,7 @@ impl WebUiAuthConfig {
             )
         })?;
         let body = bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES).await?;
-        let tokens: OidcTokenResponse = serde_json::from_slice(&body).map_err(|error| {
-            WebAuthFlowError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("OIDC token response is invalid: {error}"),
-            )
-        })?;
+        let tokens = parse_oidc_token_response(&body, "OIDC token")?;
         match self.access_token_validation(&tokens.access_token).await {
             AccessTokenValidation::Valid => {}
             AccessTokenValidation::Invalid => {
@@ -1074,10 +1125,169 @@ impl WebUiAuthConfig {
                 ));
             }
         }
-        Ok(tokens.access_token)
+        Ok(tokens)
+    }
+
+    async fn refresh_session(
+        &self,
+        refresh_token: &str,
+    ) -> Result<OidcTokenResponse, WebSessionRefreshError> {
+        if !valid_web_oidc_refresh_token(refresh_token) {
+            return Err(WebSessionRefreshError::reject(
+                "Web UI refresh session is missing or invalid",
+            ));
+        }
+
+        let digest: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
+        let operation = {
+            let mut cache = self.refresh_cache.lock().await;
+            let now = Instant::now();
+            cache.entries.retain(|_, entry| match entry {
+                WebOidcRefreshCacheEntry::InFlight { expires_at, .. }
+                | WebOidcRefreshCacheEntry::Ready { expires_at, .. } => *expires_at > now,
+            });
+            match cache.entries.get(&digest) {
+                Some(WebOidcRefreshCacheEntry::Ready { tokens, .. }) => {
+                    return Ok(tokens.as_ref().clone());
+                }
+                Some(WebOidcRefreshCacheEntry::InFlight { operation, .. }) => operation.clone(),
+                None => {
+                    if cache.entries.len() >= MAX_WEB_OIDC_REFRESH_CACHE_ENTRIES {
+                        let oldest_ready = cache
+                            .entries
+                            .iter()
+                            .filter_map(|(digest, entry)| match entry {
+                                WebOidcRefreshCacheEntry::Ready { expires_at, .. } => {
+                                    Some((*digest, *expires_at))
+                                }
+                                WebOidcRefreshCacheEntry::InFlight { .. } => None,
+                            })
+                            .min_by_key(|(_, expires_at)| *expires_at)
+                            .map(|(digest, _)| digest);
+                        if let Some(oldest_ready) = oldest_ready {
+                            cache.entries.remove(&oldest_ready);
+                        }
+                    }
+                    if cache.entries.len() >= MAX_WEB_OIDC_REFRESH_CACHE_ENTRIES {
+                        return Err(WebSessionRefreshError::preserve(WebAuthFlowError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "too many concurrent Web UI refresh requests",
+                        )));
+                    }
+                    let operation = Arc::new(OnceCell::new());
+                    cache.entries.insert(
+                        digest,
+                        WebOidcRefreshCacheEntry::InFlight {
+                            operation: operation.clone(),
+                            expires_at: now + WEB_OIDC_REFRESH_IN_FLIGHT_TTL,
+                        },
+                    );
+                    operation
+                }
+            }
+        };
+
+        let result = operation
+            .get_or_init(|| self.refresh_session_uncached(refresh_token))
+            .await
+            .clone();
+        let mut cache = self.refresh_cache.lock().await;
+        let is_current = cache.entries.get(&digest).is_some_and(|entry| {
+            matches!(
+                entry,
+                WebOidcRefreshCacheEntry::InFlight {
+                    operation: current,
+                    ..
+                } if Arc::ptr_eq(current, &operation)
+            )
+        });
+        if is_current {
+            match &result {
+                Ok(tokens) => {
+                    cache.entries.insert(
+                        digest,
+                        WebOidcRefreshCacheEntry::Ready {
+                            tokens: Arc::new(tokens.clone()),
+                            expires_at: Instant::now() + WEB_OIDC_REFRESH_REPLAY_TTL,
+                        },
+                    );
+                }
+                Err(_) => {
+                    cache.entries.remove(&digest);
+                }
+            }
+        }
+        result
+    }
+
+    async fn refresh_session_uncached(&self, refresh_token: &str) -> WebOidcRefreshResult {
+        let mut failures = Vec::new();
+        for endpoint in &self.backchannel_token_endpoints {
+            let response = match self
+                .client
+                .post(endpoint)
+                .header(header::HOST, self.backchannel_host.clone())
+                .header(header::ACCEPT, "application/json")
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", self.client_id.as_str()),
+                    ("refresh_token", refresh_token),
+                ])
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{endpoint}: {error}"));
+                    continue;
+                }
+            };
+            let status = response.status();
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                failures.push(format!("{endpoint}: HTTP {status}"));
+                continue;
+            }
+            let body = bounded_response_body(response, MAX_WEB_OIDC_TOKEN_RESPONSE_BYTES)
+                .await
+                .map_err(WebSessionRefreshError::preserve)?;
+            if status.is_success() {
+                return parse_oidc_token_response(&body, "OIDC refresh token")
+                    .map_err(WebSessionRefreshError::preserve);
+            }
+
+            let error = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|body| {
+                    body.get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if matches!(
+                error.as_str(),
+                "invalid_grant" | "invalid_token" | "expired_token"
+            ) {
+                return Err(WebSessionRefreshError::reject(
+                    "Web UI refresh session expired or was rejected",
+                ));
+            }
+            return Err(WebSessionRefreshError::preserve(WebAuthFlowError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("OIDC refresh request returned HTTP {status}"),
+            )));
+        }
+
+        Err(WebSessionRefreshError::preserve(WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "OIDC refresh request failed on every backchannel: {}",
+                failures.join("; ")
+            ),
+        )))
     }
 
     fn public_config(&self, cluster_id: String) -> WebUiPublicConfig {
+        let server_side_session = self.public_url.is_some();
         WebUiPublicConfig {
             cluster_id,
             enabled: true,
@@ -1092,6 +1302,8 @@ impl WebUiAuthConfig {
             token_endpoint: Some(self.token_endpoint.clone()),
             logout_endpoint: Some(self.logout_endpoint.clone()),
             login_endpoint: self.public_url.as_ref().map(|_| "/ui/login".to_string()),
+            session_refresh_endpoint: server_side_session.then(|| "/ui/auth/refresh".to_string()),
+            session_logout_endpoint: server_side_session.then(|| "/ui/auth/logout".to_string()),
             node_enrollment_enabled: false,
             client_enrollment_enabled: false,
         }
@@ -1234,9 +1446,56 @@ struct OidcCallbackQuery {
     error_description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct OidcTokenResponse {
     access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    expires_in: u64,
+    #[serde(default)]
+    refresh_expires_in: Option<u64>,
+}
+
+fn parse_oidc_token_response(
+    body: &[u8],
+    context: &str,
+) -> Result<OidcTokenResponse, WebAuthFlowError> {
+    let tokens: OidcTokenResponse = serde_json::from_slice(body).map_err(|error| {
+        WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("{context} response is invalid: {error}"),
+        )
+    })?;
+    if tokens.access_token.is_empty()
+        || tokens.access_token.len() > MAX_WEB_OIDC_ACCESS_TOKEN_BYTES
+        || tokens.access_token.contains(char::is_whitespace)
+        || tokens.access_token.chars().any(char::is_control)
+        || tokens.expires_in == 0
+        || tokens.expires_in > MAX_WEB_OIDC_SESSION_SECONDS
+    {
+        return Err(WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("{context} response contained invalid access token parameters"),
+        ));
+    }
+    if tokens
+        .refresh_token
+        .as_deref()
+        .is_some_and(|token| !valid_web_oidc_refresh_token(token))
+    {
+        return Err(WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("{context} response contained an invalid refresh token"),
+        ));
+    }
+    Ok(tokens)
+}
+
+fn valid_web_oidc_refresh_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_WEB_OIDC_REFRESH_TOKEN_BYTES
+        && !token.contains(char::is_whitespace)
+        && !token.chars().any(char::is_control)
 }
 
 #[derive(Debug, Serialize)]
@@ -1254,6 +1513,8 @@ struct WebUiPublicConfig {
     token_endpoint: Option<String>,
     logout_endpoint: Option<String>,
     login_endpoint: Option<String>,
+    session_refresh_endpoint: Option<String>,
+    session_logout_endpoint: Option<String>,
     node_enrollment_enabled: bool,
     client_enrollment_enabled: bool,
 }
@@ -1452,59 +1713,313 @@ where
             .as_deref()
             .is_some_and(|cookie| bounded_constant_time_matches(state, cookie, 128))
     });
+    let secure = web_oidc_secure_cookie(auth);
     let mut response = match auth.complete_login(query, state_cookie.as_deref()).await {
-        Ok(access_token) => {
-            let html = oidc_callback_html(&access_token);
-            let mut response = Html(html).into_response();
-            let headers = response.headers_mut();
-            headers.insert(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
-            );
-            headers.insert(
-                header::HeaderName::from_static("content-security-policy"),
-                header::HeaderValue::from_static(
-                    "default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
-                ),
-            );
-            headers.insert(
-                header::X_CONTENT_TYPE_OPTIONS,
-                header::HeaderValue::from_static("nosniff"),
-            );
-            headers.insert(
-                header::HeaderName::from_static("referrer-policy"),
-                header::HeaderValue::from_static("no-referrer"),
-            );
-            response
+        Ok(tokens) => {
+            let refresh_cookie = match tokens.refresh_token.as_deref() {
+                Some(refresh_token) => {
+                    web_oidc_refresh_cookie(refresh_token, tokens.refresh_expires_in, secure)
+                }
+                None => Ok(clear_web_oidc_refresh_cookie(secure)),
+            };
+            match refresh_cookie {
+                Ok(refresh_cookie) => {
+                    let html = oidc_callback_html(&tokens.access_token, tokens.expires_in);
+                    let mut response = Html(html).into_response();
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        header::CACHE_CONTROL,
+                        header::HeaderValue::from_static("no-store"),
+                    );
+                    headers.insert(
+                        header::HeaderName::from_static("content-security-policy"),
+                        header::HeaderValue::from_static(
+                            "default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+                        ),
+                    );
+                    headers.insert(
+                        header::X_CONTENT_TYPE_OPTIONS,
+                        header::HeaderValue::from_static("nosniff"),
+                    );
+                    headers.insert(
+                        header::HeaderName::from_static("referrer-policy"),
+                        header::HeaderValue::from_static("no-referrer"),
+                    );
+                    headers.append(header::SET_COOKIE, refresh_cookie);
+                    response
+                }
+                Err(error) => {
+                    let mut response = web_auth_flow_error_response(error);
+                    response
+                        .headers_mut()
+                        .append(header::SET_COOKIE, clear_web_oidc_refresh_cookie(secure));
+                    response
+                }
+            }
         }
         Err(error) => web_auth_flow_error_response(error),
     };
     if clear_state_cookie {
-        let secure_attribute = if auth
-            .public_url
-            .as_deref()
-            .is_some_and(|url| url.starts_with("https://"))
-        {
-            "; Secure"
-        } else {
-            ""
-        };
+        let secure_attribute = if secure { "; Secure" } else { "" };
         if let Ok(cookie) = header::HeaderValue::from_str(&format!(
             "{WEB_OIDC_STATE_COOKIE}=; Path=/ui/callback; Max-Age=0; HttpOnly; SameSite=Lax{secure_attribute}"
         )) {
-            response.headers_mut().insert(header::SET_COOKIE, cookie);
+            response.headers_mut().append(header::SET_COOKIE, cookie);
         }
     }
     response
 }
 
-fn oidc_callback_html(access_token: &str) -> String {
+async fn ui_session_refresh<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    headers: HeaderMap,
+) -> Response
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let Some(auth) = state.web_ui_auth.as_deref() else {
+        return web_auth_flow_error_response(WebAuthFlowError::new(
+            StatusCode::NOT_FOUND,
+            "web OIDC authentication is not configured",
+        ));
+    };
+    if let Err(error) = validate_web_oidc_session_request(auth, &headers) {
+        return web_auth_flow_error_response(error);
+    }
+    let secure = web_oidc_secure_cookie(auth);
+    let Some(refresh_token) = web_oidc_refresh_token(&headers) else {
+        let mut response = web_auth_flow_error_response(WebAuthFlowError::new(
+            StatusCode::UNAUTHORIZED,
+            "Web UI refresh session is missing or invalid",
+        ));
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, clear_web_oidc_refresh_cookie(secure));
+        return response;
+    };
+
+    match auth.refresh_session(&refresh_token).await {
+        Ok(tokens) => {
+            let cookie_token = tokens.refresh_token.as_deref().unwrap_or(&refresh_token);
+            let cookie =
+                match web_oidc_refresh_cookie(cookie_token, tokens.refresh_expires_in, secure) {
+                    Ok(cookie) => cookie,
+                    Err(error) => return web_auth_flow_error_response(error),
+                };
+            let mut response = Json(serde_json::json!({
+                "access_token": tokens.access_token,
+                "expires_in": tokens.expires_in
+            }))
+            .into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            response.headers_mut().append(header::SET_COOKIE, cookie);
+            response
+        }
+        Err(error) => {
+            let clear_cookie = error.clear_cookie;
+            let mut response = web_auth_flow_error_response(error.error);
+            if clear_cookie {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, clear_web_oidc_refresh_cookie(secure));
+            }
+            response
+        }
+    }
+}
+
+async fn ui_session_logout<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    headers: HeaderMap,
+) -> Response
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let Some(auth) = state.web_ui_auth.as_deref() else {
+        return web_auth_flow_error_response(WebAuthFlowError::new(
+            StatusCode::NOT_FOUND,
+            "web OIDC authentication is not configured",
+        ));
+    };
+    if let Err(error) = validate_web_oidc_session_request(auth, &headers) {
+        return web_auth_flow_error_response(error);
+    }
+    let mut response = Json(serde_json::json!({"status": "logged_out"})).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        clear_web_oidc_refresh_cookie(web_oidc_secure_cookie(auth)),
+    );
+    response
+}
+
+fn oidc_callback_html(access_token: &str, expires_in: u64) -> String {
     let token_json = serde_json::to_string(access_token)
         .unwrap_or_else(|_| "\"\"".to_string())
         .replace('<', "\\u003c");
     format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>HeteroNetwork Login</title><script>sessionStorage.setItem(\"{WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY}\",{token_json});location.replace(\"/ui/\");</script>"
+        "<!doctype html><meta charset=\"utf-8\"><title>HeteroNetwork Login</title><script>sessionStorage.setItem(\"{WEB_OIDC_ACCESS_TOKEN_STORAGE_KEY}\",{token_json});sessionStorage.setItem(\"{WEB_OIDC_ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY}\",String(Date.now()+{expires_in}*1000));location.replace(\"/ui/\");</script>"
     )
+}
+
+fn web_oidc_url_is_secure(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"))
+}
+
+fn web_oidc_secure_cookie(auth: &WebUiAuthConfig) -> bool {
+    auth.public_url
+        .as_deref()
+        .is_some_and(web_oidc_url_is_secure)
+}
+
+fn web_oidc_refresh_cookie(
+    refresh_token: &str,
+    refresh_expires_in: Option<u64>,
+    secure: bool,
+) -> Result<header::HeaderValue, WebAuthFlowError> {
+    if !valid_web_oidc_refresh_token(refresh_token) {
+        return Err(WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            "OIDC token response contained an invalid refresh token",
+        ));
+    }
+    let encoded = URL_SAFE_NO_PAD.encode(refresh_token.as_bytes());
+    let seconds = match refresh_expires_in {
+        Some(0) | None => DEFAULT_WEB_OIDC_REFRESH_COOKIE_SECONDS,
+        Some(seconds) => seconds.min(MAX_WEB_OIDC_SESSION_SECONDS),
+    };
+    let max_age_attribute = format!("; Max-Age={seconds}");
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{WEB_OIDC_REFRESH_COOKIE}={encoded}; Path={WEB_OIDC_REFRESH_COOKIE_PATH}{max_age_attribute}; HttpOnly; SameSite=Strict{secure_attribute}"
+    );
+    if cookie.len() > MAX_WEB_OIDC_REFRESH_COOKIE_BYTES {
+        return Err(WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            "OIDC refresh token exceeds the safe Web UI cookie limit",
+        ));
+    }
+    header::HeaderValue::from_str(&cookie).map_err(|_| {
+        WebAuthFlowError::new(
+            StatusCode::BAD_GATEWAY,
+            "failed to build the Web UI refresh cookie",
+        )
+    })
+}
+
+fn clear_web_oidc_refresh_cookie(secure: bool) -> header::HeaderValue {
+    if secure {
+        header::HeaderValue::from_static(
+            "heteronetwork_web_refresh=; Path=/ui/auth; Max-Age=0; HttpOnly; SameSite=Strict; Secure",
+        )
+    } else {
+        header::HeaderValue::from_static(
+            "heteronetwork_web_refresh=; Path=/ui/auth; Max-Age=0; HttpOnly; SameSite=Strict",
+        )
+    }
+}
+
+fn web_oidc_refresh_token(headers: &HeaderMap) -> Option<String> {
+    let mut encoded = None;
+    for header_value in headers.get_all(header::COOKIE) {
+        let header_value = header_value.to_str().ok()?;
+        for pair in header_value.split(';') {
+            let Some((name, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if name != WEB_OIDC_REFRESH_COOKIE {
+                continue;
+            }
+            if encoded.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    let encoded = encoded?;
+    if encoded.is_empty()
+        || encoded.len() > (MAX_WEB_OIDC_REFRESH_TOKEN_BYTES * 4 / 3 + 4)
+        || encoded.len() > MAX_WEB_OIDC_REFRESH_COOKIE_BYTES
+    {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let refresh_token = String::from_utf8(decoded).ok()?;
+    valid_web_oidc_refresh_token(&refresh_token).then_some(refresh_token)
+}
+
+fn validate_web_oidc_session_request(
+    auth: &WebUiAuthConfig,
+    headers: &HeaderMap,
+) -> Result<(), WebAuthFlowError> {
+    let public_url = auth.public_url.as_deref().ok_or_else(|| {
+        WebAuthFlowError::new(
+            StatusCode::NOT_FOUND,
+            "server-side OIDC login is not configured",
+        )
+    })?;
+    let expected = Url::parse(public_url).map_err(|_| {
+        WebAuthFlowError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "web public URL is invalid",
+        )
+    })?;
+
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let origin = origins
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            WebAuthFlowError::new(
+                StatusCode::FORBIDDEN,
+                "same-origin Web UI request is required",
+            )
+        })?;
+    if origins.next().is_some() {
+        return Err(WebAuthFlowError::new(
+            StatusCode::FORBIDDEN,
+            "same-origin Web UI request is required",
+        ));
+    }
+    let origin = Url::parse(origin).map_err(|_| {
+        WebAuthFlowError::new(
+            StatusCode::FORBIDDEN,
+            "same-origin Web UI request is required",
+        )
+    })?;
+    if origin.origin() != expected.origin()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.username() != ""
+        || origin.password().is_some()
+    {
+        return Err(WebAuthFlowError::new(
+            StatusCode::FORBIDDEN,
+            "same-origin Web UI request is required",
+        ));
+    }
+
+    let fetch_site = header::HeaderName::from_static("sec-fetch-site");
+    let mut fetch_sites = headers.get_all(fetch_site).iter();
+    let same_origin = fetch_sites
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("same-origin"));
+    if !same_origin || fetch_sites.next().is_some() {
+        return Err(WebAuthFlowError::new(
+            StatusCode::FORBIDDEN,
+            "same-origin Web UI request is required",
+        ));
+    }
+    Ok(())
 }
 
 fn oidc_state_cookie(headers: &HeaderMap) -> Option<String> {
@@ -1578,6 +2093,8 @@ where
             token_endpoint: None,
             logout_endpoint: None,
             login_endpoint: None,
+            session_refresh_endpoint: None,
+            session_logout_endpoint: None,
             node_enrollment_enabled: false,
             client_enrollment_enabled: false,
         });
@@ -5655,10 +6172,11 @@ struct ErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Write as _;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::process::Stdio;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::body::Body;
     use axum::http::{header, Request};
@@ -6023,6 +6541,20 @@ mod tests {
                 .as_deref(),
             Some("/ui/login")
         );
+        assert_eq!(
+            config
+                .public_config("cluster-a".to_string())
+                .session_refresh_endpoint
+                .as_deref(),
+            Some("/ui/auth/refresh")
+        );
+        assert_eq!(
+            config
+                .public_config("cluster-a".to_string())
+                .session_logout_endpoint
+                .as_deref(),
+            Some("/ui/auth/logout")
+        );
 
         let login = config
             .begin_login()
@@ -6100,9 +6632,465 @@ mod tests {
 
     #[test]
     fn server_side_oidc_callback_uses_current_ui_storage_key() {
-        let html = oidc_callback_html("access-token");
+        let html = oidc_callback_html("access-token", 300);
         assert!(html.contains("sessionStorage.setItem(\"heteronetwork_access_token\""));
+        assert!(html.contains(
+            "sessionStorage.setItem(\"heteronetwork_access_token_expires_at\",String(Date.now()+300*1000))"
+        ));
+        assert!(!html.contains("refresh-token"));
         assert!(!html.contains("ipars_access_token"));
+    }
+
+    #[test]
+    fn web_oidc_refresh_cookie_is_bounded_encoded_and_secure() {
+        let cookie = web_oidc_refresh_cookie(
+            "refresh-token-value",
+            Some(MAX_WEB_OIDC_SESSION_SECONDS + 1),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("refresh cookie should be valid: {}", error.message));
+        let cookie = cookie
+            .to_str()
+            .unwrap_or_else(|error| panic!("refresh cookie should be ASCII: {error}"));
+        assert!(cookie.starts_with("heteronetwork_web_refresh="));
+        assert!(cookie.contains("; Path=/ui/auth"));
+        assert!(cookie.contains(&format!("; Max-Age={MAX_WEB_OIDC_SESSION_SECONDS}")));
+        assert!(cookie.contains("; HttpOnly; SameSite=Strict; Secure"));
+        assert!(!cookie.contains("refresh-token-value"));
+        assert!(cookie.len() <= MAX_WEB_OIDC_REFRESH_COOKIE_BYTES);
+
+        let mut headers = HeaderMap::new();
+        let cookie_pair = cookie
+            .split(';')
+            .next()
+            .unwrap_or_else(|| panic!("refresh cookie should contain a name-value pair"));
+        headers.insert(
+            header::COOKIE,
+            header::HeaderValue::from_str(cookie_pair)
+                .unwrap_or_else(|error| panic!("cookie pair should be a valid header: {error}")),
+        );
+        assert_eq!(
+            web_oidc_refresh_token(&headers).as_deref(),
+            Some("refresh-token-value")
+        );
+
+        let non_expiring = web_oidc_refresh_cookie("refresh-token-value", Some(0), true)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "non-expiring provider token should receive the local cap: {}",
+                    error.message
+                )
+            });
+        assert!(non_expiring
+            .to_str()
+            .is_ok_and(|cookie| cookie.contains(&format!(
+                "; Max-Age={DEFAULT_WEB_OIDC_REFRESH_COOKIE_SECONDS}"
+            ))));
+        let missing_expiry = web_oidc_refresh_cookie("refresh-token-value", None, true)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a provider without refresh_expires_in should receive a bounded fallback: {}",
+                    error.message
+                )
+            });
+        assert!(missing_expiry
+            .to_str()
+            .is_ok_and(|cookie| cookie.contains(&format!(
+                "; Max-Age={DEFAULT_WEB_OIDC_REFRESH_COOKIE_SECONDS}"
+            ))));
+
+        assert!(web_oidc_url_is_secure("HTTPS://console.example"));
+        assert!(web_oidc_url_is_secure("https://console.example"));
+        assert!(!web_oidc_url_is_secure("http://console.example"));
+        assert!(!web_oidc_url_is_secure("not a URL"));
+    }
+
+    #[test]
+    fn web_oidc_session_mutations_require_exact_browser_origin() {
+        let auth = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            None,
+            "openid".to_string(),
+        )
+        .and_then(|config| config.with_public_url("https://console.example".to_string()))
+        .unwrap_or_else(|error| panic!("server-side OIDC config should be valid: {error}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://console.example"),
+        );
+        headers.insert(
+            header::HeaderName::from_static("sec-fetch-site"),
+            header::HeaderValue::from_static("same-origin"),
+        );
+        assert!(validate_web_oidc_session_request(&auth, &headers).is_ok());
+
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://attacker.example"),
+        );
+        let error = match validate_web_oidc_session_request(&auth, &headers) {
+            Ok(()) => panic!("a foreign Origin must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://console.example"),
+        );
+        headers.remove(header::HeaderName::from_static("sec-fetch-site"));
+        let error = match validate_web_oidc_session_request(&auth, &headers) {
+            Ok(()) => panic!("a non-browser mutation without fetch metadata must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn web_oidc_refresh_fails_over_rotates_without_calling_userinfo(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let token_path = "/realms/heteronetwork/protocol/openid-connect/token";
+        let userinfo_path = "/realms/heteronetwork/protocol/openid-connect/userinfo";
+        let primary_token_calls = Arc::new(AtomicUsize::new(0));
+        let primary_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let primary_address = primary_listener.local_addr()?;
+        let primary_calls = primary_token_calls.clone();
+        let primary_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                token_path,
+                post(move || {
+                    let calls = primary_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            );
+            let _ = axum::serve(primary_listener, app).await;
+        });
+
+        let fallback_token_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_userinfo_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let fallback_address = fallback_listener.local_addr()?;
+        let token_calls = fallback_token_calls.clone();
+        let userinfo_calls = fallback_userinfo_calls.clone();
+        let fallback_task = tokio::spawn(async move {
+            let token_app = post(
+                move |axum::extract::Form(form): axum::extract::Form<BTreeMap<String, String>>| {
+                    let calls = token_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if form.get("grant_type").map(String::as_str) != Some("refresh_token")
+                            || form.get("client_id").map(String::as_str)
+                                != Some("heteronetwork-web")
+                        {
+                            return StatusCode::BAD_REQUEST.into_response();
+                        }
+                        let rejected_error = match form.get("refresh_token").map(String::as_str) {
+                            Some("invalid-grant-refresh-token") => Some("invalid_grant"),
+                            Some("invalid-token-refresh-token") => Some("invalid_token"),
+                            Some("expired-token-refresh-token") => Some("expired_token"),
+                            _ => None,
+                        };
+                        if let Some(rejected_error) = rejected_error {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error": rejected_error})),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "access_token": "refreshed-access-token",
+                            "refresh_token": "rotated-refresh-token",
+                            "expires_in": 300,
+                            "refresh_expires_in": 3600
+                        }))
+                        .into_response()
+                    }
+                },
+            );
+            let userinfo_app = get(move || {
+                let calls = userinfo_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            });
+            let app = Router::new()
+                .route(token_path, token_app)
+                .route(userinfo_path, userinfo_app);
+            let _ = axum::serve(fallback_listener, app).await;
+        });
+
+        let auth = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{primary_address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?
+        .with_backchannel_fallback_base_urls(vec![format!(
+            "http://{fallback_address}/realms/heteronetwork"
+        )])?;
+
+        let refreshed = auth
+            .refresh_session("refresh-token")
+            .await
+            .map_err(|error| {
+                format!(
+                    "refresh should fail over successfully: {}",
+                    error.error.message
+                )
+            })?;
+        assert_eq!(refreshed.access_token, "refreshed-access-token");
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("rotated-refresh-token")
+        );
+        assert_eq!(refreshed.refresh_expires_in, Some(3600));
+
+        for refresh_token in [
+            "invalid-grant-refresh-token",
+            "invalid-token-refresh-token",
+            "expired-token-refresh-token",
+        ] {
+            let rejected = match auth.refresh_session(refresh_token).await {
+                Ok(_) => panic!("{refresh_token} must reject the browser session"),
+                Err(error) => error,
+            };
+            assert_eq!(rejected.error.status, StatusCode::UNAUTHORIZED);
+            assert!(rejected.clear_cookie);
+        }
+        assert_eq!(primary_token_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(fallback_token_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(fallback_userinfo_calls.load(Ordering::SeqCst), 0);
+
+        primary_task.abort();
+        fallback_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_oidc_refresh_coalesces_cloned_config_requests_and_replays_success(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let token_path = "/realms/heteronetwork/protocol/openid-connect/token";
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let calls = token_calls.clone();
+        let server_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                token_path,
+                post(
+                    move |axum::extract::Form(form): axum::extract::Form<
+                        BTreeMap<String, String>,
+                    >| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(75)).await;
+                            if form.get("refresh_token").map(String::as_str)
+                                != Some("shared-refresh-token")
+                            {
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+                            Json(serde_json::json!({
+                                "access_token": "coalesced-access-token",
+                                "refresh_token": "coalesced-rotated-token",
+                                "expires_in": 300,
+                                "refresh_expires_in": 3600
+                            }))
+                            .into_response()
+                        }
+                    },
+                ),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let auth = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?;
+        let cloned_auth = auth.clone();
+        let (first, second) = tokio::join!(
+            auth.refresh_session("shared-refresh-token"),
+            cloned_auth.refresh_session("shared-refresh-token")
+        );
+        let first = first.map_err(|error| error.error.message)?;
+        let second = second.map_err(|error| error.error.message)?;
+        assert_eq!(first.access_token, "coalesced-access-token");
+        assert_eq!(second.access_token, first.access_token);
+        assert_eq!(second.refresh_token, first.refresh_token);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+
+        let replayed = cloned_auth
+            .refresh_session("shared-refresh-token")
+            .await
+            .map_err(|error| error.error.message)?;
+        assert_eq!(replayed.access_token, first.access_token);
+        assert_eq!(replayed.refresh_token, first.refresh_token);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(auth.refresh_cache.lock().await.entries.len(), 1);
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_oidc_refresh_preserves_cookie_for_transient_provider_failures(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let token_path = "/realms/heteronetwork/protocol/openid-connect/token";
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let calls = token_calls.clone();
+        let server_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                token_path,
+                post(
+                    move |axum::extract::Form(form): axum::extract::Form<
+                        BTreeMap<String, String>,
+                    >| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            match form.get("refresh_token").map(String::as_str) {
+                                Some("invalid-client") => (
+                                    StatusCode::UNAUTHORIZED,
+                                    Json(serde_json::json!({"error": "invalid_client"})),
+                                )
+                                    .into_response(),
+                                Some("generic-unauthorized") => {
+                                    StatusCode::UNAUTHORIZED.into_response()
+                                }
+                                Some("generic-forbidden") => StatusCode::FORBIDDEN.into_response(),
+                                Some("server-error") => {
+                                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                                }
+                                _ => StatusCode::BAD_REQUEST.into_response(),
+                            }
+                        }
+                    },
+                ),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let auth = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?;
+        for refresh_token in [
+            "invalid-client",
+            "generic-unauthorized",
+            "generic-forbidden",
+            "server-error",
+        ] {
+            let error = match auth.refresh_session(refresh_token).await {
+                Ok(_) => panic!("{refresh_token} must not produce a successful refresh"),
+                Err(error) => error,
+            };
+            assert!(
+                !error.clear_cookie,
+                "{refresh_token} must preserve the refresh cookie"
+            );
+            assert_ne!(error.error.status, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(token_calls.load(Ordering::SeqCst), 4);
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_oidc_refresh_fails_over_after_rate_limit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let token_path = "/realms/heteronetwork/protocol/openid-connect/token";
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let primary_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let primary_address = primary_listener.local_addr()?;
+        let calls = primary_calls.clone();
+        let primary_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                token_path,
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::TOO_MANY_REQUESTS
+                    }
+                }),
+            );
+            let _ = axum::serve(primary_listener, app).await;
+        });
+
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let fallback_address = fallback_listener.local_addr()?;
+        let calls = fallback_calls.clone();
+        let fallback_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                token_path,
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "access_token": "fallback-access-token",
+                            "refresh_token": "fallback-rotated-token",
+                            "expires_in": 300
+                        }))
+                    }
+                }),
+            );
+            let _ = axum::serve(fallback_listener, app).await;
+        });
+
+        let auth = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{primary_address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?
+        .with_backchannel_fallback_base_urls(vec![format!(
+            "http://{fallback_address}/realms/heteronetwork"
+        )])?;
+        let refreshed = auth
+            .refresh_session("rate-limited-refresh-token")
+            .await
+            .map_err(|error| error.error.message)?;
+        assert_eq!(refreshed.access_token, "fallback-access-token");
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("fallback-rotated-token")
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+
+        primary_task.abort();
+        fallback_task.abort();
+        Ok(())
     }
 
     fn claims(cluster_id: ClusterId, issuer: NodeId, key_id: KeyId) -> JoinTokenClaims {
@@ -9704,6 +10692,8 @@ exit 47
         assert_eq!(ui_config["enabled"], true);
         assert_eq!(ui_config["operator_token_enabled"], true);
         assert_eq!(ui_config["node_enrollment_enabled"], false);
+        assert_eq!(ui_config["session_refresh_endpoint"], Value::Null);
+        assert_eq!(ui_config["session_logout_endpoint"], Value::Null);
 
         let request_body = JoinNodeRequest {
             token: issuer.sign_join_token(claims(
