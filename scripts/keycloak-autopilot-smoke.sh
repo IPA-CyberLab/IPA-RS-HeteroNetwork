@@ -691,6 +691,13 @@ if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract
 fi
 grep -Fq 'systemctl reset-failed \' "$helper_contract" \
   || fail "helper leaves intentionally stopped replicas in a failed state"
+grep -Fq 'heteronetwork-keycloak.service >/dev/null 2>&1 || true' \
+  "$helper_contract" \
+  || fail "garbage-collected Keycloak units make deactivation fail"
+grep -Fq \
+  'systemctl reset-failed heteronetwork-keycloak-edge-proxy.service >/dev/null 2>&1 \' \
+  "$helper_contract" \
+  || fail "garbage-collected edge units make deactivation fail"
 grep -Fq 'if ((config_changed == 1 || unit_changed == 1)); then' \
   "$helper_contract" \
   || fail "helper reloads an unchanged edge proxy"

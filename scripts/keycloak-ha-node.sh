@@ -627,7 +627,7 @@ deactivate_replica() {
   if ((failed == 0)); then
     systemctl reset-failed \
       heteronetwork-keycloak-backchannel.service \
-      heteronetwork-keycloak.service
+      heteronetwork-keycloak.service >/dev/null 2>&1 || true
   fi
   ((failed == 0))
 }
@@ -757,7 +757,8 @@ configure_edge_proxy() {
 deactivate_edge_proxy() {
   require_root
   systemctl stop heteronetwork-keycloak-edge-proxy.service
-  systemctl reset-failed heteronetwork-keycloak-edge-proxy.service
+  systemctl reset-failed heteronetwork-keycloak-edge-proxy.service >/dev/null 2>&1 \
+    || true
 }
 
 case "${1:-}" in
