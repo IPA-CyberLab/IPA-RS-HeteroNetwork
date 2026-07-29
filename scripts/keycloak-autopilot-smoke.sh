@@ -675,6 +675,10 @@ grep -Fq '"http://127.0.0.1:${management_port}/health/ready"' "$helper_contract"
 if grep -Fq 'Requires=heteronetwork-agent.service' "$helper_contract"; then
   fail "a generated Keycloak unit still hard-requires the Agent"
 fi
+grep -Fq 'SuccessExitStatus=143 SIGTERM' "$helper_contract" \
+  || fail "controlled Keycloak SIGTERM shutdown is not treated as successful"
+grep -Fq 'RestartPreventExitStatus=143 SIGTERM' "$helper_contract" \
+  || fail "controlled Keycloak shutdown can still trigger an automatic restart"
 if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract"; then
   fail "helper restarts an already-active Keycloak replica"
 fi

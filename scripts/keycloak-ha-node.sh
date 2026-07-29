@@ -275,6 +275,9 @@ Group=keycloak
 ExecStart=/opt/heteronetwork/libexec/keycloak-start
 Restart=on-failure
 RestartSec=5s
+# The Keycloak launcher reports a controlled SIGTERM shutdown as exit 143.
+SuccessExitStatus=143 SIGTERM
+RestartPreventExitStatus=143 SIGTERM
 TimeoutStartSec=180s
 TimeoutStopSec=45s
 LimitNOFILE=65536
