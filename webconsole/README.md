@@ -5,6 +5,18 @@ protects `/v1/admin/*` with Keycloak bearer-token validation.
 It also provides `/ui/login` and `/ui/callback` so the browser can use
 Authorization Code with PKCE even when the console is served from a plain HTTP
 lab address where `crypto.subtle` is unavailable.
+The access token remains in per-tab `sessionStorage`; the refresh token is kept
+in a path-limited `HttpOnly; SameSite=Strict` cookie and is rotated through the
+same-origin `/ui/auth/refresh` endpoint. HTTPS deployments add `Secure`, and
+`/ui/auth/logout` deletes the cookie before provider logout.
+Refresh and logout requests must carry the exact configured public origin and
+`Sec-Fetch-Site: same-origin`. Concurrent rotation requests for the same cookie
+are coalesced and successful results are replayed briefly to prevent tab races.
+
+Plain HTTP remains supported for private-overlay deployments. In that mode the
+refresh cookie cannot use `Secure`, so the WebConsole address must only traverse
+an authenticated, encrypted private overlay and must not be exposed to a public
+or otherwise untrusted network. Use HTTPS whenever the deployment permits it.
 
 It proxies the control-plane `/v1/admin/overview`, node, path, and policy
 routes, forwarding the authenticated Keycloak bearer token so the standalone

@@ -66,8 +66,9 @@ const MAX_WEB_OIDC_REFRESH_COOKIE_BYTES: usize = 4_096;
 const MAX_WEB_OIDC_SESSION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const DEFAULT_WEB_OIDC_REFRESH_COOKIE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_WEB_OIDC_REFRESH_CACHE_ENTRIES: usize = 256;
+const MAX_WEB_OIDC_REFRESH_REVOCATIONS: usize = 256;
 const WEB_OIDC_REFRESH_REPLAY_TTL: Duration = Duration::from_secs(5);
-const WEB_OIDC_REFRESH_IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+const WEB_OIDC_REFRESH_REVOCATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
@@ -680,16 +681,19 @@ type WebOidcRefreshResult = Result<OidcTokenResponse, WebSessionRefreshError>;
 #[derive(Debug, Default)]
 struct WebOidcRefreshCache {
     entries: HashMap<[u8; 32], WebOidcRefreshCacheEntry>,
+    revocations: HashMap<[u8; 32], Instant>,
 }
 
 #[derive(Debug)]
 enum WebOidcRefreshCacheEntry {
     InFlight {
         operation: Arc<OnceCell<WebOidcRefreshResult>>,
-        expires_at: Instant,
     },
     Ready {
         tokens: Arc<OidcTokenResponse>,
+        expires_at: Instant,
+    },
+    Rejected {
         expires_at: Instant,
     },
 }
@@ -1142,13 +1146,25 @@ impl WebUiAuthConfig {
         let operation = {
             let mut cache = self.refresh_cache.lock().await;
             let now = Instant::now();
+            cache.revocations.retain(|_, expires_at| *expires_at > now);
+            if cache.revocations.contains_key(&digest) {
+                return Err(WebSessionRefreshError::reject(
+                    "Web UI refresh session expired or was rejected",
+                ));
+            }
             cache.entries.retain(|_, entry| match entry {
-                WebOidcRefreshCacheEntry::InFlight { expires_at, .. }
-                | WebOidcRefreshCacheEntry::Ready { expires_at, .. } => *expires_at > now,
+                WebOidcRefreshCacheEntry::InFlight { .. } => true,
+                WebOidcRefreshCacheEntry::Ready { expires_at, .. }
+                | WebOidcRefreshCacheEntry::Rejected { expires_at } => *expires_at > now,
             });
             match cache.entries.get(&digest) {
                 Some(WebOidcRefreshCacheEntry::Ready { tokens, .. }) => {
                     return Ok(tokens.as_ref().clone());
+                }
+                Some(WebOidcRefreshCacheEntry::Rejected { .. }) => {
+                    return Err(WebSessionRefreshError::reject(
+                        "Web UI refresh session expired or was rejected",
+                    ));
                 }
                 Some(WebOidcRefreshCacheEntry::InFlight { operation, .. }) => operation.clone(),
                 None => {
@@ -1158,6 +1174,9 @@ impl WebUiAuthConfig {
                             .iter()
                             .filter_map(|(digest, entry)| match entry {
                                 WebOidcRefreshCacheEntry::Ready { expires_at, .. } => {
+                                    Some((*digest, *expires_at))
+                                }
+                                WebOidcRefreshCacheEntry::Rejected { expires_at } => {
                                     Some((*digest, *expires_at))
                                 }
                                 WebOidcRefreshCacheEntry::InFlight { .. } => None,
@@ -1179,7 +1198,6 @@ impl WebUiAuthConfig {
                         digest,
                         WebOidcRefreshCacheEntry::InFlight {
                             operation: operation.clone(),
-                            expires_at: now + WEB_OIDC_REFRESH_IN_FLIGHT_TTL,
                         },
                     );
                     operation
@@ -1192,6 +1210,21 @@ impl WebUiAuthConfig {
             .await
             .clone();
         let mut cache = self.refresh_cache.lock().await;
+        let now = Instant::now();
+        cache.revocations.retain(|_, expires_at| *expires_at > now);
+        if cache.revocations.contains_key(&digest) {
+            return Err(WebSessionRefreshError::reject(
+                "Web UI refresh session expired or was rejected",
+            ));
+        }
+        if matches!(
+            cache.entries.get(&digest),
+            Some(WebOidcRefreshCacheEntry::Rejected { .. })
+        ) {
+            return Err(WebSessionRefreshError::reject(
+                "Web UI refresh session expired or was rejected",
+            ));
+        }
         let is_current = cache.entries.get(&digest).is_some_and(|entry| {
             matches!(
                 entry,
@@ -1208,7 +1241,7 @@ impl WebUiAuthConfig {
                         digest,
                         WebOidcRefreshCacheEntry::Ready {
                             tokens: Arc::new(tokens.clone()),
-                            expires_at: Instant::now() + WEB_OIDC_REFRESH_REPLAY_TTL,
+                            expires_at: now + WEB_OIDC_REFRESH_REPLAY_TTL,
                         },
                     );
                 }
@@ -1218,6 +1251,47 @@ impl WebUiAuthConfig {
             }
         }
         result
+    }
+
+    async fn invalidate_refresh_session(&self, refresh_token: &str) {
+        if !valid_web_oidc_refresh_token(refresh_token) {
+            return;
+        }
+        let digest: [u8; 32] = Sha256::digest(refresh_token.as_bytes()).into();
+        let mut cache = self.refresh_cache.lock().await;
+        let now = Instant::now();
+        cache.revocations.retain(|_, expires_at| *expires_at > now);
+        cache.entries.retain(|_, entry| match entry {
+            WebOidcRefreshCacheEntry::InFlight { .. } => true,
+            WebOidcRefreshCacheEntry::Ready { expires_at, .. }
+            | WebOidcRefreshCacheEntry::Rejected { expires_at } => *expires_at > now,
+        });
+        let mut revoked_digests = vec![digest];
+        for (candidate_digest, entry) in &cache.entries {
+            let issued_logout_token = match entry {
+                WebOidcRefreshCacheEntry::Ready { tokens, .. } => tokens
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|token| token == refresh_token),
+                _ => false,
+            };
+            if issued_logout_token && !revoked_digests.contains(candidate_digest) {
+                revoked_digests.push(*candidate_digest);
+            }
+        }
+        for revoked_digest in &revoked_digests {
+            if cache.entries.contains_key(revoked_digest) {
+                cache.entries.insert(
+                    *revoked_digest,
+                    WebOidcRefreshCacheEntry::Rejected {
+                        expires_at: now + WEB_OIDC_REFRESH_REVOCATION_TTL,
+                    },
+                );
+            }
+        }
+        for revoked_digest in revoked_digests {
+            record_web_oidc_refresh_revocation(&mut cache, revoked_digest, now);
+        }
     }
 
     async fn refresh_session_uncached(&self, refresh_token: &str) -> WebOidcRefreshResult {
@@ -1308,6 +1382,28 @@ impl WebUiAuthConfig {
             client_enrollment_enabled: false,
         }
     }
+}
+
+fn record_web_oidc_refresh_revocation(
+    cache: &mut WebOidcRefreshCache,
+    digest: [u8; 32],
+    now: Instant,
+) {
+    if !cache.revocations.contains_key(&digest)
+        && cache.revocations.len() >= MAX_WEB_OIDC_REFRESH_REVOCATIONS
+    {
+        if let Some(oldest) = cache
+            .revocations
+            .iter()
+            .min_by_key(|(_, expires_at)| **expires_at)
+            .map(|(digest, _)| *digest)
+        {
+            cache.revocations.remove(&oldest);
+        }
+    }
+    cache
+        .revocations
+        .insert(digest, now + WEB_OIDC_REFRESH_REVOCATION_TTL);
 }
 
 fn validate_web_auth_base_url(value: String, name: &str) -> Result<String, String> {
@@ -1848,6 +1944,9 @@ where
     };
     if let Err(error) = validate_web_oidc_session_request(auth, &headers) {
         return web_auth_flow_error_response(error);
+    }
+    if let Some(refresh_token) = web_oidc_refresh_token(&headers) {
+        auth.invalidate_refresh_session(&refresh_token).await;
     }
     let mut response = Json(serde_json::json!({"status": "logged_out"})).into_response();
     response.headers_mut().insert(
@@ -6944,6 +7043,86 @@ mod tests {
         assert_eq!(replayed.refresh_token, first.refresh_token);
         assert_eq!(token_calls.load(Ordering::SeqCst), 1);
         assert_eq!(auth.refresh_cache.lock().await.entries.len(), 1);
+
+        auth.invalidate_refresh_session("coalesced-rotated-token")
+            .await;
+        let stale_replay = match auth.refresh_session("shared-refresh-token").await {
+            Ok(_) => panic!("logout with the rotated token must revoke the predecessor replay"),
+            Err(error) => error,
+        };
+        assert!(stale_replay.clear_cookie);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+
+        server_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_oidc_logout_rejects_an_in_flight_refresh() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let token_path = "/realms/heteronetwork/protocol/openid-connect/token";
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_started = Arc::new(tokio::sync::Notify::new());
+        let release_refresh = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let calls = token_calls.clone();
+        let started = refresh_started.clone();
+        let release = release_refresh.clone();
+        let server_task = tokio::spawn(async move {
+            let app = Router::new().route(
+                token_path,
+                post(move || {
+                    let calls = calls.clone();
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        release.notified().await;
+                        Json(serde_json::json!({
+                            "access_token": "late-access-token",
+                            "refresh_token": "late-rotated-token",
+                            "expires_in": 300,
+                            "refresh_expires_in": 3600
+                        }))
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let auth = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            Some(format!("http://{address}/realms/heteronetwork")),
+            "openid".to_string(),
+        )?;
+        let refresh_auth = auth.clone();
+        let refresh_task = tokio::spawn(async move {
+            refresh_auth
+                .refresh_session("logout-race-refresh-token")
+                .await
+        });
+        refresh_started.notified().await;
+        auth.invalidate_refresh_session("logout-race-refresh-token")
+            .await;
+        release_refresh.notify_one();
+
+        let error = match refresh_task.await? {
+            Ok(_) => panic!("logout must reject an in-flight refresh result"),
+            Err(error) => error,
+        };
+        assert!(error.clear_cookie);
+        assert_eq!(error.error.status, StatusCode::UNAUTHORIZED);
+        let replay = match auth.refresh_session("logout-race-refresh-token").await {
+            Ok(_) => panic!("logout tombstone must reject a replay"),
+            Err(error) => error,
+        };
+        assert!(replay.clear_cookie);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
 
         server_task.abort();
         Ok(())

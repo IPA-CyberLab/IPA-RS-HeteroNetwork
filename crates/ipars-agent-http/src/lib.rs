@@ -49,6 +49,19 @@ const MAX_PENDING_DEVICE_LOGINS: usize = 256;
 const MAX_DEVICE_AUTH_RESPONSE_BYTES: u64 = 256 * 1024;
 const MIN_DEVICE_LOGIN_START_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_DEVICE_LOGIN_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const WEB_UI_REFRESH_COOKIE: &str = "heteronetwork_web_refresh";
+const WEB_UI_REFRESH_COOKIE_PATH: &str = "/v1/web-ui/auth";
+const WEB_UI_REFRESH_COOKIE_VERSION: u8 = 1;
+const WEB_UI_REFRESH_PROVIDER_BINDING_BYTES: usize = 16;
+const MAX_WEB_UI_REFRESH_PROVIDER_BINDINGS: usize = 32;
+const MAX_WEB_UI_REFRESH_TOKEN_BYTES: usize = 2_400;
+const MAX_WEB_UI_REFRESH_COOKIE_BYTES: usize = 4_096;
+const MAX_WEB_UI_REFRESH_COORDINATOR_ENTRIES: usize = 1_024;
+const MAX_WEB_UI_REFRESH_REVOCATIONS: usize = 1_024;
+const WEB_UI_REFRESH_REPLAY_TTL: Duration = Duration::from_secs(10);
+const WEB_UI_REFRESH_REVOCATION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_WEB_UI_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_WEB_UI_SESSION_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 macro_rules! prometheus_line {
     ($body:expr, $($arg:tt)*) => {{
@@ -69,6 +82,7 @@ pub struct AgentHttpState {
     web_ui_health: Arc<RwLock<BTreeMap<String, bool>>>,
     public_web_gateway: Option<PublicWebGatewayAccess>,
     device_logins: Arc<Mutex<DeviceLoginState>>,
+    web_ui_refreshes: Arc<Mutex<WebUiRefreshCoordinator>>,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +100,26 @@ struct PendingDeviceLogin {
     expires_at: Instant,
     next_poll_at: Instant,
     interval: Duration,
+}
+
+#[derive(Debug, Default)]
+struct WebUiRefreshCoordinator {
+    entries: BTreeMap<[u8; 32], WebUiRefreshCoordinatorEntry>,
+    revocations: BTreeMap<[u8; 32], Instant>,
+}
+
+#[derive(Debug)]
+struct WebUiRefreshCoordinatorEntry {
+    gate: Arc<Mutex<()>>,
+    replay: Option<(Instant, WebUiOidcTokenResponse)>,
+    last_used_at: Instant,
+    revoked: bool,
+}
+
+#[derive(Debug)]
+struct WebUiRefreshSession {
+    provider_bindings: Vec<[u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES]>,
+    refresh_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -177,6 +211,7 @@ impl AgentHttpState {
             web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
             public_web_gateway: None,
             device_logins: Arc::new(Mutex::new(DeviceLoginState::default())),
+            web_ui_refreshes: Arc::new(Mutex::new(WebUiRefreshCoordinator::default())),
         }
     }
 
@@ -196,6 +231,7 @@ impl AgentHttpState {
             web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
             public_web_gateway: None,
             device_logins: Arc::new(Mutex::new(DeviceLoginState::default())),
+            web_ui_refreshes: Arc::new(Mutex::new(WebUiRefreshCoordinator::default())),
         }
     }
 
@@ -216,6 +252,7 @@ impl AgentHttpState {
             web_ui_health: Arc::new(RwLock::new(BTreeMap::new())),
             public_web_gateway: None,
             device_logins: Arc::new(Mutex::new(DeviceLoginState::default())),
+            web_ui_refreshes: Arc::new(Mutex::new(WebUiRefreshCoordinator::default())),
         }
     }
 
@@ -313,6 +350,8 @@ fn gateway_web_ui_routes() -> Router<AgentHttpState> {
         .route("/v1/web-ui/endpoints", get(web_ui_endpoints))
         .route("/v1/web-ui/auth/device", post(start_device_login))
         .route("/v1/web-ui/auth/device/poll", post(poll_device_login))
+        .route("/v1/web-ui/auth/refresh", post(refresh_web_ui_session))
+        .route("/v1/web-ui/auth/logout", post(logout_web_ui_session))
         .route("/v1/install/{*path}", get(proxy_management_request))
         .route("/v1/admin/{*path}", any(proxy_management_request))
         .route("/v1/clients/join", post(proxy_management_request))
@@ -470,6 +509,17 @@ struct DeviceLoginTokenEndpoint {
     host_header: HeaderValue,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct WebUiOidcTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    refresh_expires_in: Option<u64>,
+}
+
 fn default_device_login_interval() -> u64 {
     5
 }
@@ -543,6 +593,44 @@ fn oidc_host_header(url: &reqwest::Url) -> Result<HeaderValue, String> {
     };
     HeaderValue::from_str(&authority)
         .map_err(|_| "OIDC endpoint host is not valid for an HTTP Host header".to_string())
+}
+
+fn web_ui_refresh_provider_binding(
+    token_url: &str,
+    host_header: &HeaderValue,
+    client_id: &str,
+) -> [u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES] {
+    let mut digest = Sha256::new();
+    for value in [
+        token_url.as_bytes(),
+        host_header.as_bytes(),
+        client_id.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    let digest = digest.finalize();
+    let mut binding = [0_u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES];
+    binding.copy_from_slice(&digest[..WEB_UI_REFRESH_PROVIDER_BINDING_BYTES]);
+    binding
+}
+
+fn web_ui_refresh_provider_bindings(
+    endpoints: &[DeviceLoginTokenEndpoint],
+    client_id: &str,
+) -> Vec<[u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES]> {
+    let mut bindings = Vec::new();
+    for endpoint in endpoints {
+        let binding =
+            web_ui_refresh_provider_binding(&endpoint.url, &endpoint.host_header, client_id);
+        if !bindings.contains(&binding) {
+            bindings.push(binding);
+            if bindings.len() == MAX_WEB_UI_REFRESH_PROVIDER_BINDINGS {
+                break;
+            }
+        }
+    }
+    bindings
 }
 
 async fn device_login_providers(
@@ -772,6 +860,7 @@ async fn start_device_login(
 
 async fn poll_device_login(
     State(state): State<AgentHttpState>,
+    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
     Json(request): Json<DeviceLoginPollRequest>,
 ) -> Result<Response, ApiError> {
     if request.handle.is_empty()
@@ -865,17 +954,27 @@ async fn poll_device_login(
     )
     .await?;
     if status.is_success() {
-        let access_token = body
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
-            .ok_or_else(|| {
-                AgentError::ControlPlaneClient(
-                    "Keycloak device token response omitted the access token".to_string(),
-                )
-            })?;
-        return Ok(
-            Json(json!({"status": "complete", "access_token": access_token})).into_response(),
+        let tokens = parse_web_ui_oidc_tokens(body, "Keycloak device token")?;
+        if pending.token_endpoints.is_empty() {
+            return Err(AgentError::ControlPlaneClient(
+                "Keycloak device login lost its selected token endpoint".to_string(),
+            )
+            .into());
+        }
+        let provider_bindings =
+            web_ui_refresh_provider_bindings(&pending.token_endpoints, &pending.client_id);
+        if provider_bindings.is_empty() {
+            return Err(AgentError::ControlPlaneClient(
+                "Keycloak device login did not retain an identity-provider binding".to_string(),
+            )
+            .into());
+        }
+        return web_ui_session_response(
+            &tokens,
+            Some(&provider_bindings),
+            None,
+            public_gateway.is_some(),
+            true,
         );
     }
     let error = body
@@ -912,6 +1011,530 @@ async fn poll_device_login(
         Json(json!({"error": "Keycloak device authorization was rejected"})),
     )
         .into_response())
+}
+
+fn parse_web_ui_oidc_tokens(
+    body: Value,
+    context: &str,
+) -> Result<WebUiOidcTokenResponse, ApiError> {
+    let tokens: WebUiOidcTokenResponse = serde_json::from_value(body).map_err(|error| {
+        AgentError::ControlPlaneClient(format!("failed to decode {context} response: {error}"))
+    })?;
+    if tokens.access_token.is_empty()
+        || tokens.access_token.len() > MAX_WEB_UI_ACCESS_TOKEN_BYTES
+        || tokens.access_token.contains(char::is_whitespace)
+    {
+        return Err(AgentError::ControlPlaneClient(format!(
+            "{context} response contained an invalid access token"
+        ))
+        .into());
+    }
+    if tokens.refresh_token.as_deref().is_some_and(|token| {
+        token.is_empty()
+            || token.len() > MAX_WEB_UI_REFRESH_TOKEN_BYTES
+            || token.contains(char::is_whitespace)
+            || token.chars().any(char::is_control)
+    }) {
+        return Err(AgentError::ControlPlaneClient(format!(
+            "{context} response contained an invalid refresh token"
+        ))
+        .into());
+    }
+    Ok(tokens)
+}
+
+fn web_ui_session_response(
+    tokens: &WebUiOidcTokenResponse,
+    provider_bindings: Option<&[[u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES]]>,
+    previous_refresh_token: Option<&str>,
+    secure: bool,
+    include_status: bool,
+) -> Result<Response, ApiError> {
+    let expires_in = tokens
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(5 * 60)
+        .min(MAX_WEB_UI_SESSION_SECONDS);
+    let mut body = json!({
+        "access_token": tokens.access_token,
+        "expires_in": expires_in
+    });
+    if include_status {
+        body["status"] = Value::String("complete".to_string());
+    }
+    let mut response = Json(body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(refresh_token) = tokens.refresh_token.as_deref().or(previous_refresh_token) {
+        let provider_bindings = provider_bindings
+            .filter(|bindings| {
+                !bindings.is_empty() && bindings.len() <= MAX_WEB_UI_REFRESH_PROVIDER_BINDINGS
+            })
+            .ok_or_else(|| {
+                AgentError::ControlPlaneClient(
+                    "Web UI refresh session is missing its identity-provider binding".to_string(),
+                )
+            })?;
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            web_ui_refresh_cookie(
+                refresh_token,
+                provider_bindings,
+                tokens.refresh_expires_in,
+                secure,
+            )?,
+        );
+    } else if include_status {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, clear_web_ui_refresh_cookie(secure));
+    }
+    Ok(response)
+}
+
+fn web_ui_refresh_cookie(
+    refresh_token: &str,
+    provider_bindings: &[[u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES]],
+    refresh_expires_in: Option<u64>,
+    secure: bool,
+) -> Result<HeaderValue, ApiError> {
+    if refresh_token.is_empty()
+        || refresh_token.len() > MAX_WEB_UI_REFRESH_TOKEN_BYTES
+        || refresh_token.contains(char::is_whitespace)
+        || refresh_token.chars().any(char::is_control)
+    {
+        return Err(AgentError::ControlPlaneClient(
+            "Keycloak returned an invalid Web UI refresh token".to_string(),
+        )
+        .into());
+    }
+    if provider_bindings.is_empty()
+        || provider_bindings.len() > MAX_WEB_UI_REFRESH_PROVIDER_BINDINGS
+    {
+        return Err(AgentError::ControlPlaneClient(
+            "Web UI refresh session has an invalid identity-provider binding set".to_string(),
+        )
+        .into());
+    }
+    let mut session = Vec::with_capacity(
+        2 + provider_bindings.len() * WEB_UI_REFRESH_PROVIDER_BINDING_BYTES + refresh_token.len(),
+    );
+    session.push(WEB_UI_REFRESH_COOKIE_VERSION);
+    session.push(provider_bindings.len() as u8);
+    for binding in provider_bindings {
+        session.extend_from_slice(binding);
+    }
+    session.extend_from_slice(refresh_token.as_bytes());
+    let encoded = URL_SAFE_NO_PAD.encode(session);
+    let max_age = refresh_expires_in
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(MAX_WEB_UI_SESSION_SECONDS)
+        .min(MAX_WEB_UI_SESSION_SECONDS);
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{WEB_UI_REFRESH_COOKIE}={encoded}; Path={WEB_UI_REFRESH_COOKIE_PATH}; Max-Age={max_age}; HttpOnly; SameSite=Strict{secure_attribute}"
+    );
+    if cookie.len() > MAX_WEB_UI_REFRESH_COOKIE_BYTES {
+        return Err(AgentError::ControlPlaneClient(
+            "Keycloak refresh token exceeds the safe Web UI cookie limit".to_string(),
+        )
+        .into());
+    }
+    HeaderValue::from_str(&cookie).map_err(|_| {
+        AgentError::ControlPlaneClient("failed to build the Web UI refresh cookie".to_string())
+            .into()
+    })
+}
+
+fn clear_web_ui_refresh_cookie(secure: bool) -> HeaderValue {
+    if secure {
+        HeaderValue::from_static(
+            "heteronetwork_web_refresh=; Path=/v1/web-ui/auth; Max-Age=0; HttpOnly; SameSite=Strict; Secure",
+        )
+    } else {
+        HeaderValue::from_static(
+            "heteronetwork_web_refresh=; Path=/v1/web-ui/auth; Max-Age=0; HttpOnly; SameSite=Strict",
+        )
+    }
+}
+
+fn web_ui_refresh_session(headers: &HeaderMap) -> Option<WebUiRefreshSession> {
+    let mut encoded = None;
+    for header_value in headers.get_all(header::COOKIE) {
+        let header_value = header_value.to_str().ok()?;
+        for pair in header_value.split(';') {
+            let Some((name, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if name != WEB_UI_REFRESH_COOKIE {
+                continue;
+            }
+            if encoded.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    let encoded = encoded?;
+    if encoded.is_empty() || encoded.len() > MAX_WEB_UI_REFRESH_COOKIE_BYTES {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    if decoded.len() <= 2 || decoded[0] != WEB_UI_REFRESH_COOKIE_VERSION {
+        return None;
+    }
+    let binding_count = usize::from(decoded[1]);
+    if binding_count == 0 || binding_count > MAX_WEB_UI_REFRESH_PROVIDER_BINDINGS {
+        return None;
+    }
+    let token_offset =
+        2_usize.checked_add(binding_count.checked_mul(WEB_UI_REFRESH_PROVIDER_BINDING_BYTES)?)?;
+    if decoded.len() <= token_offset {
+        return None;
+    }
+    let mut provider_bindings = Vec::with_capacity(binding_count);
+    for binding in decoded
+        .get(2..token_offset)?
+        .chunks_exact(WEB_UI_REFRESH_PROVIDER_BINDING_BYTES)
+    {
+        let binding = binding.try_into().ok()?;
+        if provider_bindings.contains(&binding) {
+            return None;
+        }
+        provider_bindings.push(binding);
+    }
+    let token = String::from_utf8(decoded[token_offset..].to_vec()).ok()?;
+    if token.is_empty()
+        || token.len() > MAX_WEB_UI_REFRESH_TOKEN_BYTES
+        || token.contains(char::is_whitespace)
+        || token.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(WebUiRefreshSession {
+        provider_bindings,
+        refresh_token: token,
+    })
+}
+
+async fn refresh_web_ui_oidc_tokens(
+    state: &AgentHttpState,
+    control_plane_only: bool,
+    session: &WebUiRefreshSession,
+) -> Result<WebUiOidcTokenResponse, ApiError> {
+    let providers = device_login_providers(state, control_plane_only).await?;
+    let mut attempted = BTreeSet::new();
+    let mut failures = Vec::new();
+    let mut matched_provider = false;
+    for provider in providers {
+        let binding = web_ui_refresh_provider_binding(
+            provider.token_url.as_str(),
+            &provider.host_header,
+            &provider.client_id,
+        );
+        if !session.provider_bindings.contains(&binding) {
+            continue;
+        }
+        matched_provider = true;
+        let attempt_key = format!("{}\n{}", provider.token_url, provider.client_id);
+        if !attempted.insert(attempt_key) {
+            continue;
+        }
+        let response = match state
+            .control_plane_client
+            .post(provider.token_url.clone())
+            .header(header::HOST, provider.host_header)
+            .header(header::ACCEPT, "application/json")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", provider.client_id.as_str()),
+                ("refresh_token", session.refresh_token.as_str()),
+            ])
+            .timeout(state.control_plane_request_timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{}: {error}", provider.token_url));
+                continue;
+            }
+        };
+        let status = response.status();
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            failures.push(format!("{}: HTTP {status}", provider.token_url));
+            continue;
+        }
+        let body: Value = read_bounded_json_response(
+            response,
+            MAX_DEVICE_AUTH_RESPONSE_BYTES,
+            "Keycloak refresh token",
+        )
+        .await?;
+        if status.is_success() {
+            return parse_web_ui_oidc_tokens(body, "Keycloak refresh token");
+        }
+        let error = body.get("error").and_then(Value::as_str).unwrap_or("");
+        if matches!(error, "invalid_grant" | "invalid_token" | "expired_token") {
+            return Err(ApiError::unauthorized(
+                "Web UI refresh session expired or was rejected",
+            ));
+        }
+        return Err(AgentError::ControlPlaneClient(format!(
+            "Keycloak refresh request returned HTTP {status}"
+        ))
+        .into());
+    }
+    if !matched_provider {
+        return Err(AgentError::ControlPlaneClient(
+            "the Web UI login identity provider is not currently available".to_string(),
+        )
+        .into());
+    }
+    Err(AgentError::ControlPlaneClient(format!(
+        "Keycloak refresh request failed on every endpoint: {}",
+        failures.join("; ")
+    ))
+    .into())
+}
+
+fn web_ui_refresh_replay_key(session: &WebUiRefreshSession) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update([session.provider_bindings.len() as u8]);
+    for binding in &session.provider_bindings {
+        digest.update(binding);
+    }
+    digest.update(session.refresh_token.as_bytes());
+    digest.finalize().into()
+}
+
+fn record_web_ui_refresh_revocation(
+    coordinator: &mut WebUiRefreshCoordinator,
+    key: [u8; 32],
+    now: Instant,
+) {
+    if !coordinator.revocations.contains_key(&key)
+        && coordinator.revocations.len() >= MAX_WEB_UI_REFRESH_REVOCATIONS
+    {
+        if let Some(oldest) = coordinator
+            .revocations
+            .iter()
+            .min_by_key(|(_, expires_at)| **expires_at)
+            .map(|(key, _)| *key)
+        {
+            coordinator.revocations.remove(&oldest);
+        }
+    }
+    coordinator
+        .revocations
+        .insert(key, now + WEB_UI_REFRESH_REVOCATION_TTL);
+}
+
+async fn coordinated_web_ui_oidc_refresh(
+    state: &AgentHttpState,
+    control_plane_only: bool,
+    session: &WebUiRefreshSession,
+) -> Result<WebUiOidcTokenResponse, ApiError> {
+    let key = web_ui_refresh_replay_key(session);
+    let gate = {
+        let now = Instant::now();
+        let mut coordinator = state.web_ui_refreshes.lock().await;
+        coordinator
+            .revocations
+            .retain(|_, expires_at| *expires_at > now);
+        if coordinator.revocations.contains_key(&key) {
+            return Err(ApiError::unauthorized(
+                "Web UI refresh session expired or was rejected",
+            ));
+        }
+        coordinator.entries.retain(|_, entry| {
+            Arc::strong_count(&entry.gate) > 1
+                || now.duration_since(entry.last_used_at) <= WEB_UI_REFRESH_REPLAY_TTL
+        });
+        if !coordinator.entries.contains_key(&key)
+            && coordinator.entries.len() >= MAX_WEB_UI_REFRESH_COORDINATOR_ENTRIES
+        {
+            let oldest = coordinator
+                .entries
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.gate) == 1)
+                .min_by_key(|(_, entry)| entry.last_used_at)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                coordinator.entries.remove(&oldest);
+            }
+        }
+        if coordinator.entries.len() >= MAX_WEB_UI_REFRESH_COORDINATOR_ENTRIES
+            && !coordinator.entries.contains_key(&key)
+        {
+            return Err(AgentError::ControlPlaneClient(
+                "too many Web UI session refreshes are in progress".to_string(),
+            )
+            .into());
+        }
+        coordinator
+            .entries
+            .entry(key)
+            .or_insert_with(|| WebUiRefreshCoordinatorEntry {
+                gate: Arc::new(Mutex::new(())),
+                replay: None,
+                last_used_at: now,
+                revoked: false,
+            })
+            .gate
+            .clone()
+    };
+
+    let _guard = gate.lock().await;
+    {
+        let now = Instant::now();
+        let mut coordinator = state.web_ui_refreshes.lock().await;
+        coordinator
+            .revocations
+            .retain(|_, expires_at| *expires_at > now);
+        if coordinator.revocations.contains_key(&key) {
+            return Err(ApiError::unauthorized(
+                "Web UI refresh session expired or was rejected",
+            ));
+        }
+        if let Some(entry) = coordinator.entries.get_mut(&key) {
+            entry.last_used_at = now;
+            if entry.revoked {
+                return Err(ApiError::unauthorized(
+                    "Web UI refresh session expired or was rejected",
+                ));
+            }
+            if let Some((completed_at, tokens)) = entry.replay.as_ref() {
+                if now.duration_since(*completed_at) <= WEB_UI_REFRESH_REPLAY_TTL {
+                    return Ok(tokens.clone());
+                }
+            }
+            entry.replay = None;
+        }
+    }
+
+    let result = refresh_web_ui_oidc_tokens(state, control_plane_only, session).await;
+    let mut coordinator = state.web_ui_refreshes.lock().await;
+    let now = Instant::now();
+    coordinator
+        .revocations
+        .retain(|_, expires_at| *expires_at > now);
+    let mut revoked = coordinator.revocations.contains_key(&key);
+    if let Some(entry) = coordinator.entries.get_mut(&key) {
+        entry.last_used_at = now;
+        revoked |= entry.revoked;
+        if revoked {
+            entry.replay = None;
+        } else if let Ok(tokens) = result.as_ref() {
+            entry.replay = Some((entry.last_used_at, tokens.clone()));
+        }
+    }
+    if revoked {
+        Err(ApiError::unauthorized(
+            "Web UI refresh session expired or was rejected",
+        ))
+    } else {
+        result
+    }
+}
+
+async fn invalidate_coordinated_web_ui_refresh(
+    state: &AgentHttpState,
+    session: &WebUiRefreshSession,
+) {
+    let key = web_ui_refresh_replay_key(session);
+    let now = Instant::now();
+    let mut coordinator = state.web_ui_refreshes.lock().await;
+    coordinator
+        .revocations
+        .retain(|_, expires_at| *expires_at > now);
+    coordinator.entries.retain(|_, entry| {
+        Arc::strong_count(&entry.gate) > 1
+            || now.duration_since(entry.last_used_at) <= WEB_UI_REFRESH_REPLAY_TTL
+    });
+    let mut revoked_keys = vec![key];
+    for (candidate_key, entry) in &coordinator.entries {
+        let issued_logout_token = entry
+            .replay
+            .as_ref()
+            .and_then(|(_, tokens)| tokens.refresh_token.as_deref())
+            .is_some_and(|token| token == session.refresh_token);
+        if issued_logout_token && !revoked_keys.contains(candidate_key) {
+            revoked_keys.push(*candidate_key);
+        }
+    }
+    for revoked_key in &revoked_keys {
+        if let Some(entry) = coordinator.entries.get_mut(revoked_key) {
+            entry.last_used_at = now;
+            entry.replay = None;
+            entry.revoked = true;
+        }
+    }
+    for revoked_key in revoked_keys {
+        record_web_ui_refresh_revocation(&mut coordinator, revoked_key, now);
+    }
+}
+
+async fn refresh_web_ui_session(
+    State(state): State<AgentHttpState>,
+    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+    overlay_web_ui: Option<Extension<OverlayWebUiRequest>>,
+    headers: HeaderMap,
+) -> Response {
+    let secure = public_gateway.is_some();
+    let Some(refresh_session) = web_ui_refresh_session(&headers) else {
+        let mut response =
+            ApiError::unauthorized("Web UI refresh session is missing or invalid").into_response();
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, clear_web_ui_refresh_cookie(secure));
+        return response;
+    };
+    match coordinated_web_ui_oidc_refresh(
+        &state,
+        secure || overlay_web_ui.is_some(),
+        &refresh_session,
+    )
+    .await
+    {
+        Ok(tokens) => match web_ui_session_response(
+            &tokens,
+            Some(&refresh_session.provider_bindings),
+            Some(&refresh_session.refresh_token),
+            secure,
+            false,
+        ) {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        },
+        Err(ApiError::Unauthorized(message)) => {
+            let mut response = ApiError::Unauthorized(message).into_response();
+            response
+                .headers_mut()
+                .insert(header::SET_COOKIE, clear_web_ui_refresh_cookie(secure));
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn logout_web_ui_session(
+    State(state): State<AgentHttpState>,
+    public_gateway: Option<Extension<PublicWebGatewayRequest>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(session) = web_ui_refresh_session(&headers) {
+        invalidate_coordinated_web_ui_refresh(&state, &session).await;
+    }
+    let mut response = Json(json!({"status": "logged_out"})).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        clear_web_ui_refresh_cookie(public_gateway.is_some()),
+    );
+    response
 }
 
 async fn require_loopback_web_ui_host(request: Request, next: Next) -> Response {
@@ -1024,6 +1647,8 @@ async fn require_web_ui_access(
         (&Method::GET, "/v1/web-ui/endpoints") => true,
         (&Method::POST, "/v1/web-ui/auth/device") => true,
         (&Method::POST, "/v1/web-ui/auth/device/poll") => true,
+        (&Method::POST, "/v1/web-ui/auth/refresh") => true,
+        (&Method::POST, "/v1/web-ui/auth/logout") => true,
         (&Method::GET, path) if path.starts_with("/v1/install/") => true,
         (_, path) if path.starts_with("/v1/admin/") => true,
         (&Method::POST, "/v1/clients/join" | "/v1/clients/peers/query") => true,
@@ -1725,6 +2350,8 @@ async fn local_ui_config(
                         "device_authorization_endpoint": null,
                         "device_login_endpoint": null,
                         "device_login_poll_endpoint": null,
+                        "session_refresh_endpoint": null,
+                        "session_logout_endpoint": null,
                         "token_endpoint": null,
                         "logout_endpoint": null,
                         "login_endpoint": null,
@@ -1752,6 +2379,14 @@ async fn local_ui_config(
                         "device_login_poll_endpoint".to_string(),
                         Value::String("/v1/web-ui/auth/device/poll".to_string()),
                     );
+                    config.insert(
+                        "session_refresh_endpoint".to_string(),
+                        Value::String("/v1/web-ui/auth/refresh".to_string()),
+                    );
+                    config.insert(
+                        "session_logout_endpoint".to_string(),
+                        Value::String("/v1/web-ui/auth/logout".to_string()),
+                    );
                 }
                 config.insert("local_agent".to_string(), Value::Bool(true));
                 config.insert("bootstrap_required".to_string(), Value::Bool(false));
@@ -1778,6 +2413,8 @@ async fn local_ui_config(
             "device_authorization_endpoint": null,
             "device_login_endpoint": null,
             "device_login_poll_endpoint": null,
+            "session_refresh_endpoint": null,
+            "session_logout_endpoint": null,
             "token_endpoint": null,
             "logout_endpoint": null,
             "login_endpoint": null,
@@ -3720,6 +4357,80 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_refresh_cookie_binds_the_login_provider_and_defaults_a_bounded_lifetime(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let binding = web_ui_refresh_provider_binding(
+            "https://identity.example/realms/hn/protocol/openid-connect/token",
+            &HeaderValue::from_static("identity.example"),
+            "heteronetwork-web",
+        );
+        let other_binding = web_ui_refresh_provider_binding(
+            "https://other.example/realms/hn/protocol/openid-connect/token",
+            &HeaderValue::from_static("other.example"),
+            "heteronetwork-web",
+        );
+        assert_ne!(binding, other_binding);
+
+        let bindings = [binding, other_binding];
+        let cookie = match web_ui_refresh_cookie("refresh-token", &bindings, None, false) {
+            Ok(cookie) => cookie,
+            Err(error) => panic!("refresh cookie should be valid: {error:?}"),
+        };
+        let cookie = cookie.to_str()?;
+        assert!(cookie.contains(&format!("Max-Age={MAX_WEB_UI_SESSION_SECONDS}")));
+        assert!(!cookie.contains("refresh-token"));
+        let cookie_pair = cookie
+            .split(';')
+            .next()
+            .ok_or("refresh cookie omitted its value")?;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(cookie_pair)?);
+        let session =
+            web_ui_refresh_session(&headers).ok_or("refresh cookie did not round trip")?;
+        assert_eq!(session.provider_bindings, bindings);
+        assert_eq!(session.refresh_token, "refresh-token");
+
+        let max_bindings = (0..MAX_WEB_UI_REFRESH_PROVIDER_BINDINGS)
+            .map(|index| [index as u8; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES])
+            .collect::<Vec<_>>();
+        let max_cookie = web_ui_refresh_cookie(
+            &"r".repeat(MAX_WEB_UI_REFRESH_TOKEN_BYTES),
+            &max_bindings,
+            Some(MAX_WEB_UI_SESSION_SECONDS),
+            true,
+        )
+        .map_err(|error| format!("maximum refresh cookie should fit: {error:?}"))?;
+        assert!(max_cookie.as_bytes().len() <= MAX_WEB_UI_REFRESH_COOKIE_BYTES);
+
+        let legacy = URL_SAFE_NO_PAD.encode("refresh-token");
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{WEB_UI_REFRESH_COOKIE}={legacy}"))?,
+        );
+        assert!(web_ui_refresh_session(&headers).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_ui_logout_tombstone_rejects_a_refresh_before_provider_access() {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::new(runtime);
+        let session = WebUiRefreshSession {
+            provider_bindings: vec![[7; WEB_UI_REFRESH_PROVIDER_BINDING_BYTES]],
+            refresh_token: "logout-race-refresh-token".to_string(),
+        };
+        invalidate_coordinated_web_ui_refresh(&state, &session).await;
+        let error = match coordinated_web_ui_oidc_refresh(&state, false, &session).await {
+            Ok(_) => panic!("logout tombstone must reject refresh"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ApiError::Unauthorized(_)));
+    }
+
+    #[test]
     fn prometheus_metrics_zero_fill_packet_flow_and_path_labels() {
         let node_id = NodeId::from_string("node-zero-fill");
         let metrics = AgentMetricsResponse {
@@ -4002,6 +4713,7 @@ mod tests {
         device_authorization_form: Arc<tokio::sync::Mutex<Option<BTreeMap<String, String>>>>,
         device_token_calls: Arc<AtomicUsize>,
         device_token_forms: Arc<tokio::sync::Mutex<Vec<BTreeMap<String, String>>>>,
+        refresh_token_calls: Arc<AtomicUsize>,
     }
 
     async fn web_ui_test_config(State(state): State<WebUiTestBackend>) -> Json<Value> {
@@ -4043,6 +4755,26 @@ mod tests {
         State(state): State<WebUiTestBackend>,
         axum::extract::Form(form): axum::extract::Form<BTreeMap<String, String>>,
     ) -> Response {
+        if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+            state.refresh_token_calls.fetch_add(1, Ordering::SeqCst);
+            let valid = form.get("client_id").map(String::as_str) == Some("heteronetwork-web")
+                && form.get("refresh_token").map(String::as_str) == Some("device-refresh-token");
+            return if valid {
+                Json(json!({
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_in": 300,
+                    "refresh_expires_in": 3600
+                }))
+                .into_response()
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid_grant"})),
+                )
+                    .into_response()
+            };
+        }
         state.device_token_forms.lock().await.push(form);
         if state.device_token_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             return (
@@ -4051,7 +4783,13 @@ mod tests {
             )
                 .into_response();
         }
-        Json(json!({"access_token": "device-access-token"})).into_response()
+        Json(json!({
+            "access_token": "device-access-token",
+            "refresh_token": "device-refresh-token",
+            "expires_in": 300,
+            "refresh_expires_in": 3600
+        }))
+        .into_response()
     }
 
     async fn web_ui_test_admin(
@@ -4105,6 +4843,7 @@ mod tests {
             device_authorization_form: Arc::new(tokio::sync::Mutex::new(None)),
             device_token_calls: Arc::new(AtomicUsize::new(0)),
             device_token_forms: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            refresh_token_calls: Arc::new(AtomicUsize::new(0)),
         };
         let app = Router::new()
             .route("/ui/config", get(web_ui_test_config))
@@ -4404,6 +5143,33 @@ mod tests {
             public_config.get("token_endpoint").and_then(Value::as_str),
             Some("https://203.0.113.10/realms/heteronetwork/protocol/openid-connect/token")
         );
+        assert_eq!(
+            public_config
+                .get("session_refresh_endpoint")
+                .and_then(Value::as_str),
+            Some("/v1/web-ui/auth/refresh")
+        );
+
+        let missing_refresh_cookie = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/refresh")
+                    .header(header::HOST, "203.0.113.10")
+                    .header(header::ORIGIN, "https://203.0.113.10")
+                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing_refresh_cookie.status(), StatusCode::UNAUTHORIZED);
+        let cleared_cookie = missing_refresh_cookie
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or("refresh rejection omitted the clearing cookie")?;
+        assert!(cleared_cookie.contains("Max-Age=0"));
+        assert!(cleared_cookie.contains("Secure"));
 
         let mutation = app
             .clone()
@@ -4856,6 +5622,11 @@ mod tests {
             config["device_login_poll_endpoint"],
             "/v1/web-ui/auth/device/poll"
         );
+        assert_eq!(
+            config["session_refresh_endpoint"],
+            "/v1/web-ui/auth/refresh"
+        );
+        assert_eq!(config["session_logout_endpoint"], "/v1/web-ui/auth/logout");
 
         backend_task.abort();
         let _ = std::fs::remove_dir_all(state_dir);
@@ -4990,6 +5761,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1_050)).await;
         let second_poll = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -5000,20 +5772,114 @@ mod tests {
             )
             .await?;
         assert_eq!(second_poll.status(), StatusCode::OK);
+        let session_cookie = second_poll
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or("device login omitted the refresh cookie")?
+            .to_string();
+        assert!(session_cookie.contains("HttpOnly"));
+        assert!(session_cookie.contains("SameSite=Strict"));
+        assert!(!session_cookie.contains("Secure"));
+        assert!(!session_cookie.contains("device-refresh-token"));
+        let cookie_pair = session_cookie
+            .split(';')
+            .next()
+            .ok_or("refresh cookie omitted its value")?
+            .to_string();
         let second_poll: Value =
             serde_json::from_slice(&to_bytes(second_poll.into_body(), usize::MAX).await?)?;
         assert_eq!(second_poll["access_token"], "device-access-token");
+        assert_eq!(second_poll["expires_in"], 300);
         assert_eq!(backend.device_token_calls.load(Ordering::SeqCst), 2);
-        let token_forms = backend.device_token_forms.lock().await;
-        assert_eq!(token_forms.len(), 2);
-        let code_verifier = token_forms[0]
-            .get("code_verifier")
-            .ok_or("device token request omitted PKCE verifier")?;
-        assert_eq!(token_forms[1].get("code_verifier"), Some(code_verifier));
-        assert_eq!(
-            URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())),
-            code_challenge
+        {
+            let token_forms = backend.device_token_forms.lock().await;
+            assert_eq!(token_forms.len(), 2);
+            let code_verifier = token_forms[0]
+                .get("code_verifier")
+                .ok_or("device token request omitted PKCE verifier")?;
+            assert_eq!(token_forms[1].get("code_verifier"), Some(code_verifier));
+            assert_eq!(
+                URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())),
+                code_challenge
+            );
+        }
+
+        let first_refresh_request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/web-ui/auth/refresh")
+            .header(header::HOST, "127.0.0.1:9780")
+            .header(header::COOKIE, cookie_pair.clone())
+            .body(Body::empty())?;
+        let second_refresh_request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/web-ui/auth/refresh")
+            .header(header::HOST, "127.0.0.1:9780")
+            .header(header::COOKIE, cookie_pair.clone())
+            .body(Body::empty())?;
+        let (refresh, replayed_refresh) = tokio::join!(
+            app.clone().oneshot(first_refresh_request),
+            app.clone().oneshot(second_refresh_request)
         );
+        let refresh = refresh?;
+        let replayed_refresh = replayed_refresh?;
+        assert_eq!(refresh.status(), StatusCode::OK);
+        assert_eq!(replayed_refresh.status(), StatusCode::OK);
+        assert_eq!(
+            refresh.headers().get(header::SET_COOKIE),
+            replayed_refresh.headers().get(header::SET_COOKIE)
+        );
+        let replayed_refresh: Value =
+            serde_json::from_slice(&to_bytes(replayed_refresh.into_body(), usize::MAX).await?)?;
+        assert_eq!(replayed_refresh["access_token"], "refreshed-access-token");
+        assert_eq!(backend.refresh_token_calls.load(Ordering::SeqCst), 1);
+        let rotated_cookie = refresh
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or("refresh response omitted the rotated cookie")?;
+        assert_ne!(rotated_cookie, session_cookie);
+        assert!(!rotated_cookie.contains("rotated-refresh-token"));
+        let rotated_cookie_pair = rotated_cookie
+            .split(';')
+            .next()
+            .ok_or("rotated refresh cookie omitted its value")?
+            .to_string();
+        let refresh: Value =
+            serde_json::from_slice(&to_bytes(refresh.into_body(), usize::MAX).await?)?;
+        assert_eq!(refresh["access_token"], "refreshed-access-token");
+        assert_eq!(refresh["expires_in"], 300);
+        assert_eq!(backend.refresh_token_calls.load(Ordering::SeqCst), 1);
+
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/logout")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::COOKIE, rotated_cookie_pair)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert!(logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|cookie| cookie.contains("Max-Age=0")));
+        let stale_replay = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/refresh")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::COOKIE, cookie_pair)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(stale_replay.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(backend.refresh_token_calls.load(Ordering::SeqCst), 1);
         backend_task.abort();
         Ok(())
     }
@@ -5021,8 +5887,10 @@ mod tests {
     #[tokio::test]
     async fn device_login_fallback_preserves_each_provider_host(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (first_url, _, first_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
-        let (second_url, _, second_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let (first_url, first_backend, first_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let (second_url, second_backend, second_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
         let runtime = Arc::new(AgentRuntime::new(
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
@@ -5063,8 +5931,40 @@ mod tests {
                 .ok_or("device token endpoint omitted a host")?;
             assert_eq!(endpoint.host_header.to_str()?, expected_host);
         }
+        drop(logins);
 
+        let first_token_url = reqwest::Url::parse(&format!(
+            "{first_url}/realms/heteronetwork/protocol/openid-connect/token"
+        ))?;
+        let first_host = oidc_host_header(&first_token_url)?;
+        let second_token_url = reqwest::Url::parse(&format!(
+            "{second_url}/realms/heteronetwork/protocol/openid-connect/token"
+        ))?;
+        let second_host = oidc_host_header(&second_token_url)?;
+        let session = WebUiRefreshSession {
+            provider_bindings: vec![
+                web_ui_refresh_provider_binding(
+                    first_token_url.as_str(),
+                    &first_host,
+                    "heteronetwork-web",
+                ),
+                web_ui_refresh_provider_binding(
+                    second_token_url.as_str(),
+                    &second_host,
+                    "heteronetwork-web",
+                ),
+            ],
+            refresh_token: "device-refresh-token".to_string(),
+        };
         first_task.abort();
+        let refreshed = match refresh_web_ui_oidc_tokens(&state, false, &session).await {
+            Ok(tokens) => tokens,
+            Err(error) => panic!("provider-bound refresh should succeed: {error:?}"),
+        };
+        assert_eq!(refreshed.access_token, "refreshed-access-token");
+        assert_eq!(first_backend.refresh_token_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_backend.refresh_token_calls.load(Ordering::SeqCst), 1);
+
         second_task.abort();
         Ok(())
     }

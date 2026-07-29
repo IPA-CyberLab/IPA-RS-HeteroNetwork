@@ -81,6 +81,7 @@
     "Sign in to your network": "ネットワークにログイン",
     "Use the configured identity provider to continue.": "設定済みの ID プロバイダーで続行してください。",
     "Sign in with SSO": "SSO でログイン",
+    "Server-side sign-in is unavailable.": "サーバー側ログインを利用できません。",
     "Complete sign-in with code": "次のコードでログインを完了してください:",
     "Device sign-in expired": "デバイスログインの有効期限が切れました",
     "Device sign-in failed": "デバイスログインに失敗しました",
@@ -405,12 +406,27 @@
     "Direct shortcuts must be an integer between 0 and 64.": "直接ショートカット数は 0 から 64 の整数で指定してください。"
   };
 
+  var ACCESS_TOKEN_STORAGE_KEY = "heteronetwork_access_token";
+  var ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY = "heteronetwork_access_token_expires_at";
+  var OPERATOR_TOKEN_STORAGE_KEY = "heteronetwork_operator_token";
+  var AUTH_SESSION_LOCK_NAME = "heteronetwork-auth-session";
+  var AUTH_LOGOUT_CHANNEL_NAME = "heteronetwork-auth";
+  var AUTH_LOGOUT_STORAGE_KEY = "heteronetwork_auth_logout";
+  var ACCESS_TOKEN_REFRESH_SKEW_MS = 30 * 1000;
+  var SESSION_LOGOUT_TIMEOUT_MS = 2 * 1000;
+  var storedAccessToken = sessionStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || "";
+  var storedOperatorToken = sessionStorage.getItem(OPERATOR_TOKEN_STORAGE_KEY) || "";
+  var storedAccessTokenExpiresAt = Number(sessionStorage.getItem(ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY));
+  if (!Number.isFinite(storedAccessTokenExpiresAt) || storedAccessTokenExpiresAt <= 0) {
+    storedAccessTokenExpiresAt = null;
+  }
+
   var state = {
     config: null,
     overview: null,
-    token: sessionStorage.getItem("heteronetwork_access_token")
-      || sessionStorage.getItem("heteronetwork_operator_token")
-      || "",
+    token: storedAccessToken || storedOperatorToken,
+    tokenType: storedAccessToken ? "oidc" : (storedOperatorToken ? "operator" : null),
+    tokenExpiresAt: storedAccessToken ? storedAccessTokenExpiresAt : null,
     activeView: "overview",
     selectedNodeId: null,
     loading: false,
@@ -467,6 +483,9 @@
       acl: ""
     }
   };
+  var sessionRefreshPromise = null;
+  var authSessionGeneration = 0;
+  var authCoordinationChannel = null;
 
   function $(id) {
     return document.getElementById(id);
@@ -607,7 +626,7 @@
     applyTheme(state.theme, false);
     updateAuthConfigText();
     if (state.config && state.config.local_agent) renderWebUiEndpoints();
-    if (state.overview) {
+    if (state.token && state.overview) {
       $("cluster-name").textContent = state.overview.cluster_id;
       $("sidebar-cluster").textContent = state.overview.cluster_id;
       $("refresh-time").textContent = translateDynamicText("Updated " + formatTime(state.overview.generated_at));
@@ -818,22 +837,275 @@
     node.innerHTML = '<span class="status-dot"></span><span>' + t(online ? "Connected" : "Offline") + "</span>";
   }
 
+  function accessTokenExpiresAt(expiresIn) {
+    var seconds = Number(expiresIn);
+    return Number.isFinite(seconds) && seconds > 0 ? Date.now() + seconds * 1000 : null;
+  }
+
+  function setOidcSession(tokens) {
+    state.token = tokens.access_token;
+    state.tokenType = "oidc";
+    state.tokenExpiresAt = accessTokenExpiresAt(tokens.expires_in);
+    sessionStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, state.token);
+    if (state.tokenExpiresAt) {
+      sessionStorage.setItem(ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY, String(state.tokenExpiresAt));
+    } else {
+      sessionStorage.removeItem(ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY);
+    }
+  }
+
+  function setOperatorSession(token) {
+    state.token = token;
+    state.tokenType = "operator";
+    state.tokenExpiresAt = null;
+    sessionStorage.setItem(OPERATOR_TOKEN_STORAGE_KEY, token);
+  }
+
+  function clearOidcSession() {
+    sessionStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+    sessionStorage.removeItem(ACCESS_TOKEN_EXPIRES_AT_STORAGE_KEY);
+    if (state.tokenType === "oidc") {
+      state.token = "";
+      state.tokenType = null;
+      state.tokenExpiresAt = null;
+    }
+  }
+
+  function clearOperatorSession() {
+    sessionStorage.removeItem(OPERATOR_TOKEN_STORAGE_KEY);
+    if (state.tokenType === "operator") {
+      state.token = "";
+      state.tokenType = null;
+      state.tokenExpiresAt = null;
+    }
+  }
+
+  function clearProtectedState() {
+    state.overview = null;
+    state.selectedNodeId = null;
+    state.loading = false;
+    state.policyDirty = false;
+    state.topology.data = null;
+    state.topology.loading = false;
+    state.topology.error = "";
+    state.topology.policy = null;
+    state.topology.policyLoading = false;
+    state.topology.policyError = "";
+    state.topology.settings = null;
+    state.topology.dirty = false;
+    state.topology.saving = false;
+    state.topology.selectedGroupId = null;
+    state.topology.mermaidRenderSequence += 1;
+    state.topology.mermaidQueue = Promise.resolve();
+    state.topology.mermaidCache = {
+      epoch: null,
+      scope: null,
+      snapshot: null,
+      source: null
+    };
+    state.enrollment.result = null;
+    state.enrollment.generating = false;
+    $("drawer-root").innerHTML = "";
+    $("view-content").innerHTML = "";
+    $("cluster-name").textContent = "-";
+    $("sidebar-cluster").textContent = "-";
+    $("refresh-time").textContent = "";
+    $("nav-node-count").textContent = "-";
+    $("nav-path-count").textContent = "-";
+    $("nav-block-count").textContent = "-";
+    $("nav-rule-count").textContent = "-";
+  }
+
+  function clearSession() {
+    clearOidcSession();
+    clearOperatorSession();
+    state.token = "";
+    state.tokenType = null;
+    state.tokenExpiresAt = null;
+    clearProtectedState();
+  }
+
+  function sessionChangedError() {
+    var error = new Error("authentication required");
+    error.sessionChanged = true;
+    return error;
+  }
+
+  function withAuthSessionLock(action, signal) {
+    var locks = navigator && navigator.locks;
+    if (!locks || typeof locks.request !== "function") {
+      return Promise.resolve().then(action);
+    }
+    var options = { mode: "exclusive" };
+    if (signal) options.signal = signal;
+    try {
+      return Promise.resolve(locks.request(AUTH_SESSION_LOCK_NAME, options, action));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  function handleRemoteLogout() {
+    authSessionGeneration += 1;
+    clearSession();
+    showAuth("");
+  }
+
+  function notifyRemoteLogout() {
+    var message = { type: "logout", at: Date.now() };
+    if (authCoordinationChannel) {
+      try {
+        authCoordinationChannel.postMessage(message);
+        return;
+      } catch (_) {
+        // Fall back to a storage event when the channel is unavailable.
+      }
+    }
+    try {
+      localStorage.setItem(AUTH_LOGOUT_STORAGE_KEY, JSON.stringify(message));
+      localStorage.removeItem(AUTH_LOGOUT_STORAGE_KEY);
+    } catch (_) {
+      // Local logout still succeeds when browser coordination is unavailable.
+    }
+  }
+
+  function initializeAuthCoordination() {
+    if (typeof window.BroadcastChannel === "function") {
+      try {
+        authCoordinationChannel = new window.BroadcastChannel(AUTH_LOGOUT_CHANNEL_NAME);
+        authCoordinationChannel.onmessage = function (event) {
+          if (event.data && event.data.type === "logout") handleRemoteLogout();
+        };
+        window.addEventListener("pagehide", function () {
+          authCoordinationChannel.close();
+          authCoordinationChannel = null;
+        }, { once: true });
+        return;
+      } catch (_) {
+        authCoordinationChannel = null;
+      }
+    }
+    window.addEventListener("storage", function (event) {
+      if (event.key !== AUTH_LOGOUT_STORAGE_KEY || !event.newValue) return;
+      try {
+        var message = JSON.parse(event.newValue);
+        if (message && message.type === "logout") handleRemoteLogout();
+      } catch (_) {
+        // Ignore malformed coordination events.
+      }
+    });
+  }
+
+  function authenticationRequired(tokenType) {
+    authSessionGeneration += 1;
+    if (tokenType === "oidc") {
+      clearOidcSession();
+    }
+    if (tokenType === "operator") clearOperatorSession();
+    clearProtectedState();
+    showAuth(t("Your session expired. Sign in again."));
+    return Promise.reject(new Error("authentication required"));
+  }
+
+  function refreshOidcSession() {
+    var endpoint = state.config && state.config.session_refresh_endpoint;
+    if (!endpoint || state.tokenType === "operator") {
+      return Promise.reject(new Error("session refresh is unavailable"));
+    }
+    if (sessionRefreshPromise) return sessionRefreshPromise;
+
+    var refreshGeneration = authSessionGeneration;
+    var request = withAuthSessionLock(function () {
+      if (refreshGeneration !== authSessionGeneration) throw sessionChangedError();
+      return fetch(endpoint, {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin"
+      }).then(async function (response) {
+        if (refreshGeneration !== authSessionGeneration) {
+          clearCookieAfterStaleRefresh();
+          throw sessionChangedError();
+        }
+        var body = {};
+        try { body = await response.json(); } catch (_) { body = {}; }
+        if (refreshGeneration !== authSessionGeneration) {
+          clearCookieAfterStaleRefresh();
+          throw sessionChangedError();
+        }
+        if (!response.ok || !body.access_token) {
+          var error = new Error(body.error || ("Session refresh failed (" + response.status + ")"));
+          error.authenticationRejected = response.status === 401 || response.status === 403;
+          throw error;
+        }
+        setOidcSession(body);
+        return body;
+      });
+    });
+    var sharedRequest = request.finally(function () {
+      if (sessionRefreshPromise === sharedRequest) sessionRefreshPromise = null;
+    });
+    sessionRefreshPromise = sharedRequest;
+    return sharedRequest;
+  }
+
+  function clearCookieAfterStaleRefresh() {
+    var endpoint = state.config && state.config.session_logout_endpoint;
+    if (!endpoint) return;
+    postSessionLogout(endpoint).catch(function () {
+      // The initiating logout already removed local credentials.
+    });
+  }
+
+  function refreshOidcSessionBeforeRequest() {
+    var endpoint = state.config && state.config.session_refresh_endpoint;
+    var expiresSoon = state.tokenType === "oidc"
+      && state.tokenExpiresAt !== null
+      && Date.now() + ACCESS_TOKEN_REFRESH_SKEW_MS >= state.tokenExpiresAt;
+    if (!endpoint || !expiresSoon) return Promise.resolve();
+    return refreshOidcSession().then(null, function (error) {
+      if (error.authenticationRejected) return authenticationRequired("oidc");
+      if (state.tokenExpiresAt !== null && Date.now() < state.tokenExpiresAt) return;
+      throw error;
+    });
+  }
+
   function api(path, options) {
     var request = options || {};
+    return refreshOidcSessionBeforeRequest().then(function () {
+      return sendApiRequest(path, request, false);
+    });
+  }
+
+  function sendApiRequest(path, request, retried) {
     var headers = new Headers(request.headers || {});
     headers.set("Accept", "application/json");
     if (state.token) headers.set("Authorization", "Bearer " + state.token);
     if (request.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    var tokenUsed = state.token;
+    var tokenTypeUsed = state.tokenType;
+    var requestGeneration = authSessionGeneration;
     return fetch(path, Object.assign({}, request, { headers: headers })).then(async function (response) {
+      if (requestGeneration !== authSessionGeneration) throw sessionChangedError();
       var routedEndpoint = response.headers.get("X-HeteroNetwork-Web-UI-Endpoint");
       if (routedEndpoint && state.config && state.config.local_agent) {
         state.webUi.selectedUrl = routedEndpoint;
         renderWebUiEndpoints();
       }
       if (response.status === 401) {
-        clearSession();
-        showAuth(t("Your session expired. Sign in again."));
-        throw new Error("authentication required");
+        if (tokenTypeUsed !== "oidc") return authenticationRequired(tokenTypeUsed);
+        if (retried || state.tokenType !== "oidc") return authenticationRequired("oidc");
+        if (state.token && state.token !== tokenUsed) {
+          return sendApiRequest(path, request, true);
+        }
+        if (!state.config || !state.config.session_refresh_endpoint) {
+          return authenticationRequired("oidc");
+        }
+        return refreshOidcSession().then(function () {
+          return sendApiRequest(path, request, true);
+        }, function (error) {
+          if (error.authenticationRejected) return authenticationRequired("oidc");
+          throw error;
+        });
       }
       if (!response.ok) {
         var message = response.status + " " + response.statusText;
@@ -845,14 +1117,10 @@
         }
         throw new Error(message);
       }
-      return response.json();
+      var body = await response.json();
+      if (requestGeneration !== authSessionGeneration) throw sessionChangedError();
+      return body;
     });
-  }
-
-  function clearSession() {
-    state.token = "";
-    sessionStorage.removeItem("heteronetwork_access_token");
-    sessionStorage.removeItem("heteronetwork_operator_token");
   }
 
   function showAuth(message) {
@@ -865,27 +1133,13 @@
   }
 
   function showDashboard() {
+    if (!state.token) {
+      showAuth("");
+      return;
+    }
     $("auth-panel").hidden = true;
     $("dashboard").hidden = false;
     $("auth-button").innerHTML = '<span class="account-avatar">A</span><span class="account-label">' + t("Sign out") + '</span>';
-  }
-
-  function randomBytes(length) {
-    var bytes = new Uint8Array(length);
-    crypto.getRandomValues(bytes);
-    return bytes;
-  }
-
-  function base64Url(bytes) {
-    var binary = "";
-    bytes.forEach(function (byte) { binary += String.fromCharCode(byte); });
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-  }
-
-  function pkceChallenge(verifier) {
-    return crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)).then(function (digest) {
-      return base64Url(new Uint8Array(digest));
-    });
   }
 
   function deviceLoginPoll(handle, endpoint, delaySeconds, expiresAt) {
@@ -901,7 +1155,7 @@
     }).then(async function (response) {
       var body = {};
       try { body = await response.json(); } catch (_) { body = {}; }
-      if (response.ok && body.status === "complete" && body.access_token) return body.access_token;
+      if (response.ok && body.status === "complete" && body.access_token) return body;
       if ((response.status === 202 || response.status === 429) && body.status === "pending") {
         return deviceLoginPoll(handle, endpoint, body.retry_after_seconds || delaySeconds, expiresAt);
       }
@@ -933,10 +1187,9 @@
         body.interval || 5,
         Date.now() + Math.max(30, body.expires_in || 600) * 1000
       );
-    }).then(function (accessToken) {
+    }).then(function (tokens) {
       if (authWindow && !authWindow.closed) authWindow.close();
-      state.token = accessToken;
-      sessionStorage.setItem("heteronetwork_access_token", accessToken);
+      setOidcSession(tokens);
       $("auth-error").textContent = "";
       return loadOverview();
     }).catch(function (error) {
@@ -946,65 +1199,17 @@
   }
 
   function startLogin() {
-    if (!state.config) return Promise.resolve();
+    if (!state.config) {
+      return Promise.reject(new Error(t("Server-side sign-in is unavailable.")));
+    }
     if (state.config.device_login_endpoint && state.config.device_login_poll_endpoint) {
       return startDeviceLogin();
     }
-    if (!state.config.authorization_endpoint) return Promise.resolve();
     if (state.config.login_endpoint) {
       location.assign(state.config.login_endpoint);
       return Promise.resolve();
     }
-    var verifier = base64Url(randomBytes(32));
-    return pkceChallenge(verifier).then(function (challenge) {
-      var loginState = base64Url(randomBytes(24));
-      sessionStorage.setItem("heteronetwork_pkce_verifier", verifier);
-      sessionStorage.setItem("heteronetwork_login_state", loginState);
-      var params = new URLSearchParams({
-        response_type: "code",
-        client_id: state.config.client_id,
-        redirect_uri: location.origin + "/ui/",
-        scope: state.config.scopes || "openid profile email",
-        state: loginState,
-        code_challenge: challenge,
-        code_challenge_method: "S256"
-      });
-      location.assign(state.config.authorization_endpoint + "?" + params.toString());
-    });
-  }
-
-  function exchangeCode() {
-    var query = new URLSearchParams(location.search);
-    var code = query.get("code");
-    if (!code) return Promise.resolve(false);
-    if (query.get("state") !== sessionStorage.getItem("heteronetwork_login_state")) {
-      return Promise.reject(new Error("OIDC state validation failed"));
-    }
-    var verifier = sessionStorage.getItem("heteronetwork_pkce_verifier");
-    if (!verifier) return Promise.reject(new Error("OIDC verifier is missing"));
-    var body = new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: state.config.client_id,
-      code: code,
-      redirect_uri: location.origin + "/ui/",
-      code_verifier: verifier
-    });
-    return fetch(state.config.token_endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body
-    }).then(function (response) {
-      if (!response.ok) throw new Error("OIDC token exchange failed (" + response.status + ")");
-      return response.json();
-    }).then(function (tokens) {
-      if (!tokens.access_token) throw new Error("OIDC response did not include an access token");
-      state.token = tokens.access_token;
-      sessionStorage.setItem("heteronetwork_access_token", state.token);
-      sessionStorage.removeItem("heteronetwork_pkce_verifier");
-      sessionStorage.removeItem("heteronetwork_login_state");
-      history.replaceState({}, document.title, location.origin + "/ui/");
-      return true;
-    });
+    return Promise.reject(new Error(t("Server-side sign-in is unavailable.")));
   }
 
   function loadConfig() {
@@ -1207,8 +1412,12 @@
 
   function loadOverview() {
     if (!state.token || state.loading || state.policyDirty) return Promise.resolve();
+    var overviewGeneration = authSessionGeneration;
     state.loading = true;
     return api("/v1/admin/overview").then(function (overview) {
+      if (overviewGeneration !== authSessionGeneration || !state.token) {
+        throw sessionChangedError();
+      }
       state.overview = overview;
       $("auth-error").textContent = "";
       showDashboard();
@@ -1219,12 +1428,12 @@
       updateNavigationCounts();
       renderView();
     }).catch(function (error) {
-      if (error.message !== "authentication required") {
+      if (!error.sessionChanged && error.message !== "authentication required") {
         setStatus(error.message, true);
         if (!state.overview) $("auth-error").textContent = error.message;
       }
     }).finally(function () {
-      state.loading = false;
+      if (overviewGeneration === authSessionGeneration) state.loading = false;
     });
   }
 
@@ -1259,10 +1468,14 @@
 
   function loadTopologyPolicy(forceSettings) {
     if (!state.token || state.topology.policyLoading) return Promise.resolve();
+    var policyGeneration = authSessionGeneration;
     state.topology.policyLoading = true;
     state.topology.policyError = "";
     renderTopologyWhenActive();
     return api("/v1/admin/policy").then(function (response) {
+      if (policyGeneration !== authSessionGeneration || !state.token) {
+        throw sessionChangedError();
+      }
       var policy = topologyPolicyFromResponse(response);
       if (!policy || typeof policy !== "object") throw new Error("Policy response did not include cluster_policy");
       state.topology.policy = policy;
@@ -1273,23 +1486,30 @@
       }
       updateNavigationCounts();
     }).catch(function (error) {
+      if (error.sessionChanged || error.message === "authentication required") return;
       state.topology.policyError = error.message;
       if (!state.topology.settings) {
         var overviewPolicy = state.overview && state.overview.cluster_policy;
         state.topology.settings = settingsFromTopologyPolicy(overviewPolicy);
       }
     }).finally(function () {
-      state.topology.policyLoading = false;
-      renderTopologyWhenActive();
+      if (policyGeneration === authSessionGeneration) {
+        state.topology.policyLoading = false;
+        renderTopologyWhenActive();
+      }
     });
   }
 
   function loadOverlayTopology() {
     if (!state.token || state.topology.loading) return Promise.resolve();
+    var topologyGeneration = authSessionGeneration;
     state.topology.loading = true;
     state.topology.error = "";
     renderTopologyWhenActive();
     return api("/v1/admin/topology").then(function (topology) {
+      if (topologyGeneration !== authSessionGeneration || !state.token) {
+        throw sessionChangedError();
+      }
       state.topology.data = topology && typeof topology === "object" ? topology : {};
       var groups = Array.isArray(state.topology.data.groups) ? state.topology.data.groups : [];
       if (!groups.some(function (group) { return String(group.group_id) === String(state.topology.selectedGroupId); })) {
@@ -1299,10 +1519,13 @@
       }
       updateNavigationCounts();
     }).catch(function (error) {
+      if (error.sessionChanged || error.message === "authentication required") return;
       state.topology.error = error.message;
     }).finally(function () {
-      state.topology.loading = false;
-      renderTopologyWhenActive();
+      if (topologyGeneration === authSessionGeneration) {
+        state.topology.loading = false;
+        renderTopologyWhenActive();
+      }
     });
   }
 
@@ -2747,10 +2970,7 @@
     renderView();
   }
 
-  function signOut() {
-    var provider = state.config && state.config.provider;
-    var logoutEndpoint = state.config && state.config.logout_endpoint;
-    clearSession();
+  function finishSignOut(provider, logoutEndpoint) {
     if (location.protocol !== "https:") {
       showAuth("");
       return;
@@ -2762,6 +2982,54 @@
       return;
     }
     showAuth("");
+  }
+
+  function postSessionLogout(endpoint) {
+    try {
+      return Promise.resolve(fetch(endpoint, {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        keepalive: true
+      }));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  function clearRefreshCookie(endpoint) {
+    if (!endpoint) return Promise.resolve();
+    var request = postSessionLogout(endpoint);
+
+    return new Promise(function (resolve) {
+      var complete = false;
+      var timeoutId = setTimeout(function () {
+        finish();
+      }, SESSION_LOGOUT_TIMEOUT_MS);
+      function finish() {
+        if (complete) return;
+        complete = true;
+        clearTimeout(timeoutId);
+        resolve();
+      }
+      request.then(finish, finish);
+    });
+  }
+
+  function signOut() {
+    var provider = state.config && state.config.provider;
+    var logoutEndpoint = state.config && state.config.logout_endpoint;
+    var sessionLogoutEndpoint = state.config && state.config.session_logout_endpoint;
+    authSessionGeneration += 1;
+    var logoutGeneration = authSessionGeneration;
+    clearSession();
+    showAuth("");
+    notifyRemoteLogout();
+    return clearRefreshCookie(sessionLogoutEndpoint).then(function () {
+      if (authSessionGeneration === logoutGeneration && !state.token) {
+        finishSignOut(provider, logoutEndpoint);
+      }
+    });
   }
 
   function closeMobileNav() {
@@ -3011,8 +3279,7 @@
     event.preventDefault();
     var token = $("operator-token").value.trim();
     if (!token) return;
-    state.token = token;
-    sessionStorage.setItem("heteronetwork_operator_token", token);
+    setOperatorSession(token);
     loadOverview();
   });
 
@@ -3027,6 +3294,7 @@
     else showAuth("");
   });
 
+  initializeAuthCoordination();
   document.documentElement.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
   $("locale-select").value = state.locale;
   applyStaticTranslations();
@@ -3043,10 +3311,22 @@
     if (state.config && state.config.local_agent && !state.webUi.loading) loadWebUiEndpoints();
   }, 15000);
 
+  function restoreOidcSession() {
+    if (state.token || !state.config || !state.config.session_refresh_endpoint) {
+      return Promise.resolve(false);
+    }
+    return refreshOidcSession().then(function () {
+      return true;
+    }, function () {
+      return false;
+    });
+  }
+
   loadConfig().then(function () {
-    return exchangeCode();
-  }).then(function (exchanged) {
-    if (!state.token && !exchanged) {
+    if (state.token) return true;
+    return restoreOidcSession();
+  }).then(function () {
+    if (!state.token) {
       showAuth("");
       return;
     }
