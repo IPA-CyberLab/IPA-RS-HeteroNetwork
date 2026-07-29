@@ -13,8 +13,9 @@ readonly DEFAULT_EDGE_PORT="18079"
 readonly DEFAULT_DB_URL="jdbc:postgresql://postgres.heteronetwork.internal:25432/keycloak?sslmode=verify-full&sslrootcert=/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt"
 readonly MAX_SECRET_BYTES="4096"
 readonly MAX_ARCHIVE_BYTES="1073741824"
-readonly ACTIVATION_READY_ATTEMPTS="12"
-readonly ACTIVATION_READY_INTERVAL_SECONDS="5"
+readonly ACTIVATION_READY_ATTEMPTS="3"
+readonly ACTIVATION_READY_INTERVAL_SECONDS="3"
+readonly ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS="2"
 
 archive="${HETERONETWORK_KEYCLOAK_ARCHIVE:-}"
 archive_url="${HETERONETWORK_KEYCLOAK_ARCHIVE_URL:-$DEFAULT_KEYCLOAK_ARCHIVE_URL}"
@@ -566,9 +567,7 @@ activate_replica() {
     && -f "$backchannel_config_dir/haproxy.cfg" ]] \
     || die "Keycloak replica is not configured"
 
-  if systemctl is-active --quiet heteronetwork-keycloak.service; then
-    systemctl restart heteronetwork-keycloak.service
-  else
+  if ! systemctl is-active --quiet heteronetwork-keycloak.service; then
     systemctl start heteronetwork-keycloak.service
   fi
   systemctl is-active --quiet heteronetwork-keycloak.service \
@@ -585,7 +584,7 @@ activate_replica() {
   local attempt
   for ((attempt = 1; attempt <= ACTIVATION_READY_ATTEMPTS; attempt++)); do
     if curl --fail --silent --show-error \
-      --connect-timeout 2 --max-time 5 \
+      --connect-timeout 1 --max-time "$ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS" \
       "http://127.0.0.1:${management_port}/health/ready" >/dev/null 2>&1; then
       return
     fi

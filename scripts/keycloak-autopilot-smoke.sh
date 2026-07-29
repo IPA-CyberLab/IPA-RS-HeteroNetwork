@@ -243,9 +243,7 @@ case "$command_name" in
     ;;
   activate)
     [[ -e "$HETERONETWORK_SMOKE_STATE/configured" ]]
-    if systemctl is-active --quiet heteronetwork-keycloak.service; then
-      systemctl restart heteronetwork-keycloak.service
-    else
+    if ! systemctl is-active --quiet heteronetwork-keycloak.service; then
       systemctl start heteronetwork-keycloak.service
     fi
     systemctl start heteronetwork-keycloak-backchannel.service
@@ -438,6 +436,7 @@ run_autopilot reconcile
 [[ "$(<"$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures")" == "1" ]] \
   || fail "active but unready Keycloak was accepted as activated"
 rm -f "$fake_state/keycloak-health-down"
+touch "$fake_state/keycloak-ready"
 run_autopilot reconcile
 [[ "$(<"$test_root/var/lib/heteronetwork-keycloak-autopilot/restart-failures")" == "0" ]] \
   || fail "healthy Keycloak did not reset the activation failure counter"
@@ -513,10 +512,17 @@ grep -Fq 'prepare-edge)' "$helper_contract" \
   || fail "helper omitted lightweight edge preparation"
 grep -Fq "readonly KEYCLOAK_ARCHIVE_SHA256=\"$keycloak_sha256\"" \
   "$helper_contract" || fail "helper archive digest is not pinned"
-grep -Fq 'ACTIVATION_READY_ATTEMPTS="12"' "$helper_contract" \
-  || fail "helper activation readiness wait is not bounded"
+grep -Fq 'ACTIVATION_READY_ATTEMPTS="3"' "$helper_contract" \
+  || fail "helper activation readiness attempts are not lease-safe"
+grep -Fq 'ACTIVATION_READY_INTERVAL_SECONDS="3"' "$helper_contract" \
+  || fail "helper activation readiness interval is not lease-safe"
+grep -Fq 'ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS="2"' "$helper_contract" \
+  || fail "helper activation readiness request is not lease-safe"
 grep -Fq '"http://127.0.0.1:${management_port}/health/ready"' "$helper_contract" \
   || fail "helper activation does not probe management readiness"
+if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract"; then
+  fail "helper restarts an already-active Keycloak replica"
+fi
 if grep -Fq 'start --optimized --import-realm' "$helper_contract"; then
   fail "normal Keycloak restart still imports realms"
 fi
