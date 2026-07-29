@@ -1695,6 +1695,8 @@ async fn local_ui_config(
     let control_plane_only = is_public_gateway || overlay_web_ui.is_some();
     match select_healthy_web_ui_with_scope(&state, control_plane_only).await {
         Ok((candidate, mut config)) => {
+            merge_reachable_control_plane_enrollment_capabilities(&state, &candidate, &mut config)
+                .await;
             if is_public_gateway
                 && state
                     .public_web_gateway
@@ -1790,6 +1792,72 @@ async fn local_ui_config(
     }
 }
 
+async fn merge_reachable_control_plane_enrollment_capabilities(
+    state: &AgentHttpState,
+    selected_candidate: &WebUiCandidate,
+    selected_config: &mut Value,
+) {
+    let mut node_enrollment_enabled = selected_config
+        .get("node_enrollment_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut client_enrollment_enabled = selected_config
+        .get("client_enrollment_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if node_enrollment_enabled && client_enrollment_enabled {
+        return;
+    }
+
+    let expected_cluster_id = expected_web_ui_cluster_id(state);
+    let mut probes = JoinSet::new();
+    for candidate in web_ui_candidates(state).into_iter().filter(|candidate| {
+        web_ui_candidate_is_control_plane(candidate) && candidate.url != selected_candidate.url
+    }) {
+        let client = state.control_plane_client.clone();
+        let expected_cluster_id = expected_cluster_id.clone();
+        probes.spawn(async move {
+            let result =
+                fetch_web_ui_config(&client, &candidate, expected_cluster_id.as_deref()).await;
+            (candidate, result)
+        });
+    }
+
+    while let Some(result) = probes.join_next().await {
+        if let Ok((candidate, result)) = result {
+            match result {
+                Ok(config) => {
+                    record_web_ui_health(state, candidate.url, true).await;
+                    node_enrollment_enabled |= config
+                        .get("node_enrollment_enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    client_enrollment_enabled |= config
+                        .get("client_enrollment_enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if node_enrollment_enabled && client_enrollment_enabled {
+                        probes.abort_all();
+                        break;
+                    }
+                }
+                Err(_) => record_web_ui_health(state, candidate.url, false).await,
+            }
+        }
+    }
+
+    if let Some(config) = selected_config.as_object_mut() {
+        config.insert(
+            "node_enrollment_enabled".to_string(),
+            Value::Bool(node_enrollment_enabled),
+        );
+        config.insert(
+            "client_enrollment_enabled".to_string(),
+            Value::Bool(client_enrollment_enabled),
+        );
+    }
+}
+
 fn rewrite_keycloak_config_for_public_gateway(
     config: &mut Value,
     public_url: &str,
@@ -1876,8 +1944,16 @@ async fn proxy_management_request(
 
     if matches!(proxy_request.method, Method::GET | Method::HEAD) {
         let mut failures = Vec::new();
+        let mut unsupported_response = None;
         for candidate in candidates {
             match forward_management_request(&state, &candidate, &proxy_request).await {
+                Ok(response)
+                    if management_request_is_install_read(&proxy_request)
+                        && proxy_status_is_candidate_unsupported(response.status()) =>
+                {
+                    failures.push(format!("{} returned {}", candidate.url, response.status()));
+                    unsupported_response = Some(response);
+                }
                 Ok(response) if proxy_status_is_retryable(response.status()) => {
                     record_web_ui_health(&state, candidate.url.clone(), false).await;
                     failures.push(format!("{} returned {}", candidate.url, response.status()));
@@ -1897,12 +1973,38 @@ async fn proxy_management_request(
                 }
             }
         }
+        if let Some(response) = unsupported_response {
+            return response;
+        }
         set_selected_web_ui(&state, None).await;
         return ApiError::Agent(AgentError::ControlPlaneClient(format!(
             "all cached Web UI endpoints failed: {}",
             failures.join("; ")
         )))
         .into_response();
+    }
+
+    if management_request_is_enrollment_mutation(&proxy_request) {
+        let mut unsupported_response = None;
+        for candidate in candidates {
+            match forward_management_request(&state, &candidate, &proxy_request).await {
+                Ok(response) if proxy_status_is_candidate_unsupported(response.status()) => {
+                    unsupported_response = Some(response);
+                }
+                Ok(response) => {
+                    record_web_ui_health(&state, candidate.url.clone(), true).await;
+                    set_selected_web_ui(&state, Some(candidate.url)).await;
+                    return response;
+                }
+                Err(error) => {
+                    record_web_ui_health(&state, candidate.url, false).await;
+                    return ApiError::Agent(error).into_response();
+                }
+            }
+        }
+        if let Some(response) = unsupported_response {
+            return response;
+        }
     }
 
     let candidate = match select_healthy_web_ui_with_scope(&state, control_plane_only).await {
@@ -2037,6 +2139,33 @@ fn proxy_status_is_retryable(status: StatusCode) -> bool {
         status,
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+fn proxy_status_is_candidate_unsupported(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+    )
+}
+
+fn management_request_path(request: &ManagementProxyRequest) -> &str {
+    request
+        .path_and_query
+        .split_once('?')
+        .map_or(request.path_and_query.as_str(), |(path, _)| path)
+}
+
+fn management_request_is_install_read(request: &ManagementProxyRequest) -> bool {
+    matches!(request.method, Method::GET | Method::HEAD)
+        && management_request_path(request).starts_with("/v1/install/")
+}
+
+fn management_request_is_enrollment_mutation(request: &ManagementProxyRequest) -> bool {
+    request.method == Method::POST
+        && matches!(
+            management_request_path(request),
+            "/v1/admin/enrollment" | "/v1/admin/client-enrollment"
+        )
 }
 
 async fn status(State(state): State<AgentHttpState>) -> Json<AgentStatusResponse> {
@@ -3997,6 +4126,86 @@ mod tests {
         Ok((base_url, state, task))
     }
 
+    #[derive(Clone)]
+    struct EnrollmentAwareTestBackend {
+        base_url: String,
+        name: String,
+        management_status: StatusCode,
+        management_calls: Arc<AtomicUsize>,
+        node_enrollment_enabled: bool,
+        client_enrollment_enabled: bool,
+    }
+
+    async fn enrollment_aware_test_config(
+        State(state): State<EnrollmentAwareTestBackend>,
+    ) -> Json<Value> {
+        Json(json!({
+            "cluster_id": "cluster-a",
+            "enabled": true,
+            "auth_enabled": true,
+            "operator_token_enabled": false,
+            "provider": format!("{}-provider", state.name),
+            "issuer_url": format!("{}/issuer/{}", state.base_url, state.name),
+            "client_id": format!("{}-client", state.name),
+            "scopes": "openid profile email",
+            "node_enrollment_enabled": state.node_enrollment_enabled,
+            "client_enrollment_enabled": state.client_enrollment_enabled
+        }))
+    }
+
+    async fn enrollment_aware_test_management(
+        State(state): State<EnrollmentAwareTestBackend>,
+    ) -> Response {
+        state.management_calls.fetch_add(1, Ordering::SeqCst);
+        (
+            state.management_status,
+            Json(json!({"backend": state.name})),
+        )
+            .into_response()
+    }
+
+    async fn spawn_enrollment_aware_test_backend(
+        name: &str,
+        management_status: StatusCode,
+        node_enrollment_enabled: bool,
+        client_enrollment_enabled: bool,
+    ) -> Result<
+        (
+            String,
+            EnrollmentAwareTestBackend,
+            tokio::task::JoinHandle<()>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let base_url = format!("http://{addr}");
+        let state = EnrollmentAwareTestBackend {
+            base_url: base_url.clone(),
+            name: name.to_string(),
+            management_status,
+            management_calls: Arc::new(AtomicUsize::new(0)),
+            node_enrollment_enabled,
+            client_enrollment_enabled,
+        };
+        let app = Router::new()
+            .route("/ui/config", get(enrollment_aware_test_config))
+            .route("/v1/install/test", get(enrollment_aware_test_management))
+            .route(
+                "/v1/admin/enrollment",
+                post(enrollment_aware_test_management),
+            )
+            .route(
+                "/v1/admin/client-enrollment",
+                post(enrollment_aware_test_management),
+            )
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((base_url, state, task))
+    }
+
     #[test]
     fn web_ui_endpoint_normalization_requires_tls_for_public_addresses() {
         assert_eq!(
@@ -4894,6 +5103,257 @@ mod tests {
 
         failed_task.abort();
         healthy_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_aware_proxy_fallback_is_limited_to_safe_requests_and_statuses() {
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::NOT_IMPLEMENTED,
+        ] {
+            assert!(proxy_status_is_candidate_unsupported(status));
+        }
+        assert!(!proxy_status_is_candidate_unsupported(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+
+        let request = |method, path: &str| ManagementProxyRequest {
+            method,
+            path_and_query: path.to_string(),
+            headers: HeaderMap::new(),
+            body: Vec::new(),
+        };
+        assert!(management_request_is_install_read(&request(
+            Method::GET,
+            "/v1/install/linux?arch=amd64"
+        )));
+        assert!(management_request_is_install_read(&request(
+            Method::HEAD,
+            "/v1/install/linux"
+        )));
+        assert!(!management_request_is_install_read(&request(
+            Method::POST,
+            "/v1/install/linux"
+        )));
+        assert!(management_request_is_enrollment_mutation(&request(
+            Method::POST,
+            "/v1/admin/enrollment"
+        )));
+        assert!(management_request_is_enrollment_mutation(&request(
+            Method::POST,
+            "/v1/admin/client-enrollment?format=json"
+        )));
+        assert!(!management_request_is_enrollment_mutation(&request(
+            Method::POST,
+            "/v1/admin/enrollment/renew"
+        )));
+        assert!(!management_request_is_enrollment_mutation(&request(
+            Method::GET,
+            "/v1/admin/enrollment"
+        )));
+    }
+
+    #[tokio::test]
+    async fn install_proxy_falls_back_from_auto_control_plane_to_signer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (auto_url, auto, auto_task) =
+            spawn_enrollment_aware_test_backend("auto", StatusCode::NOT_FOUND, false, false)
+                .await?;
+        let (signer_url, signer, signer_task) =
+            spawn_enrollment_aware_test_backend("signer", StatusCode::OK, true, true).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec![auto_url.clone(), signer_url.clone()],
+        )
+        .enable_local_web_ui(true);
+        record_web_ui_health(&state, auto_url.clone(), true).await;
+        let app = router(state.clone());
+
+        for method in [Method::GET, Method::HEAD] {
+            set_selected_web_ui(&state, Some(auto_url.clone())).await;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/v1/install/test")
+                        .header(header::HOST, "127.0.0.1:9780")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-heteronetwork-web-ui-endpoint")
+                    .and_then(|value| value.to_str().ok()),
+                Some(signer_url.as_str())
+            );
+        }
+
+        assert_eq!(auto.management_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(signer.management_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.web_ui_health.read().await.get(&auto_url), Some(&true));
+        auto_task.abort();
+        signer_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enrollment_post_falls_back_from_auto_control_plane_to_signer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (auto_url, auto, auto_task) =
+            spawn_enrollment_aware_test_backend("auto", StatusCode::NOT_FOUND, false, false)
+                .await?;
+        let (signer_url, signer, signer_task) =
+            spawn_enrollment_aware_test_backend("signer", StatusCode::OK, true, true).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec![auto_url.clone(), signer_url.clone()],
+        )
+        .enable_local_web_ui(true);
+        record_web_ui_health(&state, auto_url.clone(), true).await;
+        let app = router(state.clone());
+
+        for path in ["/v1/admin/enrollment", "/v1/admin/client-enrollment"] {
+            set_selected_web_ui(&state, Some(auto_url.clone())).await;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(header::HOST, "127.0.0.1:9780")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-heteronetwork-web-ui-endpoint")
+                    .and_then(|value| value.to_str().ok()),
+                Some(signer_url.as_str())
+            );
+        }
+
+        assert_eq!(auto.management_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(signer.management_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.web_ui_health.read().await.get(&auto_url), Some(&true));
+        auto_task.abort();
+        signer_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enrollment_post_does_not_retry_after_transport_or_server_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (transport_url, transport_task) = spawn_raw_http_response(String::new()).await?;
+        let (signer_url, signer, signer_task) =
+            spawn_enrollment_aware_test_backend("signer", StatusCode::OK, true, true).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let transport_state = AgentHttpState::with_control_plane_urls(
+            runtime,
+            vec![transport_url.clone(), signer_url.clone()],
+        )
+        .enable_local_web_ui(true);
+        set_selected_web_ui(&transport_state, Some(transport_url)).await;
+        let transport_response = router(transport_state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/admin/enrollment")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert!(transport_response.status().is_server_error());
+        assert_eq!(signer.management_calls.load(Ordering::SeqCst), 0);
+
+        let (failed_url, failed, failed_task) = spawn_enrollment_aware_test_backend(
+            "failed",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            false,
+        )
+        .await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let failed_state =
+            AgentHttpState::with_control_plane_urls(runtime, vec![failed_url.clone(), signer_url])
+                .enable_local_web_ui(true);
+        set_selected_web_ui(&failed_state, Some(failed_url)).await;
+        let failed_response = router(failed_state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/admin/client-enrollment")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(failed_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failed.management_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer.management_calls.load(Ordering::SeqCst), 0);
+
+        transport_task.abort();
+        failed_task.abort();
+        signer_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_ui_config_aggregates_enrollment_without_replacing_selected_provider(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (auto_url, _, auto_task) =
+            spawn_enrollment_aware_test_backend("auto", StatusCode::OK, false, false).await?;
+        let (signer_url, _, signer_task) =
+            spawn_enrollment_aware_test_backend("signer", StatusCode::OK, true, true).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state =
+            AgentHttpState::with_control_plane_urls(runtime, vec![auto_url.clone(), signer_url])
+                .enable_local_web_ui(true);
+        set_selected_web_ui(&state, Some(auto_url.clone())).await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/config")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let config: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(config["node_enrollment_enabled"], true);
+        assert_eq!(config["client_enrollment_enabled"], true);
+        assert_eq!(config["provider"], "auto-provider");
+        assert_eq!(config["client_id"], "auto-client");
+        assert_eq!(config["selected_web_ui_endpoint"], auto_url);
+
+        auto_task.abort();
+        signer_task.abort();
         Ok(())
     }
 
