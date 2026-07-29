@@ -63,6 +63,13 @@ jobs:
           sh -n scripts/public-services-autopilot-smoke.sh
           scripts/public-services-autopilot-smoke.sh
 
+      - name: Validate automatic Keycloak HA placement
+        run: |
+          bash -n scripts/keycloak-ha-node.sh
+          bash -n scripts/keycloak-autopilot.sh
+          bash -n scripts/keycloak-autopilot-smoke.sh
+          scripts/keycloak-autopilot-smoke.sh
+
       - name: Install minimum supported Rust
         run: rustup toolchain install "$RUST_MSRV_TOOLCHAIN" --profile minimal
 

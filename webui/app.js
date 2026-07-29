@@ -2385,6 +2385,8 @@
     var keycloakReplicas = Array.isArray(keycloakPlacement.replicas) ? keycloakPlacement.replicas : [];
     var keycloakReadyCount = keycloakReplicas.filter(function (replica) { return replica.ready; }).length;
     var keycloakDesiredCount = keycloakPlacement.desired_replicas || 3;
+    var overallHaReady = Boolean(metrics.ha_ready)
+      && keycloakReadyCount >= keycloakDesiredCount;
     var serviceKinds = [
       ["Control plane", metrics.active_control_plane_count || 0],
       ["Signal", metrics.active_signal_count || 0],
@@ -2419,7 +2421,7 @@
       + metricCard("Advertised routes", routeCount, "Across registered devices", "route", "", "")
       + metricCard("NAT profiles", natProfiles, natNote, "wifi", "", staleNatProfiles || natProfiles !== nodes.length ? "warn" : "")
       + metricCard("Access rules", (policy.acl_rules || []).length, policy.allow_relay_fallback ? "Relay fallback enabled" : "Relay fallback disabled", "shield-check", "", "")
-      + metricCard("High availability", metrics.ha_ready ? "Ready" : "Degraded", (metrics.active_service_instance_count || 0) + " public instances", metrics.ha_ready ? "check-check" : "alert-triangle", "", metrics.ha_ready ? "" : "warn")
+      + metricCard("High availability", overallHaReady ? "Ready" : "Degraded", (metrics.active_service_instance_count || 0) + " public instances", overallHaReady ? "check-check" : "alert-triangle", "", overallHaReady ? "" : "warn")
       + '</div><div class="overview-grid"><section class="section-panel"><div class="section-header"><div><h2>Connection health</h2><p>Selected path distribution</p></div><span class="status-pill info">' + paths.length + ' paths</span></div><div class="section-body"><div class="state-list">'
       + stateRows + '</div></div></section><section class="section-panel"><div class="section-header"><div><h2>Policy posture</h2><p>Runtime settings</p></div><button class="button button-secondary button-small" data-navigate="acl" type="button">Edit policy</button></div><div class="section-body"><div class="policy-summary">'
       + '<div class="policy-summary-row"><span>IPv6 direct</span>' + statusPill(policy.allow_ipv6_direct ? "healthy" : "unreachable", policy.allow_ipv6_direct ? "Enabled" : "Disabled") + '</div>'
@@ -2427,7 +2429,7 @@
       + '<div class="policy-summary-row"><span>Relay fallback</span>' + statusPill(policy.allow_relay_fallback ? "healthy" : "unreachable", policy.allow_relay_fallback ? "Enabled" : "Disabled") + '</div>'
       + '<div class="policy-summary-row"><span>Path state TTL</span><span class="policy-summary-value">' + escapeHtml(policy.path_state_ttl_seconds) + " seconds</span></div>"
       + '</div></div></section></div>' + renderTopology(nodes, paths) + '<section class="section-panel"><div class="section-header"><div><h2>Public service availability</h2><p>Lease-backed failover members</p></div>'
-      + statusPill(metrics.ha_ready ? "healthy" : "degraded", metrics.ha_ready ? "HA ready" : "HA degraded")
+      + statusPill(overallHaReady ? "healthy" : "degraded", overallHaReady ? "HA ready" : "HA degraded")
       + '</div><div class="section-body"><div class="policy-summary">' + serviceRows + '</div></div>' + instanceContent
       + '</section><section class="section-panel"><div class="section-header"><div><h2>Recently seen devices</h2><p>Latest control-plane observations</p></div><button class="button button-secondary button-small" data-navigate="nodes" type="button">View all</button></div>'
       + recentContent + "</section>";

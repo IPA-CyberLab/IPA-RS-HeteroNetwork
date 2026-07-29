@@ -236,6 +236,7 @@ test("devices join service leases by owner node and retain nodes without service
     "Signal",
     "STUN",
     "Relay",
+    "Keycloak",
     "Web UI",
     "Last seen",
   ]);

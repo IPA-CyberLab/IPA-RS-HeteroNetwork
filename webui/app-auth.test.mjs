@@ -44,6 +44,43 @@ test("startup silently restores an OIDC session through the refresh cookie", asy
   assert.equal(window.localStorage.getItem(accessTokenKey), null);
 });
 
+test("overview HA stays degraded until every desired Keycloak replica is ready", async (t) => {
+  const window = bootApp(t, {
+    storage: {
+      [accessTokenKey]: "overview-token",
+      [accessTokenExpiresAtKey]: String(Date.now() + 300_000),
+    },
+    fetch: () => async (input) => {
+      const path = requestPath(input);
+      if (path === "/ui/config") return jsonResponse(uiConfig());
+      if (path === "/v1/admin/overview") {
+        const body = overview();
+        body.metrics.ha_ready = true;
+        return jsonResponse(body);
+      }
+      if (path === "/v1/admin/keycloak-placement") {
+        return jsonResponse({
+          desired_replicas: 3,
+          replicas: [
+            { ready: true },
+            { ready: true },
+            { ready: false },
+          ],
+        });
+      }
+      throw new Error(`unexpected fetch: ${path}`);
+    },
+  });
+
+  await waitFor(() => !window.document.querySelector("#dashboard").hidden);
+
+  const haCard = Array.from(window.document.querySelectorAll(".metric-card"))
+    .find((card) => card.textContent.includes("High availability"));
+  assert.ok(haCard);
+  assert.match(haCard.textContent, /Degraded/);
+  assert.match(window.document.querySelector("#view-content").textContent, /HA degraded/);
+});
+
 test("an OIDC token expiring within 30 seconds refreshes before the API request", async (t) => {
   let refreshCalls = 0;
   const overviewAuthorizations = [];
