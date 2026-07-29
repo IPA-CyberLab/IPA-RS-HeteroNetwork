@@ -33,15 +33,15 @@ use ipars_types::api::{
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
-    endpoint_addr_is_usable, relay_admission_url_is_usable,
+    endpoint_addr_is_usable, relay_admission_url_is_usable, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
-    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayNeighbor,
-    OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState, RelayCapability,
-    Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
-    TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
-    TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    NatConnectivityState, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
+    OverlayNeighbor, OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState,
+    RelayCapability, Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken,
+    TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord,
+    TokenStatus, TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
     LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
     MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
@@ -68,6 +68,14 @@ const MAX_HEARTBEAT_PATH_STATES: usize = 4_096;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
 const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
 const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
+const DEFAULT_SERVICE_HA_REPLICA_COUNT: usize = 2;
+const REQUIRED_HA_SERVICE_KINDS: [BootstrapEndpointKind; 5] = [
+    BootstrapEndpointKind::ControlPlane,
+    BootstrapEndpointKind::Signal,
+    BootstrapEndpointKind::Stun,
+    BootstrapEndpointKind::Relay,
+    BootstrapEndpointKind::WebUi,
+];
 const MAX_CLIENT_GATEWAYS: usize = 4;
 const CLIENT_GATEWAY_SELECTION_ANNOUNCE_WINDOW: Duration = Duration::from_secs(60);
 const OVERLAY_NODE_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(1);
@@ -171,6 +179,7 @@ pub struct ControlPlaneConfig {
     pub cluster_policy: ClusterPolicy,
     pub require_heartbeat_signature: bool,
     pub heartbeat_signature_max_age: Duration,
+    pub service_ha_replica_count: usize,
 }
 
 impl ControlPlaneConfig {
@@ -181,6 +190,7 @@ impl ControlPlaneConfig {
             cluster_policy: ClusterPolicy::default(),
             require_heartbeat_signature: true,
             heartbeat_signature_max_age: Duration::from_secs(300),
+            service_ha_replica_count: DEFAULT_SERVICE_HA_REPLICA_COUNT,
         }
     }
 }
@@ -1898,6 +1908,21 @@ where
         instance: ServiceInstance,
     ) -> Result<(), ControlPlaneError> {
         validate_service_instance(&instance, &self.config.cluster_id, Utc::now())?;
+        let owner_node_id = instance.owner_node_id.as_ref().ok_or_else(|| {
+            ControlPlaneError::Store("service owner node ID is required".to_string())
+        })?;
+        let owner = self
+            .store
+            .get_node(owner_node_id)
+            .await?
+            .filter(|node| node.cluster_id == self.config.cluster_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(owner_node_id.clone()))?;
+        if owner.role.is_client() {
+            return Err(ControlPlaneError::NodeUpdateRejected {
+                node_id: owner.node_id,
+                reason: "clients cannot own cluster service leases".to_string(),
+            });
+        }
         self.store.upsert_service_instance(instance).await
     }
 
@@ -1947,12 +1972,28 @@ where
         now: chrono::DateTime<Utc>,
         lease_cutoff: chrono::DateTime<Utc>,
     ) -> Result<ServiceDirectory, ControlPlaneError> {
+        let policy = self.current_cluster_policy().await?;
+        let nodes = self.store.list_nodes().await?;
+        let health_by_node = self.health_by_node(&nodes).await?;
+        let nat_by_node = self.store.list_nat_classifications().await?;
+        let eligible_owner_node_ids = eligible_service_owner_node_ids(
+            &nodes,
+            &health_by_node,
+            &nat_by_node,
+            &self.config.cluster_id,
+            now,
+            &policy,
+        );
         let mut instances = self
             .store
             .list_service_instances(&self.config.cluster_id)
             .await?
             .into_iter()
             .filter(|instance| instance.lease_expires_at > lease_cutoff)
+            .filter(|instance| {
+                service_instance_owner_node_id(instance)
+                    .is_some_and(|node_id| eligible_owner_node_ids.contains(node_id))
+            })
             .collect::<Vec<_>>();
         instances.sort_by(|left, right| {
             let left_has_core = bootstrap_endpoints_include_core_services(&left.endpoints);
@@ -4462,7 +4503,7 @@ where
         let active_service_host_count = service_directory
             .instances
             .iter()
-            .map(|instance| instance.owner_host_id.as_str())
+            .filter_map(service_instance_owner_node_id)
             .collect::<BTreeSet<_>>()
             .len();
         let active_control_plane_count = service_instance_kind_count(
@@ -4479,15 +4520,9 @@ where
             service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::Relay);
         let active_web_ui_count =
             service_instance_kind_count(&service_directory.instances, BootstrapEndpointKind::WebUi);
-        let ha_ready = [
-            active_control_plane_count,
-            active_signal_count,
-            active_stun_count,
-            active_relay_count,
-            active_web_ui_count,
-        ]
-        .into_iter()
-        .all(|count| count >= 2);
+        let full_service_node_count = full_service_owner_node_count(&service_directory.instances);
+        let ha_ready = self.config.service_ha_replica_count > 0
+            && full_service_node_count >= self.config.service_ha_replica_count;
         let relay_candidate_count = nodes
             .iter()
             .filter(|node| {
@@ -5062,24 +5097,19 @@ fn validate_service_instance(
                 .to_string(),
         ));
     }
-    if instance
+    let owner_node_id = instance
         .owner_node_id
         .as_ref()
-        .is_some_and(|node_id| !valid_service_instance_identifier(node_id.as_str()))
-    {
+        .ok_or_else(|| ControlPlaneError::Store("service owner node ID is required".to_string()))?;
+    if !valid_service_instance_identifier(owner_node_id.as_str()) {
         return Err(ControlPlaneError::Store(
             "service owner node ID must be 1 to 255 ASCII letters, digits, '_', '.' or '-'"
                 .to_string(),
         ));
     }
-    if instance
-        .owner_node_id
-        .as_ref()
-        .is_some_and(|node_id| node_id.as_str() != instance.owner_host_id)
-    {
+    if owner_node_id.as_str() != instance.owner_host_id {
         return Err(ControlPlaneError::Store(
-            "service owner host ID must equal owner node ID when an overlay owner is set"
-                .to_string(),
+            "service owner host ID must equal owner node ID".to_string(),
         ));
     }
     validate_join_token_bootstrap_endpoints(&instance.endpoints)
@@ -5134,11 +5164,74 @@ fn valid_service_instance_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
+fn service_instance_owner_node_id(instance: &ServiceInstance) -> Option<&NodeId> {
+    instance
+        .owner_node_id
+        .as_ref()
+        .filter(|node_id| node_id.as_str() == instance.owner_host_id)
+}
+
+fn eligible_service_owner_node_ids(
+    nodes: &[NodeRecord],
+    health_by_node: &BTreeMap<NodeId, NodeHealth>,
+    nat_by_node: &BTreeMap<NodeId, NatClassification>,
+    cluster_id: &ClusterId,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> BTreeSet<NodeId> {
+    nodes
+        .iter()
+        .filter(|node| node.cluster_id == *cluster_id && !node.role.is_client())
+        .filter(|node| {
+            relay_health_allows(
+                health_by_node.get(&node.node_id),
+                now,
+                policy.relay_health_ttl_seconds,
+            )
+        })
+        .filter(|node| {
+            nat_by_node
+                .get(&node.node_id)
+                .is_some_and(|classification| {
+                    service_owner_is_publicly_reachable(node, classification, now, policy)
+                })
+        })
+        .map(|node| node.node_id.clone())
+        .collect()
+}
+
+fn service_owner_is_publicly_reachable(
+    node: &NodeRecord,
+    classification: &NatClassification,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> bool {
+    classification.connectivity_state == NatConnectivityState::Public
+        && classification.public_state_is_supported()
+        && socket_addr_is_globally_routable(classification.local_addr)
+        && nat_classification_is_fresh(classification, now, policy.nat_classification_ttl_seconds)
+        && classification.confidence.is_finite()
+        && classification.confidence * 100.0
+            >= f32::from(policy.nat_classification_min_confidence_percent)
+        && node.endpoint_candidates.iter().any(|candidate| {
+            candidate.node_id == node.node_id
+                && candidate.kind == EndpointCandidateKind::PublicUdp
+                && candidate.addr.ip() == classification.local_addr.ip()
+                && candidate.validate_kind_address().is_ok()
+                && socket_addr_is_globally_routable(candidate.addr)
+                && endpoint_candidate_is_fresh(
+                    candidate,
+                    now,
+                    policy.endpoint_candidate_ttl_seconds,
+                )
+        })
+}
+
 fn service_instance_kind_count(
     instances: &[ServiceInstance],
     kind: BootstrapEndpointKind,
 ) -> usize {
-    let host_count = instances
+    instances
         .iter()
         .filter(|instance| {
             instance
@@ -5146,23 +5239,28 @@ fn service_instance_kind_count(
                 .iter()
                 .any(|endpoint| endpoint.kind == kind)
         })
-        .map(|instance| instance.owner_host_id.as_str())
+        .filter_map(service_instance_owner_node_id)
         .collect::<BTreeSet<_>>()
-        .len();
-    let endpoint_count = instances
-        .iter()
-        .filter_map(|instance| {
-            instance
-                .endpoints
+        .len()
+}
+
+fn full_service_owner_node_count(instances: &[ServiceInstance]) -> usize {
+    let mut kinds_by_owner = BTreeMap::<&NodeId, BTreeSet<BootstrapEndpointKind>>::new();
+    for instance in instances {
+        let Some(owner_node_id) = service_instance_owner_node_id(instance) else {
+            continue;
+        };
+        let kinds = kinds_by_owner.entry(owner_node_id).or_default();
+        kinds.extend(instance.endpoints.iter().map(|endpoint| endpoint.kind));
+    }
+    kinds_by_owner
+        .values()
+        .filter(|kinds| {
+            REQUIRED_HA_SERVICE_KINDS
                 .iter()
-                .find(|endpoint| endpoint.kind == kind)
+                .all(|kind| kinds.contains(kind))
         })
-        .map(|endpoint| {
-            canonical_bootstrap_endpoint_url(&endpoint.url).unwrap_or_else(|| endpoint.url.clone())
-        })
-        .collect::<BTreeSet<_>>()
-        .len();
-    host_count.min(endpoint_count)
+        .count()
 }
 
 fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneError> {
@@ -6639,11 +6737,12 @@ mod tests {
         updated_at: chrono::DateTime<Utc>,
         lease_expires_at: chrono::DateTime<Utc>,
     ) -> ServiceInstance {
+        let owner_node_id = node_id(instance_id);
         ServiceInstance {
             cluster_id: cluster_id.clone(),
             instance_id: instance_id.to_string(),
-            owner_host_id: instance_id.to_string(),
-            owner_node_id: None,
+            owner_host_id: owner_node_id.as_str().to_string(),
+            owner_node_id: Some(owner_node_id),
             endpoints: vec![
                 BootstrapEndpoint {
                     kind: BootstrapEndpointKind::ControlPlane,
@@ -6669,6 +6768,57 @@ mod tests {
             lease_expires_at,
             updated_at,
         }
+    }
+
+    async fn insert_eligible_service_node(
+        store: &InMemoryStore,
+        cluster_id: &ClusterId,
+        label: &str,
+        public_ip: Ipv4Addr,
+        observed_at: chrono::DateTime<Utc>,
+    ) -> Result<NodeId, ControlPlaneError> {
+        let mut node = node_record(label);
+        node.cluster_id = cluster_id.clone();
+        let public_addr = std::net::SocketAddr::from((public_ip, 51_820));
+        node.endpoint_candidates = vec![EndpointCandidate {
+            node_id: node.node_id.clone(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: public_addr,
+            observed_at,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        }];
+        let node_id = node.node_id.clone();
+        store.insert_node(node).await?;
+        store
+            .upsert_health(
+                node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: observed_at,
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        store
+            .upsert_nat_classification(
+                node_id.clone(),
+                NatClassification::from_observations(
+                    public_addr,
+                    vec![NatProbeObservation {
+                        local_addr: public_addr,
+                        stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                        reflexive_addr: public_addr,
+                        observed_at,
+                    }],
+                    observed_at,
+                ),
+            )
+            .await?;
+        Ok(node_id)
     }
 
     #[tokio::test]
@@ -8372,14 +8522,39 @@ mod tests {
     async fn service_directory_expires_members_and_requires_two_complete_public_nodes_for_ha(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-ha");
+        let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(
             ControlPlaneConfig::new(
                 cluster_id.clone(),
                 Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
             ),
-            Arc::new(InMemoryStore::default()),
+            store.clone(),
         );
         let now = Utc::now();
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "public-a",
+            Ipv4Addr::new(8, 8, 8, 10),
+            now,
+        )
+        .await?;
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "public-b",
+            Ipv4Addr::new(8, 8, 8, 11),
+            now,
+        )
+        .await?;
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "expired-public",
+            Ipv4Addr::new(8, 8, 8, 12),
+            now,
+        )
+        .await?;
 
         plane
             .advertise_service_instance(service_instance(
@@ -8441,7 +8616,9 @@ mod tests {
             now,
             now + Duration::seconds(30),
         );
-        colocated_public_b.owner_host_id = "public-a".to_string();
+        let public_a_node_id = node_id("public-a");
+        colocated_public_b.owner_host_id = public_a_node_id.as_str().to_string();
+        colocated_public_b.owner_node_id = Some(public_a_node_id);
         plane.advertise_service_instance(colocated_public_b).await?;
         let metrics = plane.metrics().await?;
         assert_eq!(metrics.active_service_host_count, 1);
@@ -8482,6 +8659,19 @@ mod tests {
         invalid_owner.owner_node_id = Some(NodeId::from_string("invalid owner"));
         assert!(plane
             .advertise_service_instance(invalid_owner)
+            .await
+            .is_err());
+
+        let mut missing_owner = service_instance(
+            &cluster_id,
+            "missing-owner",
+            "missing-owner.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        missing_owner.owner_node_id = None;
+        assert!(plane
+            .advertise_service_instance(missing_owner)
             .await
             .is_err());
 
@@ -8528,8 +8718,8 @@ mod tests {
         .endpoints;
         plane.advertise_service_instance(duplicate_urls).await?;
         let metrics = plane.metrics().await?;
-        assert_eq!(metrics.active_control_plane_count, 1);
-        assert!(!metrics.ha_ready);
+        assert_eq!(metrics.active_control_plane_count, 2);
+        assert!(metrics.ha_ready);
 
         let mut degraded = service_instance(
             &cluster_id,
@@ -8551,17 +8741,256 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_instance_withdrawal_removes_active_endpoint_immediately(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let cluster_id = ClusterId::from_string("cluster-withdrawal");
+    async fn split_service_owners_do_not_satisfy_ha() -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-split-service-ha");
+        let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(
             ControlPlaneConfig::new(
                 cluster_id.clone(),
                 Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
             ),
-            Arc::new(InMemoryStore::default()),
+            store.clone(),
         );
         let now = Utc::now();
+        for (index, label) in ["core-a", "core-b", "edge-a", "edge-b"]
+            .into_iter()
+            .enumerate()
+        {
+            insert_eligible_service_node(
+                store.as_ref(),
+                &cluster_id,
+                label,
+                Ipv4Addr::new(8, 8, 4, 10 + index as u8),
+                now,
+            )
+            .await?;
+            let mut instance = service_instance(
+                &cluster_id,
+                label,
+                &format!("{label}.example"),
+                now,
+                now + Duration::seconds(30),
+            );
+            if label.starts_with("core") {
+                instance.endpoints.retain(|endpoint| {
+                    matches!(
+                        endpoint.kind,
+                        BootstrapEndpointKind::ControlPlane
+                            | BootstrapEndpointKind::Signal
+                            | BootstrapEndpointKind::Stun
+                    )
+                });
+            } else {
+                instance.endpoints.retain(|endpoint| {
+                    matches!(
+                        endpoint.kind,
+                        BootstrapEndpointKind::Relay | BootstrapEndpointKind::WebUi
+                    )
+                });
+            }
+            plane.advertise_service_instance(instance).await?;
+        }
+
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.active_control_plane_count, 2);
+        assert_eq!(metrics.active_signal_count, 2);
+        assert_eq!(metrics.active_stun_count, 2);
+        assert_eq!(metrics.active_relay_count, 2);
+        assert_eq!(metrics.active_web_ui_count, 2);
+        assert!(!metrics.ha_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unregistered_and_foreign_service_owners_are_rejected_or_ignored(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-service-owner");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        let now = Utc::now();
+        let unregistered = service_instance(
+            &cluster_id,
+            "unregistered",
+            "unregistered.example",
+            now,
+            now + Duration::seconds(30),
+        );
+        assert!(matches!(
+            plane.advertise_service_instance(unregistered.clone()).await,
+            Err(ControlPlaneError::NodeNotFound(_))
+        ));
+
+        store.upsert_service_instance(unregistered).await?;
+        assert!(plane.service_directory().await?.instances.is_empty());
+        assert_eq!(plane.metrics().await?.active_service_instance_count, 0);
+
+        let mut foreign = node_record("foreign-owner");
+        foreign.cluster_id = ClusterId::from_string("other-cluster");
+        store.insert_node(foreign).await?;
+        assert!(matches!(
+            plane
+                .advertise_service_instance(service_instance(
+                    &cluster_id,
+                    "foreign-owner",
+                    "foreign.example",
+                    now,
+                    now + Duration::seconds(30),
+                ))
+                .await,
+            Err(ControlPlaneError::NodeNotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_or_unreachable_service_owners_are_excluded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-service-eligibility");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        let now = Utc::now();
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "eligible",
+            Ipv4Addr::new(8, 8, 4, 20),
+            now,
+        )
+        .await?;
+        let stale_node_id = insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "stale",
+            Ipv4Addr::new(8, 8, 4, 21),
+            now,
+        )
+        .await?;
+        let unreachable_node_id = insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "unreachable",
+            Ipv4Addr::new(8, 8, 4, 22),
+            now,
+        )
+        .await?;
+        store
+            .upsert_health(
+                stale_node_id,
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: now - Duration::seconds(91),
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        let private_addr = std::net::SocketAddr::from(([192, 168, 1, 20], 51_820));
+        store
+            .upsert_nat_classification(
+                unreachable_node_id,
+                NatClassification::from_observations(
+                    private_addr,
+                    vec![NatProbeObservation {
+                        local_addr: private_addr,
+                        stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                        reflexive_addr: std::net::SocketAddr::from(([8, 8, 4, 22], 51_820)),
+                        observed_at: now,
+                    }],
+                    now,
+                ),
+            )
+            .await?;
+        for label in ["eligible", "stale", "unreachable"] {
+            plane
+                .advertise_service_instance(service_instance(
+                    &cluster_id,
+                    label,
+                    &format!("{label}.example"),
+                    now,
+                    now + Duration::seconds(30),
+                ))
+                .await?;
+        }
+
+        let directory = plane.service_directory().await?;
+        assert_eq!(directory.instances.len(), 1);
+        assert_eq!(directory.instances[0].instance_id, "eligible");
+        let metrics = plane.metrics().await?;
+        assert_eq!(metrics.active_service_host_count, 1);
+        assert_eq!(metrics.active_control_plane_count, 1);
+        assert!(!metrics.ha_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ha_respects_configured_full_service_replica_count(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-configured-service-ha");
+        let store = Arc::new(InMemoryStore::default());
+        let mut config = ControlPlaneConfig::new(
+            cluster_id.clone(),
+            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+        );
+        config.service_ha_replica_count = 3;
+        let plane = ControlPlane::new(config, store.clone());
+        let now = Utc::now();
+        for (index, label) in ["public-a", "public-b", "public-c"].into_iter().enumerate() {
+            insert_eligible_service_node(
+                store.as_ref(),
+                &cluster_id,
+                label,
+                Ipv4Addr::new(8, 8, 4, 30 + index as u8),
+                now,
+            )
+            .await?;
+            plane
+                .advertise_service_instance(service_instance(
+                    &cluster_id,
+                    label,
+                    &format!("{label}.example"),
+                    now,
+                    now + Duration::seconds(30),
+                ))
+                .await?;
+            assert_eq!(plane.metrics().await?.ha_ready, index == 2);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_instance_withdrawal_removes_active_endpoint_immediately(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-withdrawal");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        let now = Utc::now();
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "dynamic-web",
+            Ipv4Addr::new(8, 8, 8, 20),
+            now,
+        )
+        .await?;
         let mut dynamic_web = service_instance(
             &cluster_id,
             "dynamic-web",
@@ -8586,14 +9015,23 @@ mod tests {
     async fn service_directory_retains_core_instance_when_web_leases_exceed_limit(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-core-retention");
+        let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(
             ControlPlaneConfig::new(
                 cluster_id.clone(),
                 Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
             ),
-            Arc::new(InMemoryStore::default()),
+            store.clone(),
         );
         let now = Utc::now();
+        let core_node_id = insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "core-a",
+            Ipv4Addr::new(8, 8, 8, 21),
+            now,
+        )
+        .await?;
         plane
             .advertise_service_instance(service_instance(
                 &cluster_id,
@@ -8614,6 +9052,8 @@ mod tests {
             dynamic_web
                 .endpoints
                 .retain(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi);
+            dynamic_web.owner_host_id = core_node_id.as_str().to_string();
+            dynamic_web.owner_node_id = Some(core_node_id.clone());
             plane.advertise_service_instance(dynamic_web).await?;
         }
 
@@ -8644,14 +9084,31 @@ mod tests {
     async fn enrollment_service_directory_keeps_only_recently_expired_instances(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-enrollment-directory");
+        let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(
             ControlPlaneConfig::new(
                 cluster_id.clone(),
                 Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
             ),
-            Arc::new(InMemoryStore::default()),
+            store.clone(),
         );
         let now = Utc::now();
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "public-a",
+            Ipv4Addr::new(8, 8, 8, 22),
+            now,
+        )
+        .await?;
+        insert_eligible_service_node(
+            store.as_ref(),
+            &cluster_id,
+            "public-b",
+            Ipv4Addr::new(8, 8, 8, 23),
+            now,
+        )
+        .await?;
         plane
             .advertise_service_instance(service_instance(
                 &cluster_id,
