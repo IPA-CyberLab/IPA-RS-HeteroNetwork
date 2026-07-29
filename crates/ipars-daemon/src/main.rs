@@ -13825,7 +13825,7 @@ fn public_web_gateway_caddyfile(
         }
         let _ = writeln!(
             caddyfile,
-            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/web-ui/auth/refresh /v1/web-ui/auth/logout /v1/install/* /v1/database-autopilot/nodes /v1/keycloak-autopilot/reconcile /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}",
+            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/web-ui/auth/refresh /v1/web-ui/auth/logout /v1/install/* /v1/heartbeat /v1/neighbors/query /v1/overlay-paths/query /v1/database-autopilot/nodes /v1/keycloak-autopilot/reconcile /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}",
             config.upstream, config.proxy_token
         );
         if let (Some(oidc_upstream), Some(host)) =
@@ -20635,12 +20635,20 @@ fn runtime_control_plane_urls(
     {
         fallback.to_vec()
     } else {
-        state
+        let mut urls = state
             .bootstrap_endpoints
             .iter()
             .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
             .map(|endpoint| endpoint.url.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        urls.extend(
+            state
+                .bootstrap_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
+                .map(|endpoint| endpoint.url.clone()),
+        );
+        urls
     };
     normalize_http_base_urls(base_urls, "runtime control-plane endpoint")
 }
@@ -21312,6 +21320,9 @@ mod tests {
         assert!(public.contains("/v1/web-ui/auth/refresh"));
         assert!(public.contains("/v1/web-ui/auth/logout"));
         assert!(public.contains("/v1/install/*"));
+        assert!(public.contains("/v1/heartbeat"));
+        assert!(public.contains("/v1/neighbors/query"));
+        assert!(public.contains("/v1/overlay-paths/query"));
         assert!(public.contains("/v1/database-autopilot/nodes"));
         assert!(public.contains("/v1/keycloak-autopilot/reconcile"));
         assert!(public.contains("/v1/admin/*"));
@@ -40796,12 +40807,19 @@ exec sleep 60
                 url: "udp://active.example:3478".to_string(),
                 kind: BootstrapEndpointKind::Stun,
             },
+            BootstrapEndpoint {
+                url: "https://console.active.example".to_string(),
+                kind: BootstrapEndpointKind::WebUi,
+            },
         ];
         runtime.merge_active_bootstrap_endpoints(&active, Utc::now())?;
 
         assert_eq!(
             runtime_control_plane_urls(&runtime, &control_plane_fallback)?,
-            vec!["https://active.example:8443".to_string()]
+            vec![
+                "https://active.example:8443".to_string(),
+                "https://console.active.example".to_string(),
+            ]
         );
         assert_eq!(
             runtime_signal_urls(&runtime, &signal_fallback)?,

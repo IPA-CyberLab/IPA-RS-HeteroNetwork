@@ -353,6 +353,9 @@ fn gateway_web_ui_routes() -> Router<AgentHttpState> {
         .route("/v1/web-ui/auth/refresh", post(refresh_web_ui_session))
         .route("/v1/web-ui/auth/logout", post(logout_web_ui_session))
         .route("/v1/install/{*path}", get(proxy_management_request))
+        .route("/v1/heartbeat", post(proxy_management_request))
+        .route("/v1/neighbors/query", post(proxy_management_request))
+        .route("/v1/overlay-paths/query", post(proxy_management_request))
         .route(
             "/v1/database-autopilot/nodes",
             post(proxy_management_request),
@@ -1658,6 +1661,9 @@ async fn require_web_ui_access(
         (&Method::POST, "/v1/web-ui/auth/refresh") => true,
         (&Method::POST, "/v1/web-ui/auth/logout") => true,
         (&Method::GET, path) if path.starts_with("/v1/install/") => true,
+        (&Method::POST, "/v1/heartbeat" | "/v1/neighbors/query" | "/v1/overlay-paths/query") => {
+            true
+        }
         (&Method::POST, "/v1/database-autopilot/nodes" | "/v1/keycloak-autopilot/reconcile") => {
             true
         }
@@ -4860,6 +4866,9 @@ mod tests {
             .route("/ui/config", get(web_ui_test_config))
             .route("/v1/admin/overview", any(web_ui_test_admin))
             .route("/v1/install/test", get(web_ui_test_install))
+            .route("/v1/heartbeat", post(web_ui_test_admin))
+            .route("/v1/neighbors/query", post(web_ui_test_admin))
+            .route("/v1/overlay-paths/query", post(web_ui_test_admin))
             .route("/v1/database-autopilot/nodes", post(web_ui_test_admin))
             .route("/v1/keycloak-autopilot/reconcile", post(web_ui_test_admin))
             .route("/v1/clients/peers/query", post(web_ui_test_admin))
@@ -5239,6 +5248,9 @@ mod tests {
         );
 
         for path in [
+            "/v1/heartbeat",
+            "/v1/neighbors/query",
+            "/v1/overlay-paths/query",
             "/v1/database-autopilot/nodes",
             "/v1/keycloak-autopilot/reconcile",
         ] {
