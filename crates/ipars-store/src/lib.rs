@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ipars_control_plane::{
     ensure_token_definition_matches, overlay_route_catalog_epoch, ControlPlaneError,
-    ControlPlaneStore, HeartbeatStoreUpdate, RejoinNodeStoreUpdate, RemovedNode, TokenLedger,
+    ControlPlaneStore, HeartbeatStoreUpdate, KeycloakCandidateLease, RejoinNodeStoreUpdate,
+    RemovedNode, TokenLedger,
 };
 use ipars_types::api::ClientGatewaySelection;
 use ipars_types::{
@@ -15,6 +16,7 @@ use ipars_types::{
 use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
 
 const PATH_PAIR_QUERY_CHUNK_SIZE: usize = 200;
+const MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct SqliteControlPlaneStore {
@@ -199,6 +201,29 @@ impl SqliteControlPlaneStore {
                 UPDATE service_instances
                 SET record_json = json_set(record_json, '$.owner_node_id', NULL)
                 WHERE json_type(record_json, '$.owner_node_id') IS NULL;
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS keycloak_candidate_leases (
+                    cluster_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    lease_expires_at INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (cluster_id, node_id)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        self.pool
+            .execute(
+                r#"
+                CREATE INDEX IF NOT EXISTS keycloak_candidate_leases_expiry_idx
+                ON keycloak_candidate_leases(cluster_id, lease_expires_at);
                 "#,
             )
             .await
@@ -1137,6 +1162,76 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         .collect()
     }
 
+    async fn upsert_keycloak_candidate(
+        &self,
+        candidate: KeycloakCandidateLease,
+    ) -> Result<(), ControlPlaneError> {
+        let lease_expires_at = keycloak_candidate_expiry_nanos(&candidate.lease_expires_at)?;
+        let record_json = serde_json::to_string(&candidate).map_err(json_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO keycloak_candidate_leases
+                (cluster_id, node_id, lease_expires_at, record_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(cluster_id, node_id) DO UPDATE SET
+                lease_expires_at = excluded.lease_expires_at,
+                record_json = excluded.record_json
+            "#,
+        )
+        .bind(candidate.cluster_id.as_str())
+        .bind(candidate.node_id.as_str())
+        .bind(lease_expires_at)
+        .bind(record_json)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn remove_keycloak_candidate(
+        &self,
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+    ) -> Result<bool, ControlPlaneError> {
+        let result = sqlx::query(
+            "DELETE FROM keycloak_candidate_leases WHERE cluster_id = ?1 AND node_id = ?2",
+        )
+        .bind(cluster_id.as_str())
+        .bind(node_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_keycloak_candidates(
+        &self,
+        cluster_id: &ClusterId,
+        lease_cutoff: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<KeycloakCandidateLease>, ControlPlaneError> {
+        let lease_cutoff = keycloak_candidate_expiry_nanos(&lease_cutoff)?;
+        let limit = keycloak_candidate_query_limit(limit)?;
+        sqlx::query(
+            r#"
+            SELECT cluster_id, node_id, lease_expires_at, record_json
+            FROM keycloak_candidate_leases
+            WHERE cluster_id = ?1 AND lease_expires_at > ?2
+            ORDER BY node_id
+            LIMIT ?3
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(lease_cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sql_error)?
+        .into_iter()
+        .map(row_to_keycloak_candidate)
+        .collect()
+    }
+
     async fn upsert_client_gateway_selection(
         &self,
         selection: ClientGatewaySelection,
@@ -1602,6 +1697,29 @@ impl PostgresControlPlaneStore {
                 UPDATE service_instances
                 SET record_json = record_json || '{"owner_node_id": null}'::jsonb
                 WHERE NOT (record_json ? 'owner_node_id');
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS keycloak_candidate_leases (
+                    cluster_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    lease_expires_at BIGINT NOT NULL,
+                    record_json JSONB NOT NULL,
+                    PRIMARY KEY (cluster_id, node_id)
+                );
+                "#,
+            )
+            .await
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                r#"
+                CREATE INDEX IF NOT EXISTS keycloak_candidate_leases_expiry_idx
+                ON keycloak_candidate_leases(cluster_id, lease_expires_at);
                 "#,
             )
             .await
@@ -2537,6 +2655,76 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         .collect()
     }
 
+    async fn upsert_keycloak_candidate(
+        &self,
+        candidate: KeycloakCandidateLease,
+    ) -> Result<(), ControlPlaneError> {
+        let lease_expires_at = keycloak_candidate_expiry_nanos(&candidate.lease_expires_at)?;
+        let record_json = serde_json::to_value(&candidate).map_err(json_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO keycloak_candidate_leases
+                (cluster_id, node_id, lease_expires_at, record_json)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT(cluster_id, node_id) DO UPDATE SET
+                lease_expires_at = excluded.lease_expires_at,
+                record_json = excluded.record_json
+            "#,
+        )
+        .bind(candidate.cluster_id.as_str())
+        .bind(candidate.node_id.as_str())
+        .bind(lease_expires_at)
+        .bind(record_json)
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    async fn remove_keycloak_candidate(
+        &self,
+        cluster_id: &ClusterId,
+        node_id: &NodeId,
+    ) -> Result<bool, ControlPlaneError> {
+        let result = sqlx::query(
+            "DELETE FROM keycloak_candidate_leases WHERE cluster_id = $1 AND node_id = $2",
+        )
+        .bind(cluster_id.as_str())
+        .bind(node_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(sql_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_keycloak_candidates(
+        &self,
+        cluster_id: &ClusterId,
+        lease_cutoff: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<KeycloakCandidateLease>, ControlPlaneError> {
+        let lease_cutoff = keycloak_candidate_expiry_nanos(&lease_cutoff)?;
+        let limit = keycloak_candidate_query_limit(limit)?;
+        sqlx::query(
+            r#"
+            SELECT cluster_id, node_id, lease_expires_at, record_json
+            FROM keycloak_candidate_leases
+            WHERE cluster_id = $1 AND lease_expires_at > $2
+            ORDER BY node_id
+            LIMIT $3
+            "#,
+        )
+        .bind(cluster_id.as_str())
+        .bind(lease_cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sql_error)?
+        .into_iter()
+        .map(pg_row_to_keycloak_candidate)
+        .collect()
+    }
+
     async fn upsert_client_gateway_selection(
         &self,
         selection: ClientGatewaySelection,
@@ -3033,6 +3221,17 @@ fn row_to_service_instance(
     serde_json::from_str(&record_json).map_err(json_error)
 }
 
+fn row_to_keycloak_candidate(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<KeycloakCandidateLease, ControlPlaneError> {
+    let cluster_id: String = row.get("cluster_id");
+    let node_id: String = row.get("node_id");
+    let lease_expires_at: i64 = row.get("lease_expires_at");
+    let record_json: String = row.get("record_json");
+    let candidate = serde_json::from_str(&record_json).map_err(json_error)?;
+    validate_keycloak_candidate_row(candidate, &cluster_id, &node_id, lease_expires_at)
+}
+
 fn row_to_client_gateway_selection(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<ClientGatewaySelection, ControlPlaneError> {
@@ -3095,6 +3294,17 @@ fn pg_row_to_service_instance(
 ) -> Result<ServiceInstance, ControlPlaneError> {
     let record_json: serde_json::Value = row.get("record_json");
     serde_json::from_value(record_json).map_err(json_error)
+}
+
+fn pg_row_to_keycloak_candidate(
+    row: sqlx::postgres::PgRow,
+) -> Result<KeycloakCandidateLease, ControlPlaneError> {
+    let cluster_id: String = row.get("cluster_id");
+    let node_id: String = row.get("node_id");
+    let lease_expires_at: i64 = row.get("lease_expires_at");
+    let record_json: serde_json::Value = row.get("record_json");
+    let candidate = serde_json::from_value(record_json).map_err(json_error)?;
+    validate_keycloak_candidate_row(candidate, &cluster_id, &node_id, lease_expires_at)
 }
 
 fn pg_row_to_client_gateway_selection(row: sqlx::postgres::PgRow) -> ClientGatewaySelection {
@@ -3184,6 +3394,48 @@ fn parse_utc_timestamp(value: &str) -> Result<DateTime<Utc>, ControlPlaneError> 
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
         .map_err(|error| ControlPlaneError::Store(error.to_string()))
+}
+
+fn keycloak_candidate_expiry_nanos(timestamp: &DateTime<Utc>) -> Result<i64, ControlPlaneError> {
+    timestamp.timestamp_nanos_opt().ok_or_else(|| {
+        ControlPlaneError::Store(
+            "Keycloak candidate lease expiration is outside the supported timestamp range"
+                .to_string(),
+        )
+    })
+}
+
+fn keycloak_candidate_query_limit(limit: usize) -> Result<i64, ControlPlaneError> {
+    if !(1..=MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT).contains(&limit) {
+        return Err(ControlPlaneError::Store(format!(
+            "Keycloak candidate query limit must be between 1 and {MAX_KEYCLOAK_CANDIDATE_QUERY_LIMIT}"
+        )));
+    }
+    Ok(limit as i64)
+}
+
+fn validate_keycloak_candidate_row(
+    candidate: KeycloakCandidateLease,
+    cluster_id: &str,
+    node_id: &str,
+    lease_expires_at: i64,
+) -> Result<KeycloakCandidateLease, ControlPlaneError> {
+    if candidate.cluster_id.as_str() != cluster_id {
+        return Err(ControlPlaneError::Store(
+            "stored Keycloak candidate cluster ID does not match its record".to_string(),
+        ));
+    }
+    if candidate.node_id.as_str() != node_id {
+        return Err(ControlPlaneError::Store(
+            "stored Keycloak candidate node ID does not match its record".to_string(),
+        ));
+    }
+    if keycloak_candidate_expiry_nanos(&candidate.lease_expires_at)? != lease_expires_at {
+        return Err(ControlPlaneError::Store(
+            "stored Keycloak candidate lease expiration does not match its record".to_string(),
+        ));
+    }
+    Ok(candidate)
 }
 
 fn sql_error(error: sqlx::Error) -> ControlPlaneError {
@@ -3280,6 +3532,25 @@ mod tests {
             active_sessions: 7,
             max_mbps: 1000,
             e2e_only: true,
+        }
+    }
+
+    fn keycloak_candidate(
+        cluster_id: &ClusterId,
+        node_id: &str,
+        host_octet: u8,
+        ready: bool,
+        lease_expires_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> KeycloakCandidateLease {
+        KeycloakCandidateLease {
+            cluster_id: cluster_id.clone(),
+            node_id: NodeId::from_string(node_id),
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, host_octet))),
+            version: "26.6.4".to_string(),
+            ready,
+            lease_expires_at,
+            updated_at,
         }
     }
 
@@ -4241,6 +4512,149 @@ mod tests {
             .list_service_instances(&cluster_id)
             .await?
             .is_empty());
+
+        drop(store_a);
+        drop(store_b);
+        let _ = std::fs::remove_file(database_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sqlite_keycloak_candidate_leases_are_shared_filtered_and_mutable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (database_url, database_path) = temp_sqlite_url("keycloak-candidates");
+        let cluster_id = ClusterId::from_string("cluster-ha");
+        let other_cluster_id = ClusterId::from_string("cluster-other");
+        let now = Utc::now();
+        let node_a = keycloak_candidate(
+            &cluster_id,
+            "node-a",
+            1,
+            true,
+            now + Duration::seconds(30),
+            now,
+        );
+        let node_b = keycloak_candidate(
+            &cluster_id,
+            "node-b",
+            2,
+            false,
+            now + Duration::seconds(40),
+            now,
+        );
+        let expired = keycloak_candidate(
+            &cluster_id,
+            "node-expired",
+            3,
+            true,
+            now - Duration::seconds(1),
+            now,
+        );
+        let cutoff_boundary = keycloak_candidate(&cluster_id, "node-cutoff", 4, true, now, now);
+        let other_cluster = keycloak_candidate(
+            &other_cluster_id,
+            "node-a",
+            5,
+            true,
+            now + Duration::seconds(30),
+            now,
+        );
+        let store_a = SqliteControlPlaneStore::connect(&database_url).await?;
+        let store_b = SqliteControlPlaneStore::connect(&database_url).await?;
+
+        store_a.upsert_keycloak_candidate(node_b.clone()).await?;
+        store_a.upsert_keycloak_candidate(expired).await?;
+        store_b.upsert_keycloak_candidate(node_a.clone()).await?;
+        store_b.upsert_keycloak_candidate(cutoff_boundary).await?;
+        store_b
+            .upsert_keycloak_candidate(other_cluster.clone())
+            .await?;
+
+        assert_eq!(
+            store_b
+                .list_keycloak_candidates(&cluster_id, now, 64)
+                .await?,
+            vec![node_a.clone(), node_b.clone()]
+        );
+        assert_eq!(
+            store_a
+                .list_keycloak_candidates(&cluster_id, now, 1)
+                .await?,
+            vec![node_a.clone()]
+        );
+        assert_eq!(
+            store_a
+                .list_keycloak_candidates(&other_cluster_id, now, 64)
+                .await?,
+            vec![other_cluster]
+        );
+        for invalid_limit in [0, 65] {
+            let error = store_a
+                .list_keycloak_candidates(&cluster_id, now, invalid_limit)
+                .await
+                .expect_err("invalid candidate query limit must fail");
+            assert!(
+                matches!(error, ControlPlaneError::Store(message) if message.contains("between 1 and 64"))
+            );
+        }
+
+        let renewed = KeycloakCandidateLease {
+            ready: true,
+            lease_expires_at: now + Duration::seconds(60),
+            updated_at: now + Duration::seconds(1),
+            ..node_b
+        };
+        store_b.upsert_keycloak_candidate(renewed.clone()).await?;
+        assert_eq!(
+            store_a
+                .list_keycloak_candidates(&cluster_id, now, 64)
+                .await?,
+            vec![node_a.clone(), renewed.clone()]
+        );
+        let structured_expiry = sqlx::query_scalar::<_, i64>(
+            "SELECT lease_expires_at FROM keycloak_candidate_leases WHERE cluster_id = ?1 AND node_id = ?2",
+        )
+        .bind(cluster_id.as_str())
+        .bind(renewed.node_id.as_str())
+        .fetch_one(&store_a.pool)
+        .await?;
+        assert_eq!(
+            structured_expiry,
+            keycloak_candidate_expiry_nanos(&renewed.lease_expires_at)?
+        );
+
+        sqlx::query(
+            "UPDATE keycloak_candidate_leases SET lease_expires_at = lease_expires_at + 1 WHERE cluster_id = ?1 AND node_id = ?2",
+        )
+        .bind(cluster_id.as_str())
+        .bind(renewed.node_id.as_str())
+        .execute(&store_a.pool)
+        .await?;
+        assert!(matches!(
+            store_a
+                .list_keycloak_candidates(&cluster_id, now, 64)
+                .await,
+            Err(ControlPlaneError::Store(message))
+                if message.contains("lease expiration does not match")
+        ));
+        store_b.upsert_keycloak_candidate(renewed.clone()).await?;
+
+        assert!(
+            store_a
+                .remove_keycloak_candidate(&cluster_id, &node_a.node_id)
+                .await?
+        );
+        assert!(
+            !store_b
+                .remove_keycloak_candidate(&cluster_id, &node_a.node_id)
+                .await?
+        );
+        assert_eq!(
+            store_b
+                .list_keycloak_candidates(&cluster_id, now, 64)
+                .await?,
+            vec![renewed]
+        );
 
         drop(store_a);
         drop(store_b);

@@ -154,6 +154,9 @@
     "Relay fallback disabled": "リレーフォールバック無効",
     "High availability": "高可用性",
     "Ready": "準備完了",
+    "Assigned": "割当済み",
+    "Warming": "起動中",
+    "Not assigned": "未割当",
     "Degraded": "縮退",
     "Connection health": "接続状態",
     "Selected path distribution": "選択中経路の分布",
@@ -1348,6 +1351,7 @@
     { kind: "signal", label: "Signal" },
     { kind: "stun", label: "STUN" },
     { kind: "relay", label: "Relay" },
+    { kind: "keycloak", label: "Keycloak" },
     { kind: "web_ui", label: "Web UI" }
   ];
 
@@ -1388,6 +1392,16 @@
   }
 
   function renderNodeServiceStatus(leasesByNodeId, nodeId, kind) {
+    if (kind === "keycloak") {
+      var placement = state.overview && state.overview.keycloak_placement || {};
+      var replicas = Array.isArray(placement.replicas) ? placement.replicas : [];
+      var replica = replicas.find(function (entry) { return entry.node_id === nodeId; });
+      if (!replica) return statusPill("not_running", "Not assigned");
+      var title = replica.version + " / " + formatTime(replica.lease_expires_at);
+      return '<span title="' + escapeHtml(title) + '">'
+        + statusPill(replica.ready ? "healthy" : "degraded", replica.ready ? "Ready" : "Warming")
+        + "</span>";
+    }
     var endpoints = serviceEndpointsForNode(leasesByNodeId, nodeId, kind);
     if (!endpoints.length) return statusPill("not_running", "No active lease");
     return '<span title="' + escapeHtml(endpoints.join("\n")) + '">' + statusPill("healthy", "Lease active") + "</span>";
@@ -1414,10 +1428,15 @@
     if (!state.token || state.loading || state.policyDirty) return Promise.resolve();
     var overviewGeneration = authSessionGeneration;
     state.loading = true;
-    return api("/v1/admin/overview").then(function (overview) {
+    return Promise.all([
+      api("/v1/admin/overview"),
+      api("/v1/admin/keycloak-placement").catch(function () { return null; })
+    ]).then(function (responses) {
+      var overview = responses[0];
       if (overviewGeneration !== authSessionGeneration || !state.token) {
         throw sessionChangedError();
       }
+      overview.keycloak_placement = responses[1];
       state.overview = overview;
       $("auth-error").textContent = "";
       showDashboard();
@@ -2362,6 +2381,10 @@
       return (instance.endpoints || []).some(function (endpoint) { return endpoint.kind === "web_ui"; });
     }).length;
     var activeWebUiCount = metrics.active_web_ui_count == null ? derivedWebUiCount : metrics.active_web_ui_count;
+    var keycloakPlacement = overview.keycloak_placement || {};
+    var keycloakReplicas = Array.isArray(keycloakPlacement.replicas) ? keycloakPlacement.replicas : [];
+    var keycloakReadyCount = keycloakReplicas.filter(function (replica) { return replica.ready; }).length;
+    var keycloakDesiredCount = keycloakPlacement.desired_replicas || 3;
     var serviceKinds = [
       ["Control plane", metrics.active_control_plane_count || 0],
       ["Signal", metrics.active_signal_count || 0],
@@ -2374,7 +2397,11 @@
       return '<div class="policy-summary-row"><span>' + escapeHtml(entry[0]) + '</span>'
         + statusPill(count >= 2 ? "healthy" : count === 1 ? "degraded" : "unreachable", count + " active")
         + '</div>';
-    }).join("");
+    }).join("") + '<div class="policy-summary-row"><span>Keycloak</span>'
+      + statusPill(
+        keycloakReadyCount >= keycloakDesiredCount ? "healthy" : keycloakReadyCount ? "degraded" : "unreachable",
+        keycloakReadyCount + " / " + keycloakDesiredCount + " ready"
+      ) + "</div>";
     var instanceRows = (directory.instances || []).map(function (instance) {
       var services = (instance.endpoints || []).map(function (endpoint) {
         return translateDynamicText(pretty(endpoint.kind));

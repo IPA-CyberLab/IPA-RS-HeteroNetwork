@@ -4156,6 +4156,17 @@ EOF
   if validate_bundle_directory "$legacy_bundle" >/dev/null 2>&1; then
     die "database bundle without an underlay contract was accepted"
   fi
+  rm -rf "$legacy_bundle"
+  local missing_secret_bundle digest_secret
+  for digest_secret in keycloak keycloak-bootstrap-admin; do
+    missing_secret_bundle="$state_dir/missing-${digest_secret}-bundle"
+    cp -a "$extracted" "$missing_secret_bundle"
+    rm "$missing_secret_bundle/secrets/${digest_secret}.password"
+    if validate_bundle_directory "$missing_secret_bundle" >/dev/null 2>&1; then
+      die "database bundle without required $digest_secret credential was accepted"
+    fi
+    rm -rf "$missing_secret_bundle"
+  done
   local malicious="$state_dir/malicious.tar.gz"
   python3 - "$malicious" <<'PY'
 import io

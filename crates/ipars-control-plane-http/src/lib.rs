@@ -35,7 +35,7 @@ use ipars_types::{
     BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, JoinTokenClaims, KeyId,
     NatConnectivityState, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath,
     OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag,
-    TokenLedgerMetrics, TokenPolicy, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    TokenLedgerMetrics, TokenPolicy, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
@@ -76,6 +76,12 @@ const MAX_DATABASE_AUTOPILOT_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_DATABASE_AUTOPILOT_MEMBER_IDS: usize = 32;
 const MAX_DATABASE_AUTOPILOT_CANDIDATES: usize = 64;
 const DATABASE_AUTOPILOT_REGISTRY_CACHE_TTL: Duration = Duration::from_secs(1);
+const MAX_KEYCLOAK_AUTOPILOT_REQUEST_BYTES: usize = 4 * 1024;
+const KEYCLOAK_AUTOPILOT_VERSION: &str = "26.6.4";
+const KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS: usize = 3;
+const KEYCLOAK_AUTOPILOT_MAX_CANDIDATES: usize = 64;
+const KEYCLOAK_AUTOPILOT_LEASE_SECONDS: u64 = 45;
+const KEYCLOAK_AUTOPILOT_RECONCILE_SECONDS: u64 = 15;
 const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
@@ -535,7 +541,22 @@ where
                 bearer_token,
                 require_database_autopilot_bearer,
             ));
-        protocol.merge(database_autopilot)
+        let keycloak_bearer_token: Arc<str> = Arc::from(derive_node_enrollment_cluster_secret(
+            enrollment,
+            &state.plane.config().cluster_id,
+            b"heteronetwork-keycloak-autopilot-v1",
+        ));
+        let keycloak_autopilot = Router::new()
+            .route(
+                "/v1/keycloak-autopilot/reconcile",
+                post(keycloak_autopilot_reconcile::<S, L>)
+                    .layer(DefaultBodyLimit::max(MAX_KEYCLOAK_AUTOPILOT_REQUEST_BYTES)),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                keycloak_bearer_token,
+                require_keycloak_autopilot_bearer,
+            ));
+        protocol.merge(database_autopilot).merge(keycloak_autopilot)
     } else {
         protocol
     };
@@ -548,6 +569,10 @@ where
         .route("/v1/admin/overview", get(admin_overview::<S, L>))
         .route("/v1/admin/topology", get(admin_topology::<S, L>))
         .route("/v1/admin/services", get(admin_services::<S, L>))
+        .route(
+            "/v1/admin/keycloak-placement",
+            get(admin_keycloak_placement::<S, L>),
+        )
         .route("/v1/admin/nodes", get(admin_nodes::<S, L>))
         .route("/v1/admin/paths", get(admin_paths::<S, L>))
         .route(
@@ -4858,6 +4883,46 @@ struct DatabaseAutopilotRegistryRequest {
     member_node_ids: Vec<NodeId>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeycloakAutopilotRequest {
+    node_id: NodeId,
+    vpn_ip: VpnIp,
+    eligible: bool,
+    ready: bool,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KeycloakAutopilotReplica {
+    node_id: String,
+    vpn_ip: String,
+    version: String,
+    ready: bool,
+    lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeycloakAutopilotResponse {
+    cluster_id: String,
+    placement_id: String,
+    desired_replicas: usize,
+    lease_ttl_seconds: u64,
+    reconcile_after_seconds: u64,
+    assigned: bool,
+    replicas: Vec<KeycloakAutopilotReplica>,
+    generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeycloakAdminPlacementResponse {
+    cluster_id: String,
+    placement_id: String,
+    desired_replicas: usize,
+    replicas: Vec<KeycloakAutopilotReplica>,
+    generated_at: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 struct DatabaseAutopilotRegistrySnapshot {
     loaded_at: Instant,
@@ -5039,6 +5104,68 @@ where
     }))
 }
 
+async fn keycloak_autopilot_reconcile<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<KeycloakAutopilotRequest>,
+) -> Result<Json<KeycloakAutopilotResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    if request.version != KEYCLOAK_AUTOPILOT_VERSION {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "Keycloak candidate version must be {KEYCLOAK_AUTOPILOT_VERSION}"
+        ))
+        .into());
+    }
+    if !request.eligible && request.ready {
+        return Err(ControlPlaneError::InvalidClusterPolicy(
+            "an ineligible Keycloak candidate cannot report ready".to_string(),
+        )
+        .into());
+    }
+    let generated_at = Utc::now();
+    let placement = state
+        .plane
+        .reconcile_keycloak_placement(
+            &request.node_id,
+            request.vpn_ip,
+            &request.version,
+            request.eligible,
+            request.ready,
+            Duration::from_secs(KEYCLOAK_AUTOPILOT_LEASE_SECONDS),
+            KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
+            KEYCLOAK_AUTOPILOT_MAX_CANDIDATES,
+            generated_at,
+        )
+        .await?;
+    let assigned = placement
+        .replicas
+        .iter()
+        .any(|replica| replica.node_id == request.node_id);
+    let replicas = placement
+        .replicas
+        .into_iter()
+        .map(|replica| KeycloakAutopilotReplica {
+            node_id: replica.node_id.to_string(),
+            vpn_ip: replica.vpn_ip.to_string(),
+            version: replica.version,
+            ready: replica.ready,
+            lease_expires_at: replica.lease_expires_at,
+        })
+        .collect();
+    Ok(Json(KeycloakAutopilotResponse {
+        cluster_id: state.plane.config().cluster_id.to_string(),
+        placement_id: placement.placement_id,
+        desired_replicas: KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
+        lease_ttl_seconds: KEYCLOAK_AUTOPILOT_LEASE_SECONDS,
+        reconcile_after_seconds: KEYCLOAK_AUTOPILOT_RECONCILE_SECONDS,
+        assigned,
+        replicas,
+        generated_at,
+    }))
+}
+
 async fn admin_node_snapshot<S>(
     plane: &ControlPlane<S>,
 ) -> Result<Vec<ControlPlaneNodeOverview>, ControlPlaneError>
@@ -5097,6 +5224,42 @@ where
     L: TokenLedger,
 {
     Ok(Json(state.plane.service_directory().await?))
+}
+
+async fn admin_keycloak_placement<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+) -> Result<Json<KeycloakAdminPlacementResponse>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let generated_at = Utc::now();
+    let placement = state
+        .plane
+        .keycloak_placement(
+            KEYCLOAK_AUTOPILOT_VERSION,
+            KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
+            KEYCLOAK_AUTOPILOT_MAX_CANDIDATES,
+            generated_at,
+        )
+        .await?;
+    Ok(Json(KeycloakAdminPlacementResponse {
+        cluster_id: state.plane.config().cluster_id.to_string(),
+        placement_id: placement.placement_id,
+        desired_replicas: KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS,
+        replicas: placement
+            .replicas
+            .into_iter()
+            .map(|replica| KeycloakAutopilotReplica {
+                node_id: replica.node_id.to_string(),
+                vpn_ip: replica.vpn_ip.to_string(),
+                version: replica.version,
+                ready: replica.ready,
+                lease_expires_at: replica.lease_expires_at,
+            })
+            .collect(),
+        generated_at,
+    }))
 }
 
 async fn admin_nodes<S, L>(
@@ -5224,6 +5387,25 @@ async fn require_database_autopilot_bearer(
             [(header::WWW_AUTHENTICATE, "Bearer")],
             Json(ErrorResponse {
                 error: "database autopilot API bearer token was rejected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn require_keycloak_autopilot_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = bearer_token_from_headers(request.headers());
+    if !provided.is_some_and(|provided| operator_api_token_matches(&expected, provided)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "Keycloak autopilot API bearer token was rejected".to_string(),
             }),
         )
             .into_response();
@@ -7647,6 +7829,18 @@ mod tests {
             .register_with_claims(gateway_claims, gateway_registration)
             .await?
             .node;
+        store
+            .upsert_health(
+                gateway.node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: Utc::now(),
+                    latency_ms: Some(1.0),
+                    relay_load: Some(0.0),
+                    message: None,
+                },
+            )
+            .await?;
 
         let mut key_ring = IssuerKeyRing::default();
         key_ring.insert_node_enrollment_key(
@@ -7698,6 +7892,11 @@ mod tests {
             &enrollment,
             &cluster_id,
             b"heteronetwork-postgres-ha-autopilot-v1",
+        );
+        let keycloak_autopilot_bearer = derive_node_enrollment_cluster_secret(
+            &enrollment,
+            &cluster_id,
+            b"heteronetwork-keycloak-autopilot-v1",
         );
         let app = router(
             ControlPlaneHttpState::new(plane.clone(), join_service)
@@ -7753,6 +7952,77 @@ mod tests {
             gateway.node_id.as_str()
         );
         assert_eq!(authenticated_registry["nodes"][0]["active"], true);
+
+        let keycloak_request = serde_json::to_vec(&serde_json::json!({
+            "node_id": gateway.node_id.as_str(),
+            "vpn_ip": gateway.vpn_ip.to_string(),
+            "eligible": true,
+            "ready": false,
+            "version": KEYCLOAK_AUTOPILOT_VERSION
+        }))?;
+        let unauthenticated_keycloak = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(keycloak_request.clone()))?,
+            )
+            .await?;
+        assert_eq!(unauthenticated_keycloak.status(), StatusCode::UNAUTHORIZED);
+        let authenticated_keycloak = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keycloak-autopilot/reconcile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {keycloak_autopilot_bearer}"),
+                    )
+                    .body(Body::from(keycloak_request))?,
+            )
+            .await?;
+        assert_eq!(authenticated_keycloak.status(), StatusCode::OK);
+        let authenticated_keycloak =
+            axum::body::to_bytes(authenticated_keycloak.into_body(), usize::MAX).await?;
+        let authenticated_keycloak: Value = serde_json::from_slice(&authenticated_keycloak)?;
+        assert_eq!(authenticated_keycloak["cluster_id"], cluster_id.as_str());
+        assert_eq!(
+            authenticated_keycloak["desired_replicas"],
+            KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS
+        );
+        assert_eq!(authenticated_keycloak["assigned"], true);
+        assert_eq!(
+            authenticated_keycloak["replicas"][0]["node_id"],
+            gateway.node_id.as_str()
+        );
+        assert_eq!(authenticated_keycloak["replicas"][0]["ready"], false);
+        let admin_keycloak = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/keycloak-placement")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(admin_keycloak.status(), StatusCode::OK);
+        let admin_keycloak = axum::body::to_bytes(admin_keycloak.into_body(), usize::MAX).await?;
+        let admin_keycloak: Value = serde_json::from_slice(&admin_keycloak)?;
+        assert_eq!(
+            admin_keycloak["placement_id"],
+            authenticated_keycloak["placement_id"]
+        );
+        assert_eq!(
+            admin_keycloak["replicas"][0]["node_id"],
+            gateway.node_id.as_str()
+        );
 
         let too_many_member_ids = (0..=MAX_DATABASE_AUTOPILOT_MEMBER_IDS)
             .map(|index| format!("database-member-{index}"))

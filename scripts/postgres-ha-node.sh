@@ -22,6 +22,15 @@ readonly MIN_DATABASE_MEMBER_COUNT="3"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
 readonly MIN_DCS_MEMBER_COUNT="3"
 readonly MAX_DCS_MEMBER_COUNT="9"
+readonly -a BUNDLE_SECRET_NAMES=(
+  superuser
+  replication
+  rewind
+  application
+  rest-api
+  keycloak
+  keycloak-bootstrap-admin
+)
 
 cluster_name="${HETERONETWORK_DB_CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
 interface="${HETERONETWORK_DB_INTERFACE:-$DEFAULT_INTERFACE}"
@@ -1064,7 +1073,7 @@ init_bundle() {
     -addext "subjectKeyIdentifier=hash"
 
   local secret
-  for secret in superuser replication rewind application rest-api; do
+  for secret in "${BUNDLE_SECRET_NAMES[@]}"; do
     openssl rand -hex 32 >"$output/secrets/${secret}.password"
     chmod 0600 "$output/secrets/${secret}.password"
   done
@@ -1091,7 +1100,7 @@ extend_bundle() {
   local original_bundle_dir="$bundle_dir"
   bundle_dir="$output"
   local secret
-  for secret in superuser replication rewind application rest-api; do
+  for secret in "${BUNDLE_SECRET_NAMES[@]}"; do
     read_cluster_secret "$secret" >/dev/null
   done
   local name address
@@ -1115,7 +1124,7 @@ validate_bundle() {
   local original_bundle_dir="$bundle_dir"
   bundle_dir="$output"
   local secret
-  for secret in superuser replication rewind application rest-api; do
+  for secret in "${BUNDLE_SECRET_NAMES[@]}"; do
     read_cluster_secret "$secret" >/dev/null
   done
   local name address
@@ -1216,28 +1225,45 @@ install_pki_and_secrets() {
   install -o root -g heteronetwork-db-ha -m 0640 "$node_bundle/node.key" "$state_dir/pki/node.key"
 
   local secret
-  for secret in superuser replication rewind application rest-api; do
+  for secret in "${BUNDLE_SECRET_NAMES[@]}"; do
     read_cluster_secret "$secret" >/dev/null
-    install -o root -g postgres -m 0640 \
-      "$bundle_dir/secrets/${secret}.password" "$state_dir/secrets/${secret}.password"
+    if [[ "$secret" == "keycloak-bootstrap-admin" ]]; then
+      install -o root -g root -m 0600 \
+        "$bundle_dir/secrets/${secret}.password" "$state_dir/secrets/${secret}.password"
+    else
+      install -o root -g postgres -m 0640 \
+        "$bundle_dir/secrets/${secret}.password" "$state_dir/secrets/${secret}.password"
+    fi
   done
 }
 
-install_bootstrap_script() {
-  install -o root -g postgres -m 0750 /dev/stdin /opt/heteronetwork/postgres-ha/bootstrap-database <<EOF
+render_bootstrap_script() {
+  cat <<EOF
 #!/bin/sh
 set -eu
 application_password="\$(tr -d '\\r\\n' <${state_dir}/secrets/application.password)"
+keycloak_password="\$(tr -d '\\r\\n' <${state_dir}/secrets/keycloak.password)"
 {
   printf "\\\\set application_password '%s'\\n" "\$application_password"
+  printf "\\\\set keycloak_password '%s'\\n" "\$keycloak_password"
   cat <<'SQL'
 SELECT format('CREATE ROLE heteronetwork LOGIN PASSWORD %L', :'application_password')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'heteronetwork') \gexec
 SELECT 'CREATE DATABASE heteronetwork OWNER heteronetwork'
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'heteronetwork') \gexec
+SELECT format('CREATE ROLE keycloak LOGIN PASSWORD %L', :'keycloak_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keycloak') \gexec
+SELECT 'CREATE DATABASE keycloak OWNER keycloak'
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'keycloak') \gexec
 SQL
 } | exec /usr/bin/psql "\$1" --set=ON_ERROR_STOP=1
 EOF
+}
+
+install_bootstrap_script() {
+  render_bootstrap_script \
+    | install -o root -g postgres -m 0750 /dev/stdin \
+      /opt/heteronetwork/postgres-ha/bootstrap-database
 }
 
 verify_interface_address() {
@@ -1741,7 +1767,7 @@ self_test() {
   bundle_dir="$test_dir/bundle"
   install -d -m 0700 "$bundle_dir/secrets"
   local secret
-  for secret in superuser replication rewind application rest-api; do
+  for secret in "${BUNDLE_SECRET_NAMES[@]}"; do
     printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' \
       >"$bundle_dir/secrets/${secret}.password"
     chmod 0600 "$bundle_dir/secrets/${secret}.password"
@@ -1752,6 +1778,7 @@ self_test() {
   render_patroni_config >"$test_dir/patroni.yml"
   render_haproxy_config >"$test_dir/haproxy.cfg"
   render_proxy_service >"$test_dir/haproxy.service"
+  render_bootstrap_script >"$test_dir/bootstrap-database"
   grep -Fq 'timeout connect 5s' "$test_dir/haproxy.cfg"
   grep -Fq 'timeout check 5s' "$test_dir/haproxy.cfg"
   grep -Fq 'inter 6s fastinter 6s downinter 6s fall 3 rise 2 on-marked-down shutdown-sessions' \
@@ -1774,6 +1801,16 @@ self_test() {
     "$test_dir/haproxy.cfg"
   if grep -Eq '^    server db-.* 10\.250\.' "$test_dir/haproxy.cfg"; then
     die "overlay VPN address unexpectedly appeared in a database proxy backend"
+  fi
+  grep -Fq \
+    "SELECT format('CREATE ROLE keycloak LOGIN PASSWORD %L', :'keycloak_password')" \
+    "$test_dir/bootstrap-database"
+  grep -Fq "SELECT 'CREATE DATABASE keycloak OWNER keycloak'" \
+    "$test_dir/bootstrap-database"
+  if grep -Fq \
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+      "$test_dir/bootstrap-database"; then
+    die "rendered database bootstrap script contains a secret value"
   fi
   init_bundle "$test_dir/generated-bundle" >/dev/null 2>&1
   openssl x509 -in "$test_dir/generated-bundle/ca/ca.crt" -noout -text \
@@ -1800,6 +1837,40 @@ self_test() {
   grep -Fxq \
     'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
     "$test_dir/generated-bundle/manifest.env"
+  local generated_secret
+  for generated_secret in keycloak keycloak-bootstrap-admin; do
+    [[ -s "$test_dir/generated-bundle/secrets/${generated_secret}.password" ]]
+    [[ "$(stat -c '%a' \
+      "$test_dir/generated-bundle/secrets/${generated_secret}.password")" == "600" ]]
+    (
+      bundle_dir="$test_dir/generated-bundle"
+      read_cluster_secret "$generated_secret" >/dev/null
+    )
+    install -m 0600 \
+      "$test_dir/generated-bundle/secrets/${generated_secret}.password" \
+      "$test_dir/${generated_secret}.before"
+  done
+  local invalid_secret_bundle
+  for generated_secret in keycloak keycloak-bootstrap-admin; do
+    invalid_secret_bundle="$test_dir/missing-${generated_secret}"
+    cp -a "$test_dir/generated-bundle" "$invalid_secret_bundle"
+    rm "$invalid_secret_bundle/secrets/${generated_secret}.password"
+    if (
+      validate_bundle "$invalid_secret_bundle" >/dev/null 2>&1
+    ); then
+      die "bundle without required $generated_secret credential was accepted"
+    fi
+    rm -rf "$invalid_secret_bundle"
+  done
+  invalid_secret_bundle="$test_dir/incomplete-extension"
+  cp -a "$test_dir/generated-bundle" "$invalid_secret_bundle"
+  rm "$invalid_secret_bundle/secrets/keycloak.password"
+  if (
+    extend_bundle "$invalid_secret_bundle" >/dev/null 2>&1
+  ); then
+    die "bundle extension accepted a missing Keycloak database credential"
+  fi
+  rm -rf "$invalid_secret_bundle"
   validate_bundle_access_manifest "$test_dir/generated-bundle"
   local empty_access_manifest="$test_dir/empty-access-manifest"
   install -d -m 0700 "$empty_access_manifest"
@@ -1856,6 +1927,11 @@ self_test() {
   grep -Fxq \
     'HETERONETWORK_DB_EXTRA_HBA_ENTRIES=keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32' \
     "$test_dir/generated-bundle/manifest.env"
+  for generated_secret in keycloak keycloak-bootstrap-admin; do
+    cmp -s \
+      "$test_dir/${generated_secret}.before" \
+      "$test_dir/generated-bundle/secrets/${generated_secret}.password"
+  done
   members="${members%,db-g=100.64.10.7}"
   member_identities="${member_identities%,db-g=node-g}"
   proxy_backends="$members"
