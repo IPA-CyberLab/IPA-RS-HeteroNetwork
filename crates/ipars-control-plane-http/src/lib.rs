@@ -2062,17 +2062,16 @@ fn node_enrollment_gateway_url(url: &str, vpn_pool: &ipnet::Ipv4Net) -> Option<S
         {
             return None;
         }
-        url::Host::Ipv6(ip) => {
+        url::Host::Ipv6(ip)
             if ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.segments()[0] & 0xffc0 == 0xfe80
                 || ip
                     .to_ipv4_mapped()
-                    .is_some_and(|mapped| vpn_pool.contains(&mapped))
-            {
-                return None;
-            }
+                    .is_some_and(|mapped| vpn_pool.contains(&mapped)) =>
+        {
+            return None;
         }
         _ => {}
     }
