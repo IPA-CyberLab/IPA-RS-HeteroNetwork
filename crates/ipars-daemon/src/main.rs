@@ -2126,51 +2126,51 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.nat_discovery_failure_threshold > 0,
         "--nat-discovery-failure-threshold must be greater than zero"
     );
+    match (
+        args.public_web_gateway_oidc_upstream,
+        args.public_web_gateway_oidc_probe_path.as_deref(),
+    ) {
+        (Some(upstream), Some(probe_path)) => {
+            anyhow::ensure!(
+                upstream.ip().is_loopback() && upstream.port() > 0,
+                "--public-web-gateway-oidc-upstream must be a loopback address with a nonzero port"
+            );
+            anyhow::ensure!(
+                probe_path.starts_with("/realms/")
+                    && probe_path.ends_with("/.well-known/openid-configuration")
+                    && probe_path.len() <= 1024
+                    && !probe_path.contains(['?', '#'])
+                    && !probe_path.chars().any(char::is_control),
+                "--public-web-gateway-oidc-probe-path must be a bounded Keycloak realm discovery path"
+            );
+        }
+        (Some(_), None) => anyhow::bail!(
+            "--public-web-gateway-oidc-upstream requires --public-web-gateway-oidc-probe-path"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "--public-web-gateway-oidc-probe-path requires --public-web-gateway-oidc-upstream"
+        ),
+        (None, None) => {}
+    }
+    if let Some(host) = args.public_web_gateway_oidc_host.as_deref() {
+        anyhow::ensure!(
+            args.public_web_gateway_oidc_upstream.is_some(),
+            "--public-web-gateway-oidc-host requires --public-web-gateway-oidc-upstream"
+        );
+        anyhow::ensure!(
+            valid_public_gateway_dns_hostname(host),
+            "--public-web-gateway-oidc-host must be a valid ASCII DNS hostname"
+        );
+        anyhow::ensure!(
+            args.public_web_gateway_control_plane_host.as_deref() != Some(host),
+            "--public-web-gateway-oidc-host must differ from --public-web-gateway-control-plane-host"
+        );
+    }
     if args.public_web_gateway_enabled {
         anyhow::ensure!(
             args.public_web_gateway_admin_socket.is_absolute(),
             "--public-web-gateway-admin-socket must be an absolute path"
         );
-        match (
-            args.public_web_gateway_oidc_upstream,
-            args.public_web_gateway_oidc_probe_path.as_deref(),
-        ) {
-            (Some(upstream), Some(probe_path)) => {
-                anyhow::ensure!(
-                    upstream.ip().is_loopback() && upstream.port() > 0,
-                    "--public-web-gateway-oidc-upstream must be a loopback address with a nonzero port"
-                );
-                anyhow::ensure!(
-                    probe_path.starts_with("/realms/")
-                        && probe_path.ends_with("/.well-known/openid-configuration")
-                        && probe_path.len() <= 1024
-                        && !probe_path.contains(['?', '#'])
-                        && !probe_path.chars().any(char::is_control),
-                    "--public-web-gateway-oidc-probe-path must be a bounded Keycloak realm discovery path"
-                );
-            }
-            (Some(_), None) => anyhow::bail!(
-                "--public-web-gateway-oidc-upstream requires --public-web-gateway-oidc-probe-path"
-            ),
-            (None, Some(_)) => anyhow::bail!(
-                "--public-web-gateway-oidc-probe-path requires --public-web-gateway-oidc-upstream"
-            ),
-            (None, None) => {}
-        }
-        if let Some(host) = args.public_web_gateway_oidc_host.as_deref() {
-            anyhow::ensure!(
-                args.public_web_gateway_oidc_upstream.is_some(),
-                "--public-web-gateway-oidc-host requires --public-web-gateway-oidc-upstream"
-            );
-            anyhow::ensure!(
-                valid_public_gateway_dns_hostname(host),
-                "--public-web-gateway-oidc-host must be a valid ASCII DNS hostname"
-            );
-            anyhow::ensure!(
-                args.public_web_gateway_control_plane_host.as_deref() != Some(host),
-                "--public-web-gateway-oidc-host must differ from --public-web-gateway-control-plane-host"
-            );
-        }
         match (
             args.public_web_gateway_control_plane_host.as_deref(),
             args.public_web_gateway_control_plane_upstream,
@@ -2236,14 +2236,11 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         );
     } else {
         anyhow::ensure!(
-            args.public_web_gateway_oidc_upstream.is_none()
-                && args.public_web_gateway_oidc_probe_path.is_none()
-                && args.public_web_gateway_oidc_host.is_none()
-                && args.public_web_gateway_control_plane_host.is_none()
+            args.public_web_gateway_control_plane_host.is_none()
                 && args.public_web_gateway_control_plane_upstream.is_none()
                 && args.public_web_gateway_signal_upstream.is_none()
                 && args.public_web_gateway_relay_admission_upstream.is_none(),
-            "public Web gateway proxy options require --public-web-gateway-enabled=true"
+            "public Web gateway service proxy options require --public-web-gateway-enabled=true"
         );
     }
     if !args.disable_overlay_services {
@@ -31995,6 +31992,42 @@ exec sleep 60
             anyhow::bail!("expected agent command");
         };
         validate_agent_runtime_config(&valid)?;
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_public_gateway_accepts_valid_dormant_oidc_route() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--public-web-gateway-oidc-upstream",
+            "127.0.0.1:18079",
+            "--public-web-gateway-oidc-probe-path",
+            "/realms/kakurizai/.well-known/openid-configuration",
+        ])?;
+        let Command::Agent(mut args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        args.public_web_gateway_enabled = false;
+        validate_agent_runtime_config(&args)?;
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "agent",
+            "--public-web-gateway-control-plane-host",
+            "control.example.test",
+            "--public-web-gateway-control-plane-upstream",
+            "127.0.0.1:18088",
+        ])?;
+        let Command::Agent(mut args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        args.public_web_gateway_enabled = false;
+        let error = validate_agent_runtime_config(&args)
+            .expect_err("disabled public gateway must reject active service routes");
+        assert!(error
+            .to_string()
+            .contains("public Web gateway service proxy options require"));
         Ok(())
     }
 
