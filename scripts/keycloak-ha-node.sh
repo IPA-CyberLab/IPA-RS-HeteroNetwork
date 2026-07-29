@@ -367,6 +367,8 @@ prepare_release() {
       rm -rf "$extract_dir"
       die "unable to build the pinned Keycloak release"
     fi
+    chown -R root:root "$staged_dir"
+    find "$staged_dir" -type d -exec chmod 0755 {} +
     {
       printf 'version=%s\n' "$KEYCLOAK_VERSION"
       printf 'sha256=%s\n' "$KEYCLOAK_ARCHIVE_SHA256"
@@ -383,6 +385,7 @@ prepare_release() {
 
   chown root:root "$install_dir"
   chmod 0755 "$install_dir"
+  find "$install_dir" -type d -exec chmod 0755 {} +
   ln -sfn "$install_dir" "$current_link"
   if [[ -d "$install_dir/data" && ! -L "$install_dir/data" ]]; then
     rmdir "$install_dir/data"
