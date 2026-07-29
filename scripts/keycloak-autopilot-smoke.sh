@@ -679,6 +679,13 @@ grep -Fq 'SuccessExitStatus=143 SIGTERM' "$helper_contract" \
   || fail "controlled Keycloak SIGTERM shutdown is not treated as successful"
 grep -Fq 'RestartPreventExitStatus=143 SIGTERM' "$helper_contract" \
   || fail "controlled Keycloak shutdown can still trigger an automatic restart"
+grep -Fq \
+  '/etc/systemd/system/heteronetwork-agent.service.wants/heteronetwork-keycloak-backchannel.service' \
+  "$helper_contract" \
+  || fail "helper does not remove legacy Agent-to-Keycloak enablement"
+if [[ "$(grep -c '^  remove_legacy_service_enablement$' "$helper_contract")" -lt 2 ]]; then
+  fail "legacy Keycloak enablement is not reconciled during prepare and configure"
+fi
 if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract"; then
   fail "helper restarts an already-active Keycloak replica"
 fi

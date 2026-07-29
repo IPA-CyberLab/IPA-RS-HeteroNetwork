@@ -298,6 +298,21 @@ SystemCallArchitectures=native
 EOF
 }
 
+remove_legacy_service_enablement() {
+  local path
+  for path in \
+    /etc/systemd/system/multi-user.target.wants/heteronetwork-keycloak.service \
+    /etc/systemd/system/multi-user.target.wants/heteronetwork-keycloak-backchannel.service \
+    /etc/systemd/system/heteronetwork-agent.service.wants/heteronetwork-keycloak.service \
+    /etc/systemd/system/heteronetwork-agent.service.wants/heteronetwork-keycloak-backchannel.service; do
+    if [[ -L "$path" ]]; then
+      rm -- "$path"
+    elif [[ -e "$path" ]]; then
+      die "legacy Keycloak enablement path is not a symbolic link: $path"
+    fi
+  done
+}
+
 prepare_edge() {
   require_root
   install_edge_dependencies
@@ -402,6 +417,7 @@ prepare_release() {
   render_keycloak_service \
     | install -o root -g root -m 0644 /dev/stdin \
       /etc/systemd/system/heteronetwork-keycloak.service
+  remove_legacy_service_enablement
   systemctl daemon-reload
 }
 
@@ -493,6 +509,7 @@ install_backchannel_configuration() {
   render_backchannel_service \
     | install -o root -g root -m 0644 /dev/stdin \
       /etc/systemd/system/heteronetwork-keycloak-backchannel.service
+  remove_legacy_service_enablement
 }
 
 configure_replica() {
