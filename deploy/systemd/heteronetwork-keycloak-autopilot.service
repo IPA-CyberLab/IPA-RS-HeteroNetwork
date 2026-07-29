@@ -1,8 +1,7 @@
 [Unit]
 Description=Reconcile automatic HeteroNetwork Keycloak HA placement
-Wants=network-online.target
+Wants=network-online.target heteronetwork-agent.service
 After=network-online.target heteronetwork-agent.service heteronetwork-keycloak-prepare.service
-Requires=heteronetwork-agent.service
 ConditionPathExists=/etc/heteronetwork/keycloak-autopilot.env
 ConditionPathExists=/opt/heteronetwork/libexec/keycloak-autopilot.sh
 

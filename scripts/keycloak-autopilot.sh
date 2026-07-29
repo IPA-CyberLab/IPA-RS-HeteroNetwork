@@ -11,7 +11,9 @@ readonly MAX_CONFIG_BYTES="65536"
 readonly MAX_SECRET_BYTES="4096"
 readonly MAX_RESPONSE_BYTES="262144"
 readonly MAX_CONTROL_PLANE_URLS="16"
+readonly MAX_CONTROL_PLANE_ATTEMPTS="3"
 readonly MAX_REPLICAS="3"
+readonly MAX_GENERATION="9223372036854775807"
 readonly REPLICA_PORT="18080"
 readonly EDGE_PORT="18079"
 readonly FAILURE_LIMIT="3"
@@ -53,11 +55,17 @@ readonly agent_drop_in="$agent_drop_in_dir/30-keycloak-gateway.conf"
 readonly failure_count_path="$state_dir/restart-failures"
 readonly activation_started_at_path="$state_dir/activation-started-at"
 readonly cooldown_until_path="$state_dir/cooldown-until"
+readonly assignment_lease_deadline_path="$state_dir/assignment-lease-deadline"
+readonly generation_path="$state_dir/generation"
+readonly control_plane_cursor_path="$state_dir/control-plane-cursor"
+readonly agent_restart_pending_path="$state_dir/agent-restart-pending"
 
 request_file=""
 response_file=""
 candidate_response_file=""
 curl_config_file=""
+request_generation=""
+agent_restart_attempted=false
 
 log() {
   printf 'keycloak-autopilot: %s\n' "$*" >&2
@@ -267,7 +275,11 @@ replica_is_ready() {
     && systemctl is-active --quiet heteronetwork-keycloak-backchannel.service \
     && curl --fail --silent --show-error \
       --connect-timeout 2 --max-time 5 --max-filesize 1048576 \
-      "$KEYCLOAK_READY_URL" >/dev/null 2>&1
+      "$KEYCLOAK_READY_URL" >/dev/null 2>&1 \
+    && curl --fail --silent --show-error \
+      --connect-timeout 2 --max-time 5 --max-filesize 1048576 \
+      --header 'Host: localhost' \
+      "http://127.0.0.1:${REPLICA_PORT}${oidc_probe_path}" >/dev/null 2>&1
 }
 
 read_nonnegative_state_value() {
@@ -290,6 +302,39 @@ write_state_value() {
   printf '%s\n' "$value" >"$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$path"
+}
+
+valid_generation() {
+  local value="$1"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((${#value} < ${#MAX_GENERATION})) && return 0
+  ((${#value} == ${#MAX_GENERATION})) \
+    && [[ "$value" < "$MAX_GENERATION" || "$value" == "$MAX_GENERATION" ]]
+}
+
+next_generation() {
+  local stored=0 clock_floor candidate
+  if [[ -f "$generation_path" && ! -L "$generation_path" ]]; then
+    stored="$(<"$generation_path")"
+    valid_generation "$stored" || stored=0
+  fi
+  clock_floor="$(date +%s%3N)"
+  valid_generation "$clock_floor" || {
+    log "unable to derive a safe reconciliation generation"
+    return 1
+  }
+  if valid_generation "$stored" && ((10#$stored >= 10#$clock_floor)); then
+    [[ "$stored" != "$MAX_GENERATION" ]] || {
+      log "reconciliation generation exhausted the signed 63-bit range"
+      return 1
+    }
+    candidate="$((10#$stored + 1))"
+  else
+    candidate="$clock_floor"
+  fi
+  valid_generation "$candidate" || return 1
+  write_state_value "$generation_path" "$candidate"
+  request_generation="$candidate"
 }
 
 cooldown_is_active() {
@@ -344,18 +389,21 @@ configure_candidate() {
 
 write_request() {
   local eligible="$1" ready="$2"
+  next_generation || return 1
   request_file="$(mktemp "$runtime_dir/request.XXXXXX")"
   jq -cn \
     --arg node_id "$node_id" \
     --arg vpn_ip "$vpn_ip" \
     --arg version "$KEYCLOAK_VERSION" \
+    --argjson generation "$request_generation" \
     --argjson eligible "$eligible" \
     --argjson ready "$ready" '{
       node_id: $node_id,
       vpn_ip: $vpn_ip,
       eligible: $eligible,
       ready: $ready,
-      version: $version
+      version: $version,
+      generation: $generation
     }' >"$request_file"
   chmod 0600 "$request_file"
 }
@@ -367,8 +415,8 @@ write_curl_config() {
       'fail' \
       'silent' \
       'show-error' \
-      'connect-timeout = 2' \
-      'max-time = 10' \
+      'connect-timeout = 1' \
+      'max-time = 4' \
       "max-filesize = $MAX_RESPONSE_BYTES"
     printf 'header = "Authorization: Bearer %s"\n' "$autopilot_bearer_token"
   } >"$curl_config_file"
@@ -376,10 +424,21 @@ write_curl_config() {
 }
 
 request_reconciliation() {
-  local base
+  local base cursor attempt attempts index url_count
   response_file="$(mktemp "$runtime_dir/response.XXXXXX")"
   write_curl_config
-  for base in "${control_plane_urls[@]}"; do
+  url_count="${#control_plane_urls[@]}"
+  attempts="$url_count"
+  ((attempts <= MAX_CONTROL_PLANE_ATTEMPTS)) \
+    || attempts="$MAX_CONTROL_PLANE_ATTEMPTS"
+  cursor="$(read_nonnegative_state_value "$control_plane_cursor_path" 0)"
+  if [[ ! "$cursor" =~ ^[0-9]{1,2}$ ]] \
+    || ((10#$cursor >= url_count)); then
+    cursor=0
+  fi
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    index="$(((10#$cursor + attempt) % url_count))"
+    base="${control_plane_urls[$index]}"
     candidate_response_file="$(mktemp "$runtime_dir/response-candidate.XXXXXX")"
     if curl --config "$curl_config_file" \
       --header 'Content-Type: application/json' \
@@ -388,11 +447,15 @@ request_reconciliation() {
       "${base}/v1/keycloak-autopilot/reconcile" 2>/dev/null; then
       mv -f "$candidate_response_file" "$response_file"
       candidate_response_file=""
+      write_state_value "$control_plane_cursor_path" \
+        "$(((index + 1) % url_count))"
       return 0
     fi
     rm -f "$candidate_response_file"
     candidate_response_file=""
   done
+  write_state_value "$control_plane_cursor_path" \
+    "$(((10#$cursor + attempts) % url_count))"
   return 1
 }
 
@@ -402,12 +465,15 @@ validate_response() {
     --arg node_id "$node_id" \
     --arg vpn_ip "$vpn_ip" \
     --arg version "$KEYCLOAK_VERSION" \
+    --argjson generation "$request_generation" \
     --argjson maximum "$MAX_REPLICAS" '
       type == "object"
       and (.cluster_id == $cluster_id)
+      and (.generation == $generation)
       and (.placement_id | type == "string" and test("^[a-f0-9]{64}$"))
       and (.desired_replicas == 3)
-      and (.lease_ttl_seconds | type == "number" and . >= 15 and . <= 300)
+      and (.lease_ttl_seconds
+        | type == "number" and floor == . and . >= 15 and . <= 300)
       and (.reconcile_after_seconds | type == "number" and . >= 5 and . <= 60)
       and (.assigned | type == "boolean")
       and (.replicas | type == "array" and length <= $maximum)
@@ -428,6 +494,18 @@ validate_response() {
   while IFS= read -r replica_ip; do
     valid_private_ipv4 "$replica_ip" || return 1
   done < <(jq -r '.replicas[].vpn_ip' "$response_file")
+}
+
+update_assignment_lease() {
+  local now ttl
+  if jq -e '.assigned == true' "$response_file" >/dev/null; then
+    now="$(date +%s)"
+    ttl="$(jq -r '.lease_ttl_seconds' "$response_file")"
+    write_state_value "$assignment_lease_deadline_path" \
+      "$((10#$now + 10#$ttl))"
+  else
+    rm -f "$assignment_lease_deadline_path"
+  fi
 }
 
 restart_agent_if_drop_in_changed() {
@@ -457,8 +535,25 @@ EOF
   fi
 
   if ((changed == 1)); then
-    systemctl daemon-reload >/dev/null 2>&1 \
-      && systemctl restart heteronetwork-agent.service >/dev/null 2>&1
+    write_state_value "$agent_restart_pending_path" 1
+  fi
+  retry_pending_agent_restart
+}
+
+retry_pending_agent_restart() {
+  if [[ "$agent_restart_attempted" != "false" ]]; then
+    [[ ! -e "$agent_restart_pending_path" ]]
+    return
+  fi
+  if [[ -f "$agent_restart_pending_path" \
+    && ! -L "$agent_restart_pending_path" ]]; then
+    agent_restart_attempted=true
+    if systemctl daemon-reload >/dev/null 2>&1 \
+      && systemctl restart heteronetwork-agent.service >/dev/null 2>&1; then
+      rm -f "$agent_restart_pending_path"
+    else
+      return 1
+    fi
   fi
 }
 
@@ -491,6 +586,18 @@ deactivate_local_replica() {
     || log "unable to stop the unassigned Keycloak replica"
 }
 
+expire_local_assignment_if_needed() {
+  local now deadline
+  now="$(date +%s)"
+  deadline="$(read_nonnegative_state_value "$assignment_lease_deadline_path" 0)"
+  if ((10#$deadline > 10#$now)); then
+    return
+  fi
+  rm -f "$assignment_lease_deadline_path"
+  log "local Keycloak assignment lease expired; stopping the replica"
+  deactivate_local_replica
+}
+
 withdraw_after_failures() {
   log "replica activation failed three times; withdrawing for 120 seconds"
   enter_cooldown
@@ -504,6 +611,7 @@ withdraw_after_failures() {
     log "candidate withdrawal could not be confirmed; local cooldown remains active"
     return
   fi
+  update_assignment_lease
   reconcile_edge_proxy
   if jq -e '.assigned == false' "$response_file" >/dev/null; then
     deactivate_local_replica
@@ -582,8 +690,14 @@ reconcile_command() {
   mkdir -p "$state_dir" "$runtime_dir"
   chmod 0700 "$state_dir" "$runtime_dir"
 
+  retry_pending_agent_restart \
+    || {
+      [[ ! -e "$agent_restart_pending_path" ]] \
+        || log "pending Agent restart will be retried later"
+    }
   if ! read_agent_identity; then
-    log "local Agent identity is unavailable; preserving current state"
+    log "local Agent identity is unavailable"
+    expire_local_assignment_if_needed
     return
   fi
 
@@ -607,15 +721,21 @@ reconcile_command() {
     ready=true
   fi
 
-  write_request "$eligible" "$ready"
+  if ! write_request "$eligible" "$ready"; then
+    expire_local_assignment_if_needed
+    return
+  fi
   if ! request_reconciliation; then
-    log "every Control Plane is unavailable; preserving current Keycloak state"
+    log "every attempted Control Plane is unavailable"
+    expire_local_assignment_if_needed
     return
   fi
   if ! validate_response; then
-    log "Control Plane returned an invalid Keycloak placement; preserving current state"
+    log "Control Plane returned an invalid Keycloak placement"
+    expire_local_assignment_if_needed
     return
   fi
+  update_assignment_lease
   apply_assignment "$eligible"
 }
 

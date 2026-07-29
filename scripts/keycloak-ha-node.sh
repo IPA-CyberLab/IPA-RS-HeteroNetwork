@@ -264,9 +264,9 @@ render_keycloak_service() {
   cat <<'EOF'
 [Unit]
 Description=HeteroNetwork Keycloak HA replica
-Wants=network-online.target
+Wants=network-online.target heteronetwork-agent.service
 After=network-online.target heteronetwork-agent.service heteronetwork-db-proxy.service
-Requires=heteronetwork-agent.service heteronetwork-db-proxy.service
+Requires=heteronetwork-db-proxy.service
 
 [Service]
 Type=simple
@@ -440,8 +440,9 @@ render_backchannel_service() {
   cat <<'EOF'
 [Unit]
 Description=HeteroNetwork Keycloak private backchannel
+Wants=heteronetwork-agent.service
 After=network-online.target heteronetwork-agent.service heteronetwork-keycloak.service
-Requires=heteronetwork-agent.service heteronetwork-keycloak.service
+Requires=heteronetwork-keycloak.service
 BindsTo=heteronetwork-keycloak.service
 
 [Service]
@@ -597,12 +598,10 @@ activate_replica() {
 deactivate_replica() {
   require_root
   local failed=0
-  if systemctl is-active --quiet heteronetwork-keycloak-backchannel.service \
-    && ! systemctl stop heteronetwork-keycloak-backchannel.service; then
+  if ! systemctl stop heteronetwork-keycloak-backchannel.service; then
     failed=1
   fi
-  if systemctl is-active --quiet heteronetwork-keycloak.service \
-    && ! systemctl stop heteronetwork-keycloak.service; then
+  if ! systemctl stop heteronetwork-keycloak.service; then
     failed=1
   fi
   if ((failed == 0)); then
@@ -652,8 +651,8 @@ render_edge_service() {
   cat <<'EOF'
 [Unit]
 Description=HeteroNetwork Keycloak edge proxy
+Wants=heteronetwork-agent.service
 After=network-online.target heteronetwork-agent.service
-Requires=heteronetwork-agent.service
 
 [Service]
 Type=notify
@@ -692,24 +691,42 @@ configure_edge_proxy() {
     || die "heteronetwork-agent.service is not active"
 
   install -d -o root -g haproxy -m 0750 "$edge_config_dir"
-  local temporary
+  local temporary unit_temporary config_changed=0 unit_changed=0
   temporary="$(mktemp "$edge_config_dir/.haproxy.cfg.XXXXXX")"
   render_edge_haproxy_config >"$temporary"
   chown root:haproxy "$temporary"
   chmod 0640 "$temporary"
   /usr/sbin/haproxy -c -f "$temporary" >/dev/null
-  if [[ -f "$edge_config_dir/haproxy.cfg" ]] \
+  if [[ -f "$edge_config_dir/haproxy.cfg" \
+    && ! -L "$edge_config_dir/haproxy.cfg" ]] \
     && cmp -s "$temporary" "$edge_config_dir/haproxy.cfg"; then
     rm -f "$temporary"
   else
     mv -f "$temporary" "$edge_config_dir/haproxy.cfg"
+    config_changed=1
   fi
-  render_edge_service \
-    | install -o root -g root -m 0644 /dev/stdin \
+  unit_temporary="$(mktemp \
+    /etc/systemd/system/.heteronetwork-keycloak-edge-proxy.service.XXXXXX)"
+  render_edge_service >"$unit_temporary"
+  chown root:root "$unit_temporary"
+  chmod 0644 "$unit_temporary"
+  if [[ -f /etc/systemd/system/heteronetwork-keycloak-edge-proxy.service \
+    && ! -L /etc/systemd/system/heteronetwork-keycloak-edge-proxy.service ]] \
+    && cmp -s "$unit_temporary" \
+      /etc/systemd/system/heteronetwork-keycloak-edge-proxy.service; then
+    rm -f "$unit_temporary"
+  else
+    mv -f "$unit_temporary" \
       /etc/systemd/system/heteronetwork-keycloak-edge-proxy.service
-  systemctl daemon-reload
+    unit_changed=1
+  fi
+  if ((unit_changed == 1)); then
+    systemctl daemon-reload
+  fi
   if systemctl is-active --quiet heteronetwork-keycloak-edge-proxy.service; then
-    systemctl reload-or-restart heteronetwork-keycloak-edge-proxy.service
+    if ((config_changed == 1 || unit_changed == 1)); then
+      systemctl reload-or-restart heteronetwork-keycloak-edge-proxy.service
+    fi
   else
     systemctl start heteronetwork-keycloak-edge-proxy.service
   fi
@@ -719,9 +736,8 @@ configure_edge_proxy() {
 
 deactivate_edge_proxy() {
   require_root
-  if systemctl is-active --quiet heteronetwork-keycloak-edge-proxy.service; then
-    systemctl stop heteronetwork-keycloak-edge-proxy.service
-  fi
+  systemctl stop heteronetwork-keycloak-edge-proxy.service
+  systemctl reset-failed heteronetwork-keycloak-edge-proxy.service
 }
 
 case "${1:-}" in

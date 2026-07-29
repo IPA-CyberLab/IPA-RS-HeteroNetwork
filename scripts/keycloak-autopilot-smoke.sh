@@ -53,6 +53,24 @@ count_helper_command() {
     "$helper_log"
 }
 
+count_systemctl_command() {
+  local command="$1" unit="$2"
+  awk -v command="$command" -v unit="$unit" \
+    '$1 == command && $2 == unit { count += 1 } END { print count + 0 }' \
+    "$systemctl_log"
+}
+
+count_reconcile_requests() {
+  grep -c '/v1/keycloak-autopilot/reconcile' "$curl_argv_log" || true
+}
+
+reconcile_url_at() {
+  local position="$1"
+  grep '/v1/keycloak-autopilot/reconcile' "$curl_argv_log" \
+    | sed -n "${position}p" \
+    | awk '{print $NF}'
+}
+
 b64() {
   printf '%s' "$1" | base64 | tr -d '\r\n'
 }
@@ -77,6 +95,7 @@ write_response() {
       desired_replicas: 3,
       lease_ttl_seconds: 45,
       reconcile_after_seconds: 15,
+      generation: 0,
       assigned: $assigned,
       replicas: [{
         node_id: $node_id,
@@ -125,13 +144,14 @@ case "$command_name" in
     fi
     ;;
   stop)
-    unit="${1:-}"
-    rm -f "$HETERONETWORK_SMOKE_STATE/active/$unit"
-    if [[ "$unit" == "heteronetwork-keycloak.service" ]]; then
-      rm -f "$HETERONETWORK_SMOKE_STATE/keycloak-ready"
-    fi
+    for unit in "$@"; do
+      rm -f "$HETERONETWORK_SMOKE_STATE/active/$unit"
+      if [[ "$unit" == "heteronetwork-keycloak.service" ]]; then
+        rm -f "$HETERONETWORK_SMOKE_STATE/keycloak-ready"
+      fi
+    done
     ;;
-  daemon-reload)
+  daemon-reload|reset-failed)
     ;;
   *)
     exit 1
@@ -175,12 +195,18 @@ done
 
 case "$url" in
   http://127.0.0.1:9780/v1/status)
+    [[ -e "$HETERONETWORK_SMOKE_STATE/active/heteronetwork-agent.service" ]]
     cat "$HETERONETWORK_SMOKE_STATUS_FIXTURE"
     ;;
   http://127.0.0.1:19000/health/ready)
     [[ -e "$HETERONETWORK_SMOKE_STATE/keycloak-ready" \
       && ! -e "$HETERONETWORK_SMOKE_STATE/keycloak-health-down" ]]
     printf '{"status":"UP"}\n'
+    ;;
+  http://127.0.0.1:18080/realms/heteronetwork/.well-known/openid-configuration)
+    [[ -e "$HETERONETWORK_SMOKE_STATE/keycloak-ready" \
+      && ! -e "$HETERONETWORK_SMOKE_STATE/realm-discovery-down" ]]
+    printf '{"issuer":"https://console.example.test/realms/heteronetwork"}\n'
     ;;
   */v1/keycloak-autopilot/reconcile)
     [[ ! -e "$HETERONETWORK_SMOKE_STATE/api-down" ]] || exit 7
@@ -192,8 +218,11 @@ case "$url" in
     [[ "$request" != "$data_binary" && -f "$request" && -n "$output" ]] || exit 10
     jq -e \
       'type == "object"
-       and (keys == ["eligible", "node_id", "ready", "version", "vpn_ip"])
+       and (keys == ["eligible", "generation", "node_id", "ready", "version", "vpn_ip"])
        and (.eligible | type == "boolean")
+       and (.generation
+         | type == "number" and floor == . and . > 0
+           and . <= 9223372036854775807)
        and (.ready | type == "boolean")' \
       "$request" >/dev/null || exit 11
     counter=0
@@ -202,10 +231,18 @@ case "$url" in
     counter=$((counter + 1))
     printf '%s\n' "$counter" >"$HETERONETWORK_SMOKE_CURL_COUNTER"
     cp "$request" "$HETERONETWORK_SMOKE_REQUEST_DIR/$counter.json"
+    generation="$(jq -r '.generation' "$request")"
+    if [[ -e "$HETERONETWORK_SMOKE_STATE/response-generation-mismatch" ]]; then
+      generation=$((generation + 1))
+    fi
     if jq -e '.eligible == false' "$request" >/dev/null; then
-      cp "$HETERONETWORK_SMOKE_WITHDRAW_RESPONSE_FIXTURE" "$output"
+      jq --argjson generation "$generation" \
+        '.generation = $generation' \
+        "$HETERONETWORK_SMOKE_WITHDRAW_RESPONSE_FIXTURE" >"$output"
     else
-      cp "$HETERONETWORK_SMOKE_RESPONSE_FIXTURE" "$output"
+      jq --argjson generation "$generation" \
+        '.generation = $generation' \
+        "$HETERONETWORK_SMOKE_RESPONSE_FIXTURE" >"$output"
     fi
     ;;
   *)
@@ -305,10 +342,16 @@ secret_dir="$bundle_dir/secrets"
 agent_drop_in="$test_root/etc/systemd/system/heteronetwork-agent.service.d/30-keycloak-gateway.conf"
 mkdir -p "$secret_dir"
 
+control_plane_urls_b64=""
+for index in $(seq 1 16); do
+  control_plane_urls_b64+="$(b64 "https://control-${index}.example.test") "
+done
+control_plane_urls_b64="${control_plane_urls_b64% }"
+
 cat >"$config_dir/keycloak-autopilot.env" <<EOF
 HETERONETWORK_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=$bearer_token
 HETERONETWORK_KEYCLOAK_CLUSTER_ID_B64=$(b64 "$cluster_id")
-HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='$(b64 https://control-a.example.test) $(b64 https://control-b.example.test)'
+HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='$control_plane_urls_b64'
 HETERONETWORK_KEYCLOAK_VERSION=26.6.4
 HETERONETWORK_KEYCLOAK_ARCHIVE_URL_B64=$(b64 "$archive_url")
 HETERONETWORK_KEYCLOAK_ARCHIVE_SHA256=$keycloak_sha256
@@ -367,19 +410,71 @@ first_request="$request_dir/1.json"
 jq -e \
   --arg node_id "$node_id" \
   --arg vpn_ip "$vpn_ip" '
-    . == {
-      node_id: $node_id,
-      vpn_ip: $vpn_ip,
-      eligible: true,
-      ready: false,
-      version: "26.6.4"
-    }
+    .node_id == $node_id
+    and .vpn_ip == $vpn_ip
+    and .eligible == true
+    and .ready == false
+    and .version == "26.6.4"
+    and (.generation
+      | type == "number" and floor == . and . > 0
+        and . <= 9223372036854775807)
   ' "$first_request" >/dev/null \
   || fail "initial reconciliation request violated the API contract"
+first_generation="$(jq -r '.generation' "$first_request")"
 
 run_autopilot reconcile
 jq -e '.eligible == true and .ready == true' "$(latest_request)" >/dev/null \
   || fail "an active selected replica did not report ready"
+second_generation="$(jq -r '.generation' "$(latest_request)")"
+((second_generation > first_generation)) \
+  || fail "reconciliation generation did not increase"
+
+generation_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/generation"
+rm -f "$generation_path"
+run_autopilot reconcile
+recovered_generation="$(jq -r '.generation' "$(latest_request)")"
+((recovered_generation > second_generation)) \
+  || fail "missing generation state did not recover monotonically"
+
+touch "$fake_state/realm-discovery-down"
+run_autopilot reconcile
+jq -e '.eligible == true and .ready == false' "$(latest_request)" >/dev/null \
+  || fail "realm discovery failure was reported as ready"
+rm -f "$fake_state/realm-discovery-down"
+
+state_dir="$test_root/var/lib/heteronetwork-keycloak-autopilot"
+lease_deadline_path="$state_dir/assignment-lease-deadline"
+[[ -f "$lease_deadline_path" ]] \
+  || fail "assigned response did not persist a local lease deadline"
+printf '%s\n' "$(( $(date +%s) + 30 ))" >"$lease_deadline_path"
+lease_before_mismatch="$(<"$lease_deadline_path")"
+activate_before_mismatch="$(count_helper_command activate)"
+deactivate_before_mismatch="$(count_helper_command deactivate)"
+edge_before_mismatch="$(count_helper_command configure-edge-proxy)"
+touch "$fake_state/response-generation-mismatch"
+run_autopilot reconcile
+rm -f "$fake_state/response-generation-mismatch"
+[[ "$(<"$lease_deadline_path")" == "$lease_before_mismatch" ]] \
+  || fail "mismatched response generation renewed the assignment lease"
+[[ "$(count_helper_command activate)" == "$activate_before_mismatch" \
+  && "$(count_helper_command deactivate)" == "$deactivate_before_mismatch" \
+  && "$(count_helper_command configure-edge-proxy)" == "$edge_before_mismatch" ]] \
+  || fail "mismatched response generation changed local placement"
+
+agent_restart_pending_path="$state_dir/agent-restart-pending"
+write_restart_count="$(count_systemctl_command restart heteronetwork-agent.service)"
+printf '1\n' >"$agent_restart_pending_path"
+touch "$fake_state/fail-restart-heteronetwork-agent.service"
+run_autopilot reconcile
+[[ -f "$agent_restart_pending_path" ]] \
+  || fail "failed Agent restart lost its durable retry marker"
+rm -f "$fake_state/fail-restart-heteronetwork-agent.service"
+run_autopilot reconcile
+[[ ! -e "$agent_restart_pending_path" ]] \
+  || fail "successful Agent restart did not clear its retry marker"
+[[ "$(count_systemctl_command restart heteronetwork-agent.service)" \
+  == "$((write_restart_count + 2))" ]] \
+  || fail "pending Agent restart was not retried on the next reconcile"
 
 chmod 0640 "$secret_dir/keycloak.password"
 run_autopilot reconcile
@@ -398,9 +493,13 @@ drop_in_before_outage="$(sha256sum "$agent_drop_in")"
 activate_before_outage="$(count_helper_command activate)"
 deactivate_before_outage="$(count_helper_command deactivate)"
 edge_reconcile_before_outage="$(count_helper_command configure-edge-proxy)"
+requests_before_outage="$(count_reconcile_requests)"
 touch "$fake_state/api-down"
 run_autopilot reconcile
 rm -f "$fake_state/api-down"
+[[ "$(count_reconcile_requests)" == "$((requests_before_outage + 3))" ]] \
+  || fail "sixteen dead Control Planes were not bounded to three attempts"
+first_outage_url="$(reconcile_url_at "$((requests_before_outage + 1))")"
 [[ "$(find "$fake_state/active" -maxdepth 1 -type f -printf '%f\n' | sort)" \
   == "$state_before_outage" ]] \
   || fail "Control Plane outage changed active services"
@@ -412,6 +511,40 @@ rm -f "$fake_state/api-down"
   && "$(count_helper_command deactivate)" == "$deactivate_before_outage" \
   && "$(count_helper_command configure-edge-proxy)" == "$edge_reconcile_before_outage" ]] \
   || fail "Control Plane outage changed Keycloak placement"
+
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$lease_deadline_path"
+deactivate_before_expiry="$(count_helper_command deactivate)"
+requests_before_expiry="$(count_reconcile_requests)"
+touch "$fake_state/api-down"
+run_autopilot reconcile
+rm -f "$fake_state/api-down"
+second_outage_url="$(reconcile_url_at "$((requests_before_expiry + 1))")"
+[[ "$second_outage_url" != "$first_outage_url" ]] \
+  || fail "Control Plane retries did not rotate after an outage"
+assert_inactive heteronetwork-keycloak.service
+assert_inactive heteronetwork-keycloak-backchannel.service
+[[ "$(count_helper_command deactivate)" \
+  == "$((deactivate_before_expiry + 1))" ]] \
+  || fail "expired assignment lease did not self-deactivate the replica"
+[[ ! -e "$lease_deadline_path" ]] \
+  || fail "expired assignment lease was not cleared"
+
+run_autopilot reconcile
+assert_active heteronetwork-keycloak.service
+assert_active heteronetwork-keycloak-backchannel.service
+
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$lease_deadline_path"
+requests_before_agent_outage="$(count_reconcile_requests)"
+rm -f "$fake_state/active/heteronetwork-agent.service"
+run_autopilot reconcile
+[[ "$(count_reconcile_requests)" == "$requests_before_agent_outage" ]] \
+  || fail "Agent outage still attempted a Control Plane reconcile"
+assert_inactive heteronetwork-keycloak.service
+assert_inactive heteronetwork-keycloak-backchannel.service
+touch "$fake_state/active/heteronetwork-agent.service"
+run_autopilot reconcile
+assert_active heteronetwork-keycloak.service
+assert_active heteronetwork-keycloak-backchannel.service
 
 write_response \
   "$fixture_dir/response.json" false node-keycloak-remote 10.250.0.22
@@ -512,9 +645,9 @@ grep -Fqx 'Unit=heteronetwork-keycloak-autopilot.service' \
   "$systemd_dir/heteronetwork-keycloak-autopilot.timer" \
   || fail "timer does not target the reconcile service"
 if grep -Fq \
-  'Requires=heteronetwork-agent.service heteronetwork-keycloak-prepare.service' \
+  'Requires=heteronetwork-agent.service' \
   "$systemd_dir/heteronetwork-keycloak-autopilot.service"; then
-  fail "reconciliation still hard-requires full Keycloak preparation"
+  fail "reconciliation still hard-requires the Agent"
 fi
 grep -Fqx 'TimeoutStartSec=900s' \
   "$systemd_dir/heteronetwork-keycloak-prepare.service" \
@@ -533,13 +666,23 @@ grep -Fq 'ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS="2"' "$helper_contract" \
   || fail "helper activation readiness request is not lease-safe"
 grep -Fq 'readonly ACTIVATION_TIMEOUT_SECONDS="90"' "$autopilot" \
   || fail "autopilot activation window is not bounded"
+grep -Fq 'readonly MAX_CONTROL_PLANE_ATTEMPTS="3"' "$autopilot" \
+  || fail "Control Plane retries are not bounded"
+grep -Fq '"http://127.0.0.1:${REPLICA_PORT}${oidc_probe_path}"' "$autopilot" \
+  || fail "autopilot readiness omits realm discovery"
 grep -Fq '"http://127.0.0.1:${management_port}/health/ready"' "$helper_contract" \
   || fail "helper activation does not probe management readiness"
+if grep -Fq 'Requires=heteronetwork-agent.service' "$helper_contract"; then
+  fail "a generated Keycloak unit still hard-requires the Agent"
+fi
 if grep -Fq 'systemctl restart heteronetwork-keycloak.service' "$helper_contract"; then
   fail "helper restarts an already-active Keycloak replica"
 fi
 grep -Fq 'systemctl reset-failed \' "$helper_contract" \
   || fail "helper leaves intentionally stopped replicas in a failed state"
+grep -Fq 'if ((config_changed == 1 || unit_changed == 1)); then' \
+  "$helper_contract" \
+  || fail "helper reloads an unchanged edge proxy"
 if grep -Fq 'start --optimized --import-realm' "$helper_contract"; then
   fail "normal Keycloak restart still imports realms"
 fi
