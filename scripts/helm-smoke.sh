@@ -138,7 +138,8 @@ assert_rendered_contains default "- --public-candidate-max-age-seconds"
 assert_rendered_contains default '- "180"'
 assert_rendered_contains default "- --publish-node-external-ip"
 assert_rendered_contains default "- --health-bind"
-assert_rendered_contains default '- "0.0.0.0:19089"'
+assert_rendered_contains default '- "127.0.0.1:19089"'
+assert_rendered_count default 3 "host: 127.0.0.1"
 assert_rendered_contains default "path: /readyz"
 assert_rendered_count default 2 "name: HETERONETWORK_AGENT_API_BEARER_TOKEN"
 assert_rendered_contains default 'value: "http://127.0.0.1:9780/v1/status"'

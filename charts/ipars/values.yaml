@@ -59,7 +59,7 @@ kubernetesPlugin:
     fullReconcileIntervalSeconds: 300
     publicCandidateMaxAgeSeconds: 180
     publishNodeExternalIp: true
-    healthBind: "0.0.0.0:19089"
+    healthBind: "127.0.0.1:19089"
     resources:
       requests:
         cpu: 10m

@@ -73,7 +73,7 @@ struct NodeReporterArgs {
     full_reconcile_interval_seconds: u64,
     #[arg(long, default_value_t = 180)]
     public_candidate_max_age_seconds: i64,
-    #[arg(long, default_value = "0.0.0.0:19089")]
+    #[arg(long, default_value = "127.0.0.1:19089")]
     health_bind: SocketAddr,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     publish_node_external_ip: bool,
