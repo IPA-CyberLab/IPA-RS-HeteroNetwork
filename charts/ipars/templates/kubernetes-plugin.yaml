@@ -4,7 +4,6 @@
 {{- if $pluginEnabled -}}
 {{- $controllerName := include "heteronetwork.kubernetesPluginControllerName" . -}}
 {{- $tlsSecretName := include "heteronetwork.kubernetesPluginTlsSecretName" . -}}
-{{- $serviceAccountName := include "heteronetwork.serviceAccountName" . -}}
 {{- $imageRepository := printf "%v" .Values.image.repository -}}
 {{- $imageTag := printf "%v" .Values.image.tag -}}
 {{- $webhookBind := printf "%v" .Values.kubernetesPlugin.controller.webhookBind -}}
@@ -30,11 +29,21 @@
 {{- $tlsPrivateKey = b64enc $certificate.Key -}}
 {{- end }}
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $controllerName }}
+  labels:
+    app.kubernetes.io/name: {{ $controllerName | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+automountServiceAccountToken: true
+---
+apiVersion: v1
 kind: Secret
 metadata:
   name: {{ $tlsSecretName }}
   labels:
-    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/name: {{ $controllerName | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: kubernetes-controller
 type: kubernetes.io/tls
@@ -48,13 +57,13 @@ kind: Service
 metadata:
   name: {{ $controllerName }}
   labels:
-    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/name: {{ $controllerName | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: kubernetes-controller
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/name: {{ $controllerName | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: kubernetes-controller
   ports:
@@ -69,7 +78,7 @@ kind: Deployment
 metadata:
   name: {{ $controllerName }}
   labels:
-    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/name: {{ $controllerName | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: kubernetes-controller
 spec:
@@ -77,21 +86,23 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+      app.kubernetes.io/name: {{ $controllerName | quote }}
       app.kubernetes.io/instance: {{ .Release.Name | quote }}
       app.kubernetes.io/component: kubernetes-controller
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+        app.kubernetes.io/name: {{ $controllerName | quote }}
         app.kubernetes.io/instance: {{ .Release.Name | quote }}
         app.kubernetes.io/component: kubernetes-controller
+      annotations:
+        networking.heteronetwork.io/webhook-tls-checksum: {{ sha256sum $tlsCertificate | quote }}
     spec:
-      serviceAccountName: {{ $serviceAccountName }}
+      serviceAccountName: {{ $controllerName }}
       automountServiceAccountToken: true
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -109,15 +120,13 @@ spec:
           type: RuntimeDefault
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
-                    app.kubernetes.io/instance: {{ .Release.Name | quote }}
-                    app.kubernetes.io/component: kubernetes-controller
-                topologyKey: kubernetes.io/hostname
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ $controllerName | quote }}
+                  app.kubernetes.io/instance: {{ .Release.Name | quote }}
+                  app.kubernetes.io/component: kubernetes-controller
+              topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 30
       containers:
         - name: controller
@@ -131,6 +140,10 @@ spec:
             - {{ .Values.kubernetesPlugin.loadBalancerClass | quote }}
             - --reconcile-interval-seconds
             - {{ .Values.kubernetesPlugin.controller.reconcileIntervalSeconds | quote }}
+            - --agent-pod-namespace
+            - {{ .Release.Namespace | quote }}
+            - --agent-pod-label-selector
+            - {{ printf "networking.heteronetwork.io/node-reporter=true,app.kubernetes.io/instance=%s" .Release.Name | quote }}
             - --webhook-bind
             - {{ $webhookBind | quote }}
             - --tls-cert-path
@@ -211,12 +224,28 @@ spec:
             secretName: {{ $tlsSecretName }}
             defaultMode: 0440
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $controllerName }}
+  labels:
+    app.kubernetes.io/name: {{ $controllerName | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $controllerName | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      app.kubernetes.io/component: kubernetes-controller
+---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
   name: {{ $controllerName }}
   labels:
-    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/name: {{ $controllerName | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     app.kubernetes.io/component: kubernetes-controller
 webhooks:

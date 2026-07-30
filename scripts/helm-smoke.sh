@@ -103,20 +103,43 @@ assert_rendered_contains default 'subPath: "token"'
 assert_rendered_contains default "defaultMode: 0400"
 assert_rendered_contains default "kind: Deployment"
 assert_rendered_contains default "replicas: 2"
+assert_rendered_contains default "maxUnavailable: 1"
+assert_rendered_contains default "maxSurge: 0"
+assert_rendered_count default 4 "kind: ServiceAccount"
+assert_rendered_count default 2 "kind: ClusterRoleBinding"
+assert_rendered_contains default "app.kubernetes.io/component: node-reporter"
+assert_rendered_contains default "serviceAccountName: ipars-heteronetwork-k8s-controller"
+assert_rendered_contains default "kind: PodDisruptionBudget"
+assert_rendered_contains default "minAvailable: 1"
+assert_rendered_contains default "requiredDuringSchedulingIgnoredDuringExecution:"
+assert_rendered_contains default "networking.heteronetwork.io/webhook-tls-checksum:"
 assert_rendered_contains default "name: node-reporter"
 assert_rendered_contains default "/usr/local/bin/ipars-k8s-controller"
 assert_rendered_contains default "- --load-balancer-class"
 assert_rendered_contains default '- "heteronetwork.io/public"'
+assert_rendered_contains default "- --agent-pod-namespace"
+assert_rendered_contains default "- --agent-pod-label-selector"
+assert_rendered_contains default 'networking.heteronetwork.io/node-reporter=true,app.kubernetes.io/instance=ipars'
+assert_rendered_contains default 'networking.heteronetwork.io/node-reporter: "true"'
 assert_rendered_contains default "- --webhook-bind"
 assert_rendered_contains default '- "0.0.0.0:9443"'
 assert_rendered_contains default "- --tls-cert-path"
 assert_rendered_contains default "- /tls/tls.crt"
 assert_rendered_contains default "- --tls-key-path"
 assert_rendered_contains default "- /tls/tls.key"
+assert_rendered_contains default '- "20000"'
+assert_rendered_contains default '- "65535"'
 assert_rendered_contains default "- --agent-state-path"
 assert_rendered_contains default '$(NODE_NAME)'
 assert_rendered_contains default '"/var/lib/heteronetwork/agent.json"'
+assert_rendered_contains default "- --full-reconcile-interval-seconds"
+assert_rendered_contains default '- "300"'
+assert_rendered_contains default "- --public-candidate-max-age-seconds"
+assert_rendered_contains default '- "180"'
 assert_rendered_contains default "- --publish-node-external-ip"
+assert_rendered_contains default "- --health-bind"
+assert_rendered_contains default '- "0.0.0.0:19089"'
+assert_rendered_contains default "path: /readyz"
 assert_rendered_count default 2 "name: HETERONETWORK_AGENT_API_BEARER_TOKEN"
 assert_rendered_contains default 'value: "http://127.0.0.1:9780/v1/status"'
 assert_rendered_contains default "kind: MutatingWebhookConfiguration"
@@ -129,7 +152,8 @@ assert_rendered_contains default "app.kubernetes.io/component: kubernetes-contro
 assert_rendered_contains default "- nodes/status"
 assert_rendered_contains default "- services/status"
 assert_rendered_contains default "- endpointslices"
-assert_rendered_contains default "- leases"
+assert_rendered_contains default "- pods"
+assert_rendered_absent default "- leases"
 assert_rendered_absent default "- agones.dev"
 assert_rendered_absent default "- allocation.agones.dev"
 
@@ -199,6 +223,18 @@ template_fails kubernetes-plugin-controller-interval-zero \
 template_fails kubernetes-plugin-node-reporter-interval-zero \
   "kubernetesPlugin.nodeReporter.reconcileIntervalSeconds must be greater than zero" \
   --set kubernetesPlugin.nodeReporter.reconcileIntervalSeconds=0
+
+template_fails kubernetes-plugin-node-reporter-full-interval-too-short \
+  "kubernetesPlugin.nodeReporter.fullReconcileIntervalSeconds must be at least kubernetesPlugin.nodeReporter.reconcileIntervalSeconds" \
+  --set kubernetesPlugin.nodeReporter.fullReconcileIntervalSeconds=9
+
+template_fails kubernetes-plugin-node-reporter-candidate-age-too-short \
+  "kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds must be between 30 and 86400" \
+  --set kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds=29
+
+template_fails kubernetes-plugin-node-reporter-health-zero-port \
+  "kubernetesPlugin.nodeReporter.healthBind port must be between 1 and 65535" \
+  --set-string kubernetesPlugin.nodeReporter.healthBind=0.0.0.0:0
 
 template_fails kubernetes-plugin-webhook-bind-zero-port \
   "kubernetesPlugin.controller.webhookBind port must be between 1 and 65535" \
@@ -420,6 +456,8 @@ template_release_ok release-scoping edge \
 assert_rendered_contains release-scoping "name: edge-heteronetwork"
 assert_rendered_contains release-scoping "name: edge-heteronetwork-agent"
 assert_rendered_contains release-scoping "name: edge-heteronetwork-agent-api"
+assert_rendered_contains release-scoping "name: edge-heteronetwork-node-reporter"
+assert_rendered_contains release-scoping "port: 19089"
 assert_rendered_contains release-scoping 'app.kubernetes.io/instance: "edge"'
 assert_rendered_absent release-scoping "name: ipars-agent"
 

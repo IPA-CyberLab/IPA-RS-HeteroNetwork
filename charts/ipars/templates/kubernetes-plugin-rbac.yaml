@@ -3,11 +3,52 @@
 {{- $pluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
 {{- $rbacCreate := eq (printf "%v" .Values.rbac.create) "true" -}}
 {{- if and $pluginEnabled $rbacCreate -}}
-{{- $name := include "heteronetwork.kubernetesPluginControllerName" . -}}
+{{- $controllerName := include "heteronetwork.kubernetesPluginControllerName" . -}}
+{{- $reporterName := printf "%s-node-reporter" $controllerName -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ $name }}
+  name: {{ $reporterName }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: node-reporter
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/status
+    verbs:
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $reporterName }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: node-reporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $reporterName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "heteronetwork.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $controllerName }}
   labels:
     app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
@@ -18,19 +59,7 @@ rules:
     resources:
       - nodes
     verbs:
-      - get
       - list
-      - watch
-      - patch
-      - update
-  - apiGroups:
-      - ""
-    resources:
-      - nodes/status
-    verbs:
-      - get
-      - patch
-      - update
   - apiGroups:
       - ""
     resources:
@@ -38,9 +67,7 @@ rules:
     verbs:
       - get
       - list
-      - watch
       - patch
-      - update
       {{- if eq (printf "%v" .Values.kubernetesPlugin.agones.enabled) "true" }}
       - create
       - delete
@@ -50,54 +77,33 @@ rules:
     resources:
       - services/status
     verbs:
-      - get
       - patch
-      - update
   - apiGroups:
       - discovery.k8s.io
     resources:
       - endpointslices
     verbs:
-      - get
       - list
-      - watch
   - apiGroups:
       - ""
     resources:
       - pods
     verbs:
-      - get
       - list
-      - watch
-  - apiGroups:
-      - coordination.k8s.io
-    resources:
-      - leases
-    verbs:
-      - get
-      - list
-      - watch
-      - create
-      - update
-      - patch
-      - delete
   {{- if eq (printf "%v" .Values.kubernetesPlugin.agones.enabled) "true" }}
   - apiGroups:
       - agones.dev
     resources:
       - gameservers
     verbs:
-      - get
       - list
-      - watch
       - patch
-      - update
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ $name }}
+  name: {{ $controllerName }}
   labels:
     app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
@@ -105,9 +111,9 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ $name }}
+  name: {{ $controllerName }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "heteronetwork.serviceAccountName" . }}
+    name: {{ $controllerName }}
     namespace: {{ .Release.Namespace }}
 {{- end }}

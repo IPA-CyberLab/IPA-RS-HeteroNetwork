@@ -872,6 +872,18 @@
 {{- if lt (int $nodeReporterInterval) 1 -}}
 {{- fail "kubernetesPlugin.nodeReporter.reconcileIntervalSeconds must be greater than zero" -}}
 {{- end -}}
+{{- $nodeReporterFullInterval := printf "%v" .Values.kubernetesPlugin.nodeReporter.fullReconcileIntervalSeconds -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.nodeReporter.fullReconcileIntervalSeconds" "value" $nodeReporterFullInterval "max" 86400) -}}
+{{- if lt (int $nodeReporterFullInterval) (int $nodeReporterInterval) -}}
+{{- fail "kubernetesPlugin.nodeReporter.fullReconcileIntervalSeconds must be at least kubernetesPlugin.nodeReporter.reconcileIntervalSeconds" -}}
+{{- end -}}
+{{- $publicCandidateMaxAge := printf "%v" .Values.kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds" "value" $publicCandidateMaxAge "max" 86400) -}}
+{{- if lt (int $publicCandidateMaxAge) 30 -}}
+{{- fail "kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds must be between 30 and 86400" -}}
+{{- end -}}
+{{- $nodeReporterHealthBind := printf "%v" .Values.kubernetesPlugin.nodeReporter.healthBind -}}
+{{- include "heteronetwork.validateBindSocketAddress" (dict "path" "kubernetesPlugin.nodeReporter.healthBind" "value" $nodeReporterHealthBind) -}}
 {{- $webhookBind := printf "%v" .Values.kubernetesPlugin.controller.webhookBind -}}
 {{- include "heteronetwork.validateBindSocketAddress" (dict "path" "kubernetesPlugin.controller.webhookBind" "value" $webhookBind) -}}
 {{- $webhookServicePort := printf "%v" .Values.kubernetesPlugin.webhook.servicePort -}}

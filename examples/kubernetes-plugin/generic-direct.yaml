@@ -51,6 +51,7 @@ metadata:
 spec:
   type: LoadBalancer
   loadBalancerClass: heteronetwork.io/public
+  allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
   selector:
     app.kubernetes.io/name: echo-direct

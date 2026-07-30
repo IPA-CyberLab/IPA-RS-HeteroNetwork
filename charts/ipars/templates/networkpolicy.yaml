@@ -9,6 +9,7 @@
 {{- include "heteronetwork.validateBoolean" (dict "path" "agent.hostNetwork" "value" .Values.agent.hostNetwork) -}}
 {{- $networkPolicyEnabled := .Values.networkPolicy.enabled -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
+{{- $kubernetesPluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
 {{- $agentApiNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.agentApi.enabled -}}
 {{- $relayNetworkPolicyEnabled := and $networkPolicyEnabled .Values.networkPolicy.relay.enabled -}}
 {{- if and (not $networkPolicyEnabled) (or .Values.networkPolicy.agentApi.enabled .Values.networkPolicy.relay.enabled) -}}
@@ -120,4 +121,29 @@ spec:
           port: {{ .Values.agent.relayService.udpTargetPort }}
         - protocol: TCP
           port: {{ .Values.agent.relayService.httpTargetPort }}
+{{- end }}
+{{- if and $networkPolicyEnabled $kubernetesPluginEnabled }}
+{{- if or $agentApiNetworkPolicyEnabled $relayNetworkPolicyEnabled }}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-node-reporter" (include "heteronetwork.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: node-reporter
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      networking.heteronetwork.io/node-reporter: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ int (regexFind "[0-9]+$" (printf "%v" .Values.kubernetesPlugin.nodeReporter.healthBind)) }}
 {{- end }}

@@ -70,7 +70,11 @@
 {{- $agentNatDiscoveryIntervalSeconds := printf "%v" .Values.agent.natDiscovery.intervalSeconds -}}
 {{- $kubernetesPluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
 {{- $nodeReporterReconcileIntervalSeconds := printf "%v" .Values.kubernetesPlugin.nodeReporter.reconcileIntervalSeconds -}}
+{{- $nodeReporterFullReconcileIntervalSeconds := printf "%v" .Values.kubernetesPlugin.nodeReporter.fullReconcileIntervalSeconds -}}
+{{- $nodeReporterPublicCandidateMaxAgeSeconds := printf "%v" .Values.kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds -}}
 {{- $nodeReporterPublishNodeExternalIp := printf "%v" .Values.kubernetesPlugin.nodeReporter.publishNodeExternalIp -}}
+{{- $nodeReporterHealthBind := printf "%v" .Values.kubernetesPlugin.nodeReporter.healthBind -}}
+{{- $nodeReporterHealthPort := int (regexFind "[0-9]+$" $nodeReporterHealthBind) -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
 {{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
 {{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
@@ -823,6 +827,9 @@ spec:
         {{- range $key, $value := .Values.agent.podLabels }}
         {{ $key }}: {{ $value | quote }}
         {{- end }}
+        {{- if $kubernetesPluginEnabled }}
+        networking.heteronetwork.io/node-reporter: "true"
+        {{- end }}
       {{- with .Values.agent.podAnnotations }}
       annotations:
         {{- range $key, $value := . }}
@@ -1393,8 +1400,14 @@ spec:
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
             - --reconcile-interval-seconds
             - {{ $nodeReporterReconcileIntervalSeconds | quote }}
+            - --full-reconcile-interval-seconds
+            - {{ $nodeReporterFullReconcileIntervalSeconds | quote }}
+            - --public-candidate-max-age-seconds
+            - {{ $nodeReporterPublicCandidateMaxAgeSeconds | quote }}
             - --publish-node-external-ip
             - {{ $nodeReporterPublishNodeExternalIp | quote }}
+            - --health-bind
+            - {{ $nodeReporterHealthBind | quote }}
           env:
             - name: NODE_NAME
               valueFrom:
@@ -1415,6 +1428,10 @@ spec:
             capabilities:
               drop:
                 - ALL
+          ports:
+            - name: reporter-health
+              containerPort: {{ $nodeReporterHealthPort }}
+              protocol: TCP
           {{- if or .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu .Values.kubernetesPlugin.nodeReporter.resources.requests.memory .Values.kubernetesPlugin.nodeReporter.resources.limits.cpu .Values.kubernetesPlugin.nodeReporter.resources.limits.memory }}
           resources:
             {{- if or .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu .Values.kubernetesPlugin.nodeReporter.resources.requests.memory }}
@@ -1436,21 +1453,24 @@ spec:
               {{- end }}
             {{- end }}
           {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: reporter-health
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
           readinessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -ec
-                - {{ printf "test -r %s/agent.json" $agentStateMountPath | quote }}
+            httpGet:
+              path: /readyz
+              port: reporter-health
             periodSeconds: 5
             timeoutSeconds: 1
             failureThreshold: 3
           startupProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -ec
-                - {{ printf "test -r %s/agent.json" $agentStateMountPath | quote }}
+            httpGet:
+              path: /readyz
+              port: reporter-health
             periodSeconds: 5
             timeoutSeconds: 1
             failureThreshold: 60

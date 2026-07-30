@@ -121,6 +121,7 @@ metadata:
 spec:
   type: LoadBalancer
   loadBalancerClass: heteronetwork.io/public
+  allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/name: livekit
@@ -141,6 +142,7 @@ metadata:
 spec:
   type: LoadBalancer
   loadBalancerClass: heteronetwork.io/public
+  allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
   selector:
     app.kubernetes.io/name: livekit

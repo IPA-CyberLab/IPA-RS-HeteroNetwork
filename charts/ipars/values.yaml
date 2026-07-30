@@ -26,7 +26,7 @@ kubernetesPlugin:
   loadBalancerClass: heteronetwork.io/public
   controller:
     replicas: 2
-    reconcileIntervalSeconds: 10
+    reconcileIntervalSeconds: 30
     webhookBind: "0.0.0.0:9443"
     resources:
       requests:
@@ -56,7 +56,10 @@ kubernetesPlugin:
         failureThreshold: 30
   nodeReporter:
     reconcileIntervalSeconds: 10
+    fullReconcileIntervalSeconds: 300
+    publicCandidateMaxAgeSeconds: 180
     publishNodeExternalIp: true
+    healthBind: "0.0.0.0:19089"
     resources:
       requests:
         cpu: 10m
@@ -69,8 +72,8 @@ kubernetesPlugin:
     timeoutSeconds: 10
   agones:
     enabled: false
-    portRangeStart: 7000
-    portRangeEnd: 8000
+    portRangeStart: 20000
+    portRangeEnd: 65535
 
 agent:
   interfaceName: heteronetwork0

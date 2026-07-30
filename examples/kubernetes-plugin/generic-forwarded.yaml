@@ -41,6 +41,7 @@ metadata:
 spec:
   type: LoadBalancer
   loadBalancerClass: heteronetwork.io/public
+  allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/name: echo-forwarded

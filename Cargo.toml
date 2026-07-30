@@ -16,6 +16,7 @@ members = [
     "crates/ipars-signal-http",
     "crates/ipars-store",
     "crates/ipars-stun",
+    "crates/ipars-k8s-controller",
     "crates/ipars-types",
 ]
 
@@ -30,6 +31,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 aya = { version = "0.13.1", default-features = false }
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 boringtun = { version = "0.7.1", default-features = false, features = ["device"] }
 bytes = "1.12"
@@ -41,6 +43,9 @@ genetlink = "0.2.6"
 hickory-proto = "0.26.1"
 hex = "0.4"
 ipnet = { version = "2.10", features = ["serde"] }
+json-patch = "4.2"
+k8s-openapi = { version = "0.27", features = ["v1_35"] }
+kube = { version = "=3.0.1", default-features = false, features = ["admission", "client", "config", "jsonpatch", "ring", "rustls-tls"] }
 netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
 netlink-packet-wireguard = "0.4"

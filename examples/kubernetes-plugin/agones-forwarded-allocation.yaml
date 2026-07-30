@@ -1,0 +1,9 @@
+apiVersion: allocation.agones.dev/v1
+kind: GameServerAllocation
+metadata:
+  generateName: udp-game-forwarded-
+spec:
+  required:
+    matchLabels:
+      agones.dev/fleet: udp-game-forwarded
+      networking.heteronetwork.io/public-ready: "true"

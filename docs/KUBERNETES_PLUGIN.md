@@ -16,6 +16,8 @@ Agones users must additionally set `kubernetesPlugin.agones.enabled=true`; this
 adds the Agones RBAC and GameServer reconciler. The controller runs with two
 replicas by default, while the per-node reporter runs beside the HeteroNetwork
 Agent and publishes the Kubernetes Node metadata consumed by the controller.
+The controller and reporter use separate RBAC roles; Service and GameServer
+write permissions are not granted to the Agent DaemonSet.
 
 ## Service contract
 
@@ -44,9 +46,8 @@ The accepted combinations are:
 
 The Service reconciler refuses to assign `forwarded` with `Local`, `direct`
 with `Cluster`, or an unknown traffic mode, and records the reason in
-`networking.heteronetwork.io/reconcile-error`. Always set the annotation
-explicitly even though the controller can derive a compatibility mode from
-`externalTrafficPolicy` for an older manifest.
+`networking.heteronetwork.io/reconcile-error`. The annotation is mandatory;
+the controller does not infer a mode from `externalTrafficPolicy`.
 
 A direct workload must also carry this label on its **Pod template**:
 
@@ -81,12 +82,33 @@ carry `networking.heteronetwork.io/public-ingress: "true"` plus the
 eligible only while its node is Ready and the address is locally owned by that
 node.
 
+The reporter exposes readiness only after both the local Agent status read and
+the Kubernetes Node reconciliation succeed. Controllers require the matching
+Agent DaemonSet Pod and the Kubernetes Node to be Ready before using its public
+address. Node metadata is written only when identity or address state changes,
+and a full Kubernetes reconciliation defaults to once every five minutes while
+local Agent health is checked every ten seconds. Thus a 1,000-node cluster does
+not create a Node-update and scheduler-watch fanout on every health interval. A
+stopped Agent, failed reporter, or failed Node reconciliation makes the Pod
+unready and removes that node from new ingress assignments.
+
+After the initial registration, full reconciliations are deterministically
+spread across the five-minute window by node name instead of firing as a
+DaemonSet-wide burst.
+
 In particular, a `PublicUdp` candidate used for this plugin must represent a
-globally routable IP configured on a local interface. A STUN-reflexive address
-behind NAT, a shared router address, CGNAT, or an address merely reachable from
-the node is not sufficient: the gateway must be able to bind the address and
-receive unsolicited TCP and UDP traffic for the published ports. Firewall and
-upstream routing rules must also permit those ports.
+globally routable IP configured on a local interface. It may come from an
+interface scan or from the Agent's STUN no-NAT classification. A
+`StunReflexive` address behind NAT, a shared router address, CGNAT, or an address
+merely reachable from the node is not sufficient: the gateway must be able to
+bind the address and receive unsolicited TCP and UDP traffic for the published
+ports. Firewall and upstream routing rules must also permit those ports.
+
+The candidate must belong to the Agent's reported node identity and be newer
+than `kubernetesPlugin.nodeReporter.publicCandidateMaxAgeSeconds` (180 seconds
+by default). A persisted Agent state file is used only to remove stale
+eligibility when the live Agent API is unavailable; it cannot keep a public
+address eligible.
 
 The controller owns `.status.loadBalancer.ingress` and records the selected
 gateways in `networking.heteronetwork.io/assigned-nodes`. A Service requests
@@ -98,6 +120,15 @@ public IP between nodes. In direct mode the controller publishes only public
 nodes with a Ready local endpoint. In forwarded mode it may use any healthy
 public gateway and send traffic to endpoints on private nodes over their VPN
 paths.
+
+Gateway selection uses deterministic rendezvous hashing over the Service and
+public-node identities. This spreads different Services across the available
+gateways and minimizes reassignment when a gateway is added or removed. The two
+active controller replicas reconcile every 30 seconds by default.
+
+Set `spec.allocateLoadBalancerNodePorts: false` unless another integration
+requires NodePorts. HeteroNetwork publishes the selected public IP directly
+through kube-proxy and does not use an allocated NodePort.
 
 ## Forwarded mode
 
@@ -162,9 +193,16 @@ configured `kubernetesPlugin.agones.portRangeStart` through
 - a selector scoped to that GameServer Pod
 - ports derived from the named entries in `GameServer.spec.ports`
 
+The default range is 20000 through 65535. TCP and UDP claims are tracked
+separately. A direct GameServer requests one ingress node because each
+GameServer Service has exactly one backing Pod; forwarded GameServers retain
+the normal two-gateway default.
+
 The generated Service is deleted with its GameServer. Once the Service has a
 published endpoint, the controller writes the
 `networking.heteronetwork.io/public-addresses` annotation to the GameServer.
+It also sets `networking.heteronetwork.io/public-ready: "true"` so an Agones
+allocation selector can exclude GameServers whose public Service is not ready.
 Its value is a JSON array containing the generated Service's named public
 address, port, and protocol tuples:
 
@@ -175,10 +213,10 @@ For example:
 ```
 
 The plugin does not overwrite Agones-owned `GameServer.status.address` or
-`GameServer.status.ports`. Allocation code must read the published endpoint
-annotation, or use an allocation adapter that returns it to the game client.
-Treat the annotation as controller-owned and wait for `public-addresses` before
-advertising an allocated GameServer.
+`GameServer.status.ports`. Agones includes GameServer metadata in allocation
+responses, so allocation code must select `public-ready=true` and read the
+published endpoint annotation from `status.metadata.annotations`. Treat the
+annotation and readiness label as controller-owned.
 
 Inspect an allocated endpoint with:
 
@@ -191,6 +229,13 @@ Forwarded GameServers can run on every worker:
 
 ```bash
 kubectl apply -f examples/kubernetes-plugin/agones-forwarded-fleet.yaml
+```
+
+Allocate only after the public Service is ready:
+
+```bash
+kubectl create -f \
+  examples/kubernetes-plugin/agones-forwarded-allocation.yaml -o yaml
 ```
 
 Direct GameServers carry the direct label on the nested Pod template and run
