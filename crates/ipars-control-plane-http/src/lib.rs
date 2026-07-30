@@ -29,6 +29,7 @@ use ipars_types::api::{
     RegisterClientResponse, RegisterNodeResponse, RemoveClientResponse, RemoveNodeRequest,
     RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
     RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
+    SponsoredClientRegistrationRequest,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, socket_addr_is_globally_routable, BootstrapEndpoint,
@@ -73,6 +74,7 @@ const WEB_OIDC_REFRESH_REVOCATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_SPONSORED_CLIENT_REGISTRATION_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_DATABASE_AUTOPILOT_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_DATABASE_AUTOPILOT_MEMBER_IDS: usize = 32;
 const MAX_DATABASE_AUTOPILOT_CANDIDATES: usize = 64;
@@ -157,14 +159,144 @@ macro_rules! prometheus_line {
 }
 
 #[derive(Clone)]
+struct PinnedEnrollmentBinary {
+    label: Arc<str>,
+    path: Arc<PathBuf>,
+    file: Arc<std::fs::File>,
+    sha256: Arc<str>,
+    size: u64,
+}
+
+impl PinnedEnrollmentBinary {
+    fn new(path: PathBuf, label: &str) -> Result<Self, String> {
+        let path_metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect {label} {}: {error}", path.display()))?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(format!(
+                "{label} {} must be a regular non-symlink file",
+                path.display()
+            ));
+        }
+        let mut file = std::fs::File::open(&path)
+            .map_err(|error| format!("failed to open {label} {}: {error}", path.display()))?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect opened {label} {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_NODE_ENROLLMENT_BINARY_BYTES
+        {
+            return Err(format!(
+                "{label} {} must be a non-empty regular file no larger than {MAX_NODE_ENROLLMENT_BINARY_BYTES} bytes",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+                return Err(format!(
+                    "{label} {} changed while it was opened",
+                    path.display()
+                ));
+            }
+        }
+
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("failed to hash {label} {}: {error}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("failed to rewind {label} {}: {error}", path.display()))?;
+
+        Ok(Self {
+            label: Arc::from(label),
+            path: Arc::new(path),
+            file: Arc::new(file),
+            sha256: Arc::from(format!("{:x}", digest.finalize())),
+            size: metadata.len(),
+        })
+    }
+
+    fn open(&self) -> Result<std::fs::File, String> {
+        let path_metadata = std::fs::symlink_metadata(self.path.as_ref()).map_err(|error| {
+            format!(
+                "failed to inspect {} {}: {error}",
+                self.label,
+                self.path.display()
+            )
+        })?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(format!(
+                "{} {} is no longer a regular non-symlink file",
+                self.label,
+                self.path.display()
+            ));
+        }
+        let file = std::fs::File::open(self.path.as_ref()).map_err(|error| {
+            format!(
+                "failed to open {} {}: {error}",
+                self.label,
+                self.path.display()
+            )
+        })?;
+        let original = self.file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect pinned {} {}: {error}",
+                self.label,
+                self.path.display()
+            )
+        })?;
+        let opened = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect opened {} {}: {error}",
+                self.label,
+                self.path.display()
+            )
+        })?;
+        if !opened.is_file() || opened.len() != self.size {
+            return Err(format!(
+                "{} {} changed after startup",
+                self.label,
+                self.path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if path_metadata.dev() != opened.dev()
+                || path_metadata.ino() != opened.ino()
+                || original.dev() != opened.dev()
+                || original.ino() != opened.ino()
+            {
+                return Err(format!(
+                    "{} {} changed after startup",
+                    self.label,
+                    self.path.display()
+                ));
+            }
+        }
+        Ok(file)
+    }
+}
+
+#[derive(Clone)]
 pub struct NodeEnrollmentConfig {
     issuer: IdentityKeyPair,
     key_id: KeyId,
     install_base_url: Arc<str>,
-    binary_path: Arc<PathBuf>,
-    binary: Arc<std::fs::File>,
-    binary_sha256: Arc<str>,
-    binary_size: u64,
+    daemon_binary: PinnedEnrollmentBinary,
+    cli_binary: PinnedEnrollmentBinary,
     max_ttl_seconds: u64,
     relay_admission_bearer_token: Arc<str>,
     public_services: Option<Arc<NodePublicServicesConfig>>,
@@ -176,6 +308,7 @@ impl NodeEnrollmentConfig {
         key_id: String,
         install_base_url: String,
         binary_path: PathBuf,
+        cli_binary_path: PathBuf,
         max_ttl_seconds: u64,
         relay_admission_bearer_token: String,
     ) -> Result<Self, String> {
@@ -207,79 +340,17 @@ impl NodeEnrollmentConfig {
             return Err("node enrollment public URL must not contain a path".to_string());
         }
 
-        let path_metadata = std::fs::symlink_metadata(&binary_path).map_err(|error| {
-            format!(
-                "failed to inspect node enrollment binary {}: {error}",
-                binary_path.display()
-            )
-        })?;
-        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-            return Err(format!(
-                "node enrollment binary {} must be a regular non-symlink file",
-                binary_path.display()
-            ));
-        }
-        let mut binary = std::fs::File::open(&binary_path).map_err(|error| {
-            format!(
-                "failed to open node enrollment binary {}: {error}",
-                binary_path.display()
-            )
-        })?;
-        let metadata = binary.metadata().map_err(|error| {
-            format!(
-                "failed to inspect opened node enrollment binary {}: {error}",
-                binary_path.display()
-            )
-        })?;
-        if !metadata.is_file()
-            || metadata.len() == 0
-            || metadata.len() > MAX_NODE_ENROLLMENT_BINARY_BYTES
-        {
-            return Err(format!(
-                "node enrollment binary {} must be a non-empty regular file no larger than {MAX_NODE_ENROLLMENT_BINARY_BYTES} bytes",
-                binary_path.display()
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
-                return Err(format!(
-                    "node enrollment binary {} changed while it was opened",
-                    binary_path.display()
-                ));
-            }
-        }
-
-        let mut digest = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = binary.read(&mut buffer).map_err(|error| {
-                format!(
-                    "failed to hash node enrollment binary {}: {error}",
-                    binary_path.display()
-                )
-            })?;
-            if read == 0 {
-                break;
-            }
-            digest.update(&buffer[..read]);
-        }
-        binary.seek(SeekFrom::Start(0)).map_err(|error| {
-            format!(
-                "failed to rewind node enrollment binary {}: {error}",
-                binary_path.display()
-            )
-        })?;
+        let daemon_binary =
+            PinnedEnrollmentBinary::new(binary_path, "node enrollment daemon binary")?;
+        let cli_binary =
+            PinnedEnrollmentBinary::new(cli_binary_path, "node enrollment CLI binary")?;
 
         Ok(Self {
             issuer,
             key_id: KeyId::from_string(key_id),
             install_base_url: Arc::from(install_base_url),
-            binary_path: Arc::new(binary_path),
-            binary: Arc::new(binary),
-            binary_sha256: Arc::from(format!("{:x}", digest.finalize())),
-            binary_size: metadata.len(),
+            daemon_binary,
+            cli_binary,
             max_ttl_seconds,
             relay_admission_bearer_token: Arc::from(relay_admission_bearer_token),
             public_services: None,
@@ -305,61 +376,6 @@ impl NodeEnrollmentConfig {
 
     pub fn max_ttl_seconds(&self) -> u64 {
         self.max_ttl_seconds
-    }
-
-    fn open_binary(&self) -> Result<std::fs::File, String> {
-        let path_metadata =
-            std::fs::symlink_metadata(self.binary_path.as_ref()).map_err(|error| {
-                format!(
-                    "failed to inspect node enrollment binary {}: {error}",
-                    self.binary_path.display()
-                )
-            })?;
-        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-            return Err(format!(
-                "node enrollment binary {} is no longer a regular non-symlink file",
-                self.binary_path.display()
-            ));
-        }
-        let binary = std::fs::File::open(self.binary_path.as_ref()).map_err(|error| {
-            format!(
-                "failed to open node enrollment binary {}: {error}",
-                self.binary_path.display()
-            )
-        })?;
-        let original = self.binary.metadata().map_err(|error| {
-            format!(
-                "failed to inspect pinned node enrollment binary {}: {error}",
-                self.binary_path.display()
-            )
-        })?;
-        let opened = binary.metadata().map_err(|error| {
-            format!(
-                "failed to inspect opened node enrollment binary {}: {error}",
-                self.binary_path.display()
-            )
-        })?;
-        if !opened.is_file() || opened.len() != self.binary_size {
-            return Err(format!(
-                "node enrollment binary {} changed after startup",
-                self.binary_path.display()
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if path_metadata.dev() != opened.dev()
-                || path_metadata.ino() != opened.ino()
-                || original.dev() != opened.dev()
-                || original.ino() != opened.ino()
-            {
-                return Err(format!(
-                    "node enrollment binary {} changed after startup",
-                    self.binary_path.display()
-                ));
-            }
-        }
-        Ok(binary)
     }
 }
 
@@ -582,6 +598,12 @@ where
         .route("/healthz", get(healthz))
         .route("/v1/join", post(join::<S, L>))
         .route("/v1/clients/join", post(join_client::<S, L>))
+        .route(
+            "/v1/clients/sponsored-enrollment",
+            post(sponsored_client_enrollment::<S, L>).layer(DefaultBodyLimit::max(
+                MAX_SPONSORED_CLIENT_REGISTRATION_REQUEST_BYTES,
+            )),
+        )
         .route("/v1/clients/peers/query", post(client_peers::<S, L>))
         .route("/v1/clients/{client_id}", delete(remove_client::<S, L>))
         .route("/v1/heartbeat", post(heartbeat::<S, L>))
@@ -606,6 +628,10 @@ where
         .route(
             "/v1/install/iparsd-linux-amd64",
             get(node_enrollment_binary::<S, L>),
+        )
+        .route(
+            "/v1/install/ipars-linux-amd64",
+            get(node_enrollment_cli_binary::<S, L>),
         );
     let database_autopilot_bearer_token = state.resolved_database_autopilot_bearer_token();
     let protocol = if let Some(bearer_token) = database_autopilot_bearer_token {
@@ -2353,6 +2379,7 @@ struct AdminNodeEnrollmentResponse {
     install_command: String,
     install_script: String,
     binary_sha256: String,
+    cli_binary_sha256: String,
     architecture: &'static str,
     setup: NodeEnrollmentSetup,
 }
@@ -2565,7 +2592,8 @@ where
         max_uses,
         install_command,
         install_script,
-        binary_sha256: enrollment.binary_sha256.to_string(),
+        binary_sha256: enrollment.daemon_binary.sha256.to_string(),
+        cli_binary_sha256: enrollment.cli_binary.sha256.to_string(),
         architecture: NODE_ENROLLMENT_ARCH,
         setup: request.setup,
     };
@@ -3033,8 +3061,36 @@ where
     L: TokenLedger,
 {
     let enrollment = authorize_node_enrollment(&state, &headers).await?;
-    let binary = enrollment
-        .open_binary()
+    enrollment_binary_response(
+        &enrollment.daemon_binary,
+        "iparsd-linux-amd64",
+        "node enrollment daemon binary",
+    )
+}
+
+async fn node_enrollment_cli_binary<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    headers: HeaderMap,
+) -> Result<Response, NodeEnrollmentApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let enrollment = authorize_node_enrollment(&state, &headers).await?;
+    enrollment_binary_response(
+        &enrollment.cli_binary,
+        "ipars-linux-amd64",
+        "node enrollment CLI binary",
+    )
+}
+
+fn enrollment_binary_response(
+    artifact: &PinnedEnrollmentBinary,
+    filename: &'static str,
+    label: &'static str,
+) -> Result<Response, NodeEnrollmentApiError> {
+    let binary = artifact
+        .open()
         .map_err(NodeEnrollmentApiError::unavailable)?;
     let stream = ReaderStream::new(tokio::fs::File::from_std(binary));
     let mut response = Response::new(Body::from_stream(stream));
@@ -3045,18 +3101,18 @@ where
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_static("attachment; filename=iparsd-linux-amd64"),
+        header::HeaderValue::from_str(&format!("attachment; filename={filename}"))
+            .map_err(|_| NodeEnrollmentApiError::unavailable("invalid binary filename"))?,
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        header::HeaderValue::from_str(&enrollment.binary_size.to_string()).map_err(|_| {
-            NodeEnrollmentApiError::unavailable("invalid node enrollment binary size")
-        })?,
+        header::HeaderValue::from_str(&artifact.size.to_string())
+            .map_err(|_| NodeEnrollmentApiError::unavailable(format!("invalid {label} size")))?,
     );
     headers.insert(
         header::HeaderName::from_static("x-heteronetwork-sha256"),
-        header::HeaderValue::from_str(&enrollment.binary_sha256).map_err(|_| {
-            NodeEnrollmentApiError::unavailable("invalid node enrollment binary checksum")
+        header::HeaderValue::from_str(&artifact.sha256).map_err(|_| {
+            NodeEnrollmentApiError::unavailable(format!("invalid {label} checksum"))
         })?,
     );
     apply_node_enrollment_security_headers(&mut response);
@@ -3162,6 +3218,11 @@ iparsd_previous_snapshot="$tmp_dir/iparsd.previous"
 iparsd_snapshot_ready=0
 iparsd_was_present=0
 iparsd_replaced=0
+ipars_path=/usr/local/bin/ipars
+ipars_previous_snapshot="$tmp_dir/ipars.previous"
+ipars_snapshot_ready=0
+ipars_was_present=0
+ipars_replaced=0
 relay_autopilot_transaction_active=0
 relay_autopilot_timer_enable_state=not-found
 relay_autopilot_timer_was_active=0
@@ -3392,6 +3453,51 @@ discard_iparsd_snapshot() {
   iparsd_was_present=0
 }
 
+snapshot_ipars_binary() {
+  rm -f "$ipars_previous_snapshot"
+  ipars_was_present=0
+  if [ -e "$ipars_path" ] || [ -L "$ipars_path" ]; then
+    if [ ! -f "$ipars_path" ] && [ ! -L "$ipars_path" ]; then
+      echo "Refusing to replace non-file HeteroNetwork CLI path $ipars_path" >&2
+      return 1
+    fi
+    cp -a -- "$ipars_path" "$ipars_previous_snapshot"
+    ipars_was_present=1
+  fi
+  ipars_snapshot_ready=1
+}
+
+restore_ipars_binary() {
+  if [ "$ipars_snapshot_ready" -ne 1 ]; then
+    return 0
+  fi
+  ipars_restore_path="$ipars_path.rollback.new"
+  if [ "$ipars_was_present" -eq 1 ]; then
+    if [ ! -e "$ipars_previous_snapshot" ] \
+      && [ ! -L "$ipars_previous_snapshot" ]; then
+      echo "Previous HeteroNetwork CLI snapshot is missing" >&2
+      return 1
+    fi
+    if ! rm -f "$ipars_restore_path" \
+      || ! cp -a -- "$ipars_previous_snapshot" "$ipars_restore_path" \
+      || ! mv -f -- "$ipars_restore_path" "$ipars_path"; then
+      echo "Unable to restore the previous HeteroNetwork CLI" >&2
+      rm -f "$ipars_restore_path"
+      return 1
+    fi
+  elif ! rm -f "$ipars_path" "$ipars_restore_path"; then
+    echo "Unable to remove the HeteroNetwork CLI created by the failed install" >&2
+    return 1
+  fi
+  ipars_replaced=0
+}
+
+discard_ipars_snapshot() {
+  rm -f "$ipars_previous_snapshot"
+  ipars_snapshot_ready=0
+  ipars_was_present=0
+}
+
 snapshot_relay_transaction_files() {
   rm -rf "$relay_snapshot_dir"
   install -d -m 0700 "$relay_snapshot_dir/files"
@@ -3583,9 +3689,15 @@ restore_relay_autopilot_transaction() {
   systemctl disable heteronetwork-agent.service >/dev/null 2>&1 || true
   if ! restore_relay_transaction_files; then
     echo "Unable to restore the previous Relay files" >&2
-    return 1
+    relay_rollback_failed=1
   fi
   if ! restore_iparsd_binary; then
+    relay_rollback_failed=1
+  fi
+  if ! restore_ipars_binary; then
+    relay_rollback_failed=1
+  fi
+  if [ "$relay_rollback_failed" -ne 0 ]; then
     return 1
   fi
   if ! systemctl daemon-reload; then
@@ -3638,6 +3750,7 @@ restore_relay_autopilot_transaction() {
 commit_installer_transaction() {
   relay_autopilot_transaction_active=0
   discard_iparsd_snapshot
+  discard_ipars_snapshot
 }
 
 installer_exit_cleanup() {
@@ -3649,9 +3762,13 @@ installer_exit_cleanup() {
     if ! restore_relay_autopilot_transaction; then
       echo "Relay upgrade rollback did not fully restore the previous state" >&2
     fi
-  elif [ "$installer_status" -ne 0 ] && [ "$iparsd_replaced" -eq 1 ]; then
+  elif [ "$installer_status" -ne 0 ] \
+    && { [ "$iparsd_replaced" -eq 1 ] || [ "$ipars_replaced" -eq 1 ]; }; then
     if ! restore_iparsd_binary; then
       echo "Installer rollback could not restore the previous HeteroNetwork binary" >&2
+    fi
+    if ! restore_ipars_binary; then
+      echo "Installer rollback could not restore the previous HeteroNetwork CLI" >&2
     fi
   fi
   rm -rf "$tmp_dir"
@@ -3686,6 +3803,30 @@ snapshot_iparsd_binary
 install -m 0755 "$binary" "$iparsd_path.new"
 mv -f "$iparsd_path.new" "$iparsd_path"
 iparsd_replaced=1
+
+cli_binary="$tmp_dir/ipars"
+cli_downloaded=
+for encoded_base in $download_bases; do
+  base=$(printf '%s' "$encoded_base" | base64 -d) || continue
+  rm -f "$cli_binary"
+  if curl -fsS -H "Authorization: HeteroNetworkJoin $auth" \
+    "$base/v1/install/ipars-linux-amd64" -o "$cli_binary"; then
+    actual_sha=$(sha256sum "$cli_binary" | awk '{print $1}')
+    if [ "$actual_sha" = '__CLI_SHA256__' ]; then
+      cli_downloaded=1
+      break
+    fi
+  fi
+done
+if [ -z "$cli_downloaded" ]; then
+  echo "HeteroNetwork CLI download failed on every control-plane endpoint" >&2
+  exit 1
+fi
+chmod 0755 "$cli_binary"
+snapshot_ipars_binary
+install -m 0755 "$cli_binary" "$ipars_path.new"
+mv -f "$ipars_path.new" "$ipars_path"
+ipars_replaced=1
 
 caddy_archive="$tmp_dir/caddy.tar.gz"
 curl --proto '=https' --proto-redir '=https' -fsSL \
@@ -3849,7 +3990,8 @@ echo "HeteroNetwork node enrolled and started"
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
-        .replace("__SHA256__", &enrollment.binary_sha256)
+        .replace("__SHA256__", &enrollment.daemon_binary.sha256)
+        .replace("__CLI_SHA256__", &enrollment.cli_binary.sha256)
         .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
         .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
         .replace("__RELAY_ADMISSION_INSTALL__", &relay_admission_install)
@@ -5941,6 +6083,21 @@ where
     let response = state
         .join_service
         .join_client(request.token, request.registration, Utc::now())
+        .await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn sponsored_client_enrollment<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<SponsoredClientRegistrationRequest>,
+) -> Result<(StatusCode, Json<RegisterClientResponse>), ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let response = state
+        .plane
+        .register_sponsored_client(request, Utc::now())
         .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -8065,6 +8222,7 @@ mod tests {
             "web-enrollment".to_string(),
             "https://static.example".to_string(),
             binary_path.clone(),
+            binary_path.clone(),
             3600,
             RELAY_ADMISSION_BEARER_TOKEN.to_string(),
         )?;
@@ -8561,6 +8719,7 @@ mod tests {
             key_id.as_str().to_string(),
             "http://127.0.0.1:8443".to_string(),
             binary_path.clone(),
+            binary_path.clone(),
             7 * 24 * 60 * 60,
             RELAY_ADMISSION_BEARER_TOKEN.to_string(),
         )?
@@ -8582,7 +8741,7 @@ mod tests {
             ],
             oidc_scopes: "openid profile email".to_string(),
         });
-        let expected_sha256 = enrollment.binary_sha256.to_string();
+        let expected_sha256 = enrollment.daemon_binary.sha256.to_string();
         let enrollment_signing_key = enrollment.issuer.signing_key_b64().to_string();
         let database_autopilot_bearer = derive_node_enrollment_cluster_secret(
             &enrollment,

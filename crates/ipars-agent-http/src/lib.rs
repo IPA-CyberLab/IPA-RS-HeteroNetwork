@@ -44,7 +44,6 @@ const WEB_UI_MANAGEMENT_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODE_INSTALL_PROXY_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
-const PUBLIC_WEB_GATEWAY_HEADER: &str = "x-heteronetwork-gateway-token";
 const MAX_PENDING_DEVICE_LOGINS: usize = 256;
 const MAX_DEVICE_AUTH_RESPONSE_BYTES: u64 = 256 * 1024;
 const MIN_DEVICE_LOGIN_START_INTERVAL: Duration = Duration::from_millis(250);
@@ -170,7 +169,6 @@ impl Default for PublicWebGatewayStatus {
 
 #[derive(Clone)]
 struct PublicWebGatewayAccess {
-    token: Arc<str>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
 }
 
@@ -189,7 +187,6 @@ impl std::fmt::Debug for PublicWebGatewayAccess {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PublicWebGatewayAccess")
-            .field("token", &"[REDACTED]")
             .field("status", &self.status)
             .finish()
     }
@@ -276,13 +273,9 @@ impl AgentHttpState {
 
     pub fn with_public_web_gateway(
         mut self,
-        token: String,
         status: Arc<StdRwLock<PublicWebGatewayStatus>>,
     ) -> Self {
-        self.public_web_gateway = Some(PublicWebGatewayAccess {
-            token: Arc::from(token),
-            status,
-        });
+        self.public_web_gateway = Some(PublicWebGatewayAccess { status });
         self
     }
 }
@@ -362,6 +355,10 @@ fn gateway_web_ui_routes() -> Router<AgentHttpState> {
         )
         .route("/v1/admin/{*path}", any(proxy_management_request))
         .route("/v1/clients/join", post(proxy_management_request))
+        .route(
+            "/v1/clients/sponsored-enrollment",
+            post(proxy_management_request),
+        )
         .route("/v1/clients/peers/query", post(proxy_management_request))
         .route("/v1/clients/{client_id}", delete(proxy_management_request))
 }
@@ -1582,8 +1579,8 @@ async fn require_loopback_web_ui_host(request: Request, next: Next) -> Response 
 }
 
 async fn require_web_ui_access(
-    State(access): State<PublicWebGatewayAccess>,
-    mut request: Request,
+    State(_access): State<PublicWebGatewayAccess>,
+    request: Request,
     next: Next,
 ) -> Response {
     let Some(host) = request
@@ -1599,81 +1596,7 @@ async fn require_web_ui_access(
     if url_host_is_loopback(&http_host_url) {
         return require_loopback_web_ui_host(request, next).await;
     }
-
-    let token_header = HeaderName::from_static(PUBLIC_WEB_GATEWAY_HEADER);
-    let provided = request
-        .headers()
-        .get(&token_header)
-        .and_then(|value| value.to_str().ok());
-    if !provided.is_some_and(|provided| agent_api_token_matches(&access.token, provided)) {
-        return local_web_ui_rejection("public Web UI gateway authentication was rejected");
-    }
-    let gateway = access
-        .status
-        .read()
-        .map(|status| status.clone())
-        .unwrap_or_default();
-    let Some(expected_url) = gateway.url.as_deref() else {
-        return local_web_ui_rejection("public Web UI gateway is not active");
-    };
-    let Ok(expected) = reqwest::Url::parse(expected_url) else {
-        return local_web_ui_rejection("public Web UI gateway state is invalid");
-    };
-    let Ok(actual) = reqwest::Url::parse(&format!("https://{host}/")) else {
-        return local_web_ui_rejection("public Web UI Host header is invalid");
-    };
-    if actual.origin() != expected.origin() {
-        return local_web_ui_rejection(
-            "public Web UI Host header does not match the active gateway",
-        );
-    }
-    if request
-        .headers()
-        .get(HeaderName::from_static("sec-fetch-site"))
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
-    {
-        return local_web_ui_rejection("cross-site public Web UI requests are rejected");
-    }
-    if let Some(origin) = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    {
-        let Ok(origin_url) = reqwest::Url::parse(origin) else {
-            return local_web_ui_rejection("Origin header is invalid");
-        };
-        if origin_url.origin() != expected.origin() {
-            return local_web_ui_rejection("cross-origin public Web UI requests are rejected");
-        }
-    }
-    let path = request.uri().path();
-    let public_route_allowed = match (request.method(), path) {
-        (&Method::GET, "/" | "/ui" | "/ui/") => true,
-        (&Method::GET, path) if path.starts_with("/ui/") => true,
-        (&Method::GET, "/v1/web-ui/endpoints") => true,
-        (&Method::POST, "/v1/web-ui/auth/device") => true,
-        (&Method::POST, "/v1/web-ui/auth/device/poll") => true,
-        (&Method::POST, "/v1/web-ui/auth/refresh") => true,
-        (&Method::POST, "/v1/web-ui/auth/logout") => true,
-        (&Method::GET, path) if path.starts_with("/v1/install/") => true,
-        (&Method::POST, "/v1/heartbeat" | "/v1/neighbors/query" | "/v1/overlay-paths/query") => {
-            true
-        }
-        (&Method::POST, "/v1/database-autopilot/nodes" | "/v1/keycloak-autopilot/reconcile") => {
-            true
-        }
-        (_, path) if path.starts_with("/v1/admin/") => true,
-        (&Method::POST, "/v1/clients/join" | "/v1/clients/peers/query") => true,
-        (&Method::DELETE, path) if path.starts_with("/v1/clients/") => true,
-        _ => false,
-    };
-    if !public_route_allowed {
-        return local_web_ui_rejection("route is only available from the local Agent Web UI");
-    }
-    request.headers_mut().remove(token_header);
-    request.extensions_mut().insert(PublicWebGatewayRequest);
-    next.run(request).await
+    local_web_ui_rejection("the HeteroNetwork management plane is available only over the VPN")
 }
 
 async fn require_overlay_web_ui_access(
@@ -4991,9 +4914,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_web_gateway_requires_proxy_auth_and_limits_routes(
+    async fn public_web_gateway_rejects_the_management_plane_for_public_hosts(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (backend_url, backend, backend_task) =
+        let (backend_url, _backend, backend_task) =
             spawn_web_ui_test_backend(StatusCode::OK).await?;
         let mut node_state = AgentNodeState::generate(Utc::now());
         node_state.bootstrap_endpoints.push(BootstrapEndpoint {
@@ -5014,191 +4937,38 @@ mod tests {
         }));
         let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
             .enable_local_web_ui(true)
-            .with_public_web_gateway("gateway-secret".to_string(), status);
+            .with_public_web_gateway(status);
         let candidates = web_ui_candidates(&state);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].url, backend_url);
         let app = router(state);
 
-        let missing_token = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/ui/app.js")
-                    .header(header::HOST, "203.0.113.10")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(missing_token.status(), StatusCode::FORBIDDEN);
-
-        let public_asset = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/ui/app.js")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(public_asset.status(), StatusCode::OK);
-        let public_asset = String::from_utf8(
-            to_bytes(public_asset.into_body(), usize::MAX)
-                .await?
-                .to_vec(),
-        )?;
-        assert!(public_asset.contains(r#"window.open("about:blank", "_blank")"#));
-        assert!(
-            !public_asset.contains(r#"window.open("about:blank", "heteronetwork-device-login")"#)
-        );
-
-        let public_config = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/ui/config")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(public_config.status(), StatusCode::OK);
-        let public_config: Value = serde_json::from_slice(
-            &axum::body::to_bytes(public_config.into_body(), usize::MAX).await?,
-        )?;
-        let expected_issuer = format!("{backend_url}/realms/heteronetwork");
-        let expected_token_endpoint =
-            format!("{backend_url}/realms/heteronetwork/protocol/openid-connect/token");
-        assert_eq!(
-            public_config.get("issuer_url").and_then(Value::as_str),
-            Some(expected_issuer.as_str())
-        );
-        assert_eq!(
-            public_config.get("token_endpoint").and_then(Value::as_str),
-            Some(expected_token_endpoint.as_str())
-        );
-        assert_eq!(
-            public_config
-                .get("session_refresh_endpoint")
-                .and_then(Value::as_str),
-            Some("/v1/web-ui/auth/refresh")
-        );
-
-        let missing_refresh_cookie = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/web-ui/auth/refresh")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(header::ORIGIN, "https://203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(missing_refresh_cookie.status(), StatusCode::UNAUTHORIZED);
-        let cleared_cookie = missing_refresh_cookie
-            .headers()
-            .get(header::SET_COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .ok_or("refresh rejection omitted the clearing cookie")?;
-        assert!(cleared_cookie.contains("Max-Age=0"));
-        assert!(cleared_cookie.contains("Secure"));
-
-        let mutation = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/web-ui/select")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(header::ORIGIN, "https://203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"endpoint":"https://example.com"}"#))?,
-            )
-            .await?;
-        assert_eq!(mutation.status(), StatusCode::FORBIDDEN);
-
-        let wrong_host = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/ui/app.js")
-                    .header(header::HOST, "203.0.113.11")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
-
-        let install = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/install/test")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .header(header::AUTHORIZATION, "HeteroNetworkJoin enrollment-token")
-                    .body(Body::empty())?,
-            )
-            .await?;
-        assert_eq!(install.status(), StatusCode::OK);
-        assert_eq!(
-            install.headers().get(header::CONTENT_DISPOSITION),
-            Some(&HeaderValue::from_static(
-                "attachment; filename=test-installer"
-            ))
-        );
-        assert_eq!(
-            install.headers().get("x-heteronetwork-sha256"),
-            Some(&HeaderValue::from_static("test-sha256"))
-        );
-        assert_eq!(
-            backend.authorization.lock().await.as_deref(),
-            Some("HeteroNetworkJoin enrollment-token")
-        );
-
-        for path in [
-            "/v1/heartbeat",
-            "/v1/neighbors/query",
-            "/v1/overlay-paths/query",
-            "/v1/database-autopilot/nodes",
-            "/v1/keycloak-autopilot/reconcile",
+        for (method, path) in [
+            (Method::GET, "/ui/app.js"),
+            (Method::GET, "/ui/config"),
+            (Method::GET, "/v1/install/test"),
+            (Method::POST, "/v1/admin/overview"),
+            (Method::POST, "/v1/clients/sponsored-enrollment"),
+            (Method::POST, "/v1/clients/peers/query"),
         ] {
-            let autopilot = app
+            let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method(Method::POST)
+                        .method(method)
                         .uri(path)
                         .header(header::HOST, "203.0.113.10")
-                        .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                        .header(header::AUTHORIZATION, "Bearer autopilot-token")
+                        .header("x-heteronetwork-gateway-token", "spoofed-token")
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from("{}"))?,
                 )
                 .await?;
-            assert_eq!(autopilot.status(), StatusCode::OK);
             assert_eq!(
-                backend.authorization.lock().await.as_deref(),
-                Some("Bearer autopilot-token")
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "public management path {path} was not rejected"
             );
         }
-
-        let client_query = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/clients/peers/query")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))?,
-            )
-            .await?;
-        assert_eq!(client_query.status(), StatusCode::OK);
 
         let loopback_asset = app
             .oneshot(
@@ -5214,7 +4984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_gateway_preserves_private_provider_origins(
+    async fn loopback_web_ui_preserves_private_provider_origins(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
         let runtime = Arc::new(AgentRuntime::new(
@@ -5230,15 +5000,14 @@ mod tests {
         }));
         let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
             .enable_local_web_ui(true)
-            .with_public_web_gateway("gateway-secret".to_string(), status);
+            .with_public_web_gateway(status);
         let app = router(state);
 
         let response = app
             .oneshot(
                 Request::builder()
                     .uri("/ui/config")
-                    .header(header::HOST, "203.0.113.10")
-                    .header(PUBLIC_WEB_GATEWAY_HEADER, "gateway-secret")
+                    .header(header::HOST, "127.0.0.1:9780")
                     .body(Body::empty())?,
             )
             .await?;
@@ -5290,7 +5059,7 @@ mod tests {
         }));
         let state =
             AgentHttpState::with_control_plane_urls(runtime, vec![control_plane_url.clone()])
-                .with_public_web_gateway("gateway-secret".to_string(), status);
+                .with_public_web_gateway(status);
         set_selected_web_ui(&state, Some(service_url.clone())).await;
         let listen: std::net::SocketAddr = "10.250.0.1:9781".parse()?;
         let app = overlay_web_ui_router(state.clone(), listen, "console.heteronetwork.internal");

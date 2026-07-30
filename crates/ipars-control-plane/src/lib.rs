@@ -13,11 +13,13 @@ use bounded_topology::{
 };
 use chrono::Utc;
 use ipars_crypto::{
-    node_id_from_public_key_b64, validate_wireguard_public_key_b64,
-    verify_client_control_request_signature, verify_control_plane_node_query_signature,
+    node_id_from_public_key_b64, validate_node_api_request_nonce,
+    validate_wireguard_public_key_b64, verify_client_control_request_signature,
+    verify_client_registration_bundle_signature, verify_control_plane_node_query_signature,
     verify_heartbeat_request_signature, verify_join_token, verify_overlay_path_query_signature,
     verify_remove_node_signature, verify_signal_node_upsert_signature,
-    verify_token_revocation_signature, verify_wireguard_key_rotation_signature, CryptoError,
+    verify_sponsored_client_registration_signature, verify_token_revocation_signature,
+    verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
     ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
@@ -30,6 +32,8 @@ use ipars_types::api::{
     RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest, RegisterNodeResponse,
     RelayMap, RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
     RotateWireGuardKeyRequest, RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
+    SponsoredClientRegistrationRequest, CLIENT_REGISTRATION_SCHEMA_VERSION,
+    MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
@@ -40,12 +44,13 @@ use ipars_types::{
     NatConnectivityState, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
     OverlayNeighbor, OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState,
     RelayCapability, Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken,
-    TokenLedgerMetrics, TokenLedgerRecord, TokenRevocationOutcome, TokenRevocationRecord,
-    TokenStatus, TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
-    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
-    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
-    MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
+    TokenLedgerMetrics, TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome,
+    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE,
+    MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES, MAX_PATH_SCORE_REASONS,
+    MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -2555,6 +2560,106 @@ where
         })
     }
 
+    pub async fn register_sponsored_client(
+        &self,
+        request: SponsoredClientRegistrationRequest,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RegisterClientResponse, ControlPlaneError> {
+        let reject_bundle = |reason: String| ControlPlaneError::NodeRegistrationRejected {
+            node_id: request.bundle.registration.client_id.clone(),
+            reason,
+        };
+        if request.bundle.schema_version != CLIENT_REGISTRATION_SCHEMA_VERSION {
+            return Err(reject_bundle(format!(
+                "unsupported client registration schema version {}",
+                request.bundle.schema_version
+            )));
+        }
+        if request.bundle.issued_at.timestamp_subsec_nanos() != 0
+            || request.bundle.expires_at.timestamp_subsec_nanos() != 0
+        {
+            return Err(reject_bundle(
+                "client registration timestamps must use whole-second precision".to_string(),
+            ));
+        }
+        if request.bundle.expires_at <= request.bundle.issued_at
+            || request
+                .bundle
+                .expires_at
+                .signed_duration_since(request.bundle.issued_at)
+                > chrono::Duration::seconds(MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS)
+        {
+            return Err(reject_bundle(format!(
+                "client registration validity must be between 1 and {MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS} seconds"
+            )));
+        }
+        if request.bundle.expires_at <= now {
+            return Err(reject_bundle(
+                "client registration bundle has expired".to_string(),
+            ));
+        }
+        if !timestamp_not_after_skew(
+            request.bundle.issued_at,
+            now,
+            self.config.heartbeat_signature_max_age,
+        ) {
+            return Err(reject_bundle(
+                "client registration bundle was issued in the future".to_string(),
+            ));
+        }
+        validate_node_api_request_nonce(&request.bundle.nonce).map_err(|error| {
+            reject_bundle(format!("client registration nonce is invalid: {error}"))
+        })?;
+        verify_client_registration_bundle_signature(&request.bundle).map_err(|error| {
+            reject_bundle(format!(
+                "client registration ownership proof is invalid: {error}"
+            ))
+        })?;
+
+        let sponsor_signature = request.request_signature.as_ref().ok_or_else(|| {
+            ControlPlaneError::NodeSignatureRequired(request.sponsor_node_id.clone())
+        })?;
+        let sponsor = self
+            .store
+            .get_node(&request.sponsor_node_id)
+            .await?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(request.sponsor_node_id.clone()))?;
+        if sponsor.role.is_client() {
+            return Err(ControlPlaneError::NodeSignatureRejected {
+                node_id: request.sponsor_node_id.clone(),
+                reason: "client identities cannot sponsor another client".to_string(),
+            });
+        }
+        verify_sponsored_client_registration_signature(&request, &sponsor.identity_public_key)
+            .map_err(|error| ControlPlaneError::NodeSignatureRejected {
+                node_id: request.sponsor_node_id.clone(),
+                reason: error.to_string(),
+            })?;
+        self.accept_node_query_nonce(
+            &request.sponsor_node_id,
+            sponsor_signature.signed_at,
+            &sponsor_signature.nonce,
+            now,
+        )
+        .await?;
+
+        self.require_client_gateway().await?;
+        let claims = JoinTokenClaims {
+            cluster_id: self.config.cluster_id.clone(),
+            bootstrap_endpoints: Vec::new(),
+            expires_at: request.bundle.expires_at,
+            not_before: request.bundle.issued_at,
+            role: Role::client(),
+            tags: BTreeSet::new(),
+            issuer: request.sponsor_node_id,
+            key_id: KeyId::from_string("ssh-client-registration"),
+            policy: TokenPolicy::default(),
+            nonce: request.bundle.nonce,
+        };
+        self.register_client_with_claims(claims, request.bundle.registration)
+            .await
+    }
+
     async fn register_participant_with_claims(
         &self,
         claims: JoinTokenClaims,
@@ -5024,7 +5129,7 @@ fn project_client_gateway(
         }
     }
     projected_gateway.routes = routes.into_values().collect();
-    filter_served_endpoint_candidates(projected_gateway, generated_at, policy)
+    filter_client_gateway_endpoint_candidates(projected_gateway, generated_at, policy)
 }
 
 fn node_peer_map_with_clients(
@@ -5261,6 +5366,7 @@ fn client_gateway_candidate_score(
             candidate.node_id == node.node_id
                 && candidate.validate_kind_address().is_ok()
                 && endpoint_addr_is_usable(candidate.addr)
+                && socket_addr_is_globally_routable(candidate.addr)
                 && endpoint_candidate_is_fresh(
                     candidate,
                     now,
@@ -5269,7 +5375,8 @@ fn client_gateway_candidate_score(
         })
         .filter_map(|candidate| {
             let rank = match candidate.kind {
-                EndpointCandidateKind::Ipv6 => 0,
+                EndpointCandidateKind::Ipv6 if policy.allow_ipv6_direct => 0,
+                EndpointCandidateKind::Ipv6 => return None,
                 EndpointCandidateKind::PublicUdp => 1,
                 EndpointCandidateKind::StunReflexive
                 | EndpointCandidateKind::LocalUdp
@@ -5283,6 +5390,25 @@ fn client_gateway_candidate_score(
             ))
         })
         .min()
+}
+
+fn filter_client_gateway_endpoint_candidates(
+    mut node: NodeRecord,
+    now: chrono::DateTime<Utc>,
+    policy: &ClusterPolicy,
+) -> NodeRecord {
+    node.endpoint_candidates.retain(|candidate| {
+        matches!(
+            candidate.kind,
+            EndpointCandidateKind::PublicUdp | EndpointCandidateKind::Ipv6
+        ) && (candidate.kind != EndpointCandidateKind::Ipv6 || policy.allow_ipv6_direct)
+            && candidate.node_id == node.node_id
+            && candidate.validate_kind_address().is_ok()
+            && socket_addr_is_globally_routable(candidate.addr)
+            && endpoint_candidate_is_fresh(candidate, now, policy.endpoint_candidate_ttl_seconds)
+    });
+    node.relay_capability = None;
+    node
 }
 
 fn projected_gateway_host_route(gateway: &NodeRecord, target: &NodeRecord) -> Option<Route> {
@@ -6818,8 +6944,10 @@ mod tests {
     use chrono::{Duration, Utc};
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
-        ClientControlRequest, ClientRequestKind, HeartbeatRequest, RegisterClientRequest,
-        RegisterNodeRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
+        ClientControlRequest, ClientRegistrationBundle, ClientRequestKind, HeartbeatRequest,
+        RegisterClientRequest, RegisterNodeRequest, RemoveNodeRequest, RevokeTokenRequest,
+        RotateWireGuardKeyRequest, SponsoredClientRegistrationRequest,
+        CLIENT_REGISTRATION_SCHEMA_VERSION,
     };
     use ipars_types::{
         AclAction, AclRule, BootstrapEndpoint, BootstrapEndpointKind, CandidateSource,
@@ -10619,6 +10747,174 @@ mod tests {
         assert_eq!(second.node.endpoint_candidates, request.candidates);
         assert_eq!(plane.peer_map_for(&request.node_id).await?.peers.len(), 0);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sponsored_client_registration_requires_both_signatures_and_is_retryable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-sponsored-client");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(10, 250, 0, 0), 29)?,
+            ),
+            store,
+        );
+        let sponsor_identity = identity_for_node("ssh-sponsor");
+        let mut sponsor_claims = claims(cluster_id);
+        sponsor_claims.role = Role::gateway();
+        let mut sponsor_registration = registration_request("ssh-sponsor");
+        sponsor_registration.candidates = vec![EndpointCandidate {
+            node_id: sponsor_identity.node_id(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: "8.8.8.8:51820".parse()?,
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 1,
+            source: CandidateSource::InterfaceScan,
+        }];
+        plane
+            .register_with_claims(sponsor_claims, sponsor_registration)
+            .await?;
+
+        let client_identity = identity_for_node("desktop-client");
+        let issued_at = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0)
+            .ok_or("current whole-second timestamp is invalid")?;
+        let mut bundle = ClientRegistrationBundle {
+            schema_version: CLIENT_REGISTRATION_SCHEMA_VERSION,
+            registration: RegisterClientRequest {
+                client_id: client_identity.node_id(),
+                identity_public_key: client_identity.public_key_b64(),
+                wireguard_public_key: wireguard_public_key_for_node("desktop-client"),
+            },
+            issued_at,
+            expires_at: issued_at + Duration::hours(1),
+            nonce: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD".to_string(),
+            signature: String::new(),
+        };
+        bundle.signature = client_identity.sign_client_registration_bundle(&bundle);
+        let mut request = SponsoredClientRegistrationRequest {
+            sponsor_node_id: sponsor_identity.node_id(),
+            bundle: bundle.clone(),
+            request_signature: None,
+        };
+        request.request_signature = Some(
+            sponsor_identity.sign_sponsored_client_registration_request(&request, Utc::now())?,
+        );
+
+        let mut fractional_bundle = bundle.clone();
+        fractional_bundle.expires_at += Duration::nanoseconds(1);
+        assert!(
+            verify_client_registration_bundle_signature(&fractional_bundle).is_ok(),
+            "whole-second signature compatibility should not silently admit fractions"
+        );
+        let mut fractional_request = SponsoredClientRegistrationRequest {
+            sponsor_node_id: sponsor_identity.node_id(),
+            bundle: fractional_bundle,
+            request_signature: None,
+        };
+        fractional_request.request_signature = Some(
+            sponsor_identity
+                .sign_sponsored_client_registration_request(&fractional_request, Utc::now())?,
+        );
+        assert!(matches!(
+            plane
+                .register_sponsored_client(fractional_request, Utc::now())
+                .await,
+            Err(ControlPlaneError::NodeRegistrationRejected { reason, .. })
+                if reason.contains("whole-second precision")
+        ));
+
+        let first = plane
+            .register_sponsored_client(request.clone(), Utc::now())
+            .await?;
+        assert_eq!(first.client.node_id, client_identity.node_id());
+        assert_eq!(first.peer_map.peers.len(), 1);
+        assert!(first.peer_map.peers[0]
+            .endpoint_candidates
+            .iter()
+            .all(|candidate| {
+                matches!(
+                    candidate.kind,
+                    EndpointCandidateKind::PublicUdp | EndpointCandidateKind::Ipv6
+                ) && socket_addr_is_globally_routable(candidate.addr)
+            }));
+        assert!(matches!(
+            plane.register_sponsored_client(request, Utc::now()).await,
+            Err(ControlPlaneError::NodeRequestReplay(_))
+        ));
+
+        let mut retry = SponsoredClientRegistrationRequest {
+            sponsor_node_id: sponsor_identity.node_id(),
+            bundle: bundle.clone(),
+            request_signature: None,
+        };
+        retry.request_signature =
+            Some(sponsor_identity.sign_sponsored_client_registration_request(&retry, Utc::now())?);
+        let retried = plane.register_sponsored_client(retry, Utc::now()).await?;
+        assert_eq!(retried.client.vpn_ip, first.client.vpn_ip);
+
+        let mut tampered_bundle = bundle;
+        tampered_bundle.registration.wireguard_public_key =
+            wireguard_public_key_for_node("attacker");
+        let mut tampered = SponsoredClientRegistrationRequest {
+            sponsor_node_id: sponsor_identity.node_id(),
+            bundle: tampered_bundle,
+            request_signature: None,
+        };
+        tampered.request_signature = Some(
+            sponsor_identity.sign_sponsored_client_registration_request(&tampered, Utc::now())?,
+        );
+        assert!(matches!(
+            plane.register_sponsored_client(tampered, Utc::now()).await,
+            Err(ControlPlaneError::NodeRegistrationRejected { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn client_gateway_rejects_non_global_ipv6_candidates() {
+        let now = Utc::now();
+        let mut node = node_record("ula-gateway");
+        node.endpoint_candidates = vec![EndpointCandidate {
+            node_id: node.node_id.clone(),
+            kind: EndpointCandidateKind::Ipv6,
+            addr: "[fd00::1]:51820"
+                .parse()
+                .unwrap_or_else(|error| panic!("ULA candidate should parse: {error}")),
+            observed_at: now,
+            priority: 100,
+            cost: 1,
+            source: CandidateSource::InterfaceScan,
+        }];
+        assert!(client_gateway_candidate_score(&node, now, &ClusterPolicy::default()).is_none());
+
+        node.endpoint_candidates[0].addr = "[2606:4700:4700::1111]:51820"
+            .parse()
+            .unwrap_or_else(|error| panic!("global IPv6 candidate should parse: {error}"));
+        assert!(client_gateway_candidate_score(&node, now, &ClusterPolicy::default()).is_some());
+        node.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(
+                "8.8.8.8:51820"
+                    .parse()
+                    .unwrap_or_else(|error| panic!("relay endpoint should parse: {error}")),
+            ),
+            admission_url: Some("https://8.8.8.8:18447".to_string()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let ipv6_disabled = ClusterPolicy {
+            allow_ipv6_direct: false,
+            ..ClusterPolicy::default()
+        };
+        assert!(client_gateway_candidate_score(&node, now, &ipv6_disabled).is_none());
+        let projected = filter_client_gateway_endpoint_candidates(node, now, &ipv6_disabled);
+        assert!(projected.endpoint_candidates.is_empty());
+        assert_eq!(projected.relay_capability, None);
     }
 
     #[tokio::test]

@@ -44,8 +44,10 @@ Control Plane receives a readable copy. Configure
 `HETERONETWORK_NODE_ENROLLMENT_ENABLED=true`, a distinct
 `HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID`, the bounded
 `HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS`, and the release artifact path in
-`HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH`. Do not copy the root issuer private
-key to these nodes. A direct non-systemd invocation must instead set
+`HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH`. Set
+`HETERONETWORK_NODE_ENROLLMENT_CLI_BINARY_PATH` to the matching `ipars` release
+artifact; node installers verify and install both binaries. Do not copy the root
+issuer private key to these nodes. A direct non-systemd invocation must instead set
 `HETERONETWORK_NODE_ENROLLMENT_ISSUER_PRIVATE_KEY_PATH`. Enrollment issuance
 also reads the cluster-wide, owner-only Relay admission credential selected by
 `HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH`. Use the same credential on
@@ -242,22 +244,34 @@ preferred gateway is active on the desktop client; other nodes route the client 
 back through that gateway. Do not advertise a default route solely for client
 access.
 
-Enable the dedicated enrollment signer as described under Web Management UI,
-keep at least two Control Plane endpoints active, then select **Add device** ->
-**Desktop client** in the Web UI. Open the returned `heteronetwork://` link on a
-Mac or Windows PC with the native app installed. The token is single-use. The
-macOS app installs a signed Network Extension profile; the Windows app includes
-the pinned official WireGuard embeddable service and WireGuardNT runtime, and
-requests administrator approval when its profile changes. No separate
-WireGuard installation is required. Both refresh the gateway map every five seconds while
-connected and switch to a cached standby after two failed VPN-local health
-probes. The active gateway is reported in the signed peer-map request. The
-shared control-plane store changes every node's
-return route for that client and wakes long-polling Agent heartbeats so they
-apply the new map without waiting for the 30-second background poll. Private
-key material is stored in the shared device-only Keychain on macOS or a
-current-user DPAPI blob on Windows. The active gateway
-serves the authenticated console only on its VPN address at
+Install the native app on the Mac or Windows client and generate a registration
+request. The app creates its Ed25519 identity and WireGuard keys locally, stores
+the pending private keys in the device-only Keychain on macOS or a current-user
+DPAPI blob on Windows, and displays a `heteronetwork://register?...` URI. Copy
+that URI, SSH to any enrolled non-client node, and run:
+
+```bash
+sudo ipars client register 'heteronetwork://register?request=...'
+```
+
+The command reads that node's owner-only Agent state, sponsors the public-key
+request, and prints one `heteronetwork://import?...` URI. Paste the import URI
+into the same native app. Only public keys and signed registration data leave
+the client; neither private key is included in either URI or sent to the
+Control Plane. The app validates that the import matches its pending keys,
+brings up WireGuard from the returned globally reachable gateway candidates,
+and performs its first management-plane request only after the VPN is active.
+
+The macOS app installs a signed Network Extension profile; the Windows app
+includes the pinned official WireGuard embeddable service and WireGuardNT
+runtime, and requests administrator approval when its profile changes. No
+separate WireGuard installation is required. Both refresh the gateway map every
+five seconds while connected and switch to a cached standby after two failed
+VPN-local health probes. The active gateway is reported in the signed peer-map
+request. The shared control-plane store changes every node's return route for
+that client and wakes long-polling Agent heartbeats so they apply the new map
+without waiting for the 30-second background poll. The active gateway serves
+the authenticated console only on its VPN address at
 `http://console.heteronetwork.internal:9781/ui/`; split DNS sends only
 `console.heteronetwork.internal` queries into the tunnel.
 Control-only clients are intentionally absent from the normal node table; use

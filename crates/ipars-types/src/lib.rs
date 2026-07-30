@@ -2558,10 +2558,70 @@ pub mod api {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct RegisterClientRequest {
         pub client_id: NodeId,
         pub identity_public_key: String,
         pub wireguard_public_key: String,
+    }
+
+    pub const CLIENT_REGISTRATION_SCHEMA_VERSION: u16 = 1;
+    pub const MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS: i64 = 24 * 60 * 60;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ClientRegistrationBundle {
+        pub schema_version: u16,
+        pub registration: RegisterClientRequest,
+        pub issued_at: DateTime<Utc>,
+        pub expires_at: DateTime<Utc>,
+        pub nonce: String,
+        pub signature: String,
+    }
+
+    impl ClientRegistrationBundle {
+        pub fn signature_payload(&self) -> Vec<u8> {
+            format!(
+                "heteronetwork-client-registration-v1\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                self.registration.client_id,
+                self.registration.identity_public_key,
+                self.registration.wireguard_public_key,
+                self.issued_at.timestamp(),
+                self.expires_at.timestamp(),
+                self.nonce
+            )
+            .into_bytes()
+        }
+
+        pub fn signature_bytes(
+            &self,
+        ) -> Result<[u8; ED25519_SIGNATURE_BYTES], Ed25519SignatureValidationError> {
+            decode_ed25519_signature(&self.signature)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SponsoredClientRegistrationRequest {
+        pub sponsor_node_id: NodeId,
+        pub bundle: ClientRegistrationBundle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_signature: Option<NodeApiRequestSignature>,
+    }
+
+    impl SponsoredClientRegistrationRequest {
+        pub fn signature_payload(
+            &self,
+            signed_at: DateTime<Utc>,
+            nonce: String,
+        ) -> SponsoredClientRegistrationSignaturePayload {
+            SponsoredClientRegistrationSignaturePayload {
+                sponsor_node_id: self.sponsor_node_id.clone(),
+                bundle: self.bundle.clone(),
+                signed_at,
+                nonce,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2575,6 +2635,17 @@ pub mod api {
         pub client: NodeRecord,
         pub peer_map: PeerMap,
         pub cluster_policy: ClusterPolicy,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ClientImportProfile {
+        pub schema_version: u16,
+        pub sponsor_node_id: NodeId,
+        pub registration: RegisterClientResponse,
+        pub management_urls: Vec<String>,
+        pub issued_at: DateTime<Utc>,
+        pub expires_at: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2751,6 +2822,14 @@ pub mod api {
     pub struct ControlPlaneNodeQuerySignaturePayload {
         pub kind: ControlPlaneNodeQueryKind,
         pub node_id: NodeId,
+        pub signed_at: DateTime<Utc>,
+        pub nonce: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SponsoredClientRegistrationSignaturePayload {
+        pub sponsor_node_id: NodeId,
+        pub bundle: ClientRegistrationBundle,
         pub signed_at: DateTime<Utc>,
         pub nonce: String,
     }

@@ -7,23 +7,33 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::Context;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use ipars_agent::{merge_bootstrap_endpoint_sets, AgentNodeState, FileAgentStateStore};
-use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
+use ipars_crypto::{
+    node_id_from_public_key_b64, validate_node_api_request_nonce,
+    validate_wireguard_public_key_b64, verify_client_registration_bundle_signature,
+    IdentityKeyPair, WireGuardKeyPair,
+};
 use ipars_relay::encode_relay_datagram_with_route;
 use ipars_stun::UdpStunProbe;
 use ipars_types::api::{
     AgentNodeRemovalRequest, AgentNodeRemovalResponse, AgentPathEventsResponse,
     AgentPathProbeRequest, AgentPathProbeResponse, AgentPathsResponse, AgentPeerActivityRequest,
     AgentPeerActivityResponse, AgentStatusResponse, AgentWireGuardKeyRotationRequest,
-    AgentWireGuardKeyRotationResponse, ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind,
-    ControlPlaneNodeQueryRequest, ControlPlanePathsResponse, ControlPlanePolicyResponse,
-    JoinNodeRequest, PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
+    AgentWireGuardKeyRotationResponse, ClientImportProfile, ClientRegistrationBundle,
+    ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
+    ControlPlanePathsResponse, ControlPlanePolicyResponse, JoinNodeRequest, PeerMap,
+    RegisterClientResponse, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionRequest,
     RelayAdmissionResponse, RelayStatusResponse, RevokeTokenRequest, RevokeTokenResponse,
+    SponsoredClientRegistrationRequest, CLIENT_REGISTRATION_SCHEMA_VERSION,
+    MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS,
 };
 use ipars_types::{
     canonical_bootstrap_endpoint_url, endpoint_addr_is_usable, http_url_is_usable_endpoint,
+    ip_addr_is_globally_routable, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterId, EndpointCandidate, EndpointCandidateKind, JoinTokenClaims, KeyId,
     NatProbeObservation, NodeId, NodeRecord, PathMetrics, PathState, Role, Route, ServiceDirectory,
@@ -42,6 +52,10 @@ const MAX_USERSPACE_WIREGUARD_ARG_BYTES: usize = 4096;
 const MAX_CLI_HTTP_JSON_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SERVICE_DIRECTORY_INSTANCES: usize = 64;
 const MAX_SERVICE_DIRECTORY_LEASE_SECONDS: i64 = 300;
+const MAX_CLIENT_REGISTRATION_LINK_BYTES: usize = 128 * 1024;
+const MAX_CLIENT_REGISTRATION_FUTURE_SKEW_SECONDS: i64 = 5 * 60;
+const DEFAULT_INSTALLED_AGENT_STATE_PATH: &str = "/var/lib/heteronetwork/agent.json";
+const PRIVATE_OVERLAY_CONSOLE_URL: &str = "http://console.heteronetwork.internal:9781";
 const SANITIZED_INIT_DAEMON_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
@@ -305,6 +319,10 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    Client {
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
     Relay {
         #[command(subcommand)]
         command: RelayCommand,
@@ -469,6 +487,18 @@ struct KeyRotateArgs {
 #[derive(Debug, Subcommand)]
 enum NodeCommand {
     Remove(NodeRemoveArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ClientCommand {
+    Register(ClientRegisterArgs),
+}
+
+#[derive(Debug, Args)]
+struct ClientRegisterArgs {
+    request: String,
+    #[arg(long = "control-plane-url", env = "HETERONETWORK_CONTROL_PLANE_URL")]
+    control_plane_urls: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1521,6 +1551,14 @@ async fn main() -> anyhow::Result<()> {
                     &remove_node_with_bearer(agent_url, &args, agent_api_auth.bearer_token())
                         .await?,
                 )?
+            }
+        },
+        Command::Client { command } => match command {
+            ClientCommand::Register(args) => {
+                println!(
+                    "{}",
+                    register_sponsored_client(args, agent_state_path.as_deref()).await?
+                );
             }
         },
         Command::Relay { command } => match command {
@@ -3423,6 +3461,428 @@ fn signed_control_plane_node_query(
             .context("failed to sign control-plane node query")?,
     );
     Ok(request)
+}
+
+async fn register_sponsored_client(
+    args: ClientRegisterArgs,
+    global_agent_state_path: Option<&Path>,
+) -> anyhow::Result<String> {
+    let bundle = parse_client_registration_bundle(&args.request)?;
+    let state_path = global_agent_state_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_INSTALLED_AGENT_STATE_PATH));
+    let state = FileAgentStateStore::new(&state_path)
+        .load()
+        .with_context(|| {
+            format!(
+                "failed to load sponsoring node identity from {}",
+                state_path.display()
+            )
+        })?;
+    let sponsor = state.registered_node.as_ref().with_context(|| {
+        format!(
+            "agent state {} does not contain an enrolled node",
+            state_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !sponsor.role.is_client(),
+        "client identities cannot sponsor another client"
+    );
+    anyhow::ensure!(
+        sponsor.node_id == state.node_id,
+        "registered sponsor node does not match the agent identity"
+    );
+    let identity = state
+        .identity_key_pair()
+        .context("failed to load sponsoring node identity key")?;
+    let sponsor_vpn_ip = sponsor.vpn_ip.0;
+    let request = SponsoredClientRegistrationRequest {
+        sponsor_node_id: state.node_id.clone(),
+        bundle: bundle.clone(),
+        request_signature: None,
+    };
+
+    let control_plane_urls =
+        sponsored_registration_control_plane_urls(&args.control_plane_urls, &state)?;
+    let mut failures = Vec::new();
+    let mut response = None;
+    for control_plane_url in &control_plane_urls {
+        let mut attempt = request.clone();
+        attempt.request_signature = Some(
+            identity
+                .sign_sponsored_client_registration_request(&attempt, Utc::now())
+                .context("failed to sign sponsored client registration")?,
+        );
+        match post_json_with_bearer::<_, RegisterClientResponse>(
+            control_plane_url,
+            "/v1/clients/sponsored-enrollment",
+            "sponsored client registration",
+            &attempt,
+            None,
+        )
+        .await
+        {
+            Ok(candidate) => {
+                response = Some(candidate);
+                break;
+            }
+            Err(error) => failures.push(format!("{control_plane_url}: {error:#}")),
+        }
+    }
+    let mut response = response.with_context(|| {
+        format!(
+            "all private control-plane endpoints rejected client registration: {}",
+            failures.join("; ")
+        )
+    })?;
+    let management_urls =
+        validate_and_sanitize_sponsored_client_response(&bundle, &mut response, sponsor_vpn_ip)?;
+    let now = Utc::now();
+    let profile = ClientImportProfile {
+        schema_version: CLIENT_REGISTRATION_SCHEMA_VERSION,
+        sponsor_node_id: state.node_id,
+        registration: response,
+        management_urls,
+        issued_at: now,
+        expires_at: bundle.expires_at.min(now + Duration::hours(24)),
+    };
+    let profile_json =
+        serde_json::to_vec(&profile).context("failed to serialize client import profile")?;
+    anyhow::ensure!(
+        profile_json.len() <= MAX_CLIENT_REGISTRATION_LINK_BYTES,
+        "client import profile exceeds the maximum supported size"
+    );
+    Ok(format!(
+        "heteronetwork://import?profile={}",
+        URL_SAFE_NO_PAD.encode(profile_json)
+    ))
+}
+
+fn parse_client_registration_bundle(input: &str) -> anyhow::Result<ClientRegistrationBundle> {
+    let input = input.trim();
+    anyhow::ensure!(!input.is_empty(), "client registration request is required");
+    anyhow::ensure!(
+        input.len() <= MAX_CLIENT_REGISTRATION_LINK_BYTES,
+        "client registration link exceeds the maximum supported size"
+    );
+    let url = reqwest::Url::parse(input).context("client registration request must be a URI")?;
+    anyhow::ensure!(
+        url.scheme() == "heteronetwork"
+            && url.host_str() == Some("register")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && matches!(url.path(), "" | "/")
+            && url.fragment().is_none(),
+        "client registration URI is invalid"
+    );
+    let query = url.query_pairs().collect::<Vec<_>>();
+    anyhow::ensure!(
+        query.len() == 1 && query[0].0 == "request",
+        "client registration URI must contain exactly one request parameter"
+    );
+    let json = URL_SAFE_NO_PAD
+        .decode(query[0].1.as_bytes())
+        .context("client registration request is not canonical base64url")?;
+    anyhow::ensure!(
+        json.len() <= MAX_CLIENT_REGISTRATION_LINK_BYTES,
+        "decoded client registration request exceeds the maximum supported size"
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&json).context("client registration request is not valid JSON")?;
+    anyhow::ensure!(
+        !json_contains_private_material(&value),
+        "client registration request must not contain private key material"
+    );
+    let bundle: ClientRegistrationBundle = serde_json::from_value(value)
+        .context("client registration request has an invalid shape")?;
+    anyhow::ensure!(
+        bundle.schema_version == CLIENT_REGISTRATION_SCHEMA_VERSION,
+        "unsupported client registration schema version {}",
+        bundle.schema_version
+    );
+    validate_client_registration_bundle_for_sponsorship(&bundle, Utc::now())?;
+    Ok(bundle)
+}
+
+fn validate_client_registration_bundle_for_sponsorship(
+    bundle: &ClientRegistrationBundle,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bundle.issued_at.timestamp_subsec_nanos() == 0
+            && bundle.expires_at.timestamp_subsec_nanos() == 0,
+        "client registration timestamps must use whole-second precision"
+    );
+    let validity = bundle.expires_at.signed_duration_since(bundle.issued_at);
+    anyhow::ensure!(
+        validity > Duration::zero()
+            && validity <= Duration::seconds(MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS),
+        "client registration validity must be between 1 and {MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS} seconds"
+    );
+    anyhow::ensure!(
+        bundle.expires_at > now,
+        "client registration bundle has expired"
+    );
+    anyhow::ensure!(
+        bundle.issued_at <= now + Duration::seconds(MAX_CLIENT_REGISTRATION_FUTURE_SKEW_SECONDS),
+        "client registration bundle was issued too far in the future"
+    );
+    validate_node_api_request_nonce(&bundle.nonce)
+        .context("client registration nonce is invalid")?;
+    let derived_node_id = node_id_from_public_key_b64(&bundle.registration.identity_public_key)
+        .context("client registration identity public key is invalid")?;
+    anyhow::ensure!(
+        derived_node_id == bundle.registration.client_id,
+        "client registration identity derives node ID {derived_node_id}, not {}",
+        bundle.registration.client_id
+    );
+    validate_wireguard_public_key_b64(&bundle.registration.wireguard_public_key)
+        .context("client registration WireGuard public key is invalid")?;
+    verify_client_registration_bundle_signature(bundle)
+        .context("client registration ownership proof is invalid")?;
+    Ok(())
+}
+
+fn json_contains_private_material(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            key.to_ascii_lowercase().contains("private") || json_contains_private_material(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(json_contains_private_material),
+        _ => false,
+    }
+}
+
+fn sponsored_registration_control_plane_urls(
+    explicit_urls: &[String],
+    state: &AgentNodeState,
+) -> anyhow::Result<Vec<String>> {
+    let sponsor_vpn_ip = state
+        .vpn_ip
+        .context("agent state does not contain the sponsoring node VPN address")?
+        .0;
+    let explicit = !explicit_urls.is_empty();
+    let candidates = if explicit_urls.is_empty() {
+        std::iter::once(DEFAULT_LOCAL_AGENT_URL.to_string())
+            .chain(
+                state
+                    .bootstrap_endpoints
+                    .iter()
+                    .filter(|endpoint| {
+                        matches!(
+                            endpoint.kind,
+                            BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::WebUi
+                        )
+                    })
+                    .map(|endpoint| endpoint.url.clone()),
+            )
+            .collect::<Vec<_>>()
+    } else {
+        explicit_urls.to_vec()
+    };
+    let mut seen = BTreeSet::new();
+    let mut urls = Vec::new();
+    for candidate in candidates {
+        let normalized =
+            normalize_http_api_base_url(&candidate, "sponsored registration control-plane URL")?;
+        let parsed = reqwest::Url::parse(&normalized)
+            .context("sponsored registration control-plane URL must be an absolute URL")?;
+        if !sponsored_registration_url_is_private(&parsed, sponsor_vpn_ip) {
+            if explicit {
+                anyhow::bail!(
+                    "explicit sponsored registration control-plane URL must use loopback, {PRIVATE_OVERLAY_CONSOLE_URL}, or the sponsoring node's HeteroNetwork VPN /16"
+                );
+            }
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            urls.push(normalized);
+        }
+    }
+    anyhow::ensure!(
+        !urls.is_empty(),
+        "agent state contains no private control-plane endpoint"
+    );
+    Ok(urls)
+}
+
+fn sponsored_registration_url_is_private(url: &reqwest::Url, sponsor_vpn_ip: IpAddr) -> bool {
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("console.heteronetwork.internal")
+    {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .ok()
+        .is_some_and(|ip| ip.is_loopback() || heteronetwork_overlay_address(ip, sponsor_vpn_ip))
+}
+
+fn heteronetwork_overlay_address(candidate: IpAddr, sponsor_vpn_ip: IpAddr) -> bool {
+    if candidate.is_unspecified()
+        || candidate.is_multicast()
+        || candidate.is_loopback()
+        || ip_addr_is_globally_routable(candidate)
+        || sponsor_vpn_ip.is_unspecified()
+        || sponsor_vpn_ip.is_multicast()
+        || sponsor_vpn_ip.is_loopback()
+        || ip_addr_is_globally_routable(sponsor_vpn_ip)
+    {
+        return false;
+    }
+    match (candidate, sponsor_vpn_ip) {
+        (IpAddr::V4(candidate), IpAddr::V4(sponsor)) => {
+            u32::from(candidate) & 0xffff_0000 == u32::from(sponsor) & 0xffff_0000
+        }
+        (IpAddr::V6(candidate), IpAddr::V6(sponsor)) => {
+            u128::from(candidate) >> 64 == u128::from(sponsor) >> 64
+        }
+        _ => false,
+    }
+}
+
+fn validate_and_sanitize_sponsored_client_response(
+    bundle: &ClientRegistrationBundle,
+    response: &mut RegisterClientResponse,
+    sponsor_vpn_ip: IpAddr,
+) -> anyhow::Result<Vec<String>> {
+    let client = &response.client;
+    anyhow::ensure!(
+        client.node_id == bundle.registration.client_id,
+        "registered client ID does not match the client request"
+    );
+    anyhow::ensure!(
+        client.identity_public_key == bundle.registration.identity_public_key,
+        "registered client identity key does not match the client request"
+    );
+    anyhow::ensure!(
+        client.wireguard_public_key == bundle.registration.wireguard_public_key,
+        "registered client WireGuard key does not match the client request"
+    );
+    anyhow::ensure!(
+        client.role.is_client(),
+        "control plane returned a non-client registration"
+    );
+    anyhow::ensure!(
+        client.tags.is_empty()
+            && client.endpoint_candidates.is_empty()
+            && client.relay_capability.is_none()
+            && client.routes.is_empty()
+            && client.token_policy.allow_join
+            && !client.token_policy.allow_relay
+            && client.token_policy.allowed_routes.is_empty()
+            && client.token_policy.allowed_tags.is_empty()
+            && client.token_policy.max_token_uses == Some(1),
+        "control plane returned a client with non-control capabilities"
+    );
+    anyhow::ensure!(
+        heteronetwork_overlay_address(client.vpn_ip.0, sponsor_vpn_ip),
+        "registered client VPN address is outside the sponsoring node's HeteroNetwork overlay"
+    );
+    anyhow::ensure!(
+        response.peer_map.cluster_id == client.cluster_id,
+        "client and peer map belong to different clusters"
+    );
+    anyhow::ensure!(
+        (1..=4).contains(&response.peer_map.peers.len()),
+        "client registration must return between one and four gateways"
+    );
+    let now = Utc::now();
+    let candidate_ttl =
+        StdDuration::from_secs(response.cluster_policy.endpoint_candidate_ttl_seconds);
+    let mut peer_node_ids = BTreeSet::new();
+    let mut peer_vpn_ips = BTreeSet::from([client.vpn_ip.0]);
+    let mut wireguard_public_keys = BTreeSet::from([client.wireguard_public_key.clone()]);
+    for peer in &mut response.peer_map.peers {
+        anyhow::ensure!(
+            peer.cluster_id == client.cluster_id && !peer.role.is_client(),
+            "client registration returned an invalid gateway {}",
+            peer.node_id
+        );
+        anyhow::ensure!(
+            peer.node_id != client.node_id && peer_node_ids.insert(peer.node_id.clone()),
+            "client registration returned duplicate gateway {}",
+            peer.node_id
+        );
+        let derived_peer_id = node_id_from_public_key_b64(&peer.identity_public_key)
+            .with_context(|| format!("gateway {} identity public key is invalid", peer.node_id))?;
+        anyhow::ensure!(
+            derived_peer_id == peer.node_id,
+            "gateway {} identity public key derives node ID {derived_peer_id}",
+            peer.node_id
+        );
+        validate_wireguard_public_key_b64(&peer.wireguard_public_key)
+            .with_context(|| format!("gateway {} WireGuard public key is invalid", peer.node_id))?;
+        anyhow::ensure!(
+            wireguard_public_keys.insert(peer.wireguard_public_key.clone()),
+            "gateway {} reuses a WireGuard public key",
+            peer.node_id
+        );
+        anyhow::ensure!(
+            heteronetwork_overlay_address(peer.vpn_ip.0, sponsor_vpn_ip)
+                && peer_vpn_ips.insert(peer.vpn_ip.0),
+            "gateway {} has a duplicate or out-of-overlay VPN address",
+            peer.node_id
+        );
+        peer.endpoint_candidates.retain(|candidate| {
+            matches!(
+                candidate.kind,
+                EndpointCandidateKind::PublicUdp | EndpointCandidateKind::Ipv6
+            ) && (candidate.kind != EndpointCandidateKind::Ipv6
+                || response.cluster_policy.allow_ipv6_direct)
+                && candidate.node_id == peer.node_id
+                && candidate.validate_kind_address().is_ok()
+                && socket_addr_is_globally_routable(candidate.addr)
+                && candidate.observed_at
+                    <= now + Duration::seconds(MAX_CLIENT_REGISTRATION_FUTURE_SKEW_SECONDS)
+                && now
+                    .signed_duration_since(candidate.observed_at)
+                    .to_std()
+                    .map_or(true, |age| age <= candidate_ttl)
+        });
+        anyhow::ensure!(
+            !peer.endpoint_candidates.is_empty(),
+            "gateway {} has no fresh globally reachable WireGuard endpoint",
+            peer.node_id
+        );
+        peer.relay_capability = None;
+    }
+
+    let mut management_urls = vec![PRIVATE_OVERLAY_CONSOLE_URL.to_string()];
+    for peer in &response.peer_map.peers {
+        let host = match peer.vpn_ip.0 {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        management_urls.push(format!("http://{host}:9781"));
+    }
+    let mut seen = BTreeSet::new();
+    management_urls.retain(|url| seen.insert(url.clone()));
+    response.peer_map.bootstrap_endpoints = management_urls
+        .iter()
+        .enumerate()
+        .map(|(index, url)| BootstrapEndpoint {
+            url: url.clone(),
+            kind: if index == 0 {
+                BootstrapEndpointKind::WebUi
+            } else {
+                BootstrapEndpointKind::ControlPlane
+            },
+        })
+        .collect();
+    Ok(management_urls)
 }
 
 async fn agent_routes_with_bearer(
@@ -10789,6 +11249,224 @@ mod tests {
             Ok(_) => panic!("{context}"),
             Err(error) => error,
         }
+    }
+
+    fn test_client_registration_bundle() -> ClientRegistrationBundle {
+        let identity = IdentityKeyPair::from_signing_bytes([17_u8; 32]);
+        let issued_at = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0)
+            .unwrap_or_else(|| panic!("current whole-second timestamp should be valid"));
+        let mut bundle = ClientRegistrationBundle {
+            schema_version: CLIENT_REGISTRATION_SCHEMA_VERSION,
+            registration: ipars_types::api::RegisterClientRequest {
+                client_id: identity.node_id(),
+                identity_public_key: identity.public_key_b64(),
+                wireguard_public_key: ipars_crypto::encode_bytes(&[19_u8; 32]),
+            },
+            issued_at,
+            expires_at: issued_at + Duration::hours(1),
+            nonce: URL_SAFE_NO_PAD.encode([23_u8; 24]),
+            signature: String::new(),
+        };
+        bundle.signature = identity.sign_client_registration_bundle(&bundle);
+        bundle
+    }
+
+    #[test]
+    fn client_registration_uri_contains_public_material_only() -> anyhow::Result<()> {
+        let bundle = test_client_registration_bundle();
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle)?);
+        let parsed = parse_client_registration_bundle(&format!(
+            "heteronetwork://register?request={encoded}"
+        ))?;
+        assert_eq!(parsed, bundle);
+
+        let mut value = serde_json::to_value(&bundle)?;
+        value["registration"]["identity_private_key"] =
+            serde_json::Value::String("must-never-leave-client".to_string());
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value)?);
+        let error = test_error(
+            parse_client_registration_bundle(&format!(
+                "heteronetwork://register?request={encoded}"
+            )),
+            "private key fields must be rejected",
+        );
+        assert!(error.to_string().contains("private key material"));
+
+        let mut fractional = bundle;
+        fractional.expires_at += Duration::nanoseconds(1);
+        assert!(
+            verify_client_registration_bundle_signature(&fractional).is_ok(),
+            "the fixed whole-second signature payload intentionally ignores fractions"
+        );
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&fractional)?);
+        let error = test_error(
+            parse_client_registration_bundle(&format!(
+                "heteronetwork://register?request={encoded}"
+            )),
+            "fractional timestamps must be rejected",
+        );
+        assert!(error.to_string().contains("whole-second precision"));
+        Ok(())
+    }
+
+    #[test]
+    fn sponsored_registration_uses_only_loopback_and_current_overlay_urls() -> anyhow::Result<()> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.vpn_ip = Some(ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 2))));
+        state.bootstrap_endpoints = vec![
+            BootstrapEndpoint {
+                url: "https://163.220.236.51:8443".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: "https://hn.163-220-236-51.sslip.io".to_string(),
+                kind: BootstrapEndpointKind::WebUi,
+            },
+            BootstrapEndpoint {
+                url: "http://10.250.0.4:19088".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+            BootstrapEndpoint {
+                url: PRIVATE_OVERLAY_CONSOLE_URL.to_string(),
+                kind: BootstrapEndpointKind::WebUi,
+            },
+            BootstrapEndpoint {
+                url: "http://10.251.0.4:19088".to_string(),
+                kind: BootstrapEndpointKind::ControlPlane,
+            },
+        ];
+
+        assert_eq!(
+            sponsored_registration_control_plane_urls(&[], &state)?,
+            vec![
+                DEFAULT_LOCAL_AGENT_URL.to_string(),
+                "http://10.250.0.4:19088".to_string(),
+                PRIVATE_OVERLAY_CONSOLE_URL.to_string(),
+            ]
+        );
+        assert_eq!(
+            sponsored_registration_control_plane_urls(
+                &["http://10.250.0.5:19088".to_string()],
+                &state,
+            )?,
+            vec!["http://10.250.0.5:19088".to_string()]
+        );
+        for public_or_foreign in [
+            "https://163.220.236.51:8443",
+            "https://control.example:8443",
+            "http://10.251.0.4:19088",
+            "http://console.heteronetwork.internal.evil:9781",
+        ] {
+            let error = test_error(
+                sponsored_registration_control_plane_urls(&[public_or_foreign.to_string()], &state),
+                "an explicit non-overlay URL must be rejected",
+            );
+            assert!(
+                error.to_string().contains("must use loopback"),
+                "unexpected error for {public_or_foreign}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sponsored_profile_keeps_global_addresses_only_as_wireguard_candidates() -> anyhow::Result<()>
+    {
+        let bundle = test_client_registration_bundle();
+        let cluster_id = ClusterId::from_string("cluster-client-profile");
+        let now = Utc::now();
+        let client = NodeRecord {
+            node_id: bundle.registration.client_id.clone(),
+            cluster_id: cluster_id.clone(),
+            vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 20))),
+            identity_public_key: bundle.registration.identity_public_key.clone(),
+            wireguard_public_key: bundle.registration.wireguard_public_key.clone(),
+            role: Role::client(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: Vec::new(),
+            relay_capability: None,
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: now,
+        };
+        let gateway_identity = IdentityKeyPair::from_signing_bytes([29_u8; 32]);
+        let gateway = NodeRecord {
+            node_id: gateway_identity.node_id(),
+            cluster_id: cluster_id.clone(),
+            vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 1))),
+            identity_public_key: gateway_identity.public_key_b64(),
+            wireguard_public_key: ipars_crypto::encode_bytes(&[31_u8; 32]),
+            role: Role::gateway(),
+            tags: BTreeSet::new(),
+            endpoint_candidates: vec![
+                EndpointCandidate {
+                    node_id: gateway_identity.node_id(),
+                    kind: EndpointCandidateKind::PublicUdp,
+                    addr: "8.8.8.8:51820".parse()?,
+                    observed_at: now,
+                    priority: 100,
+                    cost: 1,
+                    source: CandidateSource::InterfaceScan,
+                },
+                EndpointCandidate {
+                    node_id: gateway_identity.node_id(),
+                    kind: EndpointCandidateKind::LocalUdp,
+                    addr: "192.168.1.10:51820".parse()?,
+                    observed_at: now,
+                    priority: 90,
+                    cost: 1,
+                    source: CandidateSource::InterfaceScan,
+                },
+            ],
+            relay_capability: Some(ipars_types::RelayCapability {
+                enabled_by_policy: true,
+                public_endpoint: Some("8.8.4.4:51820".parse()?),
+                admission_url: Some("https://8.8.4.4:18447".to_string()),
+                max_sessions: 100,
+                active_sessions: 0,
+                max_mbps: 1000,
+                e2e_only: true,
+            }),
+            token_policy: TokenPolicy::default(),
+            routes: Vec::new(),
+            registered_at: now,
+        };
+        let mut response = RegisterClientResponse {
+            client,
+            peer_map: PeerMap {
+                cluster_id,
+                peers: vec![gateway],
+                bootstrap_endpoints: vec![BootstrapEndpoint {
+                    url: "https://8.8.8.8:8443".to_string(),
+                    kind: BootstrapEndpointKind::ControlPlane,
+                }],
+                generated_at: now,
+            },
+            cluster_policy: ipars_types::ClusterPolicy::default(),
+        };
+
+        let management_urls = validate_and_sanitize_sponsored_client_response(
+            &bundle,
+            &mut response,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 2)),
+        )?;
+        assert_eq!(
+            management_urls.first().map(String::as_str),
+            Some(PRIVATE_OVERLAY_CONSOLE_URL)
+        );
+        assert!(management_urls.iter().all(|url| !url.contains("8.8.8.8")));
+        assert!(response
+            .peer_map
+            .bootstrap_endpoints
+            .iter()
+            .all(|endpoint| !endpoint.url.contains("8.8.8.8")));
+        assert_eq!(response.peer_map.peers[0].endpoint_candidates.len(), 1);
+        assert_eq!(
+            response.peer_map.peers[0].endpoint_candidates[0].addr,
+            "8.8.8.8:51820".parse()?
+        );
+        assert_eq!(response.peer_map.peers[0].relay_capability, None);
+        Ok(())
     }
 
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> anyhow::Result<SignedJoinToken> {

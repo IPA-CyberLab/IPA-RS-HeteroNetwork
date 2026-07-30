@@ -18,8 +18,6 @@ use axum::Router;
 use aya::maps::{MapData, RingBuf};
 use aya::programs::{CgroupAttachMode as AyaCgroupAttachMode, CgroupSockAddr, SockOps, TracePoint};
 use aya::{Ebpf, EbpfLoader};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use hickory_proto::op::{Message as DnsMessage, MessageType, OpCode, ResponseCode};
@@ -550,6 +548,8 @@ struct ControlPlaneArgs {
     node_enrollment_max_ttl_seconds: u64,
     #[arg(long, env = "HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH")]
     node_enrollment_binary_path: Option<PathBuf>,
+    #[arg(long, env = "HETERONETWORK_NODE_ENROLLMENT_CLI_BINARY_PATH")]
+    node_enrollment_cli_binary_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH")]
     node_enrollment_relay_admission_bearer_token_path: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL")]
@@ -5057,7 +5057,8 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
     } else {
         anyhow::ensure!(
             args.node_enrollment_issuer_private_key_path.is_none()
-                && args.node_enrollment_binary_path.is_none(),
+                && args.node_enrollment_binary_path.is_none()
+                && args.node_enrollment_cli_binary_path.is_none(),
             "node enrollment key or binary options require --node-enrollment-enabled=true"
         );
     }
@@ -5164,6 +5165,20 @@ fn control_plane_node_enrollment_config(
         None => std::env::current_exe()
             .context("failed to locate the current executable for node enrollment")?,
     };
+    let cli_binary_path = match args.node_enrollment_cli_binary_path.clone() {
+        Some(path) => path,
+        None => {
+            let sibling = binary_path
+                .parent()
+                .context("node enrollment daemon binary has no parent directory")?
+                .join("ipars");
+            if sibling.is_file() {
+                sibling
+            } else {
+                PathBuf::from("/usr/local/bin/ipars")
+            }
+        }
+    };
     let relay_admission_bearer_token_path = args
         .node_enrollment_relay_admission_bearer_token_path
         .as_deref()
@@ -5215,6 +5230,7 @@ fn control_plane_node_enrollment_config(
         args.node_enrollment_issuer_key_id.clone(),
         public_url,
         binary_path,
+        cli_binary_path,
         args.node_enrollment_max_ttl_seconds,
         relay_admission_bearer_token,
     )
@@ -8862,7 +8878,6 @@ async fn run_agent(
             phase: PublicWebGatewayPhase::Standby,
             ..PublicWebGatewayStatus::default()
         }));
-        let token = generate_public_web_gateway_token();
         if registered_node.is_some() {
             background_tasks.push(start_public_web_gateway(
                 runtime.clone(),
@@ -8895,7 +8910,7 @@ async fn run_agent(
             )
             .await;
         }
-        Some((token, status))
+        Some(status)
     } else {
         if args.public_web_gateway_enabled {
             tracing::warn!(
@@ -9221,8 +9236,8 @@ async fn run_agent(
         AgentHttpState::with_wireguard_key_rotation(runtime.clone(), store, control_plane_bases)
             .with_control_plane_http_client(http_client, agent_http_request_timeout(&args))
             .enable_local_web_ui(args.listen.ip().is_loopback());
-    if let Some((token, status)) = public_web_gateway {
-        http_state = http_state.with_public_web_gateway(token, status);
+    if let Some(status) = public_web_gateway {
+        http_state = http_state.with_public_web_gateway(status);
     }
     if !args.listen.ip().is_loopback() {
         tracing::warn!(
@@ -13650,12 +13665,6 @@ struct PublicWebGatewayConfig {
     reconcile_interval: Duration,
     probe_timeout: Duration,
     classification_max_age: Duration,
-}
-
-fn generate_public_web_gateway_token() -> String {
-    let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn public_web_gateway_url(ip: IpAddr) -> String {
@@ -23303,6 +23312,10 @@ mod tests {
             binary_path
                 .to_str()
                 .context("test binary path must be UTF-8")?,
+            "--node-enrollment-cli-binary-path",
+            binary_path
+                .to_str()
+                .context("test CLI binary path must be UTF-8")?,
             "--node-enrollment-relay-admission-bearer-token-path",
             relay_admission_token_path
                 .to_str()

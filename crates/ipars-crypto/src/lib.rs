@@ -3,11 +3,11 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ipars_types::api::{
-    AuthenticatedSignalPathRequest, ClientControlRequest, ClientRequestKind,
-    ClientRequestSignature, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-    HeartbeatRequest, NodeApiRequestSignature, NodeRequestSignature, RemoveNodeRequest,
-    RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
-    SignalNodeUpsertRequest, SignalPathRequest,
+    AuthenticatedSignalPathRequest, ClientControlRequest, ClientRegistrationBundle,
+    ClientRequestKind, ClientRequestSignature, ControlPlaneNodeQueryKind,
+    ControlPlaneNodeQueryRequest, HeartbeatRequest, NodeApiRequestSignature, NodeRequestSignature,
+    RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
+    SignalNodeUpsertRequest, SignalPathRequest, SponsoredClientRegistrationRequest,
 };
 use ipars_types::{
     ClusterId, Ed25519SignatureValidationError, JoinTokenClaims, JoinTokenClaimsValidationError,
@@ -173,6 +173,21 @@ impl IdentityKeyPair {
         let nonce = random_node_api_request_nonce();
         let payload =
             serde_json::to_vec(&request.signature_payload(kind, signed_at, nonce.clone()))?;
+        Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
+    }
+
+    pub fn sign_client_registration_bundle(&self, bundle: &ClientRegistrationBundle) -> String {
+        let signature = self.signing_key.sign(&bundle.signature_payload());
+        encode_bytes(&signature.to_bytes())
+    }
+
+    pub fn sign_sponsored_client_registration_request(
+        &self,
+        request: &SponsoredClientRegistrationRequest,
+        signed_at: DateTime<Utc>,
+    ) -> Result<NodeApiRequestSignature, CryptoError> {
+        let nonce = random_node_api_request_nonce();
+        let payload = serde_json::to_vec(&request.signature_payload(signed_at, nonce.clone()))?;
         Ok(self.sign_node_api_payload(&payload, signed_at, nonce))
     }
 
@@ -419,6 +434,31 @@ pub fn verify_control_plane_node_query_signature(
     verify_node_api_payload(&payload, request_signature, node_public_key_b64)
 }
 
+pub fn verify_client_registration_bundle_signature(
+    bundle: &ClientRegistrationBundle,
+) -> Result<(), CryptoError> {
+    let signature = bundle.signature_bytes()?;
+    verify_ed25519_payload(
+        &bundle.signature_payload(),
+        signature,
+        &bundle.registration.identity_public_key,
+    )
+}
+
+pub fn verify_sponsored_client_registration_signature(
+    request: &SponsoredClientRegistrationRequest,
+    sponsor_public_key_b64: &str,
+) -> Result<(), CryptoError> {
+    let request_signature = request
+        .request_signature
+        .as_ref()
+        .ok_or(CryptoError::InvalidSignature)?;
+    let payload = serde_json::to_vec(
+        &request.signature_payload(request_signature.signed_at, request_signature.nonce.clone()),
+    )?;
+    verify_node_api_payload(&payload, request_signature, sponsor_public_key_b64)
+}
+
 pub fn verify_overlay_path_query_signature(
     request: &OverlayPathQuery,
     node_public_key_b64: &str,
@@ -583,10 +623,12 @@ mod tests {
 
     use chrono::Duration;
     use ipars_types::api::{
-        AuthenticatedSignalPathRequest, ClientControlRequest, ClientRequestKind,
-        ClientRequestSignature, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-        HeartbeatRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
-        SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
+        AuthenticatedSignalPathRequest, ClientControlRequest, ClientRegistrationBundle,
+        ClientRequestKind, ClientRequestSignature, ControlPlaneNodeQueryKind,
+        ControlPlaneNodeQueryRequest, HeartbeatRequest, RegisterClientRequest, RemoveNodeRequest,
+        RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
+        SignalNodeUpsertRequest, SignalPathRequest, SponsoredClientRegistrationRequest,
+        CLIENT_REGISTRATION_SCHEMA_VERSION,
     };
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord,
@@ -639,6 +681,68 @@ mod tests {
             &request,
             ClientRequestKind::Remove,
             &identity.public_key_b64(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn client_registration_signatures_bind_client_and_sponsor() {
+        let client = IdentityKeyPair::from_signing_bytes([9_u8; 32]);
+        let sponsor = IdentityKeyPair::from_signing_bytes([13_u8; 32]);
+        let issued_at = DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+            .unwrap_or_else(|error| panic!("fixed timestamp should parse: {error}"))
+            .with_timezone(&Utc);
+        let expires_at = issued_at + Duration::hours(1);
+        let mut bundle = ClientRegistrationBundle {
+            schema_version: CLIENT_REGISTRATION_SCHEMA_VERSION,
+            registration: RegisterClientRequest {
+                client_id: client.node_id(),
+                identity_public_key: client.public_key_b64(),
+                wireguard_public_key: encode_bytes(&[8_u8; 32]),
+            },
+            issued_at,
+            expires_at,
+            nonce: URL_SAFE_NO_PAD.encode([5_u8; NODE_API_REQUEST_NONCE_BYTES]),
+            signature: String::new(),
+        };
+        bundle.signature = client.sign_client_registration_bundle(&bundle);
+        assert_eq!(
+            bundle.registration.client_id.as_str(),
+            "node-dbc298251c51321b7266e78d1c151c2b"
+        );
+        assert_eq!(
+            bundle.signature_payload(),
+            b"heteronetwork-client-registration-v1\nnode-dbc298251c51321b7266e78d1c151c2b\n/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=\nCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=\n1785412800\n1785416400\nBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF\n"
+        );
+        assert_eq!(
+            bundle.signature,
+            "X084nfek9SQJlfKOEjrupHiAPaapn9fxsNpWYIBFwcD9YHn8f8qdS/XV1F2Te3HQPk1LYVrkmaeGXXTDGvJaBg=="
+        );
+        assert!(verify_client_registration_bundle_signature(&bundle).is_ok());
+
+        let mut request = SponsoredClientRegistrationRequest {
+            sponsor_node_id: sponsor.node_id(),
+            bundle: bundle.clone(),
+            request_signature: None,
+        };
+        request.request_signature = Some(
+            sponsor
+                .sign_sponsored_client_registration_request(&request, issued_at)
+                .unwrap_or_else(|error| panic!("sponsor signature should be generated: {error}")),
+        );
+        assert!(verify_sponsored_client_registration_signature(
+            &request,
+            &sponsor.public_key_b64()
+        )
+        .is_ok());
+
+        let mut changed_bundle = bundle;
+        changed_bundle.registration.wireguard_public_key = encode_bytes(&[10_u8; 32]);
+        assert!(verify_client_registration_bundle_signature(&changed_bundle).is_err());
+        request.bundle = changed_bundle;
+        assert!(verify_sponsored_client_registration_signature(
+            &request,
+            &sponsor.public_key_b64()
         )
         .is_err());
     }
