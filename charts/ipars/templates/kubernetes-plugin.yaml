@@ -1,0 +1,251 @@
+{{- include "heteronetwork.validateChartMetadata" . -}}
+{{- include "heteronetwork.validateKubernetesPlugin" . -}}
+{{- $pluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
+{{- if $pluginEnabled -}}
+{{- $controllerName := include "heteronetwork.kubernetesPluginControllerName" . -}}
+{{- $tlsSecretName := include "heteronetwork.kubernetesPluginTlsSecretName" . -}}
+{{- $serviceAccountName := include "heteronetwork.serviceAccountName" . -}}
+{{- $imageRepository := printf "%v" .Values.image.repository -}}
+{{- $imageTag := printf "%v" .Values.image.tag -}}
+{{- $webhookBind := printf "%v" .Values.kubernetesPlugin.controller.webhookBind -}}
+{{- $webhookContainerPort := int (regexFind "[0-9]+$" $webhookBind) -}}
+{{- $caCertificate := "" -}}
+{{- $tlsCertificate := "" -}}
+{{- $tlsPrivateKey := "" -}}
+{{- $existingSecret := lookup "v1" "Secret" .Release.Namespace $tlsSecretName -}}
+{{- if and $existingSecret $existingSecret.data (hasKey $existingSecret.data "ca.crt") (hasKey $existingSecret.data "tls.crt") (hasKey $existingSecret.data "tls.key") -}}
+{{- $caCertificate = index $existingSecret.data "ca.crt" -}}
+{{- $tlsCertificate = index $existingSecret.data "tls.crt" -}}
+{{- $tlsPrivateKey = index $existingSecret.data "tls.key" -}}
+{{- else -}}
+{{- $ca := genCA (printf "%s-ca" $controllerName) 3650 -}}
+{{- $serviceDnsNames := list
+      $controllerName
+      (printf "%s.%s" $controllerName .Release.Namespace)
+      (printf "%s.%s.svc" $controllerName .Release.Namespace)
+      (printf "%s.%s.svc.cluster.local" $controllerName .Release.Namespace) -}}
+{{- $certificate := genSignedCert $controllerName nil $serviceDnsNames 3650 $ca -}}
+{{- $caCertificate = b64enc $ca.Cert -}}
+{{- $tlsCertificate = b64enc $certificate.Cert -}}
+{{- $tlsPrivateKey = b64enc $certificate.Key -}}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tlsSecretName }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+type: kubernetes.io/tls
+data:
+  ca.crt: {{ $caCertificate | quote }}
+  tls.crt: {{ $tlsCertificate | quote }}
+  tls.key: {{ $tlsPrivateKey | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $controllerName }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+  ports:
+    - name: webhook
+      port: {{ int .Values.kubernetesPlugin.webhook.servicePort }}
+      targetPort: webhook
+      protocol: TCP
+      appProtocol: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $controllerName }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+spec:
+  replicas: {{ int .Values.kubernetesPlugin.controller.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      app.kubernetes.io/component: kubernetes-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+        app.kubernetes.io/instance: {{ .Release.Name | quote }}
+        app.kubernetes.io/component: kubernetes-controller
+    spec:
+      serviceAccountName: {{ $serviceAccountName }}
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+                    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+                    app.kubernetes.io/component: kubernetes-controller
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: controller
+          image: "{{ $imageRepository }}:{{ $imageTag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/ipars-k8s-controller
+          args:
+            - controller
+            - --load-balancer-class
+            - {{ .Values.kubernetesPlugin.loadBalancerClass | quote }}
+            - --reconcile-interval-seconds
+            - {{ .Values.kubernetesPlugin.controller.reconcileIntervalSeconds | quote }}
+            - --webhook-bind
+            - {{ $webhookBind | quote }}
+            - --tls-cert-path
+            - /tls/tls.crt
+            - --tls-key-path
+            - /tls/tls.key
+            - --agones-port-range-start
+            - {{ .Values.kubernetesPlugin.agones.portRangeStart | quote }}
+            - --agones-port-range-end
+            - {{ .Values.kubernetesPlugin.agones.portRangeEnd | quote }}
+            - --enable-agones-integration
+            - {{ .Values.kubernetesPlugin.agones.enabled | quote }}
+          ports:
+            - name: webhook
+              containerPort: {{ $webhookContainerPort }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          {{- if or .Values.kubernetesPlugin.controller.resources.requests.cpu .Values.kubernetesPlugin.controller.resources.requests.memory .Values.kubernetesPlugin.controller.resources.limits.cpu .Values.kubernetesPlugin.controller.resources.limits.memory }}
+          resources:
+            {{- if or .Values.kubernetesPlugin.controller.resources.requests.cpu .Values.kubernetesPlugin.controller.resources.requests.memory }}
+            requests:
+              {{- if .Values.kubernetesPlugin.controller.resources.requests.cpu }}
+              cpu: {{ .Values.kubernetesPlugin.controller.resources.requests.cpu | quote }}
+              {{- end }}
+              {{- if .Values.kubernetesPlugin.controller.resources.requests.memory }}
+              memory: {{ .Values.kubernetesPlugin.controller.resources.requests.memory | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if or .Values.kubernetesPlugin.controller.resources.limits.cpu .Values.kubernetesPlugin.controller.resources.limits.memory }}
+            limits:
+              {{- if .Values.kubernetesPlugin.controller.resources.limits.cpu }}
+              cpu: {{ .Values.kubernetesPlugin.controller.resources.limits.cpu | quote }}
+              {{- end }}
+              {{- if .Values.kubernetesPlugin.controller.resources.limits.memory }}
+              memory: {{ .Values.kubernetesPlugin.controller.resources.limits.memory | quote }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- if eq (printf "%v" .Values.kubernetesPlugin.controller.probes.liveness.enabled) "true" }}
+          livenessProbe:
+            tcpSocket:
+              port: webhook
+            initialDelaySeconds: {{ int .Values.kubernetesPlugin.controller.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.kubernetesPlugin.controller.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.kubernetesPlugin.controller.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.kubernetesPlugin.controller.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if eq (printf "%v" .Values.kubernetesPlugin.controller.probes.readiness.enabled) "true" }}
+          readinessProbe:
+            tcpSocket:
+              port: webhook
+            initialDelaySeconds: {{ int .Values.kubernetesPlugin.controller.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.kubernetesPlugin.controller.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ int .Values.kubernetesPlugin.controller.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ int .Values.kubernetesPlugin.controller.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if eq (printf "%v" .Values.kubernetesPlugin.controller.probes.startup.enabled) "true" }}
+          startupProbe:
+            tcpSocket:
+              port: webhook
+            initialDelaySeconds: {{ int .Values.kubernetesPlugin.controller.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ int .Values.kubernetesPlugin.controller.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ int .Values.kubernetesPlugin.controller.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ int .Values.kubernetesPlugin.controller.probes.startup.failureThreshold }}
+          {{- end }}
+          volumeMounts:
+            - name: webhook-tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: webhook-tls
+          secret:
+            secretName: {{ $tlsSecretName }}
+            defaultMode: 0440
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ $controllerName }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+webhooks:
+  - name: {{ printf "%s.direct-pods.networking.heteronetwork.io" .Release.Name | quote }}
+    admissionReviewVersions:
+      - v1
+    clientConfig:
+      caBundle: {{ $caCertificate | quote }}
+      service:
+        name: {{ $controllerName }}
+        namespace: {{ .Release.Namespace }}
+        path: /mutate-v1-pod
+        port: {{ int .Values.kubernetesPlugin.webhook.servicePort }}
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    objectSelector:
+      matchLabels:
+        networking.heteronetwork.io/traffic-mode: direct
+    reinvocationPolicy: IfNeeded
+    rules:
+      - apiGroups:
+          - ""
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+        resources:
+          - pods
+        scope: Namespaced
+    sideEffects: None
+    timeoutSeconds: {{ int .Values.kubernetesPlugin.webhook.timeoutSeconds }}
+{{- end }}

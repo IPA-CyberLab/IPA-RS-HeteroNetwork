@@ -1,0 +1,113 @@
+{{- include "heteronetwork.validateChartMetadata" . -}}
+{{- include "heteronetwork.validateKubernetesPlugin" . -}}
+{{- $pluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
+{{- $rbacCreate := eq (printf "%v" .Values.rbac.create) "true" -}}
+{{- if and $pluginEnabled $rbacCreate -}}
+{{- $name := include "heteronetwork.kubernetesPluginControllerName" . -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+      {{- if eq (printf "%v" .Values.kubernetesPlugin.agones.enabled) "true" }}
+      - create
+      - delete
+      {{- end }}
+  - apiGroups:
+      - ""
+    resources:
+      - services/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  {{- if eq (printf "%v" .Values.kubernetesPlugin.agones.enabled) "true" }}
+  - apiGroups:
+      - agones.dev
+    resources:
+      - gameservers
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ include "heteronetwork.name" . | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: kubernetes-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "heteronetwork.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

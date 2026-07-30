@@ -1,4 +1,5 @@
 {{- include "heteronetwork.validateChartMetadata" . -}}
+{{- include "heteronetwork.validateKubernetesPlugin" . -}}
 {{- if or (eq .Values.agent.joinTokenSecretName "") (gt (len .Values.agent.joinTokenSecretName) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" .Values.agent.joinTokenSecretName)) -}}
 {{- fail "agent.joinTokenSecretName must be a Kubernetes DNS subdomain" -}}
 {{- end -}}
@@ -67,6 +68,9 @@
 {{- $agentOverlayTransitPortValue := printf "%v" .Values.agent.overlayTransitPort -}}
 {{- $agentStunBind := printf "%v" .Values.agent.stunBind -}}
 {{- $agentNatDiscoveryIntervalSeconds := printf "%v" .Values.agent.natDiscovery.intervalSeconds -}}
+{{- $kubernetesPluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
+{{- $nodeReporterReconcileIntervalSeconds := printf "%v" .Values.kubernetesPlugin.nodeReporter.reconcileIntervalSeconds -}}
+{{- $nodeReporterPublishNodeExternalIp := printf "%v" .Values.kubernetesPlugin.nodeReporter.publishNodeExternalIp -}}
 {{- $agentApiTargetPortValue := printf "%v" .Values.agent.apiService.targetPort -}}
 {{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "agent.apiService.targetPort" "value" $agentApiTargetPortValue "max" 65535) -}}
 {{- $agentApiTargetPort := int $agentApiTargetPortValue -}}
@@ -1375,6 +1379,86 @@ spec:
               mountPath: /var/run/netns
               readOnly: true
             {{- end }}
+        {{- if $kubernetesPluginEnabled }}
+        - name: node-reporter
+          image: "{{ $imageRepository }}:{{ $imageTag }}"
+          imagePullPolicy: {{ $imagePullPolicy }}
+          command:
+            - /usr/local/bin/ipars-k8s-controller
+          args:
+            - node-reporter
+            - --node-name
+            - "$(NODE_NAME)"
+            - --agent-state-path
+            - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
+            - --reconcile-interval-seconds
+            - {{ $nodeReporterReconcileIntervalSeconds | quote }}
+            - --publish-node-external-ip
+            - {{ $nodeReporterPublishNodeExternalIp | quote }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HETERONETWORK_AGENT_API_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.agent.joinTokenSecretName | quote }}
+                  key: {{ .Values.agent.apiBearerTokenSecretKey | quote }}
+            - name: HETERONETWORK_AGENT_STATUS_URL
+              value: {{ printf "http://127.0.0.1:%d/v1/status" $agentApiTargetPort | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          {{- if or .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu .Values.kubernetesPlugin.nodeReporter.resources.requests.memory .Values.kubernetesPlugin.nodeReporter.resources.limits.cpu .Values.kubernetesPlugin.nodeReporter.resources.limits.memory }}
+          resources:
+            {{- if or .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu .Values.kubernetesPlugin.nodeReporter.resources.requests.memory }}
+            requests:
+              {{- if .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu }}
+              cpu: {{ .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu | quote }}
+              {{- end }}
+              {{- if .Values.kubernetesPlugin.nodeReporter.resources.requests.memory }}
+              memory: {{ .Values.kubernetesPlugin.nodeReporter.resources.requests.memory | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if or .Values.kubernetesPlugin.nodeReporter.resources.limits.cpu .Values.kubernetesPlugin.nodeReporter.resources.limits.memory }}
+            limits:
+              {{- if .Values.kubernetesPlugin.nodeReporter.resources.limits.cpu }}
+              cpu: {{ .Values.kubernetesPlugin.nodeReporter.resources.limits.cpu | quote }}
+              {{- end }}
+              {{- if .Values.kubernetesPlugin.nodeReporter.resources.limits.memory }}
+              memory: {{ .Values.kubernetesPlugin.nodeReporter.resources.limits.memory | quote }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - {{ printf "test -r %s/agent.json" $agentStateMountPath | quote }}
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - {{ printf "test -r %s/agent.json" $agentStateMountPath | quote }}
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 60
+          volumeMounts:
+            - name: agent-state
+              mountPath: {{ $agentStateMountPath | quote }}
+              readOnly: true
+        {{- end }}
         {{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled }}
         - name: relay
           image: "{{ $imageRepository }}:{{ $imageTag }}"

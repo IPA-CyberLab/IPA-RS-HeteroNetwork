@@ -64,6 +64,20 @@ assert_rendered_absent() {
   fi
 }
 
+assert_rendered_count() {
+  local name="$1"
+  local expected_count="$2"
+  local expected="$3"
+  local rendered="/tmp/heteronetwork-helm-${name}.yaml"
+  local actual_count
+  actual_count="$(grep -Fc -- "$expected" "$rendered" || true)"
+  if [[ "$actual_count" != "$expected_count" ]]; then
+    echo "Helm template output for ${name} included ${actual_count} copies of ${expected}; expected ${expected_count}" >&2
+    cat "$rendered" >&2
+    exit 1
+  fi
+}
+
 helm_cmd lint /work/charts/ipars >/tmp/heteronetwork-helm-lint.txt
 
 template_ok default
@@ -87,6 +101,133 @@ assert_rendered_contains default '- "/var/lib/heteronetwork/join-token"'
 assert_rendered_contains default 'mountPath: "/var/lib/heteronetwork/join-token"'
 assert_rendered_contains default 'subPath: "token"'
 assert_rendered_contains default "defaultMode: 0400"
+assert_rendered_contains default "kind: Deployment"
+assert_rendered_contains default "replicas: 2"
+assert_rendered_contains default "name: node-reporter"
+assert_rendered_contains default "/usr/local/bin/ipars-k8s-controller"
+assert_rendered_contains default "- --load-balancer-class"
+assert_rendered_contains default '- "heteronetwork.io/public"'
+assert_rendered_contains default "- --webhook-bind"
+assert_rendered_contains default '- "0.0.0.0:9443"'
+assert_rendered_contains default "- --tls-cert-path"
+assert_rendered_contains default "- /tls/tls.crt"
+assert_rendered_contains default "- --tls-key-path"
+assert_rendered_contains default "- /tls/tls.key"
+assert_rendered_contains default "- --agent-state-path"
+assert_rendered_contains default '$(NODE_NAME)'
+assert_rendered_contains default '"/var/lib/heteronetwork/agent.json"'
+assert_rendered_contains default "- --publish-node-external-ip"
+assert_rendered_count default 2 "name: HETERONETWORK_AGENT_API_BEARER_TOKEN"
+assert_rendered_contains default 'value: "http://127.0.0.1:9780/v1/status"'
+assert_rendered_contains default "kind: MutatingWebhookConfiguration"
+assert_rendered_contains default "path: /mutate-v1-pod"
+assert_rendered_contains default "failurePolicy: Fail"
+assert_rendered_contains default "networking.heteronetwork.io/traffic-mode: direct"
+assert_rendered_contains default "type: kubernetes.io/tls"
+assert_rendered_contains default "ca.crt:"
+assert_rendered_contains default "app.kubernetes.io/component: kubernetes-controller"
+assert_rendered_contains default "- nodes/status"
+assert_rendered_contains default "- services/status"
+assert_rendered_contains default "- endpointslices"
+assert_rendered_contains default "- leases"
+assert_rendered_absent default "- agones.dev"
+assert_rendered_absent default "- allocation.agones.dev"
+
+template_ok kubernetes-plugin-disabled \
+  --set kubernetesPlugin.enabled=false
+
+assert_rendered_absent kubernetes-plugin-disabled "/usr/local/bin/ipars-k8s-controller"
+assert_rendered_absent kubernetes-plugin-disabled "kind: MutatingWebhookConfiguration"
+assert_rendered_absent kubernetes-plugin-disabled "app.kubernetes.io/component: kubernetes-controller"
+
+template_ok kubernetes-plugin-custom \
+  --set agent.apiService.enabled=true \
+  --set agent.apiService.type=ClusterIP \
+  --set agent.apiService.targetPort=9790 \
+  --set kubernetesPlugin.controller.replicas=3 \
+  --set kubernetesPlugin.controller.reconcileIntervalSeconds=17 \
+  --set-string kubernetesPlugin.controller.webhookBind=0.0.0.0:10443 \
+  --set kubernetesPlugin.nodeReporter.reconcileIntervalSeconds=19 \
+  --set kubernetesPlugin.nodeReporter.publishNodeExternalIp=false \
+  --set kubernetesPlugin.webhook.servicePort=8443 \
+  --set kubernetesPlugin.webhook.timeoutSeconds=12 \
+  --set kubernetesPlugin.agones.enabled=true \
+  --set kubernetesPlugin.agones.portRangeStart=7100 \
+  --set kubernetesPlugin.agones.portRangeEnd=7200
+
+assert_rendered_contains kubernetes-plugin-custom "replicas: 3"
+assert_rendered_contains kubernetes-plugin-custom 'containerPort: 10443'
+assert_rendered_contains kubernetes-plugin-custom 'port: 8443'
+assert_rendered_contains kubernetes-plugin-custom '- "17"'
+assert_rendered_contains kubernetes-plugin-custom '- "19"'
+assert_rendered_contains kubernetes-plugin-custom '- "7100"'
+assert_rendered_contains kubernetes-plugin-custom '- "7200"'
+assert_rendered_contains kubernetes-plugin-custom '- "false"'
+assert_rendered_contains kubernetes-plugin-custom 'value: "http://127.0.0.1:9790/v1/status"'
+assert_rendered_contains kubernetes-plugin-custom "- agones.dev"
+assert_rendered_contains kubernetes-plugin-custom "- gameservers"
+assert_rendered_contains kubernetes-plugin-custom "- create"
+assert_rendered_contains kubernetes-plugin-custom "- delete"
+
+template_ok kubernetes-plugin-external-rbac \
+  --set rbac.create=false
+
+assert_rendered_absent kubernetes-plugin-external-rbac "kind: ClusterRole"
+assert_rendered_absent kubernetes-plugin-external-rbac "kind: ClusterRoleBinding"
+assert_rendered_contains kubernetes-plugin-external-rbac "kind: Deployment"
+
+template_fails kubernetes-plugin-string-enabled \
+  "kubernetesPlugin.enabled must be true or false" \
+  --set-string kubernetesPlugin.enabled=false
+
+template_fails kubernetes-plugin-string-publish-external-ip \
+  "kubernetesPlugin.nodeReporter.publishNodeExternalIp must be true or false" \
+  --set-string kubernetesPlugin.nodeReporter.publishNodeExternalIp=true
+
+template_fails kubernetes-plugin-string-agones-enabled \
+  "kubernetesPlugin.agones.enabled must be true or false" \
+  --set-string kubernetesPlugin.agones.enabled=false
+
+template_fails kubernetes-plugin-single-controller \
+  "kubernetesPlugin.controller.replicas must be between 2 and 100 when kubernetesPlugin.enabled=true" \
+  --set kubernetesPlugin.controller.replicas=1
+
+template_fails kubernetes-plugin-controller-interval-zero \
+  "kubernetesPlugin.controller.reconcileIntervalSeconds must be greater than zero" \
+  --set kubernetesPlugin.controller.reconcileIntervalSeconds=0
+
+template_fails kubernetes-plugin-node-reporter-interval-zero \
+  "kubernetesPlugin.nodeReporter.reconcileIntervalSeconds must be greater than zero" \
+  --set kubernetesPlugin.nodeReporter.reconcileIntervalSeconds=0
+
+template_fails kubernetes-plugin-webhook-bind-zero-port \
+  "kubernetesPlugin.controller.webhookBind port must be between 1 and 65535" \
+  --set-string kubernetesPlugin.controller.webhookBind=0.0.0.0:0
+
+template_fails kubernetes-plugin-webhook-service-port-zero \
+  "kubernetesPlugin.webhook.servicePort must be between 1 and 65535" \
+  --set kubernetesPlugin.webhook.servicePort=0
+
+template_fails kubernetes-plugin-webhook-timeout-too-large \
+  "kubernetesPlugin.webhook.timeoutSeconds must be a non-negative integer no greater than 30" \
+  --set kubernetesPlugin.webhook.timeoutSeconds=31
+
+template_fails kubernetes-plugin-agones-port-range-reversed \
+  "kubernetesPlugin.agones port range must be between 1 and 65535 with portRangeStart no greater than portRangeEnd" \
+  --set kubernetesPlugin.agones.portRangeStart=8001 \
+  --set kubernetesPlugin.agones.portRangeEnd=8000
+
+template_fails kubernetes-plugin-string-probe-enabled \
+  "kubernetesPlugin.controller.probes.startup.enabled must be true or false" \
+  --set-string kubernetesPlugin.controller.probes.startup.enabled=false
+
+template_fails kubernetes-plugin-probe-zero-threshold \
+  "kubernetesPlugin.controller.probes.readiness.failureThreshold must be greater than zero" \
+  --set kubernetesPlugin.controller.probes.readiness.failureThreshold=0
+
+template_fails kubernetes-plugin-without-agent-service-account-token \
+  "kubernetesPlugin.enabled=true requires agent.automountServiceAccountToken=true for the node reporter" \
+  --set agent.automountServiceAccountToken=false
 
 template_fails agent-api-token-key-empty \
   "agent.apiBearerTokenSecretKey must contain only ASCII letters" \
@@ -641,6 +782,7 @@ template_ok route-disabled \
   --set 'serviceExposure.serviceCidrs={}'
 
 template_ok namespaced-service-discovery-rbac \
+  --set kubernetesPlugin.enabled=false \
   --set serviceExposure.discoverServices=true \
   --set serviceExposure.discoverApiServer=false \
   --set-string 'serviceExposure.namespaces[0]=default' \

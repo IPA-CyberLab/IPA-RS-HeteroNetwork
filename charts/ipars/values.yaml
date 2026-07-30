@@ -21,6 +21,57 @@ serviceAccount:
   name: ""
   annotations: {}
 
+kubernetesPlugin:
+  enabled: true
+  loadBalancerClass: heteronetwork.io/public
+  controller:
+    replicas: 2
+    reconcileIntervalSeconds: 10
+    webhookBind: "0.0.0.0:9443"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: ""
+        memory: ""
+    probes:
+      liveness:
+        enabled: true
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 1
+        failureThreshold: 3
+      readiness:
+        enabled: true
+        initialDelaySeconds: 2
+        periodSeconds: 5
+        timeoutSeconds: 1
+        failureThreshold: 3
+      startup:
+        enabled: true
+        initialDelaySeconds: 0
+        periodSeconds: 2
+        timeoutSeconds: 1
+        failureThreshold: 30
+  nodeReporter:
+    reconcileIntervalSeconds: 10
+    publishNodeExternalIp: true
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: ""
+        memory: ""
+  webhook:
+    servicePort: 443
+    timeoutSeconds: 10
+  agones:
+    enabled: false
+    portRangeStart: 7000
+    portRangeEnd: 8000
+
 agent:
   interfaceName: heteronetwork0
   wireguardListenPort: 51820

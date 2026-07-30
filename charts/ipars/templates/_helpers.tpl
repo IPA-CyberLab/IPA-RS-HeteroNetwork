@@ -23,6 +23,16 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "heteronetwork.kubernetesPluginControllerName" -}}
+{{- $base := include "heteronetwork.fullname" . | trunc 48 | trimSuffix "-" -}}
+{{- printf "%s-k8s-controller" $base -}}
+{{- end -}}
+
+{{- define "heteronetwork.kubernetesPluginTlsSecretName" -}}
+{{- $base := include "heteronetwork.fullname" . | trunc 44 | trimSuffix "-" -}}
+{{- printf "%s-k8s-controller-tls" $base -}}
+{{- end -}}
+
 {{- define "heteronetwork.validateDnsLabelWithMax" -}}
 {{- $value := printf "%v" .value -}}
 {{- $path := .path -}}
@@ -835,5 +845,82 @@
 {{- fail (printf "%s name %q must be a Kubernetes qualified name" $path $name) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "heteronetwork.validateKubernetesPlugin" -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.enabled" "value" .Values.kubernetesPlugin.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.nodeReporter.publishNodeExternalIp" "value" .Values.kubernetesPlugin.nodeReporter.publishNodeExternalIp) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.agones.enabled" "value" .Values.kubernetesPlugin.agones.enabled) -}}
+{{- $loadBalancerClass := printf "%v" .Values.kubernetesPlugin.loadBalancerClass -}}
+{{- if eq $loadBalancerClass "" -}}
+{{- fail "kubernetesPlugin.loadBalancerClass must not be empty" -}}
+{{- end -}}
+{{- include "heteronetwork.validateOptionalQualifiedNameWithPrefix" (dict "path" "kubernetesPlugin.loadBalancerClass" "value" $loadBalancerClass) -}}
+{{- $replicas := printf "%v" .Values.kubernetesPlugin.controller.replicas -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.controller.replicas" "value" $replicas "max" 100) -}}
+{{- if and .Values.kubernetesPlugin.enabled (lt (int $replicas) 2) -}}
+{{- fail "kubernetesPlugin.controller.replicas must be between 2 and 100 when kubernetesPlugin.enabled=true" -}}
+{{- end -}}
+{{- $controllerInterval := printf "%v" .Values.kubernetesPlugin.controller.reconcileIntervalSeconds -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.controller.reconcileIntervalSeconds" "value" $controllerInterval "max" 86400) -}}
+{{- if lt (int $controllerInterval) 1 -}}
+{{- fail "kubernetesPlugin.controller.reconcileIntervalSeconds must be greater than zero" -}}
+{{- end -}}
+{{- $nodeReporterInterval := printf "%v" .Values.kubernetesPlugin.nodeReporter.reconcileIntervalSeconds -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.nodeReporter.reconcileIntervalSeconds" "value" $nodeReporterInterval "max" 86400) -}}
+{{- if lt (int $nodeReporterInterval) 1 -}}
+{{- fail "kubernetesPlugin.nodeReporter.reconcileIntervalSeconds must be greater than zero" -}}
+{{- end -}}
+{{- $webhookBind := printf "%v" .Values.kubernetesPlugin.controller.webhookBind -}}
+{{- include "heteronetwork.validateBindSocketAddress" (dict "path" "kubernetesPlugin.controller.webhookBind" "value" $webhookBind) -}}
+{{- $webhookServicePort := printf "%v" .Values.kubernetesPlugin.webhook.servicePort -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.webhook.servicePort" "value" $webhookServicePort "max" 65535) -}}
+{{- if lt (int $webhookServicePort) 1 -}}
+{{- fail "kubernetesPlugin.webhook.servicePort must be between 1 and 65535" -}}
+{{- end -}}
+{{- $webhookTimeoutSeconds := printf "%v" .Values.kubernetesPlugin.webhook.timeoutSeconds -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.webhook.timeoutSeconds" "value" $webhookTimeoutSeconds "max" 30) -}}
+{{- if lt (int $webhookTimeoutSeconds) 1 -}}
+{{- fail "kubernetesPlugin.webhook.timeoutSeconds must be between 1 and 30" -}}
+{{- end -}}
+{{- $agonesPortRangeStart := printf "%v" .Values.kubernetesPlugin.agones.portRangeStart -}}
+{{- $agonesPortRangeEnd := printf "%v" .Values.kubernetesPlugin.agones.portRangeEnd -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.agones.portRangeStart" "value" $agonesPortRangeStart "max" 65535) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.agones.portRangeEnd" "value" $agonesPortRangeEnd "max" 65535) -}}
+{{- if or (lt (int $agonesPortRangeStart) 1) (gt (int $agonesPortRangeStart) (int $agonesPortRangeEnd)) -}}
+{{- fail "kubernetesPlugin.agones port range must be between 1 and 65535 with portRangeStart no greater than portRangeEnd" -}}
+{{- end -}}
+{{- range $probeName := list "liveness" "readiness" "startup" -}}
+{{- $probe := get $.Values.kubernetesPlugin.controller.probes $probeName -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" (printf "kubernetesPlugin.controller.probes.%s.enabled" $probeName) "value" $probe.enabled) -}}
+{{- $initialDelaySeconds := printf "%v" $probe.initialDelaySeconds -}}
+{{- $periodSeconds := printf "%v" $probe.periodSeconds -}}
+{{- $timeoutSeconds := printf "%v" $probe.timeoutSeconds -}}
+{{- $failureThreshold := printf "%v" $probe.failureThreshold -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "kubernetesPlugin.controller.probes.%s.initialDelaySeconds" $probeName) "value" $initialDelaySeconds "max" 86400) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "kubernetesPlugin.controller.probes.%s.periodSeconds" $probeName) "value" $periodSeconds "max" 86400) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "kubernetesPlugin.controller.probes.%s.timeoutSeconds" $probeName) "value" $timeoutSeconds "max" 3600) -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" (printf "kubernetesPlugin.controller.probes.%s.failureThreshold" $probeName) "value" $failureThreshold "max" 1000) -}}
+{{- if lt (int $periodSeconds) 1 -}}
+{{- fail (printf "kubernetesPlugin.controller.probes.%s.periodSeconds must be greater than zero" $probeName) -}}
+{{- end -}}
+{{- if lt (int $timeoutSeconds) 1 -}}
+{{- fail (printf "kubernetesPlugin.controller.probes.%s.timeoutSeconds must be greater than zero" $probeName) -}}
+{{- end -}}
+{{- if lt (int $failureThreshold) 1 -}}
+{{- fail (printf "kubernetesPlugin.controller.probes.%s.failureThreshold must be greater than zero" $probeName) -}}
+{{- end -}}
+{{- end -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.controller.resources.requests.cpu" "value" (printf "%v" .Values.kubernetesPlugin.controller.resources.requests.cpu)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.controller.resources.requests.memory" "value" (printf "%v" .Values.kubernetesPlugin.controller.resources.requests.memory)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.controller.resources.limits.cpu" "value" (printf "%v" .Values.kubernetesPlugin.controller.resources.limits.cpu)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.controller.resources.limits.memory" "value" (printf "%v" .Values.kubernetesPlugin.controller.resources.limits.memory)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.nodeReporter.resources.requests.cpu" "value" (printf "%v" .Values.kubernetesPlugin.nodeReporter.resources.requests.cpu)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.nodeReporter.resources.requests.memory" "value" (printf "%v" .Values.kubernetesPlugin.nodeReporter.resources.requests.memory)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.nodeReporter.resources.limits.cpu" "value" (printf "%v" .Values.kubernetesPlugin.nodeReporter.resources.limits.cpu)) -}}
+{{- include "heteronetwork.validateResourceQuantity" (dict "path" "kubernetesPlugin.nodeReporter.resources.limits.memory" "value" (printf "%v" .Values.kubernetesPlugin.nodeReporter.resources.limits.memory)) -}}
+{{- if and .Values.kubernetesPlugin.enabled (not .Values.agent.automountServiceAccountToken) -}}
+{{- fail "kubernetesPlugin.enabled=true requires agent.automountServiceAccountToken=true for the node reporter" -}}
 {{- end -}}
 {{- end -}}
