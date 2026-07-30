@@ -31,7 +31,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 aya = { version = "0.13.1", default-features = false }
 axum = "0.8"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 boringtun = { version = "0.7.1", default-features = false, features = ["device"] }
 bytes = "1.12"
@@ -57,6 +57,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 opentelemetry_sdk = { version = "0.32", features = ["logs", "metrics", "rt-tokio", "trace"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rtnetlink = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
