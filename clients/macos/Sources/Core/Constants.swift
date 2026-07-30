@@ -6,6 +6,9 @@ public enum HeteroNetworkConstants {
     public static let appGroupIdentifier = "group.jp.go.ipa.cyberlab.heteronetwork"
     public static let keychainService = "jp.go.ipa.cyberlab.heteronetwork.client-session"
     public static let keychainAccount = "active"
+    public static let pendingKeychainService =
+        "jp.go.ipa.cyberlab.heteronetwork.pending-registration"
+    public static let pendingKeychainAccount = "pending"
     public static let sessionSchemaVersion = 1
     public static let overlayDNSName = "console.heteronetwork.internal"
     public static let overlayWebUIPort = 9781

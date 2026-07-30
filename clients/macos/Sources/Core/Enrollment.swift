@@ -105,7 +105,9 @@ public enum EnrollmentParser {
                       url.password == nil,
                       url.query == nil,
                       url.fragment == nil,
-                      scheme == "https" || isLoopbackHost(url.host)
+                      scheme == "https"
+                          || isLoopbackHost(url.host)
+                          || SponsoredEnrollment.isPrivateManagementURL(url)
                 else {
                     continue
                 }

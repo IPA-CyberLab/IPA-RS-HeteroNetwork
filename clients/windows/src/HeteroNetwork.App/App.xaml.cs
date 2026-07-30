@@ -189,7 +189,7 @@ public partial class App : System.Windows.Application
         {
             using var scheme = Registry.CurrentUser.CreateSubKey(
                 @"Software\Classes\heteronetwork");
-            scheme.SetValue(null, "URL:HeteroNetwork Enrollment Protocol");
+            scheme.SetValue(null, "URL:HeteroNetwork Import Protocol");
             scheme.SetValue("URL Protocol", string.Empty);
             using var icon = scheme.CreateSubKey("DefaultIcon");
             icon.SetValue(null, $"\"{executable}\",0");

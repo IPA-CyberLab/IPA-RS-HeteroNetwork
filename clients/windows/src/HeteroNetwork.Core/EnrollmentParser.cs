@@ -100,7 +100,9 @@ public static class EnrollmentParser
     public static IReadOnlyList<Uri> ManagementUrls(IEnumerable<BootstrapEndpoint> endpoints) =>
         EndpointUrls(
             endpoints,
-            [BootstrapEndpointKind.WebUi, BootstrapEndpointKind.ControlPlane]);
+            [BootstrapEndpointKind.WebUi, BootstrapEndpointKind.ControlPlane])
+        .Where(ClientRegistrationProtocol.IsPrivateManagementUri)
+        .ToArray();
 
     private static IReadOnlyList<Uri> EndpointUrls(
         IEnumerable<BootstrapEndpoint> endpoints,

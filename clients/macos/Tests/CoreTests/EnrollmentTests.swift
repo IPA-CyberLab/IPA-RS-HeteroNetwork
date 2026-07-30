@@ -98,6 +98,14 @@ final class EnrollmentTests: XCTestCase {
                     url: "http://[::1]:8080",
                     kind: .controlPlane
                 ),
+                BootstrapEndpoint(
+                    url: "http://10.250.0.4:19088",
+                    kind: .controlPlane
+                ),
+                BootstrapEndpoint(
+                    url: "http://console.heteronetwork.internal:9781",
+                    kind: .webUi
+                ),
             ]
         )
 
@@ -108,6 +116,8 @@ final class EnrollmentTests: XCTestCase {
                 "http://localhost:8080",
                 "http://127.42.0.9:8080",
                 "http://[::1]:8080",
+                "http://10.250.0.4:19088",
+                "http://console.heteronetwork.internal:9781",
             ])
         )
     }

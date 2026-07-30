@@ -82,15 +82,12 @@ public sealed record TunnelProfile(
         IEnumerable<EndpointCandidate> candidates)
     {
         return candidates
-            .Where(candidate => candidate.Kind is EndpointCandidateKind.Ipv6
-                or EndpointCandidateKind.PublicUdp
-                or EndpointCandidateKind.StunReflexive)
+            .Where(ClientRegistrationProtocol.IsGlobalWireGuardCandidate)
             .OrderBy(candidate => candidate.Kind switch
             {
                 EndpointCandidateKind.Ipv6 => 0,
                 EndpointCandidateKind.PublicUdp => 1,
-                EndpointCandidateKind.StunReflexive => 2,
-                _ => 3,
+                _ => 2,
             })
             .ThenBy(candidate => candidate.Cost)
             .ThenByDescending(candidate => candidate.Priority)
@@ -129,7 +126,6 @@ public sealed record TunnelProfile(
     {
         return IPEndPoint.TryParse(value, out var endpoint)
             && endpoint.Port > 0
-            && !endpoint.Address.Equals(IPAddress.Any)
-            && !endpoint.Address.Equals(IPAddress.IPv6Any);
+            && ClientRegistrationProtocol.IsGloballyRoutable(endpoint.Address);
     }
 }

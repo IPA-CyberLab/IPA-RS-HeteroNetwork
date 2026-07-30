@@ -12,15 +12,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard let enrollmentURL = urls.first(where: { $0.scheme == "heteronetwork" }) else { return }
-        handleEnrollmentURL(enrollmentURL)
+        guard let importURL = urls.first(where: {
+            $0.scheme == "heteronetwork" && $0.host == "import"
+        }) else { return }
+        handleImportURL(importURL)
         application.activate(ignoringOtherApps: true)
     }
 
-    func handleEnrollmentURL(_ enrollmentURL: URL) {
-        guard enrollmentURL.scheme == "heteronetwork" else { return }
-        logger.info("Received an enrollment URL")
-        model.enrollmentInput = enrollmentURL.absoluteString
+    func handleImportURL(_ importURL: URL) {
+        guard importURL.scheme == "heteronetwork", importURL.host == "import" else { return }
+        logger.info("Received an import profile URL")
+        model.importInput = importURL.absoluteString
     }
 }
 
@@ -39,10 +41,10 @@ struct HeteroNetworkApp: App {
         Window("HeteroNetwork", id: "settings") {
             SettingsView(model: appDelegate.model)
                 .onOpenURL { url in
-                    appDelegate.handleEnrollmentURL(url)
+                    appDelegate.handleImportURL(url)
                 }
         }
-        .handlesExternalEvents(matching: ["enroll"])
+        .handlesExternalEvents(matching: ["import"])
         .windowResizability(.contentSize)
     }
 }

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace HeteroNetwork.Core;
@@ -5,6 +6,8 @@ namespace HeteroNetwork.Core;
 public static class HeteroNetworkConstants
 {
     public const int SessionSchemaVersion = 1;
+    public const int ClientRegistrationSchemaVersion = 1;
+    public const int PendingRegistrationSchemaVersion = 1;
     public const string OverlayDnsName = "console.heteronetwork.internal";
     public const int OverlayWebUiPort = 9781;
     public static readonly Uri OverlayWebUiUri =
@@ -137,13 +140,88 @@ public sealed record RegisterClientRequest(
     [property: JsonPropertyName("identity_public_key")] string IdentityPublicKey,
     [property: JsonPropertyName("wireguard_public_key")] string WireGuardPublicKey);
 
+public sealed record ClientRegistrationBundle
+{
+    [JsonPropertyName("schema_version")]
+    public required int SchemaVersion { get; init; }
+
+    [JsonPropertyName("registration")]
+    public required RegisterClientRequest Registration { get; init; }
+
+    [JsonPropertyName("issued_at")]
+    public required string EncodedIssuedAt { get; init; }
+
+    [JsonPropertyName("expires_at")]
+    public required string EncodedExpiresAt { get; init; }
+
+    [JsonPropertyName("nonce")]
+    public required string Nonce { get; init; }
+
+    [JsonPropertyName("signature")]
+    public required string Signature { get; init; }
+
+    [JsonIgnore]
+    public DateTimeOffset IssuedAt => HeteroNetworkJson.ParseRfc3339(EncodedIssuedAt);
+
+    [JsonIgnore]
+    public DateTimeOffset ExpiresAt => HeteroNetworkJson.ParseRfc3339(EncodedExpiresAt);
+}
+
+public sealed class PendingClientRegistration
+{
+    [JsonPropertyName("schema_version")]
+    public int SchemaVersion { get; init; } =
+        HeteroNetworkConstants.PendingRegistrationSchemaVersion;
+
+    [JsonPropertyName("identity_private_key")]
+    public required byte[] IdentityPrivateKey { get; init; }
+
+    [JsonPropertyName("wireguard_private_key")]
+    public required byte[] WireGuardPrivateKey { get; init; }
+
+    [JsonPropertyName("bundle")]
+    public required ClientRegistrationBundle Bundle { get; init; }
+
+    [JsonIgnore]
+    public ClientKeyMaterial KeyMaterial =>
+        new(IdentityPrivateKey, WireGuardPrivateKey);
+}
+
 public sealed record JoinClientRequest(
     [property: JsonPropertyName("token")] SignedJoinToken Token,
     [property: JsonPropertyName("registration")] RegisterClientRequest Registration);
 
 public sealed record RegisterClientResponse(
     [property: JsonPropertyName("client")] NodeRecord Client,
-    [property: JsonPropertyName("peer_map")] PeerMap PeerMap);
+    [property: JsonPropertyName("peer_map")] PeerMap PeerMap,
+    [property: JsonPropertyName("cluster_policy")] JsonElement? ClusterPolicy = null);
+
+public sealed record ClientImportProfile
+{
+    [JsonPropertyName("schema_version")]
+    public required int SchemaVersion { get; init; }
+
+    [JsonPropertyName("sponsor_node_id")]
+    public required string SponsorNodeId { get; init; }
+
+    [JsonPropertyName("registration")]
+    public required RegisterClientResponse Registration { get; init; }
+
+    [JsonPropertyName("management_urls")]
+    public required IReadOnlyList<string> ManagementUrls { get; init; }
+
+    [JsonPropertyName("issued_at")]
+    public required string EncodedIssuedAt { get; init; }
+
+    [JsonPropertyName("expires_at")]
+    public required string EncodedExpiresAt { get; init; }
+
+    [JsonIgnore]
+    public DateTimeOffset IssuedAt => HeteroNetworkJson.ParseRfc3339(EncodedIssuedAt);
+
+    [JsonIgnore]
+    public DateTimeOffset ExpiresAt => HeteroNetworkJson.ParseRfc3339(EncodedExpiresAt);
+}
 
 public enum ClientRequestKind
 {

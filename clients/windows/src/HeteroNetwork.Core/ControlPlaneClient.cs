@@ -177,6 +177,12 @@ public sealed class ControlPlaneClient : IDisposable
         ControlPlaneException? lastRejection = null;
         foreach (var baseUri in bases)
         {
+            if (!ClientRegistrationProtocol.IsPrivateManagementUri(baseUri))
+            {
+                failures.Add($"{baseUri.Host}: endpoint is outside the private VPN overlay");
+                continue;
+            }
+
             try
             {
                 var endpoint = EndpointUri(baseUri, path);
@@ -245,7 +251,8 @@ public sealed class ControlPlaneClient : IDisposable
     {
         if (!baseUri.IsAbsoluteUri
             || (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps)
-            || string.IsNullOrEmpty(baseUri.Host))
+            || string.IsNullOrEmpty(baseUri.Host)
+            || !ClientRegistrationProtocol.IsPrivateManagementUri(baseUri))
         {
             throw new ControlPlaneException("A control plane endpoint is invalid.");
         }

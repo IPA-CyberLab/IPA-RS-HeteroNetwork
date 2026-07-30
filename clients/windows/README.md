@@ -1,14 +1,15 @@
 # HeteroNetwork for Windows
 
-The Windows client is a native WPF task-tray application. It uses the same
-control-only enrollment, Ed25519 request signatures, gateway-only WireGuard
+The Windows client is a native WPF task-tray application. It uses SSH-sponsored
+public-key registration, Ed25519 request signatures, a gateway-only WireGuard
 profile, five-second peer-map refresh, cached gateway failover, and overlay
-health checks as the macOS client.
+health checks.
 
 Private identity and WireGuard keys are stored in a current-user Windows DPAPI
-blob. The one-use enrollment token is never persisted. The app builds and
-bundles the official WireGuard embeddable tunnel service and the signed
-WireGuardNT driver library at pinned versions. The active WireGuard
+blob before the public registration request is displayed. Neither private key
+is included in the registration request or returned import profile. The app
+builds and bundles the official WireGuard embeddable tunnel service and the
+signed WireGuardNT driver library at pinned versions. The active WireGuard
 configuration is machine-DPAPI protected before it is handed to that embedded
 service. An NRPT rule sends only
 `console.heteronetwork.internal` DNS queries to the active gateway.
@@ -64,16 +65,28 @@ their publishers' Authenticode signatures. A locally generated self-signed
 certificate is not sufficient for Smart App Control.
 
 The app registers the `heteronetwork://` URL scheme for the current user on
-first launch. You can also paste the enrollment link directly into its window.
+first launch. You can also paste an import profile directly into its window.
 
-## Enroll
+## Register
 
-1. In the control-plane Web UI, create a desktop client enrollment.
-2. Open the returned `heteronetwork://enroll?...` link or paste it into the app.
-3. Select **Enroll this PC**, then **Connect**.
-4. Approve the Windows administrator prompt.
-5. Open the overlay console from **Open Web UI**.
+1. Select **Generate registration request**. The public
+   `heteronetwork://register?...` URI is copied to the clipboard.
+2. SSH to any machine already joined to HeteroNetwork and run:
 
-The client rejects default routes, malformed CIDRs, local/relay candidates, and
-invalid WireGuard keys before touching Windows networking. Disconnecting
-removes both the WireGuard tunnel service and the managed split-DNS rule.
+   ```text
+   sudo ipars client register '<heteronetwork://register?...>'
+   ```
+
+3. Paste the returned `heteronetwork://import?...` URI into the app, or open it
+   through the registered URL scheme.
+4. Select **Import and configure**, then **Connect**.
+5. Approve the Windows administrator prompt and open the private overlay
+   console from **Open Web UI**.
+
+Import is offline. The client validates that the profile matches its pending
+keys and rejects expired profiles, default routes, malformed CIDRs,
+local/STUN/relay candidates, non-global gateway endpoints, public management
+URLs, and invalid WireGuard keys before touching Windows networking. Connect
+uses the cached gateway first and refreshes management state only after the VPN
+tunnel starts. Disconnecting removes both the WireGuard tunnel service and the
+managed split-DNS rule.

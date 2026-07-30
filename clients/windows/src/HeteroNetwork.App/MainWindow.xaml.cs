@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows;
 using HeteroNetwork.Core;
 using Forms = System.Windows.Forms;
@@ -14,8 +15,8 @@ public partial class MainWindow : Window
 
     public MainWindow(MainViewModel viewModel)
     {
-        InitializeComponent();
         this.viewModel = viewModel;
+        InitializeComponent();
         DataContext = viewModel;
         viewModel.ActivationAccepted += ViewModel_ActivationAccepted;
         viewModel.PropertyChanged += ViewModel_PropertyChanged;
@@ -77,8 +78,9 @@ public partial class MainWindow : Window
 
     private void ViewModel_ActivationAccepted(object? sender, string activation)
     {
-        EnrollmentLink.Password = activation;
         ShowAndActivate();
+        ImportProfile.Focus();
+        ImportProfile.CaretIndex = ImportProfile.Text.Length;
     }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -97,15 +99,28 @@ public partial class MainWindow : Window
         connectionMenuItem.Enabled = viewModel.IsConfigured && !viewModel.IsBusy;
     }
 
-    private void EnrollmentLink_PasswordChanged(object sender, RoutedEventArgs e) =>
-        viewModel.SetEnrollmentInput(EnrollmentLink.Password);
-
-    private async void Enroll_Click(object sender, RoutedEventArgs e)
+    private void GenerateRegistration_Click(object sender, RoutedEventArgs e)
     {
-        await viewModel.EnrollAsync();
+        if (viewModel.GenerateRegistrationRequest() is { } request)
+        {
+            CopyToClipboard(request);
+        }
+    }
+
+    private void CopyRegistration_Click(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrWhiteSpace(viewModel.RegistrationRequest))
+        {
+            CopyToClipboard(viewModel.RegistrationRequest);
+        }
+    }
+
+    private async void Import_Click(object sender, RoutedEventArgs e)
+    {
+        await viewModel.ImportAsync();
         if (viewModel.IsConfigured)
         {
-            EnrollmentLink.Clear();
+            ImportProfile.Clear();
         }
     }
 
@@ -148,4 +163,20 @@ public partial class MainWindow : Window
     private void DismissError_Click(object sender, RoutedEventArgs e) =>
         viewModel.ClearError();
 
+    private void CopyToClipboard(string value)
+    {
+        try
+        {
+            System.Windows.Clipboard.SetText(value);
+        }
+        catch (ExternalException error)
+        {
+            System.Windows.MessageBox.Show(
+                this,
+                error.Message,
+                "Unable to copy",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+    }
 }

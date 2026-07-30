@@ -9,13 +9,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var session: ClientSession?
     @Published private(set) var vpnStatus: NEVPNStatus = .invalid
     @Published private(set) var isBusy = false
-    @Published var enrollmentInput = ""
+    @Published var registrationRequest = ""
+    @Published var importInput = ""
     @Published var lastError: String?
 
     let tunnelManager = TunnelManager()
 
     private let controlPlane = ControlPlaneClient()
     private let sessionStore = ClientSessionStore()
+    private var pendingRegistration: PendingClientRegistration?
     private var cancellables = Set<AnyCancellable>()
 
     init() {
@@ -36,22 +38,54 @@ final class AppModel: ObservableObject {
         session?.selectedGatewayNodeID ?? session?.peerMap.peers.first?.nodeID ?? "-"
     }
 
-    func enroll() async {
+    func generateRegistrationRequest() {
         guard !isBusy else { return }
         isBusy = true
         lastError = nil
         defer { isBusy = false }
         do {
-            let token = try EnrollmentParser.parse(enrollmentInput)
-            let joined = try await controlPlane.join(
-                token: token,
-                keyMaterial: ClientKeyMaterial.generate()
+            let pending = try SponsoredEnrollment.makeRegistration()
+            try sessionStore.savePendingRegistration(pending)
+            pendingRegistration = pending
+            registrationRequest = try pending.bundle.uri()
+            copyRegistrationRequest()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func copyRegistrationRequest() {
+        guard !registrationRequest.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(registrationRequest, forType: .string)
+    }
+
+    func importProfile() async {
+        guard !isBusy else { return }
+        isBusy = true
+        lastError = nil
+        defer { isBusy = false }
+        do {
+            let pending: PendingClientRegistration?
+            if let current = pendingRegistration {
+                pending = current
+            } else {
+                pending = try sessionStore.loadPendingRegistration()
+            }
+            let imported = try SponsoredEnrollment.importProfile(
+                importInput,
+                pending: pending
             )
-            _ = try TunnelProfile(session: joined)
-            try sessionStore.save(joined)
-            session = joined
-            try await tunnelManager.prepare(for: joined)
-            enrollmentInput = ""
+            _ = try TunnelProfile(session: imported)
+            guard let pending else {
+                throw SponsoredEnrollmentError.pendingRegistrationMissing
+            }
+            try sessionStore.completeImport(pending: pending, session: imported)
+            pendingRegistration = nil
+            session = imported
+            try await tunnelManager.prepare(for: imported)
+            registrationRequest = ""
+            importInput = ""
         } catch {
             lastError = error.localizedDescription
         }
@@ -63,22 +97,10 @@ final class AppModel: ObservableObject {
         lastError = nil
         defer { isBusy = false }
         do {
-            let connectionSession: ClientSession
-            do {
-                let refreshed = try await controlPlane.refresh(current)
-                _ = try TunnelProfile(session: refreshed)
-                try sessionStore.save(refreshed)
-                session = refreshed
-                connectionSession = refreshed
-            } catch {
-                // A public management gateway can be unavailable while the
-                // cached WireGuard gateway is still usable. Bring the overlay
-                // up first so the tunnel extension can recover its live
-                // control-plane route instead of deadlocking on refresh.
-                _ = try TunnelProfile(session: current)
-                connectionSession = current
-            }
-            try await tunnelManager.prepare(for: connectionSession)
+            // Management endpoints are VPN-only. The cached gateway map must
+            // establish WireGuard before the extension refreshes over it.
+            _ = try TunnelProfile(session: current)
+            try await tunnelManager.prepare(for: current)
             try tunnelManager.connect()
         } catch {
             lastError = error.localizedDescription
@@ -127,6 +149,10 @@ final class AppModel: ObservableObject {
             tunnelManager.disconnect()
             try await tunnelManager.removeProfile()
             try sessionStore.delete()
+            try sessionStore.deletePendingRegistration()
+            pendingRegistration = nil
+            registrationRequest = ""
+            importInput = ""
             session = nil
             if let remoteRemovalError {
                 lastError = "This Mac was removed locally, but control-plane cleanup failed: "
@@ -144,6 +170,12 @@ final class AppModel: ObservableObject {
     private func restore() async {
         do {
             session = try sessionStore.load()
+            if session != nil {
+                try sessionStore.deletePendingRegistration()
+            } else if let pending = try sessionStore.loadPendingRegistration() {
+                pendingRegistration = pending
+                registrationRequest = try pending.bundle.uri()
+            }
             try await tunnelManager.load()
             if let session, vpnStatus == .invalid {
                 try await tunnelManager.prepare(for: session)

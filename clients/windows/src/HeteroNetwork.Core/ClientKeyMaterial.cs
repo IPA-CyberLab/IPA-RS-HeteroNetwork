@@ -82,6 +82,22 @@ public sealed class ClientKeyMaterial
             Convert.ToBase64String(signature));
     }
 
+    public string SignRegistrationPayload(ReadOnlySpan<byte> payload)
+    {
+        var payloadBytes = payload.ToArray();
+        try
+        {
+            var signer = new Ed25519Signer();
+            signer.Init(true, IdentityKey());
+            signer.BlockUpdate(payloadBytes, 0, payloadBytes.Length);
+            return Convert.ToBase64String(signer.GenerateSignature());
+        }
+        finally
+        {
+            Array.Clear(payloadBytes);
+        }
+    }
+
     private Ed25519PrivateKeyParameters IdentityKey() => new(IdentityPrivateKey);
     private X25519PrivateKeyParameters WireGuardKey() => new(WireGuardPrivateKey);
 

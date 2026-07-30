@@ -14,15 +14,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private const int GatewayFailureThreshold = 2;
     private static readonly TimeSpan GatewayFailureCooldown = TimeSpan.FromSeconds(60);
     private readonly ClientSessionStore sessionStore = new();
+    private readonly PendingClientRegistrationStore pendingStore = new();
     private readonly ControlPlaneClient controlPlane = new();
     private readonly WindowsTunnelManager tunnelManager;
     private readonly DispatcherTimer statusTimer;
     private readonly SemaphoreSlim backgroundGate = new(1, 1);
     private readonly Dictionary<string, DateTimeOffset> failedGateways = [];
     private ClientSession? session;
+    private PendingClientRegistration? pendingRegistration;
     private TunnelConnectionStatus status;
     private bool isBusy;
-    private string enrollmentInput = string.Empty;
+    private string registrationRequest = string.Empty;
+    private string importInput = string.Empty;
     private string? lastError;
     private int consecutiveProbeFailures;
     private DateTimeOffset profileActivatedAt = DateTimeOffset.MinValue;
@@ -51,7 +54,30 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string? LastError => lastError;
     public bool WireGuardMissing => !tunnelManager.IsWireGuardInstalled;
     public bool IsConnected => status == TunnelConnectionStatus.Connected;
-    public bool CanEnroll => !isBusy && !string.IsNullOrWhiteSpace(enrollmentInput);
+    public bool HasPendingRegistration => pendingRegistration is not null;
+    public bool CanGenerateRegistration => !isBusy && session is null;
+    public bool CanImport => !isBusy
+        && session is null
+        && pendingRegistration is not null
+        && !string.IsNullOrWhiteSpace(importInput);
+    public bool CanRefresh => !isBusy && IsConnected && session is not null;
+    public string RegistrationRequest => registrationRequest;
+    public string ImportInput
+    {
+        get => importInput;
+        set
+        {
+            if (importInput == value)
+            {
+                return;
+            }
+
+            importInput = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(CanImport));
+        }
+    }
+
     public string VpnAddress => session?.Client.VpnIp ?? "-";
     public string GatewayName =>
         session?.SelectedGatewayNodeId ?? session?.PeerMap.Peers.FirstOrDefault()?.NodeId ?? "-";
@@ -84,43 +110,69 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         or TunnelConnectionStatus.Disconnecting
         or TunnelConnectionStatus.Reconnecting;
 
-    public void SetEnrollmentInput(string value)
-    {
-        enrollmentInput = value;
-        OnPropertyChanged(nameof(CanEnroll));
-    }
-
     public void AcceptActivation(string value)
     {
-        if (!value.StartsWith("heteronetwork://", StringComparison.OrdinalIgnoreCase))
+        if (!ClientRegistrationProtocol.IsImportUri(value))
         {
-            SetError("The activation link is invalid.");
+            SetError("Only a HeteroNetwork import profile can be opened here.");
             return;
         }
 
-        enrollmentInput = value;
+        ImportInput = value;
         ActivationAccepted?.Invoke(this, value);
-        OnPropertyChanged(nameof(CanEnroll));
     }
 
-    public async Task EnrollAsync()
+    public string? GenerateRegistrationRequest()
     {
-        if (isBusy || string.IsNullOrWhiteSpace(enrollmentInput))
+        if (isBusy || session is not null)
+        {
+            return null;
+        }
+
+        SetError(null);
+        try
+        {
+            var generated = ClientRegistrationProtocol.GenerateRequest();
+            pendingStore.Save(generated);
+            pendingRegistration = generated;
+            registrationRequest =
+                ClientRegistrationProtocol.RegistrationUri(generated.Bundle);
+            ImportInput = string.Empty;
+            RaiseState();
+            return registrationRequest;
+        }
+        catch (Exception error)
+        {
+            SetError(error.Message);
+            RaiseState();
+            return null;
+        }
+    }
+
+    public async Task ImportAsync()
+    {
+        if (isBusy
+            || session is not null
+            || pendingRegistration is null
+            || string.IsNullOrWhiteSpace(importInput))
         {
             return;
         }
 
-        await RunBusyAsync(async () =>
+        await RunBusyAsync(() =>
         {
-            var token = EnrollmentParser.Parse(enrollmentInput);
-            var joined = await controlPlane.JoinAsync(
-                token,
-                ClientKeyMaterial.Generate()).ConfigureAwait(true);
-            _ = TunnelProfile.FromSession(joined);
-            sessionStore.Save(joined);
-            session = joined;
-            enrollmentInput = string.Empty;
+            var imported = ClientRegistrationProtocol.ImportProfile(
+                importInput,
+                pendingRegistration);
+            sessionStore.Save(imported);
+            pendingStore.Delete();
+            pendingRegistration = null;
+            registrationRequest = string.Empty;
+            ImportInput = string.Empty;
+            session = imported;
+            status = tunnelManager.GetStatus();
             RaiseState();
+            return Task.CompletedTask;
         });
     }
 
@@ -133,15 +185,36 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
         await RunBusyAsync(async () =>
         {
-            session = await controlPlane.RefreshAsync(session).ConfigureAwait(true);
-            _ = TunnelProfile.FromSession(session);
-            sessionStore.Save(session);
+            var cached = session;
+            _ = TunnelProfile.FromSession(cached, PreferredGatewayIndex(cached));
+            sessionStore.Save(cached);
             status = TunnelConnectionStatus.Connecting;
             RaiseState();
             await tunnelManager.ConnectAsync().ConfigureAwait(true);
             status = tunnelManager.GetStatus();
             profileActivatedAt = DateTimeOffset.UtcNow;
             consecutiveProbeFailures = 0;
+            try
+            {
+                var activeGateway = cached.SelectedGatewayNodeId;
+                var refreshed = await controlPlane.RefreshAsync(cached).ConfigureAwait(true);
+                if (activeGateway is not null
+                    && GatewayIndex(refreshed, activeGateway) >= 0)
+                {
+                    refreshed.SelectedGatewayNodeId = activeGateway;
+                }
+
+                _ = TunnelProfile.FromSession(
+                    refreshed,
+                    PreferredGatewayIndex(refreshed));
+                sessionStore.Save(refreshed);
+                session = refreshed;
+            }
+            catch (ControlPlaneException)
+            {
+                session = cached;
+            }
+
             RaiseState();
         });
     }
@@ -167,7 +240,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public async Task RefreshAsync()
     {
-        if (isBusy || session is null)
+        if (isBusy || session is null || !IsConnected)
         {
             return;
         }
@@ -199,15 +272,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
         await RunBusyAsync(async () =>
         {
-            if (status != TunnelConnectionStatus.Disconnected
-                && status != TunnelConnectionStatus.NotConfigured)
+            if (status == TunnelConnectionStatus.Connected)
             {
+                await controlPlane.RemoveAsync(session).ConfigureAwait(true);
                 await tunnelManager.DisconnectAsync().ConfigureAwait(true);
             }
 
-            await controlPlane.RemoveAsync(session).ConfigureAwait(true);
             sessionStore.Delete();
+            pendingStore.Delete();
             session = null;
+            pendingRegistration = null;
+            registrationRequest = string.Empty;
+            ImportInput = string.Empty;
             status = tunnelManager.GetStatus();
             failedGateways.Clear();
             consecutiveProbeFailures = 0;
@@ -252,6 +328,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         try
         {
             session = sessionStore.Load();
+            if (session is null)
+            {
+                pendingRegistration = pendingStore.Load();
+                if (pendingRegistration is not null)
+                {
+                    registrationRequest = ClientRegistrationProtocol.RegistrationUri(
+                        pendingRegistration.Bundle);
+                }
+            }
+            else
+            {
+                pendingStore.Delete();
+            }
+
             status = tunnelManager.GetStatus();
             if (status == TunnelConnectionStatus.Connected)
             {
@@ -443,7 +533,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         OnPropertyChanged(nameof(IsConfigured));
         OnPropertyChanged(nameof(IsNotConfigured));
         OnPropertyChanged(nameof(IsBusy));
-        OnPropertyChanged(nameof(CanEnroll));
+        OnPropertyChanged(nameof(HasPendingRegistration));
+        OnPropertyChanged(nameof(CanGenerateRegistration));
+        OnPropertyChanged(nameof(CanImport));
+        OnPropertyChanged(nameof(CanRefresh));
+        OnPropertyChanged(nameof(RegistrationRequest));
+        OnPropertyChanged(nameof(ImportInput));
         OnPropertyChanged(nameof(WireGuardMissing));
         OnPropertyChanged(nameof(IsConnected));
         OnPropertyChanged(nameof(StatusDisplay));

@@ -13,7 +13,7 @@ public sealed class TunnelProfileTests
 
         Assert.Equal("100.96.0.4/32", profile.ClientAddress);
         Assert.Equal("100.96.0.1", profile.GatewayVpnIp);
-        Assert.Equal("[2001:db8::10]:51820", profile.GatewayEndpoint);
+        Assert.Equal("[2606:4700:4700::1111]:51820", profile.GatewayEndpoint);
         Assert.Equal(
             ["100.96.0.1/32", "100.96.0.3/32", "10.42.0.0/16"],
             profile.AllowedIps);
@@ -59,6 +59,11 @@ public sealed class TunnelProfileTests
     [Fact]
     public void SessionRoundTripsThroughCurrentUserDpapi()
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
         var testDirectory = Path.Combine(
             Path.GetTempPath(),
             $"heteronetwork-windows-tests-{Guid.NewGuid():N}");
@@ -74,6 +79,41 @@ public sealed class TunnelProfileTests
             Assert.Equal(session.IdentityPrivateKey, loaded.IdentityPrivateKey);
             Assert.NotEqual(
                 Convert.ToBase64String(session.IdentityPrivateKey),
+                Convert.ToBase64String(File.ReadAllBytes(path)));
+        }
+        finally
+        {
+            if (Directory.Exists(testDirectory))
+            {
+                Directory.Delete(testDirectory, true);
+            }
+        }
+    }
+
+    [Fact]
+    public void PendingRegistrationRoundTripsThroughCurrentUserDpapi()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var testDirectory = Path.Combine(
+            Path.GetTempPath(),
+            $"heteronetwork-windows-tests-{Guid.NewGuid():N}");
+        var path = Path.Combine(testDirectory, "pending.dpapi");
+        try
+        {
+            var store = new PendingClientRegistrationStore(path);
+            var pending = TestData.PendingRegistration();
+            store.Save(pending);
+
+            var loaded = Assert.IsType<PendingClientRegistration>(store.Load());
+            Assert.Equal(pending.IdentityPrivateKey, loaded.IdentityPrivateKey);
+            Assert.Equal(pending.WireGuardPrivateKey, loaded.WireGuardPrivateKey);
+            Assert.Equal(pending.Bundle, loaded.Bundle);
+            Assert.NotEqual(
+                Convert.ToBase64String(pending.IdentityPrivateKey),
                 Convert.ToBase64String(File.ReadAllBytes(path)));
         }
         finally

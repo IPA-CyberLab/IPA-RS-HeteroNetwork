@@ -37,16 +37,19 @@ Running the packet tunnel on a Mac still requires a signed Network Extension.
 
 ## Enroll
 
-1. In the control-plane Web UI, create a macOS client enrollment.
-2. Open the returned `heteronetwork://enroll?...` link on the Mac.
-3. Confirm enrollment in HeteroNetwork and approve the VPN configuration prompt.
-4. Select **Connect** from the menu-bar app.
+1. Select **Generate registration request** in the macOS app.
+2. SSH to any enrolled HeteroNetwork node and run
+   `sudo ipars client register '<heteronetwork://register?...>'`.
+3. Paste the returned `heteronetwork://import?...` profile into the macOS app
+   and select **Import profile**.
+4. Approve the VPN configuration prompt and select **Connect**.
 5. Open `http://console.heteronetwork.internal:9781/ui/` from the app.
 
-The one-use enrollment token remains in memory only. The Ed25519 identity,
-WireGuard private key, assigned VPN address, and current gateway map are stored
-in the shared, device-only Keychain item used by the app and packet-tunnel
-extension.
+The Ed25519 identity and WireGuard private keys are generated on the Mac and
+stored as a pending, device-only Keychain item. The SSH registration request
+contains only their public keys and a proof-of-possession signature. A valid
+import profile promotes those pending keys into the shared client session and
+then deletes the pending item. Neither URI contains private key material.
 
 The client installs only the active gateway and projected overlay CIDRs. The
 control plane supplies up to four ready gateway candidates, while the packet
@@ -56,5 +59,7 @@ health probes also trigger a cached-gateway switch before server-side health
 expiry. Each refresh signs the active gateway ID so the control plane can move
 the client's return routes on every Linux node at the same time. The internal
 console name uses split DNS against the active gateway; unrelated DNS remains
-on the host's normal resolver. The client refuses default routes, local/relay
-endpoint candidates, and invalid WireGuard keys before starting the tunnel.
+on the host's normal resolver. The first connection uses the imported peer map
+without contacting the VPN-only management API. The client refuses default
+routes, STUN/local/relay candidates, non-global gateway addresses, public
+management URLs, and invalid WireGuard keys before starting the tunnel.

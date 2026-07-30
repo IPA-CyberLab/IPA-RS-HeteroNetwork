@@ -12,15 +12,15 @@ public sealed class ControlPlaneClientTests
         var storedSession = TestData.Session([]);
         storedSession.ControlPlaneUrls =
         [
-            new Uri("https://retired.example:8443"),
-            new Uri("https://also-retired.example:8443"),
+            new Uri("http://10.250.0.10:19088"),
+            new Uri("http://10.250.0.11:19088"),
         ];
         var livePeerMap = storedSession.PeerMap with
         {
             BootstrapEndpoints =
             [
                 new BootstrapEndpoint(
-                    "https://active.example:8443",
+                    "http://10.250.0.12:19088",
                     BootstrapEndpointKind.ControlPlane),
             ],
         };
@@ -39,13 +39,37 @@ public sealed class ControlPlaneClientTests
 
         var refreshed = await controlPlane.RefreshAsync(storedSession);
 
-        Assert.Equal(["retired.example"], requestedHosts);
+        Assert.Equal(["10.250.0.10"], requestedHosts);
         Assert.Equal(
-            new Uri("https://active.example:8443"),
+            new Uri("http://10.250.0.12:19088"),
             Assert.Single(refreshed.ControlPlaneUrls));
         Assert.DoesNotContain(
             refreshed.ControlPlaneUrls,
-            uri => uri.Host == "retired.example" || uri.Host == "also-retired.example");
+            uri => uri.Host == "10.250.0.10" || uri.Host == "10.250.0.11");
+    }
+
+    [Fact]
+    public async Task RefreshNeverContactsPublicManagementEndpoint()
+    {
+        var storedSession = TestData.Session([]);
+        storedSession.ControlPlaneUrls =
+        [
+            new Uri("https://163.220.236.51"),
+            new Uri("http://8.8.8.8:19088"),
+        ];
+        var requestCount = 0;
+        using var httpClient = new HttpClient(new StubHttpMessageHandler(_ =>
+        {
+            requestCount++;
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }));
+        using var controlPlane = new ControlPlaneClient(httpClient);
+
+        var error = await Assert.ThrowsAsync<ControlPlaneException>(
+            () => controlPlane.RefreshAsync(storedSession));
+
+        Assert.Equal(0, requestCount);
+        Assert.Contains("private VPN overlay", error.Message);
     }
 
     private sealed class StubHttpMessageHandler(

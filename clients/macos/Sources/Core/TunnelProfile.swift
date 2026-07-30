@@ -1,5 +1,10 @@
-import Darwin
 import Foundation
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public enum TunnelProfileError: LocalizedError, Equatable {
     case invalidClientAddress
@@ -60,12 +65,7 @@ public struct TunnelProfile: Equatable, Sendable {
 
     public static func preferredEndpoint(from candidates: [EndpointCandidate]) -> EndpointCandidate? {
         candidates
-            .filter { candidate in
-                switch candidate.kind {
-                case .ipv6, .publicUDP, .stunReflexive: return true
-                case .localUDP, .relay: return false
-                }
-            }
+            .filter(SponsoredEnrollment.isUsableGatewayCandidate)
             .min { left, right in
                 candidateScore(left) < candidateScore(right)
             }
@@ -76,8 +76,7 @@ public struct TunnelProfile: Equatable, Sendable {
         switch candidate.kind {
         case .ipv6: rank = 0
         case .publicUDP: rank = 1
-        case .stunReflexive: rank = 2
-        case .localUDP, .relay: rank = 3
+        case .stunReflexive, .localUDP, .relay: rank = 2
         }
         return CandidateScore(
             rank: rank,

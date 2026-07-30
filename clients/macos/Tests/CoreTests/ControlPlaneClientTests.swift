@@ -245,6 +245,14 @@ private struct ClientConfigurationFixture: Encodable {
     enum CodingKeys: String, CodingKey {
         case client
         case peerMap = "peer_map"
+        case clusterPolicy = "cluster_policy"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(client, forKey: .client)
+        try container.encode(peerMap, forKey: .peerMap)
+        try container.encode([String: String](), forKey: .clusterPolicy)
     }
 }
 

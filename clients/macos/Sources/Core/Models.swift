@@ -308,6 +308,16 @@ public struct RegisterClientRequest: Codable, Equatable, Sendable {
     public let identityPublicKey: String
     public let wireGuardPublicKey: String
 
+    public init(
+        clientID: String,
+        identityPublicKey: String,
+        wireGuardPublicKey: String
+    ) {
+        self.clientID = clientID
+        self.identityPublicKey = identityPublicKey
+        self.wireGuardPublicKey = wireGuardPublicKey
+    }
+
     enum CodingKeys: String, CodingKey {
         case clientID = "client_id"
         case identityPublicKey = "identity_public_key"
@@ -320,13 +330,36 @@ public struct JoinClientRequest: Codable, Equatable, Sendable {
     public let registration: RegisterClientRequest
 }
 
+public struct ClusterPolicySnapshot: Decodable, Sendable {
+    public init(from decoder: Decoder) throws {
+        _ = try decoder.container(keyedBy: DynamicCodingKey.self)
+    }
+}
+
+private struct DynamicCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(intValue: Int) {
+        stringValue = String(intValue)
+        self.intValue = intValue
+    }
+}
+
 public struct RegisterClientResponse: Decodable, Sendable {
     public let client: NodeRecord
     public let peerMap: PeerMap
+    public let clusterPolicy: ClusterPolicySnapshot
 
     enum CodingKeys: String, CodingKey {
         case client
         case peerMap = "peer_map"
+        case clusterPolicy = "cluster_policy"
     }
 }
 

@@ -9,7 +9,7 @@ final class TunnelProfileTests: XCTestCase {
 
         XCTAssertEqual(profile.clientAddress, "100.96.0.4/32")
         XCTAssertEqual(profile.gatewayVPNIP, "100.96.0.1")
-        XCTAssertEqual(profile.gatewayEndpoint, "[2001:db8::10]:51820")
+        XCTAssertEqual(profile.gatewayEndpoint, "[2606:4700:4700::1111]:51820")
         XCTAssertEqual(profile.allowedIPs, ["100.96.0.1/32", "100.96.0.3/32", "10.42.0.0/16"])
     }
 
@@ -87,7 +87,7 @@ final class TunnelProfileTests: XCTestCase {
             EndpointCandidate(
                 nodeID: gatewayID,
                 kind: .publicUDP,
-                address: "198.51.100.10:51820",
+                address: "8.8.8.8:51820",
                 observedAt: now,
                 priority: 100,
                 cost: 1,
@@ -96,7 +96,7 @@ final class TunnelProfileTests: XCTestCase {
             EndpointCandidate(
                 nodeID: gatewayID,
                 kind: .ipv6,
-                address: "[2001:db8::10]:51820",
+                address: "[2606:4700:4700::1111]:51820",
                 observedAt: now,
                 priority: 10,
                 cost: 100,

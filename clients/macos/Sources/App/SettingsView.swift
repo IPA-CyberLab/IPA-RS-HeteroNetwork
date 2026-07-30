@@ -54,16 +54,50 @@ struct SettingsView: View {
 
     private var enrollmentContent: some View {
         Form {
-            Section("Enrollment") {
-                SecureField("Enrollment link", text: $model.enrollmentInput)
-                    .textFieldStyle(.roundedBorder)
+            Section("SSH sponsor registration") {
                 Button {
-                    Task { await model.enroll() }
+                    model.generateRegistrationRequest()
                 } label: {
-                    Label("Enroll this Mac", systemImage: "link.badge.plus")
+                    Label("Generate registration request", systemImage: "key.horizontal")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.enrollmentInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isBusy)
+                .disabled(model.isBusy)
+                if !model.registrationRequest.isEmpty {
+                    ScrollView {
+                        Text(model.registrationRequest)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(height: 88)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    Button {
+                        model.copyRegistrationRequest()
+                    } label: {
+                        Label("Copy request", systemImage: "doc.on.doc")
+                    }
+                }
+            }
+            Section("Import profile") {
+                TextEditor(text: $model.importInput)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(height: 72)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.secondary.opacity(0.25))
+                    }
+                Button {
+                    Task { await model.importProfile() }
+                } label: {
+                    Label("Import profile", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    model.importInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || model.isBusy
+                )
             }
             errorSection
         }
@@ -85,7 +119,7 @@ struct SettingsView: View {
                     } label: {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
-                    .disabled(model.isBusy || isTransitioning)
+                    .disabled(model.isBusy || isTransitioning || model.vpnStatus != .connected)
                     Button {
                         model.openWebUI()
                     } label: {
