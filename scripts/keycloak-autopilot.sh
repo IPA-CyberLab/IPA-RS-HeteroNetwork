@@ -508,29 +508,10 @@ update_assignment_lease() {
   fi
 }
 
-restart_agent_if_drop_in_changed() {
-  local desired="$1" changed=0 temporary
-  install -d -m 0755 "$agent_drop_in_dir"
-  if [[ -z "$filesystem_root" ]]; then
-    chown root:root "$agent_drop_in_dir"
-  fi
-  if [[ "$desired" == "present" ]]; then
-    temporary="$(mktemp "$agent_drop_in_dir/.30-keycloak-gateway.conf.XXXXXX")"
-    cat >"$temporary" <<EOF
-[Service]
-Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM=127.0.0.1:${EDGE_PORT}"
-Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH=${oidc_probe_path}"
-EOF
-    chmod 0644 "$temporary"
-    if [[ -f "$agent_drop_in" && ! -L "$agent_drop_in" ]] \
-      && cmp -s "$temporary" "$agent_drop_in"; then
-      rm -f "$temporary"
-    else
-      mv -f "$temporary" "$agent_drop_in"
-      changed=1
-    fi
-  elif [[ -e "$agent_drop_in" || -L "$agent_drop_in" ]]; then
-    rm -f "$agent_drop_in"
+remove_legacy_agent_gateway_drop_in() {
+  local changed=0
+  if [[ -e "$agent_drop_in" || -L "$agent_drop_in" ]]; then
+    rm -f -- "$agent_drop_in"
     changed=1
   fi
 
@@ -562,8 +543,6 @@ reconcile_edge_proxy() {
   replica_count="$(jq -r '.replicas | length' "$response_file")"
   if ((10#$replica_count == 0)); then
     "$helper" deactivate-edge-proxy >/dev/null 2>&1 || true
-    restart_agent_if_drop_in_changed absent \
-      || log "unable to remove the Agent Keycloak gateway route"
     return
   fi
 
@@ -571,10 +550,10 @@ reconcile_edge_proxy() {
     '[.replicas[].vpn_ip + ":" + $port] | join(",")' "$response_file")"
   if HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS="$upstreams" \
     HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT="$EDGE_PORT" \
+    HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS="$vpn_ip" \
     HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH="$oidc_probe_path" \
     "$helper" configure-edge-proxy >/dev/null 2>&1; then
-    restart_agent_if_drop_in_changed present \
-      || log "unable to activate the Agent Keycloak gateway route"
+    :
   else
     log "unable to reconcile the local Keycloak edge proxy"
   fi
@@ -663,6 +642,10 @@ apply_assignment() {
 }
 
 prepare_command() {
+  mkdir -p "$state_dir" "$runtime_dir"
+  chmod 0700 "$state_dir" "$runtime_dir"
+  remove_legacy_agent_gateway_drop_in \
+    || log "unable to remove the legacy Agent Keycloak gateway route"
   load_config || exit 1
   [[ -x "$helper" ]] || {
     log "Keycloak node helper is unavailable"
@@ -682,19 +665,16 @@ prepare_command() {
 }
 
 reconcile_command() {
+  mkdir -p "$state_dir" "$runtime_dir"
+  chmod 0700 "$state_dir" "$runtime_dir"
+
+  remove_legacy_agent_gateway_drop_in \
+    || log "legacy Agent gateway removal will be retried later"
   load_config || exit 1
   [[ -x "$helper" ]] || {
     log "Keycloak node helper is unavailable; preserving current state"
     return
   }
-  mkdir -p "$state_dir" "$runtime_dir"
-  chmod 0700 "$state_dir" "$runtime_dir"
-
-  retry_pending_agent_restart \
-    || {
-      [[ ! -e "$agent_restart_pending_path" ]] \
-        || log "pending Agent restart will be retried later"
-    }
   if ! read_agent_identity; then
     log "local Agent identity is unavailable"
     expire_local_assignment_if_needed

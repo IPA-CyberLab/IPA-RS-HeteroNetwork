@@ -294,10 +294,14 @@ case "$command_name" in
     ;;
   configure-edge-proxy)
     [[ "${HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT:-}" == "18079" ]]
+    [[ "${HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS:-}" \
+      == "$HETERONETWORK_SMOKE_VPN_IP" ]]
     [[ "${HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH:-}" \
       == "/realms/heteronetwork/.well-known/openid-configuration" ]]
     printf '%s\n' "${HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS:-}" \
       >"$HETERONETWORK_SMOKE_STATE/edge-upstreams"
+    printf '%s\n' "${HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS:-}" \
+      >"$HETERONETWORK_SMOKE_STATE/edge-vpn-listen-address"
     if systemctl is-active --quiet heteronetwork-keycloak-edge-proxy.service; then
       systemctl reload-or-restart heteronetwork-keycloak-edge-proxy.service
     else
@@ -395,17 +399,28 @@ run_autopilot prepare
 [[ "$(count_helper_command prepare-edge)" == "1" ]] \
   || fail "prepare did not stage the lightweight edge dependencies"
 
+mkdir -p "$(dirname "$agent_drop_in")"
+cat >"$agent_drop_in" <<EOF
+[Service]
+Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM=127.0.0.1:18079"
+Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH=$oidc_probe_path"
+EOF
+agent_restarts_before_cleanup="$(
+  count_systemctl_command restart heteronetwork-agent.service
+)"
 run_autopilot reconcile
 assert_active heteronetwork-keycloak.service
 assert_active heteronetwork-keycloak-backchannel.service
 assert_active heteronetwork-keycloak-edge-proxy.service
 [[ "$(<"$fake_state/edge-upstreams")" == "$vpn_ip:18080" ]] \
   || fail "selected single-replica edge upstream is wrong"
-[[ -f "$agent_drop_in" ]] || fail "Agent Keycloak gateway drop-in is missing"
-grep -Fq 'OIDC_UPSTREAM=127.0.0.1:18079' "$agent_drop_in" \
-  || fail "Agent Keycloak gateway does not target loopback port 18079"
-grep -Fq "OIDC_PROBE_PATH=$oidc_probe_path" "$agent_drop_in" \
-  || fail "Agent Keycloak discovery probe path is wrong"
+[[ "$(<"$fake_state/edge-vpn-listen-address")" == "$vpn_ip" ]] \
+  || fail "edge proxy did not receive the local HeteroNetwork VPN address"
+[[ ! -e "$agent_drop_in" && ! -L "$agent_drop_in" ]] \
+  || fail "legacy Agent Keycloak gateway drop-in survived reconciliation"
+[[ "$(count_systemctl_command restart heteronetwork-agent.service)" \
+  == "$((agent_restarts_before_cleanup + 1))" ]] \
+  || fail "Agent was not restarted after removing its legacy Keycloak route"
 first_request="$request_dir/1.json"
 jq -e \
   --arg node_id "$node_id" \
@@ -489,7 +504,6 @@ assert_active heteronetwork-keycloak-backchannel.service
 state_before_outage="$(find "$fake_state/active" -maxdepth 1 -type f \
   -printf '%f\n' | sort)"
 edge_before_outage="$(<"$fake_state/edge-upstreams")"
-drop_in_before_outage="$(sha256sum "$agent_drop_in")"
 activate_before_outage="$(count_helper_command activate)"
 deactivate_before_outage="$(count_helper_command deactivate)"
 edge_reconcile_before_outage="$(count_helper_command configure-edge-proxy)"
@@ -505,8 +519,8 @@ first_outage_url="$(reconcile_url_at "$((requests_before_outage + 1))")"
   || fail "Control Plane outage changed active services"
 [[ "$(<"$fake_state/edge-upstreams")" == "$edge_before_outage" ]] \
   || fail "Control Plane outage changed edge upstreams"
-[[ "$(sha256sum "$agent_drop_in")" == "$drop_in_before_outage" ]] \
-  || fail "Control Plane outage changed the Agent drop-in"
+[[ ! -e "$agent_drop_in" && ! -L "$agent_drop_in" ]] \
+  || fail "Control Plane outage recreated the Agent Keycloak route"
 [[ "$(count_helper_command activate)" == "$activate_before_outage" \
   && "$(count_helper_command deactivate)" == "$deactivate_before_outage" \
   && "$(count_helper_command configure-edge-proxy)" == "$edge_reconcile_before_outage" ]] \
@@ -554,8 +568,10 @@ assert_inactive heteronetwork-keycloak-backchannel.service
 assert_active heteronetwork-keycloak-edge-proxy.service
 [[ "$(<"$fake_state/edge-upstreams")" == "10.250.0.22:18080" ]] \
   || fail "non-selected node did not proxy to the selected replica"
-[[ -f "$agent_drop_in" ]] \
-  || fail "non-selected node lost its local Keycloak gateway"
+[[ "$(<"$fake_state/edge-vpn-listen-address")" == "$vpn_ip" ]] \
+  || fail "non-selected node did not retain its VPN edge listener"
+[[ ! -e "$agent_drop_in" && ! -L "$agent_drop_in" ]] \
+  || fail "non-selected node recreated the Agent Keycloak route"
 
 write_response "$fixture_dir/response.json" true "$node_id" "$vpn_ip"
 touch \
@@ -703,6 +719,51 @@ grep -Fq \
 grep -Fq 'if ((config_changed == 1 || unit_changed == 1)); then' \
   "$helper_contract" \
   || fail "helper reloads an unchanged edge proxy"
+if grep -Fq 'HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_' "$autopilot"; then
+  fail "autopilot still configures Keycloak on the Agent public gateway"
+fi
+grep -Fq \
+  'HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS="$vpn_ip"' \
+  "$autopilot" \
+  || fail "autopilot does not pass the local VPN address to the edge proxy"
+grep -Fq 'validate_private_ipv4 "$edge_vpn_listen_address"' \
+  "$helper_contract" \
+  || fail "helper does not validate the edge VPN listen address"
+grep -Fq 'bind 127.0.0.1:${edge_listen_port}' "$helper_contract" \
+  || fail "edge proxy omitted its loopback listener"
+grep -Fq 'bind ${edge_vpn_listen_address}:${edge_listen_port}' \
+  "$helper_contract" \
+  || fail "edge proxy omitted its HeteroNetwork VPN listener"
+grep -Fq 'acl keycloak_realm_path path_beg /realms/' "$helper_contract" \
+  || fail "edge proxy does not permit Keycloak realm paths"
+grep -Fq 'acl keycloak_resources_path path_beg /resources/' "$helper_contract" \
+  || fail "edge proxy does not permit Keycloak resource paths"
+grep -Fq 'acl keycloak_robots_path path -i /robots.txt' "$helper_contract" \
+  || fail "edge proxy does not permit only the exact robots path"
+grep -Fq \
+  'http-request deny deny_status 404 unless keycloak_realm_path or keycloak_resources_path or keycloak_robots_path' \
+  "$helper_contract" \
+  || fail "edge proxy does not reject paths outside the Keycloak browser surface"
+grep -Fq \
+  'acl heteronetwork_private_console req.hdr(host) -i console.heteronetwork.internal:${edge_listen_port}' \
+  "$helper_contract" \
+  || fail "backchannel does not identify the exact private console Host"
+grep -Fq \
+  'http-request set-header X-Forwarded-Proto http if heteronetwork_private_console' \
+  "$helper_contract" \
+  || fail "private console requests are not forwarded as HTTP"
+grep -Fq \
+  'http-request set-header X-Forwarded-Port ${edge_listen_port} if heteronetwork_private_console' \
+  "$helper_contract" \
+  || fail "private console requests do not retain the VPN edge port"
+grep -Fq \
+  'http-request set-header X-Forwarded-Proto https unless heteronetwork_private_console' \
+  "$helper_contract" \
+  || fail "trusted non-console backchannel requests no longer retain HTTPS"
+grep -Fq \
+  'http-request set-header X-Forwarded-Port 443 unless heteronetwork_private_console' \
+  "$helper_contract" \
+  || fail "trusted non-console backchannel requests no longer retain port 443"
 if grep -Fq 'start --optimized --import-realm' "$helper_contract"; then
   fail "normal Keycloak restart still imports realms"
 fi

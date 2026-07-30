@@ -30,6 +30,7 @@ backchannel_port="${HETERONETWORK_KEYCLOAK_BACKCHANNEL_PORT:-$DEFAULT_BACKCHANNE
 backchannel_listen_addresses="${HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES:-$cluster_bind_address}"
 edge_upstreams="${HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS:-}"
 edge_listen_port="${HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT:-$DEFAULT_EDGE_PORT}"
+edge_vpn_listen_address="${HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS:-}"
 edge_health_path="${HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH:-/realms/kakurizai/.well-known/openid-configuration}"
 
 readonly install_dir="/opt/heteronetwork/keycloak-${KEYCLOAK_VERSION}"
@@ -70,6 +71,7 @@ Optional environment:
   HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRESSES
   HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS
   HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT
+  HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS
   HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH
 
 prepare always verifies Keycloak 26.6.4 against the compiled-in SHA-256.
@@ -445,9 +447,12 @@ EOF
     printf '    bind %s:%s\n' "$address" "$backchannel_port"
   done
   cat <<EOF
+    acl heteronetwork_private_console req.hdr(host) -i console.heteronetwork.internal:${edge_listen_port}
     http-request set-header X-Forwarded-Host %[req.hdr(Host)]
-    http-request set-header X-Forwarded-Proto https
-    http-request set-header X-Forwarded-Port 443
+    http-request set-header X-Forwarded-Proto http if heteronetwork_private_console
+    http-request set-header X-Forwarded-Port ${edge_listen_port} if heteronetwork_private_console
+    http-request set-header X-Forwarded-Proto https unless heteronetwork_private_console
+    http-request set-header X-Forwarded-Port 443 unless heteronetwork_private_console
     default_backend heteronetwork_keycloak_local
 
 backend heteronetwork_keycloak_local
@@ -650,6 +655,11 @@ defaults
 
 frontend heteronetwork_keycloak_edge
     bind 127.0.0.1:${edge_listen_port}
+    bind ${edge_vpn_listen_address}:${edge_listen_port}
+    acl keycloak_realm_path path_beg /realms/
+    acl keycloak_resources_path path_beg /resources/
+    acl keycloak_robots_path path -i /robots.txt
+    http-request deny deny_status 404 unless keycloak_realm_path or keycloak_resources_path or keycloak_robots_path
     default_backend heteronetwork_keycloak_replicas
 
 backend heteronetwork_keycloak_replicas
@@ -704,6 +714,7 @@ EOF
 configure_edge_proxy() {
   require_root
   validate_port "$edge_listen_port" "HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT"
+  validate_private_ipv4 "$edge_vpn_listen_address"
   validate_edge_upstreams
   validate_edge_health_path
   command -v haproxy >/dev/null 2>&1 || die "haproxy is not installed"
