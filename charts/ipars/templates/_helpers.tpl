@@ -850,6 +850,7 @@
 
 {{- define "heteronetwork.validateKubernetesPlugin" -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.enabled" "value" .Values.kubernetesPlugin.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.customerResources.enabled" "value" .Values.kubernetesPlugin.customerResources.enabled) -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.nodeReporter.publishNodeExternalIp" "value" .Values.kubernetesPlugin.nodeReporter.publishNodeExternalIp) -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.agones.enabled" "value" .Values.kubernetesPlugin.agones.enabled) -}}
 {{- $agentMode := printf "%v" .Values.agent.mode -}}
@@ -882,6 +883,38 @@
 {{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.controller.reconcileIntervalSeconds" "value" $controllerInterval "max" 86400) -}}
 {{- if lt (int $controllerInterval) 1 -}}
 {{- fail "kubernetesPlugin.controller.reconcileIntervalSeconds must be greater than zero" -}}
+{{- end -}}
+{{- $customerResourcePollInterval := printf "%v" .Values.kubernetesPlugin.customerResources.pollIntervalSeconds -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.customerResources.pollIntervalSeconds" "value" $customerResourcePollInterval "max" 86400) -}}
+{{- if lt (int $customerResourcePollInterval) 1 -}}
+{{- fail "kubernetesPlugin.customerResources.pollIntervalSeconds must be greater than zero" -}}
+{{- end -}}
+{{- $customerResourceInternalUrls := .Values.kubernetesPlugin.customerResources.internalUrls -}}
+{{- if not (kindIs "slice" $customerResourceInternalUrls) -}}
+{{- fail "kubernetesPlugin.customerResources.internalUrls must be a list" -}}
+{{- end -}}
+{{- if .Values.kubernetesPlugin.customerResources.enabled -}}
+{{- if or (lt (len $customerResourceInternalUrls) 1) (gt (len $customerResourceInternalUrls) 32) -}}
+{{- fail "kubernetesPlugin.customerResources.internalUrls must contain 1 to 32 endpoints when enabled" -}}
+{{- end -}}
+{{- $seenCustomerResourceInternalUrls := dict -}}
+{{- range $index, $configuredUrl := $customerResourceInternalUrls -}}
+{{- $customerResourceInternalUrl := printf "%v" $configuredUrl -}}
+{{- if or (eq $customerResourceInternalUrl "") (gt (len $customerResourceInternalUrl) 4096) (not (regexMatch "^https?://[^/@?#[:space:]]+(/|/internal/v1/customer/public-services/?)?$" $customerResourceInternalUrl)) -}}
+{{- fail (printf "kubernetesPlugin.customerResources.internalUrls[%d] must be an HTTP or HTTPS origin or /internal/v1/customer/public-services URL without credentials, query, or fragment" $index) -}}
+{{- end -}}
+{{- $normalizedCustomerResourceInternalUrl := regexReplaceAll "(/internal/v1/customer/public-services)?/?$" $customerResourceInternalUrl "" -}}
+{{- if hasKey $seenCustomerResourceInternalUrls $normalizedCustomerResourceInternalUrl -}}
+{{- fail "kubernetesPlugin.customerResources.internalUrls must not contain duplicate endpoints" -}}
+{{- end -}}
+{{- $_ := set $seenCustomerResourceInternalUrls $normalizedCustomerResourceInternalUrl true -}}
+{{- end -}}
+{{- $customerResourceSecretName := printf "%v" .Values.kubernetesPlugin.customerResources.bearerTokenSecret.name -}}
+{{- include "heteronetwork.validateDnsLabelWithMax" (dict "path" "kubernetesPlugin.customerResources.bearerTokenSecret.name" "value" $customerResourceSecretName "maxBytes" 63) -}}
+{{- $customerResourceSecretKey := printf "%v" .Values.kubernetesPlugin.customerResources.bearerTokenSecret.key -}}
+{{- if or (eq $customerResourceSecretKey "") (gt (len $customerResourceSecretKey) 253) (not (regexMatch "^[-._A-Za-z0-9]+$" $customerResourceSecretKey)) -}}
+{{- fail "kubernetesPlugin.customerResources.bearerTokenSecret.key must be a non-empty Secret data key" -}}
+{{- end -}}
 {{- end -}}
 {{- $nodeReporterInterval := printf "%v" .Values.kubernetesPlugin.nodeReporter.reconcileIntervalSeconds -}}
 {{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.nodeReporter.reconcileIntervalSeconds" "value" $nodeReporterInterval "max" 86400) -}}

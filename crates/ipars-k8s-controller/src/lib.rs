@@ -19,6 +19,13 @@ pub const INGRESS_REPLICAS_ANNOTATION: &str = "networking.heteronetwork.io/ingre
 pub const ASSIGNED_NODES_ANNOTATION: &str = "networking.heteronetwork.io/assigned-nodes";
 pub const RECONCILE_ERROR_ANNOTATION: &str = "networking.heteronetwork.io/reconcile-error";
 pub const PLACEMENT_INJECTED_ANNOTATION: &str = "networking.heteronetwork.io/placement-injected";
+pub const PUBLIC_SERVICE_MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+pub const PUBLIC_SERVICE_MANAGED_BY_VALUE: &str = "heteronetwork-public-service-controller";
+pub const PUBLIC_SERVICE_RESOURCE_ID_LABEL: &str = "networking.heteronetwork.io/public-service-id";
+pub const PUBLIC_SERVICE_GENERATION_LABEL: &str =
+    "networking.heteronetwork.io/public-service-generation";
+pub const PUBLIC_SERVICE_OBSERVED_GENERATION_ANNOTATION: &str =
+    "networking.heteronetwork.io/public-service-observed-generation";
 pub const AGONES_MANAGED_LABEL: &str = "networking.heteronetwork.io/agones-managed";
 pub const AGONES_GAME_SERVER_LABEL: &str = "networking.heteronetwork.io/agones-game-server";
 pub const AGONES_PUBLIC_READY_LABEL: &str = "networking.heteronetwork.io/public-ready";

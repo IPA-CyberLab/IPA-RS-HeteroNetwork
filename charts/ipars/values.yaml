@@ -54,6 +54,13 @@ kubernetesPlugin:
         periodSeconds: 2
         timeoutSeconds: 1
         failureThreshold: 30
+  customerResources:
+    enabled: false
+    internalUrls: []
+    pollIntervalSeconds: 15
+    bearerTokenSecret:
+      name: ""
+      key: token
   nodeReporter:
     reconcileIntervalSeconds: 10
     fullReconcileIntervalSeconds: 300

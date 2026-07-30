@@ -1,5 +1,6 @@
 mod agones;
 mod controller;
+mod customer_resources;
 mod node_reporter;
 mod webhook;
 
@@ -47,6 +48,21 @@ struct ControllerArgs {
     agones_port_range_end: u16,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     enable_agones_integration: bool,
+    #[arg(
+        long = "customer-resource-internal-url",
+        env = "HETERONETWORK_CUSTOMER_RESOURCE_INTERNAL_URLS",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    customer_resource_internal_urls: Vec<String>,
+    #[arg(long, env = "HETERONETWORK_CUSTOMER_RESOURCE_API_BEARER_TOKEN_FILE")]
+    customer_resource_api_bearer_token_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_RESOURCE_POLL_INTERVAL_SECONDS",
+        default_value_t = 15
+    )]
+    customer_resource_poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -147,6 +163,11 @@ fn validate_controller_args(args: &ControllerArgs) -> anyhow::Result<()> {
             && args.agones_port_range_start <= args.agones_port_range_end,
         "Agones port range must be non-zero and ordered"
     );
+    customer_resources::validate_configuration(
+        &args.customer_resource_internal_urls,
+        args.customer_resource_api_bearer_token_file.as_deref(),
+        args.customer_resource_poll_interval_seconds,
+    )?;
     std::fs::metadata(&args.tls_cert_path).with_context(|| {
         format!(
             "TLS certificate {} is not readable",
@@ -178,4 +199,41 @@ fn validate_node_reporter_args(args: &NodeReporterArgs) -> anyhow::Result<()> {
     reqwest::Url::parse(&args.agent_status_url)
         .context("--agent-status-url must be a valid URL")?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn controller_accepts_repeated_customer_resource_internal_urls() {
+        let cli = Cli::try_parse_from([
+            "ipars-k8s-controller",
+            "controller",
+            "--agent-pod-namespace",
+            "heteronetwork-system",
+            "--agent-pod-label-selector",
+            "app=heteronetwork-agent",
+            "--tls-cert-path",
+            "/tmp/tls.crt",
+            "--tls-key-path",
+            "/tmp/tls.key",
+            "--customer-resource-internal-url",
+            "http://control-plane-a:8787",
+            "--customer-resource-internal-url",
+            "http://control-plane-b:8787/internal/v1/customer/public-services",
+        ])
+        .expect("controller CLI");
+        let Command::Controller(args) = cli.command else {
+            panic!("expected controller command");
+        };
+        assert_eq!(
+            args.customer_resource_internal_urls,
+            vec![
+                "http://control-plane-a:8787".to_string(),
+                "http://control-plane-b:8787/internal/v1/customer/public-services".to_string(),
+            ]
+        );
+    }
 }
