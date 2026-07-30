@@ -541,6 +541,29 @@ assert_demoted
 prepare_dependencies
 reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+run_reconciler
+run_reconciler
+write_gateway_status 163.220.236.51 error
+run_reconciler
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+assert_active heteronetwork-control-plane.service
+[ -f "$services_env" ] ||
+  fail "a transient gateway error removed the service environment"
+[ -f "$agent_drop_in" ] ||
+  fail "a transient gateway error removed the Agent routes"
+if grep -q '^restart .*heteronetwork-agent.service$' "$systemctl_log"; then
+  fail "a transient gateway error restarted the Agent"
+fi
+
+write_gateway_status 163.220.236.52 error
+run_reconciler
+assert_demoted
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time" '[2001:::8888]:51820'
 run_reconciler
 assert_demoted

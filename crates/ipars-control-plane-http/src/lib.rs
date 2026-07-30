@@ -125,6 +125,7 @@ const KEYCLOAK_AUTOPILOT_ARCHIVE_URL: &str =
     "https://github.com/keycloak/keycloak/releases/download/26.6.4/keycloak-26.6.4.tar.gz";
 const KEYCLOAK_AUTOPILOT_ARCHIVE_SHA256: &str =
     "386b566bbea05527226e275c43e5cf6f218896ad2441ac4be5c39f1226772e8f";
+const KEYCLOAK_AUTOPILOT_EDGE_PORT: u16 = 18_079;
 const NODE_ENROLLMENT_RELAY_UDP_PORT: u16 = 18_445;
 const NODE_ENROLLMENT_RELAY_HTTP_PORT: u16 = 18_447;
 const NODE_ENROLLMENT_RELAY_CLASSIFICATION_MAX_AGE_SECONDS: u64 = 45;
@@ -4673,11 +4674,21 @@ fn public_services_install_script(
     ));
     let enrollment_trusted_issuer_keys = enrollment_trusted_issuer_keys.join(";");
     let oidc_auth_base_url = config.oidc_auth_base_url.as_deref().unwrap_or_default();
-    let oidc_backchannel_base_url = config
-        .oidc_backchannel_base_url
-        .as_deref()
+    let oidc_backchannel_base_url = managed_keycloak_edge_base_url(&config.oidc_issuer_url)
+        .or_else(|| config.oidc_backchannel_base_url.clone())
         .unwrap_or_default();
-    let oidc_backchannel_fallback_base_urls = config.oidc_backchannel_fallback_base_urls.join(",");
+    let mut seen_backchannel_fallbacks = BTreeSet::new();
+    let oidc_backchannel_fallback_base_urls = config
+        .oidc_backchannel_base_url
+        .iter()
+        .chain(config.oidc_backchannel_fallback_base_urls.iter())
+        .filter(|url| {
+            url.as_str() != oidc_backchannel_base_url
+                && seen_backchannel_fallbacks.insert((*url).clone())
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
     let autopilot = STANDARD.encode(PUBLIC_SERVICES_AUTOPILOT_SCRIPT.as_bytes());
     format!(
         r#"if [ "$public_services_enabled" -eq 1 ]; then
@@ -4777,7 +4788,7 @@ fi
         oidc_issuer_url = encode(&config.oidc_issuer_url),
         oidc_client_id = encode(&config.oidc_client_id),
         oidc_auth_base_url = encode(oidc_auth_base_url),
-        oidc_backchannel_base_url = encode(oidc_backchannel_base_url),
+        oidc_backchannel_base_url = encode(&oidc_backchannel_base_url),
         oidc_backchannel_fallback_base_urls = encode(&oidc_backchannel_fallback_base_urls),
         oidc_scopes = encode(&config.oidc_scopes),
         control_plane_urls = encode(&control_plane_urls),
@@ -4791,6 +4802,15 @@ fi
         autopilot_unit = PUBLIC_SERVICES_AUTOPILOT_UNIT,
         autopilot_timer = PUBLIC_SERVICES_AUTOPILOT_TIMER,
     )
+}
+
+fn managed_keycloak_edge_base_url(issuer_url: &str) -> Option<String> {
+    let issuer_url = validate_web_auth_base_url(issuer_url.to_string(), "OIDC issuer URL").ok()?;
+    let issuer_url = Url::parse(&issuer_url).ok()?;
+    let issuer_path = issuer_url.path().trim_end_matches('/');
+    Some(format!(
+        "http://127.0.0.1:{KEYCLOAK_AUTOPILOT_EDGE_PORT}{issuer_path}"
+    ))
 }
 
 fn public_services_start_script(enrollment: &NodeEnrollmentConfig) -> String {
@@ -8961,6 +8981,17 @@ mod tests {
             .contains("HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS=45"));
         assert!(generated_script
             .contains("HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS=15"));
+        let managed_keycloak_backchannel =
+            STANDARD.encode("http://127.0.0.1:18079/realms/heteronetwork");
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64={managed_keycloak_backchannel}"
+        )));
+        let configured_keycloak_fallbacks = STANDARD.encode(
+            "http://10.250.0.1:8080/realms/heteronetwork,https://sso-b.example/realms/heteronetwork",
+        );
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64={configured_keycloak_fallbacks}"
+        )));
         assert!(generated_script.contains(&format!(
             "HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN={database_autopilot_bearer}"
         )));

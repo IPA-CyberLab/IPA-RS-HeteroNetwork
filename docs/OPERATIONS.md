@@ -374,6 +374,11 @@ sudo systemctl start --no-block heteronetwork-keycloak-autopilot.service
 
 The helper binds application HTTP to loopback, uses the local HeteroNetwork
 address for JGroups, and stores runtime secrets in owner-restricted files.
+Automatically promoted Control Planes validate OIDC tokens through their local
+Keycloak edge proxy. The edge proxy follows the current three-replica placement,
+so a replica promotion does not leave authentication pinned to stopped nodes.
+Configured private backchannel URLs remain ordered fallbacks for the local edge
+route.
 Inspect placement through the Web UI or
 `GET /v1/admin/keycloak-placement`. A healthy placement reports
 `desired_replicas=3` and three entries with `ready=true`. An unassigned prepared

@@ -49,6 +49,7 @@ runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
 status_file=
 relay_status_file=
 gateway_status_file=
+gateway_targets_current_public_ip=0
 services_env_tmp=
 database_url_tmp=
 database_autopilot_token_tmp=
@@ -554,12 +555,20 @@ relay_is_ready() {
 }
 
 gateway_is_ready() {
+  gateway_targets_current_public_ip=0
   gateway_status_file=$(mktemp "$runtime_dir/gateway-status.XXXXXX") || return 1
   if ! curl --fail --silent --show-error --max-time 3 --max-filesize 1048576 \
     http://127.0.0.1:9780/v1/web-ui/endpoints >"$gateway_status_file"; then
     rm -f "$gateway_status_file"
     gateway_status_file=
     return 1
+  fi
+  if jq -e --arg public_ip "$public_ip" --arg public_url "$public_https_url" '
+    (.public_gateway.public_ip == $public_ip)
+    and (.public_gateway.url | type == "string")
+    and ((.public_gateway.url | rtrimstr("/")) == $public_url)
+  ' "$gateway_status_file" >/dev/null; then
+    gateway_targets_current_public_ip=1
   fi
   if ! jq -e --arg public_ip "$public_ip" '
     (.public_gateway.phase == "ready")
@@ -933,6 +942,11 @@ relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 
 if ! gateway_is_ready; then
+  if [ "$gateway_targets_current_public_ip" -eq 1 ]; then
+    log "public Web gateway is still converging for the current public address"
+    reconcile_finished=1
+    exit 0
+  fi
   demote_and_exit "public Web gateway is not ready for the current public address"
 fi
 if ! relay_is_ready; then
