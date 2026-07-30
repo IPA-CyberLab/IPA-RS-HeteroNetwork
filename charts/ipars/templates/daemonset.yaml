@@ -31,6 +31,11 @@
 {{- $imagePullPolicy := printf "%v" .Values.image.pullPolicy -}}
 {{- $rbacCreate := printf "%v" .Values.rbac.create -}}
 {{- $serviceAccountCreate := printf "%v" .Values.serviceAccount.create -}}
+{{- $agentMode := printf "%v" .Values.agent.mode -}}
+{{- $hostAgentMode := eq $agentMode "host" -}}
+{{- $hostAgentStateFile := "/var/lib/heteronetwork/agent.json" -}}
+{{- $hostAgentApiBearerTokenFile := printf "%v" .Values.agent.hostAgent.apiBearerTokenFile -}}
+{{- $hostAgentApiBearerTokenMountPath := "/var/run/heteronetwork/agent-api-token" -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
 {{- $agentKubernetesForwardingSysctls := and .Values.serviceExposure.enabled (eq $agentHostNetwork "false") -}}
 {{- $agentAutomountServiceAccountToken := printf "%v" .Values.agent.automountServiceAccountToken -}}
@@ -1083,6 +1088,7 @@ spec:
           {{- end }}
         {{- end }}
       {{- end }}
+      {{- if not $hostAgentMode }}
       initContainers:
         - name: prepare-agent-state
           image: "{{ $imageRepository }}:{{ $imageTag }}"
@@ -1106,7 +1112,9 @@ spec:
           volumeMounts:
             - name: agent-state
               mountPath: {{ $agentStateMountPath | quote }}
+      {{- end }}
       containers:
+        {{- if not $hostAgentMode }}
         - name: agent
           image: "{{ $imageRepository }}:{{ $imageTag }}"
           imagePullPolicy: {{ $imagePullPolicy }}
@@ -1386,18 +1394,52 @@ spec:
               mountPath: /var/run/netns
               readOnly: true
             {{- end }}
+        {{- end }}
         {{- if $kubernetesPluginEnabled }}
         - name: node-reporter
           image: "{{ $imageRepository }}:{{ $imageTag }}"
           imagePullPolicy: {{ $imagePullPolicy }}
+          {{- if $hostAgentMode }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              token_file={{ $hostAgentApiBearerTokenMountPath | quote }}
+              if [ ! -r "$token_file" ]; then
+                echo "HeteroNetwork Agent API bearer token file is not readable" >&2
+                exit 1
+              fi
+              token="$(cat "$token_file")"
+              if [ -z "$token" ]; then
+                echo "HeteroNetwork Agent API bearer token file is empty" >&2
+                exit 1
+              fi
+              case "$token" in
+                *[!A-Za-z0-9._~+/=-]*)
+                  echo "HeteroNetwork Agent API bearer token file contains invalid characters" >&2
+                  exit 1
+                  ;;
+              esac
+              export HETERONETWORK_AGENT_API_BEARER_TOKEN="$token"
+              unset token
+              exec /usr/local/bin/ipars-k8s-controller node-reporter "$@"
+            - --
+          {{- else }}
           command:
             - /usr/local/bin/ipars-k8s-controller
+          {{- end }}
           args:
+            {{- if not $hostAgentMode }}
             - node-reporter
+            {{- end }}
             - --node-name
             - "$(NODE_NAME)"
             - --agent-state-path
+            {{- if $hostAgentMode }}
+            - {{ $hostAgentStateFile | quote }}
+            {{- else }}
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
+            {{- end }}
             - --reconcile-interval-seconds
             - {{ $nodeReporterReconcileIntervalSeconds | quote }}
             - --full-reconcile-interval-seconds
@@ -1413,13 +1455,19 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if not $hostAgentMode }}
             - name: HETERONETWORK_AGENT_API_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.agent.joinTokenSecretName | quote }}
                   key: {{ .Values.agent.apiBearerTokenSecretKey | quote }}
+            {{- end }}
             - name: HETERONETWORK_AGENT_STATUS_URL
+              {{- if $hostAgentMode }}
+              value: "http://127.0.0.1:9780/v1/status"
+              {{- else }}
               value: {{ printf "http://127.0.0.1:%d/v1/status" $agentApiTargetPort | quote }}
+              {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -1475,11 +1523,20 @@ spec:
             timeoutSeconds: 1
             failureThreshold: 60
           volumeMounts:
+            {{- if $hostAgentMode }}
+            - name: host-agent-state
+              mountPath: {{ $hostAgentStateFile | quote }}
+              readOnly: true
+            - name: host-agent-api-token
+              mountPath: {{ $hostAgentApiBearerTokenMountPath | quote }}
+              readOnly: true
+            {{- else }}
             - name: agent-state
               mountPath: {{ $agentStateMountPath | quote }}
               readOnly: true
+            {{- end }}
         {{- end }}
-        {{- if and .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled }}
+        {{- if and (not $hostAgentMode) .Values.agent.relayService.enabled .Values.agent.relayAdvertisement.enabled }}
         - name: relay
           image: "{{ $imageRepository }}:{{ $imageTag }}"
           imagePullPolicy: {{ $imagePullPolicy }}
@@ -1573,6 +1630,16 @@ spec:
               mountPath: {{ $agentStateMountPath | quote }}
         {{- end }}
       volumes:
+        {{- if $hostAgentMode }}
+        - name: host-agent-state
+          hostPath:
+            path: {{ $hostAgentStateFile | quote }}
+            type: File
+        - name: host-agent-api-token
+          hostPath:
+            path: {{ $hostAgentApiBearerTokenFile | quote }}
+            type: File
+        {{- else }}
         - name: agent-state
           hostPath:
             path: {{ $agentStateHostPath | quote }}
@@ -1589,4 +1656,5 @@ spec:
           hostPath:
             path: /var/run/netns
             type: Directory
+        {{- end }}
         {{- end }}

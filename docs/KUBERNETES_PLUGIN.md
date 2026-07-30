@@ -19,6 +19,45 @@ Agent and publishes the Kubernetes Node metadata consumed by the controller.
 The controller and reporter use separate RBAC roles; Service and GameServer
 write permissions are not granted to the Agent DaemonSet.
 
+## Agent deployment modes
+
+The chart uses `agent.mode: managed` by default. In this mode the DaemonSet
+keeps the existing layout: it starts the HeteroNetwork Agent, prepares its
+state directory, mounts the join-token Secret, and runs the node reporter
+beside the Agent.
+
+Set `agent.mode: host` when a systemd-managed HeteroNetwork Agent already runs
+on every Kubernetes node:
+
+```yaml
+agent:
+  mode: host
+  hostNetwork: true
+  hostAgent:
+    apiBearerTokenFile: /etc/heteronetwork/kubernetes/agent-api-token
+kubernetesPlugin:
+  enabled: true
+```
+
+Host mode renders a host-networked DaemonSet containing only the node reporter.
+It does not create the Agent container, the state init container, or the
+join-token volume. The reporter reads the local systemd Agent from
+`http://127.0.0.1:9780/v1/status` and mounts the host's
+`/var/lib/heteronetwork/agent.json` read-only.
+
+Before installing the chart, place the API bearer token for that node's local
+Agent at `agent.hostAgent.apiBearerTokenFile` on every Kubernetes node. The
+default path is
+`/etc/heteronetwork/kubernetes/agent-api-token`. Keep the file root-owned and
+readable only by the intended workload. The chart mounts it read-only; the
+container shell reads it without tracing or printing the value, exports it
+only to the reporter process, and then replaces the shell with that process.
+
+Host mode requires both `kubernetesPlugin.enabled=true` and
+`agent.hostNetwork=true`. Agent runtime, peer-map, relay, and routing settings
+in this chart are not applied to the systemd service; configure those in the
+host Agent's own service configuration.
+
 ## Service contract
 
 Managed Services use this class:

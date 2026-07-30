@@ -76,6 +76,9 @@ kubernetesPlugin:
     portRangeEnd: 65535
 
 agent:
+  mode: managed
+  hostAgent:
+    apiBearerTokenFile: /etc/heteronetwork/kubernetes/agent-api-token
   interfaceName: heteronetwork0
   wireguardListenPort: 51820
   overlayTransitPort: 51822

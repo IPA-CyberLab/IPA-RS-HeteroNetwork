@@ -852,6 +852,22 @@
 {{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.enabled" "value" .Values.kubernetesPlugin.enabled) -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.nodeReporter.publishNodeExternalIp" "value" .Values.kubernetesPlugin.nodeReporter.publishNodeExternalIp) -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "kubernetesPlugin.agones.enabled" "value" .Values.kubernetesPlugin.agones.enabled) -}}
+{{- $agentMode := printf "%v" .Values.agent.mode -}}
+{{- if not (or (eq $agentMode "managed") (eq $agentMode "host")) -}}
+{{- fail "agent.mode must be managed or host" -}}
+{{- end -}}
+{{- if eq $agentMode "host" -}}
+{{- if not .Values.kubernetesPlugin.enabled -}}
+{{- fail "agent.mode=host requires kubernetesPlugin.enabled=true" -}}
+{{- end -}}
+{{- if not .Values.agent.hostNetwork -}}
+{{- fail "agent.mode=host requires agent.hostNetwork=true" -}}
+{{- end -}}
+{{- $hostAgentApiBearerTokenFile := printf "%v" .Values.agent.hostAgent.apiBearerTokenFile -}}
+{{- if or (eq $hostAgentApiBearerTokenFile "") (eq $hostAgentApiBearerTokenFile "/") (gt (len $hostAgentApiBearerTokenFile) 4096) (not (regexMatch "^/[A-Za-z0-9._/@%+=:,~-]+$" $hostAgentApiBearerTokenFile)) (regexMatch "(^|/)[.][.]($|/)" $hostAgentApiBearerTokenFile) (regexMatch "/$" $hostAgentApiBearerTokenFile) -}}
+{{- fail "agent.hostAgent.apiBearerTokenFile must be an absolute host file path other than '/' without '..' segments, trailing '/', or unsafe characters" -}}
+{{- end -}}
+{{- end -}}
 {{- $loadBalancerClass := printf "%v" .Values.kubernetesPlugin.loadBalancerClass -}}
 {{- if eq $loadBalancerClass "" -}}
 {{- fail "kubernetesPlugin.loadBalancerClass must not be empty" -}}

@@ -157,6 +157,34 @@ assert_rendered_absent default "- leases"
 assert_rendered_absent default "- agones.dev"
 assert_rendered_absent default "- allocation.agones.dev"
 
+template_ok kubernetes-plugin-host-agent \
+  --set-string agent.mode=host
+
+assert_rendered_contains kubernetes-plugin-host-agent "hostNetwork: true"
+assert_rendered_count kubernetes-plugin-host-agent 1 "        - name: node-reporter"
+assert_rendered_count kubernetes-plugin-host-agent 0 "        - name: agent"
+assert_rendered_count kubernetes-plugin-host-agent 0 "        - name: relay"
+assert_rendered_contains kubernetes-plugin-host-agent 'value: "http://127.0.0.1:9780/v1/status"'
+assert_rendered_contains kubernetes-plugin-host-agent 'path: "/var/lib/heteronetwork/agent.json"'
+assert_rendered_contains kubernetes-plugin-host-agent 'mountPath: "/var/lib/heteronetwork/agent.json"'
+assert_rendered_contains kubernetes-plugin-host-agent 'path: "/etc/heteronetwork/kubernetes/agent-api-token"'
+assert_rendered_contains kubernetes-plugin-host-agent 'mountPath: "/var/run/heteronetwork/agent-api-token"'
+assert_rendered_contains kubernetes-plugin-host-agent 'token="$(cat "$token_file")"'
+assert_rendered_contains kubernetes-plugin-host-agent 'export HETERONETWORK_AGENT_API_BEARER_TOKEN="$token"'
+assert_rendered_contains kubernetes-plugin-host-agent 'exec /usr/local/bin/ipars-k8s-controller node-reporter "$@"'
+assert_rendered_absent kubernetes-plugin-host-agent "initContainers:"
+assert_rendered_absent kubernetes-plugin-host-agent "/usr/local/bin/iparsd"
+assert_rendered_absent kubernetes-plugin-host-agent "--join-token-path"
+assert_rendered_absent kubernetes-plugin-host-agent "name: join-token"
+assert_rendered_absent kubernetes-plugin-host-agent 'key: "agent-api-token"'
+
+template_ok kubernetes-plugin-host-agent-custom-token \
+  --set-string agent.mode=host \
+  --set-string agent.hostAgent.apiBearerTokenFile=/run/heteronetwork/kubernetes-agent-api-token
+
+assert_rendered_contains kubernetes-plugin-host-agent-custom-token 'path: "/run/heteronetwork/kubernetes-agent-api-token"'
+assert_rendered_contains kubernetes-plugin-host-agent-custom-token 'mountPath: "/var/run/heteronetwork/agent-api-token"'
+
 template_ok kubernetes-plugin-disabled \
   --set kubernetesPlugin.enabled=false
 
@@ -264,6 +292,26 @@ template_fails kubernetes-plugin-probe-zero-threshold \
 template_fails kubernetes-plugin-without-agent-service-account-token \
   "kubernetesPlugin.enabled=true requires agent.automountServiceAccountToken=true for the node reporter" \
   --set agent.automountServiceAccountToken=false
+
+template_fails agent-mode-invalid \
+  "agent.mode must be managed or host" \
+  --set-string agent.mode=external
+
+template_fails host-agent-without-kubernetes-plugin \
+  "agent.mode=host requires kubernetesPlugin.enabled=true" \
+  --set-string agent.mode=host \
+  --set kubernetesPlugin.enabled=false
+
+template_fails host-agent-without-host-network \
+  "agent.mode=host requires agent.hostNetwork=true" \
+  --set-string agent.mode=host \
+  --set agent.hostNetwork=false \
+  --set-string agent.dnsPolicy=ClusterFirst
+
+template_fails host-agent-relative-api-token-file \
+  "agent.hostAgent.apiBearerTokenFile must be an absolute host file path" \
+  --set-string agent.mode=host \
+  --set-string agent.hostAgent.apiBearerTokenFile=etc/heteronetwork/agent-api-token
 
 template_fails agent-api-token-key-empty \
   "agent.apiBearerTokenSecretKey must contain only ASCII letters" \
