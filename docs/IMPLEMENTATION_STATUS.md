@@ -4,6 +4,17 @@ This file tracks the gap between the requested final system and the current repo
 
 ## Implemented In This Baseline
 
+- A separate public customer identity/resource plane now uses the
+  `heteronetwork-customers` Keycloak realm, a distinct customer console client
+  and API audience, exact `(issuer, subject)` durable identities, transactional
+  project/public-service quotas, and ownership-scoped SQLite/PostgreSQL
+  resources. Management, public customer, and Kubernetes controller APIs use
+  separate listeners and route sets. The customer WebConsole fails closed
+  without customer-specific endpoints and cannot proxy admin routes. The
+  Kubernetes controller can materialize generation-owned direct or forwarded
+  facade Services from desired customer resources and report status through a
+  separate bearer-protected internal API. Public addresses remain node-owned
+  ephemeral ingress addresses rather than floating VIPs.
 - Public-node HA now uses durable expiring service-instance leases in the shared SQLite/PostgreSQL store. Every lease identifies its owning host and optional registered overlay node, so multiple leases on one machine cannot inflate HA. Every Control Plane aggregates canonical active Control Plane, Signal, STUN, and Relay endpoints, includes them in registration/heartbeat/peer-map responses, exposes `/v1/admin/services`, Prometheus and OTLP host-aware HA gauges, and renders a lease-aware **Node services** matrix with one row per registered node plus explicit infrastructure-only hosts. The packaged systemd units stop lease renewal when any local public service leaves the active state.
 - Agents use bounded signed-token endpoints only for initial discovery. A non-empty learned active service directory atomically replaces the seeds, is persisted as the authoritative restart and runtime endpoint set, and prevents retired token endpoints from being reintroduced. Agents resolve current Control Plane and Signal URLs on every background loop and skip unavailable STUN bootstrap DNS/socket endpoints when another endpoint succeeds. The production Compose gate starts two full public nodes, begins existing Agents from an A-only token, verifies two-instance HA discovery and encrypted WireGuard traffic, stops A's Control Plane/Signal/STUN/Relay, revalidates existing IPv4/IPv6 traffic and route reconciliation through B, and starts a fresh third Agent from a directory-generated token through B.
 - `ipars token create --service-directory-url` obtains the operator-authenticated live directory, derives its cluster ID, prepends its canonical endpoints, and by default rejects token creation unless at least two Control Plane, Signal, and STUN entries are active plus two Relay entries when relay is allowed. A bounded explicit degraded-recovery override is available. PostgreSQL service quorum remains an external deployment responsibility rather than being misreported as part of two-node application HA.

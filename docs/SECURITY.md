@@ -10,6 +10,41 @@ This document describes the current HeteroNetwork trust boundaries and the opera
 - Agents own node identity keys, WireGuard private keys, local runtime state, route application, peer-map application, relay forwarders, and heartbeat reporting.
 - Docker and Kubernetes integrations are route-intent integrations for underlay reachability. They do not replace the Kubernetes CNI and they do not rely on iptables-only rewrites as the primary integration contract.
 
+## Public Customer Identity
+
+The public customer identity plane is isolated from operator authentication:
+
+- it uses the exact `heteronetwork-customers` issuer and a dedicated
+  PostgreSQL database/schema/role;
+- `aud` must contain `heteronetwork-customer-api`, while `azp` must separately
+  equal `heteronetwork-customer-console`;
+- the exact token subject must match Keycloak UserInfo and the realm roles
+  must contain `heteronetwork-customer`;
+- durable identity is the exact `(issuer, subject)` tuple, never email or
+  display name;
+- customer, management, and Kubernetes controller routes use different
+  listeners and authentication middleware;
+- all account, project, and public-service operations include account
+  ownership in the store predicate, returning 404 across ownership boundaries;
+- the internal Kubernetes controller token is an independent root-only/systemd
+  credential mirrored into one read-only Kubernetes Secret mount.
+
+The public BFF has no admin proxy routes, uses customer-specific cookies and
+storage keys, bounds upstream responses, and rejects callbacks without the
+short-lived browser-bound PKCE cookie. That callback state is process
+independent, so a load balancer may send login and callback requests to
+different customer-console replicas. Both the BFF and customer API validate
+tokens through Keycloak UserInfo before applying realm roles. They bound
+uncached UserInfo work with token-digest caches, concurrency limits, and
+process-local rate limits; the BFF also coalesces concurrent validation of the
+same token. Customer resource collections use bounded cursor pages, and the
+Kubernetes controller rejects oversized, non-advancing, mixed-kind, or
+partially failed desired-state polls.
+
+Keycloak `org-admin` is not a global authorization role and cannot replace the
+baseline customer role. Any future organization access must be authorized by
+persisted membership scoped to the requested organization.
+
 ## Join Tokens
 
 Join tokens are Ed25519-signed claims containing the cluster ID, issuer node/key IDs, bootstrap endpoints, expiration, role/tags, relay permission, route allowlist, max-use policy, and nonce. Tokens are single-use by default unless `--max-uses` or `--unlimited-uses` is explicitly set.

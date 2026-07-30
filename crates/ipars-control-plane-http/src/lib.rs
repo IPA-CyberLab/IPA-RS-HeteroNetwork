@@ -1,4 +1,8 @@
-use std::collections::{BTreeSet, HashMap};
+mod customer_api;
+
+pub use customer_api::{customer_controller_router, customer_router};
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -45,7 +49,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, Semaphore};
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use url::Url;
@@ -71,6 +75,14 @@ const MAX_WEB_OIDC_REFRESH_CACHE_ENTRIES: usize = 256;
 const MAX_WEB_OIDC_REFRESH_REVOCATIONS: usize = 256;
 const WEB_OIDC_REFRESH_REPLAY_TTL: Duration = Duration::from_secs(5);
 const WEB_OIDC_REFRESH_REVOCATION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_CUSTOMER_OIDC_IDENTITY_BYTES: usize = 1024;
+const DEFAULT_CUSTOMER_OIDC_REQUIRED_ROLE: &str = "heteronetwork-customer";
+const MAX_CUSTOMER_AUTH_CACHE_ENTRIES: usize = 4_096;
+const MAX_CUSTOMER_AUTH_IN_FLIGHT: usize = 32;
+const MAX_CUSTOMER_AUTH_ATTEMPTS_PER_SECOND: usize = 120;
+const CUSTOMER_AUTH_ATTEMPT_WINDOW: Duration = Duration::from_secs(1);
+const CUSTOMER_AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
+const CUSTOMER_AUTH_REJECTION_CACHE_TTL: Duration = Duration::from_secs(5);
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
@@ -798,6 +810,14 @@ struct OidcLoginStart {
     state_cookie: header::HeaderValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OidcUserInfo {
+    subject: String,
+    email: Option<String>,
+    preferred_username: Option<String>,
+    display_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct WebAuthFlowError {
     status: StatusCode,
@@ -837,6 +857,45 @@ enum AccessTokenValidation {
     Valid,
     Invalid,
     Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomerAccessTokenError {
+    Unauthorized,
+    Forbidden,
+    Unavailable,
+    RateLimited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CustomerOidcPrincipal {
+    pub issuer: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub preferred_username: Option<String>,
+    pub display_name: Option<String>,
+    pub realm_roles: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomerAuthConfig {
+    oidc: WebUiAuthConfig,
+    required_audience: String,
+    required_role: String,
+    state: Arc<Mutex<CustomerAuthState>>,
+    in_flight: Arc<Semaphore>,
+}
+
+#[derive(Debug, Default)]
+struct CustomerAuthState {
+    cache: HashMap<[u8; 32], CustomerAuthCacheEntry>,
+    attempts: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct CustomerAuthCacheEntry {
+    result: Result<CustomerOidcPrincipal, CustomerAccessTokenError>,
+    expires_at: Instant,
 }
 
 impl WebAuthFlowError {
@@ -989,11 +1048,21 @@ impl WebUiAuthConfig {
     }
 
     async fn access_token_validation(&self, token: &str) -> AccessTokenValidation {
+        match self.access_token_userinfo(token).await {
+            Ok(_) => AccessTokenValidation::Valid,
+            Err(validation) => validation,
+        }
+    }
+
+    async fn access_token_userinfo(
+        &self,
+        token: &str,
+    ) -> Result<OidcUserInfo, AccessTokenValidation> {
         if token.is_empty() || token.len() > MAX_OPERATOR_API_BEARER_TOKEN_BYTES * 16 {
-            return AccessTokenValidation::Invalid;
+            return Err(AccessTokenValidation::Invalid);
         }
         let Some(backchannel_host) = self.access_token_backchannel_host(token) else {
-            return AccessTokenValidation::Invalid;
+            return Err(AccessTokenValidation::Invalid);
         };
         let mut rejected = false;
         for endpoint in &self.backchannel_userinfo_endpoints {
@@ -1024,23 +1093,15 @@ impl WebUiAuthConfig {
                     Ok(body) => body,
                     Err(_) => continue,
                 };
-            if serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|claims| {
-                    claims
-                        .get("sub")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .is_some_and(|subject| !subject.is_empty())
-            {
-                return AccessTokenValidation::Valid;
+            if let Some(userinfo) = parse_oidc_userinfo(&body) {
+                return Ok(userinfo);
             }
+            rejected = true;
         }
         if rejected {
-            AccessTokenValidation::Invalid
+            Err(AccessTokenValidation::Invalid)
         } else {
-            AccessTokenValidation::Unavailable
+            Err(AccessTokenValidation::Unavailable)
         }
     }
 
@@ -1518,6 +1579,184 @@ impl WebUiAuthConfig {
     }
 }
 
+impl CustomerAuthConfig {
+    pub fn new(
+        issuer_url: String,
+        login_client_id: String,
+        required_audience: String,
+        auth_base_url: Option<String>,
+        backchannel_base_url: Option<String>,
+        scopes: String,
+    ) -> Result<Self, String> {
+        let required_audience =
+            validate_customer_oidc_text(required_audience, "customer OIDC API audience")?;
+        Ok(Self {
+            oidc: WebUiAuthConfig::new(
+                WebAuthProvider::Keycloak,
+                issuer_url,
+                login_client_id,
+                auth_base_url,
+                backchannel_base_url,
+                scopes,
+            )?,
+            required_audience,
+            required_role: DEFAULT_CUSTOMER_OIDC_REQUIRED_ROLE.to_string(),
+            state: Arc::new(Mutex::new(CustomerAuthState::default())),
+            in_flight: Arc::new(Semaphore::new(MAX_CUSTOMER_AUTH_IN_FLIGHT)),
+        })
+    }
+
+    pub fn with_backchannel_fallback_base_urls(
+        mut self,
+        fallback_base_urls: Vec<String>,
+    ) -> Result<Self, String> {
+        self.oidc = self
+            .oidc
+            .with_backchannel_fallback_base_urls(fallback_base_urls)?;
+        Ok(self)
+    }
+
+    pub fn with_required_role(mut self, required_role: String) -> Result<Self, String> {
+        self.required_role =
+            validate_customer_oidc_text(required_role, "customer OIDC required role")?;
+        Ok(self)
+    }
+
+    async fn validate_access_token(
+        &self,
+        token: &str,
+    ) -> Result<CustomerOidcPrincipal, CustomerAccessTokenError> {
+        let claims = unverified_jwt_claims(token).ok_or(CustomerAccessTokenError::Unauthorized)?;
+        let issuer = claims
+            .get("iss")
+            .and_then(Value::as_str)
+            .and_then(|issuer| {
+                validate_customer_oidc_opaque(issuer, "customer access token issuer").ok()
+            })
+            .ok_or(CustomerAccessTokenError::Unauthorized)?;
+        if issuer != self.oidc.issuer_url
+            || validate_web_auth_base_url(issuer.clone(), "customer access token issuer").is_err()
+        {
+            return Err(CustomerAccessTokenError::Unauthorized);
+        }
+        if !oidc_token_audience_matches(&claims, &self.required_audience)
+            || claims.get("azp").and_then(Value::as_str) != Some(self.oidc.client_id.as_str())
+        {
+            return Err(CustomerAccessTokenError::Unauthorized);
+        }
+        let subject = claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .and_then(|subject| validate_customer_oidc_opaque(subject, "customer subject").ok())
+            .ok_or(CustomerAccessTokenError::Unauthorized)?;
+        let realm_roles =
+            oidc_realm_roles(&claims).ok_or(CustomerAccessTokenError::Unauthorized)?;
+        let token_exp = claims.get("exp").and_then(Value::as_i64);
+        let token_digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock().await;
+            prune_customer_auth_state(&mut state, now);
+            if let Some(entry) = state.cache.get(&token_digest) {
+                return entry.result.clone();
+            }
+            if state.attempts.len() >= MAX_CUSTOMER_AUTH_ATTEMPTS_PER_SECOND {
+                return Err(CustomerAccessTokenError::RateLimited);
+            }
+            state.attempts.push_back(now);
+        }
+
+        let _permit = self
+            .in_flight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CustomerAccessTokenError::RateLimited)?;
+        let userinfo = self
+            .oidc
+            .access_token_userinfo(token)
+            .await
+            .map_err(|error| match error {
+                AccessTokenValidation::Unavailable => CustomerAccessTokenError::Unavailable,
+                AccessTokenValidation::Invalid | AccessTokenValidation::Valid => {
+                    CustomerAccessTokenError::Unauthorized
+                }
+            });
+        let result = match userinfo {
+            Ok(userinfo) if userinfo.subject != subject => {
+                Err(CustomerAccessTokenError::Unauthorized)
+            }
+            Ok(_) if !realm_roles.contains(&self.required_role) => {
+                Err(CustomerAccessTokenError::Forbidden)
+            }
+            Ok(userinfo) => Ok(CustomerOidcPrincipal {
+                issuer,
+                subject,
+                email: userinfo.email,
+                preferred_username: userinfo.preferred_username,
+                display_name: userinfo.display_name,
+                realm_roles,
+            }),
+            Err(error) => Err(error),
+        };
+        if !matches!(
+            result,
+            Err(CustomerAccessTokenError::Unavailable | CustomerAccessTokenError::RateLimited)
+        ) {
+            let ttl = customer_auth_cache_ttl(token_exp, result.is_ok());
+            if !ttl.is_zero() {
+                let mut state = self.state.lock().await;
+                prune_customer_auth_state(&mut state, Instant::now());
+                if state.cache.len() >= MAX_CUSTOMER_AUTH_CACHE_ENTRIES {
+                    if let Some(oldest) = state
+                        .cache
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.expires_at)
+                        .map(|(digest, _)| *digest)
+                    {
+                        state.cache.remove(&oldest);
+                    }
+                }
+                state.cache.insert(
+                    token_digest,
+                    CustomerAuthCacheEntry {
+                        result: result.clone(),
+                        expires_at: Instant::now() + ttl,
+                    },
+                );
+            }
+        }
+        result
+    }
+}
+
+fn prune_customer_auth_state(state: &mut CustomerAuthState, now: Instant) {
+    state.cache.retain(|_, entry| entry.expires_at > now);
+    while state
+        .attempts
+        .front()
+        .is_some_and(|attempt| now.duration_since(*attempt) >= CUSTOMER_AUTH_ATTEMPT_WINDOW)
+    {
+        state.attempts.pop_front();
+    }
+}
+
+fn customer_auth_cache_ttl(token_exp: Option<i64>, accepted: bool) -> Duration {
+    let configured = if accepted {
+        CUSTOMER_AUTH_CACHE_TTL
+    } else {
+        CUSTOMER_AUTH_REJECTION_CACHE_TTL
+    };
+    let Some(token_exp) = token_exp else {
+        return configured.min(CUSTOMER_AUTH_REJECTION_CACHE_TTL);
+    };
+    let remaining = token_exp.saturating_sub(Utc::now().timestamp());
+    if remaining <= 0 {
+        Duration::ZERO
+    } else {
+        configured.min(Duration::from_secs(remaining as u64))
+    }
+}
+
 fn record_web_oidc_refresh_revocation(
     cache: &mut WebOidcRefreshCache,
     digest: [u8; 32],
@@ -1622,6 +1861,14 @@ fn random_oidc_value(byte_count: usize) -> String {
 }
 
 fn unverified_jwt_issuer(token: &str) -> Option<String> {
+    unverified_jwt_claims(token)?
+        .get("iss")
+        .and_then(Value::as_str)
+        .filter(|issuer| !issuer.is_empty())
+        .map(str::to_string)
+}
+
+fn unverified_jwt_claims(token: &str) -> Option<Value> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
     let payload = parts.next()?;
@@ -1630,12 +1877,71 @@ fn unverified_jwt_issuer(token: &str) -> Option<String> {
         return None;
     }
     let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Value = serde_json::from_slice(&payload).ok()?;
-    claims
-        .get("iss")
+    serde_json::from_slice(&payload).ok()
+}
+
+fn parse_oidc_userinfo(body: &[u8]) -> Option<OidcUserInfo> {
+    let claims: Value = serde_json::from_slice(body).ok()?;
+    let subject = claims
+        .get("sub")
         .and_then(Value::as_str)
-        .filter(|issuer| !issuer.is_empty())
+        .and_then(|subject| validate_customer_oidc_opaque(subject, "OIDC subject").ok())?;
+    Some(OidcUserInfo {
+        subject,
+        email: optional_customer_oidc_claim(&claims, "email"),
+        preferred_username: optional_customer_oidc_claim(&claims, "preferred_username"),
+        display_name: optional_customer_oidc_claim(&claims, "name"),
+    })
+}
+
+fn optional_customer_oidc_claim(claims: &Value, name: &str) -> Option<String> {
+    claims
+        .get(name)
+        .and_then(Value::as_str)
         .map(str::to_string)
+        .and_then(|value| validate_customer_oidc_text(value, name).ok())
+}
+
+fn validate_customer_oidc_text(value: String, name: &str) -> Result<String, String> {
+    let value = value.trim().to_string();
+    validate_customer_oidc_opaque(&value, name)
+}
+
+fn validate_customer_oidc_opaque(value: &str, name: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > MAX_CUSTOMER_OIDC_IDENTITY_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{name} must be 1 to {MAX_CUSTOMER_OIDC_IDENTITY_BYTES} non-control bytes"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn oidc_token_audience_matches(claims: &Value, required_audience: &str) -> bool {
+    match claims.get("aud") {
+        Some(Value::String(audience)) => audience == required_audience,
+        Some(Value::Array(audiences)) => audiences
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|audience| audience == required_audience),
+        _ => false,
+    }
+}
+
+fn oidc_realm_roles(claims: &Value) -> Option<BTreeSet<String>> {
+    let roles = claims.get("realm_access")?.get("roles")?.as_array()?;
+    if roles.len() > 128 {
+        return None;
+    }
+    let mut validated = BTreeSet::new();
+    for role in roles {
+        let role = role.as_str()?;
+        let role = validate_customer_oidc_opaque(role, "customer realm role").ok()?;
+        validated.insert(role);
+    }
+    Some(validated)
 }
 
 async fn bounded_response_body(
@@ -7330,6 +7636,134 @@ mod tests {
             rejected.headers().get(header::WWW_AUTHENTICATE),
             Some(&header::HeaderValue::from_static("Bearer"))
         );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn customer_oidc_requires_exact_issuer_audience_role_and_subject(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/realms/customers/protocol/openid-connect/userinfo",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "sub": "customer-a",
+                        "email": "customer@example.com",
+                        "preferred_username": "customer",
+                        "name": "Customer A"
+                    }))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        let auth = CustomerAuthConfig::new(
+            "https://accounts.example/realms/customers".to_string(),
+            "heteronetwork-customer-console".to_string(),
+            "heteronetwork-customer-api".to_string(),
+            None,
+            Some(format!("http://{address}/realms/customers")),
+            "openid profile email".to_string(),
+        )?;
+        let token = |issuer: &str,
+                     authorized_party: &str,
+                     audience: &str,
+                     subject: &str,
+                     roles: &[&str]| {
+            format!(
+                "e30.{}.signature",
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&serde_json::json!({
+                        "iss": issuer,
+                        "sub": subject,
+                        "azp": authorized_party,
+                        "aud": [audience],
+                        "realm_access": {"roles": roles}
+                    }))
+                    .unwrap_or_default()
+                )
+            )
+        };
+        let valid = token(
+            "https://accounts.example/realms/customers",
+            "heteronetwork-customer-console",
+            "heteronetwork-customer-api",
+            "customer-a",
+            &["heteronetwork-customer"],
+        );
+        let principal = auth
+            .validate_access_token(&valid)
+            .await
+            .map_err(|validation| format!("valid customer token was rejected: {validation:?}"))?;
+        assert_eq!(principal.subject, "customer-a");
+        assert_eq!(principal.email.as_deref(), Some("customer@example.com"));
+
+        for (invalid, expected) in [
+            (
+                token(
+                    "https://foreign.example/realms/customers",
+                    "heteronetwork-customer-console",
+                    "heteronetwork-customer-api",
+                    "customer-a",
+                    &["heteronetwork-customer"],
+                ),
+                CustomerAccessTokenError::Unauthorized,
+            ),
+            (
+                token(
+                    "https://accounts.example/realms/customers",
+                    "heteronetwork-customer-console",
+                    "foreign-api",
+                    "customer-a",
+                    &["heteronetwork-customer"],
+                ),
+                CustomerAccessTokenError::Unauthorized,
+            ),
+            (
+                token(
+                    "https://accounts.example/realms/customers",
+                    "foreign-console",
+                    "heteronetwork-customer-api",
+                    "customer-a",
+                    &["heteronetwork-customer"],
+                ),
+                CustomerAccessTokenError::Unauthorized,
+            ),
+            (
+                token(
+                    "https://accounts.example/realms/customers",
+                    "heteronetwork-customer-console",
+                    "heteronetwork-customer-api",
+                    "customer-a",
+                    &["offline_access"],
+                ),
+                CustomerAccessTokenError::Forbidden,
+            ),
+            (
+                token(
+                    "https://accounts.example/realms/customers",
+                    "heteronetwork-customer-console",
+                    "heteronetwork-customer-api",
+                    "other-subject",
+                    &["heteronetwork-customer"],
+                ),
+                CustomerAccessTokenError::Unauthorized,
+            ),
+            (
+                token(
+                    "https://accounts.example/realms/customers/",
+                    "heteronetwork-customer-console",
+                    "heteronetwork-customer-api",
+                    "customer-a",
+                    &["heteronetwork-customer"],
+                ),
+                CustomerAccessTokenError::Unauthorized,
+            ),
+        ] {
+            assert_eq!(auth.validate_access_token(&invalid).await, Err(expected));
+        }
         task.abort();
         Ok(())
     }

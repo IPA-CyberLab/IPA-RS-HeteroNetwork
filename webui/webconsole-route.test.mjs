@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer as createHttpServer } from "node:http";
 import test from "node:test";
 
 import { createWebConsoleServer } from "../webconsole/server.mjs";
@@ -31,6 +33,70 @@ test("standalone WebConsole serves the pinned Mermaid bundle from its own origin
   const config = await configResponse.json();
   assert.equal(config.session_refresh_endpoint, "/ui/auth/refresh");
   assert.equal(config.session_logout_endpoint, "/ui/auth/logout");
+});
+
+test("standalone WebConsole binds OIDC state to the initiating browser", async (t) => {
+  const origin = await startServer(t);
+  const login = await fetch(`${origin}/ui/login`, { redirect: "manual" });
+  assert.equal(login.status, 302);
+  const stateCookie = login.headers.get("set-cookie") || "";
+  assert.match(
+    stateCookie,
+    /^heteronetwork_web_login_state=[A-Za-z0-9_-]+; Path=\/ui\/callback; Max-Age=300; HttpOnly; SameSite=Lax/,
+  );
+  const authorization = new URL(login.headers.get("location"));
+  const state = authorization.searchParams.get("state");
+  assert.ok(state);
+
+  const rejected = await fetch(
+    `${origin}/ui/callback?state=${encodeURIComponent(state)}&code=test-code`,
+  );
+  assert.equal(rejected.status, 400);
+  assert.match(
+    rejected.headers.get("set-cookie") || "",
+    /heteronetwork_web_login_state=; Path=\/ui\/callback; Max-Age=0/,
+  );
+});
+
+test("standalone WebConsole completes PKCE from the browser-bound callback cookie", async (t) => {
+  const origin = await startServer(t);
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const login = await originalFetch(`${origin}/ui/login`, { redirect: "manual" });
+  const authorization = new URL(login.headers.get("location"));
+  const state = authorization.searchParams.get("state");
+  const cookie = (login.headers.get("set-cookie") || "").split(";", 1)[0];
+  assert.ok(state);
+  assert.match(cookie, /^heteronetwork_web_login_state=[A-Za-z0-9_-]+$/);
+
+  globalThis.fetch = async (_input, init) => {
+    const form = new URLSearchParams(String(init.body));
+    assert.equal(form.get("grant_type"), "authorization_code");
+    assert.equal(form.get("code"), "test-code");
+    assert.match(form.get("code_verifier") || "", /^[A-Za-z0-9_-]{43}$/);
+    return oidcResponse({
+      access_token: "callback-access-token",
+      refresh_token: "callback-refresh-token",
+      expires_in: 300,
+      refresh_expires_in: 3600,
+    });
+  };
+
+  const callback = await originalFetch(
+    `${origin}/ui/callback?state=${encodeURIComponent(state)}&code=test-code`,
+    { headers: { Cookie: cookie } },
+  );
+  assert.equal(callback.status, 200);
+  const policy = callback.headers.get("content-security-policy") || "";
+  const nonce = /script-src 'nonce-([A-Za-z0-9_-]+)'/.exec(policy)?.[1];
+  assert.ok(nonce);
+  assert.match(await callback.text(), new RegExp(`<script nonce="${nonce}">`));
+  assert.match(
+    callback.headers.get("set-cookie") || "",
+    /heteronetwork_web_login_state=; Path=\/ui\/callback; Max-Age=0/,
+  );
 });
 
 test("standalone WebConsole requires exact same-origin browser headers", async (t) => {
@@ -387,6 +453,137 @@ test("standalone WebConsole stops reading oversized OIDC responses", async (t) =
   assert.ok(pulls <= 6);
 });
 
+test("customer console caches successful UserInfo validation and rejects invalid JWTs", async (t) => {
+  let userinfoCalls = 0;
+  let apiCalls = 0;
+  const apiRequestTargets = [];
+  const upstream = await startHttpServer(t, (request, response) => {
+    const pathname = new URL(request.url || "/", "http://upstream.invalid").pathname;
+    if (pathname.endsWith("/protocol/openid-connect/userinfo")) {
+      userinfoCalls += 1;
+      const payload = testJwtPayload(request.headers.authorization);
+      if (payload.jti === "fake-token") {
+        return writeJson(response, 401, { error: "invalid_token" });
+      }
+      return writeJson(response, 200, {
+        email: `${payload.sub}@example.test`,
+        sub: payload.sub,
+      });
+    }
+    if (pathname === "/api/v1/customer/session") {
+      apiCalls += 1;
+      apiRequestTargets.push(request.url);
+      return writeJson(response, 200, { status: "ok" });
+    }
+    return writeJson(response, 404, { error: "not found" });
+  });
+  const customer = await startCustomerConsole(t, upstream.origin);
+  const token = customerJwt(customer.issuer, { jti: "cache-hit" });
+
+  const first = await customerRequest(customer.origin, token);
+  const second = await customerRequest(
+    customer.origin,
+    token,
+    "/v1/customer/session?cursor=prj_01&limit=100",
+  );
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(userinfoCalls, 1);
+  assert.equal(apiCalls, 2);
+  assert.deepEqual(apiRequestTargets, [
+    "/api/v1/customer/session",
+    "/api/v1/customer/session?cursor=prj_01&limit=100",
+  ]);
+
+  const expired = customerJwt(customer.issuer, {
+    expiresAt: Math.floor(Date.now() / 1_000) - 1,
+    jti: "expired-token",
+  });
+  assert.equal((await customerRequest(customer.origin, expired)).status, 401);
+  assert.equal(userinfoCalls, 1);
+
+  const fake = customerJwt(customer.issuer, { jti: "fake-token" });
+  assert.equal((await customerRequest(customer.origin, fake)).status, 401);
+  assert.equal(userinfoCalls, 2);
+  assert.equal(apiCalls, 2);
+});
+
+test("customer console bounds concurrent uncached UserInfo calls", async (t) => {
+  const releaseUserinfo = deferred();
+  t.after(() => releaseUserinfo.resolve());
+  let activeUserinfo = 0;
+  let maxActiveUserinfo = 0;
+  let userinfoCalls = 0;
+  const upstream = await startHttpServer(t, async (request, response) => {
+    const pathname = new URL(request.url || "/", "http://upstream.invalid").pathname;
+    if (pathname.endsWith("/protocol/openid-connect/userinfo")) {
+      userinfoCalls += 1;
+      activeUserinfo += 1;
+      maxActiveUserinfo = Math.max(maxActiveUserinfo, activeUserinfo);
+      await releaseUserinfo.promise;
+      activeUserinfo -= 1;
+      return writeJson(response, 200, { sub: testJwtPayload(request.headers.authorization).sub });
+    }
+    if (pathname.startsWith("/api/v1/customer/")) {
+      return writeJson(response, 200, { status: "ok" });
+    }
+    return writeJson(response, 404, { error: "not found" });
+  });
+  const customer = await startCustomerConsole(t, upstream.origin, {
+    HETERONETWORK_CUSTOMER_USERINFO_MAX_CONCURRENT: "2",
+    HETERONETWORK_CUSTOMER_USERINFO_RATE_BURST: "32",
+    HETERONETWORK_CUSTOMER_USERINFO_RATE_PER_SECOND: "32",
+  });
+  const requests = Array.from({ length: 8 }, (_, index) => (
+    customerRequest(
+      customer.origin,
+      customerJwt(customer.issuer, { jti: `concurrent-${index}` }),
+    )
+  ));
+
+  await waitFor(() => userinfoCalls === 2);
+  assert.equal(maxActiveUserinfo, 2);
+  releaseUserinfo.resolve();
+  const responses = await Promise.all(requests);
+  assert.deepEqual(
+    responses.map(({ status }) => status).sort((left, right) => left - right),
+    [200, 200, 503, 503, 503, 503, 503, 503],
+  );
+  assert.equal(userinfoCalls, 2);
+});
+
+test("customer console rate-limits uncached tokens before UserInfo fan-out", async (t) => {
+  let userinfoCalls = 0;
+  const upstream = await startHttpServer(t, (request, response) => {
+    const pathname = new URL(request.url || "/", "http://upstream.invalid").pathname;
+    if (pathname.endsWith("/protocol/openid-connect/userinfo")) {
+      userinfoCalls += 1;
+      return writeJson(response, 200, { sub: testJwtPayload(request.headers.authorization).sub });
+    }
+    if (pathname.startsWith("/api/v1/customer/")) {
+      return writeJson(response, 200, { status: "ok" });
+    }
+    return writeJson(response, 404, { error: "not found" });
+  });
+  const customer = await startCustomerConsole(t, upstream.origin, {
+    HETERONETWORK_CUSTOMER_USERINFO_MAX_CONCURRENT: "8",
+    HETERONETWORK_CUSTOMER_USERINFO_RATE_BURST: "2",
+    HETERONETWORK_CUSTOMER_USERINFO_RATE_PER_SECOND: "1",
+  });
+  const responses = await Promise.all(Array.from({ length: 8 }, (_, index) => (
+    customerRequest(
+      customer.origin,
+      customerJwt(customer.issuer, { jti: `rate-${index}` }),
+    )
+  )));
+
+  assert.deepEqual(
+    responses.map(({ status }) => status).sort((left, right) => left - right),
+    [200, 200, 429, 429, 429, 429, 429, 429],
+  );
+  assert.equal(userinfoCalls, 2);
+});
+
 async function startServer(t, options) {
   const server = createWebConsoleServer(options);
   server.listen(0, "127.0.0.1");
@@ -396,6 +593,125 @@ async function startServer(t, options) {
   const address = server.address();
   assert.equal(typeof address, "object");
   return `http://127.0.0.1:${address.port}`;
+}
+
+async function startHttpServer(t, handler) {
+  const server = createHttpServer((request, response) => {
+    Promise.resolve(handler(request, response)).catch((error) => {
+      if (!response.headersSent) {
+        writeJson(response, 500, { error: error.message });
+      } else {
+        response.destroy(error);
+      }
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  return { origin: `http://127.0.0.1:${address.port}` };
+}
+
+async function startCustomerConsole(t, upstreamOrigin, extraEnv = {}) {
+  const port = await availablePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const issuer = `${upstreamOrigin}/realms/heteronetwork-customers`;
+  const child = spawn(process.execPath, ["webconsole/server.mjs"], {
+    cwd: new URL("..", import.meta.url),
+    env: {
+      ...process.env,
+      HOST: "127.0.0.1",
+      PORT: String(port),
+      HETERONETWORK_CONSOLE_MODE: "customer",
+      HETERONETWORK_CUSTOMER_API_URL: `${upstreamOrigin}/api`,
+      HETERONETWORK_CUSTOMER_OIDC_ISSUER_URL: issuer,
+      HETERONETWORK_CUSTOMER_WEB_PUBLIC_URL: origin,
+      ...extraEnv,
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  t.after(async () => {
+    if (child.exitCode != null || child.signalCode != null) return;
+    child.kill("SIGTERM");
+    await once(child, "exit");
+  });
+  await waitFor(async () => {
+    if (child.exitCode != null) {
+      throw new Error(`customer console exited before becoming ready: ${stderr}`);
+    }
+    try {
+      return (await fetch(`${origin}/cloud/config`)).ok;
+    } catch {
+      return false;
+    }
+  });
+  return { issuer, origin };
+}
+
+async function availablePort() {
+  const server = createHttpServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  const available = address.port;
+  server.close();
+  await once(server, "close");
+  return available;
+}
+
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("condition was not met before timeout");
+}
+
+function customerRequest(origin, token, path = "/v1/customer/session") {
+  return fetch(`${origin}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+function customerJwt(issuer, {
+  expiresAt = Math.floor(Date.now() / 1_000) + 300,
+  jti,
+  sub = "customer-1",
+}) {
+  return [
+    encodeJwtPart({ alg: "RS256", typ: "JWT" }),
+    encodeJwtPart({
+      aud: "heteronetwork-customer-api",
+      azp: "heteronetwork-customer-console",
+      exp: expiresAt,
+      iss: issuer,
+      jti,
+      realm_access: { roles: ["heteronetwork-customer"] },
+      sub,
+    }),
+    "test-signature",
+  ].join(".");
+}
+
+function testJwtPayload(authorization) {
+  const token = String(authorization || "").replace(/^Bearer\s+/i, "");
+  return JSON.parse(Buffer.from(token.split(".")[1] || "", "base64url").toString("utf8"));
+}
+
+function encodeJwtPart(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function writeJson(response, status, body) {
+  response.writeHead(status, { "Content-Type": "application/json" });
+  response.end(JSON.stringify(body));
 }
 
 function sessionHeaders(cookie = "") {

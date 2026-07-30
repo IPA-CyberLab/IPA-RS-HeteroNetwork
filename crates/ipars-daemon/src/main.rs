@@ -43,13 +43,15 @@ use ipars_agent_http::{
     overlay_web_ui_router, router as agent_router, AgentHttpState, PublicWebGatewayPhase,
     PublicWebGatewayStatus,
 };
+use ipars_control_plane::customer_resources::{CustomerQuota, CustomerResourceStore};
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, ControlPlaneStore, InMemoryStore,
     InMemoryTokenLedger, IssuerKeyRing, TokenLedger,
 };
 use ipars_control_plane_http::{
-    router, ControlPlaneHttpState, DynamicWebGatewayConfig, NodeEnrollmentConfig,
-    NodePublicServicesConfig, WebAuthProvider, WebUiAuthConfig,
+    customer_controller_router, customer_router, router, ControlPlaneHttpState, CustomerAuthConfig,
+    DynamicWebGatewayConfig, NodeEnrollmentConfig, NodePublicServicesConfig, WebAuthProvider,
+    WebUiAuthConfig,
 };
 #[cfg(test)]
 use ipars_crypto::verify_signal_node_upsert_signature;
@@ -249,6 +251,7 @@ const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID: &str = "node-enrollment-issuer.key";
 const DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID: &str = "database-autopilot.token";
 const KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID: &str = "keycloak-autopilot.token";
+const CUSTOMER_CONTROLLER_TOKEN_CREDENTIAL_ID: &str = "customer-controller.token";
 const DATABASE_URL_CREDENTIAL_ID: &str = "database-url";
 const MAX_USERSPACE_WIREGUARD_ARGS: usize = 128;
 const MAX_USERSPACE_WIREGUARD_SPAWN_ARGS: usize = MAX_USERSPACE_WIREGUARD_ARGS + 4;
@@ -568,6 +571,75 @@ struct ControlPlaneArgs {
         default_value = "openid profile email"
     )]
     web_oidc_scopes: String,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_API_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    customer_api_enabled: bool,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_API_LISTEN",
+        default_value = "127.0.0.1:19881"
+    )]
+    customer_api_listen: SocketAddr,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_CONTROLLER_LISTEN",
+        default_value = "127.0.0.1:19882"
+    )]
+    customer_controller_listen: SocketAddr,
+    #[arg(long, env = "HETERONETWORK_CUSTOMER_CONTROLLER_BEARER_TOKEN_PATH")]
+    customer_controller_bearer_token_path: Option<PathBuf>,
+    #[arg(long, env = "HETERONETWORK_CUSTOMER_OIDC_ISSUER_URL")]
+    customer_oidc_issuer_url: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_OIDC_CLIENT_ID",
+        default_value = "heteronetwork-customer-console"
+    )]
+    customer_oidc_client_id: String,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_OIDC_AUDIENCE",
+        default_value = "heteronetwork-customer-api"
+    )]
+    customer_oidc_audience: String,
+    #[arg(long, env = "HETERONETWORK_CUSTOMER_OIDC_AUTH_BASE_URL")]
+    customer_oidc_auth_base_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_CUSTOMER_OIDC_BACKCHANNEL_BASE_URL")]
+    customer_oidc_backchannel_base_url: Option<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS",
+        value_delimiter = ','
+    )]
+    customer_oidc_backchannel_fallback_base_urls: Vec<String>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_OIDC_SCOPES",
+        default_value = "openid profile email"
+    )]
+    customer_oidc_scopes: String,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_OIDC_REQUIRED_ROLE",
+        default_value = "heteronetwork-customer"
+    )]
+    customer_oidc_required_role: String,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_DEFAULT_PROJECT_QUOTA",
+        default_value_t = 10
+    )]
+    customer_default_project_quota: u32,
+    #[arg(
+        long,
+        env = "HETERONETWORK_CUSTOMER_DEFAULT_PUBLIC_SERVICE_QUOTA",
+        default_value_t = 100
+    )]
+    customer_default_public_service_quota: u32,
     #[arg(long, env = "HETERONETWORK_CLUSTER_ID")]
     cluster_id: String,
     #[arg(long, env = "HETERONETWORK_VPN_POOL", default_value = "10.250.0.0/16")]
@@ -4679,7 +4751,7 @@ async fn serve_with_store<S, L>(
     otel_metrics_interval: Duration,
 ) -> anyhow::Result<()>
 where
-    S: ControlPlaneStore + 'static,
+    S: ControlPlaneStore + CustomerResourceStore + 'static,
     L: TokenLedger + 'static,
 {
     let dynamic_web_gateway = args
@@ -4697,6 +4769,7 @@ where
         .context("dynamic Web gateway configuration")?;
     let operator_api_bearer_token = control_plane_operator_api_bearer_token(&args)?;
     let autopilot_api_bearer_tokens = control_plane_autopilot_api_bearer_tokens(&args)?;
+    let customer_controller_bearer_token = control_plane_customer_controller_bearer_token(&args)?;
     let node_enrollment = control_plane_node_enrollment_config(&args)?;
     let web_ui_auth = if args.web_ui_enabled {
         let provider = WebAuthProvider::parse(&args.web_auth_provider)
@@ -4729,13 +4802,50 @@ where
     } else {
         None
     };
-    let mut config =
-        ControlPlaneConfig::new(ClusterId::from_string(args.cluster_id), args.vpn_pool);
+    let customer_auth = if args.customer_api_enabled {
+        let issuer_url = args
+            .customer_oidc_issuer_url
+            .clone()
+            .context("--customer-oidc-issuer-url is required when the customer API is enabled")?;
+        let auth = CustomerAuthConfig::new(
+            issuer_url,
+            args.customer_oidc_client_id.clone(),
+            args.customer_oidc_audience.clone(),
+            args.customer_oidc_auth_base_url.clone(),
+            args.customer_oidc_backchannel_base_url.clone(),
+            args.customer_oidc_scopes.clone(),
+        )
+        .and_then(|auth| {
+            auth.with_backchannel_fallback_base_urls(
+                args.customer_oidc_backchannel_fallback_base_urls.clone(),
+            )
+        })
+        .and_then(|auth| auth.with_required_role(args.customer_oidc_required_role.clone()))
+        .map_err(anyhow::Error::msg)
+        .context("customer OIDC configuration")?;
+        Some(auth)
+    } else {
+        None
+    };
+    let customer_quota = if args.customer_api_enabled {
+        Some(
+            CustomerQuota::new(
+                args.customer_default_project_quota,
+                args.customer_default_public_service_quota,
+            )
+            .map_err(anyhow::Error::msg)
+            .context("customer default quota configuration")?,
+        )
+    } else {
+        None
+    };
+    let cluster_id = ClusterId::from_string(args.cluster_id.clone());
+    let mut config = ControlPlaneConfig::new(cluster_id.clone(), args.vpn_pool);
     config.cluster_policy.relay_health_ttl_seconds = args.relay_health_ttl_seconds;
     config.cluster_policy.endpoint_candidate_ttl_seconds = args.endpoint_candidate_ttl_seconds;
     config.cluster_policy.path_state_ttl_seconds = args.path_state_ttl_seconds;
     config.cluster_policy.acl_rules = args.acl_rules;
-    let plane = Arc::new(ControlPlane::new(config, store));
+    let plane = Arc::new(ControlPlane::new(config, store.clone()));
     plane
         .current_cluster_policy()
         .await
@@ -4811,7 +4921,33 @@ where
     if let Some(dynamic_web_gateway) = dynamic_web_gateway {
         http_state = http_state.enable_dynamic_web_gateway(dynamic_web_gateway);
     }
-    let result = serve_router(args.listen, router(http_state)).await;
+    let management_app = router(http_state);
+    let result = if let Some(customer_auth) = customer_auth {
+        let controller_bearer_token = customer_controller_bearer_token
+            .context("customer controller bearer token is required")?;
+        let customer_quota = customer_quota.context("customer quota is required")?;
+        let customer_app = customer_router(
+            store.clone(),
+            cluster_id.clone(),
+            customer_auth,
+            customer_quota,
+        );
+        let controller_app = customer_controller_router(store, cluster_id, controller_bearer_token)
+            .map_err(anyhow::Error::msg)
+            .context("customer controller API configuration")?;
+        tokio::try_join!(
+            serve_named_router(args.listen, management_app, "control-plane"),
+            serve_named_router(args.customer_api_listen, customer_app, "customer API"),
+            serve_named_router(
+                args.customer_controller_listen,
+                controller_app,
+                "customer controller API"
+            ),
+        )
+        .map(|_| ())
+    } else {
+        serve_named_router(args.listen, management_app, "control-plane").await
+    };
     service_lease_task.abort();
     if let Some(task) = otel_metrics_task {
         task.abort();
@@ -5021,6 +5157,34 @@ fn validate_control_plane_runtime_config(args: &ControlPlaneArgs) -> anyhow::Res
         anyhow::ensure!(
             args.dynamic_web_gateway_lease_ttl_seconds <= 300,
             "--dynamic-web-gateway-lease-ttl-seconds must be at most 300"
+        );
+    }
+    if args.customer_api_enabled {
+        anyhow::ensure!(
+            args.customer_oidc_issuer_url.is_some(),
+            "--customer-api-enabled requires --customer-oidc-issuer-url"
+        );
+        anyhow::ensure!(
+            args.customer_controller_bearer_token_path.is_some()
+                || systemd_credential_path(CUSTOMER_CONTROLLER_TOKEN_CREDENTIAL_ID).is_some(),
+            "--customer-api-enabled requires --customer-controller-bearer-token-path or a systemd customer-controller.token credential"
+        );
+        anyhow::ensure!(
+            args.listen != args.customer_api_listen
+                && args.listen != args.customer_controller_listen
+                && args.customer_api_listen != args.customer_controller_listen,
+            "management, customer, and customer controller listeners must be distinct"
+        );
+        CustomerQuota::new(
+            args.customer_default_project_quota,
+            args.customer_default_public_service_quota,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("customer default quota configuration")?;
+    } else {
+        anyhow::ensure!(
+            args.customer_controller_bearer_token_path.is_none(),
+            "--customer-controller-bearer-token-path requires --customer-api-enabled=true"
         );
     }
     if let Some(instance_id) = args.service_instance_id.as_deref() {
@@ -5305,6 +5469,36 @@ fn control_plane_autopilot_api_bearer_tokens(
     })
 }
 
+fn control_plane_customer_controller_bearer_token(
+    args: &ControlPlaneArgs,
+) -> anyhow::Result<Option<String>> {
+    if !args.customer_api_enabled {
+        return Ok(None);
+    }
+    if let Some(path) = args.customer_controller_bearer_token_path.as_deref() {
+        return read_api_bearer_token_file(path, "customer controller API").map(Some);
+    }
+    let path = systemd_credential_path(CUSTOMER_CONTROLLER_TOKEN_CREDENTIAL_ID).context(
+        "--customer-controller-bearer-token-path or a systemd customer-controller.token credential is required when the customer API is enabled",
+    )?;
+    let token = read_systemd_credential_file(&path, "customer controller API")?;
+    validate_api_bearer_token(
+        &token,
+        &format!(
+            "customer controller API systemd credential {}",
+            path.display()
+        ),
+    )?;
+    Ok(Some(token))
+}
+
+fn systemd_credential_path(credential_id: &str) -> Option<PathBuf> {
+    std::env::var_os("CREDENTIALS_DIRECTORY")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+        .map(|directory| directory.join(credential_id))
+}
+
 fn control_plane_autopilot_api_bearer_token_from_sources(
     explicit_path: Option<&Path>,
     credential_directory: Option<&Path>,
@@ -5327,8 +5521,16 @@ fn control_plane_autopilot_api_bearer_token_from_sources(
 }
 
 async fn serve_router(listen: SocketAddr, app: Router) -> anyhow::Result<()> {
+    serve_named_router(listen, app, "service").await
+}
+
+async fn serve_named_router(
+    listen: SocketAddr,
+    app: Router,
+    component: &'static str,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(%listen, "control-plane listening");
+    tracing::info!(%listen, component, "HTTP listener started");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -23252,28 +23454,132 @@ mod tests {
             &keycloak_path,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbB",
         )?;
-        let invalid = control_plane_autopilot_api_bearer_token_from_sources(
+        let Err(invalid) = control_plane_autopilot_api_bearer_token_from_sources(
             Some(&keycloak_path),
             None,
             KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID,
             "Keycloak autopilot API",
-        )
-        .expect_err("uppercase hexadecimal token must be rejected");
+        ) else {
+            anyhow::bail!("uppercase hexadecimal token was accepted");
+        };
         assert!(invalid.to_string().contains("lowercase hexadecimal"));
 
-        let systemd_policy_error = control_plane_autopilot_api_bearer_token_from_sources(
+        let Err(systemd_policy_error) = control_plane_autopilot_api_bearer_token_from_sources(
             None,
             Some(&directory),
             DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID,
             "database autopilot API",
-        )
-        .expect_err("owner-only file must not bypass systemd credential validation");
+        ) else {
+            anyhow::bail!("owner-only file bypassed systemd credential validation");
+        };
         assert!(systemd_policy_error
             .to_string()
             .contains("systemd credential"));
 
         std::fs::remove_dir_all(directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn control_plane_customer_resource_plane_requires_isolated_file_backed_auth(
+    ) -> anyhow::Result<()> {
+        let directory = unique_test_dir("control-plane-customer-resource-plane")?;
+        let token_path = directory.join("controller.token");
+        let token = "customer-controller-secret-with-at-least-32-bytes";
+        write_private_test_secret(&token_path, token)?;
+        let issuer_public_key = IdentityKeyPair::generate().public_key_b64();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            issuer_public_key.as_str(),
+            "--customer-api-enabled",
+            "true",
+            "--customer-api-listen",
+            "127.0.0.1:19881",
+            "--customer-controller-listen",
+            "100.64.0.10:19882",
+            "--customer-controller-bearer-token-path",
+            token_path
+                .to_str()
+                .context("customer controller token path must be UTF-8")?,
+            "--customer-oidc-issuer-url",
+            "https://identity.example/realms/heteronetwork-customers",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        validate_control_plane_runtime_config(&args)?;
+        assert_eq!(
+            control_plane_customer_controller_bearer_token(&args)?.as_deref(),
+            Some(token)
+        );
+
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            issuer_public_key.as_str(),
+            "--customer-api-enabled",
+            "true",
+            "--customer-api-listen",
+            "0.0.0.0:8443",
+            "--customer-controller-listen",
+            "100.64.0.10:19882",
+            "--customer-controller-bearer-token-path",
+            token_path
+                .to_str()
+                .context("customer controller token path must be UTF-8")?,
+            "--customer-oidc-issuer-url",
+            "https://identity.example/realms/heteronetwork-customers",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        let Err(error) = validate_control_plane_runtime_config(&args) else {
+            anyhow::bail!("customer and management listeners were allowed to overlap");
+        };
+        assert!(error
+            .to_string()
+            .contains("management, customer, and customer controller listeners must be distinct"));
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_customer_resource_plane_ignores_dormant_quota_values() -> anyhow::Result<()> {
+        let issuer_public_key = IdentityKeyPair::generate().public_key_b64();
+        let cli = Cli::try_parse_from([
+            "iparsd",
+            "control-plane",
+            "--cluster-id",
+            "cluster-a",
+            "--issuer-node-id",
+            "issuer-a",
+            "--issuer-key-id",
+            "root",
+            "--issuer-public-key",
+            issuer_public_key.as_str(),
+            "--customer-default-project-quota",
+            "10001",
+        ])?;
+        let Command::ControlPlane(args) = cli.command else {
+            anyhow::bail!("expected control-plane command");
+        };
+        validate_control_plane_runtime_config(&args)
     }
 
     #[test]
@@ -31754,8 +32060,9 @@ exec sleep 60
             anyhow::bail!("expected agent command");
         };
         args.public_web_gateway_enabled = false;
-        let error = validate_agent_runtime_config(&args)
-            .expect_err("disabled public gateway must reject active service routes");
+        let Err(error) = validate_agent_runtime_config(&args) else {
+            anyhow::bail!("disabled public gateway accepted active service routes");
+        };
         assert!(error
             .to_string()
             .contains("public Web gateway service proxy options require"));

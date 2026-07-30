@@ -39,9 +39,9 @@ const MAX_DESIRED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STATUS_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DESIRED_PROJECTS: usize = 10_000;
 const MAX_DESIRED_RESOURCES: usize = 10_000;
+const DESIRED_PAGE_SIZE: usize = 1_000;
 const MAX_PUBLIC_ADDRESSES: usize = 32;
 const MAX_STATUS_MESSAGE_BYTES: usize = 2_048;
-const MAX_API_INGRESS_REPLICAS: u16 = 128;
 const HTTP_TIMEOUT_SECONDS: u64 = 15;
 
 #[derive(Debug, Clone)]
@@ -166,6 +166,23 @@ struct PublicServiceStatus {
 struct DesiredCustomerResources {
     projects: Vec<CustomerProject>,
     public_services: Vec<PublicServiceResource>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DesiredResourceKind {
+    Projects,
+    PublicServices,
+}
+
+impl DesiredResourceKind {
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::Projects => "projects",
+            Self::PublicServices => "public_services",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -274,23 +291,26 @@ impl CustomerResourceApi {
         for endpoint_index in self.endpoint_order() {
             let collection_url = &self.config.collection_urls[endpoint_index];
             let attempt = async {
-                let response = self
-                    .http
-                    .get(collection_url.clone())
-                    .bearer_auth(token)
-                    .send()
-                    .await
-                    .context("request failed")?;
-                let status = response.status();
-                let body = bounded_response_body(response, MAX_DESIRED_RESPONSE_BYTES).await?;
-                anyhow::ensure!(
-                    status.is_success(),
-                    "returned {status}: {}",
-                    response_error_message(&body)
-                );
-                let response: DesiredCustomerResources =
-                    serde_json::from_slice(&body).context("returned invalid desired-state JSON")?;
-                Ok::<_, anyhow::Error>(response)
+                let mut desired = DesiredCustomerResources {
+                    projects: Vec::new(),
+                    public_services: Vec::new(),
+                    next_cursor: None,
+                };
+                self.fetch_desired_pages(
+                    collection_url,
+                    token,
+                    DesiredResourceKind::Projects,
+                    &mut desired,
+                )
+                .await?;
+                self.fetch_desired_pages(
+                    collection_url,
+                    token,
+                    DesiredResourceKind::PublicServices,
+                    &mut desired,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(desired)
             }
             .await;
             match attempt {
@@ -312,6 +332,98 @@ impl CustomerResourceApi {
             "all customer resource endpoints failed while polling desired state: {}",
             failures.join("; ")
         )
+    }
+
+    async fn fetch_desired_pages(
+        &self,
+        collection_url: &Url,
+        token: &str,
+        kind: DesiredResourceKind,
+        desired: &mut DesiredCustomerResources,
+    ) -> Result<()> {
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut page_url = collection_url.clone();
+            {
+                let mut query = page_url.query_pairs_mut();
+                query.append_pair("kind", kind.query_value());
+                query.append_pair("limit", &DESIRED_PAGE_SIZE.to_string());
+                if let Some(cursor) = cursor.as_deref() {
+                    query.append_pair("cursor", cursor);
+                }
+            }
+            let response = self
+                .http
+                .get(page_url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .context("request failed")?;
+            let status = response.status();
+            let body = bounded_response_body(response, MAX_DESIRED_RESPONSE_BYTES).await?;
+            anyhow::ensure!(
+                status.is_success(),
+                "returned {status}: {}",
+                response_error_message(&body)
+            );
+            let mut page: DesiredCustomerResources =
+                serde_json::from_slice(&body).context("returned invalid desired-state JSON")?;
+            let next_cursor = page.next_cursor.take();
+            let last_id = match kind {
+                DesiredResourceKind::Projects => {
+                    anyhow::ensure!(
+                        page.public_services.is_empty(),
+                        "projects page unexpectedly contained public services"
+                    );
+                    anyhow::ensure!(
+                        page.projects.len() <= DESIRED_PAGE_SIZE,
+                        "projects page exceeded {DESIRED_PAGE_SIZE} entries"
+                    );
+                    let last_id = page
+                        .projects
+                        .last()
+                        .map(|project| project.project_id.clone());
+                    desired.projects.append(&mut page.projects);
+                    anyhow::ensure!(
+                        desired.projects.len() <= MAX_DESIRED_PROJECTS,
+                        "desired customer resource response exceeds {MAX_DESIRED_PROJECTS} projects"
+                    );
+                    last_id
+                }
+                DesiredResourceKind::PublicServices => {
+                    anyhow::ensure!(
+                        page.projects.is_empty(),
+                        "public-services page unexpectedly contained projects"
+                    );
+                    anyhow::ensure!(
+                        page.public_services.len() <= DESIRED_PAGE_SIZE,
+                        "public-services page exceeded {DESIRED_PAGE_SIZE} entries"
+                    );
+                    let last_id = page
+                        .public_services
+                        .last()
+                        .map(|resource| resource.resource_id.clone());
+                    desired.public_services.append(&mut page.public_services);
+                    anyhow::ensure!(
+                        desired.public_services.len() <= MAX_DESIRED_RESOURCES,
+                        "desired customer resource response exceeds {MAX_DESIRED_RESOURCES} resources"
+                    );
+                    last_id
+                }
+            };
+            let Some(next_cursor) = next_cursor else {
+                return Ok(());
+            };
+            anyhow::ensure!(
+                last_id.as_deref() == Some(next_cursor.as_str()),
+                "desired-state next_cursor did not match the final page item"
+            );
+            anyhow::ensure!(
+                cursor.as_deref() != Some(next_cursor.as_str()),
+                "desired-state pagination cursor did not advance"
+            );
+            cursor = Some(next_cursor);
+        }
     }
 
     async fn update_status(
@@ -1149,8 +1261,8 @@ fn validate_resource(resource: &PublicServiceResource) -> Result<()> {
         "backend_port must be greater than zero"
     );
     anyhow::ensure!(
-        (1..=MAX_API_INGRESS_REPLICAS).contains(&resource.spec.ingress_replicas),
-        "ingress_replicas must be between 1 and {MAX_API_INGRESS_REPLICAS}"
+        (1..=MAX_INGRESS_REPLICAS as u16).contains(&resource.spec.ingress_replicas),
+        "ingress_replicas must be between 1 and {MAX_INGRESS_REPLICAS}"
     );
     anyhow::ensure!(
         resource.status.public_addresses.len() <= MAX_PUBLIC_ADDRESSES,
@@ -1338,6 +1450,7 @@ fn bounded_message(message: &str) -> String {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use axum::extract::Query;
     use axum::routing::{get, put};
     use axum::{Json, Router};
     use k8s_openapi::api::core::v1::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};
@@ -1488,6 +1601,7 @@ mod tests {
         let desired = DesiredCustomerResources {
             projects: vec![project()],
             public_services: Vec::new(),
+            next_cursor: None,
         };
         validate_desired_resources(&desired).expect("project-only desired state");
         assert_eq!(
@@ -1508,6 +1622,7 @@ mod tests {
         let valid = DesiredCustomerResources {
             projects: vec![project()],
             public_services: vec![service.clone()],
+            next_cursor: None,
         };
         validate_desired_resources(&valid).expect("matching ownership");
 
@@ -1516,6 +1631,7 @@ mod tests {
         let error = validate_desired_resources(&DesiredCustomerResources {
             projects: vec![project()],
             public_services: vec![wrong_account],
+            next_cursor: None,
         })
         .expect_err("account ownership mismatch");
         assert!(error.to_string().contains("ownership does not match"));
@@ -1525,6 +1641,7 @@ mod tests {
         let error = validate_desired_resources(&DesiredCustomerResources {
             projects: vec![project()],
             public_services: vec![wrong_namespace],
+            next_cursor: None,
         })
         .expect_err("Namespace ownership mismatch");
         assert!(error.to_string().contains("ownership does not match"));
@@ -1534,6 +1651,7 @@ mod tests {
         let error = validate_desired_resources(&DesiredCustomerResources {
             projects: vec![project()],
             public_services: vec![missing_project],
+            next_cursor: None,
         })
         .expect_err("missing project");
         assert!(error.to_string().contains("references missing project"));
@@ -1548,6 +1666,7 @@ mod tests {
         let error = validate_desired_resources(&DesiredCustomerResources {
             projects: vec![first, second],
             public_services: Vec::new(),
+            next_cursor: None,
         })
         .expect_err("duplicate Namespace");
         assert!(error.to_string().contains("multiple projects"));
@@ -1599,11 +1718,71 @@ mod tests {
         assert!(second.projects.is_empty());
         assert!(second.public_services.is_empty());
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 4);
         assert_eq!(api.preferred_endpoint.load(Ordering::Relaxed), 1);
 
         first_task.abort();
         second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn desired_poll_consumes_bounded_cursor_pages() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            INTERNAL_PUBLIC_SERVICES_PATH,
+            get(move |Query(query): Query<BTreeMap<String, String>>| {
+                let calls = Arc::clone(&handler_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let kind = query.get("kind").map(String::as_str);
+                    let cursor = query.get("cursor").map(String::as_str);
+                    let project_id = match cursor {
+                        None => "prj_00000000000000000000000000000000",
+                        Some(_) => "prj_ffffffffffffffffffffffffffffffff",
+                    };
+                    let projects = if kind == Some("projects") {
+                        vec![serde_json::json!({
+                            "cluster_id": "cluster-a",
+                            "project_id": project_id,
+                            "account_id": "acct_0123456789abcdef0123456789abcdef",
+                            "name": if cursor.is_none() { "first" } else { "second" },
+                            "kubernetes_namespace": if cursor.is_none() {
+                                "hn-first-1234abcd"
+                            } else {
+                                "hn-second-1234abcd"
+                            },
+                            "created_at": "2026-07-30T00:00:00Z"
+                        })]
+                    } else {
+                        Vec::new()
+                    };
+                    Json(serde_json::json!({
+                        "projects": projects,
+                        "public_services": [],
+                        "next_cursor": if kind == Some("projects") && cursor.is_none() {
+                            Some(project_id)
+                        } else {
+                            None
+                        }
+                    }))
+                }
+            }),
+        );
+        let (url, task) = spawn_test_server(router).await;
+        let api = test_api(&[url]);
+        let desired = api
+            .desired_customer_resources("0123456789abcdef0123456789abcdef")
+            .await
+            .expect("paginated desired state");
+        assert_eq!(desired.projects.len(), 2);
+        assert_eq!(
+            desired.projects[1].project_id,
+            "prj_ffffffffffffffffffffffffffffffff"
+        );
+        assert!(desired.public_services.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        task.abort();
     }
 
     #[tokio::test]

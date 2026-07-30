@@ -7,7 +7,7 @@
     "build:webui-vendor": "node webui/build-mermaid.mjs",
     "test": "npm run test:webui && npm run test:webconsole",
     "test:webui": "node --test webui/app-mermaid.test.mjs webui/app-auth.test.mjs",
-    "test:webconsole": "node --test webui/webconsole-route.test.mjs"
+    "test:webconsole": "node --test webui/webconsole-route.test.mjs customerui/webconsole-customer-route.test.mjs customerui/app-session.test.mjs"
   },
   "devDependencies": {
     "esbuild": "0.28.1",

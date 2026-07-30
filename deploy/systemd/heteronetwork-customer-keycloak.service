@@ -1,0 +1,41 @@
+[Unit]
+Description=HeteroNetwork public customer Keycloak identity plane
+Wants=network-online.target
+After=network-online.target heteronetwork-customer-keycloak-database.service
+Requires=heteronetwork-customer-keycloak-database.service
+ConditionPathExists=/etc/heteronetwork/customer-keycloak/customer-keycloak.env
+ConditionPathExists=/opt/heteronetwork/libexec/customer-keycloak-start
+
+[Service]
+Type=simple
+User=heteronetwork-customer-keycloak
+Group=heteronetwork-customer-keycloak
+ExecStart=/opt/heteronetwork/libexec/customer-keycloak-start
+LoadCredential=db-password:/etc/heteronetwork/customer-keycloak/secrets/db.password
+LoadCredential=bootstrap-admin-password:/etc/heteronetwork/customer-keycloak/secrets/bootstrap-admin.password
+Restart=on-failure
+RestartSec=5s
+SuccessExitStatus=143 SIGTERM
+RestartPreventExitStatus=143 SIGTERM
+TimeoutStartSec=180s
+TimeoutStopSec=45s
+LimitNOFILE=65536
+Environment=JAVA_OPTS_KC_HEAP=-XX:MaxRAMPercentage=70.0
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/heteronetwork-customer-keycloak
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

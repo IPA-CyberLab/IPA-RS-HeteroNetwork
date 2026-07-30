@@ -5,6 +5,12 @@ Rust implementation of an operations-oriented P2P VPN / overlay network for Linu
 For a reproducible three-control-plane kubeadm deployment over the VPN underlay,
 see [Kubernetes HA over HeteroNetwork](docs/KUBERNETES_HA_UNDERLAY.md).
 
+For the public customer identity and resource plane, see
+[Customer Keycloak](docs/CUSTOMER_KEYCLOAK.md) and
+[Public customer resource plane](docs/CUSTOMER_RESOURCE_API.md). The separate
+public edge is documented in
+[Public customer console](docs/CUSTOMER_CONSOLE.md).
+
 The repository is being built toward a complete system rather than an MVP. The current baseline contains:
 
 - native desktop clients: a SwiftUI macOS menu-bar app backed by a Network
@@ -82,6 +88,13 @@ through their owning host and optional overlay-node identities, and lists
 infrastructure-only service hosts separately. The admin endpoints behind the UI are authenticated; node removal,
 path pinning, and policy updates are available from the browser. The UI is
 embedded in the Rust binary and does not require a Node.js build.
+
+The public customer console is a separate `/cloud/` application and uses a
+separate Keycloak realm, cookies, browser storage keys, BFF route allowlist,
+and customer API listener. It manages personal accounts, projects, quotas, and
+Kubernetes-backed public services without exposing `/v1/admin/*`. Customer
+tokens require the console `azp`, the resource API `aud`, the customer role,
+and exact issuer/subject binding.
 
 The UI supports explicit light/dark themes (with the operating-system preference
 as the first-run default) and English/Japanese locale selection. Both choices

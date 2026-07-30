@@ -1,0 +1,32 @@
+[Unit]
+Description=Reconcile the HeteroNetwork customer realm and clients
+Wants=network-online.target
+After=network-online.target heteronetwork-customer-keycloak.service
+Requires=heteronetwork-customer-keycloak.service
+ConditionPathExists=/etc/heteronetwork/customer-keycloak/customer-keycloak.env
+ConditionPathExists=/opt/heteronetwork/libexec/customer-keycloak-bootstrap.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/customer-keycloak-bootstrap.sh apply
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=180s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

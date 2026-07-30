@@ -1,0 +1,34 @@
+[Unit]
+Description=Provision the HeteroNetwork customer identity database
+Wants=network-online.target
+After=network-online.target heteronetwork-db-proxy.service
+Requires=heteronetwork-db-proxy.service
+Before=heteronetwork-customer-keycloak.service
+ConditionPathExists=/etc/heteronetwork/customer-keycloak/customer-keycloak.env
+ConditionPathExists=/opt/heteronetwork/libexec/customer-keycloak-node.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/customer-keycloak-node.sh provision-database
+RemainAfterExit=true
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=60s
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

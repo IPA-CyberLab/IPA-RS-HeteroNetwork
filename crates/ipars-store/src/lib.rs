@@ -1,3 +1,5 @@
+pub mod customer_resources;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
@@ -266,6 +268,7 @@ impl SqliteControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        customer_resources::migrate_sqlite_customer_resources(&self.pool).await?;
         Ok(())
     }
 }
@@ -1773,6 +1776,7 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
+        customer_resources::migrate_postgres_customer_resources(&mut transaction).await?;
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }
@@ -4655,10 +4659,12 @@ mod tests {
             vec![other_cluster]
         );
         for invalid_limit in [0, 65] {
-            let error = store_a
+            let Err(error) = store_a
                 .list_keycloak_candidates(&cluster_id, now, None, invalid_limit)
                 .await
-                .expect_err("invalid candidate query limit must fail");
+            else {
+                return Err("invalid candidate query limit unexpectedly succeeded".into());
+            };
             assert!(
                 matches!(error, ControlPlaneError::Store(message) if message.contains("between 1 and 64"))
             );
