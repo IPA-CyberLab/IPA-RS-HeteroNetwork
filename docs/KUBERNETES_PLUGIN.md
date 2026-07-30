@@ -316,8 +316,10 @@ kubectl apply -f examples/kubernetes-plugin/livekit-split.yaml
 ```
 
 LiveKit requires Redis for a distributed deployment and recommends direct host
-networking for its normal RTC path. See the upstream
-[Kubernetes deployment guide](https://docs.livekit.io/home/self-hosting/kubernetes)
+networking for its normal RTC path. The production deployment in
+[`deploy/kubernetes/livekit`](../deploy/kubernetes/livekit) provisions Redis
+Sentinel and generates the required Secrets. See the upstream
+[Kubernetes deployment guide](https://docs.livekit.io/transport/self-hosting/kubernetes/)
 and [port reference](https://docs.livekit.io/transport/self-hosting/ports-firewall/).
 
 ## LiveKit fully forwarded TURN profile

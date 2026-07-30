@@ -1,0 +1,42 @@
+architecture: replication
+
+auth:
+  enabled: true
+  existingSecret: livekit-redis-auth
+  existingSecretPasswordKey: redis-password
+
+image:
+  digest: sha256:08863c2c3f4e051fb6139b38fa223e9c13be5033326a59bead182860d899bf98
+  pullPolicy: IfNotPresent
+
+master:
+  persistence:
+    enabled: false
+
+replica:
+  replicaCount: 3
+  podAntiAffinityPreset: hard
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+sentinel:
+  enabled: true
+  masterSet: livekit
+  quorum: 2
+  image:
+    digest: sha256:ae75dd69c192a632bdeb21baa6721080be5b12347e52add922036398b47631da
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi

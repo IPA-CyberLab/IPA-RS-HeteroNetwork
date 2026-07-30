@@ -21,8 +21,6 @@ metadata:
 data:
   livekit.yaml: |
     port: 7880
-    log_level: info
-    key_file: /etc/livekit-secrets/keys.yaml
     redis:
       address: redis.livekit-forwarded.svc.cluster.local:6379
     rtc:
@@ -39,6 +37,8 @@ data:
       allow_restricted_peer_cidrs:
         - 10.244.0.0/16
         - 10.250.0.0/16
+    logging:
+      level: info
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -69,10 +69,12 @@ spec:
                     app.kubernetes.io/name: livekit
       containers:
         - name: livekit
-          image: livekit/livekit-server:v1.13.1
+          image: livekit/livekit-server:v1.13.4@sha256:189f7c81b704a36642bc5c7e2d3e1ae83744627c11978a23a251bf19fbec64e0
           args:
             - --config
             - /etc/livekit/livekit.yaml
+            - --key-file
+            - /etc/livekit-secrets/keys.yaml
           ports:
             - name: signal
               containerPort: 7880
