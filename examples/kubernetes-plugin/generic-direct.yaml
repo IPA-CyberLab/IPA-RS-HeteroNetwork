@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-direct
+  labels:
+    app.kubernetes.io/name: echo-direct
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: echo-direct
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: echo-direct
+        networking.heteronetwork.io/traffic-mode: direct
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: echo-direct
+      containers:
+        - name: http
+          image: nginxinc/nginx-unprivileged:1.27.5-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-direct
+  annotations:
+    networking.heteronetwork.io/traffic-mode: direct
+spec:
+  type: LoadBalancer
+  loadBalancerClass: heteronetwork.io/public
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: echo-direct
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
