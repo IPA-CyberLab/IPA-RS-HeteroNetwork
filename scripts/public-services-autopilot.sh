@@ -702,12 +702,14 @@ prepare_runtime_files() {
       "$stun_public_url"
     write_environment_entry HETERONETWORK_ADVERTISE_RELAY_URL \
       "$relay_public_url"
-    write_environment_entry HETERONETWORK_ADVERTISE_WEB_UI_URL "$public_https_url"
+    write_environment_entry HETERONETWORK_ADVERTISE_WEB_UI_URL \
+      "http://$vpn_ip:19088"
     write_environment_entry HETERONETWORK_WEB_UI_ENABLED true
     write_environment_entry HETERONETWORK_DYNAMIC_WEB_GATEWAY_ENABLED false
     write_environment_entry HETERONETWORK_NODE_ENROLLMENT_ENABLED false
     write_environment_entry HETERONETWORK_WEB_AUTH_PROVIDER keycloak
-    write_environment_entry HETERONETWORK_WEB_PUBLIC_URL "$public_https_url"
+    write_environment_entry HETERONETWORK_WEB_PUBLIC_URL \
+      "http://$vpn_ip:19088"
     write_environment_entry HETERONETWORK_WEB_OIDC_ISSUER_URL "$oidc_issuer_url"
     write_environment_entry HETERONETWORK_WEB_OIDC_CLIENT_ID "$oidc_client_id"
     write_environment_entry HETERONETWORK_WEB_OIDC_SCOPES "$oidc_scopes"

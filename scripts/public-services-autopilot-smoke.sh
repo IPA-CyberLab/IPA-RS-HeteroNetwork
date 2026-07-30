@@ -364,6 +364,10 @@ grep -q '^HETERONETWORK_LISTEN="10.250.0.4:19088"$' "$services_env" ||
   fail "automatic Control Plane listen address is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://10.250.0.4:19088"$' \
   "$services_env" || fail "automatic Control Plane advertisement is wrong"
+grep -q '^HETERONETWORK_ADVERTISE_WEB_UI_URL="http://10.250.0.4:19088"$' \
+  "$services_env" || fail "automatic Web UI advertisement escaped the VPN"
+grep -q '^HETERONETWORK_WEB_PUBLIC_URL="http://10.250.0.4:19088"$' \
+  "$services_env" || fail "automatic Web UI callback escaped the VPN"
 grep -q '^HETERONETWORK_SIGNAL_LISTEN="127.0.0.1:19443"$' "$services_env" ||
   fail "automatic Signal listen address is wrong"
 grep -q '^HETERONETWORK_STUN_LISTEN="0.0.0.0:19444"$' "$services_env" ||
@@ -586,8 +590,8 @@ grep -Fqx 'HETERONETWORK_ADVERTISE_STUN_URL="udp://[2001:4860:4860::8888]:19444"
   "$services_env" || fail "IPv6 STUN advertisement is wrong"
 grep -Fqx 'HETERONETWORK_ADVERTISE_RELAY_URL="udp://[2001:4860:4860::8888]:18445"' \
   "$services_env" || fail "IPv6 Relay advertisement is wrong"
-grep -Fqx 'HETERONETWORK_ADVERTISE_WEB_UI_URL="https://[2001:4860:4860::8888]"' \
-  "$services_env" || fail "IPv6 Web UI advertisement is wrong"
+grep -Fqx 'HETERONETWORK_ADVERTISE_WEB_UI_URL="http://10.250.0.4:19088"' \
+  "$services_env" || fail "IPv6 promotion exposed the Web UI publicly"
 grep -q '^HETERONETWORK_LISTEN="10.250.0.4:19088"$' "$services_env" ||
   fail "IPv6 promotion changed the overlay Control Plane listener"
 

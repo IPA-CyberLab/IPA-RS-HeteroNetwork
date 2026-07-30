@@ -764,6 +764,12 @@ grep -Fq \
   'http-request set-header X-Forwarded-Port 443 unless heteronetwork_private_console' \
   "$helper_contract" \
   || fail "trusted non-console backchannel requests no longer retain port 443"
+grep -Fq \
+  'hostname=http://console.heteronetwork.internal:${edge_listen_port}' \
+  "$helper_contract" \
+  || fail "Keycloak frontend hostname is not pinned to the VPN-only console"
+grep -Fq 'hostname-backchannel-dynamic=true' "$helper_contract" \
+  || fail "Keycloak backchannel URLs cannot follow private replica addresses"
 if grep -Fq 'start --optimized --import-realm' "$helper_contract"; then
   fail "normal Keycloak restart still imports realms"
 fi

@@ -126,6 +126,7 @@ const KEYCLOAK_AUTOPILOT_ARCHIVE_URL: &str =
 const KEYCLOAK_AUTOPILOT_ARCHIVE_SHA256: &str =
     "386b566bbea05527226e275c43e5cf6f218896ad2441ac4be5c39f1226772e8f";
 const KEYCLOAK_AUTOPILOT_EDGE_PORT: u16 = 18_079;
+const MANAGED_KEYCLOAK_OVERLAY_ORIGIN: &str = "http://console.heteronetwork.internal:18079";
 const NODE_ENROLLMENT_RELAY_UDP_PORT: u16 = 18_445;
 const NODE_ENROLLMENT_RELAY_HTTP_PORT: u16 = 18_447;
 const NODE_ENROLLMENT_RELAY_CLASSIFICATION_MAX_AGE_SECONDS: u64 = 45;
@@ -1569,6 +1570,7 @@ fn web_auth_plain_http_host_allowed(url: &Url) -> bool {
         Err(_) => {
             host.eq_ignore_ascii_case("localhost")
                 || host.to_ascii_lowercase().ends_with(".localhost")
+                || host.eq_ignore_ascii_case("console.heteronetwork.internal")
         }
     }
 }
@@ -4813,6 +4815,17 @@ fn managed_keycloak_edge_base_url(issuer_url: &str) -> Option<String> {
     ))
 }
 
+pub fn managed_keycloak_overlay_issuer_url(issuer_url: &str) -> Option<String> {
+    let issuer_url = validate_web_auth_base_url(issuer_url.to_string(), "OIDC issuer URL").ok()?;
+    let issuer_url = Url::parse(&issuer_url).ok()?;
+    let issuer_path = issuer_url.path().trim_end_matches('/');
+    let realm = issuer_path.strip_prefix("/realms/")?;
+    if realm.is_empty() || realm.contains('/') {
+        return None;
+    }
+    Some(format!("{MANAGED_KEYCLOAK_OVERLAY_ORIGIN}{issuer_path}"))
+}
+
 fn public_services_start_script(enrollment: &NodeEnrollmentConfig) -> String {
     if enrollment.public_services.is_none() {
         return String::new();
@@ -6897,6 +6910,24 @@ mod tests {
             Some("http://localhost:8080/realms/heteronetwork/protocol/openid-connect/auth/device")
         );
         assert_eq!(keycloak_config.login_endpoint, None);
+        assert!(WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "http://console.heteronetwork.internal:18079/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            None,
+            "openid".to_string(),
+        )
+        .is_ok());
+        assert!(WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "http://idp.heteronetwork.internal:18079/realms/heteronetwork".to_string(),
+            "heteronetwork-web".to_string(),
+            None,
+            None,
+            "openid".to_string(),
+        )
+        .is_err());
         let cognito = match WebUiAuthConfig::new(
             WebAuthProvider::Cognito,
             "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_example".to_string(),
@@ -6972,6 +7003,26 @@ mod tests {
             "openid".to_string(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn managed_keycloak_issuer_is_rewritten_to_the_private_overlay() {
+        assert_eq!(
+            managed_keycloak_overlay_issuer_url("https://203.0.113.10/realms/heteronetwork/")
+                .as_deref(),
+            Some("http://console.heteronetwork.internal:18079/realms/heteronetwork")
+        );
+        assert_eq!(
+            managed_keycloak_overlay_issuer_url(
+                "http://console.heteronetwork.internal:18079/realms/heteronetwork"
+            )
+            .as_deref(),
+            Some("http://console.heteronetwork.internal:18079/realms/heteronetwork")
+        );
+        assert!(managed_keycloak_overlay_issuer_url("https://idp.example/not-a-realm").is_none());
+        assert!(
+            managed_keycloak_overlay_issuer_url("https://idp.example/realms/a/nested").is_none()
+        );
     }
 
     #[tokio::test]

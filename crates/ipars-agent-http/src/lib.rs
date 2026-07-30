@@ -172,7 +172,6 @@ impl Default for PublicWebGatewayStatus {
 struct PublicWebGatewayAccess {
     token: Arc<str>,
     status: Arc<StdRwLock<PublicWebGatewayStatus>>,
-    oidc_proxy_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,7 +191,6 @@ impl std::fmt::Debug for PublicWebGatewayAccess {
             .debug_struct("PublicWebGatewayAccess")
             .field("token", &"[REDACTED]")
             .field("status", &self.status)
-            .field("oidc_proxy_enabled", &self.oidc_proxy_enabled)
             .finish()
     }
 }
@@ -280,12 +278,10 @@ impl AgentHttpState {
         mut self,
         token: String,
         status: Arc<StdRwLock<PublicWebGatewayStatus>>,
-        oidc_proxy_enabled: bool,
     ) -> Self {
         self.public_web_gateway = Some(PublicWebGatewayAccess {
             token: Arc::from(token),
             status,
-            oidc_proxy_enabled,
         });
         self
     }
@@ -2339,49 +2335,6 @@ async fn local_ui_config(
         Ok((candidate, mut config)) => {
             merge_reachable_control_plane_enrollment_capabilities(&state, &candidate, &mut config)
                 .await;
-            if is_public_gateway
-                && state
-                    .public_web_gateway
-                    .as_ref()
-                    .is_some_and(|access| access.oidc_proxy_enabled)
-            {
-                let public_url = state
-                    .public_web_gateway
-                    .as_ref()
-                    .and_then(|access| access.status.read().ok()?.url.clone());
-                let rewrite_result = public_url
-                    .ok_or_else(|| "public Web UI gateway is not active".to_string())
-                    .and_then(|public_url| {
-                        rewrite_keycloak_config_for_public_gateway(&mut config, &public_url)
-                    });
-                if let Err(error) = rewrite_result {
-                    return Json(json!({
-                        "enabled": false,
-                        "auth_enabled": false,
-                        "operator_token_enabled": false,
-                        "provider": null,
-                        "issuer_url": null,
-                        "client_id": null,
-                        "scopes": null,
-                        "authorization_endpoint": null,
-                        "device_authorization_endpoint": null,
-                        "device_login_endpoint": null,
-                        "device_login_poll_endpoint": null,
-                        "session_refresh_endpoint": null,
-                        "session_logout_endpoint": null,
-                        "token_endpoint": null,
-                        "logout_endpoint": null,
-                        "login_endpoint": null,
-                        "node_enrollment_enabled": false,
-                        "client_enrollment_enabled": false,
-                        "local_agent": true,
-                        "bootstrap_required": true,
-                        "selected_web_ui_endpoint": null,
-                        "cached_web_ui_endpoint_count": web_ui_candidates(&state).len(),
-                        "connection_error": truncate_error(&error)
-                    }));
-                }
-            }
             if let Some(config) = config.as_object_mut() {
                 config.insert("login_endpoint".to_string(), Value::Null);
                 if config
@@ -2510,50 +2463,6 @@ async fn merge_reachable_control_plane_enrollment_capabilities(
             Value::Bool(client_enrollment_enabled),
         );
     }
-}
-
-fn rewrite_keycloak_config_for_public_gateway(
-    config: &mut Value,
-    public_url: &str,
-) -> Result<(), String> {
-    if config.get("provider").and_then(Value::as_str) != Some("keycloak") {
-        return Ok(());
-    }
-    let public_url = reqwest::Url::parse(public_url)
-        .map_err(|error| format!("public Web UI gateway URL is invalid: {error}"))?;
-    let public_host = public_url
-        .host_str()
-        .ok_or_else(|| "public Web UI gateway URL omitted its host".to_string())?;
-    let object = config
-        .as_object_mut()
-        .ok_or_else(|| "Web UI configuration is not an object".to_string())?;
-    for field in [
-        "issuer_url",
-        "authorization_endpoint",
-        "device_authorization_endpoint",
-        "token_endpoint",
-        "logout_endpoint",
-    ] {
-        let Some(value) = object.get_mut(field) else {
-            continue;
-        };
-        let Some(endpoint) = value.as_str() else {
-            continue;
-        };
-        let mut endpoint = reqwest::Url::parse(endpoint)
-            .map_err(|error| format!("Keycloak {field} is invalid: {error}"))?;
-        endpoint
-            .set_scheme(public_url.scheme())
-            .map_err(|_| format!("cannot rewrite Keycloak {field} scheme"))?;
-        endpoint
-            .set_host(Some(public_host))
-            .map_err(|error| format!("cannot rewrite Keycloak {field} host: {error}"))?;
-        endpoint
-            .set_port(public_url.port())
-            .map_err(|_| format!("cannot rewrite Keycloak {field} port"))?;
-        *value = Value::String(endpoint.to_string());
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -5105,7 +5014,7 @@ mod tests {
         }));
         let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
             .enable_local_web_ui(true)
-            .with_public_web_gateway("gateway-secret".to_string(), status, true);
+            .with_public_web_gateway("gateway-secret".to_string(), status);
         let candidates = web_ui_candidates(&state);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].url, backend_url);
@@ -5157,13 +5066,16 @@ mod tests {
         let public_config: Value = serde_json::from_slice(
             &axum::body::to_bytes(public_config.into_body(), usize::MAX).await?,
         )?;
+        let expected_issuer = format!("{backend_url}/realms/heteronetwork");
+        let expected_token_endpoint =
+            format!("{backend_url}/realms/heteronetwork/protocol/openid-connect/token");
         assert_eq!(
             public_config.get("issuer_url").and_then(Value::as_str),
-            Some("https://203.0.113.10/realms/heteronetwork")
+            Some(expected_issuer.as_str())
         );
         assert_eq!(
             public_config.get("token_endpoint").and_then(Value::as_str),
-            Some("https://203.0.113.10/realms/heteronetwork/protocol/openid-connect/token")
+            Some(expected_token_endpoint.as_str())
         );
         assert_eq!(
             public_config
@@ -5302,7 +5214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_gateway_without_oidc_proxy_preserves_provider_origins(
+    async fn public_gateway_preserves_private_provider_origins(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (backend_url, _, backend_task) = spawn_web_ui_test_backend(StatusCode::OK).await?;
         let runtime = Arc::new(AgentRuntime::new(
@@ -5318,7 +5230,7 @@ mod tests {
         }));
         let state = AgentHttpState::with_control_plane_urls(runtime, vec![backend_url.clone()])
             .enable_local_web_ui(true)
-            .with_public_web_gateway("gateway-secret".to_string(), status, false);
+            .with_public_web_gateway("gateway-secret".to_string(), status);
         let app = router(state);
 
         let response = app
@@ -5378,7 +5290,7 @@ mod tests {
         }));
         let state =
             AgentHttpState::with_control_plane_urls(runtime, vec![control_plane_url.clone()])
-                .with_public_web_gateway("gateway-secret".to_string(), status, true);
+                .with_public_web_gateway("gateway-secret".to_string(), status);
         set_selected_web_ui(&state, Some(service_url.clone())).await;
         let listen: std::net::SocketAddr = "10.250.0.1:9781".parse()?;
         let app = overlay_web_ui_router(state.clone(), listen, "console.heteronetwork.internal");

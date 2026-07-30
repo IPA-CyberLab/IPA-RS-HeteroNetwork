@@ -505,7 +505,7 @@ struct ControlPlaneArgs {
     #[arg(
         long,
         env = "HETERONETWORK_DYNAMIC_WEB_GATEWAY_ENABLED",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set
     )]
     dynamic_web_gateway_enabled: bool,
@@ -942,22 +942,6 @@ struct AgentArgs {
         default_value = "/run/heteronetwork-gateway/admin.sock"
     )]
     public_web_gateway_admin_socket: PathBuf,
-    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM")]
-    public_web_gateway_oidc_upstream: Option<SocketAddr>,
-    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_PROBE_PATH")]
-    public_web_gateway_oidc_probe_path: Option<String>,
-    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_HOST")]
-    public_web_gateway_oidc_host: Option<String>,
-    #[arg(
-        long,
-        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_HOST"
-    )]
-    public_web_gateway_control_plane_host: Option<String>,
-    #[arg(
-        long,
-        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM"
-    )]
-    public_web_gateway_control_plane_upstream: Option<SocketAddr>,
     #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM")]
     public_web_gateway_signal_upstream: Option<SocketAddr>,
     #[arg(
@@ -2126,75 +2110,11 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.nat_discovery_failure_threshold > 0,
         "--nat-discovery-failure-threshold must be greater than zero"
     );
-    match (
-        args.public_web_gateway_oidc_upstream,
-        args.public_web_gateway_oidc_probe_path.as_deref(),
-    ) {
-        (Some(upstream), Some(probe_path)) => {
-            anyhow::ensure!(
-                upstream.ip().is_loopback() && upstream.port() > 0,
-                "--public-web-gateway-oidc-upstream must be a loopback address with a nonzero port"
-            );
-            anyhow::ensure!(
-                probe_path.starts_with("/realms/")
-                    && probe_path.ends_with("/.well-known/openid-configuration")
-                    && probe_path.len() <= 1024
-                    && !probe_path.contains(['?', '#'])
-                    && !probe_path.chars().any(char::is_control),
-                "--public-web-gateway-oidc-probe-path must be a bounded Keycloak realm discovery path"
-            );
-        }
-        (Some(_), None) => anyhow::bail!(
-            "--public-web-gateway-oidc-upstream requires --public-web-gateway-oidc-probe-path"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "--public-web-gateway-oidc-probe-path requires --public-web-gateway-oidc-upstream"
-        ),
-        (None, None) => {}
-    }
-    if let Some(host) = args.public_web_gateway_oidc_host.as_deref() {
-        anyhow::ensure!(
-            args.public_web_gateway_oidc_upstream.is_some(),
-            "--public-web-gateway-oidc-host requires --public-web-gateway-oidc-upstream"
-        );
-        anyhow::ensure!(
-            valid_public_gateway_dns_hostname(host),
-            "--public-web-gateway-oidc-host must be a valid ASCII DNS hostname"
-        );
-        anyhow::ensure!(
-            args.public_web_gateway_control_plane_host.as_deref() != Some(host),
-            "--public-web-gateway-oidc-host must differ from --public-web-gateway-control-plane-host"
-        );
-    }
     if args.public_web_gateway_enabled {
         anyhow::ensure!(
             args.public_web_gateway_admin_socket.is_absolute(),
             "--public-web-gateway-admin-socket must be an absolute path"
         );
-        match (
-            args.public_web_gateway_control_plane_host.as_deref(),
-            args.public_web_gateway_control_plane_upstream,
-        ) {
-            (Some(host), Some(upstream)) => {
-                anyhow::ensure!(
-                    valid_public_gateway_dns_hostname(host),
-                    "--public-web-gateway-control-plane-host must be a valid ASCII DNS hostname"
-                );
-                anyhow::ensure!(
-                    !upstream.ip().is_unspecified()
-                        && !upstream.ip().is_multicast()
-                        && upstream.port() > 0,
-                    "--public-web-gateway-control-plane-upstream must be a usable address with a nonzero port"
-                );
-            }
-            (Some(_), None) => anyhow::bail!(
-                "--public-web-gateway-control-plane-host requires --public-web-gateway-control-plane-upstream"
-            ),
-            (None, Some(_)) => anyhow::bail!(
-                "--public-web-gateway-control-plane-upstream requires --public-web-gateway-control-plane-host"
-            ),
-            (None, None) => {}
-        }
         for (upstream, option) in [
             (
                 args.public_web_gateway_signal_upstream,
@@ -2236,9 +2156,7 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         );
     } else {
         anyhow::ensure!(
-            args.public_web_gateway_control_plane_host.is_none()
-                && args.public_web_gateway_control_plane_upstream.is_none()
-                && args.public_web_gateway_signal_upstream.is_none()
+            args.public_web_gateway_signal_upstream.is_none()
                 && args.public_web_gateway_relay_admission_upstream.is_none(),
             "public Web gateway service proxy options require --public-web-gateway-enabled=true"
         );
@@ -5282,7 +5200,10 @@ fn control_plane_node_enrollment_config(
                 )
             })
             .collect(),
-        oidc_issuer_url: args.web_oidc_issuer_url.clone(),
+        oidc_issuer_url: ipars_control_plane_http::managed_keycloak_overlay_issuer_url(
+            &args.web_oidc_issuer_url,
+        )
+        .unwrap_or_else(|| args.web_oidc_issuer_url.clone()),
         oidc_client_id: args.web_oidc_client_id.clone(),
         oidc_auth_base_url: args.web_oidc_auth_base_url.clone(),
         oidc_backchannel_base_url: args.web_oidc_backchannel_base_url.clone(),
@@ -8942,22 +8863,14 @@ async fn run_agent(
             ..PublicWebGatewayStatus::default()
         }));
         let token = generate_public_web_gateway_token();
-        if let Some(node) = registered_node.as_ref() {
+        if registered_node.is_some() {
             background_tasks.push(start_public_web_gateway(
                 runtime.clone(),
                 status.clone(),
                 PublicWebGatewayConfig {
                     admin_socket: args.public_web_gateway_admin_socket.clone(),
-                    proxy_token: token.clone(),
-                    upstream: args.listen,
-                    oidc_upstream: args.public_web_gateway_oidc_upstream,
-                    oidc_probe_path: args.public_web_gateway_oidc_probe_path.clone(),
-                    oidc_host: args.public_web_gateway_oidc_host.clone(),
-                    control_plane_host: args.public_web_gateway_control_plane_host.clone(),
-                    control_plane_upstream: args.public_web_gateway_control_plane_upstream,
                     signal_upstream: args.public_web_gateway_signal_upstream,
                     relay_admission_upstream: args.public_web_gateway_relay_admission_upstream,
-                    cluster_id: node.cluster_id.clone(),
                     reconcile_interval: Duration::from_secs(
                         args.public_web_gateway_reconcile_interval_seconds,
                     ),
@@ -8976,7 +8889,8 @@ async fn run_agent(
                 None,
                 None,
                 Some(
-                    "node must be enrolled before its public Web UI can be advertised".to_string(),
+                    "node must be enrolled before its public connectivity gateway can start"
+                        .to_string(),
                 ),
             )
             .await;
@@ -9308,11 +9222,7 @@ async fn run_agent(
             .with_control_plane_http_client(http_client, agent_http_request_timeout(&args))
             .enable_local_web_ui(args.listen.ip().is_loopback());
     if let Some((token, status)) = public_web_gateway {
-        http_state = http_state.with_public_web_gateway(
-            token,
-            status,
-            args.public_web_gateway_oidc_upstream.is_some(),
-        );
+        http_state = http_state.with_public_web_gateway(token, status);
     }
     if !args.listen.ip().is_loopback() {
         tracing::warn!(
@@ -13735,16 +13645,8 @@ struct AgentApiErrorResponse {
 #[derive(Clone)]
 struct PublicWebGatewayConfig {
     admin_socket: PathBuf,
-    proxy_token: String,
-    upstream: SocketAddr,
-    oidc_upstream: Option<SocketAddr>,
-    oidc_probe_path: Option<String>,
-    oidc_host: Option<String>,
-    control_plane_host: Option<String>,
-    control_plane_upstream: Option<SocketAddr>,
     signal_upstream: Option<SocketAddr>,
     relay_admission_upstream: Option<SocketAddr>,
-    cluster_id: ClusterId,
     reconcile_interval: Duration,
     probe_timeout: Duration,
     classification_max_age: Duration,
@@ -13763,30 +13665,6 @@ fn public_web_gateway_url(ip: IpAddr) -> String {
     }
 }
 
-fn valid_public_gateway_dns_hostname(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host.is_ascii()
-        && !host.ends_with('.')
-        && host.parse::<IpAddr>().is_err()
-        && host.split('.').count() >= 2
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
 fn public_web_gateway_caddyfile(
     config: &PublicWebGatewayConfig,
     public_ip: Option<IpAddr>,
@@ -13802,12 +13680,10 @@ fn public_web_gateway_caddyfile(
             caddyfile,
             "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}"
         );
-        if let Some(oidc_upstream) = config.oidc_upstream {
-            let _ = writeln!(
-                caddyfile,
-                "\t@oidc path /realms/* /resources/* /robots.txt\n\thandle @oidc {{\n\t\treverse_proxy http://{oidc_upstream} {{\n\t\t\theader_up Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t\theader_up X-Forwarded-Port 443\n\t\t}}\n\t}}"
-            );
-        }
+        let _ = writeln!(
+            caddyfile,
+            "\t@health path /healthz\n\thandle @health {{\n\t\trespond 204\n\t}}"
+        );
         if let Some(signal_upstream) = config.signal_upstream {
             let _ = writeln!(
                 caddyfile,
@@ -13820,29 +13696,7 @@ fn public_web_gateway_caddyfile(
                 "\t@relay_admission path /v1/sessions\n\thandle @relay_admission {{\n\t\treverse_proxy http://{relay_admission_upstream}\n\t}}"
             );
         }
-        let _ = writeln!(
-            caddyfile,
-            "\t@web_ui path / /ui /ui/* /v1/web-ui/endpoints /v1/web-ui/auth/device /v1/web-ui/auth/device/poll /v1/web-ui/auth/refresh /v1/web-ui/auth/logout /v1/install/* /v1/heartbeat /v1/neighbors/query /v1/overlay-paths/query /v1/database-autopilot/nodes /v1/keycloak-autopilot/reconcile /v1/admin/* /v1/clients/join /v1/clients/peers/query /v1/clients/*\n\thandle @web_ui {{\n\t\treverse_proxy http://{} {{\n\t\t\theader_up X-HeteroNetwork-Gateway-Token {}\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}",
-            config.upstream, config.proxy_token
-        );
-        if let (Some(oidc_upstream), Some(host)) =
-            (config.oidc_upstream, config.oidc_host.as_deref())
-        {
-            let _ = writeln!(
-                caddyfile,
-                "\nhttps://{host} {{\n\tbind {public_ip}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\t@oidc path /realms/* /resources/* /robots.txt\n\thandle @oidc {{\n\t\treverse_proxy http://{oidc_upstream} {{\n\t\t\theader_up Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Host {{http.request.host}}\n\t\t\theader_up X-Forwarded-Proto https\n\t\t\theader_up X-Forwarded-Port 443\n\t\t}}\n\t}}\n\thandle {{\n\t\trespond 404\n\t}}\n}}"
-            );
-        }
-        if let Some((host, control_plane_upstream)) = config
-            .control_plane_host
-            .as_deref()
-            .zip(config.control_plane_upstream)
-        {
-            let _ = writeln!(
-                caddyfile,
-                "\nhttps://{host} {{\n\tbind {public_ip}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}\n\treverse_proxy http://{control_plane_upstream}\n}}"
-            );
-        }
+        let _ = writeln!(caddyfile, "\thandle {{\n\t\trespond 404\n\t}}\n}}");
     }
     caddyfile
 }
@@ -13867,97 +13721,24 @@ async fn load_public_web_gateway_caddyfile(
         .text()
         .await
         .unwrap_or_else(|error| format!("failed to read Caddy response: {error}"));
-    let detail = detail.replace(&config.proxy_token, "[REDACTED]");
     anyhow::bail!(
         "Caddy rejected gateway configuration with {status}: {}",
         detail.chars().take(512).collect::<String>()
     )
 }
 
-async fn probe_public_web_gateway(
-    client: &reqwest::Client,
-    url: &str,
-    cluster_id: &ClusterId,
-    oidc_probe_path: Option<&str>,
-) -> anyhow::Result<()> {
-    let config_url = format!("{}ui/config", url.trim_end_matches('/').to_string() + "/");
-    let mut response = client
-        .get(config_url)
-        .header(reqwest::header::ACCEPT, "application/json")
+async fn probe_public_web_gateway(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
+    let health_url = format!("{}healthz", url.trim_end_matches('/').to_string() + "/");
+    let response = client
+        .get(health_url)
         .send()
         .await
-        .context("public gateway probe failed")?
-        .error_for_status()
-        .context("public gateway probe was rejected")?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > 256 * 1024)
-    {
-        anyhow::bail!("public gateway configuration response is too large");
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("failed to read public gateway configuration")?
-    {
-        anyhow::ensure!(
-            bytes.len().saturating_add(chunk.len()) <= 256 * 1024,
-            "public gateway configuration response is too large"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    let body: serde_json::Value = serde_json::from_slice(&bytes)
-        .context("public gateway returned invalid configuration JSON")?;
+        .context("public connectivity gateway probe failed")?;
     anyhow::ensure!(
-        body.get("enabled").and_then(serde_json::Value::as_bool) == Some(true),
-        "public gateway Web UI is disabled"
+        response.status() == reqwest::StatusCode::NO_CONTENT,
+        "public connectivity gateway health returned HTTP {}",
+        response.status()
     );
-    anyhow::ensure!(
-        body.get("cluster_id").and_then(serde_json::Value::as_str) == Some(cluster_id.as_str()),
-        "public gateway returned a different cluster ID"
-    );
-    if let Some(probe_path) = oidc_probe_path {
-        let discovery_url = format!("{}{}", url.trim_end_matches('/'), probe_path);
-        let response = client
-            .get(discovery_url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .context("public gateway OIDC probe failed")?
-            .error_for_status()
-            .context("public gateway OIDC probe was rejected")?;
-        anyhow::ensure!(
-            response
-                .content_length()
-                .is_none_or(|length| length <= 256 * 1024),
-            "public gateway OIDC discovery response is too large"
-        );
-        let bytes = response
-            .bytes()
-            .await
-            .context("failed to read public gateway OIDC discovery response")?;
-        anyhow::ensure!(
-            bytes.len() <= 256 * 1024,
-            "public gateway OIDC discovery response is too large"
-        );
-        let body = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .context("public gateway OIDC discovery response is invalid")?;
-        let issuer = body
-            .get("issuer")
-            .and_then(serde_json::Value::as_str)
-            .context("public gateway OIDC discovery response omitted issuer")?;
-        let gateway_origin = reqwest::Url::parse(url)
-            .context("public gateway URL is invalid")?
-            .origin();
-        let issuer_origin = reqwest::Url::parse(issuer)
-            .context("public gateway OIDC issuer is invalid")?
-            .origin();
-        anyhow::ensure!(
-            issuer_origin == gateway_origin,
-            "public gateway OIDC issuer uses a different origin"
-        );
-    }
     Ok(())
 }
 
@@ -14020,11 +13801,8 @@ fn start_public_web_gateway(
         .build()
         .context("failed to build public Web UI probe client")?;
     Ok(tokio::spawn(async move {
-        // Keep "not reconciled yet" distinct from a reconciled standby
-        // configuration. Caddy survives Agent restarts, while the proxy token
-        // does not, so the first iteration must always replace any surviving
-        // configuration even when NAT classification currently has no public
-        // address.
+        // Caddy survives Agent restarts, so the first iteration must replace
+        // any stale configuration even when this node is currently private.
         let mut configured_ip: Option<Option<IpAddr>> = None;
         loop {
             let desired_ip =
@@ -14049,11 +13827,11 @@ fn start_public_web_gateway(
                         configured_ip = Some(desired_ip);
                         tracing::info!(
                             public_ip = ?desired_ip,
-                            "reconciled public Web UI gateway"
+                            "reconciled public connectivity gateway"
                         );
                     }
                     Err(error) => {
-                        tracing::warn!(%error, public_ip = ?desired_ip, "public Web UI gateway reconciliation failed");
+                        tracing::warn!(%error, public_ip = ?desired_ip, "public connectivity gateway reconciliation failed");
                         set_public_web_gateway_status(
                             &status,
                             PublicWebGatewayPhase::Error,
@@ -14068,14 +13846,7 @@ fn start_public_web_gateway(
 
             if configured_ip == Some(desired_ip) {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
-                    match probe_public_web_gateway(
-                        &probe_client,
-                        &url,
-                        &config.cluster_id,
-                        config.oidc_probe_path.as_deref(),
-                    )
-                    .await
-                    {
+                    match probe_public_web_gateway(&probe_client, &url).await {
                         Ok(()) => {
                             set_public_web_gateway_status(
                                 &status,
@@ -14093,7 +13864,7 @@ fn start_public_web_gateway(
                             tracing::warn!(
                                 %error,
                                 public_ip = %public_ip,
-                                "public Web UI gateway readiness probe failed"
+                                "public connectivity gateway readiness probe failed"
                             );
                             set_public_web_gateway_status(
                                 &status,
@@ -21280,19 +21051,10 @@ mod tests {
     #[test]
     fn public_web_gateway_caddyfile_has_standby_and_restricted_public_modes() {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
-        let upstream = SocketAddr::from(([127, 0, 0, 1], 9780));
         let mut config = PublicWebGatewayConfig {
             admin_socket: socket.to_path_buf(),
-            proxy_token: "secret".to_string(),
-            upstream,
-            oidc_upstream: None,
-            oidc_probe_path: None,
-            oidc_host: None,
-            control_plane_host: None,
-            control_plane_upstream: None,
             signal_upstream: None,
             relay_admission_upstream: None,
-            cluster_id: ClusterId::from_string("cluster-test"),
             reconcile_interval: Duration::from_secs(5),
             probe_timeout: Duration::from_secs(5),
             classification_max_age: Duration::from_secs(45),
@@ -21300,42 +21062,35 @@ mod tests {
         let standby = public_web_gateway_caddyfile(&config, None);
         assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
-        assert!(!standby.contains("secret"));
 
-        config.oidc_upstream = Some(SocketAddr::from(([127, 0, 0, 1], 18080)));
-        config.oidc_host = Some("idp.203-0-113-10.sslip.io".to_string());
-        config.control_plane_host = Some("hn.203-0-113-10.sslip.io".to_string());
-        config.control_plane_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18088)));
         config.signal_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18443)));
         config.relay_admission_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18447)));
         let public =
             public_web_gateway_caddyfile(&config, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
         assert!(public.contains("https://203.0.113.10"));
         assert!(public.contains("profile shortlived"));
-        assert!(public.contains("X-HeteroNetwork-Gateway-Token secret"));
-        assert!(public.contains("/v1/web-ui/auth/device/poll"));
-        assert!(public.contains("/v1/web-ui/auth/refresh"));
-        assert!(public.contains("/v1/web-ui/auth/logout"));
-        assert!(public.contains("/v1/install/*"));
-        assert!(public.contains("/v1/heartbeat"));
-        assert!(public.contains("/v1/neighbors/query"));
-        assert!(public.contains("/v1/overlay-paths/query"));
-        assert!(public.contains("/v1/database-autopilot/nodes"));
-        assert!(public.contains("/v1/keycloak-autopilot/reconcile"));
-        assert!(public.contains("/v1/admin/*"));
-        assert!(public.contains("/v1/clients/peers/query"));
-        assert!(public.contains("@oidc path /realms/* /resources/* /robots.txt"));
-        assert!(public.contains("reverse_proxy http://127.0.0.1:18080"));
-        assert!(public.contains("header_up X-Forwarded-Proto https"));
-        assert!(public.contains("https://idp.203-0-113-10.sslip.io"));
-        assert!(public.contains("https://hn.203-0-113-10.sslip.io"));
-        assert!(public.contains("reverse_proxy http://10.0.0.10:18088"));
+        assert!(public.contains("@health path /healthz"));
+        assert!(public.contains("respond 204"));
         assert!(public.contains("@signal path /v1/nodes/* /v1/paths/negotiate /v1/hole-punch"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18443"));
         assert!(public.contains("@relay_admission path /v1/sessions"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18447"));
-        assert!(!public.contains("/metrics"));
-        assert!(!public.contains("/v1/status"));
+        for private_path in [
+            "/ui",
+            "/realms/",
+            "/resources/",
+            "/v1/admin/",
+            "/v1/clients/",
+            "/v1/install/",
+            "/v1/heartbeat",
+            "/metrics",
+            "/v1/status",
+        ] {
+            assert!(
+                !public.contains(private_path),
+                "public gateway leaked private path {private_path}"
+            );
+        }
     }
 
     #[test]
@@ -21352,27 +21107,6 @@ mod tests {
             Some(Some(public_ip)),
             Some(public_ip)
         ));
-    }
-
-    #[test]
-    fn public_gateway_control_plane_host_requires_dns_name() {
-        assert!(valid_public_gateway_dns_hostname(
-            "hn.203-0-113-10.sslip.io"
-        ));
-        for invalid in [
-            "",
-            "localhost",
-            "203.0.113.10",
-            "-bad.example",
-            "bad-.example",
-            "bad_name.example",
-            "user@example.com",
-            "example.com:443",
-            "example.com/path",
-            "example.com.",
-        ] {
-            assert!(!valid_public_gateway_dns_hostname(invalid), "{invalid}");
-        }
     }
 
     #[test]
@@ -31996,28 +31730,12 @@ exec sleep 60
     }
 
     #[test]
-    fn disabled_public_gateway_accepts_valid_dormant_oidc_route() -> anyhow::Result<()> {
+    fn disabled_public_gateway_rejects_public_service_routes() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
             "agent",
-            "--public-web-gateway-oidc-upstream",
-            "127.0.0.1:18079",
-            "--public-web-gateway-oidc-probe-path",
-            "/realms/kakurizai/.well-known/openid-configuration",
-        ])?;
-        let Command::Agent(mut args) = cli.command else {
-            anyhow::bail!("expected agent command");
-        };
-        args.public_web_gateway_enabled = false;
-        validate_agent_runtime_config(&args)?;
-
-        let cli = Cli::try_parse_from([
-            "iparsd",
-            "agent",
-            "--public-web-gateway-control-plane-host",
-            "control.example.test",
-            "--public-web-gateway-control-plane-upstream",
-            "127.0.0.1:18088",
+            "--public-web-gateway-signal-upstream",
+            "127.0.0.1:19443",
         ])?;
         let Command::Agent(mut args) = cli.command else {
             anyhow::bail!("expected agent command");
