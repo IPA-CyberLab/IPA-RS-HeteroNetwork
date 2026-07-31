@@ -1,5 +1,4 @@
 pub mod bounded_topology;
-pub mod customer_resources;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -537,7 +536,6 @@ pub struct InMemoryStore {
     service_instances: RwLock<BTreeMap<(ClusterId, String), ServiceInstance>>,
     keycloak_candidates: RwLock<BTreeMap<(ClusterId, NodeId), KeycloakCandidateLease>>,
     client_gateway_selections: RwLock<BTreeMap<NodeId, ClientGatewaySelection>>,
-    customer_resources: Mutex<customer_resources::InMemoryCustomerResourceState>,
 }
 
 fn advance_in_memory_overlay_routing_epoch(

@@ -8,8 +8,6 @@ use axum_server::Handle;
 use ipars_k8s_controller::{
     managed_service, plan_assignments, public_nodes, ready_agent_nodes, ready_endpoint_nodes,
     ManagedService, ServiceAssignment, ServiceKey, ASSIGNED_NODES_ANNOTATION,
-    PUBLIC_SERVICE_GENERATION_LABEL, PUBLIC_SERVICE_MANAGED_BY_LABEL,
-    PUBLIC_SERVICE_MANAGED_BY_VALUE, PUBLIC_SERVICE_OBSERVED_GENERATION_ANNOTATION,
     RECONCILE_ERROR_ANNOTATION,
 };
 use k8s_openapi::api::core::v1::{LoadBalancerIngress, Node, Pod, Service};
@@ -19,7 +17,7 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use tokio::task::JoinHandle;
 
-use crate::{agones, customer_resources};
+use crate::agones;
 use crate::{webhook, ControllerArgs};
 
 pub async fn run(args: ControllerArgs) -> anyhow::Result<()> {
@@ -36,9 +34,7 @@ pub async fn run(args: ControllerArgs) -> anyhow::Result<()> {
             )
         })?;
     let args = Arc::new(args);
-    let reconcile_task = spawn_reconcile_loop(client.clone(), Arc::clone(&args));
-    let customer_resource_task =
-        customer_resources::spawn_reconcile_loop(client, Arc::clone(&args))?;
+    let reconcile_task = spawn_reconcile_loop(client, Arc::clone(&args));
     let handle = Handle::new();
     let server = axum_server::bind_rustls(args.webhook_bind, tls)
         .handle(handle.clone())
@@ -48,7 +44,6 @@ pub async fn run(args: ControllerArgs) -> anyhow::Result<()> {
     tracing::info!(
         bind = %args.webhook_bind,
         load_balancer_class = %args.load_balancer_class,
-        customer_resources_enabled = customer_resource_task.is_some(),
         "Kubernetes controller and admission webhook started"
     );
 
@@ -66,10 +61,6 @@ pub async fn run(args: ControllerArgs) -> anyhow::Result<()> {
     }
     reconcile_task.abort();
     let _ = reconcile_task.await;
-    if let Some(task) = customer_resource_task {
-        task.abort();
-        let _ = task.await;
-    }
     Ok(())
 }
 
@@ -193,23 +184,26 @@ async fn reconcile_service(
         current_annotations.and_then(|annotations| annotations.get(ASSIGNED_NODES_ANNOTATION));
     let current_error =
         current_annotations.and_then(|annotations| annotations.get(RECONCILE_ERROR_ANNOTATION));
-    let resource_generation = service.metadata.labels.as_ref().and_then(|labels| {
-        if labels
-            .get(PUBLIC_SERVICE_MANAGED_BY_LABEL)
-            .is_some_and(|value| value == PUBLIC_SERVICE_MANAGED_BY_VALUE)
-        {
-            labels.get(PUBLIC_SERVICE_GENERATION_LABEL)
-        } else {
-            None
-        }
-    });
-    let current_observed_generation = current_annotations
-        .and_then(|annotations| annotations.get(PUBLIC_SERVICE_OBSERVED_GENERATION_ANNOTATION));
 
-    let metadata_needs_patch = current_assigned.map(String::as_str) != Some(assigned_json.as_str())
+    if current_assigned.map(String::as_str) != Some(assigned_json.as_str())
         || current_error.map(String::as_str) != assignment.error.as_deref()
-        || resource_generation.map(String::as_str)
-            != current_observed_generation.map(String::as_str);
+    {
+        let metadata_patch = json!({
+            "metadata": {
+                "annotations": {
+                    ASSIGNED_NODES_ANNOTATION: assigned_json,
+                    RECONCILE_ERROR_ANNOTATION: assignment.error,
+                }
+            }
+        });
+        api.patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(&metadata_patch),
+        )
+        .await
+        .with_context(|| format!("failed to patch Service {namespace}/{name} annotations"))?;
+    }
 
     let desired_ingress = assignment
         .nodes
@@ -227,26 +221,7 @@ async fn reconcile_service(
         .and_then(|status| status.ingress.as_ref())
         .cloned()
         .unwrap_or_default();
-    let status_needs_patch = !ingress_equal(&current_ingress, &desired_ingress);
-    let clear_observed_generation = resource_generation.is_some()
-        && resource_generation.map(String::as_str)
-            == current_observed_generation.map(String::as_str)
-        && (metadata_needs_patch || status_needs_patch);
-    if clear_observed_generation {
-        let marker_patch = json!({
-            "metadata": {
-                "annotations": {
-                    PUBLIC_SERVICE_OBSERVED_GENERATION_ANNOTATION: Option::<String>::None,
-                }
-            }
-        });
-        api.patch(&name, &PatchParams::default(), &Patch::Merge(&marker_patch))
-            .await
-            .with_context(|| {
-                format!("failed to clear Service {namespace}/{name} reconciliation marker")
-            })?;
-    }
-    if status_needs_patch {
+    if !ingress_equal(&current_ingress, &desired_ingress) {
         let status_patch = json!({
             "status": {
                 "loadBalancer": {
@@ -257,24 +232,6 @@ async fn reconcile_service(
         api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&status_patch))
             .await
             .with_context(|| format!("failed to patch Service {namespace}/{name} status"))?;
-    }
-    if metadata_needs_patch || clear_observed_generation {
-        let metadata_patch = json!({
-            "metadata": {
-                "annotations": {
-                    ASSIGNED_NODES_ANNOTATION: assigned_json,
-                    RECONCILE_ERROR_ANNOTATION: assignment.error,
-                    PUBLIC_SERVICE_OBSERVED_GENERATION_ANNOTATION: resource_generation,
-                }
-            }
-        });
-        api.patch(
-            &name,
-            &PatchParams::default(),
-            &Patch::Merge(&metadata_patch),
-        )
-        .await
-        .with_context(|| format!("failed to patch Service {namespace}/{name} annotations"))?;
     }
     Ok(())
 }

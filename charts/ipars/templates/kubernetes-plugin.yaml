@@ -2,7 +2,6 @@
 {{- include "heteronetwork.validateKubernetesPlugin" . -}}
 {{- $pluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
 {{- if $pluginEnabled -}}
-{{- $customerResourcesEnabled := eq (printf "%v" .Values.kubernetesPlugin.customerResources.enabled) "true" -}}
 {{- $controllerName := include "heteronetwork.kubernetesPluginControllerName" . -}}
 {{- $tlsSecretName := include "heteronetwork.kubernetesPluginTlsSecretName" . -}}
 {{- $imageRepository := printf "%v" .Values.image.repository -}}
@@ -157,16 +156,6 @@ spec:
             - {{ .Values.kubernetesPlugin.agones.portRangeEnd | quote }}
             - --enable-agones-integration
             - {{ .Values.kubernetesPlugin.agones.enabled | quote }}
-            {{- if $customerResourcesEnabled }}
-            {{- range .Values.kubernetesPlugin.customerResources.internalUrls }}
-            - --customer-resource-internal-url
-            - {{ . | quote }}
-            {{- end }}
-            - --customer-resource-api-bearer-token-file
-            - /var/run/secrets/heteronetwork/customer-resource/token
-            - --customer-resource-poll-interval-seconds
-            - {{ .Values.kubernetesPlugin.customerResources.pollIntervalSeconds | quote }}
-            {{- end }}
           ports:
             - name: webhook
               containerPort: {{ $webhookContainerPort }}
@@ -229,25 +218,11 @@ spec:
             - name: webhook-tls
               mountPath: /tls
               readOnly: true
-            {{- if $customerResourcesEnabled }}
-            - name: customer-resource-api-token
-              mountPath: /var/run/secrets/heteronetwork/customer-resource
-              readOnly: true
-            {{- end }}
       volumes:
         - name: webhook-tls
           secret:
             secretName: {{ $tlsSecretName }}
             defaultMode: 0440
-        {{- if $customerResourcesEnabled }}
-        - name: customer-resource-api-token
-          secret:
-            secretName: {{ .Values.kubernetesPlugin.customerResources.bearerTokenSecret.name | quote }}
-            defaultMode: 0440
-            items:
-              - key: {{ .Values.kubernetesPlugin.customerResources.bearerTokenSecret.key | quote }}
-                path: token
-        {{- end }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

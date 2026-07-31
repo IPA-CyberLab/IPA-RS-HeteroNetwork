@@ -126,43 +126,6 @@ Signed heartbeat, Signal registration, and path-negotiation reports refresh the 
 
 Multi-server STUN probing skips unavailable endpoints while retaining successful observations from the same bound socket, and selects a responding server for filtering probes. Control Plane, Signal, and STUN replicas must use independent failure domains or network namespaces: processes sharing a failed namespace can remain scheduled while every service socket in that namespace is unreachable.
 
-## Public Customer Resource Plane
-
-The public customer plane is a separate security domain from HeteroNetwork
-operations. Its Keycloak replicas use realm `heteronetwork-customers`, a
-dedicated PostgreSQL database/schema/role, and a public HTTPS issuer. Operator
-Keycloak remains reachable only through the overlay and its tokens are never
-accepted by customer routes.
-
-Each enabled Control Plane serves three independent routers and listeners:
-management, public customer API, and internal Kubernetes controller API. The
-customer BFF publishes only `/cloud/*` and `/v1/customer/*`; it has separate
-cookies and browser storage, cannot proxy `/v1/admin/*`, and requires an exact
-issuer, console `azp`, API `aud`, customer realm role, and UserInfo subject.
-The internal controller API uses an independent systemd/Kubernetes credential
-and is never exposed through the public BFF.
-
-The durable hierarchy is:
-
-```text
-exact Keycloak (issuer, subject)
-  -> personal account and quota
-  -> project and generated Kubernetes Namespace
-  -> direct or forwarded public service
-```
-
-Keycloak roles provide only coarse application admission. Account ownership
-and every project/service lookup or mutation are enforced by the shared
-PostgreSQL resource store. The `org-admin` role does not grant global resource
-access; organization membership requires a future persisted membership model.
-
-The Kubernetes controller polls all configured internal Control Plane
-endpoints with failover, creates only explicitly owned Namespaces and facade
-Services, and reports generation-checked status. Direct services use local
-external traffic policy; forwarded services permit cluster forwarding. Public
-addresses are node-owned ingress addresses, not floating VIPs, so DNS or
-clients must retry a surviving address after a public node failure.
-
 ## VPN IP Allocation
 
 The default pool is `10.250.0.0/16`. The former `100.64.0.0/10` default overlaps the CGNAT range used by Tailscale and similar host overlays, whose anti-spoofing rules correctly reject packets from that source range on `heteronetwork0`. Deployments must select a pool that does not overlap host, container, Kubernetes, cloud VPC, or other overlay routes. IP allocation is explicit and stored as durable lease state. Reclaiming a lease requires node removal, token/policy revocation, or administrative reassignment. `DELETE /v1/nodes/{node_id}` requires a fresh node-identity signature, removes the durable node record, clears the node's health sample and pair-scoped path records, and resets in-process allocation scanning so the released VPN IP can be reused if it is still inside the configured pool. Agents do not self-assign overlay IPs. On registration, the control plane reads existing node leases from the store and skips already assigned VPN IPs before allocating the next address; SQL stores also maintain a VPN IP uniqueness index as a last-resort guard for restarted or overlapping control-plane processes. If the store reports a VPN IP uniqueness collision during insert, registration refreshes the lease view and retries allocation so concurrent control-plane instances converge on the next free address instead of surfacing a transient join failure.

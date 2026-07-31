@@ -1,5 +1,3 @@
-pub mod customer_resources;
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
@@ -268,7 +266,6 @@ impl SqliteControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
-        customer_resources::migrate_sqlite_customer_resources(&self.pool).await?;
         Ok(())
     }
 }
@@ -1776,7 +1773,6 @@ impl PostgresControlPlaneStore {
             )
             .await
             .map_err(sql_error)?;
-        customer_resources::migrate_postgres_customer_resources(&mut transaction).await?;
         transaction.commit().await.map_err(sql_error)?;
         Ok(())
     }

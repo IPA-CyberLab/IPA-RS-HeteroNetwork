@@ -110,53 +110,6 @@ placement. Both are required for direct mode so that
 `externalTrafficPolicy: Local` cannot select a public IP owner with no eligible
 local endpoint.
 
-## Customer-managed public services
-
-The public customer resource plane can create the managed `LoadBalancer`
-Service contract on behalf of a customer. Enable its controller loop with the
-same bearer credential installed on the control-plane replicas:
-
-```yaml
-kubernetesPlugin:
-  enabled: true
-  customerResources:
-    enabled: true
-    internalUrls:
-      - http://10.250.0.4:19882
-      - http://10.250.0.5:19882
-      - http://10.250.0.6:19882
-    pollIntervalSeconds: 15
-    bearerTokenSecret:
-      name: heteronetwork-customer-controller
-      key: token
-```
-
-Create that Secret out of band in the chart release Namespace. The controller
-mounts only the selected key and does not receive Kubernetes API permission to
-read arbitrary Secrets. It fails over across the configured internal URLs and
-does not expose those controller endpoints to customers.
-
-Each customer project gets a deterministic Namespace with durable cluster,
-account, and project ownership annotations. The controller creates a missing
-Namespace but refuses to adopt an existing Namespace whose ownership metadata
-does not match exactly. Removing a project does not delete its Namespace or
-unrelated workload objects.
-
-A public-service resource names an existing backend Service in its project
-Namespace. The backend must have a non-empty selector and a matching
-protocol/port. The controller leaves it unchanged and creates a separate,
-owned facade Service that copies the selector and target port and applies the
-class, mode, public port, and ingress replica request. Deleting the resource
-removes only that facade.
-
-For direct mode, the workload's Pod template still needs the `direct` label
-described above. The customer controller does not rewrite a Deployment,
-StatefulSet, Agones Fleet, or Pod placement policy. Forwarded mode does not
-require that placement label.
-
-See [Public customer resource plane](CUSTOMER_RESOURCE_API.md) for the customer
-API, account/project model, controller credential, and status contract.
-
 ## Public address eligibility
 
 The per-node reporter correlates the Kubernetes node with its HeteroNetwork

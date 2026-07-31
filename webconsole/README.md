@@ -42,27 +42,3 @@ Read endpoints allow `heteronetwork-admin`, `heteronetwork-operator`, and
 `heteronetwork-admin`. An optional email allowlist is an additional
 restriction and never bypasses those roles. The standalone server does not
 synthesize state or maintain a second copy of the control-plane data.
-
-## Public customer mode
-
-Customer mode serves `customerui/` at `/cloud/` and proxies only
-`/v1/customer/*`. It does not expose admin, policy, or metrics routes:
-
-```sh
-HOST=127.0.0.1 \
-PORT=28088 \
-HETERONETWORK_CONSOLE_MODE=customer \
-HETERONETWORK_CUSTOMER_WEB_PUBLIC_URL=https://console.example.com \
-HETERONETWORK_CUSTOMER_API_URL=http://127.0.0.1:19881 \
-HETERONETWORK_CUSTOMER_OIDC_ISSUER_URL=https://identity.example.com/realms/heteronetwork-customers \
-HETERONETWORK_CUSTOMER_OIDC_CLIENT_ID=heteronetwork-customer-console \
-HETERONETWORK_CUSTOMER_OIDC_AUDIENCE=heteronetwork-customer-api \
-node webconsole/server.mjs
-```
-
-All three customer-specific URLs are mandatory. Customer mode does not fall
-back to operator issuer or upstream settings. Tokens require exact issuer,
-console `azp`, API `aud`, matching UserInfo subject, and the
-`heteronetwork-customer` realm role. The callback cookie, refresh cookie,
-access-token storage key, and static/API route allowlists are distinct from
-operator mode.

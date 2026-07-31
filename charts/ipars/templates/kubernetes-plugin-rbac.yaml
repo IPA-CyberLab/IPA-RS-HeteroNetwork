@@ -3,7 +3,6 @@
 {{- $pluginEnabled := eq (printf "%v" .Values.kubernetesPlugin.enabled) "true" -}}
 {{- $rbacCreate := eq (printf "%v" .Values.rbac.create) "true" -}}
 {{- if and $pluginEnabled $rbacCreate -}}
-{{- $customerResourcesEnabled := eq (printf "%v" .Values.kubernetesPlugin.customerResources.enabled) "true" -}}
 {{- $controllerName := include "heteronetwork.kubernetesPluginControllerName" . -}}
 {{- $reporterName := printf "%s-node-reporter" $controllerName -}}
 apiVersion: rbac.authorization.k8s.io/v1
@@ -69,21 +68,10 @@ rules:
       - get
       - list
       - patch
-      {{- if or $customerResourcesEnabled (eq (printf "%v" .Values.kubernetesPlugin.agones.enabled) "true") }}
+      {{- if eq (printf "%v" .Values.kubernetesPlugin.agones.enabled) "true" }}
       - create
       - delete
       {{- end }}
-  {{- if $customerResourcesEnabled }}
-  - apiGroups:
-      - ""
-    resources:
-      - namespaces
-    verbs:
-      - get
-      - list
-      - create
-      - patch
-  {{- end }}
   - apiGroups:
       - ""
     resources:
