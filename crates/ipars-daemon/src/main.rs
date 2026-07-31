@@ -13812,9 +13812,13 @@ fn public_web_gateway_caddyfile(
     extra: &PublicWebGatewayExtraConfig,
 ) -> String {
     let mut caddyfile = format!(
-        "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n}}\n",
+        "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n",
         config.admin_socket.display()
     );
+    if let Some(public_ip) = public_ip {
+        let _ = writeln!(caddyfile, "\tdefault_bind {public_ip}");
+    }
+    caddyfile.push_str("}\n");
     if let Some(public_ip) = public_ip {
         let site = public_web_gateway_url(public_ip);
         let site = site.trim_end_matches('/');
@@ -21266,6 +21270,7 @@ mod tests {
             &extra,
         );
         assert!(public.contains("https://203.0.113.10"));
+        assert!(public.contains("default_bind 203.0.113.10"));
         assert!(public.contains("profile shortlived"));
         assert!(public.contains("@health path /healthz"));
         assert!(public.contains("respond 204"));

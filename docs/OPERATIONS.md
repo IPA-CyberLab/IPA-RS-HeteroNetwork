@@ -323,6 +323,9 @@ The Agent caps the file at 256 KiB, validates its ownership and permissions,
 and reloads Caddy when the content digest changes. Extra sites are loaded only
 while the node has a fresh public classification; they are withdrawn together
 with the dynamic gateway when that classification becomes private or stale.
+The Agent applies the classified public address as Caddy's `default_bind`, so
+extra sites share the same managed listener without repeating a `bind`
+directive.
 The file is trusted configuration and must not be writable by an application
 pod or service account.
 
