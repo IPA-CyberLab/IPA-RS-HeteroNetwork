@@ -180,6 +180,7 @@ const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES: u64 = 256 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -942,6 +943,8 @@ struct AgentArgs {
         default_value = "/run/heteronetwork-gateway/admin.sock"
     )]
     public_web_gateway_admin_socket: PathBuf,
+    #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE")]
+    public_web_gateway_extra_caddyfile: Option<PathBuf>,
     #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM")]
     public_web_gateway_signal_upstream: Option<SocketAddr>,
     #[arg(
@@ -2115,6 +2118,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.public_web_gateway_admin_socket.is_absolute(),
             "--public-web-gateway-admin-socket must be an absolute path"
         );
+        if let Some(path) = args.public_web_gateway_extra_caddyfile.as_deref() {
+            read_public_web_gateway_extra_caddyfile(path)
+                .context("--public-web-gateway-extra-caddyfile is not usable")?;
+        }
         for (upstream, option) in [
             (
                 args.public_web_gateway_signal_upstream,
@@ -2157,7 +2164,8 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     } else {
         anyhow::ensure!(
             args.public_web_gateway_signal_upstream.is_none()
-                && args.public_web_gateway_relay_admission_upstream.is_none(),
+                && args.public_web_gateway_relay_admission_upstream.is_none()
+                && args.public_web_gateway_extra_caddyfile.is_none(),
             "public Web gateway service proxy options require --public-web-gateway-enabled=true"
         );
     }
@@ -8884,6 +8892,7 @@ async fn run_agent(
                 status.clone(),
                 PublicWebGatewayConfig {
                     admin_socket: args.public_web_gateway_admin_socket.clone(),
+                    extra_caddyfile: args.public_web_gateway_extra_caddyfile.clone(),
                     signal_upstream: args.public_web_gateway_signal_upstream,
                     relay_admission_upstream: args.public_web_gateway_relay_admission_upstream,
                     reconcile_interval: Duration::from_secs(
@@ -13660,11 +13669,134 @@ struct AgentApiErrorResponse {
 #[derive(Clone)]
 struct PublicWebGatewayConfig {
     admin_socket: PathBuf,
+    extra_caddyfile: Option<PathBuf>,
     signal_upstream: Option<SocketAddr>,
     relay_admission_upstream: Option<SocketAddr>,
     reconcile_interval: Duration,
     probe_timeout: Duration,
     classification_max_age: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublicWebGatewayExtraConfig {
+    contents: String,
+    digest: [u8; 32],
+}
+
+fn empty_public_web_gateway_extra_config() -> PublicWebGatewayExtraConfig {
+    PublicWebGatewayExtraConfig {
+        contents: String::new(),
+        digest: Sha256::digest([]).into(),
+    }
+}
+
+fn read_public_web_gateway_extra_caddyfile(
+    path: &Path,
+) -> anyhow::Result<PublicWebGatewayExtraConfig> {
+    anyhow::ensure!(
+        path.is_absolute() && !path_has_special_component(path),
+        "public Web gateway extra Caddyfile path {} must be absolute and must not contain '.' or '..'",
+        path.display()
+    );
+    let metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("failed to inspect extra Caddyfile {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "public Web gateway extra Caddyfile {} must be a regular file and not a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES,
+        "public Web gateway extra Caddyfile {} exceeds {MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES} bytes",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        ensure_runtime_path_owner_trusted(
+            "public Web gateway extra Caddyfile",
+            "at",
+            path,
+            metadata.uid(),
+            effective_uid,
+        )?;
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o022 == 0,
+            "public Web gateway extra Caddyfile at {} must not be group- or world-writable",
+            path.display()
+        );
+        let parent = path
+            .parent()
+            .context("public Web gateway extra Caddyfile must have a parent directory")?;
+        ensure_runtime_directory_chain_has_no_symlinks(
+            "public Web gateway extra Caddyfile",
+            parent,
+        )?;
+        let parent_metadata = parent.metadata().with_context(|| {
+            format!(
+                "failed to inspect public Web gateway extra Caddyfile parent {}",
+                parent.display()
+            )
+        })?;
+        ensure_runtime_parent_directory_safe(
+            "public Web gateway extra Caddyfile",
+            parent,
+            &parent_metadata,
+            true,
+            effective_uid,
+        )?;
+        let mut ancestor = parent.parent();
+        while let Some(directory) = ancestor {
+            let ancestor_metadata = directory.metadata().with_context(|| {
+                format!(
+                    "failed to inspect public Web gateway extra Caddyfile ancestor {}",
+                    directory.display()
+                )
+            })?;
+            ensure_runtime_parent_directory_safe(
+                "public Web gateway extra Caddyfile",
+                directory,
+                &ancestor_metadata,
+                false,
+                effective_uid,
+            )?;
+            ancestor = directory.parent();
+        }
+    }
+
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open extra Caddyfile {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read extra Caddyfile {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES,
+        "public Web gateway extra Caddyfile {} exceeds {MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES} bytes",
+        path.display()
+    );
+    let contents = String::from_utf8(bytes)
+        .with_context(|| format!("extra Caddyfile {} must be UTF-8", path.display()))?;
+    anyhow::ensure!(
+        !contents.contains('\0'),
+        "extra Caddyfile {} must not contain NUL bytes",
+        path.display()
+    );
+    let digest = Sha256::digest(contents.as_bytes()).into();
+    Ok(PublicWebGatewayExtraConfig { contents, digest })
+}
+
+fn load_public_web_gateway_extra_config(
+    config: &PublicWebGatewayConfig,
+) -> anyhow::Result<PublicWebGatewayExtraConfig> {
+    match config.extra_caddyfile.as_deref() {
+        Some(path) => read_public_web_gateway_extra_caddyfile(path),
+        None => Ok(empty_public_web_gateway_extra_config()),
+    }
 }
 
 fn public_web_gateway_url(ip: IpAddr) -> String {
@@ -13677,6 +13809,7 @@ fn public_web_gateway_url(ip: IpAddr) -> String {
 fn public_web_gateway_caddyfile(
     config: &PublicWebGatewayConfig,
     public_ip: Option<IpAddr>,
+    extra: &PublicWebGatewayExtraConfig,
 ) -> String {
     let mut caddyfile = format!(
         "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n}}\n",
@@ -13706,6 +13839,11 @@ fn public_web_gateway_caddyfile(
             );
         }
         let _ = writeln!(caddyfile, "\thandle {{\n\t\trespond 404\n\t}}\n}}");
+        if !extra.contents.trim().is_empty() {
+            caddyfile.push('\n');
+            caddyfile.push_str(extra.contents.trim());
+            caddyfile.push('\n');
+        }
     }
     caddyfile
 }
@@ -13714,11 +13852,12 @@ async fn load_public_web_gateway_caddyfile(
     client: &reqwest::Client,
     config: &PublicWebGatewayConfig,
     public_ip: Option<IpAddr>,
+    extra: &PublicWebGatewayExtraConfig,
 ) -> anyhow::Result<()> {
     let response = client
         .post("http://localhost/load")
         .header(reqwest::header::CONTENT_TYPE, "text/caddyfile")
-        .body(public_web_gateway_caddyfile(config, public_ip))
+        .body(public_web_gateway_caddyfile(config, public_ip, extra))
         .send()
         .await
         .context("failed to reach Caddy admin socket")?;
@@ -13787,10 +13926,11 @@ async fn desired_public_web_gateway_ip(
 }
 
 fn public_web_gateway_needs_reconciliation(
-    configured_ip: Option<Option<IpAddr>>,
+    configured: Option<(Option<IpAddr>, [u8; 32])>,
     desired_ip: Option<IpAddr>,
+    desired_extra_digest: [u8; 32],
 ) -> bool {
-    configured_ip != Some(desired_ip)
+    configured != Some((desired_ip, desired_extra_digest))
 }
 
 fn start_public_web_gateway(
@@ -13812,12 +13952,49 @@ fn start_public_web_gateway(
     Ok(tokio::spawn(async move {
         // Caddy survives Agent restarts, so the first iteration must replace
         // any stale configuration even when this node is currently private.
-        let mut configured_ip: Option<Option<IpAddr>> = None;
+        let mut configured: Option<(Option<IpAddr>, [u8; 32])> = None;
         loop {
             let desired_ip =
                 desired_public_web_gateway_ip(&runtime, config.classification_max_age).await;
             let desired_url = desired_ip.map(public_web_gateway_url);
-            if public_web_gateway_needs_reconciliation(configured_ip, desired_ip) {
+            let extra = match load_public_web_gateway_extra_config(&config) {
+                Ok(extra) => extra,
+                Err(error) => {
+                    tracing::warn!(%error, "public connectivity gateway extra configuration is invalid");
+                    let empty = empty_public_web_gateway_extra_config();
+                    if let Err(withdraw_error) = load_public_web_gateway_caddyfile(
+                        &admin_client,
+                        &config,
+                        desired_ip,
+                        &empty,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %withdraw_error,
+                            "failed to withdraw stale public connectivity gateway extra configuration"
+                        );
+                    }
+                    configured = None;
+                    set_public_web_gateway_status(
+                        &status,
+                        PublicWebGatewayPhase::Error,
+                        desired_ip,
+                        desired_url,
+                        Some(error.to_string()),
+                    )
+                    .await;
+                    tokio::time::sleep(config.reconcile_interval).await;
+                    continue;
+                }
+            };
+            let desired_extra_digest = if desired_ip.is_some() {
+                extra.digest
+            } else {
+                Sha256::digest([]).into()
+            };
+            if public_web_gateway_needs_reconciliation(configured, desired_ip, desired_extra_digest)
+            {
                 let phase = if desired_ip.is_some() {
                     PublicWebGatewayPhase::Provisioning
                 } else {
@@ -13831,9 +14008,11 @@ fn start_public_web_gateway(
                     None,
                 )
                 .await;
-                match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip).await {
+                match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip, &extra)
+                    .await
+                {
                     Ok(()) => {
-                        configured_ip = Some(desired_ip);
+                        configured = Some((desired_ip, desired_extra_digest));
                         tracing::info!(
                             public_ip = ?desired_ip,
                             "reconciled public connectivity gateway"
@@ -13853,7 +14032,7 @@ fn start_public_web_gateway(
                 }
             }
 
-            if configured_ip == Some(desired_ip) {
+            if configured == Some((desired_ip, desired_extra_digest)) {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
                     match probe_public_web_gateway(&probe_client, &url).await {
                         Ok(()) => {
@@ -21062,20 +21241,30 @@ mod tests {
         let socket = Path::new("/run/heteronetwork-gateway/admin.sock");
         let mut config = PublicWebGatewayConfig {
             admin_socket: socket.to_path_buf(),
+            extra_caddyfile: None,
             signal_upstream: None,
             relay_admission_upstream: None,
             reconcile_interval: Duration::from_secs(5),
             probe_timeout: Duration::from_secs(5),
             classification_max_age: Duration::from_secs(45),
         };
-        let standby = public_web_gateway_caddyfile(&config, None);
+        let extra = PublicWebGatewayExtraConfig {
+            contents: "https://cloud.example {\n\treverse_proxy https://127.0.0.1:10443\n}"
+                .to_string(),
+            digest: Sha256::digest(b"cloud").into(),
+        };
+        let standby = public_web_gateway_caddyfile(&config, None, &extra);
         assert!(standby.contains("admin unix//run/heteronetwork-gateway/admin.sock|0660"));
         assert!(!standby.contains("reverse_proxy"));
+        assert!(!standby.contains("cloud.example"));
 
         config.signal_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18443)));
         config.relay_admission_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18447)));
-        let public =
-            public_web_gateway_caddyfile(&config, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
+        let public = public_web_gateway_caddyfile(
+            &config,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            &extra,
+        );
         assert!(public.contains("https://203.0.113.10"));
         assert!(public.contains("profile shortlived"));
         assert!(public.contains("@health path /healthz"));
@@ -21084,6 +21273,8 @@ mod tests {
         assert!(public.contains("reverse_proxy http://10.0.0.10:18443"));
         assert!(public.contains("@relay_admission path /v1/sessions"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18447"));
+        assert!(public.contains("https://cloud.example"));
+        assert!(public.contains("reverse_proxy https://127.0.0.1:10443"));
         for private_path in [
             "/ui",
             "/realms/",
@@ -21105,16 +21296,33 @@ mod tests {
     #[test]
     fn public_web_gateway_reconciles_once_after_agent_restart() {
         let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let empty_digest: [u8; 32] = Sha256::digest([]).into();
+        let changed_digest: [u8; 32] = Sha256::digest(b"changed").into();
 
-        assert!(public_web_gateway_needs_reconciliation(None, None));
         assert!(public_web_gateway_needs_reconciliation(
             None,
-            Some(public_ip)
+            None,
+            empty_digest
         ));
-        assert!(!public_web_gateway_needs_reconciliation(Some(None), None));
+        assert!(public_web_gateway_needs_reconciliation(
+            None,
+            Some(public_ip),
+            empty_digest
+        ));
         assert!(!public_web_gateway_needs_reconciliation(
-            Some(Some(public_ip)),
-            Some(public_ip)
+            Some((None, empty_digest)),
+            None,
+            empty_digest
+        ));
+        assert!(!public_web_gateway_needs_reconciliation(
+            Some((Some(public_ip), empty_digest)),
+            Some(public_ip),
+            empty_digest
+        ));
+        assert!(public_web_gateway_needs_reconciliation(
+            Some((Some(public_ip), empty_digest)),
+            Some(public_ip),
+            changed_digest
         ));
     }
 

@@ -315,6 +315,17 @@ active paths. Tune the remaining convergence stages with
 `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RECONCILE_INTERVAL_SECONDS`, and the
 Control Plane `HETERONETWORK_DYNAMIC_WEB_GATEWAY_*` lease/probe settings.
 
+Additional first-party services can share the managed TCP 443 listener without
+editing Caddy's generated runtime configuration. Put complete Caddy site blocks
+in a root-owned, non-symlink file below a non-writable directory and set
+`HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE` to its absolute path.
+The Agent caps the file at 256 KiB, validates its ownership and permissions,
+and reloads Caddy when the content digest changes. Extra sites are loaded only
+while the node has a fresh public classification; they are withdrawn together
+with the dynamic gateway when that classification becomes private or stale.
+The file is trusted configuration and must not be writable by an application
+pod or service account.
+
 To colocate a Keycloak replica behind the same dynamic IP certificate, bind
 Keycloak only on loopback and set both
 `HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_UPSTREAM=127.0.0.1:18080` and
