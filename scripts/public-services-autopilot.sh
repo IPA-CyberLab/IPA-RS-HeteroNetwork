@@ -557,7 +557,7 @@ relay_is_ready() {
 gateway_is_ready() {
   gateway_targets_current_public_ip=0
   gateway_status_file=$(mktemp "$runtime_dir/gateway-status.XXXXXX") || return 1
-  if ! curl --fail --silent --show-error --max-time 3 --max-filesize 1048576 \
+  if ! curl --fail --silent --show-error --max-time 6 --max-filesize 1048576 \
     http://127.0.0.1:9780/v1/web-ui/endpoints >"$gateway_status_file"; then
     rm -f "$gateway_status_file"
     gateway_status_file=
