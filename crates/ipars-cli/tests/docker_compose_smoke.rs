@@ -9,8 +9,17 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use ipars_crypto::WireGuardKeyPair;
+use chrono::Utc;
+use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
 use ipars_route_manager::HETERONETWORK_MANAGED_ROUTE_PROTOCOL;
+use ipars_types::api::{
+    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
+    RegisterNodeResponse, RemoveNodeResponse,
+};
+use ipars_types::{
+    CandidateSource, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
+    NatProbeObservation, NodeHealth, NodeId, SignedJoinToken,
+};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde_json::Value;
 
@@ -938,6 +947,9 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         .get("join_token")
         .context("init output missing join_token")?
         .to_string();
+    let service_owner_token: SignedJoinToken = serde_json::from_str(&placeholder_token)
+        .context("failed to decode dataplane service-owner join token")?;
+    let service_owners = [ComposeServiceOwner::new(0), ComposeServiceOwner::new(1)];
     let suffix = unique_suffix()?;
     let project_name = format!("heteronetwork-dataplane-{suffix}");
     let (workload_a_v6_cidr, workload_b_v6_cidr) = dataplane_ipv6_cidrs(&project_name)?;
@@ -980,6 +992,14 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             (
                 "HETERONETWORK_DATAPLANE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN".to_string(),
                 COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN.to_string(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_PUBLIC_A_NODE_ID".to_string(),
+                service_owners[0].node_id().to_string(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_PUBLIC_B_NODE_ID".to_string(),
+                service_owners[1].node_id().to_string(),
             ),
             (
                 "HETERONETWORK_DATAPLANE_BOOTSTRAP_IP".to_string(),
@@ -1080,6 +1100,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "relay-b",
         ],
     )?;
+    register_compose_service_owners(&compose, &service_owners, &service_owner_token)?;
     wait_for_json(
         &compose,
         "HA service directory",
@@ -1101,11 +1122,11 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     )?;
     wait_for_json(
         &compose,
-        "HA-ready control-plane metrics",
+        "redundant public-service metrics without Keycloak",
         "control-plane",
         "http://127.0.0.1:8443/v1/metrics",
         |value| {
-            ensure_json_bool_equals(value, "ha_ready", true)?;
+            ensure_json_bool_equals(value, "ha_ready", false)?;
             ensure_json_u64_at_least(value, "active_service_instance_count", 2)?;
             ensure_json_u64_at_least(value, "active_service_host_count", 2)?;
             ensure_json_u64_at_least(value, "active_control_plane_count", 2)?;
@@ -1383,6 +1404,21 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "HETERONETWORK_DATAPLANE_JOIN_TOKEN",
         failover_join_token.to_string(),
     )?;
+    heartbeat_compose_service_owners(&compose, &service_owners)?;
+    wait_for_json(
+        &compose,
+        "refreshed HA service directory",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/admin/services",
+        |value| {
+            let instances = value
+                .get("instances")
+                .and_then(Value::as_array)
+                .context("service directory instances must be an array")?;
+            anyhow::ensure!(instances.len() == 2, "expected two active public instances");
+            Ok(())
+        },
+    )?;
     run_compose_with_diagnostics(
         &compose,
         [
@@ -1475,6 +1511,7 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         workload_a_v6_ip,
         workload_b_v6_ip,
     )?;
+    remove_compose_service_owners(&compose, &service_owners)?;
 
     run_compose_with_diagnostics(
         &compose,
@@ -1527,6 +1564,159 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             ensure_peer_map_contains(value, &agent_b_id)
         },
     )?;
+    Ok(())
+}
+
+struct ComposeServiceOwner {
+    identity: IdentityKeyPair,
+    wireguard: WireGuardKeyPair,
+    public_addr: std::net::SocketAddr,
+}
+
+impl ComposeServiceOwner {
+    fn new(index: u8) -> Self {
+        Self {
+            identity: IdentityKeyPair::generate(),
+            wireguard: WireGuardKeyPair::generate(),
+            public_addr: std::net::SocketAddr::from((
+                [8, 8, 4, 4 + index],
+                51_820 + u16::from(index),
+            )),
+        }
+    }
+
+    fn node_id(&self) -> NodeId {
+        self.identity.node_id()
+    }
+
+    fn connectivity(
+        &self,
+        observed_at: chrono::DateTime<Utc>,
+    ) -> (EndpointCandidate, NatClassification) {
+        let node_id = self.node_id();
+        let candidate = EndpointCandidate {
+            node_id,
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: self.public_addr,
+            observed_at,
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        };
+        let classification = NatClassification::from_observations(
+            self.public_addr,
+            vec![NatProbeObservation {
+                local_addr: self.public_addr,
+                stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: self.public_addr,
+                observed_at,
+            }],
+            observed_at,
+        );
+        (candidate, classification)
+    }
+
+    fn heartbeat(&self) -> Result<HeartbeatRequest> {
+        let observed_at = Utc::now();
+        let (candidate, classification) = self.connectivity(observed_at);
+        let mut request = HeartbeatRequest {
+            node_id: self.node_id(),
+            health: NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: observed_at,
+                latency_ms: Some(1.0),
+                relay_load: None,
+                message: None,
+            },
+            candidates: vec![candidate],
+            nat_classification: Some(classification),
+            relay_capability: None,
+            routes: None,
+            path_state: Vec::new(),
+            node_signature: None,
+        };
+        request.node_signature = Some(
+            self.identity
+                .sign_heartbeat_request(&request, Utc::now())
+                .context("failed to sign Compose service-owner heartbeat")?,
+        );
+        Ok(request)
+    }
+}
+
+fn register_compose_service_owners(
+    compose: &ComposeProject,
+    owners: &[ComposeServiceOwner],
+    token: &SignedJoinToken,
+) -> Result<()> {
+    for owner in owners {
+        let observed_at = Utc::now();
+        let (candidate, classification) = owner.connectivity(observed_at);
+        let request = JoinNodeRequest {
+            token: token.clone(),
+            registration: RegisterNodeRequest {
+                node_id: owner.node_id(),
+                identity_public_key: owner.identity.public_key_b64(),
+                wireguard_public_key: owner.wireguard.public_key_b64.clone(),
+                candidates: vec![candidate],
+                nat_classification: Some(classification),
+                relay_capability: None,
+                requested_routes: Vec::new(),
+            },
+        };
+        let value = compose_exec_post_json(
+            compose,
+            "control-plane",
+            "http://127.0.0.1:8443/v1/join",
+            &serde_json::to_string(&request)?,
+        )?;
+        let response: RegisterNodeResponse = serde_json::from_value(value)
+            .context("failed to decode Compose service-owner join response")?;
+        anyhow::ensure!(
+            response.node.node_id == owner.node_id(),
+            "Compose service owner joined with an unexpected node ID"
+        );
+    }
+    heartbeat_compose_service_owners(compose, owners)
+}
+
+fn heartbeat_compose_service_owners(
+    compose: &ComposeProject,
+    owners: &[ComposeServiceOwner],
+) -> Result<()> {
+    for owner in owners {
+        let value = compose_exec_post_json(
+            compose,
+            "control-plane",
+            "http://127.0.0.1:8443/v1/heartbeat",
+            &serde_json::to_string(&owner.heartbeat()?)?,
+        )?;
+        let response: HeartbeatResponse = serde_json::from_value(value)
+            .context("failed to decode Compose service-owner heartbeat response")?;
+        anyhow::ensure!(
+            response.accepted,
+            "Compose service-owner heartbeat was rejected"
+        );
+    }
+    Ok(())
+}
+
+fn remove_compose_service_owners(
+    compose: &ComposeProject,
+    owners: &[ComposeServiceOwner],
+) -> Result<()> {
+    for owner in owners {
+        let response: RemoveNodeResponse = serde_json::from_value(compose_exec_delete_json(
+            compose,
+            "control-plane-b",
+            &format!("http://127.0.0.1:8443/v1/admin/nodes/{}", owner.node_id()),
+        )?)
+        .context("failed to decode Compose service-owner removal response")?;
+        anyhow::ensure!(
+            response.node.node_id == owner.node_id(),
+            "Compose service-owner removal returned an unexpected node"
+        );
+    }
     Ok(())
 }
 
@@ -4038,6 +4228,38 @@ fn compose_exec_post_json(
     serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
             "failed to parse JSON from docker compose exec {service} curl POST {url}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+fn compose_exec_delete_json(compose: &ComposeProject, service: &str, url: &str) -> Result<Value> {
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        service,
+        "curl",
+        "-fsS",
+        "--max-time",
+        "5",
+        "-X",
+        "DELETE",
+        "-H",
+        "Accept: application/json",
+    ]);
+    add_api_bearer_header(&mut command, service);
+    command.arg(url);
+    let output = command.output().with_context(|| {
+        format!("failed to run docker compose exec {service} curl DELETE {url}")
+    })?;
+    ensure_success(
+        &format!("docker compose exec {service} curl DELETE {url}"),
+        &output,
+    )?;
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "failed to parse JSON from docker compose exec {service} curl DELETE {url}: {}",
             String::from_utf8_lossy(&output.stdout)
         )
     })

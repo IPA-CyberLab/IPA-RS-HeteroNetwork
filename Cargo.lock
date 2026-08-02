@@ -1601,6 +1601,7 @@ dependencies = [
  "ipars-relay-http",
  "ipars-signal",
  "ipars-signal-http",
+ "ipars-stun",
  "ipars-types",
  "ipnet",
  "nix 0.30.1",

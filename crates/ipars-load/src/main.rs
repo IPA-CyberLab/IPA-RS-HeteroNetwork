@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
-use ipars_agent::FileAgentStateStore;
+use ipars_agent::{AgentNodeState, FileAgentStateStore};
 use ipars_control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneJoinService, InMemoryStore, InMemoryTokenLedger,
     IssuerKeyRing,
@@ -21,6 +21,7 @@ use ipars_relay::{encode_relay_datagram, RelayService, UdpRelay};
 use ipars_relay_http::{router as relay_router, RelayHttpState};
 use ipars_signal::SignalRegistry;
 use ipars_signal_http::{router as signal_router, SignalHttpState};
+use ipars_stun::UdpStunProbe;
 use ipars_types::api::{
     AgentPathsResponse, AgentPeerActivityRequest, AgentPeerActivityResponse, AgentStatusResponse,
     AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind,
@@ -32,9 +33,10 @@ use ipars_types::api::{
 };
 use ipars_types::{
     BootstrapEndpoint, BootstrapEndpointKind, CandidateSource, ClusterId, ClusterPolicy,
-    EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NodeHealth,
-    NodeId, NodeRecord, PathMetrics, PathQualityObservation, PathState, RelayCapability, Role,
-    Route, Tag, TokenPolicy,
+    EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
+    NatClassification, NatProbeObservation, NodeHealth, NodeId, NodeRecord, PathMetrics,
+    PathQualityObservation, PathState, RelayCapability, Role, Route, SignedJoinToken, Tag,
+    TokenPolicy,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -5081,6 +5083,14 @@ impl DaemonProcessGroup {
         std::fs::create_dir_all(&runtime_dir)?;
         secure_daemon_runtime_dir(&runtime_dir)?;
         let mut startup = DaemonStartupGuard::new(runtime_dir.clone(), options.keep_runtime_dir);
+        anyhow::ensure!(
+            options.control_plane_processes <= options.agent_processes,
+            "daemon HA requires at least one Agent service owner per control-plane process"
+        );
+        let mut agent_states = prepare_daemon_agent_states(&runtime_dir, options.agent_processes)?;
+        for index in 0..options.agent_processes {
+            startup.record_agent_state_path(daemon_agent_state_path(&runtime_dir, index));
+        }
         let control_addrs = reserve_tcp_addrs(options.control_plane_processes).await?;
         let signal_addr = reserve_tcp_addr().await?;
         let relay_http_addr = reserve_tcp_addr().await?;
@@ -5171,6 +5181,7 @@ impl DaemonProcessGroup {
             ];
             control_plane_args.extend(daemon_control_plane_service_lease_args(
                 &role,
+                &agent_states[index].node_id,
                 &daemon_service_instance_endpoints(
                     &control_plane_urls[index],
                     &signal_url,
@@ -5330,11 +5341,16 @@ impl DaemonProcessGroup {
         )
         .await?;
 
-        for (index, agent_stun_addr) in agent_stun_addrs.into_iter().enumerate() {
-            let agent_addr = reserve_tcp_addr().await?;
-            let agent_url = format!("http://{agent_addr}");
-            let state_path = daemon_agent_state_path(&runtime_dir, index);
-            startup.record_agent_state_path(state_path.clone());
+        for index in 0..options.control_plane_processes {
+            UdpStunProbe
+                .observe_binding(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    stun_addr,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to probe daemon STUN for service owner {index}")
+                })?;
             let token = issuer.sign_join_token(join_claims_with_control_plane_urls(
                 &cluster_id,
                 &issuer.node_id(),
@@ -5343,20 +5359,41 @@ impl DaemonProcessGroup {
                 scenario,
                 &control_plane_urls,
             )?)?;
-            let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
-            startup.record_join_token_path(token_path.clone());
+            let response = register_daemon_service_owner(
+                &client,
+                control_plane_urls
+                    .first()
+                    .context("daemon service owner requires a control-plane URL")?,
+                index,
+                scenario,
+                &agent_states[index],
+                agent_stun_addrs[index],
+                token.clone(),
+            )
+            .await?;
+            let state = &mut agent_states[index];
+            state.vpn_ip = Some(response.node.vpn_ip);
+            state.registered_node = Some(response.node);
+            state.bootstrap_endpoints = token.claims.bootstrap_endpoints.clone();
+            state.seed_bootstrap_endpoints = Some(token.claims.bootstrap_endpoints);
+            state.updated_at = Utc::now();
+            FileAgentStateStore::new(daemon_agent_state_path(&runtime_dir, index))
+                .save(state)
+                .with_context(|| format!("failed to persist daemon service owner state {index}"))?;
+        }
+
+        for (index, agent_stun_addr) in agent_stun_addrs.into_iter().enumerate() {
+            let agent_addr = reserve_tcp_addr().await?;
+            let agent_url = format!("http://{agent_addr}");
+            let state_path = daemon_agent_state_path(&runtime_dir, index);
             let mut agent_args = vec![
                 "agent".to_string(),
                 "--listen".to_string(),
                 agent_addr.to_string(),
                 "--state-path".to_string(),
                 state_path.display().to_string(),
-                "--join-token-path".to_string(),
-                token_path.display().to_string(),
                 "--signal-url".to_string(),
                 signal_url.clone(),
-                "--stun-server".to_string(),
-                stun_addr.to_string(),
                 "--stun-bind".to_string(),
                 agent_stun_addr.to_string(),
                 "--wireguard-listen-port".to_string(),
@@ -5376,6 +5413,34 @@ impl DaemonProcessGroup {
                 "--relay-admission-bearer-token-path".to_string(),
                 relay_admission_bearer_token_path.display().to_string(),
             ];
+            if index < options.control_plane_processes {
+                agent_args.extend([
+                    "--disable-public-stun-fallback".to_string(),
+                    "--nat-discovery-interval-seconds".to_string(),
+                    "3600".to_string(),
+                    "--public-nat-discovery-interval-seconds".to_string(),
+                    "3600".to_string(),
+                    "--public-web-gateway-classification-max-age-seconds".to_string(),
+                    "3600".to_string(),
+                ]);
+            } else {
+                let token = issuer.sign_join_token(join_claims_with_control_plane_urls(
+                    &cluster_id,
+                    &issuer.node_id(),
+                    key_id,
+                    index,
+                    scenario,
+                    &control_plane_urls,
+                )?)?;
+                let token_path = write_daemon_join_token(&runtime_dir, index, &token)?;
+                startup.record_join_token_path(token_path.clone());
+                agent_args.extend([
+                    "--join-token-path".to_string(),
+                    token_path.display().to_string(),
+                    "--stun-server".to_string(),
+                    stun_addr.to_string(),
+                ]);
+            }
             if index < scenario.relay_count {
                 agent_args.extend([
                     "--relay-public-endpoint".to_string(),
@@ -5747,17 +5812,141 @@ fn daemon_service_directory_endpoints(
     endpoints
 }
 
+fn prepare_daemon_agent_states(
+    runtime_dir: &Path,
+    agent_processes: usize,
+) -> anyhow::Result<Vec<AgentNodeState>> {
+    let now = Utc::now();
+    let mut states = Vec::with_capacity(agent_processes);
+    for index in 0..agent_processes {
+        let identity = identity_for_index(index);
+        let mut state = AgentNodeState::generate(now);
+        state.node_id = identity.node_id();
+        state.identity_private_key_b64 = identity.signing_key_b64();
+        state.identity_public_key_b64 = identity.public_key_b64();
+        FileAgentStateStore::new(daemon_agent_state_path(runtime_dir, index))
+            .save(&state)
+            .with_context(|| format!("failed to prepare daemon agent state {index}"))?;
+        states.push(state);
+    }
+    Ok(states)
+}
+
+fn daemon_service_owner_connectivity(
+    node_id: &NodeId,
+    index: usize,
+    local_addr: SocketAddr,
+    observed_at: chrono::DateTime<Utc>,
+) -> (Vec<EndpointCandidate>, NatClassification) {
+    let public_addr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4 + index as u8)),
+        51_820 + index as u16,
+    );
+    let public_candidate = EndpointCandidate {
+        node_id: node_id.clone(),
+        kind: EndpointCandidateKind::PublicUdp,
+        addr: public_addr,
+        observed_at,
+        priority: 10,
+        cost: 100,
+        source: CandidateSource::StunProbe,
+    };
+    let local_candidate = EndpointCandidate {
+        node_id: node_id.clone(),
+        kind: EndpointCandidateKind::LocalUdp,
+        addr: local_addr,
+        observed_at,
+        priority: 100,
+        cost: 10,
+        source: CandidateSource::StunProbe,
+    };
+    let classification = NatClassification::from_observations(
+        public_addr,
+        vec![NatProbeObservation {
+            local_addr: public_addr,
+            stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+            reflexive_addr: public_addr,
+            observed_at,
+        }],
+        observed_at,
+    );
+    (vec![local_candidate, public_candidate], classification)
+}
+
+async fn register_daemon_service_owner(
+    client: &reqwest::Client,
+    control_plane_url: &str,
+    index: usize,
+    scenario: Scenario,
+    state: &AgentNodeState,
+    local_addr: SocketAddr,
+    token: SignedJoinToken,
+) -> anyhow::Result<RegisterNodeResponse> {
+    let identity = state
+        .identity_key_pair()
+        .with_context(|| format!("failed to load daemon service owner identity {index}"))?;
+    let observed_at = Utc::now();
+    let (candidates, classification) =
+        daemon_service_owner_connectivity(&state.node_id, index, local_addr, observed_at);
+    let relay_capability = relay_capability(index, scenario);
+    let routes = advertised_routes(index, scenario)?;
+    let response: RegisterNodeResponse = post_json(
+        client,
+        format!("{control_plane_url}/v1/join"),
+        &JoinNodeRequest {
+            token,
+            registration: RegisterNodeRequest {
+                node_id: state.node_id.clone(),
+                identity_public_key: state.identity_public_key_b64.clone(),
+                wireguard_public_key: state.wireguard_public_key_b64.clone(),
+                candidates: candidates.clone(),
+                nat_classification: Some(classification.clone()),
+                relay_capability: relay_capability.clone(),
+                requested_routes: routes.clone(),
+            },
+        },
+        "daemon service owner join",
+    )
+    .await
+    .with_context(|| format!("failed to join daemon service owner {index}"))?;
+    let mut heartbeat = HeartbeatRequest {
+        node_id: state.node_id.clone(),
+        health: healthy_node_health(),
+        candidates,
+        nat_classification: Some(classification),
+        relay_capability,
+        routes: Some(routes),
+        path_state: Vec::new(),
+        node_signature: None,
+    };
+    heartbeat.node_signature = Some(
+        identity
+            .sign_heartbeat_request(&heartbeat, Utc::now())
+            .with_context(|| format!("failed to sign daemon service owner {index} heartbeat"))?,
+    );
+    let _: HeartbeatResponse = post_json(
+        client,
+        format!("{control_plane_url}/v1/heartbeat"),
+        &heartbeat,
+        "daemon service owner heartbeat",
+    )
+    .await
+    .with_context(|| format!("failed to heartbeat daemon service owner {index}"))?;
+    Ok(response)
+}
+
 fn daemon_control_plane_service_lease_args(
     instance_id: &str,
+    owner_node_id: &NodeId,
     endpoints: &[BootstrapEndpoint],
 ) -> Vec<String> {
     let mut args = vec![
         "--service-instance-id".to_string(),
         instance_id.to_string(),
         "--service-owner-host-id".to_string(),
-        instance_id.to_string(),
+        owner_node_id.to_string(),
         "--service-owner-node-id".to_string(),
-        instance_id.to_string(),
+        owner_node_id.to_string(),
         "--service-lease-ttl-seconds".to_string(),
         "6".to_string(),
         "--service-lease-renew-interval-seconds".to_string(),
@@ -11153,16 +11342,17 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31_003),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31_004),
         );
+        let owner_node_id = NodeId::from_string("node-owner-0");
 
         assert_eq!(
-            daemon_control_plane_service_lease_args("control-plane-0", &endpoints),
+            daemon_control_plane_service_lease_args("control-plane-0", &owner_node_id, &endpoints,),
             vec![
                 "--service-instance-id".to_string(),
                 "control-plane-0".to_string(),
                 "--service-owner-host-id".to_string(),
-                "control-plane-0".to_string(),
+                "node-owner-0".to_string(),
                 "--service-owner-node-id".to_string(),
-                "control-plane-0".to_string(),
+                "node-owner-0".to_string(),
                 "--service-lease-ttl-seconds".to_string(),
                 "6".to_string(),
                 "--service-lease-renew-interval-seconds".to_string(),
@@ -11177,6 +11367,25 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
                 "udp://127.0.0.1:31004".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn daemon_service_owner_fixture_is_publicly_reachable() {
+        let node_id = NodeId::from_string("node-owner-0");
+        let (candidates, classification) = daemon_service_owner_connectivity(
+            &node_id,
+            0,
+            SocketAddr::from(([10, 0, 0, 1], 51_820)),
+            Utc::now(),
+        );
+
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.node_id == node_id));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == EndpointCandidateKind::PublicUdp));
+        assert!(classification.public_state_is_supported());
     }
 
     #[test]
