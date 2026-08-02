@@ -19,6 +19,8 @@ release="${HETERONETWORK_K8S_SMOKE_RELEASE:-heteronetwork-live-${suffix}}"
 bootstrap_name="heteronetwork-bootstrap"
 signal_name="heteronetwork-signal"
 service_instance_id="kubernetes-live-smoke"
+service_owner_state_secret="heteronetwork-live-service-owner-state"
+service_owner_state_seeder="heteronetwork-live-service-owner-state-seeder"
 token_secret="heteronetwork-live-join"
 agent_api_token="ipars-k8s-smoke-agent-api-${suffix}-secret"
 control_plane_operator_api_token="ipars-k8s-smoke-control-plane-operator-${suffix}-secret"
@@ -31,6 +33,7 @@ stale_kubernetes_route_cidr="198.18.0.0/15"
 chart_fullname=""
 relay_service_name=""
 relay_cluster_ip=""
+relay_node_name=""
 relay_node_ip=""
 relay_public_endpoint=""
 relay_admission_url=""
@@ -38,6 +41,8 @@ relay_status_url=""
 tmp_dir=""
 namespace_created=0
 helm_installed=0
+service_owner_state_secret_created=0
+service_owner_state_seeder_created=0
 
 require_command() {
   local command_name="$1"
@@ -113,6 +118,15 @@ dump_diagnostics() {
 cleanup() {
   local status=$?
   trap - EXIT
+
+  if [[ $service_owner_state_seeder_created -eq 1 ]]; then
+    "$kubectl_bin" -n "$namespace" delete pod "$service_owner_state_seeder" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+  if [[ $service_owner_state_secret_created -eq 1 ]]; then
+    "$kubectl_bin" -n "$namespace" delete secret "$service_owner_state_secret" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
 
   if [[ $status -ne 0 && $namespace_created -eq 1 ]]; then
     dump_diagnostics
@@ -206,8 +220,7 @@ wait_for_agent_runtime() {
         --arg signal "$signal_url" \
         --arg stun "$stun_url" \
         --arg relay "$relay_bootstrap_url" '
-          .seed_bootstrap_endpoints == null
-          and (.bootstrap_endpoints | length) == 4
+          (.bootstrap_endpoints | length) == 4
           and any(.bootstrap_endpoints[]?;
             .kind == "control_plane" and .url == $control_plane)
           and any(.bootstrap_endpoints[]?;
@@ -216,6 +229,10 @@ wait_for_agent_runtime() {
             .kind == "stun" and .url == $stun)
           and any(.bootstrap_endpoints[]?;
             .kind == "relay" and .url == $relay)
+          and (
+            .seed_bootstrap_endpoints == null
+            or .seed_bootstrap_endpoints == .bootstrap_endpoints
+          )
         ' >/dev/null 2>&1 <<<"$state_json"; then
       printf '%s\n' "$status_json"
       return 0
@@ -225,7 +242,7 @@ wait_for_agent_runtime() {
   state_directory_summary="$(jq -c \
     '{seed_bootstrap_endpoints, bootstrap_endpoints}' \
     <<<"$state_json" 2>/dev/null || true)"
-  echo "agent pod ${pod} did not report a synchronized runtime and authoritative service directory" >&2
+  echo "agent pod ${pod} did not report a synchronized runtime and exact signed or authoritative service directory" >&2
   echo "Agent service directory: ${state_directory_summary:-<unavailable>}" >&2
   return 1
 }
@@ -682,12 +699,19 @@ relay_admission_token_secret_file="$tmp_dir/relay-admission-token.secret"
 "$kubectl_bin" version --request-timeout=15s >/dev/null
 "$kubectl_bin" get nodes --no-headers | grep -q .
 "$helm_bin" version --short >/dev/null
-relay_node_ip="$($kubectl_bin get nodes \
+relay_node_name="$($kubectl_bin get nodes \
   -l 'node-role.kubernetes.io/control-plane' \
-  -o jsonpath='{range .items[0].status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+if [[ -z "$relay_node_name" ]]; then
+  relay_node_name="$($kubectl_bin get nodes -o jsonpath='{.items[0].metadata.name}')"
+fi
+require_dns_label "$relay_node_name" "relay Node name" 253
+relay_node_ip="$($kubectl_bin get node "$relay_node_name" \
+  -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' \
   | awk 'NF { print; exit }')"
 if [[ -z "$relay_node_ip" ]]; then
-  relay_node_ip="$($kubectl_bin get nodes -o jsonpath='{range .items[0].status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}' | awk 'NF { print; exit }')"
+  echo "relay Node ${relay_node_name} has no InternalIP" >&2
+  exit 1
 fi
 if [[ ! "$relay_node_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   echo "kind live smoke requires an IPv4 node InternalIP for the relay NodePort, got ${relay_node_ip:-<empty>}" >&2
@@ -766,10 +790,43 @@ run_ipars init \
 cluster_id="$(jq -er '.cluster_id | strings' "$init_output")"
 issuer_node_id="$(jq -er '.issuer_node_id | strings' "$init_output")"
 issuer_public_key="$(jq -er '.issuer_public_key | strings' "$init_output")"
+service_owner_state_file="$tmp_dir/bootstrap/relay-agent.json"
+service_owner_node_id="$(jq -er \
+  '.node_id | strings | select(test("^node-[A-Za-z0-9._-]+$"))' \
+  "$service_owner_state_file")"
 token_file="$tmp_dir/join-token.json"
 agent_api_token_file="$tmp_dir/agent-api.token"
 control_plane_operator_api_token_file="$tmp_dir/control-plane-operator-api.token"
-jq -ce '.join_token' "$init_output" >"$token_file"
+run_ipars token create \
+  --cluster-id "$cluster_id" \
+  --issuer-key-id live-smoke \
+  --issuer-private-key-path "$issuer_key" \
+  --role kubernetes-node \
+  --ttl-seconds "$timeout_seconds" \
+  --control-plane-bootstrap "$control_plane_url" \
+  --signal-bootstrap "$signal_url" \
+  --stun-bootstrap "$stun_url" \
+  --relay-bootstrap "$relay_bootstrap_url" \
+  --allowed-route "$service_cidr" \
+  --unlimited-uses >"$token_file"
+if ! jq -e \
+  --arg control_plane "$control_plane_url" \
+  --arg signal "$signal_url" \
+  --arg stun "$stun_url" \
+  --arg relay "$relay_bootstrap_url" '
+    (.claims.bootstrap_endpoints | length) == 4
+    and any(.claims.bootstrap_endpoints[]?;
+      .kind == "control_plane" and .url == $control_plane)
+    and any(.claims.bootstrap_endpoints[]?;
+      .kind == "signal" and .url == $signal)
+    and any(.claims.bootstrap_endpoints[]?;
+      .kind == "stun" and .url == $stun)
+    and any(.claims.bootstrap_endpoints[]?;
+      .kind == "relay" and .url == $relay)
+  ' "$token_file" >/dev/null; then
+  echo "generated Kubernetes join token did not contain the exact four runtime service endpoints" >&2
+  exit 1
+fi
 tr -d '\r\n' <"$relay_admission_token_file" >"$relay_admission_token_secret_file"
 printf '%s' "$agent_api_token" >"$agent_api_token_file"
 printf '%s' "$control_plane_operator_api_token" >"$control_plane_operator_api_token_file"
@@ -786,6 +843,75 @@ image_ref_json="$(json_string "$image_ref")"
 cluster_id_json="$(json_string "$cluster_id")"
 issuer_node_id_json="$(json_string "$issuer_node_id")"
 issuer_public_key_json="$(json_string "$issuer_public_key")"
+agent_state_path="/var/lib/heteronetwork-live/${release}"
+
+"$kubectl_bin" -n "$namespace" create secret generic "$service_owner_state_secret" \
+  --from-file=agent.json="$service_owner_state_file" >/dev/null
+service_owner_state_secret_created=1
+"$kubectl_bin" -n "$namespace" apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${service_owner_state_seeder}
+  labels:
+    app.kubernetes.io/component: heteronetwork-service-owner-state-seeder
+spec:
+  nodeName: ${relay_node_name}
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: seed
+      image: ${image_ref_json}
+      imagePullPolicy: ${image_pull_policy}
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          install -d -m 0700 /host-state
+          install -m 0600 /seed/agent.json /host-state/agent.json
+          stat -c '%a' /host-state/agent.json | grep -Fx 600
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: host-state
+          mountPath: /host-state
+        - name: owner-state
+          mountPath: /seed
+          readOnly: true
+  volumes:
+    - name: host-state
+      hostPath:
+        path: ${agent_state_path}
+        type: DirectoryOrCreate
+    - name: owner-state
+      secret:
+        secretName: ${service_owner_state_secret}
+        defaultMode: 0400
+EOF
+service_owner_state_seeder_created=1
+for attempt in $(seq 1 60); do
+  seeder_phase="$($kubectl_bin -n "$namespace" get pod "$service_owner_state_seeder" \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  if [[ "$seeder_phase" == "Succeeded" ]]; then
+    break
+  fi
+  if [[ "$seeder_phase" == "Failed" || "$attempt" == 60 ]]; then
+    "$kubectl_bin" -n "$namespace" logs "$service_owner_state_seeder" 2>&1 || true
+    echo "service owner state seeder failed with phase ${seeder_phase:-<unknown>}" >&2
+    exit 1
+  fi
+  sleep 1
+done
+"$kubectl_bin" -n "$namespace" delete pod "$service_owner_state_seeder" \
+  --wait=true --timeout="${timeout_seconds}s" >/dev/null
+service_owner_state_seeder_created=0
+"$kubectl_bin" -n "$namespace" delete secret "$service_owner_state_secret" \
+  --wait=true --timeout="${timeout_seconds}s" >/dev/null
+service_owner_state_secret_created=0
 
 "$kubectl_bin" -n "$namespace" apply -f - <<EOF
 apiVersion: apps/v1
@@ -827,9 +953,9 @@ spec:
             - --service-instance-id
             - ${service_instance_id}
             - --service-owner-host-id
-            - ${service_instance_id}
+            - ${service_owner_node_id}
             - --service-owner-node-id
-            - ${service_instance_id}
+            - ${service_owner_node_id}
             - --advertise-control-plane-url
             - ${control_plane_url}
             - --advertise-signal-url
@@ -915,7 +1041,6 @@ EOF
 wait_for_bootstrap_health
 wait_for_signal_health
 
-agent_state_path="/var/lib/heteronetwork-live/${release}"
 agent_api_service_name="${chart_fullname}-agent"
 "$helm_bin" upgrade --install "$release" "$repo_root/charts/ipars" \
   --namespace "$namespace" \
@@ -1014,6 +1139,11 @@ if [[ -z "$relay_candidate_index" ]]; then
   echo "could not map the advertised relay NodePort node IP to an Agent pod" >&2
   exit 1
 fi
+if [[ "${node_ids[$relay_candidate_index]}" != "$service_owner_node_id" ]]; then
+  echo "service lease owner ${service_owner_node_id} did not register as the Agent on relay Node ${relay_node_name}; got ${node_ids[$relay_candidate_index]}" >&2
+  exit 1
+fi
+echo "service lease owner ${service_owner_node_id} registered as the real Agent on relay Node ${relay_node_name}"
 wait_for_relay_service "${agent_pods[0]}" "$relay_service_name" "${node_ids[$relay_candidate_index]}"
 
 "$kubectl_bin" -n "$namespace" apply -f - <<EOF
