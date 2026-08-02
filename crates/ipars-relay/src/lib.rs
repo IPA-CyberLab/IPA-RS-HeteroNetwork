@@ -1066,6 +1066,9 @@ impl RelayService {
         &self,
         request: RelayAdmissionRequest,
     ) -> Result<RelayAdmissionResponse, RelayError> {
+        if request.left == self.relay_node || request.right == self.relay_node {
+            return Err(RelayError::AdmissionDenied);
+        }
         let mut capability = self.capability.write().await;
         let mut table = self.table.write().await;
         table.purge_expired(Utc::now());
@@ -2227,6 +2230,37 @@ mod tests {
             .admit(RelayAdmissionRequest {
                 left: NodeId::from_string("left"),
                 right: NodeId::from_string("left"),
+                left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
+                right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
+            })
+            .await;
+
+        assert!(matches!(rejected, Err(RelayError::AdmissionDenied)));
+        let status = service.status().await;
+        assert_eq!(status.capability.active_sessions, 0);
+        assert_eq!(status.admission_attempt_count, 1);
+        assert_eq!(status.admission_success_count, 0);
+        assert_eq!(status.admission_failure_count, 1);
+        assert_eq!(
+            status
+                .admission_failures_by_reason
+                .get(&RelayAdmissionFailureReason::AdmissionDenied),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_service_rejects_path_endpoint_admission(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let service = RelayService::new(
+            NodeId::from_string("relay"),
+            relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000),
+        );
+        let rejected = service
+            .admit(RelayAdmissionRequest {
+                left: NodeId::from_string("relay"),
+                right: NodeId::from_string("peer"),
                 left_addr: SocketAddr::from(([10, 0, 0, 1], 10000)),
                 right_addr: SocketAddr::from(([10, 0, 0, 2], 10000)),
             })

@@ -180,6 +180,7 @@ const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_SHARED_RELAY_ADMISSION_ATTEMPTS: usize = 3;
 const MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES: u64 = 256 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
@@ -16807,7 +16808,10 @@ async fn admit_relay_session_with_candidates(
         .ok_or(AgentRelayAdmissionError::NoEndpointCandidate)?;
     let admission_url =
         relay_admission_url(relay).map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
-    let mut request_builder = client.post(admission_url).json(&request);
+    let mut request_builder = client
+        .post(&admission_url)
+        .header(reqwest::header::CONNECTION, "close")
+        .json(&request);
     if let Some(token) = relay_admission_bearer_token {
         request_builder = request_builder.bearer_auth(token);
     }
@@ -16825,6 +16829,12 @@ async fn admit_relay_session_with_candidates(
     .await
     .map_err(AgentRelayAdmissionError::InvalidResponse)?;
 
+    if response.relay_node == status.node_id || response.relay_node == peer.node_id {
+        return Err(AgentRelayAdmissionError::InvalidResponse(anyhow::anyhow!(
+            "relay admission response used endpoint {} as relay",
+            response.relay_node
+        )));
+    }
     let admitted_relay = relay_candidates
         .iter()
         .find(|candidate| candidate.node_id == response.relay_node)
@@ -16834,6 +16844,18 @@ async fn admit_relay_session_with_candidates(
                 response.relay_node
             ))
         })?;
+    let admitted_url = relay_admission_url(admitted_relay).map_err(|error| {
+        AgentRelayAdmissionError::InvalidResponse(anyhow::anyhow!(
+            "relay admission response identified relay {} without a usable admission URL: {error:#}",
+            response.relay_node
+        ))
+    })?;
+    if admitted_url != admission_url {
+        return Err(AgentRelayAdmissionError::InvalidResponse(anyhow::anyhow!(
+            "relay admission response identified relay {} from a different admission endpoint",
+            response.relay_node
+        )));
+    }
     let relay_endpoint = relay_public_endpoint(admitted_relay)
         .map_err(AgentRelayAdmissionError::InvalidRelayCandidate)?;
     relay_session_state_from_admission(
@@ -16871,46 +16893,54 @@ async fn admit_relay_session_from_candidates(
         }
     }
     let mut errors = Vec::new();
+    let mut attempted_admission_urls = BTreeSet::new();
     for relay in relays {
-        runtime.record_relay_admission_attempt();
-        match admit_relay_session_with_candidates(
-            client,
-            status,
-            peer,
-            relay,
-            &known_relay_candidates,
-            relay_admission_bearer_token,
-        )
-        .await
+        let admission_url = relay_admission_url(relay).ok();
+        if admission_url
+            .as_ref()
+            .is_some_and(|url| !attempted_admission_urls.insert(url.clone()))
         {
-            Ok(session) => {
-                if session.relay_node == status.node_id || session.relay_node == peer.node_id {
-                    let error = AgentRelayAdmissionError::InvalidResponse(anyhow::anyhow!(
-                        "relay admission response used endpoint {} as relay",
-                        session.relay_node
-                    ));
+            continue;
+        }
+        let attempts = if admission_url.as_ref().is_some_and(|url| {
+            known_relay_candidates
+                .iter()
+                .filter_map(|candidate| relay_admission_url(candidate).ok())
+                .filter(|candidate_url| candidate_url == url)
+                .take(2)
+                .count()
+                > 1
+        }) {
+            MAX_SHARED_RELAY_ADMISSION_ATTEMPTS
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            runtime.record_relay_admission_attempt();
+            match admit_relay_session_with_candidates(
+                client,
+                status,
+                peer,
+                relay,
+                &known_relay_candidates,
+                relay_admission_bearer_token,
+            )
+            .await
+            {
+                Ok(session) => {
+                    runtime.record_relay_admission_success();
+                    return Ok(session);
+                }
+                Err(error) => {
                     runtime.record_relay_admission_failure_reason(error.reason());
                     errors.push(format!("{}: {error:#}", relay.node_id));
                     tracing::warn!(
                         relay = %relay.node_id,
                         peer = %peer.node_id,
                         %error,
-                        "relay admission candidate resolved to a path endpoint; trying next relay"
+                        "failed relay admission endpoint attempt; trying next available selection"
                     );
-                    continue;
                 }
-                runtime.record_relay_admission_success();
-                return Ok(session);
-            }
-            Err(error) => {
-                runtime.record_relay_admission_failure_reason(error.reason());
-                errors.push(format!("{}: {error:#}", relay.node_id));
-                tracing::warn!(
-                    relay = %relay.node_id,
-                    peer = %peer.node_id,
-                    %error,
-                    "failed relay admission candidate; trying next relay"
-                );
             }
         }
     }
@@ -37920,8 +37950,113 @@ exec sleep 60
         };
         assert!(error.to_string().contains("used endpoint peer-a as relay"));
         let metrics = runtime.metrics().await;
-        assert_eq!(metrics.relay_admission_attempt_count, 1);
+        assert_eq!(
+            metrics.relay_admission_attempt_count,
+            MAX_SHARED_RELAY_ADMISSION_ATTEMPTS as u64
+        );
         assert_eq!(metrics.relay_admission_success_count, 0);
+        assert_eq!(
+            metrics.relay_admission_failure_count,
+            MAX_SHARED_RELAY_ADMISSION_ATTEMPTS as u64
+        );
+        assert_agent_relay_admission_failure_reason(
+            &metrics,
+            AgentRelayAdmissionFailureReason::InvalidResponse,
+            MAX_SHARED_RELAY_ADMISSION_ATTEMPTS as u64,
+        );
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_admission_retries_shared_endpoint_after_path_endpoint_response(
+    ) -> anyhow::Result<()> {
+        async fn relay_admission_selection(
+            axum::extract::State(attempts): axum::extract::State<
+                Arc<std::sync::atomic::AtomicUsize>,
+            >,
+            axum::Json(request): axum::Json<RelayAdmissionRequest>,
+        ) -> axum::Json<RelayAdmissionResponse> {
+            let relay_node = if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                NodeId::from_string("peer-a")
+            } else {
+                NodeId::from_string("relay-good")
+            };
+            axum::Json(RelayAdmissionResponse {
+                relay_node,
+                session_id: RelaySessionId::new(&request.left, &request.right)
+                    .as_str()
+                    .to_string(),
+                session_token: "token-shared".to_string(),
+                expires_at: Utc::now() + ChronoDuration::seconds(60),
+                left: request.left,
+                right: request.right,
+                left_addr: request.left_addr,
+                right_addr: request.right_addr,
+            })
+        }
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (relay_base, relay_task) = spawn_test_http_service(
+            Router::new()
+                .route(
+                    "/v1/sessions",
+                    axum::routing::post(relay_admission_selection),
+                )
+                .with_state(attempts.clone()),
+        )
+        .await?;
+        let mut relay = node_record("relay-good");
+        relay.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 31], 51820))),
+            admission_url: Some(relay_base.clone()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let status = agent_status(
+            "local",
+            vec![candidate("local", EndpointCandidateKind::StunReflexive, 10)],
+        );
+        let mut peer = node_record("peer-a");
+        let mut peer_candidate = candidate("peer-a", EndpointCandidateKind::StunReflexive, 10);
+        peer_candidate.addr = SocketAddr::from(([203, 0, 113, 20], 51820));
+        peer.endpoint_candidates = vec![peer_candidate];
+        peer.relay_capability = Some(RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(SocketAddr::from(([203, 0, 113, 32], 51820))),
+            admission_url: Some(relay_base),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1000,
+            e2e_only: true,
+        });
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+
+        let session = admit_relay_session_from_candidates(
+            &reqwest::Client::new(),
+            &runtime,
+            &status,
+            &peer,
+            &[relay],
+            None,
+        )
+        .await?;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(session.relay_node, NodeId::from_string("relay-good"));
+        assert_eq!(
+            session.relay_endpoint,
+            SocketAddr::from(([203, 0, 113, 31], 51820))
+        );
+        let metrics = runtime.metrics().await;
+        assert_eq!(metrics.relay_admission_attempt_count, 2);
+        assert_eq!(metrics.relay_admission_success_count, 1);
         assert_eq!(metrics.relay_admission_failure_count, 1);
         assert_agent_relay_admission_failure_reason(
             &metrics,
