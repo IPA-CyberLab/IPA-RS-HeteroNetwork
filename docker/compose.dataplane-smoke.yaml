@@ -197,8 +197,11 @@ services:
     network_mode: !reset null
     networks:
       default:
+        interface_name: eth0
       workload-a:
+        interface_name: eth1
       workload-a-v6:
+        interface_name: eth2
     entrypoint: !override
       - /bin/sh
       - -ceu
@@ -284,8 +287,11 @@ services:
       - heteronetwork-agent-entrypoint
     networks:
       default:
+        interface_name: eth0
       workload-b:
+        interface_name: eth1
       workload-b-v6:
+        interface_name: eth2
     command:
       - agent
       - --listen

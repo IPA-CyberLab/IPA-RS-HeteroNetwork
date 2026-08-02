@@ -2774,12 +2774,30 @@ wg show "$interface" latest-handshakes | awk '$2 > 0 { found = 1 } END { exit !f
         };
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "Docker Agent {service} did not establish a WireGuard path from {local_vpn_ip} to {remote_vpn_ip}\nlast probe:\n{last_output}\n{}",
+                "Docker Agent {service} did not establish a WireGuard path from {local_vpn_ip} to {remote_vpn_ip}\nlast probe:\n{last_output}\nnetwork state:\n{}\n{}",
+                compose_agent_network_diagnostics(compose, service),
                 compose_diagnostics(compose)
             );
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn compose_agent_network_diagnostics(compose: &ComposeProject, service: &str) -> String {
+    let script = r#"
+set +e
+echo 'addresses:'
+ip -o address show
+echo 'routes:'
+ip route show table all
+echo 'neighbors:'
+ip neigh show
+echo 'wireguard:'
+wg show all dump
+"#;
+    let mut command = compose_command(compose);
+    command.args(["exec", "-T", service, "sh", "-c", script]);
+    command_output_text(command.output())
 }
 
 fn assert_compose_reconciles_unknown_wireguard_peer(
