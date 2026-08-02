@@ -377,19 +377,19 @@ def run_self_test() -> None:
         == "/callback/<redacted>"
     )
     private_manifest = build_manifest(
-        app_name="KakuriZai Login",
-        homepage_url="https://github.com/IPA-CyberLab/IPA-RS-KakuriZai",
+        app_name="HeteroNetwork Private Login",
+        homepage_url="https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork",
         redirect_url="http://192.168.0.10:39091/callback/test",
-        keycloak_realm="kakurizai",
+        keycloak_realm="heteronetwork",
         callback_urls=[
-            "http://192.168.0.10:18080/realms/kakurizai/broker/github/endpoint"
+            "http://192.168.0.10:18080/realms/heteronetwork/broker/github/endpoint"
         ],
     )
     assert len(private_manifest["callback_urls"]) == 1
     try:
         validate_callback_url(
-            "http://8.8.8.8/realms/kakurizai/broker/github/endpoint",
-            "kakurizai",
+            "http://8.8.8.8/realms/heteronetwork/broker/github/endpoint",
+            "heteronetwork",
         )
     except ValueError:
         pass
