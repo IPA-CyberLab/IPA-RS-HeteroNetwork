@@ -1,24 +1,23 @@
 use std::collections::{hash_map::DefaultHasher, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use ipars_crypto::{IdentityKeyPair, WireGuardKeyPair};
+use ipars_agent::{merge_bootstrap_endpoint_sets, AgentNodeState};
+use ipars_crypto::WireGuardKeyPair;
 use ipars_route_manager::HETERONETWORK_MANAGED_ROUTE_PROTOCOL;
-use ipars_types::api::{
-    HeartbeatRequest, HeartbeatResponse, JoinNodeRequest, RegisterNodeRequest,
-    RegisterNodeResponse, RemoveNodeResponse,
-};
+use ipars_types::api::{JoinNodeRequest, RegisterNodeRequest, RegisterNodeResponse};
 use ipars_types::{
-    CandidateSource, EndpointCandidate, EndpointCandidateKind, HealthState, NatClassification,
-    NatProbeObservation, NodeHealth, NodeId, SignedJoinToken,
+    socket_addr_is_globally_routable, CandidateSource, EndpointCandidate, EndpointCandidateKind,
+    NatClassification, NatProbeObservation, SignedJoinToken,
 };
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde_json::Value;
@@ -31,6 +30,7 @@ const COMPOSE_CONTROL_PLANE_OPERATOR_API_BEARER_TOKEN: &str =
 const COMPOSE_SIGNAL_OPERATOR_API_BEARER_TOKEN: &str = "compose-signal-operator-api-secret";
 const COMPOSE_STUN_OPERATOR_API_BEARER_TOKEN: &str = "compose-stun-operator-api-secret";
 const COMPOSE_RELAY_OPERATOR_API_BEARER_TOKEN: &str = "compose-relay-operator-api-secret";
+const DOCKER_STATE_HELPER_IMAGE: &str = "postgres:16";
 
 #[test]
 fn docker_compose_stack_reaches_healthy_services_with_generated_token() -> Result<()> {
@@ -947,26 +947,40 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         .get("join_token")
         .context("init output missing join_token")?
         .to_string();
-    let service_owner_token: SignedJoinToken = serde_json::from_str(&placeholder_token)
-        .context("failed to decode dataplane service-owner join token")?;
-    let service_owners = [ComposeServiceOwner::new(0), ComposeServiceOwner::new(1)];
     let suffix = unique_suffix()?;
     let project_name = format!("heteronetwork-dataplane-{suffix}");
+    let mut agent_states = [
+        AgentNodeState::generate(Utc::now()),
+        AgentNodeState::generate(Utc::now()),
+    ];
+    let agent_state_volumes = [
+        format!("{project_name}-agent-a-state"),
+        format!("{project_name}-agent-b-state"),
+    ];
+    let mut docker_volume_guard = DockerVolumesCleanup { names: Vec::new() };
+    for volume in &agent_state_volumes {
+        create_docker_state_volume(volume)?;
+        docker_volume_guard.names.push(volume.clone());
+        prepare_docker_agent_state_volume(volume)?;
+    }
     let (workload_a_v6_cidr, workload_b_v6_cidr) = dataplane_ipv6_cidrs(&project_name)?;
     let docker_socket = docker_engine_socket_path()?;
+    let default_network = format!("{project_name}-default");
     let route_a_network = format!("{project_name}-route-a");
     let route_b_network = format!("{project_name}-route-b");
     let route_b_replacement_reservation = format!("{project_name}-route-b-next");
-    let _docker_network_guard = DockerNetworksCleanup {
-        names: vec![
-            route_a_network.clone(),
-            route_b_network.clone(),
-            route_b_replacement_reservation.clone(),
-        ],
-    };
+    let mut docker_network_guard = DockerNetworksCleanup { names: Vec::new() };
+    let default_network_cidr = create_docker_internal_bridge_network(&default_network)?;
+    docker_network_guard.names.push(default_network.clone());
+    let (agent_public_ip, agent_b_public_ip) = dataplane_public_agent_ips(&project_name)?;
     let route_a_cidr = create_docker_bridge_network(&route_a_network)?;
+    docker_network_guard.names.push(route_a_network.clone());
     let route_b_cidr = create_docker_bridge_network(&route_b_network)?;
+    docker_network_guard.names.push(route_b_network.clone());
     let route_b_replacement_cidr = create_docker_bridge_network(&route_b_replacement_reservation)?;
+    docker_network_guard
+        .names
+        .push(route_b_replacement_reservation.clone());
     let agent_api_bearer_token = COMPOSE_AGENT_API_BEARER_TOKEN.to_string();
     let mut compose = ComposeProject {
         repo_root: repo_root.to_path_buf(),
@@ -995,11 +1009,31 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             ),
             (
                 "HETERONETWORK_DATAPLANE_PUBLIC_A_NODE_ID".to_string(),
-                service_owners[0].node_id().to_string(),
+                agent_states[0].node_id.to_string(),
             ),
             (
                 "HETERONETWORK_DATAPLANE_PUBLIC_B_NODE_ID".to_string(),
-                service_owners[1].node_id().to_string(),
+                agent_states[1].node_id.to_string(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_AGENT_A_STATE_VOLUME".to_string(),
+                agent_state_volumes[0].clone(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_AGENT_B_STATE_VOLUME".to_string(),
+                agent_state_volumes[1].clone(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_DEFAULT_NETWORK".to_string(),
+                default_network.clone(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_AGENT_A_PUBLIC_IP".to_string(),
+                agent_public_ip.to_string(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_AGENT_B_PUBLIC_IP".to_string(),
+                agent_b_public_ip.to_string(),
             ),
             (
                 "HETERONETWORK_DATAPLANE_BOOTSTRAP_IP".to_string(),
@@ -1100,42 +1134,6 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "relay-b",
         ],
     )?;
-    register_compose_service_owners(&compose, &service_owners, &service_owner_token)?;
-    wait_for_json(
-        &compose,
-        "HA service directory",
-        "control-plane",
-        "http://127.0.0.1:8443/v1/admin/services",
-        |value| {
-            let instances = value
-                .get("instances")
-                .and_then(Value::as_array)
-                .context("service directory instances must be an array")?;
-            anyhow::ensure!(instances.len() == 2, "expected two active public instances");
-            let endpoints = value
-                .get("bootstrap_endpoints")
-                .and_then(Value::as_array)
-                .context("service directory bootstrap_endpoints must be an array")?;
-            anyhow::ensure!(endpoints.len() == 10, "expected ten distinct HA endpoints");
-            Ok(())
-        },
-    )?;
-    wait_for_json(
-        &compose,
-        "redundant public-service metrics without Keycloak",
-        "control-plane",
-        "http://127.0.0.1:8443/v1/metrics",
-        |value| {
-            ensure_json_bool_equals(value, "ha_ready", false)?;
-            ensure_json_u64_at_least(value, "active_service_instance_count", 2)?;
-            ensure_json_u64_at_least(value, "active_service_host_count", 2)?;
-            ensure_json_u64_at_least(value, "active_control_plane_count", 2)?;
-            ensure_json_u64_at_least(value, "active_signal_count", 2)?;
-            ensure_json_u64_at_least(value, "active_stun_count", 2)?;
-            ensure_json_u64_at_least(value, "active_relay_count", 2)?;
-            ensure_json_u64_at_least(value, "active_web_ui_count", 2)
-        },
-    )?;
     let bootstrap_ip = compose_service_ipv4(&compose, "control-plane")?;
     run_compose_with_diagnostics(
         &compose,
@@ -1187,12 +1185,25 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         bootstrap_ip,
         &allowed_routes,
     )?;
-    let failover_join_token = generated_dataplane_ha_join_token(
+    let signed_join_token: SignedJoinToken = serde_json::from_value(join_token.clone())
+        .context("failed to decode Docker dataplane join token")?;
+    register_and_persist_compose_agent(
         &compose,
-        &cluster_id,
-        &issuer_key_id,
-        &issuer_private_key,
-        &allowed_routes,
+        0,
+        &mut agent_states[0],
+        SocketAddr::new(IpAddr::V4(agent_public_ip), 51_820),
+        &signed_join_token,
+        &agent_state_volumes[0],
+        "agent.json",
+    )?;
+    register_and_persist_compose_agent(
+        &compose,
+        1,
+        &mut agent_states[1],
+        SocketAddr::new(IpAddr::V4(agent_b_public_ip), 51_820),
+        &signed_join_token,
+        &agent_state_volumes[1],
+        "agent-b.json",
     )?;
     replace_compose_env(
         &mut compose,
@@ -1231,6 +1242,35 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     );
     anyhow::ensure!(
         rendered
+            .matches("HETERONETWORK_AGENT_JOIN_TOKEN:")
+            .count()
+            == 1
+            && !rendered.contains("--stun-server")
+            && rendered
+                .matches("HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS: \"3600\"")
+                .count()
+                == 2
+            && rendered
+                .matches("HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS: \"3600\"")
+                .count()
+                == 2,
+        "dataplane Compose config did not render join-token-free Agent resume with deferred NAT discovery\n{rendered}"
+    );
+    anyhow::ensure!(
+        rendered.contains(&format!("name: {default_network}"))
+            && rendered.contains("external: true")
+            && rendered.contains(&format!(
+                "HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP: {agent_public_ip}"
+            ))
+            && rendered.contains(&format!(
+                "HETERONETWORK_DATAPLANE_AGENT_PEER_PUBLIC_IP: {agent_b_public_ip}"
+            ))
+            && !rendered.contains(&format!("subnet: {agent_public_ip}/"))
+            && !rendered.contains(&format!("subnet: {agent_b_public_ip}/")),
+        "dataplane Compose config did not preserve the external private network with netns-local public /32 addresses\n{rendered}"
+    );
+    anyhow::ensure!(
+        rendered
             .matches("HETERONETWORK_DOCKER_DISCOVER_NETWORKS: \"true\"")
             .count()
             == 2
@@ -1245,7 +1285,6 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
             "up",
             "-d",
             "--no-deps",
-            "--force-recreate",
             "--wait",
             "--wait-timeout",
             "180",
@@ -1284,6 +1323,16 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         agent_netns != agent_b_netns,
         "dataplane Agents unexpectedly shared network namespace {agent_netns}"
     );
+    let running_agent_default_ip =
+        compose_service_ipv4_in_subnet(&compose, "agent", default_network_cidr)?;
+    let running_agent_b_default_ip =
+        compose_service_ipv4_in_subnet(&compose, "agent-b", default_network_cidr)?;
+    anyhow::ensure!(
+        running_agent_default_ip != running_agent_b_default_ip,
+        "running Agents unexpectedly shared private default-network IP {running_agent_default_ip}"
+    );
+    assert_compose_agent_public_endpoint(&compose, "agent", agent_public_ip, agent_b_public_ip)?;
+    assert_compose_agent_public_endpoint(&compose, "agent-b", agent_b_public_ip, agent_public_ip)?;
 
     let (agent_id, agent_vpn_ip) = compose_dataplane_agent_status(&compose, "agent")?;
     let (agent_b_id, agent_b_vpn_ip) = compose_dataplane_agent_status(&compose, "agent-b")?;
@@ -1292,9 +1341,47 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "dataplane Agents unexpectedly registered the same node ID {agent_id}"
     );
     anyhow::ensure!(
+        agent_id == agent_states[0].node_id.as_str()
+            && agent_b_id == agent_states[1].node_id.as_str(),
+        "dataplane service owners did not match the actual Agent identities: expected {} and {}, got {agent_id} and {agent_b_id}",
+        agent_states[0].node_id,
+        agent_states[1].node_id,
+    );
+    anyhow::ensure!(
         agent_vpn_ip != agent_b_vpn_ip,
         "dataplane Agents unexpectedly received the same VPN IP {agent_vpn_ip}"
     );
+    let expected_service_owner_ids = BTreeSet::from([agent_id.clone(), agent_b_id.clone()]);
+    wait_for_json(
+        &compose,
+        "HA service directory owned by actual Agents",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/admin/services",
+        |value| ensure_compose_ha_service_directory(value, &expected_service_owner_ids),
+    )?;
+    wait_for_json(
+        &compose,
+        "redundant public-service metrics without Keycloak",
+        "control-plane",
+        "http://127.0.0.1:8443/v1/metrics",
+        |value| {
+            ensure_json_bool_equals(value, "ha_ready", false)?;
+            ensure_json_u64_at_least(value, "active_service_instance_count", 2)?;
+            ensure_json_u64_at_least(value, "active_service_host_count", 2)?;
+            ensure_json_u64_at_least(value, "active_control_plane_count", 2)?;
+            ensure_json_u64_at_least(value, "active_signal_count", 2)?;
+            ensure_json_u64_at_least(value, "active_stun_count", 2)?;
+            ensure_json_u64_at_least(value, "active_relay_count", 2)?;
+            ensure_json_u64_at_least(value, "active_web_ui_count", 2)
+        },
+    )?;
+    let failover_join_token = generated_dataplane_ha_join_token(
+        &compose,
+        &cluster_id,
+        &issuer_key_id,
+        &issuer_private_key,
+        &allowed_routes,
+    )?;
     let nodes = ComposeAgentNodes {
         agent: agent_id.clone(),
         agent_b: agent_b_id.clone(),
@@ -1404,20 +1491,12 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         "HETERONETWORK_DATAPLANE_JOIN_TOKEN",
         failover_join_token.to_string(),
     )?;
-    heartbeat_compose_service_owners(&compose, &service_owners)?;
     wait_for_json(
         &compose,
-        "refreshed HA service directory",
+        "fresh HA service directory before failover",
         "control-plane",
         "http://127.0.0.1:8443/v1/admin/services",
-        |value| {
-            let instances = value
-                .get("instances")
-                .and_then(Value::as_array)
-                .context("service directory instances must be an array")?;
-            anyhow::ensure!(instances.len() == 2, "expected two active public instances");
-            Ok(())
-        },
+        |value| ensure_compose_ha_service_directory(value, &expected_service_owner_ids),
     )?;
     run_compose_with_diagnostics(
         &compose,
@@ -1511,8 +1590,6 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         workload_a_v6_ip,
         workload_b_v6_ip,
     )?;
-    remove_compose_service_owners(&compose, &service_owners)?;
-
     run_compose_with_diagnostics(
         &compose,
         [
@@ -1567,156 +1644,122 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-struct ComposeServiceOwner {
-    identity: IdentityKeyPair,
-    wireguard: WireGuardKeyPair,
-    public_addr: std::net::SocketAddr,
-}
-
-impl ComposeServiceOwner {
-    fn new(index: u8) -> Self {
-        Self {
-            identity: IdentityKeyPair::generate(),
-            wireguard: WireGuardKeyPair::generate(),
-            public_addr: std::net::SocketAddr::from((
-                [8, 8, 4, 4 + index],
-                51_820 + u16::from(index),
-            )),
-        }
-    }
-
-    fn node_id(&self) -> NodeId {
-        self.identity.node_id()
-    }
-
-    fn connectivity(
-        &self,
-        observed_at: chrono::DateTime<Utc>,
-    ) -> (EndpointCandidate, NatClassification) {
-        let node_id = self.node_id();
-        let candidate = EndpointCandidate {
-            node_id,
-            kind: EndpointCandidateKind::PublicUdp,
-            addr: self.public_addr,
+fn register_and_persist_compose_agent(
+    compose: &ComposeProject,
+    index: u8,
+    state: &mut AgentNodeState,
+    local_addr: SocketAddr,
+    token: &SignedJoinToken,
+    state_volume: &str,
+    state_file: &str,
+) -> Result<()> {
+    let observed_at = Utc::now();
+    anyhow::ensure!(
+        socket_addr_is_globally_routable(local_addr),
+        "Compose Agent {index} address {local_addr} must be globally routable"
+    );
+    let public_addr = local_addr;
+    let stun_server = SocketAddr::new(compose_service_ipv4(compose, "stun")?, 3478);
+    let candidates = vec![
+        EndpointCandidate {
+            node_id: state.node_id.clone(),
+            kind: EndpointCandidateKind::LocalUdp,
+            addr: local_addr,
             observed_at,
             priority: 100,
             cost: 10,
             source: CandidateSource::StunProbe,
-        };
-        let classification = NatClassification::from_observations(
-            self.public_addr,
-            vec![NatProbeObservation {
-                local_addr: self.public_addr,
-                stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
-                reflexive_addr: self.public_addr,
-                observed_at,
-            }],
+        },
+        EndpointCandidate {
+            node_id: state.node_id.clone(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: public_addr,
             observed_at,
-        );
-        (candidate, classification)
-    }
-
-    fn heartbeat(&self) -> Result<HeartbeatRequest> {
-        let observed_at = Utc::now();
-        let (candidate, classification) = self.connectivity(observed_at);
-        let mut request = HeartbeatRequest {
-            node_id: self.node_id(),
-            health: NodeHealth {
-                state: HealthState::Healthy,
-                last_seen_at: observed_at,
-                latency_ms: Some(1.0),
-                relay_load: None,
-                message: None,
-            },
-            candidates: vec![candidate],
+            priority: 10,
+            cost: 100,
+            source: CandidateSource::StunProbe,
+        },
+    ];
+    let classification = NatClassification::from_observations(
+        public_addr,
+        vec![NatProbeObservation {
+            local_addr: public_addr,
+            stun_server,
+            reflexive_addr: public_addr,
+            observed_at,
+        }],
+        observed_at,
+    );
+    let request = JoinNodeRequest {
+        token: token.clone(),
+        registration: RegisterNodeRequest {
+            node_id: state.node_id.clone(),
+            identity_public_key: state.identity_public_key_b64.clone(),
+            wireguard_public_key: state.wireguard_public_key_b64.clone(),
+            candidates,
             nat_classification: Some(classification),
             relay_capability: None,
-            routes: None,
-            path_state: Vec::new(),
-            node_signature: None,
-        };
-        request.node_signature = Some(
-            self.identity
-                .sign_heartbeat_request(&request, Utc::now())
-                .context("failed to sign Compose service-owner heartbeat")?,
-        );
-        Ok(request)
-    }
+            requested_routes: Vec::new(),
+        },
+    };
+    let value = compose_exec_post_json(
+        compose,
+        "control-plane",
+        "http://127.0.0.1:8443/v1/join",
+        &serde_json::to_string(&request)?,
+    )?;
+    let response: RegisterNodeResponse = serde_json::from_value(value)
+        .with_context(|| format!("failed to decode Compose Agent {index} join response"))?;
+    anyhow::ensure!(
+        response.node.cluster_id == token.claims.cluster_id
+            && response.node.node_id == state.node_id
+            && response.node.identity_public_key == state.identity_public_key_b64
+            && response.node.wireguard_public_key == state.wireguard_public_key_b64,
+        "Compose Agent {index} join response did not preserve its registered identity"
+    );
+
+    let seeds = token.claims.bootstrap_endpoints.clone();
+    let active = response.peer_map.bootstrap_endpoints.clone();
+    state.vpn_ip = Some(response.node.vpn_ip);
+    state.registered_node = Some(response.node);
+    state.bootstrap_endpoints = merge_bootstrap_endpoint_sets(&active, &seeds)
+        .with_context(|| format!("failed to merge Compose Agent {index} bootstrap endpoints"))?;
+    state.seed_bootstrap_endpoints = active.is_empty().then_some(seeds);
+    state.updated_at = Utc::now();
+    state
+        .validate()
+        .with_context(|| format!("Compose Agent {index} state was invalid after registration"))?;
+    write_docker_volume_agent_state(state_volume, state_file, state)
 }
 
-fn register_compose_service_owners(
-    compose: &ComposeProject,
-    owners: &[ComposeServiceOwner],
-    token: &SignedJoinToken,
+fn ensure_compose_ha_service_directory(
+    value: &Value,
+    expected_owner_ids: &BTreeSet<String>,
 ) -> Result<()> {
-    for owner in owners {
-        let observed_at = Utc::now();
-        let (candidate, classification) = owner.connectivity(observed_at);
-        let request = JoinNodeRequest {
-            token: token.clone(),
-            registration: RegisterNodeRequest {
-                node_id: owner.node_id(),
-                identity_public_key: owner.identity.public_key_b64(),
-                wireguard_public_key: owner.wireguard.public_key_b64.clone(),
-                candidates: vec![candidate],
-                nat_classification: Some(classification),
-                relay_capability: None,
-                requested_routes: Vec::new(),
-            },
-        };
-        let value = compose_exec_post_json(
-            compose,
-            "control-plane",
-            "http://127.0.0.1:8443/v1/join",
-            &serde_json::to_string(&request)?,
-        )?;
-        let response: RegisterNodeResponse = serde_json::from_value(value)
-            .context("failed to decode Compose service-owner join response")?;
-        anyhow::ensure!(
-            response.node.node_id == owner.node_id(),
-            "Compose service owner joined with an unexpected node ID"
-        );
-    }
-    heartbeat_compose_service_owners(compose, owners)
-}
-
-fn heartbeat_compose_service_owners(
-    compose: &ComposeProject,
-    owners: &[ComposeServiceOwner],
-) -> Result<()> {
-    for owner in owners {
-        let value = compose_exec_post_json(
-            compose,
-            "control-plane",
-            "http://127.0.0.1:8443/v1/heartbeat",
-            &serde_json::to_string(&owner.heartbeat()?)?,
-        )?;
-        let response: HeartbeatResponse = serde_json::from_value(value)
-            .context("failed to decode Compose service-owner heartbeat response")?;
-        anyhow::ensure!(
-            response.accepted,
-            "Compose service-owner heartbeat was rejected"
-        );
-    }
-    Ok(())
-}
-
-fn remove_compose_service_owners(
-    compose: &ComposeProject,
-    owners: &[ComposeServiceOwner],
-) -> Result<()> {
-    for owner in owners {
-        let response: RemoveNodeResponse = serde_json::from_value(compose_exec_delete_json(
-            compose,
-            "control-plane-b",
-            &format!("http://127.0.0.1:8443/v1/admin/nodes/{}", owner.node_id()),
-        )?)
-        .context("failed to decode Compose service-owner removal response")?;
-        anyhow::ensure!(
-            response.node.node_id == owner.node_id(),
-            "Compose service-owner removal returned an unexpected node"
-        );
-    }
+    let instances = value
+        .get("instances")
+        .and_then(Value::as_array)
+        .context("service directory instances must be an array")?;
+    anyhow::ensure!(instances.len() == 2, "expected two active public instances");
+    let actual_owner_ids = instances
+        .iter()
+        .map(|instance| {
+            instance
+                .get("owner_node_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .context("active service instance omitted owner_node_id")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    anyhow::ensure!(
+        actual_owner_ids == *expected_owner_ids,
+        "active service owners {actual_owner_ids:?} did not match actual Agents {expected_owner_ids:?}"
+    );
+    let endpoints = value
+        .get("bootstrap_endpoints")
+        .and_then(Value::as_array)
+        .context("service directory bootstrap_endpoints must be an array")?;
+    anyhow::ensure!(endpoints.len() == 10, "expected ten distinct HA endpoints");
     Ok(())
 }
 
@@ -1729,7 +1772,6 @@ fn generated_dataplane_join_token(
 ) -> Result<Value> {
     let control_plane = format!("http://{bootstrap_ip}:8443");
     let signal = format!("http://{bootstrap_ip}:9443");
-    let stun = format!("udp://{bootstrap_ip}:3478");
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipars"));
     command
         .env("HETERONETWORK_ISSUER_PRIVATE_KEY", issuer_private_key)
@@ -1748,7 +1790,6 @@ fn generated_dataplane_join_token(
         ]);
     command.arg("--control-plane-bootstrap").arg(control_plane);
     command.arg("--signal-bootstrap").arg(signal);
-    command.arg("--stun-bootstrap").arg(stun);
     for route in allowed_routes {
         command.arg("--allowed-route").arg(route.to_string());
     }
@@ -2238,6 +2279,80 @@ fn create_docker_bridge_network(name: &str) -> Result<Ipv4Net> {
     )
 }
 
+fn create_docker_internal_bridge_network(name: &str) -> Result<Ipv4Net> {
+    let mut last_error = String::new();
+    for third in 0..=255u16 {
+        let cidr = format!("10.239.{third}.0/24").parse::<Ipv4Net>()?;
+        let output = Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--internal",
+                "--subnet",
+                &cidr.to_string(),
+                name,
+            ])
+            .output()
+            .with_context(|| format!("failed to create Docker network {name}"))?;
+        if output.status.success() {
+            assert_docker_internal_bridge_network(name, cidr)?;
+            return Ok(cidr);
+        }
+        last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    }
+    anyhow::bail!(
+        "failed to allocate an isolated private Docker bridge subnet for {name}: {last_error}"
+    )
+}
+
+fn assert_docker_internal_bridge_network(name: &str, expected_cidr: Ipv4Net) -> Result<()> {
+    let output = Command::new("docker")
+        .args(["network", "inspect", name])
+        .output()
+        .with_context(|| format!("failed to inspect internal Docker network {name}"))?;
+    ensure_success(&format!("inspect internal Docker network {name}"), &output)?;
+    let inspected: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("failed to parse internal Docker network {name}"))?;
+    let network = inspected
+        .as_array()
+        .and_then(|networks| networks.first())
+        .with_context(|| format!("Docker network inspection for {name} was empty"))?;
+    anyhow::ensure!(
+        network.get("Internal").and_then(Value::as_bool) == Some(true),
+        "Docker network {name} was not internal"
+    );
+    let subnets = network
+        .get("IPAM")
+        .and_then(|ipam| ipam.get("Config"))
+        .and_then(Value::as_array)
+        .context("internal Docker network omitted IPAM configuration")?
+        .iter()
+        .filter_map(|config| config.get("Subnet").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let expected_cidr = expected_cidr.to_string();
+    anyhow::ensure!(
+        subnets.len() == 1 && subnets[0] == expected_cidr,
+        "internal Docker network {name} used unexpected subnets {subnets:?}; expected only {expected_cidr}"
+    );
+    Ok(())
+}
+
+fn dataplane_public_agent_ips(project_name: &str) -> Result<(Ipv4Addr, Ipv4Addr)> {
+    let mut hasher = DefaultHasher::new();
+    project_name.hash(&mut hasher);
+    let third = (hasher.finish() & 0xff) as u8;
+    let agent = Ipv4Addr::new(11, 240, third, 100);
+    let agent_b = Ipv4Addr::new(11, 240, third, 101);
+    anyhow::ensure!(
+        socket_addr_is_globally_routable(SocketAddr::new(IpAddr::V4(agent), 51_820))
+            && socket_addr_is_globally_routable(SocketAddr::new(IpAddr::V4(agent_b), 51_820)),
+        "netns-local Agent addresses {agent} and {agent_b} must be globally routable"
+    );
+    Ok((agent, agent_b))
+}
+
 fn dataplane_ipv6_cidrs(project_name: &str) -> Result<(Ipv6Net, Ipv6Net)> {
     let mut hasher = DefaultHasher::new();
     project_name.hash(&mut hasher);
@@ -2457,6 +2572,43 @@ fn compose_service_ipv6_in_subnet(
         "service {service} must have exactly one IPv6 address in {subnet}, got {addresses:?}: {stdout:?}"
     );
     Ok(addresses[0])
+}
+
+fn assert_compose_agent_public_endpoint(
+    compose: &ComposeProject,
+    service: &str,
+    local: Ipv4Addr,
+    peer: Ipv4Addr,
+) -> Result<()> {
+    let local_cidr = format!("{local}/32");
+    let script = r#"
+set -eu
+ip -4 -o address show dev eth0 | grep -F -- "$1" >/dev/null
+route="$(ip -4 route get "$2" from "$3")"
+printf '%s\n' "$route"
+printf '%s\n' "$route" | grep -F -- "dev eth0" >/dev/null
+printf '%s\n' "$route" | grep -E -- "(from|src) $3([[:space:]]|$)" >/dev/null
+"#;
+    let mut command = compose_command(compose);
+    command.args([
+        "exec",
+        "-T",
+        service,
+        "sh",
+        "-ceu",
+        script,
+        "assert-public-endpoint",
+        &local_cidr,
+        &peer.to_string(),
+        &local.to_string(),
+    ]);
+    let output = command.output().with_context(|| {
+        format!("failed to inspect {service} netns-local public endpoint {local}")
+    })?;
+    ensure_success(
+        &format!("verify {service} netns-local public endpoint {local} and route to {peer}"),
+        &output,
+    )
 }
 
 fn configure_compose_workload_routes(
@@ -3118,8 +3270,23 @@ struct ComposeCleanup {
 }
 
 #[derive(Debug)]
+struct DockerVolumesCleanup {
+    names: Vec<String>,
+}
+
+#[derive(Debug)]
 struct DockerNetworksCleanup {
     names: Vec<String>,
+}
+
+impl Drop for DockerVolumesCleanup {
+    fn drop(&mut self) {
+        for name in &self.names {
+            let _ = Command::new("docker")
+                .args(["volume", "rm", "--force", name])
+                .output();
+        }
+    }
 }
 
 impl Drop for DockerNetworksCleanup {
@@ -3130,6 +3297,120 @@ impl Drop for DockerNetworksCleanup {
                 .output();
         }
     }
+}
+
+fn validate_docker_state_volume_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        name.starts_with("heteronetwork-dataplane-")
+            && (name.ends_with("-agent-a-state") || name.ends_with("-agent-b-state"))
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+        "refusing unsafe Docker Agent state volume {name:?}"
+    );
+    Ok(())
+}
+
+fn docker_state_helper_command(volume: &str) -> Result<Command> {
+    validate_docker_state_volume_name(volume)?;
+    let mut command = Command::new("docker");
+    command.args([
+        "run",
+        "--rm",
+        "--interactive",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--user",
+        "0:0",
+        "--entrypoint",
+        "sh",
+        "--mount",
+    ]);
+    command.arg(format!("type=volume,source={volume},target=/state"));
+    command.arg(DOCKER_STATE_HELPER_IMAGE);
+    Ok(command)
+}
+
+fn create_docker_state_volume(volume: &str) -> Result<()> {
+    validate_docker_state_volume_name(volume)?;
+    let inspected = Command::new("docker")
+        .args(["volume", "inspect", volume])
+        .output()
+        .with_context(|| format!("failed to check Docker state volume {volume}"))?;
+    anyhow::ensure!(
+        !inspected.status.success(),
+        "refusing to reuse existing Docker state volume {volume}"
+    );
+    let output = Command::new("docker")
+        .args([
+            "volume",
+            "create",
+            "--label",
+            "heteronetwork.smoke=dataplane-agent-state",
+            volume,
+        ])
+        .output()
+        .with_context(|| format!("failed to create Docker state volume {volume}"))?;
+    ensure_success(&format!("create Docker state volume {volume}"), &output)
+}
+
+fn prepare_docker_agent_state_volume(volume: &str) -> Result<()> {
+    let mut command = docker_state_helper_command(volume)?;
+    command.args([
+        "-ceu",
+        "umask 077; test -d /state; test -z \"$(find /state -mindepth 1 -maxdepth 1 -print -quit)\"; chmod 0700 /state",
+        "prepare-agent-state-volume",
+    ]);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to prepare Docker Agent state volume {volume}"))?;
+    ensure_success(
+        &format!("prepare Docker Agent state volume {volume}"),
+        &output,
+    )
+}
+
+fn write_docker_volume_agent_state(
+    volume: &str,
+    state_file: &str,
+    state: &AgentNodeState,
+) -> Result<()> {
+    anyhow::ensure!(
+        matches!(state_file, "agent.json" | "agent-b.json"),
+        "refusing unsafe Docker Agent state file {state_file:?}"
+    );
+    let mut bytes = serde_json::to_vec_pretty(state).context("failed to encode Agent state")?;
+    bytes.push(b'\n');
+
+    let mut command = docker_state_helper_command(volume)?;
+    command
+        .args([
+            "-ceu",
+            "umask 077; target=\"/state/$1\"; temporary=\"/state/.$1.tmp\"; test ! -e \"$target\"; test ! -L \"$target\"; test ! -e \"$temporary\"; cat > \"$temporary\"; chmod 0600 \"$temporary\"; test -s \"$temporary\"; mv -T \"$temporary\" \"$target\"",
+            "write-agent-state",
+            state_file,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start Agent state writer for {state_file}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .context("Agent state writer stdin was unavailable")?
+        .write_all(&bytes)
+        .with_context(|| format!("failed to write Agent state {state_file}"));
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for Agent state writer {state_file}"))?;
+    write_result?;
+    ensure_success(&format!("write Agent state {state_file}"), &output)
 }
 
 impl Drop for ComposeCleanup {
@@ -4228,38 +4509,6 @@ fn compose_exec_post_json(
     serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
             "failed to parse JSON from docker compose exec {service} curl POST {url}: {}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    })
-}
-
-fn compose_exec_delete_json(compose: &ComposeProject, service: &str, url: &str) -> Result<Value> {
-    let mut command = compose_command(compose);
-    command.args([
-        "exec",
-        "-T",
-        service,
-        "curl",
-        "-fsS",
-        "--max-time",
-        "5",
-        "-X",
-        "DELETE",
-        "-H",
-        "Accept: application/json",
-    ]);
-    add_api_bearer_header(&mut command, service);
-    command.arg(url);
-    let output = command.output().with_context(|| {
-        format!("failed to run docker compose exec {service} curl DELETE {url}")
-    })?;
-    ensure_success(
-        &format!("docker compose exec {service} curl DELETE {url}"),
-        &output,
-    )?;
-    serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "failed to parse JSON from docker compose exec {service} curl DELETE {url}: {}",
             String::from_utf8_lossy(&output.stdout)
         )
     })

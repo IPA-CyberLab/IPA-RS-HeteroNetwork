@@ -196,9 +196,17 @@ services:
   agent:
     network_mode: !reset null
     networks:
-      - default
-      - workload-a
-      - workload-a-v6
+      default:
+      workload-a:
+      workload-a-v6:
+    entrypoint: !override
+      - /bin/sh
+      - -ceu
+      - |
+        ip -4 address replace "$${HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP}/32" dev eth0
+        ip -4 route replace "$${HETERONETWORK_DATAPLANE_AGENT_PEER_PUBLIC_IP}/32" dev eth0 scope link src "$${HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP}"
+        exec /usr/local/bin/iparsd "$$@"
+      - heteronetwork-agent-entrypoint
     command:
       - agent
       - --listen
@@ -212,14 +220,16 @@ services:
       - "1"
       - --heartbeat-interval-seconds
       - "1"
-      - --stun-server
-      - ${HETERONETWORK_DATAPLANE_BOOTSTRAP_IP:?set HETERONETWORK_DATAPLANE_BOOTSTRAP_IP}:3478
     environment: !override
       HETERONETWORK_ROLE: agent
-      HETERONETWORK_AGENT_JOIN_TOKEN: ${HETERONETWORK_DATAPLANE_JOIN_TOKEN:?set HETERONETWORK_DATAPLANE_JOIN_TOKEN}
+      HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP: ${HETERONETWORK_DATAPLANE_AGENT_A_PUBLIC_IP:?set HETERONETWORK_DATAPLANE_AGENT_A_PUBLIC_IP}
+      HETERONETWORK_DATAPLANE_AGENT_PEER_PUBLIC_IP: ${HETERONETWORK_DATAPLANE_AGENT_B_PUBLIC_IP:?set HETERONETWORK_DATAPLANE_AGENT_B_PUBLIC_IP}
       HETERONETWORK_AGENT_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN}
       HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51820
       HETERONETWORK_AGENT_DISABLE_PUBLIC_STUN_FALLBACK: "true"
+      HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS: "3600"
+      HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS: "3600"
+      HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CLASSIFICATION_MAX_AGE_SECONDS: "3600"
       HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51820"
       HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command
       HETERONETWORK_AGENT_WIREGUARD_BACKEND: command
@@ -265,11 +275,17 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     entrypoint:
-      - /usr/local/bin/iparsd
+      - /bin/sh
+      - -ceu
+      - |
+        ip -4 address replace "$${HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP}/32" dev eth0
+        ip -4 route replace "$${HETERONETWORK_DATAPLANE_AGENT_PEER_PUBLIC_IP}/32" dev eth0 scope link src "$${HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP}"
+        exec /usr/local/bin/iparsd "$$@"
+      - heteronetwork-agent-entrypoint
     networks:
-      - default
-      - workload-b
-      - workload-b-v6
+      default:
+      workload-b:
+      workload-b-v6:
     command:
       - agent
       - --listen
@@ -283,14 +299,16 @@ services:
       - "1"
       - --heartbeat-interval-seconds
       - "1"
-      - --stun-server
-      - ${HETERONETWORK_DATAPLANE_BOOTSTRAP_IP:?set HETERONETWORK_DATAPLANE_BOOTSTRAP_IP}:3478
     environment:
       HETERONETWORK_ROLE: agent
-      HETERONETWORK_AGENT_JOIN_TOKEN: ${HETERONETWORK_DATAPLANE_JOIN_TOKEN:?set HETERONETWORK_DATAPLANE_JOIN_TOKEN}
+      HETERONETWORK_DATAPLANE_AGENT_PUBLIC_IP: ${HETERONETWORK_DATAPLANE_AGENT_B_PUBLIC_IP:?set HETERONETWORK_DATAPLANE_AGENT_B_PUBLIC_IP}
+      HETERONETWORK_DATAPLANE_AGENT_PEER_PUBLIC_IP: ${HETERONETWORK_DATAPLANE_AGENT_A_PUBLIC_IP:?set HETERONETWORK_DATAPLANE_AGENT_A_PUBLIC_IP}
       HETERONETWORK_AGENT_API_BEARER_TOKEN: ${HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN:?set HETERONETWORK_DATAPLANE_AGENT_API_BEARER_TOKEN}
       HETERONETWORK_AGENT_STUN_BIND: 0.0.0.0:51820
       HETERONETWORK_AGENT_DISABLE_PUBLIC_STUN_FALLBACK: "true"
+      HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS: "3600"
+      HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS: "3600"
+      HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CLASSIFICATION_MAX_AGE_SECONDS: "3600"
       HETERONETWORK_AGENT_WIREGUARD_LISTEN_PORT: "51820"
       HETERONETWORK_AGENT_RUNTIME_BACKEND: linux-command
       HETERONETWORK_AGENT_WIREGUARD_BACKEND: command
@@ -470,6 +488,9 @@ services:
       start_period: 5s
 
 networks:
+  default:
+    external: true
+    name: ${HETERONETWORK_DATAPLANE_DEFAULT_NETWORK:?set HETERONETWORK_DATAPLANE_DEFAULT_NETWORK}
   workload-a:
   workload-b:
   workload-a-v6:
@@ -485,5 +506,9 @@ networks:
 
 volumes:
   agent-dataplane-a:
+    external: true
+    name: ${HETERONETWORK_DATAPLANE_AGENT_A_STATE_VOLUME:?set HETERONETWORK_DATAPLANE_AGENT_A_STATE_VOLUME}
   agent-dataplane-b:
+    external: true
+    name: ${HETERONETWORK_DATAPLANE_AGENT_B_STATE_VOLUME:?set HETERONETWORK_DATAPLANE_AGENT_B_STATE_VOLUME}
   agent-dataplane-failover:
