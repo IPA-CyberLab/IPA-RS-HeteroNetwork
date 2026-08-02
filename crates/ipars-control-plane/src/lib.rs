@@ -1676,7 +1676,7 @@ enum OverlayTopologyNodeSource {
 impl OverlayTopologyNodeSource {
     fn nodes(&self) -> &[NodeRecord] {
         match self {
-            Self::Snapshot(snapshot) => &snapshot.active_nodes,
+            Self::Snapshot(snapshot) => &snapshot.nodes,
             #[cfg(test)]
             Self::Owned(nodes) => nodes,
         }
@@ -3196,9 +3196,9 @@ where
             .enumerate()
             .filter_map(|(index, neighbor_id)| {
                 snapshot
-                    .active_nodes_by_id
+                    .nodes_by_id
                     .get(neighbor_id)
-                    .and_then(|index| snapshot.active_nodes.get(*index))
+                    .and_then(|index| snapshot.nodes.get(*index))
                     .map(|neighbor| {
                         let mut node =
                             filter_served_endpoint_candidates(neighbor.clone(), now, &policy);
@@ -3256,7 +3256,7 @@ where
     ) -> Result<ControlPlaneTopologyResponse, ControlPlaneError> {
         let generated_at = Utc::now();
         let (policy, snapshot) = self.current_overlay_snapshot().await?;
-        let mut nodes = snapshot.active_nodes.clone();
+        let mut nodes = snapshot.nodes.clone();
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let topology = self
             .overlay_topology_for_snapshot(&snapshot, &policy)
@@ -3428,6 +3428,16 @@ where
                     .map(BTreeSet::len)
                     .unwrap_or(0);
                 let health = health_by_node.get(&node.node_id);
+                let health_state = if overlay_node_health_allows(
+                    &node,
+                    health,
+                    generated_at,
+                    policy.relay_health_ttl_seconds,
+                ) {
+                    health.map(|health| health.state)
+                } else {
+                    Some(HealthState::Unhealthy)
+                };
                 let representative_for = representative_assignments
                     .remove(&node.node_id)
                     .unwrap_or_default();
@@ -3439,7 +3449,7 @@ where
                     leaf_group_id,
                     ancestry,
                     degree,
-                    health_state: health.map(|health| health.state),
+                    health_state,
                     last_seen_at: health.map(|health| health.last_seen_at),
                     representative_for,
                 })
@@ -3504,8 +3514,14 @@ where
         let topology = self
             .overlay_topology_for_snapshot(&snapshot, &policy)
             .await?;
+        let unavailable_nodes = snapshot
+            .nodes
+            .iter()
+            .filter(|node| !snapshot.active_nodes_by_id.contains_key(&node.node_id))
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
         let paths = topology
-            .paths(&source.node_id, &target.node_id)
+            .paths_avoiding(&source.node_id, &target.node_id, &unavailable_nodes)
             .ok_or_else(|| ControlPlaneError::OverlayPathUnavailable {
                 source_node: source.node_id.clone(),
                 destination_node: target.node_id.clone(),
@@ -3595,11 +3611,10 @@ where
             .enumerate()
             .map(|(index, node)| (node.node_id.clone(), index))
             .collect::<BTreeMap<_, _>>();
-        let membership_epoch =
-            overlay_membership_epoch(active_nodes_by_id.keys().map(NodeId::as_str));
+        let membership_epoch = overlay_membership_epoch(nodes_by_id.keys().map(NodeId::as_str));
         let topology_cache_key = Arc::new(OverlayTopologyCacheKey {
             membership_epoch,
-            node_count: active_nodes.len(),
+            node_count: nodes.len(),
             block_size: policy.overlay_block_size,
             max_degree: policy.overlay_max_degree,
             permutation_seed: self.config.cluster_id.as_str().to_string(),
@@ -7574,7 +7589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_or_unhealthy_overlay_nodes_are_replaced_in_the_topology(
+    async fn stale_overlay_node_keeps_recovery_neighbors_but_is_excluded_from_paths(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::from_string("cluster-a");
         let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
@@ -7583,8 +7598,7 @@ mod tests {
             ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
             store.clone(),
         );
-        let mut node_ids = Vec::new();
-        for index in 0..8 {
+        for index in 0..12 {
             let mut node = node_record(&format!("topology-health-{index}"));
             node.cluster_id = cluster_id.clone();
             node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
@@ -7593,19 +7607,47 @@ mod tests {
                 0,
                 u8::try_from(index + 1)?,
             )));
-            node_ids.push(node.node_id.clone());
             store.insert_node(node).await?;
         }
 
         let policy = plane.current_cluster_policy().await?;
         let initial_nodes = plane.overlay_nodes().await?;
         let initial_topology = plane.overlay_topology(&initial_nodes, &policy).await?;
-        assert_eq!(initial_nodes.len(), 8);
+        assert_eq!(initial_nodes.len(), 12);
+        let (source_node, failed_node, target_node) = initial_nodes
+            .iter()
+            .find_map(|failed| {
+                initial_nodes.iter().find_map(|source| {
+                    initial_nodes.iter().find_map(|target| {
+                        if source.node_id == failed.node_id
+                            || target.node_id == failed.node_id
+                            || source.node_id == target.node_id
+                        {
+                            return None;
+                        }
+                        initial_topology
+                            .shortest_path(&source.node_id, &target.node_id)
+                            .filter(|path| {
+                                path.iter()
+                                    .skip(1)
+                                    .take(path.len().saturating_sub(2))
+                                    .any(|node_id| node_id == &failed.node_id)
+                            })
+                            .map(|_| (source.clone(), failed.clone(), target.clone()))
+                    })
+                })
+            })
+            .ok_or("test topology did not contain an internal transit node")?;
+        let healthy_neighbor_id = initial_topology
+            .neighbors(&failed_node.node_id)
+            .and_then(|neighbors| neighbors.iter().next())
+            .cloned()
+            .ok_or("failed node did not have a recovery neighbor")?;
+        let initial_epoch = initial_topology.topology_epoch();
 
-        let failed_node = node_ids[0].clone();
         store
             .upsert_health(
-                failed_node.clone(),
+                failed_node.node_id.clone(),
                 NodeHealth {
                     state: HealthState::Healthy,
                     last_seen_at: Utc::now()
@@ -7617,50 +7659,59 @@ mod tests {
             )
             .await?;
         plane.invalidate_overlay_node_snapshot().await;
-        let survivor_nodes = plane.overlay_nodes().await?;
-        let survivor_topology = plane.overlay_topology(&survivor_nodes, &policy).await?;
-        assert_eq!(survivor_nodes.len(), 7);
-        assert!(survivor_nodes
-            .iter()
-            .all(|node| node.node_id != failed_node));
-        assert_ne!(
-            initial_topology.topology_epoch(),
-            survivor_topology.topology_epoch()
-        );
-
-        store
-            .upsert_health(
-                failed_node.clone(),
-                NodeHealth {
-                    state: HealthState::Healthy,
-                    last_seen_at: Utc::now(),
-                    latency_ms: None,
-                    relay_load: None,
-                    message: None,
-                },
-            )
-            .await?;
-        plane.invalidate_overlay_node_snapshot().await;
-        assert_eq!(plane.overlay_nodes().await?.len(), 8);
-
-        store
-            .upsert_health(
-                failed_node.clone(),
-                NodeHealth {
-                    state: HealthState::Unhealthy,
-                    last_seen_at: Utc::now(),
-                    latency_ms: None,
-                    relay_load: None,
-                    message: None,
-                },
-            )
-            .await?;
-        plane.invalidate_overlay_node_snapshot().await;
         assert!(plane
             .overlay_nodes()
             .await?
             .iter()
-            .all(|node| node.node_id != failed_node));
+            .all(|node| node.node_id != failed_node.node_id));
+
+        let neighbor_map = plane.neighbor_map_for(&healthy_neighbor_id).await?;
+        assert!(neighbor_map
+            .neighbors
+            .iter()
+            .any(|neighbor| neighbor.node.node_id == failed_node.node_id));
+        let recovering_map = plane.neighbor_map_for(&failed_node.node_id).await?;
+        assert_eq!(
+            recovering_map
+                .neighbors
+                .iter()
+                .map(|neighbor| neighbor.node.node_id.clone())
+                .collect::<BTreeSet<_>>(),
+            initial_topology
+                .neighbors(&failed_node.node_id)
+                .cloned()
+                .unwrap_or_default()
+        );
+        assert_eq!(recovering_map.topology_epoch, initial_epoch);
+        assert!(recovering_map.neighbors.len() <= usize::from(policy.overlay_max_degree));
+
+        let displayed = plane.overlay_topology_snapshot().await?;
+        assert_eq!(displayed.node_count, 12);
+        assert_eq!(displayed.topology_epoch, initial_epoch.to_string());
+        let failed_display = displayed
+            .nodes
+            .iter()
+            .find(|node| node.node_id == failed_node.node_id)
+            .ok_or("stale registered node was absent from topology display")?;
+        assert_eq!(failed_display.health_state, Some(HealthState::Unhealthy));
+        assert!(failed_display.last_seen_at.is_some());
+
+        let path = plane
+            .overlay_path_for(&OverlayPathQuery {
+                source: source_node.node_id,
+                destination: target_node.vpn_ip.0,
+                source_identity_proof: ipars_types::api::NodeApiRequestSignature {
+                    signed_at: Utc::now(),
+                    nonce: "stale-transit-recovery-test".to_string(),
+                    signature: String::new(),
+                },
+            })
+            .await?;
+        assert!(!path.ordered_nodes.contains(&failed_node.node_id));
+        assert!(path
+            .secondary_ordered_nodes
+            .as_ref()
+            .is_none_or(|secondary| !secondary.contains(&failed_node.node_id)));
         Ok(())
     }
 

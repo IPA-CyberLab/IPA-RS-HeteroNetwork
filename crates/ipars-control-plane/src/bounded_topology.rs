@@ -571,6 +571,52 @@ impl BoundedTopology {
             .materialize(&self.routing_node_ids)
     }
 
+    pub fn paths_avoiding(
+        &self,
+        source: &NodeId,
+        destination: &NodeId,
+        unavailable_nodes: &BTreeSet<NodeId>,
+    ) -> Option<TopologyPaths> {
+        let primary =
+            self.shortest_path_avoiding(source, destination, unavailable_nodes, &BTreeSet::new())?;
+        if source == destination {
+            return Some(TopologyPaths {
+                primary,
+                secondary: None,
+            });
+        }
+
+        let primary_edges = path_edges(&primary);
+        let mut unavailable_for_secondary = unavailable_nodes.clone();
+        unavailable_for_secondary.extend(
+            primary
+                .iter()
+                .skip(1)
+                .take(primary.len().saturating_sub(2))
+                .cloned(),
+        );
+        let secondary = self
+            .shortest_path_avoiding(
+                source,
+                destination,
+                &unavailable_for_secondary,
+                &primary_edges,
+            )
+            .map(|nodes| SecondaryPath {
+                kind: SecondaryPathKind::VertexDisjoint,
+                nodes,
+            })
+            .or_else(|| {
+                self.shortest_path_avoiding(source, destination, unavailable_nodes, &primary_edges)
+                    .map(|nodes| SecondaryPath {
+                        kind: SecondaryPathKind::EdgeDisjoint,
+                        nodes,
+                    })
+            });
+
+        Some(TopologyPaths { primary, secondary })
+    }
+
     #[cfg(test)]
     fn uncached_paths(&self, source: &NodeId, destination: &NodeId) -> Option<TopologyPaths> {
         let primary = self.shortest_path(source, destination)?;
@@ -2552,6 +2598,48 @@ mod tests {
             }
         }
         assert_eq!(topology.cached_next_hop_source_count(), nodes.len());
+    }
+
+    #[test]
+    fn paths_avoiding_exclude_unavailable_nodes_from_both_routes() {
+        let nodes = records(32);
+        let topology = topology(&nodes, 4);
+        let (source, destination, unavailable) = nodes
+            .iter()
+            .find_map(|source| {
+                nodes.iter().find_map(|destination| {
+                    if source.node_id == destination.node_id {
+                        return None;
+                    }
+                    topology
+                        .shortest_path(&source.node_id, &destination.node_id)
+                        .and_then(|path| path.get(1).cloned())
+                        .filter(|node_id| node_id != &destination.node_id)
+                        .map(|unavailable| {
+                            (
+                                source.node_id.clone(),
+                                destination.node_id.clone(),
+                                unavailable,
+                            )
+                        })
+                })
+            })
+            .unwrap_or_else(|| panic!("test topology must contain an internal transit node"));
+
+        let paths = topology
+            .paths_avoiding(
+                &source,
+                &destination,
+                &BTreeSet::from([unavailable.clone()]),
+            )
+            .unwrap_or_else(|| {
+                panic!("bounded topology must survive one unavailable transit node")
+            });
+        assert!(!paths.primary.contains(&unavailable));
+        assert!(paths
+            .secondary
+            .as_ref()
+            .is_none_or(|secondary| !secondary.nodes.contains(&unavailable)));
     }
 
     #[test]
