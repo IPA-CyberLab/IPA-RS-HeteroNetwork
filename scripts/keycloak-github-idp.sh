@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly DEFAULT_SERVER_URL="http://127.0.0.1:18080"
-readonly DEFAULT_REALM="kakurizai"
+readonly DEFAULT_REALM="heteronetwork"
 readonly DEFAULT_ADMIN_USERNAME="admin"
 readonly DEFAULT_IDP_ALIAS="github"
 readonly DEFAULT_FLOW_ALIAS="github-deny-unlinked"
@@ -500,14 +500,16 @@ verify() {
 self_test() {
   local rendered
   require_command jq
+  [[ "$DEFAULT_REALM" == "heteronetwork" ]] \
+    || die "default Keycloak realm is not heteronetwork"
   validate_github_login "mizuamedesu" || die "valid GitHub login was rejected"
   ! validate_github_login "-invalid" || die "invalid GitHub login was accepted"
   ! validate_github_login "invalid-" || die "invalid GitHub login was accepted"
   validate_github_user_id "97249122" || die "valid GitHub user ID was rejected"
   ! validate_github_user_id "0" || die "invalid GitHub user ID was accepted"
-  github_realm_roles_csv="kakurizai-admin,kakurizai-operator"
+  github_realm_roles_csv="heteronetwork-admin,heteronetwork-operator"
   parse_github_realm_roles
-  [[ "${github_realm_roles[*]}" == "kakurizai-admin kakurizai-operator" ]] \
+  [[ "${github_realm_roles[*]}" == "heteronetwork-admin heteronetwork-operator" ]] \
     || die "GitHub realm role parsing failed"
   rendered="$(render_identity_provider "Iv1.0123456789abcdef" \
     "0123456789abcdef0123456789abcdef01234567")"

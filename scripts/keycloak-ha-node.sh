@@ -31,7 +31,7 @@ backchannel_listen_addresses="${HETERONETWORK_KEYCLOAK_BACKCHANNEL_LISTEN_ADDRES
 edge_upstreams="${HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS:-}"
 edge_listen_port="${HETERONETWORK_KEYCLOAK_EDGE_LISTEN_PORT:-$DEFAULT_EDGE_PORT}"
 edge_vpn_listen_address="${HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS:-}"
-edge_health_path="${HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH:-/realms/kakurizai/.well-known/openid-configuration}"
+edge_health_path="${HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH:-/realms/heteronetwork/.well-known/openid-configuration}"
 
 readonly install_dir="/opt/heteronetwork/keycloak-${KEYCLOAK_VERSION}"
 readonly current_link="/opt/heteronetwork/keycloak"

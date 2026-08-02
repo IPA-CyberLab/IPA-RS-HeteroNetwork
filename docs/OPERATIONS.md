@@ -453,13 +453,13 @@ then verify through every replica:
 sudo env \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN=github-login \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID=12345678 \
-  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES=console-admin \
+  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES=heteronetwork-admin,heteronetwork-operator \
   scripts/keycloak-github-idp.sh configure
 
 sudo env \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_LOGIN=github-login \
   HETERONETWORK_KEYCLOAK_GITHUB_ALLOWED_USER_ID=12345678 \
-  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES=console-admin \
+  HETERONETWORK_KEYCLOAK_GITHUB_REALM_ROLES=heteronetwork-admin,heteronetwork-operator \
   scripts/keycloak-github-idp.sh verify
 ```
 

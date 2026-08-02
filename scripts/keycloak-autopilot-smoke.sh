@@ -722,6 +722,13 @@ grep -Fq 'if ((config_changed == 1 || unit_changed == 1)); then' \
 if grep -Fq 'HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_OIDC_' "$autopilot"; then
   fail "autopilot still configures Keycloak on the Agent public gateway"
 fi
+default_edge_health_path="$(
+  env -u HETERONETWORK_KEYCLOAK_EDGE_HEALTH_PATH \
+    bash -c 'source "$1" help >/dev/null; printf "%s" "$edge_health_path"' \
+    _ "$helper_contract"
+)"
+[[ "$default_edge_health_path" == "$oidc_probe_path" ]] \
+  || fail "helper default edge health path does not use the HeteroNetwork realm"
 grep -Fq \
   'HETERONETWORK_KEYCLOAK_EDGE_VPN_LISTEN_ADDRESS="$vpn_ip"' \
   "$autopilot" \

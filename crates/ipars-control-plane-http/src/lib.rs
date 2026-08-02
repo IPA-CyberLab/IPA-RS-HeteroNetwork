@@ -7339,13 +7339,13 @@ mod tests {
         let authenticated = serde_json::json!({
             "auth_enabled": true,
             "provider": "keycloak",
-            "issuer_url": "https://203.0.113.10/realms/kakurizai/"
+            "issuer_url": "https://203.0.113.10/realms/heteronetwork/"
         });
         assert_eq!(
             dynamic_web_gateway_oidc_discovery(&authenticated, "https://203.0.113.10", None),
             Ok(Some((
-                "https://203.0.113.10/realms/kakurizai".to_string(),
-                "https://203.0.113.10/realms/kakurizai/.well-known/openid-configuration"
+                "https://203.0.113.10/realms/heteronetwork".to_string(),
+                "https://203.0.113.10/realms/heteronetwork/.well-known/openid-configuration"
                     .to_string(),
             )))
         );
@@ -7353,23 +7353,24 @@ mod tests {
         let foreign_issuer = serde_json::json!({
             "auth_enabled": true,
             "provider": "keycloak",
-            "issuer_url": "https://idp.example/realms/kakurizai"
+            "issuer_url": "https://idp.example/realms/heteronetwork"
         });
         assert_eq!(
             dynamic_web_gateway_oidc_discovery(
                 &foreign_issuer,
                 "https://203.0.113.10",
-                Some("https://idp.example/realms/kakurizai"),
+                Some("https://idp.example/realms/heteronetwork"),
             ),
             Ok(Some((
-                "https://idp.example/realms/kakurizai".to_string(),
-                "https://idp.example/realms/kakurizai/.well-known/openid-configuration".to_string(),
+                "https://idp.example/realms/heteronetwork".to_string(),
+                "https://idp.example/realms/heteronetwork/.well-known/openid-configuration"
+                    .to_string(),
             )))
         );
         assert!(dynamic_web_gateway_oidc_discovery(
             &foreign_issuer,
             "https://203.0.113.10",
-            Some("https://other-idp.example/realms/kakurizai"),
+            Some("https://other-idp.example/realms/heteronetwork"),
         )
         .is_err());
 

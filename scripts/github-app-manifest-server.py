@@ -116,7 +116,7 @@ def build_manifest(
     return {
         "name": app_name,
         "url": homepage_url,
-        "description": "GitHub sign-in for the HeteroNetwork Kakurizai console.",
+        "description": "GitHub sign-in for the HeteroNetwork console.",
         "redirect_url": redirect_url,
         "callback_urls": callbacks,
         "public": False,
@@ -354,16 +354,21 @@ class ManifestServer(http.server.ThreadingHTTPServer):
 
 
 def run_self_test() -> None:
+    defaults = parse_args([])
+    assert defaults.app_name == "HeteroNetwork Login"
+    assert defaults.keycloak_realm == "heteronetwork"
     manifest = build_manifest(
-        app_name="HeteroNetwork Kakurizai Login",
+        app_name="HeteroNetwork Login",
         homepage_url="https://163.220.236.51",
         redirect_url="http://192.168.0.10:39090/callback/test",
-        keycloak_realm="kakurizai",
+        keycloak_realm="heteronetwork",
         callback_urls=[
-            "https://163.220.236.51/realms/kakurizai/broker/github/endpoint",
-            "https://163.220.236.52/realms/kakurizai/broker/github/endpoint",
+            "https://163.220.236.51/realms/heteronetwork/broker/github/endpoint",
+            "https://163.220.236.52/realms/heteronetwork/broker/github/endpoint",
         ],
     )
+    assert manifest["name"] == "HeteroNetwork Login"
+    assert manifest["description"] == "GitHub sign-in for the HeteroNetwork console."
     assert manifest["public"] is False
     assert "default_permissions" not in manifest
     assert "default_events" not in manifest
@@ -398,7 +403,7 @@ def run_self_test() -> None:
                 "client_id": "Iv1.0123456789abcdef",
                 "client_secret": "0123456789abcdef0123456789abcdef01234567",
                 "id": 123,
-                "slug": "heteronetwork-kakurizai-login",
+                "slug": "heteronetwork-login",
                 "owner": {"login": "mizuamedesu"},
             },
             "mizuamedesu",
@@ -410,18 +415,18 @@ def run_self_test() -> None:
     print("GitHub App manifest server self-test passed")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--listen", type=parse_listen)
     parser.add_argument("--public-base-url")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--app-name", default="HeteroNetwork Kakurizai Login")
+    parser.add_argument("--app-name", default="HeteroNetwork Login")
     parser.add_argument("--expected-owner", default="mizuamedesu")
     parser.add_argument("--homepage-url", default="https://163.220.236.51")
-    parser.add_argument("--keycloak-realm", default="kakurizai")
+    parser.add_argument("--keycloak-realm", default="heteronetwork")
     parser.add_argument("--callback-url", action="append", default=[])
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:

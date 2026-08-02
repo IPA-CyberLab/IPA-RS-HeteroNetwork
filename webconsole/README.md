@@ -30,7 +30,8 @@ console and the embedded console use the same management API.
 HOST=0.0.0.0 \
 PORT=18088 \
 HETERONETWORK_WEB_PUBLIC_URL=https://163.220.236.51 \
-HETERONETWORK_WEB_OIDC_ISSUER_URL=https://163.220.236.51/realms/kakurizai \
+HETERONETWORK_WEB_OIDC_ISSUER_URL=http://console.heteronetwork.internal:18079/realms/heteronetwork \
+HETERONETWORK_WEB_OIDC_AUTH_BASE_URL=http://10.250.0.4:18080/realms/heteronetwork \
 HETERONETWORK_WEB_OIDC_CLIENT_ID=heteronetwork-web \
 HETERONETWORK_WEB_ALLOWED_EMAILS=hello@mizuame.works \
 HETERONETWORK_CONTROL_PLANE_URL=https://hn-a.163-220-236-51.sslip.io \
