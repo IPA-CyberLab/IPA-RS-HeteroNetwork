@@ -22,7 +22,28 @@ final class SponsoredEnrollmentTests: XCTestCase {
             nonce: "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF",
             signature: ""
         )
-        let signature = try identity.signature(for: unsigned.signingPayload())
+        let payload = unsigned.signingPayload()
+        let rustPayload = Data(
+            (
+                "heteronetwork-client-registration-v1\n"
+                    + "node-dbc298251c51321b7266e78d1c151c2b\n"
+                    + "/RckOFqgx1tk+3jNYC+h2ZH96/drE8WO1wLqyDXp9hg=\n"
+                    + "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg=\n"
+                    + "1785412800\n"
+                    + "1785416400\n"
+                    + "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF\n"
+            ).utf8
+        )
+        XCTAssertEqual(payload, rustPayload)
+        let rustSignature = try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "X084nfek9SQJlfKOEjrupHiAPaapn9fxsNpWYIBFwcD9YHn8f8qdS/XV1F2Te3HQPk1LYVrkmaeGXXTDGvJaBg=="
+            )
+        )
+        XCTAssertTrue(identity.publicKey.isValidSignature(rustSignature, for: payload))
+
+        let signature = try identity.signature(for: payload)
             .base64EncodedString()
         let bundle = ClientRegistrationBundle(
             registration: unsigned.registration,
@@ -36,10 +57,8 @@ final class SponsoredEnrollmentTests: XCTestCase {
             bundle.registration.clientID,
             "node-dbc298251c51321b7266e78d1c151c2b"
         )
-        XCTAssertEqual(
-            bundle.signature,
-            "X084nfek9SQJlfKOEjrupHiAPaapn9fxsNpWYIBFwcD9YHn8f8qdS/XV1F2Te3HQPk1LYVrkmaeGXXTDGvJaBg=="
-        )
+        let generatedSignature = try XCTUnwrap(Data(base64Encoded: bundle.signature))
+        XCTAssertTrue(identity.publicKey.isValidSignature(generatedSignature, for: payload))
         XCTAssertEqual(
             try SponsoredEnrollment.parseRegistrationURI(
                 bundle.uri(),
