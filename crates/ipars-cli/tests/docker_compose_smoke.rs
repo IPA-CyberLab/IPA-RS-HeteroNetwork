@@ -1028,6 +1028,18 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
                 default_network.clone(),
             ),
             (
+                "HETERONETWORK_DATAPLANE_DEFAULT_NETWORK_CIDR".to_string(),
+                default_network_cidr.to_string(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_WORKLOAD_A_CIDR".to_string(),
+                "192.0.2.0/32".to_string(),
+            ),
+            (
+                "HETERONETWORK_DATAPLANE_WORKLOAD_B_CIDR".to_string(),
+                "192.0.2.1/32".to_string(),
+            ),
+            (
                 "HETERONETWORK_DATAPLANE_AGENT_A_PUBLIC_IP".to_string(),
                 agent_public_ip.to_string(),
             ),
@@ -1153,6 +1165,16 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
     )?;
     let workload_a_cidr = compose_network_ipv4_subnet(&compose, "workload-a")?;
     let workload_b_cidr = compose_network_ipv4_subnet(&compose, "workload-b")?;
+    replace_compose_env(
+        &mut compose,
+        "HETERONETWORK_DATAPLANE_WORKLOAD_A_CIDR",
+        workload_a_cidr.to_string(),
+    )?;
+    replace_compose_env(
+        &mut compose,
+        "HETERONETWORK_DATAPLANE_WORKLOAD_B_CIDR",
+        workload_b_cidr.to_string(),
+    )?;
     let workload_a_v6_ipv4_cidr = compose_network_ipv4_subnet(&compose, "workload-a-v6")?;
     let workload_b_v6_ipv4_cidr = compose_network_ipv4_subnet(&compose, "workload-b-v6")?;
     let discovered_workload_a_v6_cidr = compose_network_ipv6_subnet(&compose, "workload-a-v6")?;
@@ -2583,10 +2605,11 @@ fn assert_compose_agent_public_endpoint(
     let local_cidr = format!("{local}/32");
     let script = r#"
 set -eu
-ip -4 -o address show dev eth0 | grep -F -- "$1" >/dev/null
+interface="$(ip -4 -o address show | awk -v cidr="$1" '$4 == cidr { print $2; exit }')"
+test -n "$interface"
 route="$(ip -4 route get "$2" from "$3")"
 printf '%s\n' "$route"
-printf '%s\n' "$route" | grep -F -- "dev eth0" >/dev/null
+printf '%s\n' "$route" | grep -F -- "dev $interface" >/dev/null
 printf '%s\n' "$route" | grep -E -- "(from|src) $3([[:space:]]|$)" >/dev/null
 "#;
     let mut command = compose_command(compose);
