@@ -49,8 +49,12 @@ kubectl apply --server-side --field-manager=heteronetwork-bootstrap \
   -f "${ROOT_DIR}/deploy/gitops/project.yaml" \
   -f "${ROOT_DIR}/deploy/gitops/applications"
 
-kubectl -n "${ARGOCD_NAMESPACE}" rollout status deployment --all --timeout="${TIMEOUT}"
-kubectl -n "${ARGOCD_NAMESPACE}" rollout status statefulset --all --timeout="${TIMEOUT}"
+while IFS= read -r workload; do
+  kubectl -n "${ARGOCD_NAMESPACE}" rollout status "${workload}" --timeout="${TIMEOUT}"
+done < <(kubectl -n "${ARGOCD_NAMESPACE}" get deployment -o name)
+while IFS= read -r workload; do
+  kubectl -n "${ARGOCD_NAMESPACE}" rollout status "${workload}" --timeout="${TIMEOUT}"
+done < <(kubectl -n "${ARGOCD_NAMESPACE}" get statefulset -o name)
 
 for application in heterocloud heterocloud-flow; do
   kubectl -n "${ARGOCD_NAMESPACE}" wait "application/${application}" \
@@ -63,6 +67,6 @@ done
 
 printf '%s\n' \
   'GitOps bootstrap completed.' \
-  'Argo CD:    http://argocd.heteronetwork.internal' \
+  'Argo CD:    http://argocd.heteronetwork.internal:8088' \
   'Grafana:    http://grafana.heteronetwork.internal:3000' \
   'Prometheus: http://prometheus.heteronetwork.internal:9090'
