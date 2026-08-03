@@ -24,6 +24,8 @@ CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 CLIENT_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9._-]{20,512}$")
 MANIFEST_CODE_PATTERN = re.compile(r"^[A-Fa-f0-9]{40}$")
 KEYCLOAK_REALM_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+MANAGED_KEYCLOAK_OVERLAY_HOST = "console.heteronetwork.internal"
+MANAGED_KEYCLOAK_OVERLAY_PORT = 18079
 TRUSTED_HTTP_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in (
@@ -68,25 +70,44 @@ def validate_http_url(value: str, *, allow_http: bool) -> str:
 
 
 def validate_callback_url(value: str, keycloak_realm: str) -> str:
+    if not KEYCLOAK_REALM_PATTERN.fullmatch(keycloak_realm):
+        raise ValueError("Keycloak realm must be a 1-63 character safe identifier")
     value = validate_http_url(value, allow_http=True)
     parsed = urllib.parse.urlsplit(value)
     if parsed.scheme == "http":
         try:
-            address = ipaddress.ip_address(parsed.hostname or "")
+            port = parsed.port
         except ValueError as error:
-            raise ValueError(
-                "HTTP callback URLs must use a trusted private IP address"
-            ) from error
-        if not any(address in network for network in TRUSTED_HTTP_NETWORKS):
-            raise ValueError(
-                "HTTP callback URLs must use loopback, private, CGNAT, or link-local IPs"
-            )
-    if not KEYCLOAK_REALM_PATTERN.fullmatch(keycloak_realm):
-        raise ValueError("Keycloak realm must be a 1-63 character safe identifier")
+            raise ValueError("HTTP callback URL contains an invalid port") from error
+        managed_overlay = (
+            (parsed.hostname or "").casefold()
+            == MANAGED_KEYCLOAK_OVERLAY_HOST.casefold()
+            and port == MANAGED_KEYCLOAK_OVERLAY_PORT
+        )
+        if not managed_overlay:
+            try:
+                address = ipaddress.ip_address(parsed.hostname or "")
+            except ValueError as error:
+                raise ValueError(
+                    "HTTP callback URLs must use the managed overlay host or a trusted private IP address"
+                ) from error
+            if not any(address in network for network in TRUSTED_HTTP_NETWORKS):
+                raise ValueError(
+                    "HTTP callback URLs must use loopback, private, CGNAT, or link-local IPs"
+                )
     expected_suffix = f"/realms/{keycloak_realm}/broker/github/endpoint"
     if parsed.path != expected_suffix:
         raise ValueError(f"callback URL must end with {expected_suffix}")
     return value
+
+
+def managed_overlay_callback_url(keycloak_realm: str) -> str:
+    if not KEYCLOAK_REALM_PATTERN.fullmatch(keycloak_realm):
+        raise ValueError("Keycloak realm must be a 1-63 character safe identifier")
+    return (
+        f"http://{MANAGED_KEYCLOAK_OVERLAY_HOST}:{MANAGED_KEYCLOAK_OVERLAY_PORT}"
+        f"/realms/{keycloak_realm}/broker/github/endpoint"
+    )
 
 
 def sanitized_request_path(target: str) -> str:
@@ -108,11 +129,18 @@ def build_manifest(
         raise ValueError("app name must contain 1-100 printable characters")
     homepage_url = validate_http_url(homepage_url, allow_http=False)
     redirect_url = validate_http_url(redirect_url, allow_http=True)
-    callbacks = [
+    supplied_callbacks = [
         validate_callback_url(value, keycloak_realm) for value in callback_urls
     ]
-    if not 1 <= len(callbacks) <= 10 or len(set(callbacks)) != len(callbacks):
-        raise ValueError("1-10 distinct Keycloak callback URLs are required")
+    if len(set(supplied_callbacks)) != len(supplied_callbacks):
+        raise ValueError("Keycloak callback URLs must be distinct")
+    managed_callback = managed_overlay_callback_url(keycloak_realm)
+    callbacks = [
+        managed_callback,
+        *(value for value in supplied_callbacks if value != managed_callback),
+    ]
+    if len(callbacks) > 10:
+        raise ValueError("GitHub Apps support at most 10 Keycloak callback URLs")
     return {
         "name": app_name,
         "url": homepage_url,
@@ -372,6 +400,10 @@ def run_self_test() -> None:
     assert manifest["public"] is False
     assert "default_permissions" not in manifest
     assert "default_events" not in manifest
+    assert manifest["callback_urls"][0] == (
+        "http://console.heteronetwork.internal:18079/realms/heteronetwork/"
+        "broker/github/endpoint"
+    )
     assert (
         sanitized_request_path("/callback/private?code=secret&state=secret")
         == "/callback/<redacted>"
@@ -385,7 +417,28 @@ def run_self_test() -> None:
             "http://192.168.0.10:18080/realms/heteronetwork/broker/github/endpoint"
         ],
     )
-    assert len(private_manifest["callback_urls"]) == 1
+    assert len(private_manifest["callback_urls"]) == 2
+    managed_only_manifest = build_manifest(
+        app_name="HeteroNetwork Managed Login",
+        homepage_url="https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork",
+        redirect_url="http://192.168.0.10:39092/callback/test",
+        keycloak_realm="heteronetwork",
+        callback_urls=[],
+    )
+    assert managed_only_manifest["callback_urls"] == [
+        "http://console.heteronetwork.internal:18079/realms/heteronetwork/"
+        "broker/github/endpoint"
+    ]
+    for invalid_callback in (
+        "http://console.heteronetwork.internal:18080/realms/heteronetwork/broker/github/endpoint",
+        "http://console.heteronetwork.internal.evil:18079/realms/heteronetwork/broker/github/endpoint",
+    ):
+        try:
+            validate_callback_url(invalid_callback, "heteronetwork")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("untrusted managed callback URL was accepted")
     try:
         validate_callback_url(
             "http://8.8.8.8/realms/heteronetwork/broker/github/endpoint",
@@ -436,8 +489,8 @@ def main() -> int:
         return 0
     if args.listen is None or args.public_base_url is None or args.output_dir is None:
         raise SystemExit("--listen, --public-base-url, and --output-dir are required")
-    if not 1 <= len(args.callback_url) <= 10:
-        raise SystemExit("--callback-url must be supplied 1-10 times")
+    if len(args.callback_url) > 10:
+        raise SystemExit("--callback-url may be supplied at most 10 times")
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", args.expected_owner):
         raise SystemExit("--expected-owner must be a valid GitHub login")
 

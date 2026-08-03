@@ -417,13 +417,18 @@ the selected replicas.
 
 Register a private GitHub App with no repository, organization, account, or
 webhook permissions. The authenticated `GET /user` endpoint exposes the durable
-numeric user ID and login without additional GitHub App permissions. Configure
-each Keycloak origin as one of the app's 1-10 callbacks:
+numeric user ID and login without additional GitHub App permissions. GitHub
+must redirect the browser to Keycloak through the canonical VPN-only edge URL:
 
 ```text
-https://public-a.example/realms/heteronetwork/broker/github/endpoint
-https://public-b.example/realms/heteronetwork/broker/github/endpoint
+http://console.heteronetwork.internal:18079/realms/heteronetwork/broker/github/endpoint
 ```
+
+Add that exact value to the existing GitHub App's **Callback URLs** before
+enabling the provider. Do not add public-node Keycloak callbacks; the canonical
+edge follows the active HA placement inside HeteroNetwork. The manifest helper
+always includes this managed callback, including when no additional
+`--callback-url` option is supplied.
 
 For a one-time registration, run the manifest helper on a trusted operator-only
 address. It binds only the requested address, validates the expected GitHub App
@@ -433,14 +438,12 @@ exits after the callback. Complete the browser flow within one hour:
 ```bash
 sudo install -d -o root -g root -m 0700 /var/lib/heteronetwork-github-bootstrap
 sudo scripts/github-app-manifest-server.py \
-  --listen 100.64.0.10:39090 \
-  --public-base-url http://100.64.0.10:39090 \
+  --listen 10.250.0.4:39090 \
+  --public-base-url http://10.250.0.4:39090 \
   --output-dir /var/lib/heteronetwork-github-bootstrap \
   --expected-owner github-login \
-  --homepage-url https://public-a.example \
-  --keycloak-realm heteronetwork \
-  --callback-url https://public-a.example/realms/heteronetwork/broker/github/endpoint \
-  --callback-url https://public-b.example/realms/heteronetwork/broker/github/endpoint
+  --homepage-url https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork \
+  --keycloak-realm heteronetwork
 ```
 
 Install the resulting files at
