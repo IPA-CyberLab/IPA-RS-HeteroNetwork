@@ -79,6 +79,9 @@ agent:
   mode: managed
   hostAgent:
     apiBearerTokenFile: /etc/heteronetwork/kubernetes/agent-api-token
+  overlayDns:
+    enabled: false
+    records: {}
   interfaceName: heteronetwork0
   wireguardListenPort: 51820
   overlayTransitPort: 51822

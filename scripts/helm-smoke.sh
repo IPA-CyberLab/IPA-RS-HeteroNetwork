@@ -186,6 +186,23 @@ template_ok kubernetes-plugin-host-agent-custom-token \
 assert_rendered_contains kubernetes-plugin-host-agent-custom-token 'path: "/run/heteronetwork/kubernetes-agent-api-token"'
 assert_rendered_contains kubernetes-plugin-host-agent-custom-token 'mountPath: "/var/run/heteronetwork/agent-api-token"'
 
+template_ok overlay-dns-host-agent \
+  --set-string agent.mode=host \
+  --set agent.overlayDns.enabled=true \
+  --set-string 'agent.overlayDns.records.grafana\.heteronetwork\.internal[0]=10.250.0.4' \
+  --set-string 'agent.overlayDns.records.grafana\.heteronetwork\.internal[1]=10.250.0.5'
+
+assert_rendered_contains overlay-dns-host-agent "name: ipars-heteronetwork-overlay-dns"
+assert_rendered_contains overlay-dns-host-agent '"grafana.heteronetwork.internal"'
+assert_rendered_contains overlay-dns-host-agent "name: install-overlay-dns-records"
+assert_rendered_contains overlay-dns-host-agent 'path: /var/lib/heteronetwork'
+assert_rendered_contains overlay-dns-host-agent "checksum/overlay-dns-records:"
+
+template_fails overlay-dns-reserved-console \
+  "must be a lowercase subdomain below heteronetwork.internal and must not be the reserved console name" \
+  --set agent.overlayDns.enabled=true \
+  --set-string 'agent.overlayDns.records.console\.heteronetwork\.internal[0]=10.250.0.4'
+
 template_ok kubernetes-plugin-disabled \
   --set kubernetesPlugin.enabled=false
 

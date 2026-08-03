@@ -1,0 +1,34 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: heterocloud
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
+    targetRevision: master
+    path: deploy/helm/heterocloud
+    helm:
+      releaseName: heterocloud
+      valueFiles:
+        - ../../environments/heteronet/values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+      - CreateNamespace=true
+      - RespectIgnoreDifferences=true

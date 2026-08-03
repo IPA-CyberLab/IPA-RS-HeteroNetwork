@@ -34,6 +34,8 @@
 {{- $agentMode := printf "%v" .Values.agent.mode -}}
 {{- $hostAgentMode := eq $agentMode "host" -}}
 {{- $hostAgentStateFile := "/var/lib/heteronetwork/agent.json" -}}
+{{- $overlayDnsConfigMountPath := "/etc/heteronetwork/overlay-dns" -}}
+{{- $overlayDnsEnabled := eq (printf "%v" .Values.agent.overlayDns.enabled) "true" -}}
 {{- $hostAgentApiBearerTokenFile := printf "%v" .Values.agent.hostAgent.apiBearerTokenFile -}}
 {{- $hostAgentApiBearerTokenMountPath := "/var/run/heteronetwork/agent-api-token" -}}
 {{- $agentHostNetwork := printf "%v" .Values.agent.hostNetwork -}}
@@ -94,6 +96,32 @@
 {{- include "heteronetwork.validateOptionalBoolean" (dict "path" "agent.podSecurityContext.runAsNonRoot" "value" .Values.agent.podSecurityContext.runAsNonRoot) -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "agent.peerMap.enabled" "value" .Values.agent.peerMap.enabled) -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "agent.peerProbe.enabled" "value" .Values.agent.peerProbe.enabled) -}}
+{{- include "heteronetwork.validateBoolean" (dict "path" "agent.overlayDns.enabled" "value" .Values.agent.overlayDns.enabled) -}}
+{{- if $overlayDnsEnabled -}}
+{{- if not .Values.agent.peerMap.enabled -}}
+{{- fail "agent.overlayDns.enabled=true requires agent.peerMap.enabled=true" -}}
+{{- end -}}
+{{- if gt (len .Values.agent.overlayDns.records) 256 -}}
+{{- fail "agent.overlayDns.records must not contain more than 256 names" -}}
+{{- end -}}
+{{- range $name, $addresses := .Values.agent.overlayDns.records -}}
+{{- if or (eq $name "console.heteronetwork.internal") (gt (len $name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*[.]heteronetwork[.]internal$" $name)) -}}
+{{- fail (printf "agent.overlayDns.records name %q must be a lowercase subdomain below heteronetwork.internal and must not be the reserved console name" $name) -}}
+{{- end -}}
+{{- if or (lt (len $addresses) 1) (gt (len $addresses) 16) -}}
+{{- fail (printf "agent.overlayDns.records[%q] must contain 1-16 addresses" $name) -}}
+{{- end -}}
+{{- $seenAddresses := dict -}}
+{{- range $address := $addresses -}}
+{{- $address = printf "%v" $address -}}
+{{- include "heteronetwork.validateUsableServiceIPAddress" (dict "path" (printf "agent.overlayDns.records[%q]" $name) "value" $address) -}}
+{{- if hasKey $seenAddresses $address -}}
+{{- fail (printf "agent.overlayDns.records[%q] repeats address %q" $name $address) -}}
+{{- end -}}
+{{- $_ := set $seenAddresses $address true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- include "heteronetwork.validateBoolean" (dict "path" "agent.relayAdvertisement.enabled" "value" .Values.agent.relayAdvertisement.enabled) -}}
 {{- if hasKey .Values.serviceExposure "apiServer" -}}
 {{- fail "serviceExposure.apiServer is not supported; use serviceExposure.discoverApiServer and serviceExposure.apiServerCidrs" -}}
@@ -835,9 +863,12 @@ spec:
         {{- if $kubernetesPluginEnabled }}
         networking.heteronetwork.io/node-reporter: "true"
         {{- end }}
-      {{- with .Values.agent.podAnnotations }}
+      {{- if or $overlayDnsEnabled .Values.agent.podAnnotations }}
       annotations:
-        {{- range $key, $value := . }}
+        {{- if $overlayDnsEnabled }}
+        checksum/overlay-dns-records: {{ toJson .Values.agent.overlayDns.records | sha256sum | quote }}
+        {{- end }}
+        {{- range $key, $value := .Values.agent.podAnnotations }}
         {{ $key }}: {{ $value | quote }}
         {{- end }}
       {{- end }}
@@ -1088,8 +1119,9 @@ spec:
           {{- end }}
         {{- end }}
       {{- end }}
-      {{- if not $hostAgentMode }}
+      {{- if or (not $hostAgentMode) $overlayDnsEnabled }}
       initContainers:
+        {{- if not $hostAgentMode }}
         - name: prepare-agent-state
           image: "{{ $imageRepository }}:{{ $imageTag }}"
           imagePullPolicy: {{ $imagePullPolicy }}
@@ -1112,6 +1144,39 @@ spec:
           volumeMounts:
             - name: agent-state
               mountPath: {{ $agentStateMountPath | quote }}
+        {{- end }}
+        {{- if $overlayDnsEnabled }}
+        - name: install-overlay-dns-records
+          image: "{{ $imageRepository }}:{{ $imageTag }}"
+          imagePullPolicy: {{ $imagePullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              destination="${HETERONETWORK_AGENT_STATE_DIR}/overlay-dns-records.json"
+              temporary="${destination}.tmp"
+              cp "${HETERONETWORK_DNS_CONFIG}/records.json" "${temporary}"
+              chmod 0644 "${temporary}"
+              mv -f "${temporary}" "${destination}"
+          env:
+            - name: HETERONETWORK_AGENT_STATE_DIR
+              value: {{ if $hostAgentMode }}"/var/lib/heteronetwork"{{ else }}{{ $agentStateMountPath | quote }}{{ end }}
+            - name: HETERONETWORK_DNS_CONFIG
+              value: {{ $overlayDnsConfigMountPath | quote }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          volumeMounts:
+            - name: overlay-dns-config
+              mountPath: {{ $overlayDnsConfigMountPath | quote }}
+              readOnly: true
+            - name: {{ if $hostAgentMode }}overlay-dns-host-state{{ else }}agent-state{{ end }}
+              mountPath: {{ if $hostAgentMode }}"/var/lib/heteronetwork"{{ else }}{{ $agentStateMountPath | quote }}{{ end }}
+        {{- end }}
       {{- end }}
       containers:
         {{- if not $hostAgentMode }}
@@ -1126,6 +1191,10 @@ spec:
             - {{ printf "0.0.0.0:%d" $agentApiTargetPort | quote }}
             - --state-path
             - {{ printf "%s/agent.json" $agentStateMountPath | quote }}
+            {{- if $overlayDnsEnabled }}
+            - --overlay-dns-records-file
+            - {{ printf "%s/overlay-dns-records.json" $agentStateMountPath | quote }}
+            {{- end }}
             - --wireguard-interface
             - {{ .Values.agent.interfaceName | quote }}
             - --wireguard-listen-port
@@ -1633,6 +1702,18 @@ spec:
               mountPath: {{ $agentStateMountPath | quote }}
         {{- end }}
       volumes:
+        {{- if $overlayDnsEnabled }}
+        - name: overlay-dns-config
+          configMap:
+            name: {{ printf "%s-overlay-dns" (include "heteronetwork.fullname" .) | trunc 63 | trimSuffix "-" }}
+            defaultMode: 0444
+        {{- if $hostAgentMode }}
+        - name: overlay-dns-host-state
+          hostPath:
+            path: /var/lib/heteronetwork
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- end }}
         {{- if $hostAgentMode }}
         - name: host-agent-state
           hostPath:

@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: hetero-platform
+  namespace: argocd
+spec:
+  description: HeteroNetwork and HeteroCloud production workloads
+  sourceRepos:
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
+  destinations:
+    - namespace: heterocloud
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-flow
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

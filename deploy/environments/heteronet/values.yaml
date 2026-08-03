@@ -1,0 +1,25 @@
+image:
+  repository: ghcr.io/ipa-cyberlab/heteronetwork
+  tag: c144688
+  pullPolicy: Never
+
+agent:
+  mode: host
+  overlayDns:
+    enabled: true
+    records:
+      grafana.heteronetwork.internal:
+        - 10.250.0.4
+        - 10.250.0.5
+        - 10.250.0.6
+      prometheus.heteronetwork.internal:
+        - 10.250.0.4
+        - 10.250.0.5
+        - 10.250.0.6
+      argocd.heteronetwork.internal:
+        - 10.250.0.4
+        - 10.250.0.5
+        - 10.250.0.6
+
+serviceExposure:
+  enabled: false

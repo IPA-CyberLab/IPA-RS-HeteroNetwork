@@ -157,10 +157,16 @@ const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
     "udp://stun.cloudflare.com:53",
 ];
 const OVERLAY_WEB_UI_DNS_NAME: &str = "console.heteronetwork.internal";
+const OVERLAY_DNS_SUFFIX: &str = ".heteronetwork.internal";
+const DEFAULT_OVERLAY_DNS_RECORDS_PATH: &str = "/var/lib/heteronetwork/overlay-dns-records.json";
 const OVERLAY_SERVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const OVERLAY_DNS_RECORDS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 const OVERLAY_DNS_TTL_SECONDS: u32 = 5;
 const MAX_OVERLAY_DNS_MESSAGE_BYTES: usize = 4096;
 const MAX_OVERLAY_DNS_TCP_CONNECTIONS: usize = 64;
+const MAX_OVERLAY_DNS_RECORDS_FILE_BYTES: u64 = 64 * 1024;
+const MAX_OVERLAY_DNS_NAMES: usize = 256;
+const MAX_OVERLAY_DNS_ADDRESSES_PER_NAME: usize = 16;
 const MIN_API_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_API_BEARER_TOKEN_BYTES: usize = 512;
 const MAX_API_BEARER_TOKEN_FILE_BYTES: u64 = 1024;
@@ -990,6 +996,12 @@ struct AgentArgs {
         default_value_t = 53
     )]
     overlay_dns_port: u16,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_OVERLAY_DNS_RECORDS_FILE",
+        default_value = DEFAULT_OVERLAY_DNS_RECORDS_PATH
+    )]
+    overlay_dns_records_file: PathBuf,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_OVERLAY_TRANSIT_PORT",
@@ -2179,6 +2191,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         anyhow::ensure!(
             args.overlay_dns_port > 0,
             "--overlay-dns-port must be greater than zero"
+        );
+        anyhow::ensure!(
+            args.overlay_dns_records_file.is_absolute(),
+            "--overlay-dns-records-file must be an absolute path"
         );
     }
     if args.apply_peer_map {
@@ -5366,10 +5382,154 @@ fn start_overlay_web_ui(listen: SocketAddr, app: Router) -> tokio::task::JoinHan
     })
 }
 
-fn start_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> tokio::task::JoinHandle<()> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OverlayDnsZone {
+    records: BTreeMap<String, Vec<IpAddr>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OverlayDnsRecordsDocument {
+    schema_version: u32,
+    records: BTreeMap<String, Vec<IpAddr>>,
+}
+
+fn parse_overlay_dns_zone(bytes: &[u8]) -> anyhow::Result<OverlayDnsZone> {
+    anyhow::ensure!(
+        !bytes.is_empty(),
+        "overlay DNS records document must not be empty"
+    );
+    let document: OverlayDnsRecordsDocument =
+        serde_json::from_slice(bytes).context("invalid overlay DNS records JSON")?;
+    anyhow::ensure!(
+        document.schema_version == 1,
+        "unsupported overlay DNS records schema_version {}",
+        document.schema_version
+    );
+    anyhow::ensure!(
+        document.records.len() <= MAX_OVERLAY_DNS_NAMES,
+        "overlay DNS records document exceeds the {MAX_OVERLAY_DNS_NAMES}-name limit"
+    );
+
+    let mut records = BTreeMap::new();
+    for (raw_name, addresses) in document.records {
+        let name = raw_name.trim_end_matches('.').to_ascii_lowercase();
+        anyhow::ensure!(
+            !name.is_empty() && name.len() <= 253,
+            "overlay DNS name {raw_name:?} has an invalid length"
+        );
+        hickory_proto::rr::Name::from_ascii(&name)
+            .with_context(|| format!("overlay DNS name {raw_name:?} is invalid"))?;
+        anyhow::ensure!(
+            name.ends_with(OVERLAY_DNS_SUFFIX),
+            "overlay DNS name {raw_name:?} must be below heteronetwork.internal"
+        );
+        anyhow::ensure!(
+            name != OVERLAY_WEB_UI_DNS_NAME,
+            "overlay DNS name {raw_name:?} is reserved for the local console"
+        );
+        anyhow::ensure!(
+            !addresses.is_empty()
+                && addresses.len() <= MAX_OVERLAY_DNS_ADDRESSES_PER_NAME,
+            "overlay DNS name {raw_name:?} must contain 1-{MAX_OVERLAY_DNS_ADDRESSES_PER_NAME} addresses"
+        );
+
+        let mut unique = BTreeSet::new();
+        for address in &addresses {
+            anyhow::ensure!(
+                !address.is_unspecified() && !address.is_loopback() && !address.is_multicast(),
+                "overlay DNS name {raw_name:?} contains unusable address {address}"
+            );
+            anyhow::ensure!(
+                unique.insert(*address),
+                "overlay DNS name {raw_name:?} repeats address {address}"
+            );
+        }
+        anyhow::ensure!(
+            records.insert(name.clone(), addresses).is_none(),
+            "overlay DNS name {name:?} is repeated after normalization"
+        );
+    }
+    Ok(OverlayDnsZone { records })
+}
+
+async fn load_overlay_dns_zone(path: &Path) -> anyhow::Result<OverlayDnsZone> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OverlayDnsZone::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file(),
+        "overlay DNS records path {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_OVERLAY_DNS_RECORDS_FILE_BYTES,
+        "overlay DNS records file {} exceeds {} bytes",
+        path.display(),
+        MAX_OVERLAY_DNS_RECORDS_FILE_BYTES
+    );
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_OVERLAY_DNS_RECORDS_FILE_BYTES,
+        "overlay DNS records file {} changed while reading and exceeds {} bytes",
+        path.display(),
+        MAX_OVERLAY_DNS_RECORDS_FILE_BYTES
+    );
+    parse_overlay_dns_zone(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn start_overlay_dns_zone_reloader(
+    path: PathBuf,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(OVERLAY_DNS_RECORDS_RELOAD_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match load_overlay_dns_zone(&path).await {
+                Ok(next) => {
+                    let record_count = next.records.len();
+                    let mut current = zone
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *current != next {
+                        *current = next;
+                        tracing::info!(
+                            path = %path.display(),
+                            record_count,
+                            "reloaded overlay DNS records"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "overlay DNS records reload failed; retaining the last valid zone"
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn start_overlay_dns(
+    listen: SocketAddr,
+    answer_ip: IpAddr,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = serve_overlay_dns(listen, answer_ip).await {
+            if let Err(error) = serve_overlay_dns(listen, answer_ip, zone.clone()).await {
                 tracing::warn!(%error, %listen, "overlay DNS listener stopped; retrying");
             }
             tokio::time::sleep(OVERLAY_SERVICE_RETRY_INTERVAL).await;
@@ -5377,7 +5537,11 @@ fn start_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> tokio::task::Join
     })
 }
 
-async fn serve_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> anyhow::Result<()> {
+async fn serve_overlay_dns(
+    listen: SocketAddr,
+    answer_ip: IpAddr,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
+) -> anyhow::Result<()> {
     let udp = tokio::net::UdpSocket::bind(listen)
         .await
         .with_context(|| format!("failed to bind overlay DNS UDP listener at {listen}"))?;
@@ -5391,8 +5555,8 @@ async fn serve_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> anyhow::Res
         "overlay split DNS listening"
     );
     tokio::try_join!(
-        serve_overlay_dns_udp(udp, answer_ip),
-        serve_overlay_dns_tcp(tcp, answer_ip)
+        serve_overlay_dns_udp(udp, answer_ip, zone.clone()),
+        serve_overlay_dns_tcp(tcp, answer_ip, zone)
     )?;
     Ok(())
 }
@@ -5400,11 +5564,18 @@ async fn serve_overlay_dns(listen: SocketAddr, answer_ip: IpAddr) -> anyhow::Res
 async fn serve_overlay_dns_udp(
     socket: tokio::net::UdpSocket,
     answer_ip: IpAddr,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
 ) -> anyhow::Result<()> {
     let mut buffer = [0_u8; MAX_OVERLAY_DNS_MESSAGE_BYTES];
     loop {
         let (length, peer) = socket.recv_from(&mut buffer).await?;
-        match overlay_dns_response(&buffer[..length], answer_ip) {
+        let response = {
+            let zone = zone
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            overlay_dns_response(&buffer[..length], answer_ip, &zone)
+        };
+        match response {
             Ok(response) => {
                 socket.send_to(&response, peer).await?;
             }
@@ -5418,6 +5589,7 @@ async fn serve_overlay_dns_udp(
 async fn serve_overlay_dns_tcp(
     listener: tokio::net::TcpListener,
     answer_ip: IpAddr,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
 ) -> anyhow::Result<()> {
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_OVERLAY_DNS_TCP_CONNECTIONS));
     loop {
@@ -5427,11 +5599,12 @@ async fn serve_overlay_dns_tcp(
             .acquire_owned()
             .await
             .context("overlay DNS TCP semaphore closed")?;
+        let zone = zone.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                handle_overlay_dns_tcp_connection(stream, answer_ip),
+                handle_overlay_dns_tcp_connection(stream, answer_ip, zone),
             )
             .await;
             if let Ok(Err(error)) = result {
@@ -5444,6 +5617,7 @@ async fn serve_overlay_dns_tcp(
 async fn handle_overlay_dns_tcp_connection(
     mut stream: tokio::net::TcpStream,
     answer_ip: IpAddr,
+    zone: Arc<StdRwLock<OverlayDnsZone>>,
 ) -> anyhow::Result<()> {
     let mut length = [0_u8; 2];
     stream.read_exact(&mut length).await?;
@@ -5454,7 +5628,12 @@ async fn handle_overlay_dns_tcp_connection(
     );
     let mut request = vec![0_u8; length];
     stream.read_exact(&mut request).await?;
-    let response = overlay_dns_response(&request, answer_ip)?;
+    let response = {
+        let zone = zone
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        overlay_dns_response(&request, answer_ip, &zone)?
+    };
     let response_length =
         u16::try_from(response.len()).context("overlay DNS response too large")?;
     stream.write_all(&response_length.to_be_bytes()).await?;
@@ -5462,7 +5641,11 @@ async fn handle_overlay_dns_tcp_connection(
     Ok(())
 }
 
-fn overlay_dns_response(request: &[u8], answer_ip: IpAddr) -> anyhow::Result<Vec<u8>> {
+fn overlay_dns_response(
+    request: &[u8],
+    answer_ip: IpAddr,
+    zone: &OverlayDnsZone,
+) -> anyhow::Result<Vec<u8>> {
     let request = DnsMessage::from_vec(request).context("invalid DNS message")?;
     let mut response = DnsMessage::response(request.metadata.id, request.metadata.op_code);
     response.metadata.recursion_desired = request.metadata.recursion_desired;
@@ -5487,27 +5670,33 @@ fn overlay_dns_response(request: &[u8], answer_ip: IpAddr) -> anyhow::Result<Vec
         response.metadata.response_code = ResponseCode::Refused;
         return response.to_vec().context("failed to encode DNS response");
     }
-    if !query
+    let query_name = query
         .name
         .to_ascii()
         .trim_end_matches('.')
-        .eq_ignore_ascii_case(OVERLAY_WEB_UI_DNS_NAME)
-    {
+        .to_ascii_lowercase();
+    let addresses = if query_name == OVERLAY_WEB_UI_DNS_NAME {
+        std::slice::from_ref(&answer_ip)
+    } else if let Some(addresses) = zone.records.get(&query_name) {
+        addresses.as_slice()
+    } else {
         response.metadata.response_code = ResponseCode::NXDomain;
         return response.to_vec().context("failed to encode DNS response");
-    }
-
-    let rdata = match (query.query_type, answer_ip) {
-        (RecordType::A | RecordType::ANY, IpAddr::V4(ip)) => Some(RData::A(ip.into())),
-        (RecordType::AAAA | RecordType::ANY, IpAddr::V6(ip)) => Some(RData::AAAA(ip.into())),
-        _ => None,
     };
-    if let Some(rdata) = rdata {
-        response.add_answer(Record::from_rdata(
-            query.name.clone(),
-            OVERLAY_DNS_TTL_SECONDS,
-            rdata,
-        ));
+
+    for address in addresses {
+        let rdata = match (query.query_type, address) {
+            (RecordType::A | RecordType::ANY, IpAddr::V4(ip)) => Some(RData::A((*ip).into())),
+            (RecordType::AAAA | RecordType::ANY, IpAddr::V6(ip)) => Some(RData::AAAA((*ip).into())),
+            _ => None,
+        };
+        if let Some(rdata) = rdata {
+            response.add_answer(Record::from_rdata(
+                query.name.clone(),
+                OVERLAY_DNS_TTL_SECONDS,
+                rdata,
+            ));
+        }
     }
     response.to_vec().context("failed to encode DNS response")
 }
@@ -9263,6 +9452,18 @@ async fn run_agent(
         let overlay_ip = runtime_local_vpn_ip(&runtime)?.0;
         let overlay_web_listen = SocketAddr::new(overlay_ip, args.overlay_web_ui_port);
         let overlay_dns_listen = SocketAddr::new(overlay_ip, args.overlay_dns_port);
+        let overlay_dns_zone = match load_overlay_dns_zone(&args.overlay_dns_records_file).await {
+            Ok(zone) => zone,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %args.overlay_dns_records_file.display(),
+                    "initial overlay DNS records load failed; starting with the built-in console record"
+                );
+                OverlayDnsZone::default()
+            }
+        };
+        let overlay_dns_zone = Arc::new(StdRwLock::new(overlay_dns_zone));
         background_tasks.push(start_overlay_web_ui(
             overlay_web_listen,
             overlay_web_ui_router(
@@ -9271,7 +9472,15 @@ async fn run_agent(
                 OVERLAY_WEB_UI_DNS_NAME,
             ),
         ));
-        background_tasks.push(start_overlay_dns(overlay_dns_listen, overlay_ip));
+        background_tasks.push(start_overlay_dns_zone_reloader(
+            args.overlay_dns_records_file.clone(),
+            overlay_dns_zone.clone(),
+        ));
+        background_tasks.push(start_overlay_dns(
+            overlay_dns_listen,
+            overlay_ip,
+            overlay_dns_zone,
+        ));
     }
     let result = serve_router(args.listen, agent_router(http_state)).await;
     for task in background_tasks {
@@ -21489,14 +21698,30 @@ mod tests {
     }
 
     #[test]
-    fn overlay_dns_answers_only_the_internal_console_name() -> anyhow::Result<()> {
+    fn overlay_dns_answers_console_and_configured_internal_names() -> anyhow::Result<()> {
+        let zone = parse_overlay_dns_zone(
+            br#"{
+                "schema_version": 1,
+                "records": {
+                    "grafana.heteronetwork.internal": [
+                        "10.250.0.4",
+                        "10.250.0.5",
+                        "10.250.0.6"
+                    ],
+                    "ipv6.heteronetwork.internal": ["fd00::1"]
+                }
+            }"#,
+        )?;
         let mut request = DnsMessage::query();
         request.add_query(hickory_proto::op::Query::query(
             hickory_proto::rr::Name::from_ascii(OVERLAY_WEB_UI_DNS_NAME)?,
             RecordType::A,
         ));
-        let response =
-            overlay_dns_response(&request.to_vec()?, IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)))?;
+        let response = overlay_dns_response(
+            &request.to_vec()?,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)),
+            &zone,
+        )?;
         let response = DnsMessage::from_vec(&response)?;
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert_eq!(response.answers.len(), 1);
@@ -21506,17 +21731,76 @@ mod tests {
         ));
         assert_eq!(response.answers[0].ttl, OVERLAY_DNS_TTL_SECONDS);
 
+        let mut configured = DnsMessage::query();
+        configured.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("grafana.heteronetwork.internal")?,
+            RecordType::A,
+        ));
+        let response = overlay_dns_response(
+            &configured.to_vec()?,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)),
+            &zone,
+        )?;
+        let response = DnsMessage::from_vec(&response)?;
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 3);
+        assert_eq!(
+            response
+                .answers
+                .iter()
+                .filter_map(|answer| match answer.data {
+                    RData::A(value) => Some(value.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                Ipv4Addr::new(10, 250, 0, 4),
+                Ipv4Addr::new(10, 250, 0, 5),
+                Ipv4Addr::new(10, 250, 0, 6),
+            ]
+        );
+
+        let mut wrong_family = DnsMessage::query();
+        wrong_family.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("ipv6.heteronetwork.internal")?,
+            RecordType::A,
+        ));
+        let response = overlay_dns_response(
+            &wrong_family.to_vec()?,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)),
+            &zone,
+        )?;
+        let response = DnsMessage::from_vec(&response)?;
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
+
         let mut unknown = DnsMessage::query();
         unknown.add_query(hickory_proto::op::Query::query(
             hickory_proto::rr::Name::from_ascii("unknown.heteronetwork.internal")?,
             RecordType::A,
         ));
-        let response =
-            overlay_dns_response(&unknown.to_vec()?, IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)))?;
+        let response = overlay_dns_response(
+            &unknown.to_vec()?,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)),
+            &zone,
+        )?;
         let response = DnsMessage::from_vec(&response)?;
         assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
         assert!(response.answers.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn overlay_dns_records_reject_invalid_or_reserved_entries() {
+        for document in [
+            br#"{"schema_version":2,"records":{}}"#.as_slice(),
+            br#"{"schema_version":1,"records":{"console.heteronetwork.internal":["10.250.0.4"]}}"#,
+            br#"{"schema_version":1,"records":{"public.example":["10.250.0.4"]}}"#,
+            br#"{"schema_version":1,"records":{"grafana.heteronetwork.internal":["127.0.0.1"]}}"#,
+            br#"{"schema_version":1,"records":{"grafana.heteronetwork.internal":["10.250.0.4","10.250.0.4"]}}"#,
+        ] {
+            assert!(parse_overlay_dns_zone(document).is_err());
+        }
     }
 
     fn token_with_bootstrap(endpoints: Vec<BootstrapEndpoint>) -> SignedJoinToken {
