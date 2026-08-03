@@ -67,8 +67,8 @@ gateway field invalidates the signature. Legacy v1 requests cannot nominate a
 gateway and therefore remain pinned to the server-selected primary.
 It rejects default routes, malformed CIDRs, local or relay endpoint candidates,
 and invalid WireGuard keys before starting WireGuardKit or changing Windows
-networking. On Windows, an NRPT rule directs only
-`console.heteronetwork.internal` to the active gateway and is removed with the
+networking. On Windows, an NRPT suffix rule directs the private
+`heteronetwork.internal` zone to the active gateway and is removed with the
 tunnel. The overlay Web UI and
 authoritative split-DNS listeners bind only to the Agent's VPN address; their
 router excludes Agent status, metrics, and mutation APIs. This client identity is

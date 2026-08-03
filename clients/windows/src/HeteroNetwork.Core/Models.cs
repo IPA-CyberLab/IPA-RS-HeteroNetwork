@@ -8,7 +8,9 @@ public static class HeteroNetworkConstants
     public const int SessionSchemaVersion = 1;
     public const int ClientRegistrationSchemaVersion = 1;
     public const int PendingRegistrationSchemaVersion = 1;
-    public const string OverlayDnsName = "console.heteronetwork.internal";
+    public const string OverlayDnsZone = "heteronetwork.internal";
+    public const string OverlayDnsNamespace = "." + OverlayDnsZone;
+    public const string OverlayDnsName = "console." + OverlayDnsZone;
     public const int OverlayWebUiPort = 9781;
     public static readonly Uri OverlayWebUiUri =
         new($"http://{OverlayDnsName}:{OverlayWebUiPort}/ui/");

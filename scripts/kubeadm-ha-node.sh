@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly DEFAULT_INTERFACE="heteronetwork0"
 readonly DEFAULT_API_NAME="k8s-api.heteronetwork.internal"
+readonly DEFAULT_OVERLAY_DNS_ZONE="heteronetwork.internal"
 readonly DEFAULT_API_PROXY_PORT="7443"
 readonly DEFAULT_POD_CIDR="10.244.0.0/16"
 readonly DEFAULT_SERVICE_CIDR="10.96.0.0/12"
@@ -32,6 +33,7 @@ Usage: kubeadm-ha-node.sh COMMAND
 
 Commands:
   prepare               Install and configure this Kubernetes host
+  configure-overlay-dns Configure persistent host split DNS for the private zone
   init                   Initialize the first stacked-etcd control-plane node
   refresh-join-bundle    Rotate the short-lived kubeadm join credentials
   refresh-worker-join-bundle
@@ -164,6 +166,14 @@ validate_common_config() {
   backend_addresses >/dev/null
 }
 
+validate_overlay_dns_config() {
+  validate_interface_name "$interface"
+  validate_ipv4 "$node_ip"
+  validate_dns_name "$DEFAULT_OVERLAY_DNS_ZONE"
+  [[ "$state_dir" == /* ]] || die "state directory must be absolute"
+  backend_addresses >/dev/null
+}
+
 node_is_control_plane_backend() {
   local found=0
   local backend
@@ -291,6 +301,104 @@ render_kubelet_dropin() {
 [Unit]
 Wants=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
 After=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
+EOF
+}
+
+render_overlay_dns_helper() {
+  cat <<'EOF'
+#!/bin/sh
+set -eu
+
+action="${1:-}"
+: "${HETERONETWORK_OVERLAY_DNS_INTERFACE:?missing overlay DNS interface}"
+: "${HETERONETWORK_OVERLAY_DNS_LOCAL_ADDRESS:?missing overlay DNS local address}"
+: "${HETERONETWORK_OVERLAY_DNS_SERVERS:?missing overlay DNS servers}"
+: "${HETERONETWORK_OVERLAY_DNS_ZONE:?missing overlay DNS zone}"
+
+revert() {
+  /usr/bin/resolvectl revert "$HETERONETWORK_OVERLAY_DNS_INTERFACE" >/dev/null 2>&1 || true
+  /usr/bin/resolvectl flush-caches >/dev/null 2>&1 || true
+}
+
+case "$action" in
+  apply)
+    ready=0
+    attempt=0
+    while [ "$attempt" -lt 30 ]; do
+      if /usr/sbin/ip -o -4 address show dev "$HETERONETWORK_OVERLAY_DNS_INTERFACE" \
+        | /usr/bin/awk '{print $4}' \
+        | /usr/bin/cut -d/ -f1 \
+        | /usr/bin/grep -Fxq "$HETERONETWORK_OVERLAY_DNS_LOCAL_ADDRESS"; then
+        ready=1
+        break
+      fi
+      attempt=$((attempt + 1))
+      sleep 1
+    done
+    if [ "$ready" -ne 1 ]; then
+      echo "HeteroNetwork interface did not expose the configured DNS address" >&2
+      exit 1
+    fi
+
+    trap revert EXIT HUP INT TERM
+    dns_servers=$(printf '%s' "$HETERONETWORK_OVERLAY_DNS_SERVERS" | /usr/bin/tr ',' ' ')
+    set -- $dns_servers
+    [ "$#" -ge 3 ] || {
+      echo "HeteroNetwork split DNS requires at least three servers" >&2
+      exit 1
+    }
+    /usr/bin/resolvectl dns "$HETERONETWORK_OVERLAY_DNS_INTERFACE" "$@"
+    /usr/bin/resolvectl domain \
+      "$HETERONETWORK_OVERLAY_DNS_INTERFACE" \
+      "~$HETERONETWORK_OVERLAY_DNS_ZONE"
+    /usr/bin/resolvectl default-route "$HETERONETWORK_OVERLAY_DNS_INTERFACE" no
+    /usr/bin/resolvectl flush-caches
+
+    attempt=0
+    while [ "$attempt" -lt 30 ]; do
+      if /usr/bin/resolvectl query \
+        "console.$HETERONETWORK_OVERLAY_DNS_ZONE" >/dev/null 2>&1; then
+        trap - EXIT HUP INT TERM
+        exit 0
+      fi
+      attempt=$((attempt + 1))
+      sleep 1
+    done
+    echo "HeteroNetwork split-DNS health query failed" >&2
+    exit 1
+    ;;
+  revert)
+    revert
+    ;;
+  *)
+    echo "Usage: $0 apply|revert" >&2
+    exit 2
+    ;;
+esac
+EOF
+}
+
+render_overlay_dns_service() {
+  cat <<'EOF'
+[Unit]
+Description=HeteroNetwork private-zone split DNS
+Requires=systemd-resolved.service
+BindsTo=heteronetwork-agent.service
+After=systemd-resolved.service heteronetwork-agent.service
+PartOf=heteronetwork-agent.service
+ConditionPathExists=/usr/bin/resolvectl
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/heteronetwork/kubernetes/overlay-dns.env
+ExecStart=/opt/heteronetwork/libexec/overlay-dns-resolved apply
+ExecStop=/opt/heteronetwork/libexec/overlay-dns-resolved revert
+RemainAfterExit=yes
+TimeoutStartSec=45s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
 EOF
 }
 
@@ -498,6 +606,86 @@ install_from_stdin() {
   rm -f "$temporary"
 }
 
+ensure_nss_resolve() {
+  require_command apt-get
+  require_command dpkg-query
+  if dpkg-query -W -f='${db:Status-Abbrev}' libnss-resolve 2>/dev/null \
+    | grep -Fq 'ii '; then
+    return
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y libnss-resolve
+}
+
+configure_nss_resolve() {
+  local temporary
+  temporary="$(mktemp)"
+  if ! awk '
+    /^[[:space:]]*hosts:[[:space:]]*/ {
+      if ($0 ~ /(^|[[:space:]])resolve([[:space:]]|$)/) {
+        print
+        found = 1
+        next
+      }
+      line = $0
+      sub(/^[[:space:]]*hosts:[[:space:]]*/, "", line)
+      if (line ~ /^files([[:space:]]|$)/) {
+        sub(/^files[[:space:]]*/, "", line)
+        print "hosts:          files resolve [!UNAVAIL=return] " line
+      } else {
+        print "hosts:          resolve [!UNAVAIL=return] " line
+      }
+      found = 1
+      next
+    }
+    { print }
+    END { if (!found) exit 42 }
+  ' /etc/nsswitch.conf >"$temporary"; then
+    rm -f "$temporary"
+    die "failed to update the hosts database in /etc/nsswitch.conf"
+  fi
+  install -o root -g root -m 0644 "$temporary" /etc/nsswitch.conf
+  rm -f "$temporary"
+}
+
+configure_overlay_dns() {
+  require_root
+  validate_overlay_dns_config
+  verify_interface_address
+  require_command resolvectl
+  require_command systemctl
+  ensure_nss_resolve
+  configure_nss_resolve
+  systemctl is-active --quiet heteronetwork-agent.service \
+    || die "heteronetwork-agent.service must be active for HeteroNetwork split DNS"
+  systemctl is-active --quiet systemd-resolved.service \
+    || die "systemd-resolved.service must be active for HeteroNetwork split DNS"
+
+  install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+  install -d -o root -g root -m 0700 "$state_dir"
+  render_overlay_dns_helper \
+    | install_from_stdin /opt/heteronetwork/libexec/overlay-dns-resolved 0755
+  render_overlay_dns_service \
+    | install_from_stdin /etc/systemd/system/heteronetwork-overlay-dns.service 0644
+  local dns_servers
+  dns_servers="$(backend_addresses | paste -sd, -)"
+  cat <<EOF | install_from_stdin "$state_dir/overlay-dns.env" 0600
+HETERONETWORK_OVERLAY_DNS_INTERFACE=${interface}
+HETERONETWORK_OVERLAY_DNS_LOCAL_ADDRESS=${node_ip}
+HETERONETWORK_OVERLAY_DNS_SERVERS=${dns_servers}
+HETERONETWORK_OVERLAY_DNS_ZONE=${DEFAULT_OVERLAY_DNS_ZONE}
+EOF
+
+  systemctl daemon-reload
+  systemctl enable heteronetwork-overlay-dns.service >/dev/null
+  systemctl restart heteronetwork-overlay-dns.service
+  systemctl is-active --quiet heteronetwork-overlay-dns.service \
+    || die "HeteroNetwork split DNS did not become active"
+  getent ahosts "console.${DEFAULT_OVERLAY_DNS_ZONE}" >/dev/null \
+    || die "the host resolver did not use HeteroNetwork split DNS"
+}
+
 configure_hosts_entry() {
   local temporary
   temporary="$(mktemp)"
@@ -644,7 +832,7 @@ install_kubernetes_packages() {
   require_command apt-get
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y apt-transport-https ca-certificates conntrack curl ethtool gpg haproxy jq openssl socat
+  apt-get install -y apt-transport-https ca-certificates conntrack curl ethtool gpg haproxy jq libnss-resolve openssl socat
   if ! command -v containerd >/dev/null 2>&1; then
     apt-get install -y containerd
   fi
@@ -680,6 +868,7 @@ prepare_host() {
   configure_kernel
   configure_containerd
   configure_hosts_entry
+  configure_overlay_dns
   configure_haproxy
   configure_kubelet
   configure_local_state
@@ -1120,6 +1309,15 @@ self_test() {
   [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
   rendered="$(render_haproxy_service)"
   grep -Fq 'ExecReload=/bin/kill -USR2 $MAINPID' <<<"$rendered"
+  rendered="$(render_overlay_dns_helper)"
+  grep -Fq 'resolvectl domain' <<<"$rendered"
+  grep -Fq '"~$HETERONETWORK_OVERLAY_DNS_ZONE"' <<<"$rendered"
+  grep -Fq 'resolvectl default-route "$HETERONETWORK_OVERLAY_DNS_INTERFACE" no' <<<"$rendered"
+  grep -Fq 'console.$HETERONETWORK_OVERLAY_DNS_ZONE' <<<"$rendered"
+  rendered="$(render_overlay_dns_service)"
+  grep -Fq 'BindsTo=heteronetwork-agent.service' <<<"$rendered"
+  grep -Fq 'PartOf=heteronetwork-agent.service' <<<"$rendered"
+  grep -Fq 'RemainAfterExit=yes' <<<"$rendered"
   rendered="$(render_init_config v1.36.1)"
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"
@@ -1216,6 +1414,7 @@ self_test() {
 command="${1:-}"
 case "$command" in
   prepare) prepare_host ;;
+  configure-overlay-dns) configure_overlay_dns ;;
   init) initialize_cluster ;;
   refresh-join-bundle) refresh_join_bundle ;;
   refresh-worker-join-bundle) refresh_worker_join_bundle ;;

@@ -271,7 +271,7 @@
     <Border Grid.Row="2" Background="#E9EDF5" Padding="30,10">
       <TextBlock Foreground="{StaticResource MutedInkBrush}"
                  FontSize="11"
-                 Text="HeteroNetwork 0.1.0 · Keys protected with Windows DPAPI · Split DNS for console.heteronetwork.internal" />
+                 Text="HeteroNetwork 0.1.0 · Keys protected with Windows DPAPI · Split DNS for heteronetwork.internal" />
     </Border>
   </Grid>
 </Window>

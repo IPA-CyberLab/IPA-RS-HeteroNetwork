@@ -2,6 +2,15 @@ import XCTest
 @testable import HeteroNetworkCore
 
 final class OverlayDNSHealthProbeTests: XCTestCase {
+    func testRoutesTheWholePrivateZoneThroughSplitDNS() {
+        XCTAssertEqual(HeteroNetworkConstants.overlayDNSZone, "heteronetwork.internal")
+        XCTAssertTrue(
+            HeteroNetworkConstants.overlayDNSName.hasSuffix(
+                ".\(HeteroNetworkConstants.overlayDNSZone)"
+            )
+        )
+    }
+
     func testBuildsOverlayAQuery() {
         let query = OverlayDNSHealthProbe.query(id: 0x1234)
 

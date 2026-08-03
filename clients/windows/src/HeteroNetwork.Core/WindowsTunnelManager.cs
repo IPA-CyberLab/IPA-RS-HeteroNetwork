@@ -315,7 +315,7 @@ public sealed class WindowsTunnelManager
             "$ErrorActionPreference = 'Stop'\r\n"
             + $"Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{NrptComment}' }} "
             + "| Remove-DnsClientNrptRule -Force\r\n"
-            + $"Add-DnsClientNrptRule -Namespace '{HeteroNetworkConstants.OverlayDnsName}' "
+            + $"Add-DnsClientNrptRule -Namespace '{HeteroNetworkConstants.OverlayDnsNamespace}' "
             + $"-NameServers '{gatewayVpnIp}' -Comment '{NrptComment}'";
         return RunPowerShellAsync(command, cancellationToken);
     }

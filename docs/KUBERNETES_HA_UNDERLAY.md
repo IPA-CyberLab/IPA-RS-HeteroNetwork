@@ -86,7 +86,11 @@ sudo -E scripts/kubeadm-ha-node.sh prepare
 `prepare` installs Kubernetes from the signed `pkgs.k8s.io` v1.36 repository,
 configures containerd with the systemd cgroup driver and CRI enabled, loads
 `overlay` and `br_netfilter`, enables forwarding, and starts the dedicated API
-load balancer. An existing Docker-provided containerd is retained. Its minimal
+load balancer. It also enables `heteronetwork-overlay-dns.service`, which
+idempotently registers `heteronetwork.internal` as a route-only domain on
+`heteronetwork0` with `systemd-resolved`. The service follows Agent restarts and
+removes its per-link resolver state when stopped. An existing Docker-provided
+containerd is retained. Its minimal
 `disabled_plugins = ["cri"]` configuration is backed up and expanded from that
 installed containerd version's own defaults; custom layouts are updated in
 place only when they already expose `SystemdCgroup`, otherwise the script

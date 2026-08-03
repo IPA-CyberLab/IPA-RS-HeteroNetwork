@@ -110,7 +110,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             throw PacketTunnelError.invalidGatewayConfiguration
         }
         interface.dns = [dnsServer]
-        interface.dnsSearch = [HeteroNetworkConstants.overlayDNSName]
+        interface.dnsSearch = [HeteroNetworkConstants.overlayDNSZone]
 
         var peer = PeerConfiguration(publicKey: publicKey)
         peer.endpoint = endpoint

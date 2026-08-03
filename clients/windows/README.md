@@ -11,8 +11,8 @@ is included in the registration request or returned import profile. The app
 builds and bundles the official WireGuard embeddable tunnel service and the
 signed WireGuardNT driver library at pinned versions. The active WireGuard
 configuration is machine-DPAPI protected before it is handed to that embedded
-service. An NRPT rule sends only
-`console.heteronetwork.internal` DNS queries to the active gateway.
+service. An NRPT suffix rule sends the entire `heteronetwork.internal` zone to
+the active gateway.
 
 ## Requirements
 

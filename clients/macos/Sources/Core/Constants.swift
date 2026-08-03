@@ -10,7 +10,8 @@ public enum HeteroNetworkConstants {
         "jp.go.ipa.cyberlab.heteronetwork.pending-registration"
     public static let pendingKeychainAccount = "pending"
     public static let sessionSchemaVersion = 1
-    public static let overlayDNSName = "console.heteronetwork.internal"
+    public static let overlayDNSZone = "heteronetwork.internal"
+    public static let overlayDNSName = "console.\(overlayDNSZone)"
     public static let overlayWebUIPort = 9781
     public static let gatewayRefreshIntervalNanoseconds: UInt64 = 5_000_000_000
     public static let gatewayFailureThreshold = 2

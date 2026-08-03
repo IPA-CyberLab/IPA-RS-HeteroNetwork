@@ -5,6 +5,19 @@ namespace HeteroNetwork.Core.Tests;
 public sealed class TunnelProfileTests
 {
     [Fact]
+    public void RoutesTheWholePrivateZoneThroughSplitDns()
+    {
+        Assert.Equal("heteronetwork.internal", HeteroNetworkConstants.OverlayDnsZone);
+        Assert.Equal(
+            $".{HeteroNetworkConstants.OverlayDnsZone}",
+            HeteroNetworkConstants.OverlayDnsNamespace);
+        Assert.True(
+            HeteroNetworkConstants.OverlayDnsName.EndsWith(
+                HeteroNetworkConstants.OverlayDnsNamespace,
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void RoutesOnlyThroughPreferredPublicGateway()
     {
         var session = TestData.Session(["100.96.0.3/32", "10.42.0.0/16"]);

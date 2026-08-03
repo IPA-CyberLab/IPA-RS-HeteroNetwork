@@ -272,8 +272,8 @@ request. The shared control-plane store changes every node's return route for
 that client and wakes long-polling Agent heartbeats so they apply the new map
 without waiting for the 30-second background poll. The active gateway serves
 the authenticated console only on its VPN address at
-`http://console.heteronetwork.internal:9781/ui/`; split DNS sends only
-`console.heteronetwork.internal` queries into the tunnel.
+`http://console.heteronetwork.internal:9781/ui/`; split DNS sends the complete
+`heteronetwork.internal` private zone into the tunnel.
 Control-only clients are intentionally absent from the normal node table; use
 `ipars_control_plane_clients` or `client_count` to observe their allocation.
 

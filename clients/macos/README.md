@@ -57,9 +57,9 @@ tunnel refreshes its signed peer map every five seconds and updates the running
 WireGuard adapter when the preferred gateway changes. Two failed VPN-local
 health probes also trigger a cached-gateway switch before server-side health
 expiry. Each refresh signs the active gateway ID so the control plane can move
-the client's return routes on every Linux node at the same time. The internal
-console name uses split DNS against the active gateway; unrelated DNS remains
-on the host's normal resolver. The first connection uses the imported peer map
-without contacting the VPN-only management API. The client refuses default
+the client's return routes on every Linux node at the same time. The private
+`heteronetwork.internal` zone uses split DNS against the active gateway;
+unrelated DNS remains on the host's normal resolver. The first connection uses
+the imported peer map without contacting the VPN-only management API. The client refuses default
 routes, STUN/local/relay candidates, non-global gateway addresses, public
 management URLs, and invalid WireGuard keys before starting the tunnel.
