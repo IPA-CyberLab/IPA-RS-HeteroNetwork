@@ -96,6 +96,19 @@ installed containerd version's own defaults; custom layouts are updated in
 place only when they already expose `SystemdCgroup`, otherwise the script
 aborts for operator review.
 
+To reconcile split DNS alone on an existing node, provide that node's VPN
+address and the same three control-plane addresses used by the cluster:
+
+```bash
+export HETERONETWORK_KUBEADM_NODE_IP=10.250.0.1
+export HETERONETWORK_KUBEADM_CONTROL_PLANES=10.250.0.1,10.250.0.2,10.250.0.3
+sudo -E scripts/kubeadm-ha-node.sh configure-overlay-dns
+```
+
+The command preserves existing NSS databases, installs `libnss-resolve` when
+needed, and verifies the private console name through the normal host resolver.
+It is safe to rerun with the same inputs.
+
 Host swap remains available to non-Pod processes. kubelet uses
 `failSwapOn: false` with `NoSwap`, so Kubernetes workloads cannot consume it.
 
