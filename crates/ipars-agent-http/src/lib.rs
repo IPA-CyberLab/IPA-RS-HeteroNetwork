@@ -374,6 +374,7 @@ pub fn overlay_web_ui_router(
     };
     let dns_origin = format!("http://{dns_name}:{}", listen.port());
     gateway_web_ui_routes()
+        .route("/metrics", get(prometheus_metrics))
         .route_layer(middleware::from_fn_with_state(
             OverlayWebUiAccess {
                 origins: Arc::from([ip_origin, dns_origin]),
@@ -5251,6 +5252,19 @@ mod tests {
             )
             .await?;
         assert_eq!(health.status(), StatusCode::OK);
+
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(header::HOST, "10.250.0.1:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let metrics = String::from_utf8(to_bytes(metrics.into_body(), usize::MAX).await?.to_vec())?;
+        assert!(metrics.contains("ipars_agent_metrics_generated_timestamp_seconds"));
 
         let wrong_host = app
             .clone()

@@ -591,6 +591,11 @@ Initial agent HTTP routes:
 - `POST /v1/packet-flow`
 
 The Agent listener defaults to loopback. Non-loopback listeners require a 32-512 byte management Bearer token, and configured authentication covers `/metrics` plus all `/v1/*` reads and mutations. `/healthz` remains unauthenticated for orchestration probes. CLI Agent calls, Compose, and the Helm DaemonSet carry the same credential through file-backed or Secret-backed configuration; the management credential is intentionally separate from the signed join token.
+When overlay services are enabled, the Agent also exposes only the Prometheus
+`GET /metrics` route through its VPN-bound Web UI listener. That listener keeps
+the overlay Host and cross-origin checks and does not expose Agent management
+routes, allowing a VPN-local collector to discover nodes without receiving the
+management credential.
 
 ## Observability
 
