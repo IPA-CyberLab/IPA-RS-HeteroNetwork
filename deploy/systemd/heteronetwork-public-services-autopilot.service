@@ -20,10 +20,9 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
-ReadWritePaths=/etc/heteronetwork/public-services /etc/systemd/system/heteronetwork-agent.service.d
+ReadWritePaths=/etc/heteronetwork/public-services /etc/systemd/system/heteronetwork-agent.service.d /etc/systemd/system/heteronetwork-control-plane.service.d
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-
