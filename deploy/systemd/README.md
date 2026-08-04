@@ -77,7 +77,13 @@ gateway, Relay, and PostgreSQL HA dependencies are healthy; otherwise it
 withdraws the lease and stops those services. Pass
 `--disable-public-services` only for an explicit per-node opt-out. Automatically
 promoted Control Planes receive the root and enrollment public verification
-keys but never an enrollment private signing key.
+keys. They remain verification-only unless an operator explicitly provisions
+both `/etc/credstore/node-enrollment-issuer.key` and the root-only
+`/etc/heteronetwork/agent-relay-admission.token`. When both files pass the
+owner-only credential checks, the autopilot imports them into only the Control
+Plane's systemd credential namespace and enables enrollment. This lets selected
+automatic replicas provide HA enrollment without distributing the signing key
+to every public node.
 Install the local database proxy and place its complete TLS-verifying
 PostgreSQL URL in `/etc/credstore/database-url`, owned by `root:root` with mode
 `0400`. The unit imports that URL as a separate systemd credential, keeping the

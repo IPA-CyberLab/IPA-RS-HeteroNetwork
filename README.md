@@ -254,6 +254,11 @@ only while it has a fresh directly reachable public classification and healthy
 database, gateway, and Relay dependencies. Losing any prerequisite withdraws
 the service lease and stops the promoted services. Use
 `--disable-public-services` only for an explicit per-node opt-out.
+An automatically promoted Control Plane remains enrollment verification-only by
+default. If the dedicated signer is explicitly installed at
+`/etc/credstore/node-enrollment-issuer.key` together with the root-only Agent
+Relay admission credential, the autopilot loads both through an isolated
+systemd credential drop-in and advertises that replica as an enrollment signer.
 
 This signer is distinct from the offline root issuer. The verifier limits it to
 non-control-plane node roles, matching tags, no route grants, bounded uses/TTL,

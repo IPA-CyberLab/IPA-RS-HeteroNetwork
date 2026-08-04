@@ -57,6 +57,14 @@ authenticated management access
 and two distinct active URLs for Control Plane, Signal, and STUN, plus two Relay
 URLs when relay permission is requested.
 
+The public-services autopilot applies the same rule to automatically promoted
+Control Planes. It enables enrollment only when the root-owned
+`/etc/credstore/node-enrollment-issuer.key` and
+`/etc/heteronetwork/agent-relay-admission.token` are both present with mode
+`0400` or `0600`; otherwise that replica remains verification-only. Provision
+the same dedicated signer on at least two promoted public nodes when enrollment
+must survive a node failure.
+
 The four local services form one advertised failure domain. The packaged Control Plane unit is bound to Signal, STUN, and Relay, so stopping or losing any of them stops the local lease renewal. A failed instance disappears from `/v1/admin/services` after `HETERONETWORK_SERVICE_LEASE_TTL_SECONDS`. Deploy the three-member private PostgreSQL quorum described in [`POSTGRES_HA.md`](POSTGRES_HA.md); a single database on either public host makes whole-host failover asymmetric.
 
 Mint join tokens from the active directory instead of manually copying endpoint lists:

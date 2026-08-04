@@ -170,6 +170,18 @@ test("Cloudscape console renders overview and hierarchical topology", async ({ p
 
   await expect(page.getByRole("heading", { name: "ネットワーク概要" })).toBeVisible();
   await expect(page.getByText("5台が正常")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Argo CD" })).toHaveAttribute(
+    "href",
+    "http://argocd.heteronetwork.internal:8088",
+  );
+  await expect(page.getByRole("link", { name: "Grafana" })).toHaveAttribute(
+    "href",
+    "http://grafana.heteronetwork.internal:33000",
+  );
+  await expect(page.getByRole("link", { name: "Prometheus" })).toHaveAttribute(
+    "href",
+    "http://prometheus.heteronetwork.internal:9090",
+  );
   await expect(page.getByRole("table").last().getByRole("row")).toHaveCount(6);
 
   await page.getByText("オーバーレイトポロジー", { exact: true }).first().click();

@@ -15,6 +15,21 @@ import {
   shortId,
 } from "../utils.js";
 
+const operationsConsoles = [
+  {
+    label: "Argo CD",
+    href: "http://argocd.heteronetwork.internal:8088",
+  },
+  {
+    label: "Grafana",
+    href: "http://grafana.heteronetwork.internal:33000",
+  },
+  {
+    label: "Prometheus",
+    href: "http://prometheus.heteronetwork.internal:9090",
+  },
+];
+
 function Metric({ label, value, detail }) {
   return (
     <div>
@@ -112,6 +127,22 @@ export function OverviewPage({ overview, onNavigate, onOpenNode }) {
 
   return (
     <SpaceBetween size="l">
+      <Container header={<Header variant="h2">運用ツール</Header>}>
+        <ColumnLayout columns={3} variant="text-grid">
+          {operationsConsoles.map((console) => (
+            <Button
+              key={console.label}
+              href={console.href}
+              target="_blank"
+              iconName="external"
+              fullWidth
+            >
+              {console.label}
+            </Button>
+          ))}
+        </ColumnLayout>
+      </Container>
+
       <Container header={<Header variant="h2">ネットワーク概要</Header>}>
         <ColumnLayout columns={4} variant="text-grid">
           <Metric

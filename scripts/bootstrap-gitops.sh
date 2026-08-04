@@ -68,5 +68,5 @@ done
 printf '%s\n' \
   'GitOps bootstrap completed.' \
   'Argo CD:    http://argocd.heteronetwork.internal:8088' \
-  'Grafana:    http://grafana.heteronetwork.internal:3000' \
+  'Grafana:    http://grafana.heteronetwork.internal:33000' \
   'Prometheus: http://prometheus.heteronetwork.internal:9090'

@@ -5176,11 +5176,15 @@ fn control_plane_node_enrollment_config(
     anyhow::ensure!(
         args.trusted_node_enrollment_issuer_keys
             .iter()
+            .filter(|trusted| {
+                trusted.issuer_node_id == issuer_node_id.as_str()
+                    && trusted.key_id == args.node_enrollment_issuer_key_id
+            })
             .all(|trusted| {
-                trusted.issuer_node_id != issuer_node_id.as_str()
-                    || trusted.key_id != args.node_enrollment_issuer_key_id
+                trusted.public_key == issuer_public_key
+                    && trusted.max_ttl_seconds == args.node_enrollment_max_ttl_seconds
             }),
-        "node enrollment private signer conflicts with a public-only trusted node-enrollment issuer entry"
+        "node enrollment private signer does not match its trusted node-enrollment issuer entry"
     );
     let public_url = args
         .web_public_url
@@ -23947,6 +23951,11 @@ mod tests {
             "control-plane-test-relay-admission-token-32-bytes",
         )?;
         std::fs::write(&binary_path, b"test-linux-amd64-binary")?;
+        let trusted_enrollment_signer = format!(
+            "{},web-enrollment,{},604800",
+            enrollment_issuer.node_id(),
+            enrollment_issuer.public_key_b64()
+        );
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -23976,6 +23985,8 @@ mod tests {
             relay_admission_token_path
                 .to_str()
                 .context("test relay admission token path must be UTF-8")?,
+            "--trusted-node-enrollment-issuer-key",
+            trusted_enrollment_signer.as_str(),
         ])?;
         let Command::ControlPlane(args) = cli.command else {
             anyhow::bail!("expected control-plane command");

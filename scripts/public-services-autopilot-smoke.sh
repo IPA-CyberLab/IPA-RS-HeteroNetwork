@@ -142,6 +142,9 @@ database_url=$public_services_dir/database-url
 database_autopilot_token_file=$public_services_dir/database-autopilot.token
 keycloak_autopilot_token_file=$public_services_dir/keycloak-autopilot.token
 agent_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/30-public-services.conf
+control_plane_enrollment_drop_in=$test_root/root/etc/systemd/system/heteronetwork-control-plane.service.d/40-node-enrollment.conf
+node_enrollment_issuer_key=$test_root/root/etc/credstore/node-enrollment-issuer.key
+node_enrollment_relay_token=$test_root/root/etc/heteronetwork/agent-relay-admission.token
 
 b64() {
   printf '%s' "$1" | base64 | tr -d '\r\n'
@@ -151,6 +154,8 @@ root_public_key=$(printf 'root-public-key-material-0000000000' | head -c 32 | ba
 trusted_public_key=$(printf 'trusted-public-key-material-000000' | head -c 32 | base64 | tr -d '\r\n')
 enrollment_public_key=$(printf 'enroll-public-key-material-0000000' | head -c 32 | base64 | tr -d '\r\n')
 rotation_public_key=$(printf 'rotate-public-key-material-0000000' | head -c 32 | base64 | tr -d '\r\n')
+enrollment_private_key=$(printf 'enroll-private-key-material-000000' | head -c 32 | base64 | tr -d '\r\n')
+enrollment_relay_token='enrollment-relay-admission-token-0123456789abcdef'
 
 mkdir -p "$public_services_dir"
 cat >"$public_services_dir/bootstrap.env" <<EOF
@@ -174,6 +179,11 @@ HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS=15
 HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS=45
 EOF
 chmod 0600 "$public_services_dir/bootstrap.env"
+mkdir -p "$(dirname "$node_enrollment_issuer_key")" \
+  "$(dirname "$node_enrollment_relay_token")"
+printf '%s\n' "$enrollment_private_key" >"$node_enrollment_issuer_key"
+printf '%s\n' "$enrollment_relay_token" >"$node_enrollment_relay_token"
+chmod 0400 "$node_enrollment_issuer_key" "$node_enrollment_relay_token"
 
 write_status() {
   status_state=$1
@@ -269,7 +279,8 @@ reset_auto_services() {
     "$database_url" \
     "$database_autopilot_token_file" \
     "$keycloak_autopilot_token_file" \
-    "$agent_drop_in"
+    "$agent_drop_in" \
+    "$control_plane_enrollment_drop_in"
 }
 
 run_reconciler() {
@@ -326,6 +337,8 @@ run_reconciler
 [ -f "$keycloak_autopilot_token_file" ] ||
   fail "Keycloak autopilot credential was not generated"
 [ -f "$agent_drop_in" ] || fail "Agent drop-in was not generated"
+[ -f "$control_plane_enrollment_drop_in" ] ||
+  fail "Control Plane enrollment credential drop-in was not generated"
 [ "$(stat -c '%a' "$services_env")" = 640 ] ||
   fail "service environment mode is not 0640"
 [ "$(stat -c '%a' "$database_url")" = 400 ] ||
@@ -336,6 +349,8 @@ run_reconciler
   fail "Keycloak autopilot credential mode is not 0400"
 [ "$(stat -c '%a' "$agent_drop_in")" = 644 ] ||
   fail "Agent drop-in mode is not 0644"
+[ "$(stat -c '%a' "$control_plane_enrollment_drop_in")" = 644 ] ||
+  fail "Control Plane enrollment drop-in mode is not 0644"
 [ "$(tr -d '\r\n' <"$database_autopilot_token_file")" = \
     "$database_autopilot_token" ] ||
   fail "database autopilot credential content is wrong"
@@ -368,6 +383,19 @@ grep -q '^HETERONETWORK_ADVERTISE_WEB_UI_URL="http://10.250.0.4:19088"$' \
   "$services_env" || fail "automatic Web UI advertisement escaped the VPN"
 grep -q '^HETERONETWORK_WEB_PUBLIC_URL="http://10.250.0.4:19088"$' \
   "$services_env" || fail "automatic Web UI callback escaped the VPN"
+grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="true"' "$services_env" ||
+  fail "explicitly provisioned enrollment signer was not enabled"
+grep -Fqx \
+  'HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH="/run/credentials/heteronetwork-control-plane.service/node-enrollment-relay-admission.token"' \
+  "$services_env" || fail "node enrollment did not use its isolated Relay credential"
+grep -Fqx \
+  'LoadCredential=node-enrollment-issuer.key:/etc/credstore/node-enrollment-issuer.key' \
+  "$control_plane_enrollment_drop_in" ||
+  fail "node enrollment signer was not isolated as a systemd credential"
+grep -Fqx \
+  'LoadCredential=node-enrollment-relay-admission.token:/etc/heteronetwork/agent-relay-admission.token' \
+  "$control_plane_enrollment_drop_in" ||
+  fail "node enrollment Relay credential was not isolated by systemd"
 grep -q '^HETERONETWORK_SIGNAL_LISTEN="127.0.0.1:19443"$' "$services_env" ||
   fail "automatic Signal listen address is wrong"
 grep -q '^HETERONETWORK_STUN_LISTEN="0.0.0.0:19444"$' "$services_env" ||
@@ -429,6 +457,7 @@ database_checksum=$(cksum "$database_url")
 database_autopilot_token_checksum=$(cksum "$database_autopilot_token_file")
 keycloak_autopilot_token_checksum=$(cksum "$keycloak_autopilot_token_file")
 drop_in_checksum=$(cksum "$agent_drop_in")
+enrollment_drop_in_checksum=$(cksum "$control_plane_enrollment_drop_in")
 chmod 0640 "$database_url"
 run_reconciler
 [ "$(cksum "$services_env")" = "$services_checksum" ] ||
@@ -445,6 +474,9 @@ run_reconciler
   fail "idempotent run rewrote the Keycloak autopilot credential"
 [ "$(cksum "$agent_drop_in")" = "$drop_in_checksum" ] ||
   fail "idempotent run rewrote the Agent drop-in"
+[ "$(cksum "$control_plane_enrollment_drop_in")" = \
+  "$enrollment_drop_in_checksum" ] ||
+  fail "idempotent run rewrote the Control Plane enrollment drop-in"
 if grep -Eq '^(start|stop|restart|kill) ' "$systemctl_log"; then
   fail "idempotent run changed a service"
 fi
@@ -455,6 +487,20 @@ run_reconciler
   fail "database autopilot credential permissions were not repaired"
 [ "$(stat -c '%a' "$keycloak_autopilot_token_file")" = 400 ] ||
   fail "Keycloak autopilot credential permissions were not repaired"
+
+rm -f "$node_enrollment_issuer_key"
+run_reconciler
+grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="false"' "$services_env" ||
+  fail "automatic Control Plane retained enrollment after signer removal"
+[ ! -e "$control_plane_enrollment_drop_in" ] ||
+  fail "enrollment credential drop-in survived signer removal"
+printf '%s\n' "$enrollment_private_key" >"$node_enrollment_issuer_key"
+chmod 0400 "$node_enrollment_issuer_key"
+run_reconciler
+grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="true"' "$services_env" ||
+  fail "automatic Control Plane did not restore enrollment after signer provisioning"
+[ -f "$control_plane_enrollment_drop_in" ] ||
+  fail "enrollment credential drop-in was not restored"
 
 sed -i \
   's/^HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/' \
@@ -610,7 +656,9 @@ if grep -Fq "$secret" "$output_log" ||
   grep -Fq "$database_autopilot_token" "$output_log" ||
   grep -Fq "$database_autopilot_token" "$systemctl_log" ||
   grep -Fq "$keycloak_autopilot_token" "$output_log" ||
-  grep -Fq "$keycloak_autopilot_token" "$systemctl_log"; then
+  grep -Fq "$keycloak_autopilot_token" "$systemctl_log" ||
+  grep -Fq "$enrollment_private_key" "$output_log" ||
+  grep -Fq "$enrollment_private_key" "$systemctl_log"; then
   fail "a secret was printed"
 fi
 

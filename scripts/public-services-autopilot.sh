@@ -44,6 +44,10 @@ postgres_password_file=$filesystem_root/etc/heteronetwork/postgres-autopilot/bun
 postgres_ca_file=$filesystem_root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
 agent_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-agent.service.d
 agent_drop_in=$agent_drop_in_dir/30-public-services.conf
+control_plane_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-control-plane.service.d
+control_plane_enrollment_drop_in=$control_plane_drop_in_dir/40-node-enrollment.conf
+node_enrollment_issuer_key=$filesystem_root/etc/credstore/node-enrollment-issuer.key
+node_enrollment_relay_token=$filesystem_root/etc/heteronetwork/agent-relay-admission.token
 runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
 
 status_file=
@@ -55,6 +59,8 @@ database_url_tmp=
 database_autopilot_token_tmp=
 keycloak_autopilot_token_tmp=
 agent_drop_in_tmp=
+control_plane_enrollment_drop_in_tmp=
+node_enrollment_enabled=0
 reconcile_finished=0
 
 log() {
@@ -72,6 +78,8 @@ cleanup() {
   [ -z "$keycloak_autopilot_token_tmp" ] ||
     rm -f "$keycloak_autopilot_token_tmp"
   [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
+  [ -z "$control_plane_enrollment_drop_in_tmp" ] ||
+    rm -f "$control_plane_enrollment_drop_in_tmp"
 }
 
 unit_is_active() {
@@ -340,6 +348,75 @@ valid_public_key() {
   valid_key_canonical=$(printf '%s' "$valid_key_value" | base64 -d 2>/dev/null |
     base64 | tr -d '\r\n') || return 1
   [ "$valid_key_canonical" = "$valid_key_value" ]
+}
+
+secure_root_credential() {
+  credential_path=$1
+  credential_min_bytes=$2
+  credential_max_bytes=$3
+  [ -f "$credential_path" ] && [ ! -L "$credential_path" ] || return 1
+  credential_metadata=$(stat -c '%u %a %h %s' "$credential_path" 2>/dev/null) ||
+    return 1
+  set -- $credential_metadata
+  [ "$#" -eq 4 ] || return 1
+  credential_uid=$1
+  credential_mode=$2
+  credential_links=$3
+  credential_size=$4
+  if [ -n "$filesystem_root" ]; then
+    credential_expected_uid=$(id -u)
+  else
+    credential_expected_uid=0
+  fi
+  [ "$credential_uid" -eq "$credential_expected_uid" ] || return 1
+  [ "$credential_links" -eq 1 ] || return 1
+  [ "$credential_size" -ge "$credential_min_bytes" ] &&
+    [ "$credential_size" -le "$credential_max_bytes" ] || return 1
+  credential_owner_digit=$((credential_mode / 100 % 10))
+  credential_group_digit=$((credential_mode / 10 % 10))
+  credential_world_digit=$((credential_mode % 10))
+  case "$credential_owner_digit:$credential_group_digit:$credential_world_digit" in
+    4:0:0|6:0:0) ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_node_enrollment_credentials() {
+  node_enrollment_enabled=0
+  if [ ! -e "$node_enrollment_issuer_key" ] &&
+    [ ! -L "$node_enrollment_issuer_key" ]; then
+    return 0
+  fi
+  if ! secure_root_credential "$node_enrollment_issuer_key" 43 128; then
+    log "ignoring an unsafe node-enrollment issuer credential"
+    return 0
+  fi
+  enrollment_private_key=$(tr -d '\r\n' <"$node_enrollment_issuer_key") || return 1
+  if ! valid_public_key "$enrollment_private_key"; then
+    log "ignoring an invalid node-enrollment issuer credential"
+    return 0
+  fi
+  enrollment_private_key=
+  if ! secure_root_credential "$node_enrollment_relay_token" 32 513; then
+    log "node enrollment remains disabled without a secure Relay admission credential"
+    return 0
+  fi
+  enrollment_relay_token=$(tr -d '\r\n' <"$node_enrollment_relay_token") || return 1
+  if [ "${#enrollment_relay_token}" -lt 32 ] ||
+    [ "${#enrollment_relay_token}" -gt 512 ]; then
+    enrollment_relay_token=
+    log "node enrollment remains disabled with an invalid Relay admission credential"
+    return 0
+  fi
+  case "$enrollment_relay_token" in
+    *[!A-Za-z0-9._~+/=-]*)
+      enrollment_relay_token=
+      log "node enrollment remains disabled with an invalid Relay admission credential"
+      return 0
+      ;;
+  esac
+  enrollment_relay_token=
+  node_enrollment_enabled=1
 }
 
 valid_http_url() {
@@ -663,11 +740,35 @@ install_root_credential_candidate() {
 }
 
 prepare_runtime_files() {
-  mkdir -p "$public_services_dir" "$agent_drop_in_dir" || return 1
+  mkdir -p "$public_services_dir" "$agent_drop_in_dir" \
+    "$control_plane_drop_in_dir" || return 1
   chown root:"$service_group" "$public_services_dir" || return 1
   chmod 0750 "$public_services_dir" || return 1
   chown root:root "$agent_drop_in_dir" || return 1
   chmod 0755 "$agent_drop_in_dir" || return 1
+  chown root:root "$control_plane_drop_in_dir" || return 1
+  chmod 0755 "$control_plane_drop_in_dir" || return 1
+
+  if [ "$node_enrollment_enabled" -eq 1 ]; then
+    control_plane_enrollment_drop_in_tmp=$(
+      mktemp "$control_plane_drop_in_dir/.40-node-enrollment.conf.XXXXXX"
+    ) || return 1
+    cat >"$control_plane_enrollment_drop_in_tmp" <<'EOF' || return 1
+[Service]
+LoadCredential=node-enrollment-issuer.key:/etc/credstore/node-enrollment-issuer.key
+LoadCredential=node-enrollment-relay-admission.token:/etc/heteronetwork/agent-relay-admission.token
+EOF
+    install_candidate "$control_plane_enrollment_drop_in_tmp" \
+      "$control_plane_enrollment_drop_in" root:root 0644 || return 1
+    control_plane_enrollment_drop_in_tmp=
+    control_plane_enrollment_drop_in_changed=$CANDIDATE_CHANGED
+  elif [ -e "$control_plane_enrollment_drop_in" ] ||
+    [ -L "$control_plane_enrollment_drop_in" ]; then
+    rm -f "$control_plane_enrollment_drop_in" || return 1
+    control_plane_enrollment_drop_in_changed=1
+  else
+    control_plane_enrollment_drop_in_changed=0
+  fi
 
   services_env_tmp=$(mktemp "$public_services_dir/.services.env.XXXXXX") || return 1
   {
@@ -706,7 +807,19 @@ prepare_runtime_files() {
       "http://$vpn_ip:19088"
     write_environment_entry HETERONETWORK_WEB_UI_ENABLED true
     write_environment_entry HETERONETWORK_DYNAMIC_WEB_GATEWAY_ENABLED false
-    write_environment_entry HETERONETWORK_NODE_ENROLLMENT_ENABLED false
+    if [ "$node_enrollment_enabled" -eq 1 ]; then
+      write_environment_entry HETERONETWORK_NODE_ENROLLMENT_ENABLED true
+      write_environment_entry HETERONETWORK_NODE_ENROLLMENT_ISSUER_KEY_ID web-enrollment
+      write_environment_entry HETERONETWORK_NODE_ENROLLMENT_MAX_TTL_SECONDS 604800
+      write_environment_entry HETERONETWORK_NODE_ENROLLMENT_BINARY_PATH \
+        /opt/heteronetwork/bin/iparsd
+      write_environment_entry HETERONETWORK_NODE_ENROLLMENT_CLI_BINARY_PATH \
+        /opt/heteronetwork/bin/ipars
+      write_environment_entry HETERONETWORK_RELAY_ADMISSION_BEARER_TOKEN_PATH \
+        /run/credentials/heteronetwork-control-plane.service/node-enrollment-relay-admission.token
+    else
+      write_environment_entry HETERONETWORK_NODE_ENROLLMENT_ENABLED false
+    fi
     write_environment_entry HETERONETWORK_WEB_AUTH_PROVIDER keycloak
     write_environment_entry HETERONETWORK_WEB_PUBLIC_URL \
       "http://$vpn_ip:19088"
@@ -780,8 +893,13 @@ promote() {
   if [ "$services_env_changed" -eq 1 ] ||
     [ "$database_url_changed" -eq 1 ] ||
     [ "$database_autopilot_token_changed" -eq 1 ] ||
-    [ "$keycloak_autopilot_token_changed" -eq 1 ]; then
+    [ "$keycloak_autopilot_token_changed" -eq 1 ] ||
+    [ "$control_plane_enrollment_drop_in_changed" -eq 1 ]; then
     runtime_configuration_changed=1
+  fi
+
+  if [ "$control_plane_enrollment_drop_in_changed" -eq 1 ]; then
+    systemctl daemon-reload || return 1
   fi
 
   if [ "$runtime_configuration_changed" -eq 1 ]; then
@@ -973,6 +1091,10 @@ if [ "${#database_password}" -gt 512 ]; then
 fi
 
 signal_control_plane_urls="http://$vpn_ip:19088,$bootstrap_control_plane_urls"
+
+if ! detect_node_enrollment_credentials; then
+  demote_and_exit "unable to validate optional node-enrollment credentials"
+fi
 
 if ! prepare_runtime_files; then
   demote_and_exit "unable to stage automatic public-service configuration"

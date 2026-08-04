@@ -4809,13 +4809,16 @@ fn public_services_install_script(
         .join(",");
     let trusted_issuer_keys = config.trusted_issuer_keys.join(";");
     let mut enrollment_trusted_issuer_keys = config.trusted_node_enrollment_issuer_keys.clone();
-    enrollment_trusted_issuer_keys.push(format!(
+    let enrollment_signer_entry = format!(
         "{},{},{},{}",
         enrollment.issuer_node_id(),
         enrollment.issuer_key_id(),
         enrollment.issuer_public_key_b64(),
         enrollment.max_ttl_seconds(),
-    ));
+    );
+    if !enrollment_trusted_issuer_keys.contains(&enrollment_signer_entry) {
+        enrollment_trusted_issuer_keys.push(enrollment_signer_entry);
+    }
     let enrollment_trusted_issuer_keys = enrollment_trusted_issuer_keys.join(";");
     let oidc_auth_base_url = config.oidc_auth_base_url.as_deref().unwrap_or_default();
     let oidc_backchannel_base_url = managed_keycloak_edge_base_url(&config.oidc_issuer_url)
@@ -8715,6 +8718,13 @@ mod tests {
         ));
         std::fs::write(&binary_path, binary_contents)?;
         let root_issuer = identity_for_node("enrollment-root");
+        let trusted_enrollment_signer = format!(
+            "{},{},{},{}",
+            issuer.node_id(),
+            key_id,
+            issuer.public_key_b64(),
+            7 * 24 * 60 * 60,
+        );
         let enrollment = NodeEnrollmentConfig::new(
             issuer,
             key_id.as_str().to_string(),
@@ -8730,7 +8740,7 @@ mod tests {
             issuer_key_id: "root".to_string(),
             issuer_public_key: root_issuer.public_key_b64(),
             trusted_issuer_keys: Vec::new(),
-            trusted_node_enrollment_issuer_keys: Vec::new(),
+            trusted_node_enrollment_issuer_keys: vec![trusted_enrollment_signer.clone()],
             oidc_issuer_url: "https://sso.example/realms/heteronetwork".to_string(),
             oidc_client_id: "heteronetwork-web".to_string(),
             oidc_auth_base_url: None,
@@ -9188,6 +9198,10 @@ mod tests {
         assert!(generated_script.contains("User=heteronetwork-services"));
         assert!(generated_script
             .contains("HETERONETWORK_PUBLIC_SERVICES_ENROLLMENT_TRUSTED_ISSUER_KEY_B64="));
+        assert!(generated_script.contains(&format!(
+            "HETERONETWORK_PUBLIC_SERVICES_ENROLLMENT_TRUSTED_ISSUER_KEY_B64={}",
+            STANDARD.encode(trusted_enrollment_signer.as_bytes())
+        )));
         assert!(generated_script
             .contains("HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS=45"));
         assert!(generated_script
