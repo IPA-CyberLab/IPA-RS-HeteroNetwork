@@ -11,10 +11,10 @@ public sealed class TunnelProfileTests
         Assert.Equal(
             $".{HeteroNetworkConstants.OverlayDnsZone}",
             HeteroNetworkConstants.OverlayDnsNamespace);
-        Assert.True(
-            HeteroNetworkConstants.OverlayDnsName.EndsWith(
-                HeteroNetworkConstants.OverlayDnsNamespace,
-                StringComparison.Ordinal));
+        Assert.EndsWith(
+            HeteroNetworkConstants.OverlayDnsNamespace,
+            HeteroNetworkConstants.OverlayDnsName,
+            StringComparison.Ordinal);
     }
 
     [Fact]
