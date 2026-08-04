@@ -151,7 +151,7 @@ Invoke-DotNet @(
 
 if (-not $NoPublish) {
     $output = Join-Path $clientRoot "artifacts\win-x64"
-    $appProject = Join-Path $clientRoot "src\HeteroNetwork.App\HeteroNetwork.App.csproj"
+    $appProject = Join-Path $clientRoot "src\HeteroNetworkApp\HeteroNetwork.App.csproj"
     Invoke-DotNet @(
         "restore",
         $appProject,

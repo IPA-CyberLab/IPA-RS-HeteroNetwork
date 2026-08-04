@@ -37,7 +37,7 @@ For a quick development build:
 
 ```powershell
 .\bootstrap-wireguard.ps1
-dotnet run --project .\src\HeteroNetwork.App\HeteroNetwork.App.csproj
+dotnet run --project .\src\HeteroNetworkApp\HeteroNetwork.App.csproj
 ```
 
 The bootstrap pins `wireguard-windows` to commit
