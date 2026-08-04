@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/heteronetwork
-  tag: c144688
+  tag: 7b49957
   pullPolicy: Never
 
 agent:
