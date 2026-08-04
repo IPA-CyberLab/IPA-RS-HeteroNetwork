@@ -137,7 +137,7 @@ function LoginPage({ config, error, onLogin, onOperatorToken, onBootstrap, busy 
             </SpaceBetween>
           </Container>
           <StatusIndicator type="info">
-            セッションはコントロールプレーンで保護されています
+            セッションはコントロールプレーンで保護されます
           </StatusIndicator>
         </SpaceBetween>
       </div>
