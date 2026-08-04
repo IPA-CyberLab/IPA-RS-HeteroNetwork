@@ -12018,12 +12018,11 @@ exit 47
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let body = String::from_utf8(body.to_vec())?;
-        assert!(body.contains("function nodeTableHeader()"));
-        assert!(body.contains("function renderNodeServiceStatus("));
-        assert!(!body.contains("function renderServices()"));
+        assert!(body.contains("Cloudscape"));
+        assert!(body.contains("AppLayout"));
         assert!(body.contains("service_directory"));
-        assert!(body.contains("function renderEnrollment()"));
-        assert!(body.contains("heteronetwork_locale"));
+        assert!(body.contains("client-enrollment"));
+        assert!(!body.contains("function renderServices()"));
 
         let response = app
             .clone()

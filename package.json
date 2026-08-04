@@ -4,14 +4,24 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:webui-vendor": "node webui/build-mermaid.mjs",
+    "build:webui": "node webui/build-app.mjs && node webui/build-mermaid.mjs",
+    "build:webui-vendor": "npm run build:webui",
     "test": "npm run test:webui && npm run test:webconsole",
-    "test:webui": "node --test webui/app-mermaid.test.mjs webui/app-auth.test.mjs",
-    "test:webconsole": "node --test webui/webconsole-route.test.mjs"
+    "test:webui": "node --test webui/src/api.test.mjs webui/src/utils.test.mjs",
+    "test:webconsole": "node --test webui/webconsole-route.test.mjs",
+    "test:webui:e2e": "playwright test --config webui/e2e/playwright.config.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "esbuild": "0.28.1",
     "jsdom": "30.0.0",
     "mermaid": "11.16.0"
+  },
+  "dependencies": {
+    "@cloudscape-design/collection-hooks": "^1.0.105",
+    "@cloudscape-design/components": "^3.0.1340",
+    "@cloudscape-design/global-styles": "^1.0.65",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   }
 }
