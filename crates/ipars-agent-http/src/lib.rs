@@ -2253,7 +2253,7 @@ fn apply_local_ui_security_headers(
             .map(|origin| format!("'self' {origin}"))
             .unwrap_or_else(|| "'self'".to_string());
         let policy = format!(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src {connect_src}; font-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src {connect_src}; font-src 'self' data:; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         );
         if let Ok(value) = HeaderValue::from_str(&policy) {
             headers.insert(HeaderName::from_static("content-security-policy"), value);
@@ -5204,7 +5204,9 @@ mod tests {
             .get("content-security-policy")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| {
-                value.contains("script-src 'self'") && !value.contains("'unsafe-eval'")
+                value.contains("script-src 'self'")
+                    && value.contains("font-src 'self' data:")
+                    && !value.contains("'unsafe-eval'")
             }));
         let index = String::from_utf8(to_bytes(index.into_body(), usize::MAX).await?.to_vec())?;
         let Some(mermaid_script) = index.find("/ui/vendor/mermaid.min.js") else {
