@@ -256,6 +256,7 @@ const MAX_RUNTIME_COMMAND_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_PROGRAM_TOKEN_BYTES: usize = 4096;
 const MAX_DAEMON_IDENTIFIER_BYTES: usize = 255;
 const NODE_ENROLLMENT_ISSUER_CREDENTIAL_ID: &str = "node-enrollment-issuer.key";
+const NODE_ENROLLMENT_RELAY_ADMISSION_CREDENTIAL_ID: &str = "node-enrollment-relay-admission.token";
 const DATABASE_AUTOPILOT_TOKEN_CREDENTIAL_ID: &str = "database-autopilot.token";
 const KEYCLOAK_AUTOPILOT_TOKEN_CREDENTIAL_ID: &str = "keycloak-autopilot.token";
 const DATABASE_URL_CREDENTIAL_ID: &str = "database-url";
@@ -5213,9 +5214,12 @@ fn control_plane_node_enrollment_config(
         .node_enrollment_relay_admission_bearer_token_path
         .as_deref()
         .context("node enrollment relay admission bearer token path is required")?;
-    let relay_admission_bearer_token = read_relay_admission_bearer_token_file(
+    let relay_admission_bearer_token = read_node_enrollment_relay_admission_bearer_token_file(
         relay_admission_bearer_token_path,
-        "node enrollment relay admission",
+        std::env::var_os("CREDENTIALS_DIRECTORY")
+            .filter(|directory| !directory.is_empty())
+            .as_deref()
+            .map(Path::new),
     )?;
     let public_services = NodePublicServicesConfig {
         vpn_pool: args.vpn_pool.to_string(),
@@ -16529,7 +16533,47 @@ fn agent_relay_admission_bearer_token(args: &AgentArgs) -> anyhow::Result<Option
 }
 
 fn read_relay_admission_bearer_token_file(path: &Path, label: &str) -> anyhow::Result<String> {
-    let token = read_bounded_bearer_token_file(path, label)?;
+    read_relay_admission_bearer_token_file_with_policy(
+        path,
+        label,
+        SecretFilePermissionPolicy::OwnerOnly,
+    )
+}
+
+fn read_node_enrollment_relay_admission_bearer_token_file(
+    path: &Path,
+    credential_directory: Option<&Path>,
+) -> anyhow::Result<String> {
+    let permission_policy =
+        node_enrollment_relay_admission_permission_policy(path, credential_directory);
+    read_relay_admission_bearer_token_file_with_policy(
+        path,
+        "node enrollment relay admission",
+        permission_policy,
+    )
+}
+
+fn node_enrollment_relay_admission_permission_policy(
+    path: &Path,
+    credential_directory: Option<&Path>,
+) -> SecretFilePermissionPolicy {
+    if credential_directory
+        .map(|directory| directory.join(NODE_ENROLLMENT_RELAY_ADMISSION_CREDENTIAL_ID))
+        .as_deref()
+        == Some(path)
+    {
+        SecretFilePermissionPolicy::SystemdCredential
+    } else {
+        SecretFilePermissionPolicy::OwnerOnly
+    }
+}
+
+fn read_relay_admission_bearer_token_file_with_policy(
+    path: &Path,
+    label: &str,
+    permission_policy: SecretFilePermissionPolicy,
+) -> anyhow::Result<String> {
+    let token = read_bounded_secret_file(path, label, permission_policy)?;
     validate_relay_admission_bearer_token(
         &token,
         &format!("{label} bearer token file {}", path.display()),
@@ -32534,6 +32578,32 @@ exec sleep 60
         assert!(!systemd_credential_permissions_are_secure(0o440, 0, 1000));
         assert!(!systemd_credential_permissions_are_secure(0o640, 0, 0));
         assert!(!systemd_credential_permissions_are_secure(0o444, 0, 0));
+    }
+
+    #[test]
+    fn node_enrollment_only_accepts_the_named_systemd_relay_credential() {
+        let credential_directory = Path::new("/run/credentials/control-plane.service");
+        assert_eq!(
+            node_enrollment_relay_admission_permission_policy(
+                &credential_directory.join(NODE_ENROLLMENT_RELAY_ADMISSION_CREDENTIAL_ID),
+                Some(credential_directory),
+            ),
+            SecretFilePermissionPolicy::SystemdCredential
+        );
+        assert_eq!(
+            node_enrollment_relay_admission_permission_policy(
+                &credential_directory.join("other.token"),
+                Some(credential_directory),
+            ),
+            SecretFilePermissionPolicy::OwnerOnly
+        );
+        assert_eq!(
+            node_enrollment_relay_admission_permission_policy(
+                Path::new("/etc/heteronetwork/relay.token"),
+                Some(credential_directory),
+            ),
+            SecretFilePermissionPolicy::OwnerOnly
+        );
     }
 
     #[test]

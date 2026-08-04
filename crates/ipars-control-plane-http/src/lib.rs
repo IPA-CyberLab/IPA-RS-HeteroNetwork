@@ -9197,6 +9197,9 @@ mod tests {
         assert!(generated_script.contains(
             "ReadWritePaths=/etc/heteronetwork/public-services /etc/systemd/system/heteronetwork-agent.service.d /etc/systemd/system/heteronetwork-control-plane.service.d"
         ));
+        assert!(generated_script.contains(
+            "ConfigurationDirectory=systemd/system/heteronetwork-control-plane.service.d"
+        ));
         assert!(generated_script.contains("u heteronetwork-services -"));
         assert!(generated_script.contains("User=heteronetwork-services"));
         assert!(generated_script
