@@ -46,6 +46,7 @@ helm upgrade --install "${ARGOCD_RELEASE}" argo/argo-cd \
   --history-max 10
 
 kubectl apply --server-side --field-manager=heteronetwork-bootstrap \
+  -f "${ROOT_DIR}/deploy/gitops/argocd-overlay-service.yaml" \
   -f "${ROOT_DIR}/deploy/gitops/project.yaml" \
   -f "${ROOT_DIR}/deploy/gitops/applications"
 

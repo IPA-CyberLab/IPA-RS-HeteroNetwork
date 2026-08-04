@@ -19,9 +19,11 @@ The script performs these idempotent reconciliations:
 4. applies self-healing Argo CD Applications for HeteroCloud and Flow.
 
 The Argo CD chart is pinned by `ARGOCD_CHART_VERSION` (default `10.2.2`). Its
-three Web replicas listen only on the control-plane VPN addresses. Initial
-administrator credentials remain in the standard `argocd-initial-admin-secret`.
-The console URL is `http://argocd.heteronetwork.internal:8088`.
+three Web replicas run on the Kubernetes pod network. The separately managed
+`argocd-server-overlay` Service exposes them only through the three
+control-plane VPN addresses. Initial administrator credentials remain in the
+standard `argocd-initial-admin-secret`. The console URL is
+`http://argocd.heteronetwork.internal:8088`.
 
 Internal DNS records are declared in
 `deploy/environments/heteronet/values.yaml`. Every HeteroNetwork agent reloads

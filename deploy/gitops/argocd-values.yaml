@@ -77,15 +77,8 @@ controller:
 
 server:
   replicas: 3
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  extraArgs:
-    - --address=$(ARGOCD_NODE_IP)
-  env:
-    - name: ARGOCD_NODE_IP
-      valueFrom:
-        fieldRef:
-          fieldPath: status.hostIP
+  hostNetwork: false
+  dnsPolicy: ClusterFirst
   containerPorts:
     server: 8088
     metrics: 8083
