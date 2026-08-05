@@ -164,6 +164,10 @@ pub struct AgentNodeState {
     /// `None` records that signed seeds must not be reintroduced into the runtime directory.
     #[serde(default)]
     pub seed_bootstrap_endpoints: Option<Vec<BootstrapEndpoint>>,
+    /// Trusted control-plane gateways retained across restarts so the Agent can fetch its first
+    /// peer map before private overlay control-plane endpoints are reachable.
+    #[serde(default)]
+    pub control_plane_seed_urls: Vec<String>,
     #[serde(default)]
     pub web_ui_seed_urls: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -184,6 +188,7 @@ impl AgentNodeState {
             registered_node: None,
             bootstrap_endpoints: Vec::new(),
             seed_bootstrap_endpoints: Some(Vec::new()),
+            control_plane_seed_urls: Vec::new(),
             web_ui_seed_urls: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -250,6 +255,7 @@ impl AgentNodeState {
                 ))
             })?;
         }
+        validate_control_plane_seed_urls(&self.control_plane_seed_urls)?;
         validate_web_ui_seed_urls(&self.web_ui_seed_urls)?;
         if let Some(node) = &self.registered_node {
             if node.node_id != self.node_id {
@@ -1685,6 +1691,23 @@ fn validate_web_ui_seed_urls(urls: &[String]) -> Result<(), AgentError> {
     validate_bootstrap_endpoint_set(&endpoints, "web UI seed URL set")
 }
 
+fn validate_control_plane_seed_urls(urls: &[String]) -> Result<(), AgentError> {
+    if urls.len() > MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND {
+        return Err(AgentError::InvalidState(format!(
+            "control-plane seed URL count exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND}"
+        )));
+    }
+    let endpoints = urls
+        .iter()
+        .cloned()
+        .map(|url| BootstrapEndpoint {
+            kind: BootstrapEndpointKind::ControlPlane,
+            url,
+        })
+        .collect::<Vec<_>>();
+    validate_bootstrap_endpoint_set(&endpoints, "control-plane seed URL set")
+}
+
 /// Selects signed seeds only until a non-empty authoritative directory is available.
 pub fn merge_bootstrap_endpoint_sets(
     active: &[BootstrapEndpoint],
@@ -1954,6 +1977,41 @@ impl AgentRuntime {
         }
         state.bootstrap_endpoints = seeds.to_vec();
         state.seed_bootstrap_endpoints = Some(seeds.to_vec());
+        state.updated_at = updated_at;
+        Ok(Some(state.clone()))
+    }
+
+    pub fn replace_control_plane_seed_urls(
+        &self,
+        urls: &[String],
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AgentNodeState>, AgentError> {
+        if urls.len() > MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND {
+            return Err(AgentError::InvalidState(format!(
+                "control-plane seed URL count exceeds maximum {MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND}"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        let mut canonical_urls = Vec::new();
+        for url in urls {
+            let canonical = canonical_bootstrap_endpoint_url(url).ok_or_else(|| {
+                AgentError::InvalidState(
+                    "control-plane seed URL is not an absolute URL".to_string(),
+                )
+            })?;
+            if seen.insert(canonical.clone()) {
+                canonical_urls.push(canonical);
+            }
+        }
+        validate_control_plane_seed_urls(&canonical_urls)?;
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.control_plane_seed_urls == canonical_urls {
+            return Ok(None);
+        }
+        state.control_plane_seed_urls = canonical_urls;
         state.updated_at = updated_at;
         Ok(Some(state.clone()))
     }
@@ -16314,6 +16372,53 @@ mod tests {
             .merge_active_bootstrap_endpoints(&[], Utc::now())?
             .is_none());
         assert_eq!(runtime.state().bootstrap_endpoints, replacement);
+        Ok(())
+    }
+
+    #[test]
+    fn control_plane_seeds_survive_active_directory_replacement() -> Result<(), AgentError> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let seeds = vec![
+            "https://gateway.example/".to_string(),
+            "https://gateway.example".to_string(),
+        ];
+        let seeded = runtime
+            .replace_control_plane_seed_urls(&seeds, Utc::now())?
+            .ok_or_else(|| {
+                AgentError::InvalidState("control-plane seeds were not retained".to_string())
+            })?;
+        assert_eq!(
+            seeded.control_plane_seed_urls,
+            vec!["https://gateway.example".to_string()]
+        );
+
+        let active = vec![
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::ControlPlane,
+                url: "http://10.250.0.4:19088".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://signal.example".to_string(),
+            },
+            BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Stun,
+                url: "udp://stun.example:3478".to_string(),
+            },
+        ];
+        let active_state = runtime
+            .merge_active_bootstrap_endpoints(&active, Utc::now())?
+            .ok_or_else(|| {
+                AgentError::InvalidState("active directory was not applied".to_string())
+            })?;
+        assert_eq!(
+            active_state.control_plane_seed_urls,
+            vec!["https://gateway.example".to_string()]
+        );
+        active_state.validate()?;
         Ok(())
     }
 

@@ -189,6 +189,9 @@ const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AGENT_RELAY_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_SHARED_RELAY_ADMISSION_ATTEMPTS: usize = 3;
 const MAX_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE_BYTES: u64 = 256 * 1024;
+const PUBLIC_WEB_GATEWAY_RECONCILE_PROBE_PATH: &str = "/.well-known/heteronetwork-gateway-health";
+const PUBLIC_WEB_GATEWAY_RECONCILE_HEADER: &str = "x-heteronetwork-gateway";
+const PUBLIC_WEB_GATEWAY_RECONCILE_HEADER_VALUE: &str = "ready";
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_LINE_BYTES: usize = 4096;
 const DEFAULT_PACKET_FLOW_PROCFS_MAX_FLOWS: usize = 131_072;
@@ -954,6 +957,11 @@ struct AgentArgs {
     public_web_gateway_admin_socket: PathBuf,
     #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_EXTRA_CADDYFILE")]
     public_web_gateway_extra_caddyfile: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM"
+    )]
+    public_web_gateway_control_plane_upstream: Option<SocketAddr>,
     #[arg(long, env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM")]
     public_web_gateway_signal_upstream: Option<SocketAddr>,
     #[arg(
@@ -2139,6 +2147,10 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         }
         for (upstream, option) in [
             (
+                args.public_web_gateway_control_plane_upstream,
+                "--public-web-gateway-control-plane-upstream",
+            ),
+            (
                 args.public_web_gateway_signal_upstream,
                 "--public-web-gateway-signal-upstream",
             ),
@@ -2178,7 +2190,8 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         );
     } else {
         anyhow::ensure!(
-            args.public_web_gateway_signal_upstream.is_none()
+            args.public_web_gateway_control_plane_upstream.is_none()
+                && args.public_web_gateway_signal_upstream.is_none()
                 && args.public_web_gateway_relay_admission_upstream.is_none()
                 && args.public_web_gateway_extra_caddyfile.is_none(),
             "public Web gateway service proxy options require --public-web-gateway-enabled=true"
@@ -8967,6 +8980,22 @@ async fn run_agent(
     if let Some(token) = join_token.as_ref() {
         persist_agent_seed_directory(runtime.as_ref(), &store, &token.claims.bootstrap_endpoints)?;
     }
+    let control_plane_seeds = if let Some(control_plane_url) = args.control_plane_url.as_ref() {
+        vec![control_plane_url.clone()]
+    } else if let Some(token) = join_token.as_ref() {
+        token
+            .claims
+            .bootstrap_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+            .map(|endpoint| endpoint.url.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !control_plane_seeds.is_empty() {
+        persist_agent_control_plane_seed_urls(runtime.as_ref(), &store, &control_plane_seeds)?;
+    }
     let stun_servers =
         runtime_stun_servers(runtime.as_ref(), &AgentStunDiscoveryConfig::from(&args)).await?;
     if !stun_servers.is_empty() {
@@ -9069,6 +9098,7 @@ async fn run_agent(
         args.control_plane_url.as_deref(),
         registered_control_plane_base.as_deref(),
         &runtime.state().bootstrap_endpoints,
+        &runtime.state().control_plane_seed_urls,
     )?;
     let signal_bases = signal_base_urls_with_persisted(
         join_token.as_ref(),
@@ -9092,6 +9122,7 @@ async fn run_agent(
                 PublicWebGatewayConfig {
                     admin_socket: args.public_web_gateway_admin_socket.clone(),
                     extra_caddyfile: args.public_web_gateway_extra_caddyfile.clone(),
+                    control_plane_upstream: args.public_web_gateway_control_plane_upstream,
                     signal_upstream: args.public_web_gateway_signal_upstream,
                     relay_admission_upstream: args.public_web_gateway_relay_admission_upstream,
                     reconcile_interval: Duration::from_secs(
@@ -13889,6 +13920,7 @@ struct AgentApiErrorResponse {
 struct PublicWebGatewayConfig {
     admin_socket: PathBuf,
     extra_caddyfile: Option<PathBuf>,
+    control_plane_upstream: Option<SocketAddr>,
     signal_upstream: Option<SocketAddr>,
     relay_admission_upstream: Option<SocketAddr>,
     reconcile_interval: Duration,
@@ -14047,8 +14079,18 @@ fn public_web_gateway_caddyfile(
         );
         let _ = writeln!(
             caddyfile,
+            "\t@reconcile_probe path {PUBLIC_WEB_GATEWAY_RECONCILE_PROBE_PATH}\n\thandle @reconcile_probe {{\n\t\theader X-HeteroNetwork-Gateway \"{PUBLIC_WEB_GATEWAY_RECONCILE_HEADER_VALUE}\"\n\t\trespond 204\n\t}}"
+        );
+        let _ = writeln!(
+            caddyfile,
             "\t@health path /healthz\n\thandle @health {{\n\t\trespond 204\n\t}}"
         );
+        if let Some(control_plane_upstream) = config.control_plane_upstream {
+            let _ = writeln!(
+                caddyfile,
+                "\t@control_plane_bootstrap path /v1/join /v1/heartbeat /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
+            );
+        }
         if let Some(signal_upstream) = config.signal_upstream {
             let _ = writeln!(
                 caddyfile,
@@ -14098,19 +14140,39 @@ async fn load_public_web_gateway_caddyfile(
     )
 }
 
-async fn probe_public_web_gateway(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
-    let health_url = format!("{}healthz", url.trim_end_matches('/').to_string() + "/");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicWebGatewayProbeOutcome {
+    Ready,
+    ConfigurationDrift(reqwest::StatusCode),
+}
+
+async fn probe_public_web_gateway(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<PublicWebGatewayProbeOutcome> {
+    let health_url = format!(
+        "{}{}",
+        url.trim_end_matches('/'),
+        PUBLIC_WEB_GATEWAY_RECONCILE_PROBE_PATH
+    );
     let response = client
         .get(health_url)
         .send()
         .await
         .context("public connectivity gateway probe failed")?;
-    anyhow::ensure!(
-        response.status() == reqwest::StatusCode::NO_CONTENT,
-        "public connectivity gateway health returned HTTP {}",
-        response.status()
-    );
-    Ok(())
+    let status = response.status();
+    let marker_matches = response
+        .headers()
+        .get(PUBLIC_WEB_GATEWAY_RECONCILE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(PUBLIC_WEB_GATEWAY_RECONCILE_HEADER_VALUE);
+    Ok(
+        if status == reqwest::StatusCode::NO_CONTENT && marker_matches {
+            PublicWebGatewayProbeOutcome::Ready
+        } else {
+            PublicWebGatewayProbeOutcome::ConfigurationDrift(status)
+        },
+    )
 }
 
 async fn set_public_web_gateway_status(
@@ -14258,13 +14320,32 @@ fn start_public_web_gateway(
             if configured == Some((desired_ip, desired_extra_digest)) {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
                     match probe_public_web_gateway(&probe_client, &url).await {
-                        Ok(()) => {
+                        Ok(PublicWebGatewayProbeOutcome::Ready) => {
                             set_public_web_gateway_status(
                                 &status,
                                 PublicWebGatewayPhase::Ready,
                                 Some(public_ip),
                                 Some(url),
                                 None,
+                            )
+                            .await;
+                        }
+                        Ok(PublicWebGatewayProbeOutcome::ConfigurationDrift(status_code)) => {
+                            configured = None;
+                            let error = format!(
+                                "public connectivity gateway reconciliation probe returned HTTP {status_code} without the expected marker"
+                            );
+                            tracing::warn!(
+                                %error,
+                                public_ip = %public_ip,
+                                "public connectivity gateway configuration drift detected"
+                            );
+                            set_public_web_gateway_status(
+                                &status,
+                                PublicWebGatewayPhase::Error,
+                                Some(public_ip),
+                                Some(url),
+                                Some(error),
                             )
                             .await;
                         }
@@ -20868,7 +20949,7 @@ fn agent_control_plane_base_urls(
     override_url: Option<&str>,
     registered_url: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    agent_control_plane_base_urls_with_persisted(token, override_url, registered_url, &[])
+    agent_control_plane_base_urls_with_persisted(token, override_url, registered_url, &[], &[])
 }
 
 fn agent_control_plane_base_urls_with_persisted(
@@ -20876,6 +20957,7 @@ fn agent_control_plane_base_urls_with_persisted(
     override_url: Option<&str>,
     registered_url: Option<&str>,
     persisted_bootstrap_endpoints: &[BootstrapEndpoint],
+    persisted_control_plane_seed_urls: &[String],
 ) -> anyhow::Result<Vec<String>> {
     if let Some(override_url) = override_url {
         return normalize_http_base_urls([override_url.to_string()], "control-plane URL");
@@ -20896,6 +20978,7 @@ fn agent_control_plane_base_urls_with_persisted(
                 .map(|endpoint| endpoint.url.clone()),
         );
     }
+    base_urls.extend(persisted_control_plane_seed_urls.iter().cloned());
     normalize_http_base_urls(base_urls, "control-plane endpoint")
 }
 
@@ -20999,6 +21082,23 @@ fn persist_agent_seed_directory(
     Ok(true)
 }
 
+fn persist_agent_control_plane_seed_urls(
+    runtime: &AgentRuntime,
+    store: &FileAgentStateStore,
+    urls: &[String],
+) -> anyhow::Result<bool> {
+    let Some(state) = runtime
+        .replace_control_plane_seed_urls(urls, chrono::Utc::now())
+        .context("failed to retain trusted control-plane seed URLs")?
+    else {
+        return Ok(false);
+    };
+    store
+        .save(&state)
+        .context("failed to persist trusted control-plane seed URLs")?;
+    Ok(true)
+}
+
 fn runtime_control_plane_urls(
     runtime: &AgentRuntime,
     fallback: &[String],
@@ -21024,6 +21124,10 @@ fn runtime_control_plane_urls(
         );
         urls
     };
+    let base_urls = base_urls
+        .into_iter()
+        .chain(state.control_plane_seed_urls)
+        .collect::<Vec<_>>();
     normalize_http_base_urls(base_urls, "runtime control-plane endpoint")
 }
 
@@ -21660,6 +21764,7 @@ mod tests {
         let mut config = PublicWebGatewayConfig {
             admin_socket: socket.to_path_buf(),
             extra_caddyfile: None,
+            control_plane_upstream: None,
             signal_upstream: None,
             relay_admission_upstream: None,
             reconcile_interval: Duration::from_secs(5),
@@ -21676,6 +21781,7 @@ mod tests {
         assert!(!standby.contains("reverse_proxy"));
         assert!(!standby.contains("cloud.example"));
 
+        config.control_plane_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 19088)));
         config.signal_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18443)));
         config.relay_admission_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18447)));
         let public = public_web_gateway_caddyfile(
@@ -21686,8 +21792,19 @@ mod tests {
         assert!(public.contains("https://203.0.113.10"));
         assert!(public.contains("default_bind 203.0.113.10"));
         assert!(public.contains("profile shortlived"));
+        assert!(public.contains(&format!(
+            "@reconcile_probe path {PUBLIC_WEB_GATEWAY_RECONCILE_PROBE_PATH}"
+        )));
+        assert!(public.contains(&format!(
+            "header X-HeteroNetwork-Gateway \"{PUBLIC_WEB_GATEWAY_RECONCILE_HEADER_VALUE}\""
+        )));
         assert!(public.contains("@health path /healthz"));
         assert!(public.contains("respond 204"));
+        assert!(public.contains("@control_plane_bootstrap path /v1/join /v1/heartbeat"));
+        assert!(public.contains("/v1/neighbors/query"));
+        assert!(public.contains("/v1/overlay-paths/query"));
+        assert!(public.contains("/v1/install/*"));
+        assert!(public.contains("reverse_proxy http://10.0.0.10:19088"));
         assert!(public.contains("@signal path /v1/nodes/* /v1/paths/negotiate /v1/hole-punch"));
         assert!(public.contains("reverse_proxy http://10.0.0.10:18443"));
         assert!(public.contains("@relay_admission path /v1/sessions"));
@@ -21700,8 +21817,6 @@ mod tests {
             "/resources/",
             "/v1/admin/",
             "/v1/clients/",
-            "/v1/install/",
-            "/v1/heartbeat",
             "/metrics",
             "/v1/status",
         ] {
@@ -41518,7 +41633,7 @@ exec sleep 60
         ];
 
         assert_eq!(
-            agent_control_plane_base_urls_with_persisted(None, None, None, &persisted)?,
+            agent_control_plane_base_urls_with_persisted(None, None, None, &persisted, &[])?,
             vec!["https://203.0.113.10:8443".to_string()]
         );
         assert_eq!(
@@ -41527,6 +41642,7 @@ exec sleep 60
                 None,
                 Some("https://203.0.113.12:8443/"),
                 &persisted,
+                &[],
             )?,
             vec!["https://203.0.113.10:8443".to_string()]
         );
@@ -41535,8 +41651,27 @@ exec sleep 60
             kind: BootstrapEndpointKind::Signal,
         }];
         assert_eq!(
-            agent_control_plane_base_urls_with_persisted(Some(&token), None, None, &signal_only,)?,
+            agent_control_plane_base_urls_with_persisted(
+                Some(&token),
+                None,
+                None,
+                &signal_only,
+                &[],
+            )?,
             Vec::<String>::new()
+        );
+        assert_eq!(
+            agent_control_plane_base_urls_with_persisted(
+                None,
+                None,
+                None,
+                &persisted,
+                &["https://gateway.example/".to_string()],
+            )?,
+            vec![
+                "https://203.0.113.10:8443".to_string(),
+                "https://gateway.example".to_string(),
+            ]
         );
         Ok(())
     }
@@ -41591,12 +41726,17 @@ exec sleep 60
             },
         ];
         runtime.merge_active_bootstrap_endpoints(&active, Utc::now())?;
+        runtime.replace_control_plane_seed_urls(
+            &["https://enrollment-gateway.example/".to_string()],
+            Utc::now(),
+        )?;
 
         assert_eq!(
             runtime_control_plane_urls(&runtime, &control_plane_fallback)?,
             vec![
                 "https://active.example:8443".to_string(),
                 "https://console.active.example".to_string(),
+                "https://enrollment-gateway.example".to_string(),
             ]
         );
         assert_eq!(

@@ -418,13 +418,12 @@ grep -Fq \
 grep -Fqx \
   "HETERONETWORK_TRUSTED_ISSUER_KEYS=\"issuer-next,root-next,$trusted_public_key\"" \
   "$services_env" || fail "trusted root rotation key was not preserved"
+grep -q 'CONTROL_PLANE_UPSTREAM=10.250.0.4:19088' "$agent_drop_in" ||
+  fail "restricted Control Plane bootstrap gateway route is missing"
 grep -q 'SIGNAL_UPSTREAM=127.0.0.1:19443' "$agent_drop_in" ||
   fail "Signal gateway route is missing"
 grep -q 'RELAY_ADMISSION_UPSTREAM=10.250.0.4:18447' "$agent_drop_in" ||
   fail "Relay admission gateway route is missing"
-if grep -q 'CONTROL_PLANE_HOST\|CONTROL_PLANE_UPSTREAM' "$agent_drop_in"; then
-  fail "automatic services replaced the signer-enabled Control Plane route"
-fi
 if grep -q 'NODE_ENROLLMENT_ISSUER_PRIVATE_KEY' "$services_env"; then
   fail "automatic Control Plane received a private enrollment signer"
 fi

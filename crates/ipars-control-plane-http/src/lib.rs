@@ -4448,12 +4448,23 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 withdraw_relay() {
+  relay_withdrawal_required=0
   relay_advertisement_removed=1
   if [ -e "$agent_drop_in" ] || [ -L "$agent_drop_in" ]; then
+    relay_withdrawal_required=1
     if ! rm -f "$agent_drop_in"; then
       echo "Unable to remove the Relay advertisement from $agent_service" >&2
       relay_advertisement_removed=0
     fi
+  fi
+  if [ -e "$relay_env" ] || [ -L "$relay_env" ]; then
+    relay_withdrawal_required=1
+  fi
+  if systemctl is-active --quiet "$relay_service"; then
+    relay_withdrawal_required=1
+  fi
+  if [ "$relay_withdrawal_required" -eq 0 ]; then
+    return 0
   fi
   if ! refresh_agent_after_relay_config_change \
     "$relay_advertisement_removed" \
@@ -9314,6 +9325,9 @@ mod tests {
             .contains("Environment=\"HETERONETWORK_AGENT_RELAY_STATUS_URL=$relay_http_url\""));
         assert!(generated_script.contains("cmp -s \"$relay_env_tmp\" \"$relay_env\""));
         assert!(generated_script.contains("cmp -s \"$agent_drop_in_tmp\" \"$agent_drop_in\""));
+        assert!(generated_script.contains("relay_withdrawal_required=0"));
+        assert!(generated_script
+            .contains("if [ \"$relay_withdrawal_required\" -eq 0 ]; then\n    return 0"));
         assert!(generated_script.contains("begin_runtime_relay_transaction"));
         assert!(generated_script.contains("rollback_runtime_relay_transaction"));
         assert!(generated_script.contains("commit_runtime_relay_transaction"));
@@ -10150,6 +10164,63 @@ fi
             }
             std::fs::remove_dir_all(withdrawal_dir)?;
         }
+
+        let no_op_withdrawal_dir = std::env::temp_dir().join(format!(
+            "heteronetwork-relay-no-op-withdrawal-{}",
+            random_oidc_value(12)
+        ));
+        let no_op_systemctl_log = no_op_withdrawal_dir.join("systemctl.log");
+        let no_op_agent_drop_in = no_op_withdrawal_dir.join("agent.conf");
+        let no_op_relay_env = no_op_withdrawal_dir.join("relay.env");
+        std::fs::create_dir(&no_op_withdrawal_dir)?;
+        let no_op_withdrawal_harness = format!(
+            r#"set -eu
+relay_service=heteronetwork-relay.service
+agent_service=heteronetwork-agent.service
+agent_drop_in=$1
+relay_env=$2
+systemctl_log=$3
+runtime_transaction_active=0
+status_file=
+relay_env_tmp=
+agent_drop_in_tmp=
+runtime_transaction_dir=
+
+cleanup_temporary_files() {{
+  return 0
+}}
+cleanup_random_temporary_files() {{
+  return 0
+}}
+systemctl() {{
+  printf '%s\n' "$*" >>"$systemctl_log"
+  if [ "$1" = is-active ]; then
+    return 1
+  fi
+  return 0
+}}
+{relay_withdrawal_functions}
+withdraw_relay
+"#
+        );
+        let no_op_withdrawal = std::process::Command::new("sh")
+            .args(["-c", &no_op_withdrawal_harness, "sh"])
+            .arg(&no_op_agent_drop_in)
+            .arg(&no_op_relay_env)
+            .arg(&no_op_systemctl_log)
+            .output()?;
+        assert!(
+            no_op_withdrawal.status.success(),
+            "already-withdrawn Relay reconciliation failed: {}",
+            String::from_utf8_lossy(&no_op_withdrawal.stderr)
+        );
+        let no_op_systemctl_calls = std::fs::read_to_string(&no_op_systemctl_log)?;
+        assert!(no_op_systemctl_calls.contains("is-active --quiet heteronetwork-relay.service"));
+        assert!(!no_op_systemctl_calls.contains("restart heteronetwork-agent.service"));
+        assert!(!no_op_systemctl_calls.contains("stop heteronetwork-agent.service"));
+        assert!(!no_op_systemctl_calls.contains("stop heteronetwork-relay.service"));
+        assert!(!no_op_systemctl_calls.contains("daemon-reload"));
+        std::fs::remove_dir_all(no_op_withdrawal_dir)?;
 
         for rollback_can_quiesce in [true, false] {
             let transaction_dir = std::env::temp_dir().join(format!(
