@@ -20,6 +20,7 @@ import {
 import {
   copyText,
   formatDateTime,
+  nodeDisplayName,
   pretty,
   shortId,
   topologyMermaid,
@@ -74,6 +75,9 @@ export function TopologyPage({
   const groups = topology.groups || [];
   const edges = topology.edges || [];
   const nodes = topology.nodes || [];
+  const nodesById = new Map(nodes.map((node) => [node.node_id, node]));
+  const nodeName = (nodeId) =>
+    nodeDisplayName(nodesById.get(nodeId) || { node_id: nodeId });
   const save = async () => {
     const fanoutValue = Number(fanout);
     const shortcutValue = Number(shortcutLimit);
@@ -124,7 +128,7 @@ export function TopologyPage({
       header: "代表",
       cell: (group) =>
         (group.representatives || [])
-          .map((representative) => `${shortId(representative.node_id)} (${representative.role})`)
+          .map((representative) => `${nodeName(representative.node_id)} (${representative.role})`)
           .join(", ") || "-",
     },
   ];
@@ -132,12 +136,12 @@ export function TopologyPage({
     {
       id: "source",
       header: "送信元",
-      cell: (edge) => <Box variant="code">{shortId(edge.source)}</Box>,
+      cell: (edge) => nodeName(edge.source),
     },
     {
       id: "target",
       header: "宛先",
-      cell: (edge) => <Box variant="code">{shortId(edge.target)}</Box>,
+      cell: (edge) => nodeName(edge.target),
     },
     {
       id: "placement",
@@ -285,7 +289,9 @@ export function TopologyPage({
                   [
                     group.group_id,
                     ...(group.node_ids || []),
+                    ...(group.node_ids || []).map((nodeId) => nodeName(nodeId)),
                     ...(group.representatives || []).map((entry) => entry.node_id),
+                    ...(group.representatives || []).map((entry) => nodeName(entry.node_id)),
                   ].join(" ")
                 }
                 emptyTitle="グループがありません"
@@ -304,7 +310,9 @@ export function TopologyPage({
                 searchText={(edge) =>
                   [
                     edge.source,
+                    nodeName(edge.source),
                     edge.target,
+                    nodeName(edge.target),
                     edge.observed_status,
                     ...(edge.placements || []).map((placement) => placement.kind),
                   ].join(" ")

@@ -8743,6 +8743,7 @@ mod tests {
     ) -> NodeRecord {
         NodeRecord {
             node_id,
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(vpn_ip),
             identity_public_key: "identity-public".to_string(),

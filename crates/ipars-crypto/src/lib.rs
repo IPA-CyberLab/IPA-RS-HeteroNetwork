@@ -968,6 +968,7 @@ mod tests {
             relay_capability: None,
             routes: None,
             service_advertisement: Some(NodeServiceAdvertisement {
+                hostname: None,
                 endpoints: vec![BootstrapEndpoint {
                     kind: BootstrapEndpointKind::Stun,
                     url: "udp://203.0.113.10:19444".to_string(),
@@ -1073,6 +1074,7 @@ mod tests {
         let mut request = SignalNodeUpsertRequest {
             node: NodeRecord {
                 node_id: identity.node_id(),
+                hostname: None,
                 cluster_id: ClusterId::from_string("cluster-a"),
                 vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
                 identity_public_key: identity.public_key_b64(),

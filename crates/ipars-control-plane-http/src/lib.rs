@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,12 +33,12 @@ use ipars_types::api::{
     SponsoredClientRegistrationRequest,
 };
 use ipars_types::{
-    bootstrap_endpoints_include_core_services, BootstrapEndpoint, BootstrapEndpointKind, ClusterId,
-    ClusterPolicy, HealthState, JoinTokenClaims, KeyId, NeighborMap, NodeHealth, NodeId,
-    NodeRecord, OverlayPath, OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance,
-    SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy, VpnIp,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+    bootstrap_endpoints_include_core_services, ip_addr_is_globally_routable, BootstrapEndpoint,
+    BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidateKind, HealthState,
+    JoinTokenClaims, KeyId, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath,
+    OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag,
+    TokenLedgerMetrics, TokenPolicy, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -5705,9 +5706,38 @@ where
     let nodes = plane.list_nodes().await?;
     let mut snapshot = Vec::with_capacity(nodes.len());
     for node in nodes {
+        let nat_classification = plane.nat_classification_for(&node.node_id).await?;
+        let mut public_ips = node
+            .endpoint_candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.kind,
+                    EndpointCandidateKind::PublicUdp
+                        | EndpointCandidateKind::Ipv6
+                        | EndpointCandidateKind::StunReflexive
+                ) && ip_addr_is_globally_routable(candidate.addr.ip())
+            })
+            .map(|candidate| candidate.addr.ip())
+            .collect::<BTreeSet<IpAddr>>();
+        if let Some(public_ip) = nat_classification
+            .as_ref()
+            .and_then(|classification| classification.publicly_reachable_ip())
+        {
+            public_ips.insert(public_ip);
+        }
+        if let Some(observed_ip) = nat_classification
+            .as_ref()
+            .and_then(|classification| classification.observed_endpoint)
+            .map(|endpoint| endpoint.ip())
+            .filter(|ip| ip_addr_is_globally_routable(*ip))
+        {
+            public_ips.insert(observed_ip);
+        }
         snapshot.push(ControlPlaneNodeOverview {
             health: plane.health_for_node(&node.node_id).await?,
-            nat_classification: plane.nat_classification_for(&node.node_id).await?,
+            nat_classification,
+            public_ips: public_ips.into_iter().collect(),
             node,
         });
     }
@@ -11437,6 +11467,22 @@ exit 47
             .nodes
             .iter()
             .all(|entry| entry.nat_classification.is_some()));
+        assert_eq!(
+            overview
+                .nodes
+                .iter()
+                .find(|entry| entry.node.node_id == node_id("node-public"))
+                .map(|entry| entry.public_ips.clone()),
+            Some(vec![public_endpoint.ip()])
+        );
+        assert_eq!(
+            overview
+                .nodes
+                .iter()
+                .find(|entry| entry.node.node_id == node_id("node-nat"))
+                .map(|entry| entry.public_ips.clone()),
+            Some(vec![nat_endpoint.ip()])
+        );
         assert!(overview
             .nat_discovery
             .fresh_nat_classification_strategy_counts
@@ -11463,7 +11509,10 @@ exit 47
                 candidates: Vec::new(),
                 relay_capability: None,
                 routes: None,
-                service_advertisement: None,
+                service_advertisement: Some(ipars_types::api::NodeServiceAdvertisement {
+                    hostname: Some("uc-k8sp3".to_string()),
+                    endpoints: Vec::new(),
+                }),
                 path_state: Vec::new(),
                 nat_classification: Some(updated),
                 node_signature: None,
@@ -11507,6 +11556,7 @@ exit 47
                 .map(|classification| classification.observed_endpoint),
             Some(Some(relay_endpoint_a))
         );
+        assert_eq!(relay_node.node.hostname.as_deref(), Some("uc-k8sp3"));
         Ok(())
     }
 

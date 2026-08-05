@@ -940,6 +940,9 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
+        if let Some(hostname) = update.hostname {
+            node.hostname = Some(hostname);
+        }
         if let Some(routes) = update.routes {
             node.routes = routes;
         }
@@ -2444,6 +2447,9 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
+        if let Some(hostname) = update.hostname {
+            node.hostname = Some(hostname);
+        }
         if let Some(routes) = update.routes {
             node.routes = routes;
         }
@@ -3544,6 +3550,7 @@ mod tests {
     fn node(id: &str, ip: Ipv4Addr) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(id),
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(ip)),
             identity_public_key: format!("identity-{id}"),
@@ -3668,6 +3675,7 @@ mod tests {
             expected_identity_public_key: local.identity_public_key.clone(),
             expected_registered_at: local.registered_at,
             accepted_signature_at: Some(accepted_at),
+            hostname: None,
             candidates: vec![candidate],
             nat_classification: None,
             relay_capability: Some(relay),
@@ -4912,8 +4920,10 @@ mod tests {
         let old_at = received_at - chrono::Duration::seconds(120);
         let new_at = old_at + chrono::Duration::seconds(1);
         let mut old = heartbeat_update(&local, &remote, old_at, "old", 10)?;
+        old.hostname = Some("old-host".to_string());
         old.health.last_seen_at = received_at;
         let mut newest = heartbeat_update(&local, &remote, new_at, "new", 11)?;
+        newest.hostname = Some("new-host".to_string());
         newest.health.last_seen_at = received_at + chrono::Duration::milliseconds(1);
 
         store.apply_heartbeat(old.clone()).await?;
@@ -4928,6 +4938,7 @@ mod tests {
             .await?
             .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?;
         assert_eq!(stored_node.endpoint_candidates, newest.candidates);
+        assert_eq!(stored_node.hostname.as_deref(), Some("new-host"));
         assert_eq!(stored_node.relay_capability, newest.relay_capability);
         assert_eq!(
             stored_node.routes,

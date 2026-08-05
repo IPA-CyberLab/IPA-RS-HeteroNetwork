@@ -1489,6 +1489,7 @@ mod tests {
     fn node_record(value: &str) -> NodeRecord {
         NodeRecord {
             node_id: node(value),
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, node_octet(value)))),
             identity_public_key: format!("identity-{value}"),

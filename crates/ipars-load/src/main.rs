@@ -12842,6 +12842,7 @@ fi
     fn node_record_with_routes(label: &str, routes: Vec<Route>) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(label),
+            hostname: None,
             cluster_id: ClusterId::from_string("load-route-count-test"),
             vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))),
             identity_public_key: "identity-public-key".to_string(),

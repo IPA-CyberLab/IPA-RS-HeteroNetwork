@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   connectivity,
+  nodeDisplayName,
   pathState,
   shortId,
   topologyMermaid,
@@ -9,6 +10,8 @@ import {
 
 test("node and path presentation helpers normalize API values", () => {
   assert.equal(shortId("node-abcdefghijklmnopqrstuvwxyz").includes("…"), true);
+  assert.equal(nodeDisplayName({ node_id: "node-a", hostname: "uc-k8sp1" }), "uc-k8sp1");
+  assert.equal(nodeDisplayName({ node_id: "node-a" }), "node-a");
   assert.equal(pathState("DirectNatTraversal"), "direct_nat_traversal");
   assert.deepEqual(connectivity({ connectivity_state: "public" }), {
     state: "healthy",
@@ -46,7 +49,12 @@ test("Mermaid source includes hierarchy, members, and observed links", () => {
       },
     ],
     nodes: [
-      { node_id: "node-a", vpn_ip: "10.250.0.1", leaf_group_id: "leaf" },
+      {
+        node_id: "node-a",
+        hostname: "uc-k8sp1",
+        vpn_ip: "10.250.0.1",
+        leaf_group_id: "leaf",
+      },
       { node_id: "node-b", vpn_ip: "10.250.0.2", leaf_group_id: "leaf" },
     ],
     edges: [
@@ -61,6 +69,7 @@ test("Mermaid source includes hierarchy, members, and observed links", () => {
   assert.match(source, /^flowchart TB/m);
   assert.match(source, /root/);
   assert.match(source, /10\.250\.0\.1/);
+  assert.match(source, /uc-k8sp1/);
   assert.match(source, /Leaf Cycle/);
   assert.match(source, /-->/);
   assert.match(source, /---\|/);

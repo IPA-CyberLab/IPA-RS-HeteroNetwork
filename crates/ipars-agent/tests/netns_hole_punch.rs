@@ -1694,6 +1694,7 @@ fn signal_node_record(
 ) -> NodeRecord {
     NodeRecord {
         node_id: node_id.clone(),
+        hostname: None,
         cluster_id: ClusterId::from_string("netns-signal-plan"),
         vpn_ip: VpnIp(IpAddr::V4(vpn_ip)),
         identity_public_key: format!("identity-{node_id}"),

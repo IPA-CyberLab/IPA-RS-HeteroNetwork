@@ -3,6 +3,12 @@ export function shortId(value) {
   return text.length <= 20 ? text : `${text.slice(0, 9)}…${text.slice(-5)}`;
 }
 
+export function nodeDisplayName(value) {
+  const node = value?.node || value || {};
+  const hostname = String(node.hostname || "").trim();
+  return hostname || shortId(node.node_id);
+}
+
 export function formatDateTime(value) {
   if (!value) return "-";
   const date = new Date(value);
@@ -140,7 +146,7 @@ export function topologyMermaid(topology) {
   for (const node of nodes) {
     const nodeId = mermaidId("node", node.node_id);
     lines.push(
-      `${nodeId}(["${mermaidText(shortId(node.node_id))}<br/>${mermaidText(node.vpn_ip || "-")}"])`,
+      `${nodeId}(["${mermaidText(nodeDisplayName(node))}<br/>${mermaidText(node.vpn_ip || "-")}"])`,
     );
     if (node.leaf_group_id) {
       lines.push(`${mermaidId("group", node.leaf_group_id)} -.-> ${nodeId}`);

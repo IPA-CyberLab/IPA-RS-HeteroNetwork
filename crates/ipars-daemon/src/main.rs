@@ -9,7 +9,7 @@ use std::net::Ipv6Addr;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -108,14 +108,14 @@ use ipars_types::ebpf::{
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, endpoint_addr_is_usable,
-    http_url_is_usable_endpoint, relay_pair_rendezvous_ordering, socket_addr_is_globally_routable,
-    validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
-    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
-    NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics, PathRecord, PathScore,
-    PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
-    TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
-    MAX_PATH_SCORE_REASONS,
+    http_url_is_usable_endpoint, node_hostname_is_valid, relay_pair_rendezvous_ordering,
+    socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, AclRule,
+    BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
+    HealthState, KeyId, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
+    OverlayPath, PathMetrics, PathRecord, PathScore, PathState, RelayCapability, Route,
+    ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
+    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_PATH_SCORE_REASONS,
 };
 use ipnet::IpNet;
 use netlink_sys::{
@@ -14884,6 +14884,7 @@ async fn heartbeat_request(
     let path_state = heartbeat_path_state(runtime, now).await;
     let health = agent_health_from_status(&status, "agent heartbeat");
     let service_advertisement = heartbeat_service_advertisement(
+        agent_hostname(),
         advertised_signal_url,
         advertised_stun_url,
         relay_capability.as_ref(),
@@ -14908,6 +14909,7 @@ async fn heartbeat_request(
 }
 
 fn heartbeat_service_advertisement(
+    hostname: Option<String>,
     advertised_signal_url: Option<&str>,
     advertised_stun_url: Option<&str>,
     relay_capability: Option<&RelayCapability>,
@@ -14938,12 +14940,32 @@ fn heartbeat_service_advertisement(
             url: format!("udp://{public_endpoint}"),
         });
     }
-    if endpoints.is_empty() {
+    if endpoints.is_empty() && hostname.is_none() {
         return Ok(None);
     }
     validate_join_token_bootstrap_endpoints(&endpoints)
         .context("agent service advertisement is invalid")?;
-    Ok(Some(NodeServiceAdvertisement { endpoints }))
+    Ok(Some(NodeServiceAdvertisement {
+        hostname,
+        endpoints,
+    }))
+}
+
+fn agent_hostname() -> Option<String> {
+    static HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            std::env::var("HETERONETWORK_NODE_HOSTNAME")
+                .ok()
+                .or_else(|| std::env::var("HETERONETWORK_KUBERNETES_NODE_NAME").ok())
+                .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+                .and_then(|hostname| {
+                    let hostname = hostname.trim().split('.').next()?.trim();
+                    node_hostname_is_valid(hostname).then(|| hostname.to_string())
+                })
+        })
+        .clone()
 }
 
 async fn heartbeat_path_state(
@@ -22222,6 +22244,7 @@ mod tests {
     fn node_record(node_id: &str) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(node_id),
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: format!("identity-{node_id}"),
@@ -37536,6 +37559,7 @@ exec sleep 60
         fn overlay_node(state: &ipars_agent::AgentNodeState, vpn_ip: Ipv4Addr) -> NodeRecord {
             NodeRecord {
                 node_id: state.node_id.clone(),
+                hostname: None,
                 cluster_id: ClusterId::from_string("cluster-overlay-e2e"),
                 vpn_ip: VpnIp(IpAddr::V4(vpn_ip)),
                 identity_public_key: state.identity_public_key_b64.clone(),
@@ -40257,7 +40281,7 @@ exec sleep 60
             e2e_only: true,
         };
 
-        let advertisement = heartbeat_service_advertisement(None, None, Some(&relay))?
+        let advertisement = heartbeat_service_advertisement(None, None, None, Some(&relay))?
             .context("healthy Relay should be advertised")?;
 
         assert_eq!(

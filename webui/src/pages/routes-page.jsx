@@ -3,7 +3,7 @@ import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import { ResourceTable, Status } from "../components.jsx";
-import { pretty, shortId } from "../utils.js";
+import { nodeDisplayName, pretty } from "../utils.js";
 
 export function RoutesPage({ overview, onOpenNode }) {
   const routes = (overview.nodes || []).flatMap((entry) =>
@@ -29,7 +29,7 @@ export function RoutesPage({ overview, onOpenNode }) {
       header: "広報元",
       cell: (item) => (
         <Button variant="inline-link" onClick={() => onOpenNode(item.entry)}>
-          {shortId(item.entry.node?.node_id)}
+          {nodeDisplayName(item.entry)}
         </Button>
       ),
     },
@@ -69,6 +69,7 @@ export function RoutesPage({ overview, onOpenNode }) {
           item.route.id,
           item.route.cidr,
           item.entry.node?.node_id,
+          item.entry.node?.hostname,
           item.entry.node?.role,
           ...(item.entry.node?.tags || []),
         ].join(" ")

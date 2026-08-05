@@ -1914,6 +1914,7 @@ mod tests {
         }
         NodeRecord {
             node_id,
+            hostname: None,
             cluster_id: ClusterId::new(),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: "identity".to_string(),
@@ -1951,6 +1952,7 @@ mod tests {
     fn relay() -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string("relay-a"),
+            hostname: None,
             cluster_id: ClusterId::new(),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10))),
             identity_public_key: "identity-relay".to_string(),

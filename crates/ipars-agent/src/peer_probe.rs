@@ -596,6 +596,7 @@ mod tests {
     fn peer_record(vpn_ip: IpAddr) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string("peer-a"),
+            hostname: None,
             cluster_id: ClusterId::new(),
             vpn_ip: VpnIp(vpn_ip),
             identity_public_key: "identity".to_string(),

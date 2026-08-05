@@ -1110,6 +1110,7 @@ mod tests {
         let identity = identity_for_node(node_id);
         NodeRecord {
             node_id: NodeId::from_string(node_id),
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: identity.public_key_b64(),

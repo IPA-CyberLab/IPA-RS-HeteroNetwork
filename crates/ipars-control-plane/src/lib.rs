@@ -38,7 +38,7 @@ use ipars_types::api::{
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
     endpoint_addr_is_usable, literal_http_bootstrap_socket_addr, literal_udp_bootstrap_socket_addr,
-    relay_admission_url_is_usable, socket_addr_is_globally_routable,
+    node_hostname_is_valid, relay_admission_url_is_usable, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
@@ -459,6 +459,7 @@ pub struct HeartbeatStoreUpdate {
     pub expected_identity_public_key: String,
     pub expected_registered_at: chrono::DateTime<Utc>,
     pub accepted_signature_at: Option<chrono::DateTime<Utc>>,
+    pub hostname: Option<String>,
     pub candidates: Vec<EndpointCandidate>,
     pub nat_classification: Option<NatClassification>,
     pub relay_capability: Option<RelayCapability>,
@@ -973,6 +974,9 @@ impl ControlPlaneStore for InMemoryStore {
 
         node.endpoint_candidates = update.candidates;
         node.relay_capability = update.relay_capability;
+        if let Some(hostname) = update.hostname {
+            node.hostname = Some(hostname);
+        }
         if let Some(routes) = update.routes {
             node.routes = routes;
         }
@@ -2844,6 +2848,7 @@ where
                 .allocate_next(&reserved_vpn_ips)?;
             let node = NodeRecord {
                 node_id: request.node_id.clone(),
+                hostname: None,
                 cluster_id: claims.cluster_id.clone(),
                 vpn_ip,
                 identity_public_key: request.identity_public_key.clone(),
@@ -3444,6 +3449,7 @@ where
                     .unwrap_or_default();
                 Ok(ControlPlaneTopologyNode {
                     node_id: node.node_id,
+                    hostname: node.hostname,
                     vpn_ip: node.vpn_ip,
                     role: node.role,
                     tags: node.tags,
@@ -4045,6 +4051,20 @@ where
             })
             .collect::<BTreeSet<_>>();
         let request_node_id = request.node_id.clone();
+        let hostname = request
+            .service_advertisement
+            .as_ref()
+            .and_then(|advertisement| advertisement.hostname.clone());
+        if let Some(hostname) = hostname.as_deref() {
+            if !node_hostname_is_valid(hostname) {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request_node_id.clone(),
+                    reason: "hostname must be 1 to 253 ASCII letters, digits, '.', '_' or '-'"
+                        .to_string(),
+                });
+            }
+        }
+        let hostname_changed = hostname.is_some() && hostname != node.hostname;
         let relay_capability = request
             .relay_capability
             .map(|mut relay_capability| {
@@ -4070,6 +4090,7 @@ where
                 expected_identity_public_key: node.identity_public_key,
                 expected_registered_at: node.registered_at,
                 accepted_signature_at,
+                hostname,
                 candidates: request.candidates,
                 nat_classification: request.nat_classification,
                 relay_capability,
@@ -4081,7 +4102,7 @@ where
         if let Some(instance) = heartbeat_service_instance {
             self.advertise_service_instance(instance).await?;
         }
-        if route_catalog_update_requested {
+        if route_catalog_update_requested || hostname_changed {
             self.invalidate_overlay_node_snapshot().await;
         }
 
@@ -5488,9 +5509,7 @@ fn heartbeat_service_instance(
         reason,
     };
     if advertisement.endpoints.is_empty() {
-        return Err(reject(
-            "service advertisement must contain at least one endpoint".to_string(),
-        ));
+        return Ok(None);
     }
     validate_join_token_bootstrap_endpoints(&advertisement.endpoints)
         .map_err(|error| reject(error.to_string()))?;
@@ -7201,6 +7220,7 @@ mod tests {
         let identity = identity_for_node(node_id);
         NodeRecord {
             node_id: identity.node_id(),
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: identity.public_key_b64(),
@@ -9164,6 +9184,7 @@ mod tests {
             expected_identity_public_key: node.identity_public_key.clone(),
             expected_registered_at: node.registered_at,
             accepted_signature_at: Some(accepted_at),
+            hostname: None,
             candidates: vec![EndpointCandidate {
                 node_id: node.node_id.clone(),
                 kind: EndpointCandidateKind::StunReflexive,
@@ -12719,6 +12740,7 @@ mod tests {
                     relay_capability: Some(relay.clone()),
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
+                        hostname: Some("service-host".to_string()),
                         endpoints: vec![
                             BootstrapEndpoint {
                                 kind: BootstrapEndpointKind::Signal,
@@ -12748,6 +12770,15 @@ mod tests {
             heartbeat_service_instance_id(&node_id("service-node"))
         );
         assert_eq!(directory.instances[0].endpoints.len(), 3);
+        assert_eq!(
+            plane
+                .list_nodes()
+                .await?
+                .into_iter()
+                .find(|node| node.node_id == node_id("service-node"))
+                .and_then(|node| node.hostname),
+            Some("service-host".to_string())
+        );
 
         let rejected_signal = plane
             .heartbeat(signed_heartbeat_at(
@@ -12760,6 +12791,7 @@ mod tests {
                     relay_capability: Some(relay),
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
+                        hostname: None,
                         endpoints: vec![BootstrapEndpoint {
                             kind: BootstrapEndpointKind::Signal,
                             url: "http://100.64.0.2:19443".to_string(),
@@ -12788,6 +12820,7 @@ mod tests {
                     relay_capability: None,
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
+                        hostname: None,
                         endpoints: vec![BootstrapEndpoint {
                             kind: BootstrapEndpointKind::Stun,
                             url: "udp://1.1.1.1:19444".to_string(),

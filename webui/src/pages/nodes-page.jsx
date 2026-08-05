@@ -11,6 +11,7 @@ import {
   age,
   connectivity,
   formatDateTime,
+  nodeDisplayName,
   pretty,
   shortId,
 } from "../utils.js";
@@ -61,12 +62,19 @@ export function NodesPage({ overview, onOpenNode }) {
         id: "node",
         header: "ノード",
         cell: (entry) => (
-          <Button variant="inline-link" onClick={() => onOpenNode(entry)}>
-            {shortId(entry.node?.node_id)}
-          </Button>
+          <SpaceBetween size="xxs">
+            <Button variant="inline-link" onClick={() => onOpenNode(entry)}>
+              {nodeDisplayName(entry)}
+            </Button>
+            {entry.node?.hostname ? (
+              <Box variant="small" color="text-body-secondary">
+                {shortId(entry.node?.node_id)}
+              </Box>
+            ) : null}
+          </SpaceBetween>
         ),
         sortingComparator: (a, b) =>
-          String(a.node?.node_id).localeCompare(String(b.node?.node_id)),
+          nodeDisplayName(a).localeCompare(nodeDisplayName(b)),
       },
       {
         id: "vpn",
@@ -74,6 +82,24 @@ export function NodesPage({ overview, onOpenNode }) {
         cell: (entry) => <Box variant="code">{entry.node?.vpn_ip || "-"}</Box>,
         sortingComparator: (a, b) =>
           String(a.node?.vpn_ip).localeCompare(String(b.node?.vpn_ip)),
+      },
+      {
+        id: "publicIp",
+        header: "グローバルIP",
+        cell: (entry) =>
+          (entry.public_ips || []).length ? (
+            <SpaceBetween size="xxs">
+              {entry.public_ips.map((address) => (
+                <Box key={address} variant="code">
+                  {address}
+                </Box>
+              ))}
+            </SpaceBetween>
+          ) : (
+            "-"
+          ),
+        sortingComparator: (a, b) =>
+          String(a.public_ips?.[0] || "").localeCompare(String(b.public_ips?.[0] || "")),
       },
       {
         id: "health",
@@ -140,11 +166,13 @@ export function NodesPage({ overview, onOpenNode }) {
       items={overview.nodes || []}
       columns={columns}
       trackBy={(entry) => entry.node?.node_id}
-      searchPlaceholder="ノード、VPNアドレス、タグを検索"
+      searchPlaceholder="ホスト名、IPアドレス、タグを検索"
       searchText={(entry) =>
         [
           entry.node?.node_id,
+          entry.node?.hostname,
           entry.node?.vpn_ip,
+          ...(entry.public_ips || []),
           entry.node?.role,
           ...(entry.node?.tags || []),
           entry.health?.state,
@@ -199,8 +227,13 @@ export function NodeDetailModal({ entry, visible, onDismiss, onRemove, loading }
         <KeyValuePairs
           columns={3}
           items={[
+            { label: "ホスト名", value: node.hostname || "-" },
             { label: "ノードID", value: <Box variant="code">{node.node_id || "-"}</Box> },
             { label: "VPNアドレス", value: <Box variant="code">{node.vpn_ip || "-"}</Box> },
+            {
+              label: "グローバルIP",
+              value: (entry?.public_ips || []).join(", ") || "-",
+            },
             { label: "ロール", value: pretty(node.role) },
             {
               label: "状態",

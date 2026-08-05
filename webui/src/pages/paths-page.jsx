@@ -3,7 +3,7 @@ import Button from "@cloudscape-design/components/button";
 import Select from "@cloudscape-design/components/select";
 import { useMemo, useState } from "react";
 import { ResourceTable, Status } from "../components.jsx";
-import { age, pathLabels, pathState, shortId } from "../utils.js";
+import { age, nodeDisplayName, pathLabels, pathState } from "../utils.js";
 
 const stateOptions = [
   { value: "all", label: "すべての状態" },
@@ -14,6 +14,12 @@ const stateOptions = [
 
 export function PathsPage({ overview, onPin, pinningKey }) {
   const [selectedState, setSelectedState] = useState(stateOptions[0]);
+  const nodesById = useMemo(
+    () => new Map((overview.nodes || []).map((entry) => [entry.node?.node_id, entry.node])),
+    [overview.nodes],
+  );
+  const nodeName = (nodeId) =>
+    nodeDisplayName(nodesById.get(nodeId) || { node_id: nodeId });
   const paths = useMemo(
     () =>
       (overview.paths || []).filter((path) => {
@@ -29,14 +35,14 @@ export function PathsPage({ overview, onPin, pinningKey }) {
     {
       id: "local",
       header: "ローカルノード",
-      cell: (path) => <Box variant="code">{shortId(path.key?.local)}</Box>,
+      cell: (path) => nodeName(path.key?.local),
       sortingComparator: (a, b) =>
         String(a.key?.local).localeCompare(String(b.key?.local)),
     },
     {
       id: "remote",
       header: "リモートノード",
-      cell: (path) => <Box variant="code">{shortId(path.key?.remote)}</Box>,
+      cell: (path) => nodeName(path.key?.remote),
       sortingComparator: (a, b) =>
         String(a.key?.remote).localeCompare(String(b.key?.remote)),
     },
@@ -60,7 +66,7 @@ export function PathsPage({ overview, onPin, pinningKey }) {
       header: "リレー",
       cell: (path) => (
         <Box variant="code">
-          {path.relay_node ? shortId(path.relay_node) : "-"}
+          {path.relay_node ? nodeName(path.relay_node) : "-"}
         </Box>
       ),
     },
@@ -112,9 +118,12 @@ export function PathsPage({ overview, onPin, pinningKey }) {
       searchText={(path) =>
         [
           path.key?.local,
+          nodeName(path.key?.local),
           path.key?.remote,
+          nodeName(path.key?.remote),
           path.selected_candidate?.addr,
           path.relay_node,
+          path.relay_node ? nodeName(path.relay_node) : "",
           pathState(path.selected_state),
         ].join(" ")
       }

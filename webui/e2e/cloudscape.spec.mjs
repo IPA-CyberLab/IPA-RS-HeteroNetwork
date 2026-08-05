@@ -7,6 +7,7 @@ const webuiDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const nodes = Array.from({ length: 5 }, (_, index) => ({
   node: {
     node_id: `node-${index + 1}-0123456789abcdef`,
+    hostname: `uc-k8sp${index + 1}`,
     vpn_ip: `10.250.0.${index + 1}`,
     role: index < 2 ? "edge" : "worker",
     tags: index < 3 ? ["kubernetes-control-plane"] : ["kubernetes-worker"],
@@ -18,6 +19,7 @@ const nodes = Array.from({ length: 5 }, (_, index) => ({
     last_seen_at: "2026-08-04T07:00:00Z",
   },
   connectivity_state: index < 2 ? "public" : "private",
+  public_ips: index < 2 ? [`163.220.236.${51 + index}`] : [],
 }));
 
 const paths = nodes.flatMap((local, localIndex) =>
@@ -83,6 +85,7 @@ const topology = {
   ],
   nodes: nodes.map((entry, index) => ({
     node_id: entry.node.node_id,
+    hostname: entry.node.hostname,
     vpn_ip: entry.node.vpn_ip,
     leaf_group_id: index < 3 ? "leaf-a" : "leaf-b",
   })),
@@ -184,9 +187,15 @@ test("Cloudscape console renders overview and hierarchical topology", async ({ p
   );
   await expect(page.getByRole("table").last().getByRole("row")).toHaveCount(6);
 
+  await page.getByText("ノード", { exact: true }).first().click();
+  await expect(page.getByRole("heading", { name: "ノード", exact: true })).toBeVisible();
+  await expect(page.getByText("uc-k8sp1", { exact: true })).toBeVisible();
+  await expect(page.getByText("163.220.236.51", { exact: true })).toBeVisible();
+
   await page.getByText("オーバーレイトポロジー", { exact: true }).first().click();
   await expect(page.getByRole("heading", { name: "オーバーレイトポロジー" })).toBeVisible();
   await expect(page.locator(".topology-diagram svg")).toHaveCount(1);
+  await expect(page.locator(".topology-diagram svg")).toContainText("uc-k8sp1");
   expect(pageErrors).toEqual([]);
 });
 

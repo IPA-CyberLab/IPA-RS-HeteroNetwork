@@ -11384,6 +11384,7 @@ mod tests {
         let now = Utc::now();
         let client = NodeRecord {
             node_id: bundle.registration.client_id.clone(),
+            hostname: None,
             cluster_id: cluster_id.clone(),
             vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 20))),
             identity_public_key: bundle.registration.identity_public_key.clone(),
@@ -11399,6 +11400,7 @@ mod tests {
         let gateway_identity = IdentityKeyPair::from_signing_bytes([29_u8; 32]);
         let gateway = NodeRecord {
             node_id: gateway_identity.node_id(),
+            hostname: None,
             cluster_id: cluster_id.clone(),
             vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 1))),
             identity_public_key: gateway_identity.public_key_b64(),
@@ -11757,6 +11759,7 @@ mod tests {
     fn cli_test_node_record(node_id: NodeId) -> ipars_types::NodeRecord {
         ipars_types::NodeRecord {
             node_id,
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: ipars_types::VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: "identity-public".to_string(),
@@ -14658,6 +14661,7 @@ fi
             bootstrap_endpoints: Vec::new(),
             peers: vec![ipars_types::NodeRecord {
                 node_id: peer.clone(),
+                hostname: None,
                 cluster_id: ClusterId::from_string("cluster-a"),
                 vpn_ip: ipars_types::VpnIp(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                     100, 64, 0, 2,

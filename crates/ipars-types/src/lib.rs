@@ -1558,6 +1558,8 @@ pub struct NodeHealth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub cluster_id: ClusterId,
     pub vpn_ip: VpnIp,
     pub identity_public_key: String,
@@ -1569,6 +1571,19 @@ pub struct NodeRecord {
     pub token_policy: TokenPolicy,
     pub routes: Vec<Route>,
     pub registered_at: DateTime<Utc>,
+}
+
+pub const MAX_NODE_HOSTNAME_BYTES: usize = 253;
+
+pub fn node_hostname_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_NODE_HOSTNAME_BYTES
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 pub const MAX_OVERLAY_DEGREE: u16 = 64;
@@ -2953,6 +2968,8 @@ pub mod api {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NodeServiceAdvertisement {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hostname: Option<String>,
         pub endpoints: Vec<BootstrapEndpoint>,
     }
 
@@ -3183,6 +3200,8 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ControlPlaneTopologyNode {
         pub node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hostname: Option<String>,
         pub vpn_ip: VpnIp,
         pub role: Role,
         pub tags: BTreeSet<Tag>,
@@ -3344,6 +3363,8 @@ pub mod api {
         pub health: Option<NodeHealth>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub nat_classification: Option<NatClassification>,
+        #[serde(default)]
+        pub public_ips: Vec<IpAddr>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20020,6 +20041,7 @@ mod tests {
     fn overlay_test_node(node_id: &str, cluster_id: &str, vpn_ip: IpAddr) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(node_id),
+            hostname: None,
             cluster_id: ClusterId::from_string(cluster_id),
             vpn_ip: VpnIp(vpn_ip),
             identity_public_key: format!("identity-{node_id}"),
@@ -20032,6 +20054,18 @@ mod tests {
             routes: Vec::new(),
             registered_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn node_hostname_validation_accepts_machine_names_and_rejects_unsafe_values() {
+        assert!(node_hostname_is_valid("uc-k8sp1"));
+        assert!(node_hostname_is_valid("server-room_1.local"));
+        assert!(!node_hostname_is_valid(""));
+        assert!(!node_hostname_is_valid("../server"));
+        assert!(!node_hostname_is_valid("server room"));
+        assert!(!node_hostname_is_valid(
+            &"a".repeat(MAX_NODE_HOSTNAME_BYTES + 1)
+        ));
     }
 
     fn valid_neighbor_map() -> Result<NeighborMap, Box<dyn std::error::Error>> {
@@ -31307,6 +31341,7 @@ mod tests {
 
         let node = NodeRecord {
             node_id: NodeId::from_string("node-a"),
+            hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 2))),
             identity_public_key: "identity".to_string(),

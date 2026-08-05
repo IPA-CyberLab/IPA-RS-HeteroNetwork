@@ -10,9 +10,9 @@ import { ResourceTable, Status } from "../components.jsx";
 import {
   age,
   connectivity,
+  nodeDisplayName,
   pathLabels,
   pathState,
-  shortId,
 } from "../utils.js";
 
 const operationsConsoles = [
@@ -90,11 +90,11 @@ export function OverviewPage({ overview, onNavigate, onOpenNode }) {
       header: "ノード",
       cell: (entry) => (
         <Button variant="inline-link" onClick={() => onOpenNode(entry)}>
-          {shortId(entry.node?.node_id)}
+          {nodeDisplayName(entry)}
         </Button>
       ),
       sortingComparator: (a, b) =>
-        String(a.node?.node_id).localeCompare(String(b.node?.node_id)),
+        nodeDisplayName(a).localeCompare(nodeDisplayName(b)),
     },
     {
       id: "vpn",
