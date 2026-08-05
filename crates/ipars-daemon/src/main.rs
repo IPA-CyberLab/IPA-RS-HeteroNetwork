@@ -218,6 +218,7 @@ const RELAY_NODE_ID_STATE_WAIT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
+const ADVERTISED_SIGNAL_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
 const DEFAULT_DIRECT_PATH_PROBE_TIMEOUT_SECONDS: u64 = 120;
 const POLL_JITTER_MIN_BASIS_POINTS: u64 = 8_000;
@@ -1065,6 +1066,8 @@ struct AgentArgs {
     relay_admission_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_AGENT_RELAY_STATUS_URL")]
     relay_status_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_AGENT_ADVERTISE_SIGNAL_URL")]
+    advertise_signal_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_AGENT_ADVERTISE_STUN_URL")]
     advertise_stun_url: Option<String>,
     #[arg(
@@ -2134,6 +2137,13 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             url: stun_url.clone(),
         }])
         .context("--advertise-stun-url is not a usable UDP STUN endpoint")?;
+    }
+    if let Some(signal_url) = args.advertise_signal_url.as_ref() {
+        validate_join_token_bootstrap_endpoints(&[BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Signal,
+            url: signal_url.clone(),
+        }])
+        .context("--advertise-signal-url is not a usable HTTP(S) Signal endpoint")?;
     }
     validate_positive_seconds(
         args.nat_discovery_interval_seconds,
@@ -9201,6 +9211,7 @@ async fn run_agent(
                 .context("failed to load agent identity key for heartbeat signing")?,
             control_plane_urls: control_plane_bases.clone(),
             interval: Duration::from_secs(args.heartbeat_interval_seconds),
+            advertised_signal_url: args.advertise_signal_url.clone(),
             advertised_stun_url: args.advertise_stun_url.clone(),
             relay_capability_reporter: relay_capability_reporter.clone(),
             route_reporter: heartbeat_route_reporter,
@@ -13940,6 +13951,7 @@ struct HeartbeatReporterConfig {
     identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
+    advertised_signal_url: Option<String>,
     advertised_stun_url: Option<String>,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
     route_reporter: Option<HeartbeatRouteReporter>,
@@ -14632,6 +14644,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
         identity,
         control_plane_urls,
         interval,
+        advertised_signal_url,
         advertised_stun_url,
         relay_capability_reporter,
         route_reporter,
@@ -14647,6 +14660,10 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
         let cycle_interval = jittered_poll_interval(interval);
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
+        let healthy_signal_url = match advertised_signal_url.as_deref() {
+            Some(url) if advertised_signal_is_healthy(&client, url).await => Some(url),
+            _ => None,
+        };
         let routes = heartbeat_routes(route_reporter.as_ref()).await;
         let refreshed_routes = routes.clone();
         let request = match heartbeat_request(
@@ -14654,6 +14671,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
             &identity,
             relay_capability.clone(),
             routes,
+            healthy_signal_url,
             advertised_stun_url.as_deref(),
         )
         .await
@@ -14824,11 +14842,40 @@ async fn send_heartbeat(
     .await
 }
 
+async fn advertised_signal_is_healthy(client: &reqwest::Client, signal_url: &str) -> bool {
+    let health_url = format!("{}/healthz", signal_url.trim_end_matches('/'));
+    match client
+        .get(&health_url)
+        .timeout(ADVERTISED_SIGNAL_HEALTH_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => true,
+        Ok(response) => {
+            tracing::warn!(
+                signal_url,
+                status = %response.status(),
+                "local Signal health check failed; omitting it from the service lease"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                signal_url,
+                "local Signal health check failed; omitting it from the service lease"
+            );
+            false
+        }
+    }
+}
+
 async fn heartbeat_request(
     runtime: &AgentRuntime,
     identity: &IdentityKeyPair,
     relay_capability: Option<RelayCapability>,
     routes: Option<Vec<Route>>,
+    advertised_signal_url: Option<&str>,
     advertised_stun_url: Option<&str>,
 ) -> anyhow::Result<HeartbeatRequest> {
     let now = chrono::Utc::now();
@@ -14836,8 +14883,11 @@ async fn heartbeat_request(
     let status = runtime.status().await;
     let path_state = heartbeat_path_state(runtime, now).await;
     let health = agent_health_from_status(&status, "agent heartbeat");
-    let service_advertisement =
-        heartbeat_service_advertisement(advertised_stun_url, relay_capability.as_ref())?;
+    let service_advertisement = heartbeat_service_advertisement(
+        advertised_signal_url,
+        advertised_stun_url,
+        relay_capability.as_ref(),
+    )?;
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
         health,
@@ -14858,10 +14908,17 @@ async fn heartbeat_request(
 }
 
 fn heartbeat_service_advertisement(
+    advertised_signal_url: Option<&str>,
     advertised_stun_url: Option<&str>,
     relay_capability: Option<&RelayCapability>,
 ) -> anyhow::Result<Option<NodeServiceAdvertisement>> {
     let mut endpoints = Vec::new();
+    if let Some(url) = advertised_signal_url {
+        endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Signal,
+            url: url.to_string(),
+        });
+    }
     if let Some(url) = advertised_stun_url {
         endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::Stun,
@@ -22652,6 +22709,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -22664,6 +22722,23 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .context("timed out waiting for heartbeat rejection test server")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_advertisement_requires_a_healthy_local_endpoint() -> anyhow::Result<()> {
+        let (signal_url, signal_task) = spawn_test_http_service(Router::new().route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        ))
+        .await?;
+        let client = reqwest::Client::new();
+
+        assert!(advertised_signal_is_healthy(&client, &signal_url).await);
+
+        signal_task.abort();
+        let unavailable_url = unused_http_base_url().await?;
+        assert!(!advertised_signal_is_healthy(&client, &unavailable_url).await);
         Ok(())
     }
 
@@ -23011,7 +23086,7 @@ mod tests {
         let state = AgentNodeState::generate(Utc::now());
         let identity = state.identity_key_pair()?;
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
-        let request = heartbeat_request(&runtime, &identity, None, None, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None, None, None).await?;
 
         let received = send_heartbeat_to_control_planes(
             &reqwest::Client::new(),
@@ -23094,7 +23169,7 @@ mod tests {
         let identity = state.identity_key_pair()?;
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
         let notifier = runtime.peer_map_sync_notifier();
-        let request = heartbeat_request(&runtime, &identity, None, None, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None, None, None).await?;
         let response =
             send_heartbeat_to_control_planes(&reqwest::Client::new(), &[], request, Duration::ZERO)
                 .await;
@@ -40078,6 +40153,7 @@ exec sleep 60
             &identity,
             None,
             Some(vec![advertised_route.clone()]),
+            Some("http://10.250.0.10:19443"),
             Some("udp://203.0.113.10:19444"),
         )
         .await?;
@@ -40095,10 +40171,16 @@ exec sleep 60
                 .as_ref()
                 .map(|advertisement| advertisement.endpoints.as_slice()),
             Some(
-                [BootstrapEndpoint {
-                    kind: BootstrapEndpointKind::Stun,
-                    url: "udp://203.0.113.10:19444".to_string(),
-                }]
+                [
+                    BootstrapEndpoint {
+                        kind: BootstrapEndpointKind::Signal,
+                        url: "http://10.250.0.10:19443".to_string(),
+                    },
+                    BootstrapEndpoint {
+                        kind: BootstrapEndpointKind::Stun,
+                        url: "udp://203.0.113.10:19444".to_string(),
+                    },
+                ]
                 .as_slice()
             )
         );
@@ -40153,6 +40235,7 @@ exec sleep 60
             None,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -40173,7 +40256,7 @@ exec sleep 60
             e2e_only: true,
         };
 
-        let advertisement = heartbeat_service_advertisement(None, Some(&relay))?
+        let advertisement = heartbeat_service_advertisement(None, None, Some(&relay))?
             .context("healthy Relay should be advertised")?;
 
         assert_eq!(
@@ -40224,6 +40307,7 @@ exec sleep 60
             None,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -40247,6 +40331,7 @@ exec sleep 60
         let request = heartbeat_request(
             &runtime,
             &runtime.state().identity_key_pair()?,
+            None,
             None,
             None,
             None,
@@ -40287,7 +40372,7 @@ exec sleep 60
             .await;
         let identity = runtime.state().identity_key_pair()?;
 
-        let request = heartbeat_request(&runtime, &identity, None, None, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None, None, None).await?;
 
         assert_eq!(request.health.state, HealthState::Unhealthy);
         let message = request.health.message.as_deref().unwrap_or_default();

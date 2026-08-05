@@ -65,7 +65,7 @@ Control Planes. It enables enrollment only when the root-owned
 the same dedicated signer on at least two promoted public nodes when enrollment
 must survive a node failure.
 
-The four local services form one advertised failure domain. The packaged Control Plane unit is bound to Signal, STUN, and Relay, so stopping or losing any of them stops the local lease renewal. A failed instance disappears from `/v1/admin/services` after `HETERONETWORK_SERVICE_LEASE_TTL_SECONDS`. Deploy the three-member private PostgreSQL quorum described in [`POSTGRES_HA.md`](POSTGRES_HA.md); a single database on either public host makes whole-host failover asymmetric.
+Local roles have independent failure boundaries. Signal uses `signal-services.env` and authenticates through the active remote Control Plane directory; STUN uses `udp-services.env`; Relay reports its own live capability. The Agent publishes healthy Signal/STUN/Relay endpoints in a signed 45-second heartbeat lease. The local Control Plane alone requires PostgreSQL and renews its separate lease. Losing SQL or public HTTPS therefore does not stop the traversal and signaling roles. A failed endpoint disappears from `/v1/admin/services` after its lease expires. Deploy the three-member private PostgreSQL quorum described in [`POSTGRES_HA.md`](POSTGRES_HA.md); a single database on a public host still makes Control Plane failover asymmetric.
 
 Mint join tokens from the active directory instead of manually copying endpoint lists:
 

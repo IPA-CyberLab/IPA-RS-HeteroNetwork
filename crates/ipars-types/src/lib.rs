@@ -488,6 +488,27 @@ pub fn literal_udp_bootstrap_socket_addr(value: &str) -> Option<SocketAddr> {
     endpoint_addr_is_usable(addr).then_some(addr)
 }
 
+pub fn literal_http_bootstrap_socket_addr(value: &str) -> Option<SocketAddr> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return None;
+    }
+    let port = parsed.port_or_known_default()?;
+    let ip = match parsed.host()? {
+        url::Host::Domain(domain) => domain.parse::<IpAddr>().ok()?,
+        url::Host::Ipv4(ip) => IpAddr::V4(ip),
+        url::Host::Ipv6(ip) => IpAddr::V6(ip),
+    };
+    let addr = SocketAddr::new(ip, port);
+    endpoint_addr_is_usable(addr).then_some(addr)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointCandidate {
     pub node_id: NodeId,
@@ -19739,6 +19760,29 @@ mod tests {
                 validate_join_token_bootstrap_endpoints(&[invalid]).is_err(),
                 "invalid bootstrap endpoint should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn literal_http_bootstrap_socket_requires_a_usable_literal_ip() {
+        assert_eq!(
+            literal_http_bootstrap_socket_addr("http://10.250.0.8:19443"),
+            Some(SocketAddr::from(([10, 250, 0, 8], 19_443)))
+        );
+        assert_eq!(
+            literal_http_bootstrap_socket_addr("https://[2001:4860:4860::8888]"),
+            Some(SocketAddr::from((
+                Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+                443,
+            )))
+        );
+        for invalid in [
+            "http://signal.example:19443",
+            "http://0.0.0.0:19443",
+            "http://10.250.0.8:19443/path",
+            "udp://10.250.0.8:19443",
+        ] {
+            assert_eq!(literal_http_bootstrap_socket_addr(invalid), None);
         }
     }
 

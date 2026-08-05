@@ -4,13 +4,13 @@ Wants=network-online.target
 Requires=heteronetwork-agent.service
 After=network-online.target heteronetwork-agent.service
 BindsTo=heteronetwork-agent.service
-ConditionPathExists=/etc/heteronetwork/public-services/services.env
+ConditionPathExists=/etc/heteronetwork/public-services/signal-services.env
 
 [Service]
 Type=simple
 User=heteronetwork-services
 Group=heteronetwork-services
-EnvironmentFile=/etc/heteronetwork/public-services/services.env
+EnvironmentFile=/etc/heteronetwork/public-services/signal-services.env
 ExecStart=/opt/heteronetwork/bin/iparsd signal
 Restart=on-failure
 RestartSec=5s
@@ -30,4 +30,3 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-

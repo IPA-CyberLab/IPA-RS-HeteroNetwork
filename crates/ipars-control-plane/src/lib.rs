@@ -37,20 +37,20 @@ use ipars_types::api::{
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
-    endpoint_addr_is_usable, literal_udp_bootstrap_socket_addr, relay_admission_url_is_usable,
-    socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, AclAction, AclRule,
-    AggregateOverlayRoute, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy,
-    EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
-    NatClassification, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
-    OverlayNeighbor, OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState,
-    RelayCapability, Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken,
-    TokenLedgerMetrics, TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome,
-    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE,
-    MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES, MAX_PATH_SCORE_REASONS,
-    MIN_OVERLAY_BLOCK_SIZE,
+    endpoint_addr_is_usable, literal_http_bootstrap_socket_addr, literal_udp_bootstrap_socket_addr,
+    relay_admission_url_is_usable, socket_addr_is_globally_routable,
+    validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
+    BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
+    EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
+    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayNeighbor,
+    OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState, RelayCapability,
+    Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
+    TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
+    TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
+    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
+    MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -3967,7 +3967,7 @@ where
         let now = Utc::now();
         self.validate_heartbeat_request(&request, &node, &policy, previous_signature_at, now)?;
         let heartbeat_service_instance =
-            heartbeat_service_instance(&request, &self.config.cluster_id, now)?;
+            heartbeat_service_instance(&request, &node, &self.config.cluster_id, now)?;
         let route_catalog_update_requested = request
             .routes
             .as_ref()
@@ -5476,6 +5476,7 @@ fn heartbeat_service_instance_id(node_id: &NodeId) -> String {
 
 fn heartbeat_service_instance(
     request: &HeartbeatRequest,
+    node: &NodeRecord,
     cluster_id: &ClusterId,
     now: chrono::DateTime<Utc>,
 ) -> Result<Option<ServiceInstance>, ControlPlaneError> {
@@ -5504,7 +5505,9 @@ fn heartbeat_service_instance(
     for endpoint in &advertisement.endpoints {
         if !matches!(
             endpoint.kind,
-            BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay
+            BootstrapEndpointKind::Signal
+                | BootstrapEndpointKind::Stun
+                | BootstrapEndpointKind::Relay
         ) {
             return Err(reject(format!(
                 "heartbeat service advertisement cannot publish {}",
@@ -5517,31 +5520,53 @@ fn heartbeat_service_instance(
                 endpoint.kind
             )));
         }
-        let advertised_addr =
-            literal_udp_bootstrap_socket_addr(&endpoint.url).ok_or_else(|| {
-                reject(format!(
-                    "heartbeat {} endpoint must use a literal, usable public IP address",
-                    endpoint.kind
-                ))
-            })?;
-        if advertised_addr.ip() != public_ip {
-            return Err(reject(format!(
-                "heartbeat {} endpoint IP {} does not match classified public IP {public_ip}",
-                endpoint.kind,
-                advertised_addr.ip()
-            )));
-        }
-        if endpoint.kind == BootstrapEndpointKind::Relay {
-            let relay = request.relay_capability.as_ref().ok_or_else(|| {
-                reject("Relay endpoint requires a live Relay capability report".to_string())
-            })?;
-            if validate_relay_capability_shape(relay).is_err()
-                || relay.public_endpoint != Some(advertised_addr)
-            {
-                return Err(reject(
-                    "Relay endpoint does not match the live Relay capability report".to_string(),
-                ));
+        match endpoint.kind {
+            BootstrapEndpointKind::Signal => {
+                let advertised_addr = literal_http_bootstrap_socket_addr(&endpoint.url)
+                    .ok_or_else(|| {
+                        reject(
+                            "heartbeat Signal endpoint must use a literal, usable VPN IP address"
+                                .to_string(),
+                        )
+                    })?;
+                if advertised_addr.ip() != node.vpn_ip.0 {
+                    return Err(reject(format!(
+                        "heartbeat Signal endpoint IP {} does not match node VPN IP {}",
+                        advertised_addr.ip(),
+                        node.vpn_ip
+                    )));
+                }
             }
+            BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay => {
+                let advertised_addr =
+                    literal_udp_bootstrap_socket_addr(&endpoint.url).ok_or_else(|| {
+                        reject(format!(
+                            "heartbeat {} endpoint must use a literal, usable public IP address",
+                            endpoint.kind
+                        ))
+                    })?;
+                if advertised_addr.ip() != public_ip {
+                    return Err(reject(format!(
+                        "heartbeat {} endpoint IP {} does not match classified public IP {public_ip}",
+                        endpoint.kind,
+                        advertised_addr.ip()
+                    )));
+                }
+                if endpoint.kind == BootstrapEndpointKind::Relay {
+                    let relay = request.relay_capability.as_ref().ok_or_else(|| {
+                        reject("Relay endpoint requires a live Relay capability report".to_string())
+                    })?;
+                    if validate_relay_capability_shape(relay).is_err()
+                        || relay.public_endpoint != Some(advertised_addr)
+                    {
+                        return Err(reject(
+                            "Relay endpoint does not match the live Relay capability report"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => unreachable!("unsupported heartbeat service kind was rejected"),
         }
     }
     Ok(Some(ServiceInstance {
@@ -12627,8 +12652,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_publishes_signed_udp_service_lease() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn heartbeat_publishes_signed_node_service_lease(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cluster_id = ClusterId::new();
         let store = Arc::new(InMemoryStore::default());
         let plane = ControlPlane::new(
@@ -12640,7 +12665,7 @@ mod tests {
         );
         let mut relay_claims = claims(cluster_id);
         relay_claims.policy.allow_relay = true;
-        plane
+        let registration = plane
             .register_with_claims(relay_claims, registration_request("service-node"))
             .await?;
 
@@ -12691,10 +12716,14 @@ mod tests {
                     health: health.clone(),
                     candidates: vec![candidate.clone()],
                     nat_classification: Some(classification.clone()),
-                    relay_capability: Some(relay),
+                    relay_capability: Some(relay.clone()),
                     routes: None,
                     service_advertisement: Some(NodeServiceAdvertisement {
                         endpoints: vec![
+                            BootstrapEndpoint {
+                                kind: BootstrapEndpointKind::Signal,
+                                url: format!("http://{}:19443", registration.node.vpn_ip),
+                            },
                             BootstrapEndpoint {
                                 kind: BootstrapEndpointKind::Stun,
                                 url: format!("udp://{public_ip}:19444"),
@@ -12718,7 +12747,35 @@ mod tests {
             directory.instances[0].instance_id,
             heartbeat_service_instance_id(&node_id("service-node"))
         );
-        assert_eq!(directory.instances[0].endpoints.len(), 2);
+        assert_eq!(directory.instances[0].endpoints.len(), 3);
+
+        let rejected_signal = plane
+            .heartbeat(signed_heartbeat_at(
+                "service-node",
+                HeartbeatRequest {
+                    node_id: node_id("service-node"),
+                    health: health.clone(),
+                    candidates: vec![candidate.clone()],
+                    nat_classification: Some(classification.clone()),
+                    relay_capability: Some(relay),
+                    routes: None,
+                    service_advertisement: Some(NodeServiceAdvertisement {
+                        endpoints: vec![BootstrapEndpoint {
+                            kind: BootstrapEndpointKind::Signal,
+                            url: "http://100.64.0.2:19443".to_string(),
+                        }],
+                    }),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                now + Duration::milliseconds(1),
+            ))
+            .await;
+        assert!(matches!(
+            rejected_signal,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("does not match node VPN IP")
+        ));
 
         let rejected = plane
             .heartbeat(signed_heartbeat_at(
@@ -12739,7 +12796,7 @@ mod tests {
                     path_state: Vec::new(),
                     node_signature: None,
                 },
-                now + Duration::milliseconds(1),
+                now + Duration::milliseconds(2),
             ))
             .await;
         assert!(matches!(

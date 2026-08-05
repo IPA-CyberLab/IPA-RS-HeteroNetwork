@@ -36,6 +36,7 @@ fi
 
 public_services_dir=$filesystem_root/etc/heteronetwork/public-services
 bootstrap_env=$public_services_dir/bootstrap.env
+signal_services_env=$public_services_dir/signal-services.env
 udp_services_env=$public_services_dir/udp-services.env
 services_env=$public_services_dir/services.env
 database_url_file=$public_services_dir/database-url
@@ -58,7 +59,9 @@ relay_status_file=
 gateway_status_file=
 https_services_enabled=0
 relay_services_enabled=0
+signal_services_enabled=0
 services_env_tmp=
+signal_services_env_tmp=
 udp_services_env_tmp=
 database_url_tmp=
 database_autopilot_token_tmp=
@@ -68,8 +71,8 @@ agent_gateway_drop_in_tmp=
 control_plane_enrollment_drop_in_tmp=
 node_enrollment_enabled=0
 reconcile_finished=0
-udp_services_ready=0
-udp_activation_deferred=0
+independent_services_ready=0
+independent_activation_deferred=0
 
 log() {
   printf '%s\n' "public-services-autopilot: $*" >&2
@@ -79,6 +82,7 @@ cleanup() {
   [ -z "$status_file" ] || rm -f "$status_file"
   [ -z "$relay_status_file" ] || rm -f "$relay_status_file"
   [ -z "$gateway_status_file" ] || rm -f "$gateway_status_file"
+  [ -z "$signal_services_env_tmp" ] || rm -f "$signal_services_env_tmp"
   [ -z "$udp_services_env_tmp" ] || rm -f "$udp_services_env_tmp"
   [ -z "$services_env_tmp" ] || rm -f "$services_env_tmp"
   [ -z "$database_url_tmp" ] || rm -f "$database_url_tmp"
@@ -156,6 +160,7 @@ demote_all() {
     fi
   done
   for demote_path in \
+    "$signal_services_env" \
     "$udp_services_env" \
     "$services_env" \
     "$database_url_file" \
@@ -193,10 +198,6 @@ demote_control_services() {
     control_demote_changed=1
   fi
   stop_unit "$control_plane_service" || control_demote_failed=1
-  if unit_is_active "$signal_service"; then
-    control_demote_changed=1
-  fi
-  stop_unit "$signal_service" || control_demote_failed=1
 
   control_drop_in_removed=0
   for control_demote_path in \
@@ -230,14 +231,22 @@ demote_control_services() {
       control_demote_failed=1
     fi
   fi
-  if [ "$udp_services_ready" -eq 1 ] && ! unit_is_active "$stun_service"; then
+  if [ "$independent_services_ready" -eq 1 ] && ! unit_is_active "$stun_service"; then
     if ! systemctl start "$stun_service" || ! stun_is_ready; then
       log "unable to restore STUN after the Agent configuration changed"
       control_demote_failed=1
     fi
   fi
+  if [ "$independent_services_ready" -eq 1 ] &&
+    [ "$signal_services_enabled" -eq 1 ] &&
+    ! unit_is_active "$signal_service"; then
+    if ! systemctl start "$signal_service" || ! signal_is_ready; then
+      log "unable to restore Signal after the Agent configuration changed"
+      control_demote_failed=1
+    fi
+  fi
   if [ "$control_demote_changed" -eq 1 ]; then
-    log "demoted Control Plane and Signal only: $control_demote_reason"
+    log "demoted Control Plane only: $control_demote_reason"
   fi
   [ "$control_demote_failed" -eq 0 ]
 }
@@ -254,7 +263,7 @@ demote_and_exit() {
 demote_control_and_exit() {
   demote_control_exit_reason=$1
   if demote_control_services "$demote_control_exit_reason"; then
-    log "$demote_control_exit_reason; STUN and Relay remain independent"
+    log "$demote_control_exit_reason; Signal, STUN, and Relay remain independent"
     reconcile_finished=1
     exit 0
   fi
@@ -266,7 +275,7 @@ on_exit() {
   trap - EXIT HUP INT TERM
   set +e
   if [ "$reconcile_finished" -ne 1 ]; then
-    if [ "$udp_services_ready" -eq 1 ]; then
+    if [ "$independent_services_ready" -eq 1 ]; then
       demote_control_services "control-service reconciliation exited before reaching a stable state"
     else
       demote_all "reconciliation exited before reaching a stable state"
@@ -619,6 +628,12 @@ load_bootstrap() {
   valid_positive_integer "$classification_max_age_seconds" 300 || return 1
 }
 
+load_signal_bootstrap() {
+  decode_config_value HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 || return 1
+  signal_control_plane_seed_urls=$DECODED_VALUE
+  valid_url_csv "$signal_control_plane_seed_urls" 0
+}
+
 load_control_bootstrap() {
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_CLUSTER_ID_B64 || return 1
   cluster_id=$DECODED_VALUE
@@ -753,6 +768,22 @@ stun_is_ready() {
   return 1
 }
 
+signal_is_ready() {
+  signal_ready_attempt=1
+  while [ "$signal_ready_attempt" -le 10 ]; do
+    if curl --fail --silent --max-time 2 --max-filesize 1048576 \
+      "http://$vpn_ip:19443/healthz" >/dev/null; then
+      return 0
+    fi
+    if [ "$signal_ready_attempt" -lt 10 ]; then
+      sleep 1
+    fi
+    signal_ready_attempt=$((signal_ready_attempt + 1))
+  done
+  log "Signal health endpoint did not become ready within 10 seconds"
+  return 1
+}
+
 write_environment_entry() {
   environment_name=$1
   environment_value=$2
@@ -820,12 +851,32 @@ install_root_credential_candidate() {
   CANDIDATE_CHANGED=1
 }
 
-prepare_udp_runtime_files() {
+prepare_independent_runtime_files() {
   mkdir -p "$public_services_dir" "$agent_drop_in_dir" || return 1
   chown root:"$service_group" "$public_services_dir" || return 1
   chmod 0750 "$public_services_dir" || return 1
   chown root:root "$agent_drop_in_dir" || return 1
   chmod 0755 "$agent_drop_in_dir" || return 1
+
+  signal_services_env_changed=0
+  if [ "$signal_services_enabled" -eq 1 ]; then
+    signal_services_env_tmp=$(
+      mktemp "$public_services_dir/.signal-services.env.XXXXXX"
+    ) || return 1
+    {
+      write_environment_entry HETERONETWORK_SIGNAL_LISTEN "$vpn_ip:19443"
+      write_environment_entry \
+        HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS \
+        "$signal_control_plane_seed_urls"
+    } >"$signal_services_env_tmp" || return 1
+    install_candidate "$signal_services_env_tmp" "$signal_services_env" \
+      "root:$service_group" 0640 || return 1
+    signal_services_env_tmp=
+    signal_services_env_changed=$CANDIDATE_CHANGED
+  elif [ -e "$signal_services_env" ] || [ -L "$signal_services_env" ]; then
+    rm -f "$signal_services_env" || return 1
+    signal_services_env_changed=1
+  fi
 
   udp_services_env_tmp=$(mktemp "$public_services_dir/.udp-services.env.XXXXXX") ||
     return 1
@@ -841,10 +892,17 @@ prepare_udp_runtime_files() {
   agent_udp_drop_in_tmp=$(
     mktemp "$agent_drop_in_dir/.30-public-udp-services.conf.XXXXXX"
   ) || return 1
-  cat >"$agent_udp_drop_in_tmp" <<EOF || return 1
+  {
+    cat <<'EOF'
 [Service]
-Environment="HETERONETWORK_AGENT_ADVERTISE_STUN_URL=$stun_public_url"
 EOF
+    if [ "$signal_services_enabled" -eq 1 ]; then
+      printf '%s\n' \
+        "Environment=\"HETERONETWORK_AGENT_ADVERTISE_SIGNAL_URL=http://$vpn_ip:19443\""
+    fi
+    printf '%s\n' \
+      "Environment=\"HETERONETWORK_AGENT_ADVERTISE_STUN_URL=$stun_public_url\""
+  } >"$agent_udp_drop_in_tmp" || return 1
   install_candidate "$agent_udp_drop_in_tmp" \
     "$agent_udp_drop_in" root:root 0644 || return 1
   agent_udp_drop_in_tmp=
@@ -856,13 +914,13 @@ EOF
   fi
 }
 
-promote_udp_services() {
-  udp_activation_deferred=0
+promote_independent_services() {
+  independent_activation_deferred=0
   if [ "$agent_udp_drop_in_changed" -eq 1 ]; then
     systemctl daemon-reload || return 1
     systemctl restart --no-block "$agent_service" || return 1
-    udp_activation_deferred=1
-    log "staged independent STUN advertisement; activation continues next cycle"
+    independent_activation_deferred=1
+    log "staged independent Signal/STUN advertisement; activation continues next cycle"
     return 0
   fi
 
@@ -874,7 +932,27 @@ promote_udp_services() {
   fi
   unit_is_active "$stun_service" || return 1
   stun_is_ready || return 1
-  udp_services_ready=1
+
+  if [ "$signal_services_enabled" -eq 1 ]; then
+    signal_activation_failed=0
+    if ! unit_is_active "$signal_service"; then
+      systemctl start "$signal_service" || signal_activation_failed=1
+    elif [ "$signal_services_env_changed" -eq 1 ]; then
+      systemctl restart "$signal_service" || signal_activation_failed=1
+    fi
+    if [ "$signal_activation_failed" -eq 0 ] &&
+      { ! unit_is_active "$signal_service" || ! signal_is_ready; }; then
+      signal_activation_failed=1
+    fi
+    if [ "$signal_activation_failed" -eq 1 ]; then
+      stop_unit "$signal_service" || return 1
+      signal_services_enabled=0
+      log "Signal is not currently ready; STUN and Relay remain independent"
+    fi
+  else
+    stop_unit "$signal_service" || return 1
+  fi
+  independent_services_ready=1
 }
 
 prepare_runtime_files() {
@@ -922,7 +1000,7 @@ EOF
       HETERONETWORK_TRUSTED_NODE_ENROLLMENT_ISSUER_KEYS \
       "$enrollment_trusted_issuer_keys"
     write_environment_entry HETERONETWORK_LISTEN "$vpn_ip:19088"
-    write_environment_entry HETERONETWORK_SIGNAL_LISTEN "127.0.0.1:19443"
+    write_environment_entry HETERONETWORK_SIGNAL_LISTEN "$vpn_ip:19443"
     write_environment_entry \
       HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS \
       "$signal_control_plane_urls"
@@ -936,7 +1014,9 @@ EOF
     write_environment_entry HETERONETWORK_SERVICE_LEASE_RENEW_INTERVAL_SECONDS 10
     write_environment_entry HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL \
       "http://$vpn_ip:19088"
-    if [ "$https_services_enabled" -eq 1 ]; then
+    if [ "$https_services_enabled" -eq 1 ] &&
+      [ "$signal_services_enabled" -eq 1 ] &&
+      unit_is_active "$signal_service"; then
       write_environment_entry HETERONETWORK_ADVERTISE_SIGNAL_URL "$public_https_url"
     fi
     write_environment_entry HETERONETWORK_ADVERTISE_STUN_URL \
@@ -1024,7 +1104,7 @@ EOF
   cat >"$agent_gateway_drop_in_tmp" <<EOF || return 1
 [Service]
 Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM=$vpn_ip:19088"
-Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM=127.0.0.1:19443"
+Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM=$vpn_ip:19443"
 Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RELAY_ADMISSION_UPSTREAM=$vpn_ip:18447"
 EOF
   install_candidate "$agent_gateway_drop_in_tmp" \
@@ -1049,7 +1129,6 @@ promote_control_services() {
 
   if [ "$runtime_configuration_changed" -eq 1 ]; then
     stop_unit "$control_plane_service" || return 1
-    stop_unit "$signal_service" || return 1
   fi
 
   if [ "$agent_gateway_drop_in_changed" -eq 1 ]; then
@@ -1062,17 +1141,6 @@ promote_control_services() {
   unit_is_active "$agent_service" || return 1
   unit_is_active "$stun_service" || return 1
 
-  if [ "$https_services_enabled" -eq 1 ]; then
-    if ! unit_is_active "$signal_service"; then
-      systemctl start "$signal_service" || return 1
-    elif [ "$runtime_configuration_changed" -eq 1 ]; then
-      systemctl restart "$signal_service" || return 1
-    fi
-    unit_is_active "$signal_service" || return 1
-  else
-    stop_unit "$signal_service" || return 1
-  fi
-
   if ! unit_is_active "$control_plane_service"; then
     systemctl start "$control_plane_service" || return 1
   elif [ "$runtime_configuration_changed" -eq 1 ]; then
@@ -1083,9 +1151,9 @@ promote_control_services() {
   if [ "$runtime_configuration_changed" -eq 1 ] ||
     [ "$agent_gateway_drop_in_changed" -eq 1 ]; then
     if [ "$https_services_enabled" -eq 1 ]; then
-      log "promoted node to automatic Control Plane, Signal, STUN, and Relay services"
+      log "promoted node to automatic Control Plane with public HTTPS routes; Signal, STUN, and Relay remain independent"
     else
-      log "promoted node to automatic VPN Control Plane, STUN, and Relay services; public HTTPS Signal is unavailable"
+      log "promoted node to automatic VPN Control Plane; Signal, STUN, and Relay remain independent"
     fi
   fi
 }
@@ -1215,26 +1283,32 @@ relay_public_url="udp://$public_url_host:18445"
 relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 
+if unit_is_loaded "$signal_service" && load_signal_bootstrap; then
+  signal_services_enabled=1
+else
+  log "Signal bootstrap or systemd unit is unavailable; STUN and Relay remain independent"
+fi
+
 if unit_is_loaded "$gateway_service" &&
   unit_is_active "$gateway_service" && gateway_is_ready; then
   https_services_enabled=1
 else
-  log "public Web gateway is unavailable; STUN and Relay remain independent"
+  log "public Web gateway is unavailable; VPN Signal, STUN, and Relay remain independent"
 fi
 if unit_is_loaded "$relay_service" &&
   unit_is_active "$relay_service" && relay_is_ready; then
   relay_services_enabled=1
 else
-  log "Relay is not currently ready; STUN remains active and Relay will advertise after recovery"
+  log "Relay is not currently ready; Signal and STUN remain active and Relay will advertise after recovery"
 fi
 
-if ! prepare_udp_runtime_files; then
-  demote_and_exit "unable to stage independent STUN configuration"
+if ! prepare_independent_runtime_files; then
+  demote_and_exit "unable to stage independent Signal/STUN configuration"
 fi
-if ! promote_udp_services; then
-  demote_and_exit "independent STUN activation failed"
+if ! promote_independent_services; then
+  demote_and_exit "independent Signal/STUN activation failed"
 fi
-if [ "$udp_activation_deferred" -eq 1 ]; then
+if [ "$independent_activation_deferred" -eq 1 ]; then
   reconcile_finished=1
   exit 0
 fi
@@ -1243,7 +1317,7 @@ if ! load_control_bootstrap; then
   demote_control_and_exit "Control Plane bootstrap configuration is invalid"
 fi
 
-for control_required_unit in "$control_plane_service" "$signal_service"; do
+for control_required_unit in "$control_plane_service"; do
   if ! unit_is_loaded "$control_required_unit"; then
     demote_control_and_exit "Control Plane systemd units are unavailable"
   fi

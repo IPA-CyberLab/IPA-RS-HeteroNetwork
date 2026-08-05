@@ -4,6 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 autopilot=$script_dir/public-services-autopilot.sh
 control_plane_unit=$script_dir/../deploy/systemd/heteronetwork-control-plane.service
+signal_unit=$script_dir/../deploy/systemd/heteronetwork-signal.service
 stun_unit=$script_dir/../deploy/systemd/heteronetwork-stun.service
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/heteronetwork-public-services-smoke.XXXXXX")
 fake_bin=$test_root/fake-bin
@@ -142,6 +143,7 @@ public_services_dir=$test_root/root/etc/heteronetwork/public-services
 password_file=$test_root/root/etc/heteronetwork/postgres-autopilot/bundle/secrets/application.password
 ca_file=$test_root/root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
 services_env=$public_services_dir/services.env
+signal_services_env=$public_services_dir/signal-services.env
 udp_services_env=$public_services_dir/udp-services.env
 database_url=$public_services_dir/database-url
 database_autopilot_token_file=$public_services_dir/database-autopilot.token
@@ -312,6 +314,7 @@ reset_auto_services() {
   set_inactive heteronetwork-signal.service
   set_inactive heteronetwork-stun.service
   rm -f \
+    "$signal_services_env" \
     "$udp_services_env" \
     "$services_env" \
     "$database_url" \
@@ -342,6 +345,7 @@ assert_demoted() {
   assert_inactive heteronetwork-control-plane.service
   assert_inactive heteronetwork-signal.service
   assert_inactive heteronetwork-stun.service
+  [ ! -e "$signal_services_env" ] || fail "Signal service environment survived demotion"
   [ ! -e "$udp_services_env" ] || fail "UDP service environment survived demotion"
   [ ! -e "$services_env" ] || fail "service environment survived demotion"
   [ ! -e "$database_url" ] || fail "database URL survived demotion"
@@ -355,19 +359,22 @@ assert_demoted() {
   [ ! -e "$agent_gateway_drop_in" ] || fail "Agent gateway routes survived demotion"
 }
 
-assert_control_demoted_udp_active() {
+assert_control_demoted_independent_active() {
   assert_inactive heteronetwork-control-plane.service
-  assert_inactive heteronetwork-signal.service
+  assert_active heteronetwork-signal.service
   assert_active heteronetwork-stun.service
+  [ -f "$signal_services_env" ] || fail "independent Signal environment is missing"
   [ -f "$udp_services_env" ] || fail "independent UDP environment is missing"
-  [ -f "$agent_udp_drop_in" ] || fail "independent STUN advertisement is missing"
+  [ -f "$agent_udp_drop_in" ] || fail "independent Signal/STUN advertisement is missing"
+  grep -q 'HETERONETWORK_AGENT_ADVERTISE_SIGNAL_URL=' "$agent_udp_drop_in" ||
+    fail "independent Signal advertisement is missing"
   [ ! -e "$services_env" ] || fail "Control Plane environment survived partial demotion"
   [ ! -e "$agent_gateway_drop_in" ] || fail "Control Plane gateway routes survived partial demotion"
 }
 
-assert_udp_services_only() {
+assert_vpn_services_only() {
   assert_active heteronetwork-control-plane.service
-  assert_inactive heteronetwork-signal.service
+  assert_active heteronetwork-signal.service
   assert_active heteronetwork-stun.service
   assert_active heteronetwork-relay.service
   [ -f "$services_env" ] || fail "UDP-only service environment is missing"
@@ -398,6 +405,7 @@ assert_inactive heteronetwork-control-plane.service
 run_reconciler
 
 [ -f "$services_env" ] || fail "service environment was not generated"
+[ -f "$signal_services_env" ] || fail "Signal service environment was not generated"
 [ -f "$udp_services_env" ] || fail "UDP service environment was not generated"
 [ -f "$database_url" ] || fail "database URL was not generated"
 [ -f "$database_autopilot_token_file" ] ||
@@ -410,6 +418,8 @@ run_reconciler
   fail "Control Plane enrollment credential drop-in was not generated"
 [ "$(stat -c '%a' "$services_env")" = 640 ] ||
   fail "service environment mode is not 0640"
+[ "$(stat -c '%a' "$signal_services_env")" = 640 ] ||
+  fail "Signal service environment mode is not 0640"
 [ "$(stat -c '%a' "$udp_services_env")" = 640 ] ||
   fail "UDP service environment mode is not 0640"
 [ "$(stat -c '%a' "$database_url")" = 400 ] ||
@@ -456,6 +466,9 @@ fi
 grep -Fqx \
   'EnvironmentFile=/etc/heteronetwork/public-services/udp-services.env' \
   "$stun_unit" || fail "STUN does not use its independent environment"
+grep -Fqx \
+  'EnvironmentFile=/etc/heteronetwork/public-services/signal-services.env' \
+  "$signal_unit" || fail "Signal does not use its independent environment"
 grep -q '^HETERONETWORK_LISTEN="10.250.0.4:19088"$' "$services_env" ||
   fail "automatic Control Plane listen address is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://10.250.0.4:19088"$' \
@@ -477,8 +490,10 @@ grep -Fqx \
   'LoadCredential=node-enrollment-relay-admission.token:/etc/heteronetwork/agent-relay-admission.token' \
   "$control_plane_enrollment_drop_in" ||
   fail "node enrollment Relay credential was not isolated by systemd"
-grep -q '^HETERONETWORK_SIGNAL_LISTEN="127.0.0.1:19443"$' "$services_env" ||
+grep -q '^HETERONETWORK_SIGNAL_LISTEN="10.250.0.4:19443"$' "$signal_services_env" ||
   fail "automatic Signal listen address is wrong"
+grep -q '^HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS="https://seed-a.example,https://seed-b.example"$' \
+  "$signal_services_env" || fail "automatic Signal Control Plane directory is wrong"
 grep -q '^HETERONETWORK_STUN_LISTEN="0.0.0.0:19444"$' "$udp_services_env" ||
   fail "automatic STUN listen address is wrong"
 grep -q '^HETERONETWORK_STUN_HTTP_LISTEN="10.250.0.4:19446"$' "$udp_services_env" ||
@@ -493,6 +508,8 @@ grep -q '^HETERONETWORK_ADVERTISE_STUN_URL="udp://163.220.236.51:19444"$' \
   "$services_env" || fail "automatic STUN advertisement is wrong"
 grep -q 'HETERONETWORK_AGENT_ADVERTISE_STUN_URL=udp://163.220.236.51:19444' \
   "$agent_udp_drop_in" || fail "Agent STUN heartbeat advertisement is wrong"
+grep -q 'HETERONETWORK_AGENT_ADVERTISE_SIGNAL_URL=http://10.250.0.4:19443' \
+  "$agent_udp_drop_in" || fail "Agent Signal heartbeat advertisement is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL="udp://163.220.236.51:18445"$' \
   "$services_env" || fail "Relay advertisement is wrong"
 grep -Fq \
@@ -503,7 +520,7 @@ grep -Fqx \
   "$services_env" || fail "trusted root rotation key was not preserved"
 grep -q 'CONTROL_PLANE_UPSTREAM=10.250.0.4:19088' "$agent_gateway_drop_in" ||
   fail "restricted Control Plane bootstrap gateway route is missing"
-grep -q 'SIGNAL_UPSTREAM=127.0.0.1:19443' "$agent_gateway_drop_in" ||
+grep -q 'SIGNAL_UPSTREAM=10.250.0.4:19443' "$agent_gateway_drop_in" ||
   fail "Signal gateway route is missing"
 grep -q 'RELAY_ADMISSION_UPSTREAM=10.250.0.4:18447' "$agent_gateway_drop_in" ||
   fail "Relay admission gateway route is missing"
@@ -515,12 +532,11 @@ if grep -Fq "$database_autopilot_token" "$services_env" ||
   fail "an autopilot credential was written to the service environment"
 fi
 
-signal_start_line=$(grep -n '^start heteronetwork-signal.service$' "$systemctl_log" |
-  cut -d: -f1)
-control_plane_start_line=$(grep -n '^start heteronetwork-control-plane.service$' \
-  "$systemctl_log" | cut -d: -f1)
-[ "$signal_start_line" -lt "$control_plane_start_line" ] ||
-  fail "Control Plane started before Signal"
+grep -q '^start heteronetwork-control-plane.service$' "$systemctl_log" ||
+  fail "Control Plane was not started after independent services"
+if grep -q '^stop heteronetwork-signal.service$' "$systemctl_log"; then
+  fail "Control Plane reconciliation stopped independent Signal"
+fi
 
 sed -i \
   's/^HETERONETWORK_PUBLIC_SERVICES_TRUSTED_ISSUER_KEYS_B64=.*/HETERONETWORK_PUBLIC_SERVICES_TRUSTED_ISSUER_KEYS_B64=/' \
@@ -531,6 +547,7 @@ if grep -q '^HETERONETWORK_TRUSTED_ISSUER_KEYS=' "$services_env"; then
 fi
 
 services_checksum=$(cksum "$services_env")
+signal_services_checksum=$(cksum "$signal_services_env")
 udp_services_checksum=$(cksum "$udp_services_env")
 database_checksum=$(cksum "$database_url")
 database_autopilot_token_checksum=$(cksum "$database_autopilot_token_file")
@@ -542,6 +559,8 @@ chmod 0640 "$database_url"
 run_reconciler
 [ "$(cksum "$services_env")" = "$services_checksum" ] ||
   fail "idempotent run rewrote the service environment"
+[ "$(cksum "$signal_services_env")" = "$signal_services_checksum" ] ||
+  fail "idempotent run rewrote the Signal service environment"
 [ "$(cksum "$udp_services_env")" = "$udp_services_checksum" ] ||
   fail "idempotent run rewrote the UDP service environment"
 [ "$(cksum "$database_url")" = "$database_checksum" ] ||
@@ -590,7 +609,7 @@ sed -i \
   's/^HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/' \
   "$public_services_dir/bootstrap.env"
 run_reconciler
-assert_control_demoted_udp_active
+assert_control_demoted_independent_active
 sed -i \
   "s/^HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=$database_autopilot_token/" \
   "$public_services_dir/bootstrap.env"
@@ -604,7 +623,7 @@ sed -i \
   "s/^HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=${keycloak_autopilot_token%?}/" \
   "$public_services_dir/bootstrap.env"
 run_reconciler
-assert_control_demoted_udp_active
+assert_control_demoted_independent_active
 sed -i \
   "s/^HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN=$keycloak_autopilot_token/" \
   "$public_services_dir/bootstrap.env"
@@ -616,7 +635,7 @@ write_status public "$fresh_time"
 ln -s "$test_root/credential-symlink-target" "$database_autopilot_token_file"
 run_reconciler
 run_reconciler
-assert_control_demoted_udp_active
+assert_control_demoted_independent_active
 
 prepare_dependencies
 reset_auto_services
@@ -645,7 +664,7 @@ write_status public "$fresh_time"
 run_reconciler
 rm -f "$password_file"
 run_reconciler
-assert_control_demoted_udp_active
+assert_control_demoted_independent_active
 
 prepare_dependencies
 reset_auto_services
@@ -661,6 +680,28 @@ assert_active heteronetwork-stun.service
 if grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL=' "$services_env"; then
   fail "inactive Relay was advertised by the Control Plane"
 fi
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+run_reconciler
+: >"$fake_state/fail-start-heteronetwork-signal.service"
+run_reconciler
+run_reconciler
+assert_active heteronetwork-control-plane.service
+assert_inactive heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+if grep -q '^HETERONETWORK_ADVERTISE_SIGNAL_URL=' "$services_env"; then
+  fail "failed Signal was advertised by the Control Plane"
+fi
+rm -f "$fake_state/fail-start-heteronetwork-signal.service"
+run_reconciler
+assert_active heteronetwork-control-plane.service
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+grep -q '^HETERONETWORK_ADVERTISE_SIGNAL_URL=' "$services_env" ||
+  fail "recovered Signal was not advertised"
 
 prepare_dependencies
 reset_auto_services
@@ -685,7 +726,7 @@ write_gateway_status 163.220.236.51 error
 run_reconciler
 run_reconciler
 run_reconciler
-assert_udp_services_only
+assert_vpn_services_only
 
 prepare_dependencies
 reset_auto_services
@@ -696,7 +737,7 @@ run_reconciler
 run_reconciler
 write_gateway_status 163.220.236.51 error
 run_reconciler
-assert_udp_services_only
+assert_vpn_services_only
 [ -f "$services_env" ] ||
   fail "a transient gateway error removed the service environment"
 [ -f "$agent_gateway_drop_in" ] ||
@@ -715,7 +756,7 @@ grep -q '^HETERONETWORK_ADVERTISE_SIGNAL_URL="https://163.220.236.51"$' \
 
 write_gateway_status 163.220.236.52 error
 run_reconciler
-assert_udp_services_only
+assert_vpn_services_only
 
 prepare_dependencies
 reset_auto_services
@@ -772,7 +813,7 @@ run_reconciler
 run_reconciler
 run_reconciler
 rm -f "$fake_state/fail-start-heteronetwork-control-plane.service"
-assert_control_demoted_udp_active
+assert_control_demoted_independent_active
 
 if grep -Fq "$secret" "$output_log" ||
   grep -Fq "$secret" "$systemctl_log" ||
