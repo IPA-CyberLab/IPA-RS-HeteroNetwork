@@ -738,8 +738,19 @@ gateway_is_ready() {
 }
 
 stun_is_ready() {
-  curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
-    "http://$vpn_ip:19446/healthz" >/dev/null
+  stun_ready_attempt=1
+  while [ "$stun_ready_attempt" -le 10 ]; do
+    if curl --fail --silent --max-time 2 --max-filesize 1048576 \
+      "http://$vpn_ip:19446/healthz" >/dev/null; then
+      return 0
+    fi
+    if [ "$stun_ready_attempt" -lt 10 ]; then
+      sleep 1
+    fi
+    stun_ready_attempt=$((stun_ready_attempt + 1))
+  done
+  log "STUN health endpoint did not become ready within 10 seconds"
+  return 1
 }
 
 write_environment_entry() {
