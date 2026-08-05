@@ -14141,7 +14141,7 @@ fn public_web_gateway_caddyfile(
         if let Some(control_plane_upstream) = config.control_plane_upstream {
             let _ = writeln!(
                 caddyfile,
-                "\t@control_plane_bootstrap path /v1/join /v1/heartbeat /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
+                "\t@control_plane_bootstrap path /v1/join /v1/heartbeat /v1/nodes/authenticate-signal-upsert /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
             );
         }
         if let Some(signal_upstream) = config.signal_upstream {
@@ -21971,6 +21971,7 @@ mod tests {
         assert!(public.contains("@health path /healthz"));
         assert!(public.contains("respond 204"));
         assert!(public.contains("@control_plane_bootstrap path /v1/join /v1/heartbeat"));
+        assert!(public.contains("/v1/nodes/authenticate-signal-upsert"));
         assert!(public.contains("/v1/neighbors/query"));
         assert!(public.contains("/v1/overlay-paths/query"));
         assert!(public.contains("/v1/install/*"));
