@@ -492,7 +492,7 @@ grep -Fqx \
   fail "node enrollment Relay credential was not isolated by systemd"
 grep -q '^HETERONETWORK_SIGNAL_LISTEN="10.250.0.4:19443"$' "$signal_services_env" ||
   fail "automatic Signal listen address is wrong"
-grep -q '^HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS="https://seed-a.example,https://seed-b.example"$' \
+grep -q '^HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS="http://10.250.0.4:19088,https://seed-a.example,https://seed-b.example"$' \
   "$signal_services_env" || fail "automatic Signal Control Plane directory is wrong"
 grep -q '^HETERONETWORK_STUN_LISTEN="0.0.0.0:19444"$' "$udp_services_env" ||
   fail "automatic STUN listen address is wrong"

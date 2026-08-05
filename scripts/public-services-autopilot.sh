@@ -867,7 +867,7 @@ prepare_independent_runtime_files() {
       write_environment_entry HETERONETWORK_SIGNAL_LISTEN "$vpn_ip:19443"
       write_environment_entry \
         HETERONETWORK_SIGNAL_CONTROL_PLANE_URLS \
-        "$signal_control_plane_seed_urls"
+        "$signal_control_plane_urls"
     } >"$signal_services_env_tmp" || return 1
     install_candidate "$signal_services_env_tmp" "$signal_services_env" \
       "root:$service_group" 0640 || return 1
@@ -1284,6 +1284,7 @@ relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 
 if unit_is_loaded "$signal_service" && load_signal_bootstrap; then
+  signal_control_plane_urls="http://$vpn_ip:19088,$signal_control_plane_seed_urls"
   signal_services_enabled=1
 else
   log "Signal bootstrap or systemd unit is unavailable; STUN and Relay remain independent"
