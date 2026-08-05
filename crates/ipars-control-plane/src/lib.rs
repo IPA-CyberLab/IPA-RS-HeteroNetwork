@@ -37,19 +37,20 @@ use ipars_types::api::{
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
-    endpoint_addr_is_usable, relay_admission_url_is_usable, socket_addr_is_globally_routable,
-    validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
-    BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
-    EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
-    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayNeighbor,
-    OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState, RelayCapability,
-    Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
-    TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
-    TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
-    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
-    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
-    MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
+    endpoint_addr_is_usable, literal_udp_bootstrap_socket_addr, relay_admission_url_is_usable,
+    socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, AclAction, AclRule,
+    AggregateOverlayRoute, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy,
+    EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
+    NatClassification, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
+    OverlayNeighbor, OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState,
+    RelayCapability, Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken,
+    TokenLedgerMetrics, TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome,
+    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE,
+    MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES, MAX_PATH_SCORE_REASONS,
+    MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -73,6 +74,7 @@ const MAX_HEARTBEAT_PATH_STATES: usize = 4_096;
 const MAX_ACCEPTED_NODE_QUERY_NONCES: usize = 131_072;
 const MAX_ACTIVE_SERVICE_INSTANCES: usize = 64;
 const MAX_SERVICE_LEASE_SECONDS: i64 = 300;
+const HEARTBEAT_SERVICE_LEASE_SECONDS: i64 = 45;
 const DEFAULT_SERVICE_HA_REPLICA_COUNT: usize = 2;
 const REQUIRED_HA_SERVICE_KINDS: [BootstrapEndpointKind; 5] = [
     BootstrapEndpointKind::ControlPlane,
@@ -3964,6 +3966,8 @@ where
             .await?;
         let now = Utc::now();
         self.validate_heartbeat_request(&request, &node, &policy, previous_signature_at, now)?;
+        let heartbeat_service_instance =
+            heartbeat_service_instance(&request, &self.config.cluster_id, now)?;
         let route_catalog_update_requested = request
             .routes
             .as_ref()
@@ -4074,6 +4078,9 @@ where
                 paths: request.path_state,
             })
             .await?;
+        if let Some(instance) = heartbeat_service_instance {
+            self.advertise_service_instance(instance).await?;
+        }
         if route_catalog_update_requested {
             self.invalidate_overlay_node_snapshot().await;
         }
@@ -5461,6 +5468,90 @@ fn insert_preferred_gateway_route(routes: &mut BTreeMap<IpNet, Route>, route: Ro
     if replace {
         routes.insert(route.cidr, route);
     }
+}
+
+fn heartbeat_service_instance_id(node_id: &NodeId) -> String {
+    format!("agent-services-{node_id}")
+}
+
+fn heartbeat_service_instance(
+    request: &HeartbeatRequest,
+    cluster_id: &ClusterId,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<ServiceInstance>, ControlPlaneError> {
+    let Some(advertisement) = request.service_advertisement.as_ref() else {
+        return Ok(None);
+    };
+    let reject = |reason: String| ControlPlaneError::NodeUpdateRejected {
+        node_id: request.node_id.clone(),
+        reason,
+    };
+    if advertisement.endpoints.is_empty() {
+        return Err(reject(
+            "service advertisement must contain at least one endpoint".to_string(),
+        ));
+    }
+    validate_join_token_bootstrap_endpoints(&advertisement.endpoints)
+        .map_err(|error| reject(error.to_string()))?;
+    let public_ip = request
+        .nat_classification
+        .as_ref()
+        .and_then(NatClassification::publicly_reachable_ip)
+        .ok_or_else(|| {
+            reject("service advertisement requires a public NAT classification".to_string())
+        })?;
+    let mut kinds = BTreeSet::new();
+    for endpoint in &advertisement.endpoints {
+        if !matches!(
+            endpoint.kind,
+            BootstrapEndpointKind::Stun | BootstrapEndpointKind::Relay
+        ) {
+            return Err(reject(format!(
+                "heartbeat service advertisement cannot publish {}",
+                endpoint.kind
+            )));
+        }
+        if !kinds.insert(endpoint.kind) {
+            return Err(reject(format!(
+                "heartbeat service advertisement contains multiple {} endpoints",
+                endpoint.kind
+            )));
+        }
+        let advertised_addr =
+            literal_udp_bootstrap_socket_addr(&endpoint.url).ok_or_else(|| {
+                reject(format!(
+                    "heartbeat {} endpoint must use a literal, usable public IP address",
+                    endpoint.kind
+                ))
+            })?;
+        if advertised_addr.ip() != public_ip {
+            return Err(reject(format!(
+                "heartbeat {} endpoint IP {} does not match classified public IP {public_ip}",
+                endpoint.kind,
+                advertised_addr.ip()
+            )));
+        }
+        if endpoint.kind == BootstrapEndpointKind::Relay {
+            let relay = request.relay_capability.as_ref().ok_or_else(|| {
+                reject("Relay endpoint requires a live Relay capability report".to_string())
+            })?;
+            if !relay.is_eligible_relay() || relay.public_endpoint != Some(advertised_addr) {
+                return Err(reject(
+                    "Relay endpoint does not match the live Relay capability report".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Some(ServiceInstance {
+        cluster_id: cluster_id.clone(),
+        instance_id: heartbeat_service_instance_id(&request.node_id),
+        owner_host_id: request.node_id.as_str().to_string(),
+        owner_node_id: Some(request.node_id.clone()),
+        enrollment_signer: false,
+        endpoints: advertisement.endpoints.clone(),
+        lease_expires_at: now + chrono::Duration::seconds(HEARTBEAT_SERVICE_LEASE_SECONDS),
+        updated_at: now,
+    }))
 }
 
 fn validate_service_instance(
@@ -6965,8 +7056,8 @@ mod tests {
     use ipars_crypto::{encode_bytes, IdentityKeyPair};
     use ipars_types::api::{
         ClientControlRequest, ClientRegistrationBundle, ClientRequestKind, HeartbeatRequest,
-        RegisterClientRequest, RegisterNodeRequest, RemoveNodeRequest, RevokeTokenRequest,
-        RotateWireGuardKeyRequest, SponsoredClientRegistrationRequest,
+        NodeServiceAdvertisement, RegisterClientRequest, RegisterNodeRequest, RemoveNodeRequest,
+        RevokeTokenRequest, RotateWireGuardKeyRequest, SponsoredClientRegistrationRequest,
         CLIENT_REGISTRATION_SCHEMA_VERSION,
     };
     use ipars_types::{
@@ -7869,6 +7960,7 @@ mod tests {
                         "10.43.1.0/24",
                         "routing-epoch-target",
                     )?]),
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -10094,6 +10186,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -10184,6 +10277,7 @@ mod tests {
                     )],
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -10720,6 +10814,7 @@ mod tests {
                     nat_classification: None,
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     node_signature: None,
                 },
@@ -12122,6 +12217,7 @@ mod tests {
                 nat_classification: None,
                 relay_capability: None,
                 routes: None,
+                service_advertisement: None,
                 path_state: Vec::new(),
                 node_signature: None,
             },
@@ -12155,6 +12251,7 @@ mod tests {
                     nat_classification: None,
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![source_path],
                     node_signature: None,
                 },
@@ -12448,6 +12545,7 @@ mod tests {
                     candidates: vec![candidate("node-a")],
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![path("node-a", "node-b")],
                     nat_classification: None,
                     node_signature: None,
@@ -12499,6 +12597,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12522,6 +12621,131 @@ mod tests {
             Some(second_reported_at)
         );
         assert!(store.list_paths_for(&node_id("node-a")).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_publishes_signed_udp_service_lease() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cluster_id = ClusterId::new();
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store,
+        );
+        let mut relay_claims = claims(cluster_id);
+        relay_claims.policy.allow_relay = true;
+        plane
+            .register_with_claims(relay_claims, registration_request("service-node"))
+            .await?;
+
+        let now = Utc::now();
+        let public_ip = Ipv4Addr::new(8, 8, 8, 8);
+        let wireguard_addr = std::net::SocketAddr::from((public_ip, 51_820));
+        let relay_addr = std::net::SocketAddr::from((public_ip, 18_445));
+        let classification = NatClassification::from_observations(
+            wireguard_addr,
+            vec![NatProbeObservation {
+                local_addr: wireguard_addr,
+                stun_server: std::net::SocketAddr::from(([198, 51, 100, 1], 3478)),
+                reflexive_addr: wireguard_addr,
+                observed_at: now,
+            }],
+            now,
+        );
+        let health = NodeHealth {
+            state: HealthState::Healthy,
+            last_seen_at: now,
+            latency_ms: Some(1.0),
+            relay_load: Some(0.0),
+            message: None,
+        };
+        let candidate = EndpointCandidate {
+            node_id: node_id("service-node"),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: wireguard_addr,
+            observed_at: now,
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        };
+        let relay = RelayCapability {
+            enabled_by_policy: true,
+            public_endpoint: Some(relay_addr),
+            admission_url: Some("http://100.64.0.1:18447".to_string()),
+            max_sessions: 100,
+            active_sessions: 0,
+            max_mbps: 1_000,
+            e2e_only: true,
+        };
+        plane
+            .heartbeat(signed_heartbeat_at(
+                "service-node",
+                HeartbeatRequest {
+                    node_id: node_id("service-node"),
+                    health: health.clone(),
+                    candidates: vec![candidate.clone()],
+                    nat_classification: Some(classification.clone()),
+                    relay_capability: Some(relay),
+                    routes: None,
+                    service_advertisement: Some(NodeServiceAdvertisement {
+                        endpoints: vec![
+                            BootstrapEndpoint {
+                                kind: BootstrapEndpointKind::Stun,
+                                url: format!("udp://{public_ip}:19444"),
+                            },
+                            BootstrapEndpoint {
+                                kind: BootstrapEndpointKind::Relay,
+                                url: format!("udp://{relay_addr}"),
+                            },
+                        ],
+                    }),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                now,
+            ))
+            .await?;
+
+        let directory = plane.service_directory().await?;
+        assert_eq!(directory.instances.len(), 1);
+        assert_eq!(
+            directory.instances[0].instance_id,
+            heartbeat_service_instance_id(&node_id("service-node"))
+        );
+        assert_eq!(directory.instances[0].endpoints.len(), 2);
+
+        let rejected = plane
+            .heartbeat(signed_heartbeat_at(
+                "service-node",
+                HeartbeatRequest {
+                    node_id: node_id("service-node"),
+                    health,
+                    candidates: vec![candidate],
+                    nat_classification: Some(classification),
+                    relay_capability: None,
+                    routes: None,
+                    service_advertisement: Some(NodeServiceAdvertisement {
+                        endpoints: vec![BootstrapEndpoint {
+                            kind: BootstrapEndpointKind::Stun,
+                            url: "udp://1.1.1.1:19444".to_string(),
+                        }],
+                    }),
+                    path_state: Vec::new(),
+                    node_signature: None,
+                },
+                now + Duration::milliseconds(1),
+            ))
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(ControlPlaneError::NodeUpdateRejected { reason, .. })
+                if reason.contains("does not match classified public IP")
+        ));
+
         Ok(())
     }
 
@@ -12582,6 +12806,7 @@ mod tests {
                         candidates: Vec::new(),
                         relay_capability: None,
                         routes: None,
+                        service_advertisement: None,
                         path_state: Vec::new(),
                         nat_classification: None,
                         node_signature: None,
@@ -12632,6 +12857,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: Some(vec![route.clone()]),
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12663,6 +12889,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12714,6 +12941,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: Some(vec![outside_scope]),
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12770,6 +12998,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: Some(vec![route("route-denied", "10.43.1.0/24", "node-a")?]),
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12815,6 +13044,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: Some(vec![route("route-unowned", "10.42.1.0/24", "node-b")?]),
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12863,6 +13093,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: Some(vec![zero_metric]),
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -12911,6 +13142,7 @@ mod tests {
                 candidates: vec![candidate("node-a")],
                 relay_capability: None,
                 routes: None,
+                service_advertisement: None,
                 path_state: Vec::new(),
                 nat_classification: None,
                 node_signature: None,
@@ -12967,6 +13199,7 @@ mod tests {
             candidates: Vec::new(),
             relay_capability: None,
             routes: None,
+            service_advertisement: None,
             path_state: Vec::new(),
             nat_classification: None,
             node_signature: None,
@@ -13016,6 +13249,7 @@ mod tests {
                     candidates: vec![candidate("node-b")],
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -13036,6 +13270,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![path("node-b", "node-c")],
                     nat_classification: None,
                     node_signature: None,
@@ -13079,6 +13314,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13133,6 +13369,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13179,6 +13416,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![path("node-a", "node-b"), path("node-a", "node-b")],
                     nat_classification: None,
                     node_signature: None,
@@ -13224,6 +13462,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![path("node-a", "node-b"); MAX_HEARTBEAT_PATH_STATES + 1],
                     nat_classification: None,
                     node_signature: None,
@@ -13271,6 +13510,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![path("node-a", "node-b")],
                     nat_classification: None,
                     node_signature: None,
@@ -13343,6 +13583,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![path("node-a", "node-b")],
                     nat_classification: None,
                     node_signature: None,
@@ -13432,6 +13673,7 @@ mod tests {
             nat_classification: None,
             relay_capability: None,
             routes: None,
+            service_advertisement: None,
             path_state: vec![path("node-a", "relay-a")],
             node_signature: None,
         };
@@ -13447,6 +13689,7 @@ mod tests {
         ));
 
         let relay_request = HeartbeatRequest {
+            service_advertisement: None,
             path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
             ..hidden_peer_request
         };
@@ -13513,6 +13756,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13588,6 +13832,7 @@ mod tests {
                         candidates: Vec::new(),
                         relay_capability: None,
                         routes: None,
+                        service_advertisement: None,
                         path_state: vec![reported_path],
                         nat_classification: None,
                         node_signature: None,
@@ -13640,6 +13885,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13697,6 +13943,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13745,6 +13992,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13797,6 +14045,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13845,6 +14094,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![relay_path("node-a", "node-b", None)],
                     nat_classification: None,
                     node_signature: None,
@@ -13894,6 +14144,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -13950,6 +14201,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -14013,6 +14265,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     nat_classification: None,
                     node_signature: None,
@@ -14062,6 +14315,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("node-a"))],
                     nat_classification: None,
                     node_signature: None,
@@ -14135,6 +14389,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14163,6 +14418,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     nat_classification: None,
                     node_signature: None,
@@ -14237,6 +14493,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14265,6 +14522,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     nat_classification: None,
                     node_signature: None,
@@ -14311,6 +14569,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14339,6 +14598,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![relay_path("node-a", "node-b", Some("relay-a"))],
                     nat_classification: None,
                     node_signature: None,
@@ -14384,6 +14644,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: vec![reported_path],
                     nat_classification: None,
                     node_signature: None,
@@ -14430,6 +14691,7 @@ mod tests {
                     candidates: vec![invalid_ipv6_candidate("node-a")],
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14481,6 +14743,7 @@ mod tests {
                     candidates: vec![future_candidate],
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14538,6 +14801,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(heartbeat_relay),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14591,6 +14855,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14614,6 +14879,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: None,
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14663,6 +14929,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(relay_capability()),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,
@@ -14707,6 +14974,7 @@ mod tests {
                     candidates: Vec::new(),
                     relay_capability: Some(bad_admission_url),
                     routes: None,
+                    service_advertisement: None,
                     path_state: Vec::new(),
                     nat_classification: None,
                     node_signature: None,

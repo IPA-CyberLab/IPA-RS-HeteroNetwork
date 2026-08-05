@@ -467,6 +467,27 @@ fn udp_bootstrap_url_is_usable(url: &url::Url) -> bool {
     }
 }
 
+pub fn literal_udp_bootstrap_socket_addr(value: &str) -> Option<SocketAddr> {
+    let parsed = url::Url::parse(value).ok()?;
+    if parsed.scheme() != "udp"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return None;
+    }
+    let port = parsed.port()?;
+    let ip = match parsed.host()? {
+        url::Host::Domain(domain) => domain.parse::<IpAddr>().ok()?,
+        url::Host::Ipv4(ip) => IpAddr::V4(ip),
+        url::Host::Ipv6(ip) => IpAddr::V6(ip),
+    };
+    let addr = SocketAddr::new(ip, port);
+    endpoint_addr_is_usable(addr).then_some(addr)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointCandidate {
     pub node_id: NodeId,
@@ -2903,8 +2924,15 @@ pub mod api {
         pub relay_capability: Option<RelayCapability>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub routes: Option<Vec<Route>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub service_advertisement: Option<NodeServiceAdvertisement>,
         pub path_state: Vec<PathRecord>,
         pub signed_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NodeServiceAdvertisement {
+        pub endpoints: Vec<BootstrapEndpoint>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2969,6 +2997,8 @@ pub mod api {
         pub relay_capability: Option<RelayCapability>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub routes: Option<Vec<Route>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub service_advertisement: Option<NodeServiceAdvertisement>,
         pub path_state: Vec<PathRecord>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node_signature: Option<NodeRequestSignature>,
@@ -2983,6 +3013,7 @@ pub mod api {
                 nat_classification: self.nat_classification.clone(),
                 relay_capability: self.relay_capability.clone(),
                 routes: self.routes.clone(),
+                service_advertisement: self.service_advertisement.clone(),
                 path_state: self.path_state.clone(),
                 signed_at,
             }

@@ -5916,6 +5916,7 @@ async fn register_daemon_service_owner(
         nat_classification: Some(classification),
         relay_capability,
         routes: Some(routes),
+        service_advertisement: None,
         path_state: Vec::new(),
         node_signature: None,
     };
@@ -8415,6 +8416,7 @@ fn heartbeat_request(index: usize, node: &NodeRecord) -> anyhow::Result<Heartbea
         nat_classification: None,
         relay_capability: node.relay_capability.clone(),
         routes: Some(node.routes.clone()),
+        service_advertisement: None,
         path_state: Vec::new(),
         node_signature: None,
     };

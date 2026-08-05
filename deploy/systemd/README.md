@@ -75,11 +75,14 @@ installer with `--disable-relay` only when that node must not receive Relay
 admission configuration. Do not configure Relay admission manually on joining
 nodes.
 The installer also enables `heteronetwork-public-services-autopilot.timer` by
-default. On every enrolled machine it promotes VPN Control Plane and Web UI plus
-public STUN and Relay while the Agent has a fresh directly reachable public
-classification and the Relay and PostgreSQL HA dependencies are healthy. It
-adds Signal only while the public HTTPS gateway probe succeeds, so a gateway
-failure no longer stops the UDP services. Pass
+default. On every enrolled machine with a fresh directly reachable public
+classification, it starts STUN from the independent `udp-services.env` file and
+has the Agent publish signed STUN and live Relay endpoints to the existing
+Control Planes. This base promotion requires neither a local Control Plane nor
+PostgreSQL or HTTPS. A local VPN Control Plane and Web UI are added only when the
+PostgreSQL HA proxy and credentials are available, and Signal is added only
+while the public HTTPS gateway probe succeeds. Failure of one role does not stop
+the other roles. Pass
 `--disable-public-services` only for an explicit per-node opt-out. Automatically
 promoted Control Planes receive the root and enrollment public verification
 keys. They remain verification-only unless an operator explicitly provisions

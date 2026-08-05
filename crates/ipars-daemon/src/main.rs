@@ -84,12 +84,12 @@ use ipars_types::api::{
     AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics,
     AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind,
     ControlPlaneNodeQueryRequest, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-    NatTraversalStrategyCount, PathStateCount, PeerConnectionIntent, PeerMap, RegisterNodeRequest,
-    RegisterNodeResponse, RelayAdmissionFailureReason, RelayAdmissionRequest,
-    RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
-    SignalHolePunchPlanRequest, SignalHolePunchPlanResponse, SignalMetricsResponse,
-    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
-    StunMetricsResponse,
+    NatTraversalStrategyCount, NodeServiceAdvertisement, PathStateCount, PeerConnectionIntent,
+    PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionFailureReason,
+    RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
+    RelayStatusResponse, SignalHolePunchPlanRequest, SignalHolePunchPlanResponse,
+    SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest,
+    SignalPathResponse, StunMetricsResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -1065,6 +1065,8 @@ struct AgentArgs {
     relay_admission_url: Option<String>,
     #[arg(long, env = "HETERONETWORK_AGENT_RELAY_STATUS_URL")]
     relay_status_url: Option<String>,
+    #[arg(long, env = "HETERONETWORK_AGENT_ADVERTISE_STUN_URL")]
+    advertise_stun_url: Option<String>,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN",
@@ -2125,6 +2127,13 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
             args.heartbeat_interval_seconds,
             "--heartbeat-interval-seconds",
         )?;
+    }
+    if let Some(stun_url) = args.advertise_stun_url.as_ref() {
+        validate_join_token_bootstrap_endpoints(&[BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: stun_url.clone(),
+        }])
+        .context("--advertise-stun-url is not a usable UDP STUN endpoint")?;
     }
     validate_positive_seconds(
         args.nat_discovery_interval_seconds,
@@ -9192,6 +9201,7 @@ async fn run_agent(
                 .context("failed to load agent identity key for heartbeat signing")?,
             control_plane_urls: control_plane_bases.clone(),
             interval: Duration::from_secs(args.heartbeat_interval_seconds),
+            advertised_stun_url: args.advertise_stun_url.clone(),
             relay_capability_reporter: relay_capability_reporter.clone(),
             route_reporter: heartbeat_route_reporter,
         }));
@@ -13930,6 +13940,7 @@ struct HeartbeatReporterConfig {
     identity: IdentityKeyPair,
     control_plane_urls: Vec<String>,
     interval: Duration,
+    advertised_stun_url: Option<String>,
     relay_capability_reporter: Option<RelayCapabilityReporter>,
     route_reporter: Option<HeartbeatRouteReporter>,
 }
@@ -14621,6 +14632,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
         identity,
         control_plane_urls,
         interval,
+        advertised_stun_url,
         relay_capability_reporter,
         route_reporter,
     } = config;
@@ -14642,6 +14654,7 @@ async fn run_heartbeat_loop(config: HeartbeatReporterConfig) {
             &identity,
             relay_capability.clone(),
             routes,
+            advertised_stun_url.as_deref(),
         )
         .await
         {
@@ -14816,12 +14829,15 @@ async fn heartbeat_request(
     identity: &IdentityKeyPair,
     relay_capability: Option<RelayCapability>,
     routes: Option<Vec<Route>>,
+    advertised_stun_url: Option<&str>,
 ) -> anyhow::Result<HeartbeatRequest> {
     let now = chrono::Utc::now();
     runtime.refresh_candidate_observations(now).await;
     let status = runtime.status().await;
     let path_state = heartbeat_path_state(runtime, now).await;
     let health = agent_health_from_status(&status, "agent heartbeat");
+    let service_advertisement =
+        heartbeat_service_advertisement(advertised_stun_url, relay_capability.as_ref())?;
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
         health,
@@ -14829,6 +14845,7 @@ async fn heartbeat_request(
         nat_classification: status.nat_classification,
         relay_capability,
         routes,
+        service_advertisement,
         path_state,
         node_signature: None,
     };
@@ -14838,6 +14855,34 @@ async fn heartbeat_request(
             .context("failed to sign agent heartbeat request")?,
     );
     Ok(request)
+}
+
+fn heartbeat_service_advertisement(
+    advertised_stun_url: Option<&str>,
+    relay_capability: Option<&RelayCapability>,
+) -> anyhow::Result<Option<NodeServiceAdvertisement>> {
+    let mut endpoints = Vec::new();
+    if let Some(url) = advertised_stun_url {
+        endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Stun,
+            url: url.to_string(),
+        });
+    }
+    if let Some(public_endpoint) = relay_capability
+        .filter(|capability| capability.is_eligible_relay())
+        .and_then(|capability| capability.public_endpoint)
+    {
+        endpoints.push(BootstrapEndpoint {
+            kind: BootstrapEndpointKind::Relay,
+            url: format!("udp://{public_endpoint}"),
+        });
+    }
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+    validate_join_token_bootstrap_endpoints(&endpoints)
+        .context("agent service advertisement is invalid")?;
+    Ok(Some(NodeServiceAdvertisement { endpoints }))
 }
 
 async fn heartbeat_path_state(
@@ -22597,8 +22642,14 @@ mod tests {
             AgentNodeState::generate(Utc::now()),
             ClusterPolicy::default(),
         );
-        let request =
-            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+        let request = heartbeat_request(
+            &runtime,
+            &runtime.state().identity_key_pair()?,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         let error = test_error(
             send_heartbeat(&reqwest::Client::new(), &url, request, Duration::ZERO).await,
@@ -22956,7 +23007,7 @@ mod tests {
         let state = AgentNodeState::generate(Utc::now());
         let identity = state.identity_key_pair()?;
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
-        let request = heartbeat_request(&runtime, &identity, None, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None, None).await?;
 
         let received = send_heartbeat_to_control_planes(
             &reqwest::Client::new(),
@@ -23039,7 +23090,7 @@ mod tests {
         let identity = state.identity_key_pair()?;
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
         let notifier = runtime.peer_map_sync_notifier();
-        let request = heartbeat_request(&runtime, &identity, None, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None, None).await?;
         let response =
             send_heartbeat_to_control_planes(&reqwest::Client::new(), &[], request, Duration::ZERO)
                 .await;
@@ -40023,6 +40074,7 @@ exec sleep 60
             &identity,
             None,
             Some(vec![advertised_route.clone()]),
+            Some("udp://203.0.113.10:19444"),
         )
         .await?;
 
@@ -40033,6 +40085,19 @@ exec sleep 60
         assert!(request.candidates[0].observed_at > stale_observed_at);
         assert!(request.relay_capability.is_none());
         assert_eq!(request.routes, Some(vec![advertised_route]));
+        assert_eq!(
+            request
+                .service_advertisement
+                .as_ref()
+                .map(|advertisement| advertisement.endpoints.as_slice()),
+            Some(
+                [BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://203.0.113.10:19444".to_string(),
+                }]
+                .as_slice()
+            )
+        );
         assert_eq!(request.path_state.len(), 1);
         assert_eq!(request.path_state[0].key, path.key);
         assert!(request.path_state[0].score.reasons.iter().any(|reason| {
@@ -40078,8 +40143,14 @@ exec sleep 60
             })
             .await?;
 
-        let request =
-            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+        let request = heartbeat_request(
+            &runtime,
+            &runtime.state().identity_key_pair()?,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         assert!(request.path_state.is_empty());
         Ok(())
@@ -40117,8 +40188,14 @@ exec sleep 60
             })
             .await;
 
-        let request =
-            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+        let request = heartbeat_request(
+            &runtime,
+            &runtime.state().identity_key_pair()?,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         assert!(request.path_state.is_empty());
         Ok(())
@@ -40137,8 +40214,14 @@ exec sleep 60
             .await;
         assert!(runtime.path_state().await.is_empty());
 
-        let request =
-            heartbeat_request(&runtime, &runtime.state().identity_key_pair()?, None, None).await?;
+        let request = heartbeat_request(
+            &runtime,
+            &runtime.state().identity_key_pair()?,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         assert_eq!(request.path_state.len(), 1);
         let path = &request.path_state[0];
@@ -40174,7 +40257,7 @@ exec sleep 60
             .await;
         let identity = runtime.state().identity_key_pair()?;
 
-        let request = heartbeat_request(&runtime, &identity, None, None).await?;
+        let request = heartbeat_request(&runtime, &identity, None, None, None).await?;
 
         assert_eq!(request.health.state, HealthState::Unhealthy);
         let message = request.health.message.as_deref().unwrap_or_default();

@@ -36,6 +36,7 @@ fi
 
 public_services_dir=$filesystem_root/etc/heteronetwork/public-services
 bootstrap_env=$public_services_dir/bootstrap.env
+udp_services_env=$public_services_dir/udp-services.env
 services_env=$public_services_dir/services.env
 database_url_file=$public_services_dir/database-url
 database_autopilot_token_file=$public_services_dir/database-autopilot.token
@@ -43,7 +44,9 @@ keycloak_autopilot_token_file=$public_services_dir/keycloak-autopilot.token
 postgres_password_file=$filesystem_root/etc/heteronetwork/postgres-autopilot/bundle/secrets/application.password
 postgres_ca_file=$filesystem_root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
 agent_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-agent.service.d
-agent_drop_in=$agent_drop_in_dir/30-public-services.conf
+agent_udp_drop_in=$agent_drop_in_dir/30-public-udp-services.conf
+agent_gateway_drop_in=$agent_drop_in_dir/40-public-control-services.conf
+legacy_agent_drop_in=$agent_drop_in_dir/30-public-services.conf
 control_plane_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-control-plane.service.d
 control_plane_enrollment_drop_in=$control_plane_drop_in_dir/40-node-enrollment.conf
 node_enrollment_issuer_key=$filesystem_root/etc/credstore/node-enrollment-issuer.key
@@ -54,14 +57,19 @@ status_file=
 relay_status_file=
 gateway_status_file=
 https_services_enabled=0
+relay_services_enabled=0
 services_env_tmp=
+udp_services_env_tmp=
 database_url_tmp=
 database_autopilot_token_tmp=
 keycloak_autopilot_token_tmp=
-agent_drop_in_tmp=
+agent_udp_drop_in_tmp=
+agent_gateway_drop_in_tmp=
 control_plane_enrollment_drop_in_tmp=
 node_enrollment_enabled=0
 reconcile_finished=0
+udp_services_ready=0
+udp_activation_deferred=0
 
 log() {
   printf '%s\n' "public-services-autopilot: $*" >&2
@@ -71,13 +79,15 @@ cleanup() {
   [ -z "$status_file" ] || rm -f "$status_file"
   [ -z "$relay_status_file" ] || rm -f "$relay_status_file"
   [ -z "$gateway_status_file" ] || rm -f "$gateway_status_file"
+  [ -z "$udp_services_env_tmp" ] || rm -f "$udp_services_env_tmp"
   [ -z "$services_env_tmp" ] || rm -f "$services_env_tmp"
   [ -z "$database_url_tmp" ] || rm -f "$database_url_tmp"
   [ -z "$database_autopilot_token_tmp" ] ||
     rm -f "$database_autopilot_token_tmp"
   [ -z "$keycloak_autopilot_token_tmp" ] ||
     rm -f "$keycloak_autopilot_token_tmp"
-  [ -z "$agent_drop_in_tmp" ] || rm -f "$agent_drop_in_tmp"
+  [ -z "$agent_udp_drop_in_tmp" ] || rm -f "$agent_udp_drop_in_tmp"
+  [ -z "$agent_gateway_drop_in_tmp" ] || rm -f "$agent_gateway_drop_in_tmp"
   [ -z "$control_plane_enrollment_drop_in_tmp" ] ||
     rm -f "$control_plane_enrollment_drop_in_tmp"
 }
@@ -110,7 +120,7 @@ stop_unit() {
   fi
 }
 
-demote() {
+demote_all() {
   demote_reason=$1
   demote_changed=0
   demote_failed=0
@@ -131,40 +141,39 @@ demote() {
   stop_unit "$stun_service" || demote_failed=1
 
   drop_in_removed=0
-  if [ -e "$agent_drop_in" ] || [ -L "$agent_drop_in" ]; then
-    demote_changed=1
-    if rm -f "$agent_drop_in"; then
-      drop_in_removed=1
-    else
-      log "unable to remove the automatic public-service Agent routes"
-      demote_failed=1
+  for demote_path in \
+    "$agent_udp_drop_in" \
+    "$agent_gateway_drop_in" \
+    "$legacy_agent_drop_in"; do
+    if [ -e "$demote_path" ] || [ -L "$demote_path" ]; then
+      demote_changed=1
+      if rm -f "$demote_path"; then
+        drop_in_removed=1
+      else
+        log "unable to remove automatic Agent service configuration"
+        demote_failed=1
+      fi
     fi
-  fi
-  if [ -e "$services_env" ] || [ -L "$services_env" ]; then
-    demote_changed=1
-    rm -f "$services_env" || demote_failed=1
-  fi
-  if [ -e "$database_url_file" ] || [ -L "$database_url_file" ]; then
-    demote_changed=1
-    rm -f "$database_url_file" || demote_failed=1
-  fi
-  if [ -e "$database_autopilot_token_file" ] ||
-    [ -L "$database_autopilot_token_file" ]; then
-    demote_changed=1
-    rm -f "$database_autopilot_token_file" || demote_failed=1
-  fi
-  if [ -e "$keycloak_autopilot_token_file" ] ||
-    [ -L "$keycloak_autopilot_token_file" ]; then
-    demote_changed=1
-    rm -f "$keycloak_autopilot_token_file" || demote_failed=1
-  fi
+  done
+  for demote_path in \
+    "$udp_services_env" \
+    "$services_env" \
+    "$database_url_file" \
+    "$database_autopilot_token_file" \
+    "$keycloak_autopilot_token_file" \
+    "$control_plane_enrollment_drop_in"; do
+    if [ -e "$demote_path" ] || [ -L "$demote_path" ]; then
+      demote_changed=1
+      rm -f "$demote_path" || demote_failed=1
+    fi
+  done
 
-  if [ "$drop_in_removed" -eq 1 ]; then
+  if [ "$drop_in_removed" -eq 1 ] && unit_is_loaded "$agent_service"; then
     if ! systemctl daemon-reload; then
-      log "unable to reload systemd after removing automatic public-service routes"
+      log "unable to reload systemd after removing automatic Agent services"
       demote_failed=1
-    elif ! systemctl restart "$agent_service"; then
-      log "unable to restart the Agent after removing automatic public-service routes"
+    elif unit_is_active "$agent_service" && ! systemctl restart "$agent_service"; then
+      log "unable to restart the Agent after removing automatic services"
       demote_failed=1
     fi
   fi
@@ -175,9 +184,77 @@ demote() {
   [ "$demote_failed" -eq 0 ]
 }
 
+demote_control_services() {
+  control_demote_reason=$1
+  control_demote_changed=0
+  control_demote_failed=0
+
+  if unit_is_active "$control_plane_service"; then
+    control_demote_changed=1
+  fi
+  stop_unit "$control_plane_service" || control_demote_failed=1
+  if unit_is_active "$signal_service"; then
+    control_demote_changed=1
+  fi
+  stop_unit "$signal_service" || control_demote_failed=1
+
+  control_drop_in_removed=0
+  for control_demote_path in \
+    "$agent_gateway_drop_in" \
+    "$legacy_agent_drop_in"; do
+    if [ -e "$control_demote_path" ] || [ -L "$control_demote_path" ]; then
+      control_demote_changed=1
+      if rm -f "$control_demote_path"; then
+        control_drop_in_removed=1
+      else
+        control_demote_failed=1
+      fi
+    fi
+  done
+  for control_demote_path in \
+    "$services_env" \
+    "$database_url_file" \
+    "$database_autopilot_token_file" \
+    "$keycloak_autopilot_token_file" \
+    "$control_plane_enrollment_drop_in"; do
+    if [ -e "$control_demote_path" ] || [ -L "$control_demote_path" ]; then
+      control_demote_changed=1
+      rm -f "$control_demote_path" || control_demote_failed=1
+    fi
+  done
+
+  if [ "$control_drop_in_removed" -eq 1 ]; then
+    if ! systemctl daemon-reload; then
+      control_demote_failed=1
+    elif ! systemctl restart "$agent_service"; then
+      control_demote_failed=1
+    fi
+  fi
+  if [ "$udp_services_ready" -eq 1 ] && ! unit_is_active "$stun_service"; then
+    if ! systemctl start "$stun_service" || ! stun_is_ready; then
+      log "unable to restore STUN after the Agent configuration changed"
+      control_demote_failed=1
+    fi
+  fi
+  if [ "$control_demote_changed" -eq 1 ]; then
+    log "demoted Control Plane and Signal only: $control_demote_reason"
+  fi
+  [ "$control_demote_failed" -eq 0 ]
+}
+
 demote_and_exit() {
   demote_exit_reason=$1
-  if demote "$demote_exit_reason"; then
+  if demote_all "$demote_exit_reason"; then
+    reconcile_finished=1
+    exit 0
+  fi
+  exit 1
+}
+
+demote_control_and_exit() {
+  demote_control_exit_reason=$1
+  if demote_control_services "$demote_control_exit_reason"; then
+    log "$demote_control_exit_reason; STUN and Relay remain independent"
     reconcile_finished=1
     exit 0
   fi
@@ -189,7 +266,11 @@ on_exit() {
   trap - EXIT HUP INT TERM
   set +e
   if [ "$reconcile_finished" -ne 1 ]; then
-    demote "reconciliation exited before reaching a stable state"
+    if [ "$udp_services_ready" -eq 1 ]; then
+      demote_control_services "control-service reconciliation exited before reaching a stable state"
+    else
+      demote_all "reconciliation exited before reaching a stable state"
+    fi
   fi
   cleanup
   exit "$exit_status"
@@ -532,6 +613,13 @@ load_bootstrap() {
   # installer-generated assignments.
   . "$bootstrap_env"
 
+  reconcile_interval_seconds=${HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS-}
+  classification_max_age_seconds=${HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS-}
+  valid_positive_integer "$reconcile_interval_seconds" 300 || return 1
+  valid_positive_integer "$classification_max_age_seconds" 300 || return 1
+}
+
+load_control_bootstrap() {
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_CLUSTER_ID_B64 || return 1
   cluster_id=$DECODED_VALUE
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_VPN_POOL_B64 || return 1
@@ -566,8 +654,6 @@ load_bootstrap() {
 
   database_autopilot_bearer_token=${HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN-}
   keycloak_autopilot_bearer_token=${HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN-}
-  reconcile_interval_seconds=${HETERONETWORK_PUBLIC_SERVICES_RECONCILE_INTERVAL_SECONDS-}
-  classification_max_age_seconds=${HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS-}
 
   valid_identifier "$cluster_id" || return 1
   valid_ipv4_cidr "$vpn_pool" || return 1
@@ -591,8 +677,6 @@ load_bootstrap() {
   valid_url_csv "$bootstrap_control_plane_urls" 0 || return 1
   valid_autopilot_bearer_token "$database_autopilot_bearer_token" || return 1
   valid_autopilot_bearer_token "$keycloak_autopilot_bearer_token" || return 1
-  valid_positive_integer "$reconcile_interval_seconds" 300 || return 1
-  valid_positive_integer "$classification_max_age_seconds" 300 || return 1
 }
 
 postgres_proxy_is_ready() {
@@ -651,6 +735,11 @@ gateway_is_ready() {
   fi
   rm -f "$gateway_status_file"
   gateway_status_file=
+}
+
+stun_is_ready() {
+  curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
+    "http://$vpn_ip:19446/healthz" >/dev/null
 }
 
 write_environment_entry() {
@@ -720,6 +809,63 @@ install_root_credential_candidate() {
   CANDIDATE_CHANGED=1
 }
 
+prepare_udp_runtime_files() {
+  mkdir -p "$public_services_dir" "$agent_drop_in_dir" || return 1
+  chown root:"$service_group" "$public_services_dir" || return 1
+  chmod 0750 "$public_services_dir" || return 1
+  chown root:root "$agent_drop_in_dir" || return 1
+  chmod 0755 "$agent_drop_in_dir" || return 1
+
+  udp_services_env_tmp=$(mktemp "$public_services_dir/.udp-services.env.XXXXXX") ||
+    return 1
+  {
+    write_environment_entry HETERONETWORK_STUN_LISTEN "$stun_listen"
+    write_environment_entry HETERONETWORK_STUN_HTTP_LISTEN "$vpn_ip:19446"
+  } >"$udp_services_env_tmp" || return 1
+  install_candidate "$udp_services_env_tmp" "$udp_services_env" \
+    "root:$service_group" 0640 || return 1
+  udp_services_env_tmp=
+  udp_services_env_changed=$CANDIDATE_CHANGED
+
+  agent_udp_drop_in_tmp=$(
+    mktemp "$agent_drop_in_dir/.30-public-udp-services.conf.XXXXXX"
+  ) || return 1
+  cat >"$agent_udp_drop_in_tmp" <<EOF || return 1
+[Service]
+Environment="HETERONETWORK_AGENT_ADVERTISE_STUN_URL=$stun_public_url"
+EOF
+  install_candidate "$agent_udp_drop_in_tmp" \
+    "$agent_udp_drop_in" root:root 0644 || return 1
+  agent_udp_drop_in_tmp=
+  agent_udp_drop_in_changed=$CANDIDATE_CHANGED
+
+  if [ -e "$legacy_agent_drop_in" ] || [ -L "$legacy_agent_drop_in" ]; then
+    rm -f "$legacy_agent_drop_in" || return 1
+    agent_udp_drop_in_changed=1
+  fi
+}
+
+promote_udp_services() {
+  udp_activation_deferred=0
+  if [ "$agent_udp_drop_in_changed" -eq 1 ]; then
+    systemctl daemon-reload || return 1
+    systemctl restart --no-block "$agent_service" || return 1
+    udp_activation_deferred=1
+    log "staged independent STUN advertisement; activation continues next cycle"
+    return 0
+  fi
+
+  unit_is_active "$agent_service" || return 1
+  if ! unit_is_active "$stun_service"; then
+    systemctl start "$stun_service" || return 1
+  elif [ "$udp_services_env_changed" -eq 1 ]; then
+    systemctl restart "$stun_service" || return 1
+  fi
+  unit_is_active "$stun_service" || return 1
+  stun_is_ready || return 1
+  udp_services_ready=1
+}
+
 prepare_runtime_files() {
   mkdir -p "$public_services_dir" "$agent_drop_in_dir" \
     "$control_plane_drop_in_dir" || return 1
@@ -784,8 +930,10 @@ EOF
     fi
     write_environment_entry HETERONETWORK_ADVERTISE_STUN_URL \
       "$stun_public_url"
-    write_environment_entry HETERONETWORK_ADVERTISE_RELAY_URL \
-      "$relay_public_url"
+    if [ "$relay_services_enabled" -eq 1 ]; then
+      write_environment_entry HETERONETWORK_ADVERTISE_RELAY_URL \
+        "$relay_public_url"
+    fi
     write_environment_entry HETERONETWORK_ADVERTISE_WEB_UI_URL \
       "http://$vpn_ip:19088"
     write_environment_entry HETERONETWORK_WEB_UI_ENABLED true
@@ -859,20 +1007,22 @@ EOF
   keycloak_autopilot_token_tmp=
   keycloak_autopilot_token_changed=$CANDIDATE_CHANGED
 
-  agent_drop_in_tmp=$(mktemp "$agent_drop_in_dir/.30-public-services.conf.XXXXXX") ||
-    return 1
-  cat >"$agent_drop_in_tmp" <<EOF || return 1
+  agent_gateway_drop_in_tmp=$(
+    mktemp "$agent_drop_in_dir/.40-public-control-services.conf.XXXXXX"
+  ) || return 1
+  cat >"$agent_gateway_drop_in_tmp" <<EOF || return 1
 [Service]
 Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_CONTROL_PLANE_UPSTREAM=$vpn_ip:19088"
 Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_SIGNAL_UPSTREAM=127.0.0.1:19443"
 Environment="HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_RELAY_ADMISSION_UPSTREAM=$vpn_ip:18447"
 EOF
-  install_candidate "$agent_drop_in_tmp" "$agent_drop_in" root:root 0644 || return 1
-  agent_drop_in_tmp=
-  agent_drop_in_changed=$CANDIDATE_CHANGED
+  install_candidate "$agent_gateway_drop_in_tmp" \
+    "$agent_gateway_drop_in" root:root 0644 || return 1
+  agent_gateway_drop_in_tmp=
+  agent_gateway_drop_in_changed=$CANDIDATE_CHANGED
 }
 
-promote() {
+promote_control_services() {
   runtime_configuration_changed=0
   if [ "$services_env_changed" -eq 1 ] ||
     [ "$database_url_changed" -eq 1 ] ||
@@ -889,25 +1039,16 @@ promote() {
   if [ "$runtime_configuration_changed" -eq 1 ]; then
     stop_unit "$control_plane_service" || return 1
     stop_unit "$signal_service" || return 1
-    stop_unit "$stun_service" || return 1
   fi
 
-  if [ "$agent_drop_in_changed" -eq 1 ]; then
+  if [ "$agent_gateway_drop_in_changed" -eq 1 ]; then
     systemctl daemon-reload || return 1
     systemctl restart --no-block "$agent_service" || return 1
-    log "staged automatic public-service Agent routes; activation continues next cycle"
+    log "staged automatic Control Plane gateway routes; activation continues next cycle"
     return 0
   fi
 
   unit_is_active "$agent_service" || return 1
-  unit_is_active "$relay_service" || return 1
-  relay_is_ready || return 1
-
-  if ! unit_is_active "$stun_service"; then
-    systemctl start "$stun_service" || return 1
-  elif [ "$runtime_configuration_changed" -eq 1 ]; then
-    systemctl restart "$stun_service" || return 1
-  fi
   unit_is_active "$stun_service" || return 1
 
   if [ "$https_services_enabled" -eq 1 ]; then
@@ -929,7 +1070,7 @@ promote() {
   unit_is_active "$control_plane_service" || return 1
 
   if [ "$runtime_configuration_changed" -eq 1 ] ||
-    [ "$agent_drop_in_changed" -eq 1 ]; then
+    [ "$agent_gateway_drop_in_changed" -eq 1 ]; then
     if [ "$https_services_enabled" -eq 1 ]; then
       log "promoted node to automatic Control Plane, Signal, STUN, and Relay services"
     else
@@ -942,12 +1083,7 @@ if ! load_bootstrap; then
   demote_and_exit "bootstrap configuration is missing or invalid"
 fi
 
-for required_unit in \
-  "$agent_service" \
-  "$relay_service" \
-  "$control_plane_service" \
-  "$signal_service" \
-  "$stun_service"; do
+for required_unit in "$agent_service" "$stun_service"; do
   if ! unit_is_loaded "$required_unit"; then
     demote_and_exit "required systemd unit is unavailable"
   fi
@@ -956,10 +1092,6 @@ done
 if ! unit_is_active "$agent_service"; then
   demote_and_exit "Agent dependency is not active"
 fi
-if ! unit_is_active "$relay_service"; then
-  demote_and_exit "Relay dependency is not active"
-fi
-
 mkdir -p "$runtime_dir"
 chmod 0700 "$runtime_dir"
 status_file=$(mktemp "$runtime_dir/status.XXXXXX")
@@ -1076,40 +1208,65 @@ if unit_is_loaded "$gateway_service" &&
   unit_is_active "$gateway_service" && gateway_is_ready; then
   https_services_enabled=1
 else
-  log "public Web gateway is unavailable; continuing with VPN Control Plane, STUN, and Relay services"
+  log "public Web gateway is unavailable; STUN and Relay remain independent"
 fi
-if ! relay_is_ready; then
-  demote_and_exit "Relay health or advertised endpoint does not match this node"
+if unit_is_loaded "$relay_service" &&
+  unit_is_active "$relay_service" && relay_is_ready; then
+  relay_services_enabled=1
+else
+  log "Relay is not currently ready; STUN remains active and Relay will advertise after recovery"
 fi
+
+if ! prepare_udp_runtime_files; then
+  demote_and_exit "unable to stage independent STUN configuration"
+fi
+if ! promote_udp_services; then
+  demote_and_exit "independent STUN activation failed"
+fi
+if [ "$udp_activation_deferred" -eq 1 ]; then
+  reconcile_finished=1
+  exit 0
+fi
+
+if ! load_control_bootstrap; then
+  demote_control_and_exit "Control Plane bootstrap configuration is invalid"
+fi
+
+for control_required_unit in "$control_plane_service" "$signal_service"; do
+  if ! unit_is_loaded "$control_required_unit"; then
+    demote_control_and_exit "Control Plane systemd units are unavailable"
+  fi
+done
+
 if [ ! -f "$postgres_password_file" ] || [ -L "$postgres_password_file" ] ||
   [ ! -f "$postgres_ca_file" ] || [ -L "$postgres_ca_file" ]; then
-  demote_and_exit "PostgreSQL HA credentials are unavailable"
+  demote_control_and_exit "PostgreSQL HA credentials are unavailable"
 fi
 if ! postgres_proxy_is_ready; then
-  demote_and_exit "local PostgreSQL HA proxy is unavailable"
+  demote_control_and_exit "local PostgreSQL HA proxy is unavailable"
 fi
 
 database_password=$(tr -d '\r\n' <"$postgres_password_file")
 case "$database_password" in
   ''|*[!A-Za-z0-9._~-]*)
-    demote_and_exit "PostgreSQL HA application credential has an invalid format"
+    demote_control_and_exit "PostgreSQL HA application credential has an invalid format"
     ;;
 esac
 if [ "${#database_password}" -gt 512 ]; then
-  demote_and_exit "PostgreSQL HA application credential is too large"
+  demote_control_and_exit "PostgreSQL HA application credential is too large"
 fi
 
 signal_control_plane_urls="http://$vpn_ip:19088,$bootstrap_control_plane_urls"
 
 if ! detect_node_enrollment_credentials; then
-  demote_and_exit "unable to validate optional node-enrollment credentials"
+  demote_control_and_exit "unable to validate optional node-enrollment credentials"
 fi
 
 if ! prepare_runtime_files; then
-  demote_and_exit "unable to stage automatic public-service configuration"
+  demote_control_and_exit "unable to stage automatic Control Plane configuration"
 fi
-if ! promote; then
-  demote_and_exit "automatic public-service activation failed"
+if ! promote_control_services; then
+  demote_control_and_exit "automatic Control Plane activation failed"
 fi
 
 reconcile_finished=1

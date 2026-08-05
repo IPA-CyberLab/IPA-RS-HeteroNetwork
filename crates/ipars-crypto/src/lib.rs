@@ -625,10 +625,10 @@ mod tests {
     use ipars_types::api::{
         AuthenticatedSignalPathRequest, ClientControlRequest, ClientRegistrationBundle,
         ClientRequestKind, ClientRequestSignature, ControlPlaneNodeQueryKind,
-        ControlPlaneNodeQueryRequest, HeartbeatRequest, RegisterClientRequest, RemoveNodeRequest,
-        RevokeTokenRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanRequest,
-        SignalNodeUpsertRequest, SignalPathRequest, SponsoredClientRegistrationRequest,
-        CLIENT_REGISTRATION_SCHEMA_VERSION,
+        ControlPlaneNodeQueryRequest, HeartbeatRequest, NodeServiceAdvertisement,
+        RegisterClientRequest, RemoveNodeRequest, RevokeTokenRequest, RotateWireGuardKeyRequest,
+        SignalHolePunchPlanRequest, SignalNodeUpsertRequest, SignalPathRequest,
+        SponsoredClientRegistrationRequest, CLIENT_REGISTRATION_SCHEMA_VERSION,
     };
     use ipars_types::{
         BootstrapEndpoint, BootstrapEndpointKind, HealthState, KeyId, NodeHealth, NodeRecord,
@@ -967,6 +967,12 @@ mod tests {
             nat_classification: None,
             relay_capability: None,
             routes: None,
+            service_advertisement: Some(NodeServiceAdvertisement {
+                endpoints: vec![BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://203.0.113.10:19444".to_string(),
+                }],
+            }),
             path_state: Vec::new(),
             node_signature: None,
         };
@@ -983,6 +989,12 @@ mod tests {
         ));
         request.node_signature = valid_signature;
         request.health.message = Some("tampered".to_string());
+        assert!(matches!(
+            verify_heartbeat_request_signature(&request, &key.public_key_b64()),
+            Err(CryptoError::InvalidSignature)
+        ));
+        request.health.message = Some("ok".to_string());
+        request.service_advertisement = None;
         assert!(matches!(
             verify_heartbeat_request_signature(&request, &key.public_key_b64()),
             Err(CryptoError::InvalidSignature)
