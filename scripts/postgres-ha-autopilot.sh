@@ -388,15 +388,23 @@ agent_status_is_direct_public() {
         | type == "string"
           and test("^[0-9]+(\\.[0-9]+){3}$"))
       and ($nat | type == "object")
-      and ($nat.connectivity_state == "public")
-      and ($nat.mapping_behavior == "no_nat")
-      and ($nat.strategy == "direct_candidate")
       and ($nat.local_addr | type == "string")
-      and ($nat.observed_endpoint == $nat.local_addr)
       and ($nat.observations | type == "array" and length > 0)
-      and all($nat.observations[];
-        .local_addr == $nat.local_addr
-        and .reflexive_addr == $nat.local_addr)
+      and (
+        (($nat.connectivity_state == "public")
+          and ($nat.mapping_behavior == "no_nat")
+          and ($nat.strategy == "direct_candidate")
+          and ($nat.observed_endpoint == $nat.local_addr)
+          and all($nat.observations[];
+            .local_addr == $nat.local_addr
+            and .reflexive_addr == $nat.local_addr))
+        or
+        (($nat.connectivity_state == "mapped_public")
+          and ($nat.mapping_behavior == "endpoint_independent")
+          and ($nat.observed_endpoint | type == "string")
+          and ($nat.observed_endpoint != $nat.local_addr)
+          and all($nat.observations[]; .local_addr == $nat.local_addr))
+      )
       and ($assessed != null)
       and ($assessed <= (now + 5))
       and ($assessed >= (now - $max_age))
@@ -3394,6 +3402,15 @@ self_test() {
     }
   }')"
   agent_status_is_direct_public "$public_status"
+  agent_status_is_direct_public "$(
+    jq '
+      .nat_classification.connectivity_state = "mapped_public"
+      | .nat_classification.mapping_behavior = "endpoint_independent"
+      | .nat_classification.strategy = "insufficient_data"
+      | .nat_classification.local_addr = "10.10.10.103:51820"
+      | .nat_classification.observations |= map(.local_addr = "10.10.10.103:51820")
+    ' <<<"$public_status"
+  )"
   if agent_status_is_direct_public "$(
     jq '.nat_classification.mapping_behavior = "endpoint_independent"' \
       <<<"$public_status"

@@ -1000,15 +1000,23 @@ if ! jq -e --argjson max_age "$classification_max_age_seconds" '
         and length <= 64
         and test("^[0-9A-Fa-f:.]+$"))
     and ($nat | type == "object")
-    and ($nat.connectivity_state == "public")
-    and ($nat.mapping_behavior == "no_nat")
-    and ($nat.strategy == "direct_candidate")
     and ($nat.local_addr | type == "string")
-    and ($nat.observed_endpoint == $nat.local_addr)
     and ($nat.observations | type == "array" and length > 0)
-    and all($nat.observations[];
-      .local_addr == $nat.local_addr
-      and .reflexive_addr == $nat.local_addr)
+    and (
+      (($nat.connectivity_state == "public")
+        and ($nat.mapping_behavior == "no_nat")
+        and ($nat.strategy == "direct_candidate")
+        and ($nat.observed_endpoint == $nat.local_addr)
+        and all($nat.observations[];
+          .local_addr == $nat.local_addr
+          and .reflexive_addr == $nat.local_addr))
+      or
+      (($nat.connectivity_state == "mapped_public")
+        and ($nat.mapping_behavior == "endpoint_independent")
+        and ($nat.observed_endpoint | type == "string")
+        and ($nat.observed_endpoint != $nat.local_addr)
+        and all($nat.observations[]; .local_addr == $nat.local_addr))
+    )
     and ($assessed != null)
     and ($assessed <= (now + 5))
     and ($assessed >= (now - $max_age))
@@ -1020,13 +1028,25 @@ node_id=$(jq -er '.node_id' "$status_file") ||
   demote_and_exit "Agent node identity is invalid"
 vpn_ip=$(jq -er '.vpn_ip' "$status_file") ||
   demote_and_exit "Agent VPN address is invalid"
-nat_local_addr=$(jq -er '.nat_classification.local_addr' "$status_file") ||
+nat_local_addr=$(jq -er '
+  .nat_classification
+  | if .connectivity_state == "mapped_public" then
+      .observed_endpoint
+    else
+      .local_addr
+    end
+' "$status_file") ||
   demote_and_exit "Agent public endpoint is invalid"
 
 case "$nat_local_addr" in
   \[*)
     public_ip=$(jq -er '
-      .nat_classification.local_addr
+      .nat_classification
+      | if .connectivity_state == "mapped_public" then
+          .observed_endpoint
+        else
+          .local_addr
+        end
       | capture("^\\[(?<host>[0-9A-Fa-f:]+)\\]:[0-9]+$").host
     ' "$status_file") ||
       demote_and_exit "Agent public endpoint is malformed IPv6"
@@ -1039,7 +1059,12 @@ case "$nat_local_addr" in
     ;;
   *)
     public_ip=$(jq -er '
-      .nat_classification.local_addr
+      .nat_classification
+      | if .connectivity_state == "mapped_public" then
+          .observed_endpoint
+        else
+          .local_addr
+        end
       | capture("^(?<host>[0-9.]+):[0-9]+$").host
     ' "$status_file") ||
       demote_and_exit "Agent public endpoint is malformed IPv4"

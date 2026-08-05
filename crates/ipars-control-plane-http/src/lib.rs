@@ -32,12 +32,12 @@ use ipars_types::api::{
     SponsoredClientRegistrationRequest,
 };
 use ipars_types::{
-    bootstrap_endpoints_include_core_services, socket_addr_is_globally_routable, BootstrapEndpoint,
-    BootstrapEndpointKind, ClusterId, ClusterPolicy, HealthState, JoinTokenClaims, KeyId,
-    NatConnectivityState, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath,
-    OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag,
-    TokenLedgerMetrics, TokenPolicy, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+    bootstrap_endpoints_include_core_services, BootstrapEndpoint, BootstrapEndpointKind, ClusterId,
+    ClusterPolicy, HealthState, JoinTokenClaims, KeyId, NeighborMap, NodeHealth, NodeId,
+    NodeRecord, OverlayPath, OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance,
+    SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy, VpnIp,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -3148,8 +3148,20 @@ set -eu
 
 relay_enabled=1
 public_services_enabled=1
+mapped_public_ip=
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --mapped-public-ip)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--mapped-public-ip requires an IP address" >&2
+        exit 2
+      fi
+      mapped_public_ip=$1
+      ;;
+    --mapped-public-ip=*)
+      mapped_public_ip=${1#*=}
+      ;;
     --disable-relay)
       relay_enabled=0
       public_services_enabled=0
@@ -3159,12 +3171,25 @@ while [ "$#" -gt 0 ]; do
       ;;
     *)
       echo "Unknown HeteroNetwork installer argument: $1" >&2
-      echo "Usage: $0 [--disable-relay] [--disable-public-services]" >&2
+      echo "Usage: $0 [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]" >&2
       exit 2
       ;;
   esac
   shift
 done
+
+if [ -n "$mapped_public_ip" ]; then
+  case "$mapped_public_ip" in
+    *[!0-9A-Fa-f:.]*|'')
+      echo "--mapped-public-ip must be an IPv4 or IPv6 address" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${#mapped_public_ip}" -gt 64 ]; then
+    echo "--mapped-public-ip is too long" >&2
+    exit 2
+  fi
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "HeteroNetwork installation must run as root" >&2
@@ -3240,6 +3265,7 @@ relay_transaction_paths='
 /etc/heteronetwork/relay-server-admission.token
 /etc/heteronetwork/relay-autopilot/relay.env
 /etc/systemd/system/heteronetwork-agent.service.d/10-relay-admission.conf
+/etc/systemd/system/heteronetwork-agent.service.d/05-mapped-public.conf
 /etc/systemd/system/heteronetwork-agent.service.d/20-relay-autopilot.conf
 /opt/heteronetwork/libexec/relay-autopilot.sh
 /etc/systemd/system/heteronetwork-relay.service
@@ -3249,6 +3275,7 @@ relay_transaction_paths='
 relay_transaction_temporary_paths='
 /etc/heteronetwork/.relay-admission.token.new
 /etc/heteronetwork/.relay-server-admission.token.new
+/etc/systemd/system/heteronetwork-agent.service.d/.05-mapped-public.conf.new
 /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new
 /etc/systemd/system/.heteronetwork-relay.service.new
 /etc/systemd/system/.heteronetwork-relay-autopilot.service.new
@@ -3950,6 +3977,17 @@ WantedBy=multi-user.target
 UNIT
 
 __RELAY_ADMISSION_INSTALL__
+if [ -n "$mapped_public_ip" ]; then
+  install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
+  cat >/etc/systemd/system/heteronetwork-agent.service.d/.05-mapped-public.conf.new <<MAPPED_PUBLIC_UNIT
+[Service]
+Environment="HETERONETWORK_AGENT_MAPPED_PUBLIC_IP=$mapped_public_ip"
+MAPPED_PUBLIC_UNIT
+  chown root:root /etc/systemd/system/heteronetwork-agent.service.d/.05-mapped-public.conf.new
+  chmod 0644 /etc/systemd/system/heteronetwork-agent.service.d/.05-mapped-public.conf.new
+  mv -f /etc/systemd/system/heteronetwork-agent.service.d/.05-mapped-public.conf.new \
+    /etc/systemd/system/heteronetwork-agent.service.d/05-mapped-public.conf
+fi
 __PUBLIC_SERVICES_INSTALL__
 __KEYCLOAK_INSTALL__
 systemctl daemon-reload
@@ -4518,15 +4556,23 @@ if ! jq -e '
         and length <= 64
         and test("^[0-9A-Fa-f:.]+$"))
     and ($nat | type == "object")
-    and ($nat.connectivity_state == "public")
-    and ($nat.mapping_behavior == "no_nat")
-    and ($nat.strategy == "direct_candidate")
     and ($nat.local_addr | type == "string")
-    and ($nat.observed_endpoint == $nat.local_addr)
     and ($nat.observations | type == "array" and length > 0)
-    and all($nat.observations[];
-      .local_addr == $nat.local_addr
-      and .reflexive_addr == $nat.local_addr)
+    and (
+      (($nat.connectivity_state == "public")
+        and ($nat.mapping_behavior == "no_nat")
+        and ($nat.strategy == "direct_candidate")
+        and ($nat.observed_endpoint == $nat.local_addr)
+        and all($nat.observations[];
+          .local_addr == $nat.local_addr
+          and .reflexive_addr == $nat.local_addr))
+      or
+      (($nat.connectivity_state == "mapped_public")
+        and ($nat.mapping_behavior == "endpoint_independent")
+        and ($nat.observed_endpoint | type == "string")
+        and ($nat.observed_endpoint != $nat.local_addr)
+        and all($nat.observations[]; .local_addr == $nat.local_addr))
+    )
     and ($assessed != null)
     and ($assessed <= (now + 5))
     and ($assessed >= (now - __RELAY_CLASSIFICATION_MAX_AGE_SECONDS__))
@@ -4537,7 +4583,12 @@ fi
 node_id=$(jq -r '.node_id' "$status_file")
 vpn_ip=$(jq -r '.vpn_ip' "$status_file")
 public_ip=$(jq -er '
-  .nat_classification.local_addr
+  .nat_classification
+  | (if .connectivity_state == "mapped_public" then
+       .observed_endpoint
+     else
+       .local_addr
+     end)
   | if startswith("[") then
       capture("^\\[(?<host>[0-9A-Fa-f:.]+)\\]:[0-9]+$").host
     else
@@ -6452,12 +6503,9 @@ where
     let classification = state.plane.nat_classification_for(node_id).await?;
     let public_ip = classification.as_ref().and_then(|classification| {
         let age = now.signed_duration_since(classification.assessed_at);
-        (classification.connectivity_state == NatConnectivityState::Public
-            && classification.public_state_is_supported()
-            && socket_addr_is_globally_routable(classification.local_addr)
-            && age >= ChronoDuration::zero()
-            && age <= config.classification_max_age)
-            .then_some(classification.local_addr.ip())
+        (age >= ChronoDuration::zero() && age <= config.classification_max_age)
+            .then(|| classification.publicly_reachable_ip())
+            .flatten()
     });
     let Some(public_ip) = public_ip else {
         state.plane.withdraw_service_instance(&instance_id).await?;
@@ -9195,9 +9243,12 @@ mod tests {
         assert!(!generated_script.contains(&enrollment_signing_key));
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
-        assert!(
-            generated_script.contains("Usage: $0 [--disable-relay] [--disable-public-services]")
-        );
+        assert!(generated_script.contains(
+            "Usage: $0 [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]"
+        ));
+        assert!(generated_script.contains("HETERONETWORK_AGENT_MAPPED_PUBLIC_IP="));
+        assert!(generated_script
+            .contains("/etc/systemd/system/heteronetwork-agent.service.d/05-mapped-public.conf"));
         assert!(generated_script.contains("public_services_enabled=1"));
         assert!(generated_script.contains("--disable-public-services"));
         assert!(generated_script.contains(
@@ -9308,7 +9359,9 @@ mod tests {
             "ReadWritePaths=/etc/heteronetwork/relay-autopilot /etc/systemd/system/heteronetwork-agent.service.d"
         ));
         assert!(generated_script.contains("($nat.connectivity_state == \"public\")"));
+        assert!(generated_script.contains("($nat.connectivity_state == \"mapped_public\")"));
         assert!(generated_script.contains("($nat.mapping_behavior == \"no_nat\")"));
+        assert!(generated_script.contains("($nat.mapping_behavior == \"endpoint_independent\")"));
         assert!(generated_script.contains("($nat.strategy == \"direct_candidate\")"));
         assert!(generated_script.contains("sub(\"\\\\.[0-9]+Z$\"; \"Z\")"));
         assert!(generated_script.contains("($assessed >= (now - 45))"));

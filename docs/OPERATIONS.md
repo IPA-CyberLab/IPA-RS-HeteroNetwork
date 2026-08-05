@@ -99,6 +99,22 @@ local gateway, Relay, and PostgreSQL HA dependencies are healthy. The
 reconciler withdraws all five services when those conditions stop holding.
 Append `--disable-public-services` only for an explicit node opt-out.
 
+For a node behind persistent one-to-one or port DNAT, append
+`--mapped-public-ip <public-ip>` to the generated install command:
+
+```bash
+sudo sh install-heteronetwork.sh --mapped-public-ip "$PUBLIC_IP"
+```
+
+Set `PUBLIC_IP` to the node's actual globally routable DNAT address. The
+declaration is not trusted by itself. The Agent emits `mapped_public` only
+while STUN observes the same globally routable IP through a stable
+endpoint-independent mapping; an address mismatch or repeated discovery
+failure withdraws its public candidate. Forward the configured public UDP
+ports to the node's matching listeners: `51820` for WireGuard, `18445` for
+Relay, and `19444` for STUN. Automatic public-service promotion additionally
+requires the public HTTPS gateway route used by the deployment.
+
 An idle ACL-visible peer remains installed in WireGuard as a passive quarantine
 entry with its overlay `/32` AllowedIP and host route, a loopback discard hold
 endpoint, no keepalive, and a public key distinct from the advertised real peer
@@ -642,9 +658,11 @@ before registration and refreshes non-public classifications every
 classification is refreshed at the shorter
 `HETERONETWORK_AGENT_PUBLIC_NAT_DISCOVERY_INTERVAL_SECONDS` interval. The signed
 join and heartbeat payloads carry mapping/filtering observations, confidence,
-traversal strategy, and the derived connectivity state (`public`, `nat`,
-`double_nat`, or `relay_only`). Control Plane retains the latest result and the
-WebConsole reads the same state for its node table, drawer, and topology. Run
+traversal strategy, and the derived connectivity state (`public`,
+`mapped_public`, `private`, `nat`, `double_nat`, or `relay_only`).
+`mapped_public` represents an explicitly configured static-DNAT address that
+matches current STUN observations. Control Plane retains the latest result and
+the WebConsole reads the same state for its node table, drawer, and topology. Run
 `scripts/nat-discovery-smoke.sh` to verify the three-node overview and heartbeat
 update contract without manually assigning NAT labels.
 

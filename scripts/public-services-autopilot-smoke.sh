@@ -215,6 +215,36 @@ write_status() {
 EOF
 }
 
+write_mapped_status() {
+  status_assessed_at=$1
+  status_local_addr=${2:-10.10.10.103:51820}
+  status_public_addr=${3:-163.220.236.51:51820}
+  cat >"$fixture" <<EOF
+{
+  "node_id": "node-0e1c0dadf2fab64e23dfe42c9a073f1b",
+  "vpn_ip": "10.250.0.4",
+  "nat_classification": {
+    "connectivity_state": "mapped_public",
+    "mapping_behavior": "endpoint_independent",
+    "strategy": "insufficient_data",
+    "local_addr": "$status_local_addr",
+    "observed_endpoint": "$status_public_addr",
+    "assessed_at": "$status_assessed_at",
+    "observations": [
+      {
+        "local_addr": "$status_local_addr",
+        "reflexive_addr": "$status_public_addr"
+      },
+      {
+        "local_addr": "$status_local_addr",
+        "reflexive_addr": "$status_public_addr"
+      }
+    ]
+  }
+}
+EOF
+}
+
 write_relay_status() {
   relay_status_endpoint=$1
   relay_status_health=${2:-healthy}
@@ -609,6 +639,20 @@ fi
 write_gateway_status 163.220.236.52 error
 run_reconciler
 assert_demoted
+
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_mapped_status "$fresh_time"
+run_reconciler
+run_reconciler
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+assert_active heteronetwork-control-plane.service
+grep -q '^HETERONETWORK_ADVERTISE_STUN_URL="udp://163.220.236.51:19444"$' \
+  "$services_env" || fail "mapped public STUN advertisement is wrong"
+grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL="udp://163.220.236.51:18445"$' \
+  "$services_env" || fail "mapped public Relay advertisement is wrong"
 
 prepare_dependencies
 reset_auto_services

@@ -41,16 +41,15 @@ use ipars_types::{
     validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
     EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
-    NatConnectivityState, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
-    OverlayNeighbor, OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState,
-    RelayCapability, Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken,
-    TokenLedgerMetrics, TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome,
-    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
-    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE,
-    MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES, MAX_PATH_SCORE_REASONS,
-    MIN_OVERLAY_BLOCK_SIZE,
+    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayNeighbor,
+    OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState, RelayCapability,
+    Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
+    TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
+    TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
+    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
+    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
+    MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -5657,24 +5656,30 @@ fn service_owner_is_publicly_reachable(
     now: chrono::DateTime<Utc>,
     policy: &ClusterPolicy,
 ) -> bool {
-    classification.connectivity_state == NatConnectivityState::Public
-        && classification.public_state_is_supported()
-        && socket_addr_is_globally_routable(classification.local_addr)
-        && nat_classification_is_fresh(classification, now, policy.nat_classification_ttl_seconds)
-        && classification.confidence.is_finite()
-        && classification.confidence * 100.0
-            >= f32::from(policy.nat_classification_min_confidence_percent)
-        && node.endpoint_candidates.iter().any(|candidate| {
-            candidate.node_id == node.node_id
-                && candidate.kind == EndpointCandidateKind::PublicUdp
-                && candidate.addr.ip() == classification.local_addr.ip()
-                && candidate.validate_kind_address().is_ok()
-                && socket_addr_is_globally_routable(candidate.addr)
-                && endpoint_candidate_is_fresh(
-                    candidate,
+    classification
+        .publicly_reachable_ip()
+        .is_some_and(|public_ip| {
+            socket_addr_is_globally_routable(std::net::SocketAddr::new(public_ip, 1))
+                && nat_classification_is_fresh(
+                    classification,
                     now,
-                    policy.endpoint_candidate_ttl_seconds,
+                    policy.nat_classification_ttl_seconds,
                 )
+                && classification.confidence.is_finite()
+                && classification.confidence * 100.0
+                    >= f32::from(policy.nat_classification_min_confidence_percent)
+                && node.endpoint_candidates.iter().any(|candidate| {
+                    candidate.node_id == node.node_id
+                        && candidate.kind == EndpointCandidateKind::PublicUdp
+                        && candidate.addr.ip() == public_ip
+                        && candidate.validate_kind_address().is_ok()
+                        && socket_addr_is_globally_routable(candidate.addr)
+                        && endpoint_candidate_is_fresh(
+                            candidate,
+                            now,
+                            policy.endpoint_candidate_ttl_seconds,
+                        )
+                })
         })
 }
 
@@ -6701,7 +6706,7 @@ fn validate_nat_classification_shape(
 ) -> Result<(), String> {
     if !classification.public_state_is_supported() {
         return Err(
-            "NAT classification public state requires matching globally routable no-NAT observations"
+            "NAT classification public state requires matching globally routable direct or explicitly mapped observations"
                 .to_string(),
         );
     }
@@ -8997,7 +9002,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
             ),
             Err(error)
-                if error.contains("requires matching globally routable no-NAT observations")
+                if error.contains("requires matching globally routable direct or explicitly mapped observations")
         ));
     }
 
@@ -9590,6 +9595,80 @@ mod tests {
         assert_eq!(metrics.active_service_host_count, 1);
         assert_eq!(metrics.active_control_plane_count, 1);
         assert!(!metrics.ha_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicitly_mapped_public_service_owner_is_eligible(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-mapped-service-owner");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(
+                cluster_id.clone(),
+                Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 29)?,
+            ),
+            store.clone(),
+        );
+        let now = Utc::now();
+        let mapped_ip = IpAddr::from([8, 8, 4, 40]);
+        let local_addr = std::net::SocketAddr::from(([10, 10, 10, 103], 51_820));
+        let mut node = node_record("mapped-owner");
+        node.cluster_id = cluster_id.clone();
+        node.endpoint_candidates = vec![EndpointCandidate {
+            node_id: node.node_id.clone(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: std::net::SocketAddr::new(mapped_ip, 51_820),
+            observed_at: now,
+            priority: 80,
+            cost: 20,
+            source: CandidateSource::StunProbe,
+        }];
+        let node_id = node.node_id.clone();
+        store.insert_node(node).await?;
+        store
+            .upsert_health(
+                node_id.clone(),
+                NodeHealth {
+                    state: HealthState::Healthy,
+                    last_seen_at: now,
+                    latency_ms: None,
+                    relay_load: None,
+                    message: None,
+                },
+            )
+            .await?;
+        let observations = [
+            std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+            std::net::SocketAddr::from(([8, 8, 8, 8], 3478)),
+        ]
+        .into_iter()
+        .map(|stun_server| NatProbeObservation {
+            local_addr,
+            stun_server,
+            reflexive_addr: std::net::SocketAddr::new(mapped_ip, 51_820),
+            observed_at: now,
+        })
+        .collect();
+        let mut classification =
+            NatClassification::from_observations(local_addr, observations, now);
+        assert_eq!(classification.declare_mapped_public_ip(mapped_ip), Ok(()));
+        store
+            .upsert_nat_classification(node_id, classification)
+            .await?;
+        plane
+            .advertise_service_instance(service_instance(
+                &cluster_id,
+                "mapped-owner",
+                "mapped.example",
+                now,
+                now + Duration::seconds(30),
+            ))
+            .await?;
+
+        let directory = plane.service_directory().await?;
+        assert_eq!(directory.instances.len(), 1);
+        assert_eq!(directory.instances[0].instance_id, "mapped-owner");
         Ok(())
     }
 

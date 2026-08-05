@@ -690,6 +690,8 @@ pub enum NatTraversalStrategy {
 
 /// Connectivity state derived from the latest STUN mapping observations.
 ///
+/// `MappedPublic` is an operator-declared static DNAT address that matches the
+/// currently observed stable public STUN address.
 /// `DoubleNat` is a conservative heuristic for a private local address with
 /// address-dependent mappings observed from multiple reflexive endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -698,6 +700,7 @@ pub enum NatConnectivityState {
     #[default]
     Unknown,
     Public,
+    MappedPublic,
     Private,
     Nat,
     DoubleNat,
@@ -780,19 +783,75 @@ impl NatClassification {
     }
 
     pub fn public_state_is_supported(&self) -> bool {
-        if self.connectivity_state != NatConnectivityState::Public {
-            return true;
+        match self.connectivity_state {
+            NatConnectivityState::Public => {
+                self.mapping_behavior == NatMappingBehavior::NoNat
+                    && self.strategy == NatTraversalStrategy::DirectCandidate
+                    && socket_addr_is_globally_routable(self.local_addr)
+                    && self.observed_endpoint == Some(self.local_addr)
+                    && !self.observations.is_empty()
+                    && self.observations.iter().all(|observation| {
+                        observation.local_addr == self.local_addr
+                            && observation.reflexive_addr == self.local_addr
+                            && socket_addr_is_globally_routable(observation.reflexive_addr)
+                    })
+            }
+            NatConnectivityState::MappedPublic => {
+                let Some(observed_endpoint) = self.observed_endpoint else {
+                    return false;
+                };
+                self.mapping_behavior == NatMappingBehavior::EndpointIndependent
+                    && !socket_addr_is_globally_routable(self.local_addr)
+                    && socket_addr_is_globally_routable(observed_endpoint)
+                    && self.local_addr.ip() != observed_endpoint.ip()
+                    && !self.observations.is_empty()
+                    && self.observations.iter().all(|observation| {
+                        observation.local_addr == self.local_addr
+                            && observation.reflexive_addr.ip() == observed_endpoint.ip()
+                            && socket_addr_is_globally_routable(observation.reflexive_addr)
+                    })
+            }
+            _ => true,
         }
-        self.mapping_behavior == NatMappingBehavior::NoNat
-            && self.strategy == NatTraversalStrategy::DirectCandidate
-            && socket_addr_is_globally_routable(self.local_addr)
-            && self.observed_endpoint == Some(self.local_addr)
-            && !self.observations.is_empty()
-            && self.observations.iter().all(|observation| {
-                observation.local_addr == self.local_addr
-                    && observation.reflexive_addr == self.local_addr
-                    && socket_addr_is_globally_routable(observation.reflexive_addr)
-            })
+    }
+
+    pub fn publicly_reachable_ip(&self) -> Option<IpAddr> {
+        if !self.public_state_is_supported() {
+            return None;
+        }
+        match self.connectivity_state {
+            NatConnectivityState::Public => Some(self.local_addr.ip()),
+            NatConnectivityState::MappedPublic => self.observed_endpoint.map(|addr| addr.ip()),
+            _ => None,
+        }
+    }
+
+    pub fn declare_mapped_public_ip(&mut self, expected_ip: IpAddr) -> Result<(), String> {
+        let expected_endpoint = SocketAddr::new(expected_ip, 1);
+        if !socket_addr_is_globally_routable(expected_endpoint) {
+            return Err(format!(
+                "mapped public IP {expected_ip} is not globally routable"
+            ));
+        }
+        let observed_ip = self
+            .observed_endpoint
+            .map(|endpoint| endpoint.ip())
+            .ok_or_else(|| "mapped public IP requires a stable STUN endpoint".to_string())?;
+        if observed_ip != expected_ip {
+            return Err(format!(
+                "mapped public IP {expected_ip} does not match STUN address {observed_ip}"
+            ));
+        }
+        let previous_state = self.connectivity_state;
+        self.connectivity_state = NatConnectivityState::MappedPublic;
+        if !self.public_state_is_supported() {
+            self.connectivity_state = previous_state;
+            return Err(
+                "mapped public IP requires a private local address and stable endpoint-independent STUN mappings"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -30950,6 +31009,64 @@ mod tests {
             forged.connectivity_state = NatConnectivityState::Public;
             assert!(!forged.public_state_is_supported());
         }
+    }
+
+    #[test]
+    fn nat_classification_supports_explicit_mapped_public_ip() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([10, 10, 10, 103], 51_820));
+        let mapped_ip = std::net::IpAddr::from([8, 8, 4, 4]);
+        let mut classification = NatClassification::from_observations(
+            local_addr,
+            vec![
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                    reflexive_addr: std::net::SocketAddr::new(mapped_ip, 51_820),
+                    observed_at: assessed_at,
+                },
+                NatProbeObservation {
+                    local_addr,
+                    stun_server: std::net::SocketAddr::from(([8, 8, 8, 8], 3478)),
+                    reflexive_addr: std::net::SocketAddr::new(mapped_ip, 51_820),
+                    observed_at: assessed_at,
+                },
+            ],
+            assessed_at,
+        );
+
+        assert_eq!(classification.connectivity_state, NatConnectivityState::Nat);
+        assert_eq!(classification.declare_mapped_public_ip(mapped_ip), Ok(()));
+        assert_eq!(
+            classification.connectivity_state,
+            NatConnectivityState::MappedPublic
+        );
+        assert!(classification.public_state_is_supported());
+        assert_eq!(classification.publicly_reachable_ip(), Some(mapped_ip));
+    }
+
+    #[test]
+    fn mapped_public_ip_must_match_stun_and_stable_mapping() {
+        let assessed_at = Utc::now();
+        let local_addr = std::net::SocketAddr::from(([10, 10, 10, 103], 51_820));
+        let mut classification = NatClassification::from_observations(
+            local_addr,
+            vec![NatProbeObservation {
+                local_addr,
+                stun_server: std::net::SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: std::net::SocketAddr::from(([8, 8, 4, 4], 51_820)),
+                observed_at: assessed_at,
+            }],
+            assessed_at,
+        );
+
+        assert!(classification
+            .declare_mapped_public_ip(std::net::IpAddr::from([8, 8, 8, 8]))
+            .is_err());
+        assert!(classification
+            .declare_mapped_public_ip(std::net::IpAddr::from([8, 8, 4, 4]))
+            .is_err());
+        assert_eq!(classification.connectivity_state, NatConnectivityState::Nat);
     }
 
     #[test]

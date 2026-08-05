@@ -1219,7 +1219,7 @@ fn validate_nat_classification(
     if !classification.public_state_is_supported() {
         return Err(SignalError::NatClassificationInvalid {
             node_id: node_id.clone(),
-            reason: "public state requires matching globally routable no-NAT observations",
+            reason: "public state requires matching globally routable direct or explicitly mapped observations",
         });
     }
     validate_nat_addr(
@@ -4125,7 +4125,7 @@ mod tests {
                 .upsert_node_with_nat(source(Vec::new()), Some(forged_public))
                 .await,
             Err(SignalError::NatClassificationInvalid {
-                reason: "public state requires matching globally routable no-NAT observations",
+                reason: "public state requires matching globally routable direct or explicitly mapped observations",
                 ..
             })
         ));

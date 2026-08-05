@@ -44,10 +44,9 @@ use ipars_types::{
     endpoint_addr_is_usable, private_ip_addrs_share_subnet, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, BootstrapEndpoint, BootstrapEndpointKind,
     CandidateSource, ClusterPolicy, EndpointCandidate, EndpointCandidateKind, NatClassification,
-    NatConnectivityState, NatProbeObservation, NeighborMap, NodeId, NodeRecord, OverlayPath,
-    PathChangeEvent, PathChangeKind, PathQualityObservation, PathRecord, PathScore, PathState,
-    Role, Route, Tag, TransportProtocol, VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_OVERLAY_NODE_ROUTES,
+    NatProbeObservation, NeighborMap, NodeId, NodeRecord, OverlayPath, PathChangeEvent,
+    PathChangeKind, PathQualityObservation, PathRecord, PathScore, PathState, Role, Route, Tag,
+    TransportProtocol, VpnIp, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_OVERLAY_NODE_ROUTES,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -122,6 +121,8 @@ pub enum AgentError {
     Crypto(#[from] CryptoError),
     #[error("stun probe error: {0}")]
     Stun(#[from] StunError),
+    #[error("mapped public IP validation failed: {0}")]
+    MappedPublic(String),
     #[error("route manager error: {0}")]
     RouteManager(#[from] RouteManagerError),
     #[error("route planning error: {0}")]
@@ -2233,14 +2234,13 @@ impl AgentRuntime {
             return false;
         }
 
-        let is_public = classification.connectivity_state == NatConnectivityState::Public
-            && classification.public_state_is_supported();
+        let public_ip = classification.publicly_reachable_ip();
         let mut refreshed = Vec::with_capacity(2);
-        if is_public {
+        if let Some(public_ip) = public_ip {
             refreshed.push(EndpointCandidate {
                 node_id: node_id.clone(),
                 kind: EndpointCandidateKind::PublicUdp,
-                addr: local_addr,
+                addr: SocketAddr::new(public_ip, listen_port),
                 observed_at,
                 priority: 80,
                 cost: 20,
@@ -2279,7 +2279,25 @@ impl AgentRuntime {
             source: CandidateSource::StunProbe,
         });
         self.replace_stun_candidates(refreshed).await;
-        is_public
+        public_ip.is_some()
+    }
+
+    pub async fn declare_mapped_public_ip(
+        &self,
+        expected_ip: IpAddr,
+    ) -> Result<NatClassification, AgentError> {
+        let classification = {
+            let mut current = self.nat_classification.write().await;
+            let classification = current.as_mut().ok_or_else(|| {
+                AgentError::MappedPublic("a successful STUN classification is required".to_string())
+            })?;
+            classification
+                .declare_mapped_public_ip(expected_ip)
+                .map_err(AgentError::MappedPublic)?;
+            classification.clone()
+        };
+        self.request_heartbeat_report();
+        Ok(classification)
     }
 
     async fn classify_nat_internal(
@@ -16915,6 +16933,51 @@ mod tests {
             private_candidates[0].addr,
             SocketAddr::from(([100, 100, 20, 30], 51_820))
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_rebuilds_declared_mapped_public_candidate() -> Result<(), AgentError> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let assessed_at = Utc::now();
+        let local_addr = SocketAddr::from(([10, 10, 10, 103], 40_000));
+        let mapped_ip = IpAddr::from([8, 8, 4, 4]);
+        let observations = vec![
+            NatProbeObservation {
+                local_addr,
+                stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: SocketAddr::new(mapped_ip, 40_000),
+                observed_at: assessed_at,
+            },
+            NatProbeObservation {
+                local_addr,
+                stun_server: SocketAddr::from(([8, 8, 8, 8], 3478)),
+                reflexive_addr: SocketAddr::new(mapped_ip, 40_000),
+                observed_at: assessed_at,
+            },
+        ];
+        let classification =
+            NatClassification::from_observations(local_addr, observations, assessed_at);
+        *runtime.nat_classification.write().await = Some(classification);
+        let classification = runtime.declare_mapped_public_ip(mapped_ip).await?;
+
+        assert!(
+            runtime
+                .refresh_candidates_for_wireguard_listen_port(&classification, 51_820)
+                .await
+        );
+        let candidates = runtime.status().await.candidates;
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].kind, EndpointCandidateKind::PublicUdp);
+        assert_eq!(candidates[0].addr, SocketAddr::new(mapped_ip, 51_820));
+        assert_eq!(candidates[1].kind, EndpointCandidateKind::LocalUdp);
+        assert_eq!(
+            candidates[1].addr,
+            SocketAddr::from(([10, 10, 10, 103], 51_820))
+        );
+        Ok(())
     }
 
     #[tokio::test]

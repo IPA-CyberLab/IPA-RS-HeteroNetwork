@@ -110,10 +110,10 @@ use ipars_types::{
     bootstrap_endpoints_include_core_services, endpoint_addr_is_usable,
     http_url_is_usable_endpoint, relay_pair_rendezvous_ordering, socket_addr_is_globally_routable,
     validate_join_token_bootstrap_endpoints, AclRule, BootstrapEndpoint, BootstrapEndpointKind,
-    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatConnectivityState,
-    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics,
-    PathRecord, PathScore, PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken,
-    TokenLedgerMetrics, TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    ClusterId, ClusterPolicy, EndpointCandidate, HealthState, KeyId, NatTraversalStrategy,
+    NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics, PathRecord, PathScore,
+    PathState, RelayCapability, Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
+    TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
     MAX_PATH_SCORE_REASONS,
 };
@@ -925,6 +925,8 @@ struct AgentArgs {
         default_value = "0.0.0.0:51820"
     )]
     stun_bind: SocketAddr,
+    #[arg(long, env = "HETERONETWORK_AGENT_MAPPED_PUBLIC_IP")]
+    mapped_public_ip: Option<IpAddr>,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_NAT_DISCOVERY_INTERVAL_SECONDS",
@@ -2136,6 +2138,12 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
         args.nat_discovery_failure_threshold > 0,
         "--nat-discovery-failure-threshold must be greater than zero"
     );
+    if let Some(mapped_public_ip) = args.mapped_public_ip {
+        anyhow::ensure!(
+            socket_addr_is_globally_routable(SocketAddr::new(mapped_public_ip, 1)),
+            "--mapped-public-ip must be globally routable"
+        );
+    }
     if args.public_web_gateway_enabled {
         anyhow::ensure!(
             args.public_web_gateway_admin_socket.is_absolute(),
@@ -9003,6 +9011,7 @@ async fn run_agent(
             runtime.as_ref(),
             args.stun_bind,
             args.wireguard_listen_port,
+            args.mapped_public_ip,
             &stun_servers,
         )
         .await
@@ -9163,6 +9172,7 @@ async fn run_agent(
         runtime.clone(),
         AgentStunDiscoveryConfig::from(&args),
         args.stun_bind,
+        args.mapped_public_ip,
         Duration::from_secs(args.nat_discovery_interval_seconds),
         Duration::from_secs(args.public_nat_discovery_interval_seconds),
         args.nat_discovery_failure_threshold,
@@ -9864,10 +9874,22 @@ async fn classify_agent_startup_nat(
     runtime: &AgentRuntime,
     stun_bind: SocketAddr,
     wireguard_listen_port: u16,
+    mapped_public_ip: Option<IpAddr>,
     stun_servers: &[SocketAddr],
 ) -> Result<(), AgentError> {
     match runtime.classify_nat(stun_bind, stun_servers.to_vec()).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            if let Some(mapped_public_ip) = mapped_public_ip {
+                let classification = runtime.declare_mapped_public_ip(mapped_public_ip).await?;
+                runtime
+                    .refresh_candidates_for_wireguard_listen_port(
+                        &classification,
+                        wireguard_listen_port,
+                    )
+                    .await;
+            }
+            Ok(())
+        }
         Err(error) if agent_stun_bind_address_in_use(&error) => {
             let probe_bind = SocketAddr::new(stun_bind.ip(), 0);
             tracing::info!(
@@ -9878,6 +9900,11 @@ async fn classify_agent_startup_nat(
             let classification = runtime
                 .classify_nat_without_candidate_refresh(probe_bind, stun_servers.to_vec())
                 .await?;
+            let classification = if let Some(mapped_public_ip) = mapped_public_ip {
+                runtime.declare_mapped_public_ip(mapped_public_ip).await?
+            } else {
+                classification
+            };
             runtime
                 .refresh_candidates_for_wireguard_listen_port(
                     &classification,
@@ -14198,16 +14225,12 @@ async fn desired_public_web_gateway_ip(
     max_age: Duration,
 ) -> Option<IpAddr> {
     let classification = runtime.status().await.nat_classification?;
-    if classification.connectivity_state != NatConnectivityState::Public
-        || !classification.public_state_is_supported()
-    {
-        return None;
-    }
+    let public_ip = classification.publicly_reachable_ip()?;
     let age = chrono::Utc::now()
         .signed_duration_since(classification.assessed_at)
         .to_std()
         .ok()?;
-    (age <= max_age).then_some(classification.local_addr.ip())
+    (age <= max_age).then_some(public_ip)
 }
 
 fn public_web_gateway_needs_reconciliation(
@@ -14388,6 +14411,7 @@ fn start_nat_discovery(
     runtime: Arc<AgentRuntime>,
     stun_config: AgentStunDiscoveryConfig,
     stun_bind: SocketAddr,
+    mapped_public_ip: Option<IpAddr>,
     interval: Duration,
     public_interval: Duration,
     failure_threshold: u32,
@@ -14395,15 +14419,11 @@ fn start_nat_discovery(
     tokio::spawn(async move {
         let mut consecutive_failures = 0_u32;
         loop {
-            let currently_public =
-                runtime
-                    .status()
-                    .await
-                    .nat_classification
-                    .is_some_and(|classification| {
-                        classification.connectivity_state == NatConnectivityState::Public
-                            && classification.public_state_is_supported()
-                    });
+            let currently_public = runtime
+                .status()
+                .await
+                .nat_classification
+                .is_some_and(|classification| classification.publicly_reachable_ip().is_some());
             let next_interval =
                 nat_discovery_refresh_interval(currently_public, interval, public_interval);
             tokio::time::sleep(next_interval).await;
@@ -14412,6 +14432,31 @@ fn start_nat_discovery(
                 .await
             {
                 Ok(classification) => {
+                    let classification = if let Some(mapped_public_ip) = mapped_public_ip {
+                        match runtime.declare_mapped_public_ip(mapped_public_ip).await {
+                            Ok(classification) => classification,
+                            Err(error) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                let classification_cleared =
+                                    if consecutive_failures >= failure_threshold {
+                                        runtime.clear_nat_classification().await
+                                    } else {
+                                        false
+                                    };
+                                tracing::warn!(
+                                    %error,
+                                    %mapped_public_ip,
+                                    consecutive_failures,
+                                    failure_threshold,
+                                    classification_cleared,
+                                    "mapped public IP no longer matches STUN discovery"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        classification
+                    };
                     consecutive_failures = 0;
                     let public_candidate_refreshed = runtime
                         .refresh_candidates_for_wireguard_listen_port(
@@ -42125,6 +42170,28 @@ exec sleep 60
         Ok(())
     }
 
+    #[test]
+    fn agent_accepts_only_globally_routable_mapped_public_ip() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--mapped-public-ip", "8.8.4.4"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        assert_eq!(args.mapped_public_ip, Some(IpAddr::from([8, 8, 4, 4])));
+        validate_agent_runtime_config(&args)?;
+
+        let cli = Cli::try_parse_from(["iparsd", "agent", "--mapped-public-ip", "10.10.10.103"])?;
+        let Command::Agent(args) = cli.command else {
+            anyhow::bail!("expected agent command");
+        };
+        let Err(error) = validate_agent_runtime_config(&args) else {
+            anyhow::bail!("private mapped public IP unexpectedly passed validation");
+        };
+        assert!(error
+            .to_string()
+            .contains("--mapped-public-ip must be globally routable"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn agent_startup_nat_retries_with_ephemeral_port_when_wireguard_owns_bind(
     ) -> anyhow::Result<()> {
@@ -42143,6 +42210,7 @@ exec sleep 60
             &runtime,
             occupied_addr,
             occupied_addr.port(),
+            None,
             &[server_addr],
         )
         .await?;

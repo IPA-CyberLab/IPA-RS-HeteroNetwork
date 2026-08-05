@@ -14,6 +14,10 @@ test("node and path presentation helpers normalize API values", () => {
     state: "healthy",
     label: "公開",
   });
+  assert.deepEqual(connectivity({ connectivity_state: "mapped_public" }), {
+    state: "healthy",
+    label: "公開",
+  });
 });
 
 test("Mermaid source includes hierarchy, members, and observed links", () => {

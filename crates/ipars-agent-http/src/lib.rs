@@ -4136,6 +4136,7 @@ impl IntoResponse for ApiError {
             | AgentError::RelaySession(_)
             | AgentError::InsecureStatePath(_)
             | AgentError::InvalidState(_)
+            | AgentError::MappedPublic(_)
             | AgentError::WireGuard(_)
             | AgentError::PeerProbe(_) => StatusCode::SERVICE_UNAVAILABLE,
             AgentError::PathProbeRejected(_) | AgentError::PathStateRejected(_) => {
