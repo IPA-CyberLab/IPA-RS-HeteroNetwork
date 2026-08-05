@@ -2422,6 +2422,94 @@ mod tests {
     }
 
     #[test]
+    fn thousand_node_next_hop_tables_reach_every_ordered_node_pair() {
+        const NODE_COUNT: usize = 1_000;
+        const EXPECTED_ORDERED_PAIRS: usize = NODE_COUNT * (NODE_COUNT - 1);
+
+        let nodes = records(NODE_COUNT);
+        for max_degree in SUPPORTED_MAX_DEGREES {
+            let topology = topology(&nodes, max_degree);
+            let mut reached_pairs = 0;
+            let mut maximum_hops = 0;
+
+            for source in &nodes {
+                let source_table = topology
+                    .next_hop_table(&source.node_id)
+                    .unwrap_or_else(|| panic!("{} must have a next-hop table", source.node_id));
+                for destination in &nodes {
+                    if source.node_id == destination.node_id {
+                        continue;
+                    }
+
+                    let (primary, alternate) =
+                        source_table.get(&destination.node_id).unwrap_or_else(|| {
+                            panic!(
+                                "{} must have next hops to {}",
+                                source.node_id, destination.node_id
+                            )
+                        });
+                    let source_neighbors = topology
+                        .neighbors(&source.node_id)
+                        .unwrap_or_else(|| panic!("{} must be in the topology", source.node_id));
+                    assert!(source_neighbors.contains(&primary));
+                    let alternate = alternate.unwrap_or_else(|| {
+                        panic!(
+                            "{} must have an alternate first hop to {}",
+                            source.node_id, destination.node_id
+                        )
+                    });
+                    assert!(source_neighbors.contains(&alternate));
+                    assert_ne!(primary, alternate);
+
+                    let mut current = source.node_id.clone();
+                    let mut visited = BTreeSet::new();
+                    let mut hops = 0;
+                    while current != destination.node_id {
+                        assert!(
+                            visited.insert(current.clone()),
+                            "next-hop loop from {} to {} at {current}",
+                            source.node_id,
+                            destination.node_id
+                        );
+                        let next = topology
+                            .next_hop_table(&current)
+                            .and_then(|table| table.get(&destination.node_id))
+                            .map(|(next, _)| next)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{} lost its route to {} while forwarding from {}",
+                                    current, destination.node_id, source.node_id
+                                )
+                            });
+                        assert!(
+                            topology
+                                .adjacency()
+                                .get(&current)
+                                .is_some_and(|neighbors| neighbors.contains(&next)),
+                            "next hop {next} is not adjacent to {current}"
+                        );
+                        current = next;
+                        hops += 1;
+                        assert!(
+                            hops < ipars_types::MAX_OVERLAY_PATH_NODES,
+                            "{} to {} exceeded the wire path limit",
+                            source.node_id,
+                            destination.node_id
+                        );
+                    }
+                    maximum_hops = maximum_hops.max(hops);
+                    reached_pairs += 1;
+                }
+            }
+
+            assert_eq!(reached_pairs, EXPECTED_ORDERED_PAIRS);
+            eprintln!(
+                "degree {max_degree}: reached all {reached_pairs} ordered pairs in at most {maximum_hops} hops"
+            );
+        }
+    }
+
+    #[test]
     fn thousand_node_same_source_queries_build_only_requested_pairs() {
         let nodes = records(1_000);
         let topology = Arc::new(topology(&nodes, 4));

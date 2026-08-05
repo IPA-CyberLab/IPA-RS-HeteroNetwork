@@ -3375,6 +3375,18 @@ impl AgentRuntime {
         matched.pinned = lazy_connect.is_pinned(&matched.peer);
         self.packet_flow_match_count.fetch_add(1, Ordering::Relaxed);
         drop(lazy_connect);
+        let needs_overlay_path =
+            overlay_destination && !self.has_current_overlay_route_to_peer(&matched.peer).await;
+        if needs_overlay_path {
+            let queued = self
+                .pending_overlay_destinations
+                .lock()
+                .await
+                .enqueue(destination);
+            if queued {
+                self.request_lazy_connect_path_sync();
+            }
+        }
         self.invalidate_overlay_shortcut_snapshot();
         if !was_active || (matched.pinned && !was_pinned) {
             self.request_lazy_connect_sync();
@@ -12844,16 +12856,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_overlay_queues_only_unknown_overlay_destinations(
+    async fn bounded_overlay_queues_unknown_and_known_non_neighbor_destinations(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
         let local_vpn_destination = IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8));
         state.vpn_ip = Some(VpnIp(local_vpn_destination));
         let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let neighbor = peer_record(
+            NodeId::from_string("backbone-neighbor"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 10)),
+            "wg-backbone-neighbor",
+            Vec::new(),
+            Vec::new(),
+        );
         runtime
-            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node.clone(), Vec::new(), 7))
+            .record_neighbor_map_snapshot(bounded_neighbor_map(
+                local_node.clone(),
+                vec![neighbor.clone()],
+                7,
+            ))
             .await?;
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&neighbor))
+            .await;
 
         assert!(runtime
             .record_packet_flow_activity(local_vpn_destination, Utc::now(), false)
@@ -12878,6 +12904,34 @@ mod tests {
         assert_eq!(
             runtime.take_pending_overlay_destinations(8).await,
             vec![overlay_destination]
+        );
+
+        assert!(runtime
+            .record_packet_flow_activity(neighbor.vpn_ip.0, Utc::now(), false)
+            .await
+            .is_some());
+        assert!(runtime
+            .take_pending_overlay_destinations(8)
+            .await
+            .is_empty());
+
+        let non_neighbor = peer_record(
+            NodeId::from_string("known-non-neighbor"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 11)),
+            "wg-known-non-neighbor",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&non_neighbor))
+            .await;
+        assert!(runtime
+            .record_packet_flow_activity(non_neighbor.vpn_ip.0, Utc::now(), false)
+            .await
+            .is_some());
+        assert_eq!(
+            runtime.take_pending_overlay_destinations(8).await,
+            vec![non_neighbor.vpn_ip.0]
         );
 
         assert!(runtime
