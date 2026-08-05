@@ -1511,6 +1511,7 @@ mod tests {
             topology_epoch: epoch,
             routing_epoch: epoch,
             max_degree: neighbors.len() as u16,
+            on_demand_peer_limit: 4,
             vpn_cidr: "10.250.0.0/24"
                 .parse()
                 .unwrap_or_else(|error| panic!("test CIDR must parse: {error}")),

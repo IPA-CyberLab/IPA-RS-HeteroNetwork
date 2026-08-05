@@ -43,7 +43,7 @@ export function TopologyPage({
 }) {
   const [fanout, setFanout] = useState("4");
   const [maxDegree, setMaxDegree] = useState(degreeOptions[0]);
-  const [shortcutLimit, setShortcutLimit] = useState("0");
+  const [onDemandPeerLimit, setOnDemandPeerLimit] = useState("4");
   const [validationError, setValidationError] = useState(null);
 
   useEffect(() => {
@@ -54,11 +54,11 @@ export function TopologyPage({
           option.value === String(policy?.overlay_max_degree ?? topology?.max_degree ?? 4),
       ) || degreeOptions[0],
     );
-    setShortcutLimit(
+    setOnDemandPeerLimit(
       String(
-        policy?.overlay_direct_shortcut_limit ??
-          topology?.direct_shortcut_limit ??
-          0,
+        policy?.overlay_on_demand_peer_limit ??
+          topology?.on_demand_peer_limit ??
+          4,
       ),
     );
   }, [policy, topology]);
@@ -80,20 +80,24 @@ export function TopologyPage({
     nodeDisplayName(nodesById.get(nodeId) || { node_id: nodeId });
   const save = async () => {
     const fanoutValue = Number(fanout);
-    const shortcutValue = Number(shortcutLimit);
+    const onDemandPeerValue = Number(onDemandPeerLimit);
     if (!Number.isInteger(fanoutValue) || fanoutValue < 4 || fanoutValue > 64) {
       setValidationError(new Error("グループファンアウトは4から64の整数で指定してください。"));
       return;
     }
-    if (!Number.isInteger(shortcutValue) || shortcutValue < 0 || shortcutValue > 64) {
-      setValidationError(new Error("直接ショートカット数は0から64の整数で指定してください。"));
+    if (
+      !Number.isInteger(onDemandPeerValue) ||
+      onDemandPeerValue < 0 ||
+      onDemandPeerValue > 64
+    ) {
+      setValidationError(new Error("オンデマンド論理ピア数は0から64の整数で指定してください。"));
       return;
     }
     setValidationError(null);
     await onSaveSettings({
       overlay_block_size: fanoutValue,
       overlay_max_degree: Number(maxDegree.value),
-      overlay_direct_shortcut_limit: shortcutValue,
+      overlay_on_demand_peer_limit: onDemandPeerValue,
     });
   };
 
@@ -237,13 +241,13 @@ export function TopologyPage({
               />
             </FormField>
             <FormField
-              label="直接ショートカット数"
-              description="階層外に追加する低遅延の直接接続"
+              label="オンデマンド論理ピア数"
+              description="バックボーン経由で同時に維持する追加の暗号化セッション上限"
             >
               <Input
                 type="number"
-                value={shortcutLimit}
-                onChange={({ detail }) => setShortcutLimit(detail.value)}
+                value={onDemandPeerLimit}
+                onChange={({ detail }) => setOnDemandPeerLimit(detail.value)}
               />
             </FormField>
           </ColumnLayout>

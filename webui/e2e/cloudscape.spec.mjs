@@ -41,6 +41,7 @@ const policy = {
   overlay_block_size: 4,
   overlay_max_degree: 4,
   overlay_direct_shortcut_limit: 0,
+  overlay_on_demand_peer_limit: 4,
   acl_rules: [],
 };
 
@@ -54,6 +55,7 @@ const topology = {
   fanout: 4,
   max_degree: 4,
   direct_shortcut_limit: 0,
+  on_demand_peer_limit: 4,
   topology_epoch: 12,
   groups: [
     {

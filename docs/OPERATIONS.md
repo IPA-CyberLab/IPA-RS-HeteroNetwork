@@ -581,6 +581,26 @@ curl -fsS \
     "${CONTROL_PLANE}/v1/admin/policy"
 ```
 
+`ClusterPolicy.overlay_on_demand_peer_limit` independently bounds the logical
+peer sessions that one routing node retains above its physical backbone. It
+defaults to 4 and accepts 0 through 64. When the limit is reached, the Agent
+evicts the least-recently-used session before resolving another one; pinned
+sessions are preferred but cannot exceed the hard limit. Lowering the value is
+applied by the next signed neighbor map without restarting the Agent. This
+changes the limit to 8 while preserving every other policy field:
+
+```bash
+curl -fsS \
+  -H 'Authorization: Bearer <operator-token>' \
+  "${CONTROL_PLANE}/v1/admin/policy" |
+  jq '.cluster_policy.overlay_on_demand_peer_limit = 8 | {cluster_policy}' |
+  curl -fsS -X PUT \
+    -H 'Authorization: Bearer <operator-token>' \
+    -H 'Content-Type: application/json' \
+    --data-binary @- \
+    "${CONTROL_PLANE}/v1/admin/policy"
+```
+
 An accepted topology-policy change updates the content-derived
 `topology_epoch`. Agents converge without restart on subsequent signed
 neighbor-map and overlay-path refreshes. During rollout, inspect the active
@@ -610,7 +630,10 @@ removed from active membership and its representatives are reassigned; a fresh
 heartbeat adds it back with a new topology epoch. The degree shown here is the
 direct bounded-overlay degree. Client-to-gateway sessions are separate, and
 non-neighbor Kubernetes PodCIDR owners stay passive until traffic resolves a
-path through the hierarchy.
+path through the hierarchy. A routing node therefore retains at most
+`overlay_max_degree + overlay_on_demand_peer_limit` steady-state routing peers,
+apart from bounded topology-migration state and separately accounted client
+sessions.
 
 For clusters with many advertised routes, set
 `ClusterPolicy.overlay_route_scopes` to the stable PodCIDR allocation ranges.
@@ -638,9 +661,10 @@ The Control Plane does not route across holes by widening the result. Scopes
 only trigger packet capture.
 The destination owner is selected on demand from the exact longest-prefix
 route index and remains subject to destination-specific ACL checks. Each Agent
-keeps no more than 4,096 resolved peer paths and 4,096 exact route leases, with
-at most 256 routes per owner and least-recently-used unpinned entries evicted
-as new demand arrives. Node identity, route, and policy changes atomically
+keeps no more than `overlay_on_demand_peer_limit` active non-backbone logical
+peer paths, 4,096 exact route leases, and 256 routes per owner. Logical paths
+and route leases use least-recently-used eviction as new demand arrives. Node
+identity, route, and policy changes atomically
 advance a shared monotonic routing epoch and immediately discard existing route
 leases on every Agent that receives the new map. Active-active policy and route
 writes use transactional compare-and-swap guards; a concurrent stale write

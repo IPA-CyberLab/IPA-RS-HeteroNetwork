@@ -285,6 +285,15 @@ their proxy tasks expire after the idle timeout even when route ownership keeps
 the destination discoverable. Thus advertising one PodCIDR per node does not
 recreate either an `N x N` direct mesh or permanently retained all-pairs proxy
 state.
+Each `NeighborMap` carries the current
+`ClusterPolicy.overlay_on_demand_peer_limit`. The Agent retains at most that
+many non-backbone logical peers (four by default, at most 64), evicting the
+least recently used entry before admitting another. Unpinned entries are
+evicted first; a pin receives retention priority but cannot override the hard
+budget. Backbone peers and the bounded previous-topology migration set are
+accounted separately, while client-to-gateway sessions remain a separate
+termination class. This makes the routing-node peer budget independent of
+cluster size even when demand touches every node.
 The `NeighborMap` carries at most 64 aggregate capture scopes instead of the
 complete route-owner directory. An empty `ClusterPolicy.overlay_route_scopes`
 asks the Control Plane to aggregate the exact advertised CIDRs; an explicit
@@ -295,9 +304,9 @@ It also rejects an automatically derived result above 64 scopes rather than
 widening a scope across unadvertised address space. Packet demand is resolved
 against a cached longest-prefix route index, with metric and stable identity
 tie-breaking plus per-request ACL checks, so a broad capture scope is not an
-authorization grant. Each Agent retains at most 4,096 resolved peer paths and
-4,096 exact route leases, with at most 256 leases per route owner, evicting the
-least recently used unpinned state. Backbone neighbor records never carry
+authorization grant. Each Agent retains at most 4,096 exact route leases, with
+at most 256 leases per route owner, evicting the least recently used state.
+Backbone neighbor records never carry
 advertised routes; a directly adjacent route owner receives the authorized
 route on its existing peer without starting a forwarding proxy. A
 transactional, monotonically increasing routing epoch covers node identity,
@@ -311,9 +320,9 @@ Path resolution runs in its own Control Plane failover loop and therefore does
 not depend on Signal or direct-path negotiation being enabled. Its bounded
 deduplicating FIFO retries failed destinations at the tail and resolves up to
 16 requests concurrently, so permanently rejected destinations cannot starve
-the rest of a 1,000-node cluster. The direct-shortcut policy field is reserved
-for future bilateral, control-plane-issued leases; its fresh-cluster default is
-zero.
+the rest of a 1,000-node cluster. The direct-shortcut policy field remains
+reserved for future bilateral, control-plane-issued leases; its fresh-cluster
+default is zero and it is not used as the logical peer budget.
 
 ACL-visible idle peers are represented by passive WireGuard peer entries with
 their overlay `/32` AllowedIP and host route, a loopback discard hold endpoint,

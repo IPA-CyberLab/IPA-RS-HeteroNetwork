@@ -924,6 +924,51 @@ impl ResolvedOverlayPathState {
     }
 }
 
+fn trim_on_demand_overlay_paths(
+    resolved: &mut ResolvedOverlayPathState,
+    lazy_connect: &mut LazyConnectManager,
+    backbone_peers: &BTreeSet<NodeId>,
+    limit: usize,
+    protected_peer: Option<&NodeId>,
+) -> BTreeSet<NodeId> {
+    let on_demand_count = resolved
+        .paths
+        .keys()
+        .filter(|peer| !backbone_peers.contains(*peer))
+        .count();
+    let excess = on_demand_count.saturating_sub(limit);
+    if excess == 0 {
+        return BTreeSet::new();
+    }
+
+    let mut candidates = resolved
+        .paths
+        .iter()
+        .filter(|(peer, _)| !backbone_peers.contains(*peer) && protected_peer != Some(*peer))
+        .map(|(peer, lease)| {
+            (
+                lazy_connect.is_durably_pinned(peer),
+                lazy_connect
+                    .last_used
+                    .get(peer)
+                    .copied()
+                    .unwrap_or(lease.resolved_at),
+                peer.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    let mut evicted = BTreeSet::new();
+    for (_, _, peer) in candidates.into_iter().take(excess) {
+        resolved.remove_peer(&peer);
+        lazy_connect.remove_activity(&peer);
+        lazy_connect.remove_observed_peer(&peer);
+        evicted.insert(peer);
+    }
+    evicted
+}
+
 #[derive(Debug)]
 struct OverlayShortcutGenerationUpdate<'a> {
     generation: &'a AtomicU64,
@@ -3721,16 +3766,22 @@ impl AgentRuntime {
             (active_epochs, retained_topology_pins)
         };
 
-        let topology_pins = neighbor_map
+        let backbone_peer_ids = neighbor_map
             .neighbors
             .iter()
             .map(|neighbor| neighbor.node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let topology_pins = backbone_peer_ids
+            .iter()
+            .cloned()
             .chain(retained_topology_pins)
             .collect::<BTreeSet<_>>();
-        self.lazy_connect
-            .write()
-            .await
-            .replace_topology_pins(topology_pins);
+        let on_demand_peer_limit = usize::from(neighbor_map.on_demand_peer_limit);
+        {
+            let mut lazy_connect = self.lazy_connect.write().await;
+            lazy_connect.replace_topology_pins(topology_pins);
+            lazy_connect.replace_on_demand_peer_limit(neighbor_map.on_demand_peer_limit);
+        }
 
         let (destinations_to_refresh, expired_peers) = {
             let mut resolved = self.resolved_overlay_paths.write().await;
@@ -3770,11 +3821,27 @@ impl AgentRuntime {
                 lazy_connect.remove_activity(peer);
                 lazy_connect.remove_observed_peer(peer);
             }
-            drop(lazy_connect);
+        }
+        let budget_evicted_peers = {
+            let mut lazy_connect = self.lazy_connect.write().await;
+            let mut resolved = self.resolved_overlay_paths.write().await;
+            trim_on_demand_overlay_paths(
+                &mut resolved,
+                &mut lazy_connect,
+                &backbone_peer_ids,
+                on_demand_peer_limit,
+                None,
+            )
+        };
+        let removed_peers = expired_peers
+            .union(&budget_evicted_peers)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !removed_peers.is_empty() {
             self.overlay_forwarder_endpoints
                 .write()
                 .await
-                .retain(|peer, _| !expired_peers.contains(peer));
+                .retain(|peer, _| !removed_peers.contains(peer));
         }
         *self.latest_neighbor_map.write().await = Some(neighbor_map);
         drop(shortcut_update);
@@ -3927,10 +3994,18 @@ impl AgentRuntime {
         let exact_route = normalize_resolved_overlay_path_routes(&mut path)?;
 
         let target_id = path.target.node_id.clone();
-        let is_backbone_neighbor = neighbor_map
+        let backbone_peer_ids = neighbor_map
             .neighbors
             .iter()
-            .any(|neighbor| neighbor.node.node_id == target_id);
+            .map(|neighbor| neighbor.node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        let is_backbone_neighbor = backbone_peer_ids.contains(&target_id);
+        let on_demand_peer_limit = usize::from(neighbor_map.on_demand_peer_limit);
+        if !is_backbone_neighbor && on_demand_peer_limit == 0 {
+            return Err(AgentError::InvalidState(
+                "on-demand overlay peer limit is zero".to_string(),
+            ));
+        }
         let local_route_cidrs = self
             .local_advertised_routes
             .read()
@@ -3949,39 +4024,16 @@ impl AgentRuntime {
                 resolved.remove_peer(&target_id);
                 lazy_connect.remove_observed_peer(&target_id);
             }
-            if !resolved.paths.contains_key(&target_id)
-                && resolved.paths.len() >= MAX_RESOLVED_OVERLAY_PATHS
-            {
-                let evicted = resolved
-                    .paths
-                    .iter()
-                    .filter(|(peer, lease)| {
-                        if lease.exact_route_count() > 0 {
-                            !lazy_connect.is_route_lease_pinned(peer)
-                        } else {
-                            !lazy_connect.is_durably_pinned(peer)
-                        }
-                    })
-                    .min_by_key(|(peer, lease)| {
-                        (
-                            lazy_connect
-                                .last_used
-                                .get(*peer)
-                                .copied()
-                                .unwrap_or(lease.resolved_at),
-                            (*peer).clone(),
-                        )
-                    })
-                    .map(|(peer, _)| peer.clone())
-                    .ok_or_else(|| {
-                        AgentError::InvalidState(format!(
-                            "all {MAX_RESOLVED_OVERLAY_PATHS} resolved overlay paths are pinned"
-                        ))
-                    })?;
-                resolved.remove_peer(&evicted);
-                lazy_connect.remove_activity(&evicted);
-                lazy_connect.remove_observed_peer(&evicted);
-                evicted_paths.insert(evicted);
+            if !is_backbone_neighbor {
+                let target_exists = resolved.paths.contains_key(&target_id);
+                let retained_limit = on_demand_peer_limit - usize::from(!target_exists);
+                evicted_paths.extend(trim_on_demand_overlay_paths(
+                    &mut resolved,
+                    &mut lazy_connect,
+                    &backbone_peer_ids,
+                    retained_limit,
+                    target_exists.then_some(&target_id),
+                ));
             }
 
             if let Some(route) = exact_route.as_ref() {
@@ -7897,6 +7949,10 @@ impl LazyConnectManager {
         self.topology_pins = peers;
     }
 
+    pub fn replace_on_demand_peer_limit(&mut self, limit: u16) {
+        self.policy.overlay_on_demand_peer_limit = limit;
+    }
+
     pub fn is_pinned(&self, peer: &NodeId) -> bool {
         self.pins.contains(peer)
             || self.observed_policy_pins.contains(peer)
@@ -7908,10 +7964,6 @@ impl LazyConnectManager {
         self.pins.contains(peer)
             || self.observed_policy_pins.contains(peer)
             || self.topology_pins.contains(peer)
-    }
-
-    fn is_route_lease_pinned(&self, peer: &NodeId) -> bool {
-        self.pins.contains(peer) || self.observed_policy_pins.contains(peer)
     }
 
     pub fn is_pinned_by_policy(&self, role: &Role, tags: &BTreeSet<Tag>) -> bool {
@@ -8009,6 +8061,7 @@ impl LazyConnectManager {
         LazyConnectMetrics {
             active_peer_count: self.last_used.len(),
             pinned_peer_count,
+            on_demand_peer_limit: usize::from(self.policy.overlay_on_demand_peer_limit),
             observed_peer_vpn_ip_count: self.peer_vpn_ips.len(),
             observed_route_peer_count: self.advertised_routes.len(),
             observed_route_count: self.advertised_routes.values().map(Vec::len).sum(),
@@ -8769,6 +8822,7 @@ mod tests {
             topology_epoch,
             routing_epoch: topology_epoch,
             max_degree: 4,
+            on_demand_peer_limit: 4,
             vpn_cidr: "100.64.0.0/10"
                 .parse()
                 .unwrap_or_else(|error| panic!("static test VPN CIDR must parse: {error}")),
@@ -13104,6 +13158,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_overlay_applies_a_lower_on_demand_peer_limit_immediately(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let mut neighbor_map = bounded_neighbor_map(local_node.clone(), Vec::new(), 7);
+        neighbor_map.on_demand_peer_limit = 4;
+        let initial_generated_at = neighbor_map.generated_at;
+        runtime
+            .record_neighbor_map_snapshot(neighbor_map.clone())
+            .await?;
+
+        let observed_at = Utc::now();
+        for index in 1_u8..=4 {
+            let target = peer_record(
+                NodeId::from_string(format!("on-demand-{index}")),
+                IpAddr::V4(Ipv4Addr::new(100, 64, 2, index)),
+                &format!("wg-on-demand-{index}"),
+                Vec::new(),
+                Vec::new(),
+            );
+            runtime
+                .record_resolved_overlay_path(
+                    bounded_overlay_path(
+                        local_node.clone(),
+                        target,
+                        IpAddr::V4(Ipv4Addr::new(100, 64, 2, index)),
+                        7,
+                    ),
+                    observed_at + ChronoDuration::milliseconds(i64::from(index)),
+                )
+                .await?;
+        }
+
+        neighbor_map.on_demand_peer_limit = 2;
+        neighbor_map.generated_at = initial_generated_at + ChronoDuration::milliseconds(1);
+        runtime.record_neighbor_map_snapshot(neighbor_map).await?;
+
+        let retained = runtime
+            .resolved_overlay_peers()
+            .await
+            .into_iter()
+            .map(|peer| peer.node_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            retained,
+            BTreeSet::from([
+                NodeId::from_string("on-demand-3"),
+                NodeId::from_string("on-demand-4"),
+            ])
+        );
+        let metrics = runtime.metrics().await.lazy_connect;
+        assert_eq!(metrics.active_peer_count, 2);
+        assert_eq!(metrics.on_demand_peer_limit, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn overlay_shortcut_snapshot_waits_for_neighbor_map_update(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Arc::new(AgentRuntime::new(
@@ -13133,9 +13245,9 @@ mod tests {
         let state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
         let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
-        runtime
-            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node.clone(), Vec::new(), 7))
-            .await?;
+        let mut neighbor_map = bounded_neighbor_map(local_node.clone(), Vec::new(), 7);
+        neighbor_map.on_demand_peer_limit = 12;
+        runtime.record_neighbor_map_snapshot(neighbor_map).await?;
 
         let observed_at = Utc::now();
         let mut targets = Vec::new();
@@ -13934,6 +14046,9 @@ mod tests {
     #[tokio::test]
     async fn bounded_overlay_logical_podcidrs_and_resolved_leases_stay_bounded(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        const ON_DEMAND_PEER_LIMIT: usize = 4;
+        const SCALE_NODE_COUNT: usize = 1_000;
+
         let state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
         let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
@@ -13986,7 +14101,7 @@ mod tests {
         let mut first_target = None;
         let mut second_target = None;
         let mut newest_target = None;
-        for index in 0..=MAX_RESOLVED_OVERLAY_PATHS {
+        for index in 0..SCALE_NODE_COUNT {
             let target_id = NodeId::from_string(format!("scale-route-owner-{index:04}"));
             let vpn_offset = index + 1;
             let target_vpn_ip = IpAddr::V4(Ipv4Addr::new(
@@ -14039,6 +14154,12 @@ mod tests {
                     observed_at + ChronoDuration::milliseconds(index as i64),
                 )
                 .await?;
+            runtime
+                .upsert_overlay_forwarder_endpoint(
+                    target_id.clone(),
+                    SocketAddr::from(([127, 0, 0, 1], 52_000_u16 + u16::try_from(index)?)),
+                )
+                .await;
             if index == 0 {
                 runtime
                     .record_peer_activity(target_id.clone(), observed_at, true)
@@ -14046,14 +14167,14 @@ mod tests {
                 first_target = Some(target_id);
             } else if index == 1 {
                 second_target = Some(target_id);
-            } else if index == MAX_RESOLVED_OVERLAY_PATHS {
+            } else if index == SCALE_NODE_COUNT - 1 {
                 newest_target = Some(target_id);
             }
         }
 
         {
             let resolved = runtime.resolved_overlay_paths.read().await;
-            assert_eq!(resolved.exact_route_lru.len(), MAX_RESOLVED_OVERLAY_PATHS);
+            assert_eq!(resolved.exact_route_lru.len(), ON_DEMAND_PEER_LIMIT);
             assert_eq!(
                 resolved
                     .paths
@@ -14068,13 +14189,13 @@ mod tests {
             .iter()
             .map(|path| path.target.node_id.clone())
             .collect::<BTreeSet<_>>();
-        assert_eq!(paths.len(), MAX_RESOLVED_OVERLAY_PATHS);
+        assert_eq!(paths.len(), ON_DEMAND_PEER_LIMIT);
         assert_eq!(
             paths
                 .iter()
                 .map(|path| path.target.routes.len())
                 .sum::<usize>(),
-            MAX_RESOLVED_OVERLAY_PATHS
+            ON_DEMAND_PEER_LIMIT
         );
         assert!(retained_target_ids.contains(
             &first_target.ok_or_else(|| AgentError::InvalidState("missing first target".into()))?
@@ -14088,16 +14209,18 @@ mod tests {
                 .ok_or_else(|| AgentError::InvalidState("missing newest target".into()))?
         ));
         let metrics = runtime.metrics().await.lazy_connect;
-        assert_eq!(metrics.active_peer_count, MAX_RESOLVED_OVERLAY_PATHS);
-        assert_eq!(
-            metrics.observed_peer_vpn_ip_count,
-            MAX_RESOLVED_OVERLAY_PATHS
-        );
-        assert_eq!(
-            metrics.observed_route_peer_count,
-            MAX_RESOLVED_OVERLAY_PATHS
-        );
-        assert_eq!(metrics.observed_route_count, MAX_RESOLVED_OVERLAY_PATHS);
+        assert_eq!(metrics.active_peer_count, ON_DEMAND_PEER_LIMIT);
+        assert_eq!(metrics.on_demand_peer_limit, ON_DEMAND_PEER_LIMIT);
+        assert_eq!(metrics.observed_peer_vpn_ip_count, ON_DEMAND_PEER_LIMIT);
+        assert_eq!(metrics.observed_route_peer_count, ON_DEMAND_PEER_LIMIT);
+        assert_eq!(metrics.observed_route_count, ON_DEMAND_PEER_LIMIT);
+
+        applier
+            .apply_peer_map(runtime.overlay_peer_map_snapshot().await?)
+            .await?;
+        let applied_peers = applier.wireguard.peers.read().await;
+        assert_eq!(applied_peers.len(), ON_DEMAND_PEER_LIMIT + 1);
+        assert!(applied_peers.contains_key(&NodeId::from_string(OVERLAY_QUARANTINE_NODE_ID)));
         Ok(())
     }
 

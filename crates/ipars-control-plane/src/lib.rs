@@ -3244,6 +3244,7 @@ where
             topology_epoch: topology.topology_epoch(),
             routing_epoch: snapshot.routing_epoch,
             max_degree: policy.overlay_max_degree,
+            on_demand_peer_limit: policy.overlay_on_demand_peer_limit,
             vpn_cidr: IpNet::V4(self.config.vpn_pool),
             neighbors,
             aggregate_routes,
@@ -3482,6 +3483,7 @@ where
             fanout: policy.overlay_block_size,
             max_degree: policy.overlay_max_degree,
             direct_shortcut_limit: 0,
+            on_demand_peer_limit: policy.overlay_on_demand_peer_limit,
             node_count: topology.invariants().node_count,
             group_count: groups.len(),
             level_count,
@@ -5873,6 +5875,11 @@ fn validate_cluster_policy(policy: &ClusterPolicy) -> Result<(), ControlPlaneErr
             "overlay_direct_shortcut_limit must be at most {MAX_OVERLAY_DEGREE}"
         )));
     }
+    if policy.overlay_on_demand_peer_limit > MAX_OVERLAY_DEGREE {
+        return Err(ControlPlaneError::InvalidClusterPolicy(format!(
+            "overlay_on_demand_peer_limit must be at most {MAX_OVERLAY_DEGREE}"
+        )));
+    }
     if policy.overlay_route_scopes.len() > MAX_OVERLAY_ROUTE_SCOPES {
         return Err(ControlPlaneError::InvalidClusterPolicy(format!(
             "overlay_route_scopes must contain at most {MAX_OVERLAY_ROUTE_SCOPES} CIDRs"
@@ -7601,12 +7608,15 @@ mod tests {
 
         let mut policy = plane_a.current_cluster_policy().await?;
         policy.overlay_block_size = 8;
+        policy.overlay_on_demand_peer_limit = 7;
         plane_a.set_cluster_policy(policy).await?;
 
         let observed = plane_b.current_cluster_policy().await?;
         assert_eq!(observed.overlay_block_size, 8);
+        assert_eq!(observed.overlay_on_demand_peer_limit, 7);
         let updated = plane_b.overlay_topology_snapshot().await?;
         assert_eq!(updated.fanout, 8);
+        assert_eq!(updated.on_demand_peer_limit, 7);
         assert_eq!(updated.groups.len(), updated.group_count);
         assert_ne!(initial.topology_epoch, updated.topology_epoch);
         assert!(updated.max_observed_degree <= usize::from(updated.max_degree));
@@ -7623,6 +7633,26 @@ mod tests {
             plane_b.current_cluster_policy().await?.overlay_block_size,
             8
         );
+        let source = plane_b
+            .list_nodes()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("registered source node is missing")?;
+        assert_eq!(
+            plane_b
+                .neighbor_map_for(&source.node_id)
+                .await?
+                .on_demand_peer_limit,
+            7
+        );
+
+        let mut invalid = observed;
+        invalid.overlay_on_demand_peer_limit = MAX_OVERLAY_DEGREE + 1;
+        assert!(matches!(
+            plane_a.set_cluster_policy(invalid).await,
+            Err(ControlPlaneError::InvalidClusterPolicy(_))
+        ));
         Ok(())
     }
 

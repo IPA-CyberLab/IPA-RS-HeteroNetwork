@@ -1402,6 +1402,8 @@ pub struct ClusterPolicy {
     pub overlay_max_degree: u16,
     #[serde(default = "default_overlay_direct_shortcut_limit")]
     pub overlay_direct_shortcut_limit: u16,
+    #[serde(default = "default_overlay_on_demand_peer_limit")]
+    pub overlay_on_demand_peer_limit: u16,
     #[serde(default)]
     pub overlay_route_scopes: Vec<IpNet>,
     #[serde(default = "default_relay_health_ttl_seconds")]
@@ -1437,6 +1439,7 @@ impl Default for ClusterPolicy {
             overlay_block_size: default_overlay_block_size(),
             overlay_max_degree: default_overlay_max_degree(),
             overlay_direct_shortcut_limit: default_overlay_direct_shortcut_limit(),
+            overlay_on_demand_peer_limit: default_overlay_on_demand_peer_limit(),
             overlay_route_scopes: Vec::new(),
             relay_health_ttl_seconds: default_relay_health_ttl_seconds(),
             endpoint_candidate_ttl_seconds: default_endpoint_candidate_ttl_seconds(),
@@ -1466,6 +1469,12 @@ fn default_overlay_max_degree() -> u16 {
 
 fn default_overlay_direct_shortcut_limit() -> u16 {
     0
+}
+
+pub const DEFAULT_OVERLAY_ON_DEMAND_PEER_LIMIT: u16 = 4;
+
+fn default_overlay_on_demand_peer_limit() -> u16 {
+    DEFAULT_OVERLAY_ON_DEMAND_PEER_LIMIT
 }
 
 fn default_relay_health_ttl_seconds() -> u64 {
@@ -1645,6 +1654,7 @@ pub struct NeighborMap {
     pub topology_epoch: u64,
     pub routing_epoch: u64,
     pub max_degree: u16,
+    pub on_demand_peer_limit: u16,
     pub vpn_cidr: IpNet,
     pub neighbors: Vec<OverlayNeighbor>,
     pub aggregate_routes: Vec<AggregateOverlayRoute>,
@@ -1665,6 +1675,15 @@ impl NeighborMap {
                 format!(
                     "max degree must be between 1 and {MAX_OVERLAY_DEGREE}, got {}",
                     self.max_degree
+                ),
+            ));
+        }
+        if self.on_demand_peer_limit > MAX_OVERLAY_DEGREE {
+            return Err(OverlayValidationError::new(
+                "on_demand_peer_limit",
+                format!(
+                    "on-demand peer limit must be at most {MAX_OVERLAY_DEGREE}, got {}",
+                    self.on_demand_peer_limit
                 ),
             ));
         }
@@ -3268,6 +3287,7 @@ pub mod api {
         pub fanout: u16,
         pub max_degree: u16,
         pub direct_shortcut_limit: u16,
+        pub on_demand_peer_limit: u16,
         pub node_count: usize,
         pub group_count: usize,
         pub level_count: usize,
@@ -19129,6 +19149,7 @@ pub mod api {
     pub struct LazyConnectMetrics {
         pub active_peer_count: usize,
         pub pinned_peer_count: usize,
+        pub on_demand_peer_limit: usize,
         pub observed_peer_vpn_ip_count: usize,
         pub observed_route_peer_count: usize,
         pub observed_route_count: usize,
@@ -19485,6 +19506,22 @@ mod tests {
 
         let decoded: ClusterPolicy = serde_json::from_value(encoded)?;
         assert_eq!(decoded.overlay_block_size, DEFAULT_OVERLAY_BLOCK_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_policy_defaults_missing_on_demand_peer_limit() -> Result<(), serde_json::Error> {
+        let mut encoded = serde_json::to_value(ClusterPolicy::default())?;
+        let Some(object) = encoded.as_object_mut() else {
+            panic!("cluster policy must serialize as an object");
+        };
+        object.remove("overlay_on_demand_peer_limit");
+
+        let decoded: ClusterPolicy = serde_json::from_value(encoded)?;
+        assert_eq!(
+            decoded.overlay_on_demand_peer_limit,
+            DEFAULT_OVERLAY_ON_DEMAND_PEER_LIMIT
+        );
         Ok(())
     }
 
@@ -20077,6 +20114,7 @@ mod tests {
             topology_epoch: 42,
             routing_epoch: 42,
             max_degree: 4,
+            on_demand_peer_limit: 4,
             vpn_cidr: "10.250.0.0/24".parse()?,
             neighbors: vec![
                 OverlayNeighbor {
@@ -20133,6 +20171,14 @@ mod tests {
             .ok_or("degree overflow should be rejected")?;
         assert_eq!(error.field(), "neighbors");
         assert!(error.reason().contains("exceeds configured maximum degree"));
+
+        invalid = valid.clone();
+        invalid.on_demand_peer_limit = MAX_OVERLAY_DEGREE + 1;
+        let error = invalid
+            .validate()
+            .err()
+            .ok_or("on-demand peer overflow should be rejected")?;
+        assert_eq!(error.field(), "on_demand_peer_limit");
 
         invalid = valid.clone();
         invalid.neighbors[0].node.node_id = invalid.node_id.clone();

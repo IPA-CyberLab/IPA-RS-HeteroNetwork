@@ -7587,6 +7587,7 @@ struct AgentOtelMetrics {
     metrics_generated_timestamp_seconds: Gauge<u64>,
     lazy_active_peers: Gauge<u64>,
     lazy_pinned_peers: Gauge<u64>,
+    lazy_on_demand_peer_limit: Gauge<u64>,
     lazy_observed_peer_vpn_ips: Gauge<u64>,
     lazy_observed_route_peers: Gauge<u64>,
     lazy_observed_routes: Gauge<u64>,
@@ -7722,6 +7723,10 @@ impl AgentOtelMetrics {
             lazy_pinned_peers: meter
                 .u64_gauge("ipars.agent.lazy_connect.pinned_peers")
                 .with_description("Peers pinned in lazy-connect state.")
+                .build(),
+            lazy_on_demand_peer_limit: meter
+                .u64_gauge("ipars.agent.lazy_connect.on_demand_peer_limit")
+                .with_description("Maximum non-backbone peers retained on demand.")
                 .build(),
             lazy_observed_peer_vpn_ips: meter
                 .u64_gauge("ipars.agent.lazy_connect.observed_peer_vpn_ips")
@@ -8138,6 +8143,10 @@ impl AgentOtelMetrics {
             .record(metrics.lazy_connect.active_peer_count as u64, &node_attrs);
         self.lazy_pinned_peers
             .record(metrics.lazy_connect.pinned_peer_count as u64, &node_attrs);
+        self.lazy_on_demand_peer_limit.record(
+            metrics.lazy_connect.on_demand_peer_limit as u64,
+            &node_attrs,
+        );
         self.lazy_observed_peer_vpn_ips.record(
             metrics.lazy_connect.observed_peer_vpn_ip_count as u64,
             &node_attrs,
@@ -22834,6 +22843,7 @@ mod tests {
             topology_epoch: 1,
             routing_epoch: 1,
             max_degree: 4,
+            on_demand_peer_limit: 4,
             vpn_cidr: "100.64.0.0/10".parse()?,
             neighbors: Vec::new(),
             aggregate_routes: Vec::new(),
@@ -22901,6 +22911,7 @@ mod tests {
                 topology_epoch: 6,
                 routing_epoch: 6,
                 max_degree: 4,
+                on_demand_peer_limit: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: vec![ipars_types::OverlayNeighbor {
                     node: retained_neighbor.clone(),
@@ -22918,6 +22929,7 @@ mod tests {
             topology_epoch: 7,
             routing_epoch: 7,
             max_degree: 4,
+            on_demand_peer_limit: 4,
             vpn_cidr: "100.64.0.0/10".parse()?,
             neighbors: vec![ipars_types::OverlayNeighbor {
                 node: neighbor.clone(),
@@ -23320,6 +23332,7 @@ mod tests {
                 topology_epoch: 7,
                 routing_epoch: 7,
                 max_degree: 4,
+                on_demand_peer_limit: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: direct_neighbor
                     .then(|| ipars_types::OverlayNeighbor {
@@ -25207,6 +25220,7 @@ mod tests {
             lazy_connect: LazyConnectMetrics {
                 active_peer_count: 1,
                 pinned_peer_count: 1,
+                on_demand_peer_limit: 4,
                 observed_peer_vpn_ip_count: 1,
                 observed_route_peer_count: 1,
                 observed_route_count: 2,
@@ -37581,6 +37595,7 @@ exec sleep 60
                 topology_epoch: 7,
                 routing_epoch: 7,
                 max_degree: 4,
+                on_demand_peer_limit: 4,
                 vpn_cidr: "127.0.0.0/8".parse().unwrap_or_else(|error| {
                     panic!("static loopback test CIDR must parse: {error}")
                 }),

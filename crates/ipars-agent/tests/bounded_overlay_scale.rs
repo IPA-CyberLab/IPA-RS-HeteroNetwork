@@ -75,6 +75,7 @@ fn neighbor_map(index: usize, topology_epoch: u64) -> NeighborMap {
         topology_epoch,
         routing_epoch: topology_epoch,
         max_degree: 4,
+        on_demand_peer_limit: 4,
         vpn_cidr: "10.250.0.0/16"
             .parse()
             .unwrap_or_else(|error| panic!("static scale-test VPN CIDR must parse: {error}")),

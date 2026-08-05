@@ -3700,6 +3700,16 @@ fn render_prometheus_metrics(metrics: &AgentMetricsResponse) -> String {
     );
     prometheus_line!(
         &mut body,
+        "# HELP ipars_agent_on_demand_peer_limit Maximum non-backbone peers retained on demand."
+    );
+    prometheus_line!(&mut body, "# TYPE ipars_agent_on_demand_peer_limit gauge");
+    prometheus_line!(
+        &mut body,
+        "ipars_agent_on_demand_peer_limit{{node_id=\"{node_id}\"}} {}",
+        metrics.lazy_connect.on_demand_peer_limit
+    );
+    prometheus_line!(
+        &mut body,
         "# HELP ipars_agent_observed_peer_vpn_ips Number of peer VPN IPs indexed for packet-flow resolution."
     );
     prometheus_line!(&mut body, "# TYPE ipars_agent_observed_peer_vpn_ips gauge");
@@ -4320,6 +4330,7 @@ mod tests {
             lazy_connect: LazyConnectMetrics {
                 active_peer_count: 0,
                 pinned_peer_count: 0,
+                on_demand_peer_limit: 4,
                 observed_peer_vpn_ip_count: 0,
                 observed_route_peer_count: 0,
                 observed_route_count: 0,
@@ -4374,6 +4385,9 @@ mod tests {
         )));
         assert!(body.contains(&format!(
             "ipars_agent_peer_probe_measurements_total{{node_id=\"{prometheus_node_id}\"}} 0"
+        )));
+        assert!(body.contains(&format!(
+            "ipars_agent_on_demand_peer_limit{{node_id=\"{prometheus_node_id}\"}} 4"
         )));
 
         for source in AgentPacketFlowDuplicateSource::ALL {
@@ -7537,6 +7551,7 @@ mod tests {
                 topology_epoch: 1,
                 routing_epoch: 1,
                 max_degree: 4,
+                on_demand_peer_limit: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: Vec::new(),
                 aggregate_routes: vec![AggregateOverlayRoute {
