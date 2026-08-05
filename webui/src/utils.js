@@ -65,9 +65,11 @@ export const pathLabels = {
 };
 
 export function connectivity(entry) {
-  const discovery = entry?.nat_discovery || entry?.connectivity || {};
+  const discovery =
+    entry?.nat_classification || entry?.nat_discovery || entry?.connectivity || {};
   const profile = String(
-    discovery.connectivity ||
+    discovery.connectivity_state ||
+      discovery.connectivity ||
       discovery.profile ||
       entry?.connectivity_state ||
       "unknown",

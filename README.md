@@ -249,13 +249,15 @@ Relay configuration.
 
 The same installer enables automatic public-service promotion by default.
 Every joined node continuously reconciles its authenticated Agent state and
-starts Control Plane, Signal, STUN, Relay, and Web UI service advertisement
-only while it has a fresh directly reachable public classification and healthy
-database, gateway, and Relay dependencies. A host behind static DNAT can be
+starts VPN-reachable Control Plane and Web UI plus public STUN and Relay service
+advertisement while it has a fresh directly reachable public classification and
+healthy database and Relay dependencies. Signal is advertised in addition only
+while the public HTTPS gateway probe succeeds; losing HTTPS withdraws Signal
+without stopping STUN or Relay. A host behind static DNAT can be
 declared with `--mapped-public-ip IP` on the generated installer; promotion then
 also requires that STUN continuously observes that exact globally routable IP
-with a stable endpoint-independent mapping. Losing any prerequisite withdraws
-the service lease and stops the promoted services. Use
+with a stable endpoint-independent mapping. Losing a base prerequisite withdraws
+the remaining service lease and stops the promoted services. Use
 `--disable-public-services` only for an explicit per-node opt-out.
 An automatically promoted Control Plane remains enrollment verification-only by
 default. If the dedicated signer is explicitly installed at

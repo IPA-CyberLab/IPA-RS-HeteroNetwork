@@ -1,9 +1,9 @@
 [Unit]
 Description=HeteroNetwork automatically promoted Control Plane
 Wants=network-online.target
-Requires=heteronetwork-agent.service heteronetwork-gateway.service heteronetwork-relay.service heteronetwork-signal.service heteronetwork-stun.service
-After=network-online.target heteronetwork-agent.service heteronetwork-gateway.service heteronetwork-relay.service heteronetwork-signal.service heteronetwork-stun.service
-BindsTo=heteronetwork-agent.service heteronetwork-gateway.service heteronetwork-relay.service heteronetwork-signal.service heteronetwork-stun.service
+Requires=heteronetwork-agent.service heteronetwork-relay.service heteronetwork-stun.service
+After=network-online.target heteronetwork-agent.service heteronetwork-relay.service heteronetwork-stun.service
+BindsTo=heteronetwork-agent.service heteronetwork-relay.service heteronetwork-stun.service
 ConditionPathExists=/etc/heteronetwork/public-services/services.env
 ConditionPathExists=/etc/heteronetwork/public-services/database-url
 

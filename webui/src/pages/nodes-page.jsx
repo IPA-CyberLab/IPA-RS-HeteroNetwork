@@ -19,7 +19,7 @@ const serviceKinds = [
   ["control_plane", "Control Plane"],
   ["signal", "Signal"],
   ["stun", "STUN"],
-  ["relay", "TURN"],
+  ["relay", "リレー"],
   ["keycloak", "Keycloak"],
   ["web_ui", "Web UI"],
 ];

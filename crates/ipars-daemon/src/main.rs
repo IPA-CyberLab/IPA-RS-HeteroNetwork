@@ -4935,10 +4935,6 @@ fn control_plane_service_lease_config(
     }
     validate_join_token_bootstrap_endpoints(&endpoints)
         .context("invalid advertised HA service endpoint")?;
-    anyhow::ensure!(
-        bootstrap_endpoints_include_core_services(&endpoints),
-        "advertised HA service instance must include --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url"
-    );
     let owner_host_id = args
         .service_owner_host_id
         .clone()
@@ -4971,7 +4967,7 @@ fn required_control_plane_service_lease_config(
     args: &ControlPlaneArgs,
 ) -> anyhow::Result<ControlPlaneServiceLeaseConfig> {
     control_plane_service_lease_config(args)?.context(
-        "control-plane service advertisement is required; configure --service-instance-id, --service-owner-host-id, --service-owner-node-id, --advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url",
+        "control-plane service advertisement is required; configure --service-instance-id, --service-owner-host-id, --service-owner-node-id, and at least one advertised endpoint",
     )
 }
 
@@ -21795,7 +21791,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_requires_complete_service_advertisement() -> anyhow::Result<()> {
+    fn control_plane_requires_service_advertisement() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -23854,7 +23850,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_rejects_partial_service_advertisement() -> anyhow::Result<()> {
+    fn control_plane_accepts_partial_service_advertisement() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "iparsd",
             "control-plane",
@@ -23868,6 +23864,10 @@ mod tests {
             "pub-a",
             "--service-instance-id",
             "partial-a",
+            "--service-owner-host-id",
+            "node-owner-a",
+            "--service-owner-node-id",
+            "node-owner-a",
             "--advertise-control-plane-url",
             "https://partial.example:8443",
         ])?;
@@ -23875,13 +23875,13 @@ mod tests {
             anyhow::bail!("expected control-plane command");
         };
 
-        let error = match control_plane_service_lease_config(&args) {
-            Ok(_) => anyhow::bail!("partial service advertisement must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains(
-            "--advertise-control-plane-url, --advertise-signal-url, and --advertise-stun-url"
-        ));
+        let config = required_control_plane_service_lease_config(&args)?;
+        let instance = config.instance();
+        assert_eq!(instance.endpoints.len(), 1);
+        assert_eq!(
+            instance.endpoints[0].kind,
+            BootstrapEndpointKind::ControlPlane
+        );
         Ok(())
     }
 

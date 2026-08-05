@@ -343,6 +343,21 @@ assert_demoted() {
   [ ! -e "$agent_drop_in" ] || fail "Agent routes survived demotion"
 }
 
+assert_udp_services_only() {
+  assert_active heteronetwork-control-plane.service
+  assert_inactive heteronetwork-signal.service
+  assert_active heteronetwork-stun.service
+  assert_active heteronetwork-relay.service
+  [ -f "$services_env" ] || fail "UDP-only service environment is missing"
+  if grep -q '^HETERONETWORK_ADVERTISE_SIGNAL_URL=' "$services_env"; then
+    fail "UDP-only promotion advertised an unavailable Signal endpoint"
+  fi
+  grep -q '^HETERONETWORK_ADVERTISE_STUN_URL=' "$services_env" ||
+    fail "UDP-only promotion did not advertise STUN"
+  grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL=' "$services_env" ||
+    fail "UDP-only promotion did not advertise Relay"
+}
+
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 prepare_dependencies
 reset_auto_services
@@ -405,6 +420,10 @@ grep -Fqx \
   'LoadCredential=keycloak-autopilot.token:/etc/heteronetwork/public-services/keycloak-autopilot.token' \
   "$control_plane_unit" ||
   fail "Control Plane Keycloak autopilot credential is not loaded by systemd"
+if grep -Eq '^(Requires|BindsTo)=.*heteronetwork-(gateway|signal)\.service' \
+  "$control_plane_unit"; then
+  fail "Control Plane still depends on public HTTPS services"
+fi
 grep -q '^HETERONETWORK_LISTEN="10.250.0.4:19088"$' "$services_env" ||
   fail "automatic Control Plane listen address is wrong"
 grep -q '^HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://10.250.0.4:19088"$' \
@@ -615,7 +634,8 @@ fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time"
 write_gateway_status 163.220.236.51 error
 run_reconciler
-assert_demoted
+run_reconciler
+assert_udp_services_only
 
 prepare_dependencies
 reset_auto_services
@@ -625,9 +645,7 @@ run_reconciler
 run_reconciler
 write_gateway_status 163.220.236.51 error
 run_reconciler
-assert_active heteronetwork-signal.service
-assert_active heteronetwork-stun.service
-assert_active heteronetwork-control-plane.service
+assert_udp_services_only
 [ -f "$services_env" ] ||
   fail "a transient gateway error removed the service environment"
 [ -f "$agent_drop_in" ] ||
@@ -636,9 +654,17 @@ if grep -q '^restart .*heteronetwork-agent.service$' "$systemctl_log"; then
   fail "a transient gateway error restarted the Agent"
 fi
 
+write_gateway_status 163.220.236.51 ready
+run_reconciler
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+assert_active heteronetwork-control-plane.service
+grep -q '^HETERONETWORK_ADVERTISE_SIGNAL_URL="https://163.220.236.51"$' \
+  "$services_env" || fail "recovered gateway did not restore Signal advertisement"
+
 write_gateway_status 163.220.236.52 error
 run_reconciler
-assert_demoted
+assert_udp_services_only
 
 prepare_dependencies
 reset_auto_services

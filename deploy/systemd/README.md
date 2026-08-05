@@ -1,16 +1,20 @@
 # Public node systemd deployment
 
-The units in this directory run Control Plane, Signal, STUN, and Relay as one
-public-node failure domain. Each Control Plane renews its instance lease in the
-shared PostgreSQL store. Signed token endpoints are used only for initial
-discovery; Agents persist each non-empty active directory as authoritative and
-replace retired endpoints instead of retaining them as permanent seeds.
+The units in this directory support both manually configured full public nodes
+and automatically promoted partial nodes. Each Control Plane renews its instance
+lease in the shared PostgreSQL store. Signed token endpoints are used only for
+initial discovery; Agents persist each core-complete active directory as
+authoritative and replace retired endpoints instead of retaining them as
+permanent seeds.
 
 `ipars-control-plane.service` uses `BindsTo=` for the other three services. If
 Signal, STUN, or Relay leaves the active state, the Control Plane also stops and
 its whole-node lease expires instead of advertising a partially dead public
-node. All units use automatic restart and systemd hardening without root or
-network capabilities.
+node. The automatic `heteronetwork-control-plane.service` instead binds its base
+lease to Agent, STUN, and Relay. Its reconciler independently adds Signal while
+the HTTPS gateway is reachable and removes only Signal when that probe fails.
+All units use automatic restart and systemd hardening without root or network
+capabilities.
 
 ## Prerequisites
 
@@ -71,10 +75,11 @@ installer with `--disable-relay` only when that node must not receive Relay
 admission configuration. Do not configure Relay admission manually on joining
 nodes.
 The installer also enables `heteronetwork-public-services-autopilot.timer` by
-default. On every enrolled machine it promotes all five node services only
-while the Agent has a fresh directly reachable public classification and the
-gateway, Relay, and PostgreSQL HA dependencies are healthy; otherwise it
-withdraws the lease and stops those services. Pass
+default. On every enrolled machine it promotes VPN Control Plane and Web UI plus
+public STUN and Relay while the Agent has a fresh directly reachable public
+classification and the Relay and PostgreSQL HA dependencies are healthy. It
+adds Signal only while the public HTTPS gateway probe succeeds, so a gateway
+failure no longer stops the UDP services. Pass
 `--disable-public-services` only for an explicit per-node opt-out. Automatically
 promoted Control Planes receive the root and enrollment public verification
 keys. They remain verification-only unless an operator explicitly provisions

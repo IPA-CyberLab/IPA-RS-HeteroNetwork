@@ -53,7 +53,7 @@ runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
 status_file=
 relay_status_file=
 gateway_status_file=
-gateway_targets_current_public_ip=0
+https_services_enabled=0
 services_env_tmp=
 database_url_tmp=
 database_autopilot_token_tmp=
@@ -632,7 +632,6 @@ relay_is_ready() {
 }
 
 gateway_is_ready() {
-  gateway_targets_current_public_ip=0
   gateway_status_file=$(mktemp "$runtime_dir/gateway-status.XXXXXX") || return 1
   if ! curl --fail --silent --show-error --max-time 6 --max-filesize 1048576 \
     http://127.0.0.1:9780/v1/web-ui/endpoints >"$gateway_status_file"; then
@@ -640,17 +639,11 @@ gateway_is_ready() {
     gateway_status_file=
     return 1
   fi
-  if jq -e --arg public_ip "$public_ip" --arg public_url "$public_https_url" '
-    (.public_gateway.public_ip == $public_ip)
-    and (.public_gateway.url | type == "string")
-    and ((.public_gateway.url | rtrimstr("/")) == $public_url)
-  ' "$gateway_status_file" >/dev/null; then
-    gateway_targets_current_public_ip=1
-  fi
-  if ! jq -e --arg public_ip "$public_ip" '
+  if ! jq -e --arg public_ip "$public_ip" --arg public_url "$public_https_url" '
     (.public_gateway.phase == "ready")
     and (.public_gateway.public_ip == $public_ip)
-    and (.public_gateway.url | type == "string" and startswith("https://"))
+    and (.public_gateway.url | type == "string")
+    and ((.public_gateway.url | rtrimstr("/")) == $public_url)
   ' "$gateway_status_file" >/dev/null; then
     rm -f "$gateway_status_file"
     gateway_status_file=
@@ -658,18 +651,6 @@ gateway_is_ready() {
   fi
   rm -f "$gateway_status_file"
   gateway_status_file=
-}
-
-wait_gateway_ready() {
-  gateway_wait_attempt=1
-  while [ "$gateway_wait_attempt" -le 6 ]; do
-    if gateway_is_ready; then
-      return 0
-    fi
-    gateway_wait_attempt=$((gateway_wait_attempt + 1))
-    sleep 1
-  done
-  return 1
 }
 
 write_environment_entry() {
@@ -798,7 +779,9 @@ EOF
     write_environment_entry HETERONETWORK_SERVICE_LEASE_RENEW_INTERVAL_SECONDS 10
     write_environment_entry HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL \
       "http://$vpn_ip:19088"
-    write_environment_entry HETERONETWORK_ADVERTISE_SIGNAL_URL "$public_https_url"
+    if [ "$https_services_enabled" -eq 1 ]; then
+      write_environment_entry HETERONETWORK_ADVERTISE_SIGNAL_URL "$public_https_url"
+    fi
     write_environment_entry HETERONETWORK_ADVERTISE_STUN_URL \
       "$stun_public_url"
     write_environment_entry HETERONETWORK_ADVERTISE_RELAY_URL \
@@ -917,17 +900,8 @@ promote() {
   fi
 
   unit_is_active "$agent_service" || return 1
-  unit_is_active "$gateway_service" || return 1
   unit_is_active "$relay_service" || return 1
-  wait_gateway_ready || return 1
   relay_is_ready || return 1
-
-  if ! unit_is_active "$signal_service"; then
-    systemctl start "$signal_service" || return 1
-  elif [ "$runtime_configuration_changed" -eq 1 ]; then
-    systemctl restart "$signal_service" || return 1
-  fi
-  unit_is_active "$signal_service" || return 1
 
   if ! unit_is_active "$stun_service"; then
     systemctl start "$stun_service" || return 1
@@ -935,6 +909,17 @@ promote() {
     systemctl restart "$stun_service" || return 1
   fi
   unit_is_active "$stun_service" || return 1
+
+  if [ "$https_services_enabled" -eq 1 ]; then
+    if ! unit_is_active "$signal_service"; then
+      systemctl start "$signal_service" || return 1
+    elif [ "$runtime_configuration_changed" -eq 1 ]; then
+      systemctl restart "$signal_service" || return 1
+    fi
+    unit_is_active "$signal_service" || return 1
+  else
+    stop_unit "$signal_service" || return 1
+  fi
 
   if ! unit_is_active "$control_plane_service"; then
     systemctl start "$control_plane_service" || return 1
@@ -945,7 +930,11 @@ promote() {
 
   if [ "$runtime_configuration_changed" -eq 1 ] ||
     [ "$agent_drop_in_changed" -eq 1 ]; then
-    log "promoted node to automatic Control Plane, Signal, and STUN services"
+    if [ "$https_services_enabled" -eq 1 ]; then
+      log "promoted node to automatic Control Plane, Signal, STUN, and Relay services"
+    else
+      log "promoted node to automatic VPN Control Plane, STUN, and Relay services; public HTTPS Signal is unavailable"
+    fi
   fi
 }
 
@@ -955,7 +944,6 @@ fi
 
 for required_unit in \
   "$agent_service" \
-  "$gateway_service" \
   "$relay_service" \
   "$control_plane_service" \
   "$signal_service" \
@@ -967,9 +955,6 @@ done
 
 if ! unit_is_active "$agent_service"; then
   demote_and_exit "Agent dependency is not active"
-fi
-if ! unit_is_active "$gateway_service"; then
-  demote_and_exit "Caddy gateway dependency is not active"
 fi
 if ! unit_is_active "$relay_service"; then
   demote_and_exit "Relay dependency is not active"
@@ -1087,13 +1072,11 @@ relay_public_url="udp://$public_url_host:18445"
 relay_admission_url="http://$vpn_ip:18447"
 relay_status_url="$relay_admission_url/v1/status"
 
-if ! gateway_is_ready; then
-  if [ "$gateway_targets_current_public_ip" -eq 1 ]; then
-    log "public Web gateway is still converging for the current public address"
-    reconcile_finished=1
-    exit 0
-  fi
-  demote_and_exit "public Web gateway is not ready for the current public address"
+if unit_is_loaded "$gateway_service" &&
+  unit_is_active "$gateway_service" && gateway_is_ready; then
+  https_services_enabled=1
+else
+  log "public Web gateway is unavailable; continuing with VPN Control Plane, STUN, and Relay services"
 fi
 if ! relay_is_ready; then
   demote_and_exit "Relay health or advertised endpoint does not match this node"
