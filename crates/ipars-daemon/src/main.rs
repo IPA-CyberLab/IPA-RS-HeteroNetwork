@@ -14868,10 +14868,14 @@ fn heartbeat_service_advertisement(
             url: url.to_string(),
         });
     }
-    if let Some(public_endpoint) = relay_capability
-        .filter(|capability| capability.is_eligible_relay())
-        .and_then(|capability| capability.public_endpoint)
-    {
+    if let Some(public_endpoint) = relay_capability.and_then(|capability| {
+        let mut policy_authorized = capability.clone();
+        policy_authorized.enabled_by_policy = true;
+        policy_authorized
+            .is_eligible_relay()
+            .then_some(capability.public_endpoint)
+            .flatten()
+    }) {
         endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::Relay,
             url: format!("udp://{public_endpoint}"),
@@ -40153,6 +40157,32 @@ exec sleep 60
         .await?;
 
         assert!(request.path_state.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_service_advertisement_includes_relay_before_policy_ack() -> anyhow::Result<()> {
+        let relay_endpoint = SocketAddr::from(([8, 8, 8, 8], 18_445));
+        let relay = RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(relay_endpoint),
+            admission_url: Some("http://100.64.0.8:18447".to_string()),
+            max_sessions: 10_000,
+            active_sessions: 2,
+            max_mbps: 1_000,
+            e2e_only: true,
+        };
+
+        let advertisement = heartbeat_service_advertisement(None, Some(&relay))?
+            .context("healthy Relay should be advertised")?;
+
+        assert_eq!(
+            advertisement.endpoints,
+            vec![BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Relay,
+                url: format!("udp://{relay_endpoint}"),
+            }]
+        );
         Ok(())
     }
 

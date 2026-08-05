@@ -5535,7 +5535,9 @@ fn heartbeat_service_instance(
             let relay = request.relay_capability.as_ref().ok_or_else(|| {
                 reject("Relay endpoint requires a live Relay capability report".to_string())
             })?;
-            if !relay.is_eligible_relay() || relay.public_endpoint != Some(advertised_addr) {
+            if validate_relay_capability_shape(relay).is_err()
+                || relay.public_endpoint != Some(advertised_addr)
+            {
                 return Err(reject(
                     "Relay endpoint does not match the live Relay capability report".to_string(),
                 ));
@@ -12673,7 +12675,7 @@ mod tests {
             source: CandidateSource::StunProbe,
         };
         let relay = RelayCapability {
-            enabled_by_policy: true,
+            enabled_by_policy: false,
             public_endpoint: Some(relay_addr),
             admission_url: Some("http://100.64.0.1:18447".to_string()),
             max_sessions: 100,
