@@ -13955,6 +13955,12 @@ struct PublicWebGatewayConfig {
     classification_max_age: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublicWebGatewayTarget {
+    public_ip: IpAddr,
+    bind_ip: IpAddr,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PublicWebGatewayExtraConfig {
     contents: String,
@@ -14086,23 +14092,24 @@ fn public_web_gateway_url(ip: IpAddr) -> String {
 
 fn public_web_gateway_caddyfile(
     config: &PublicWebGatewayConfig,
-    public_ip: Option<IpAddr>,
+    target: Option<PublicWebGatewayTarget>,
     extra: &PublicWebGatewayExtraConfig,
 ) -> String {
     let mut caddyfile = format!(
         "{{\n\tadmin unix/{}|0660\n\tpersist_config off\n",
         config.admin_socket.display()
     );
-    if let Some(public_ip) = public_ip {
-        let _ = writeln!(caddyfile, "\tdefault_bind {public_ip}");
+    if let Some(target) = target {
+        let _ = writeln!(caddyfile, "\tdefault_bind {}", target.bind_ip);
     }
     caddyfile.push_str("}\n");
-    if let Some(public_ip) = public_ip {
-        let site = public_web_gateway_url(public_ip);
+    if let Some(target) = target {
+        let site = public_web_gateway_url(target.public_ip);
         let site = site.trim_end_matches('/');
         let _ = writeln!(
             caddyfile,
-            "{site} {{\n\tbind {public_ip}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}"
+            "{site} {{\n\tbind {}\n\ttls {{\n\t\tissuer acme {{\n\t\t\tprofile shortlived\n\t\t}}\n\t}}\n\theader {{\n\t\tStrict-Transport-Security \"max-age=31536000\"\n\t\tX-Content-Type-Options \"nosniff\"\n\t\tReferrer-Policy \"no-referrer\"\n\t}}",
+            target.bind_ip
         );
         let _ = writeln!(
             caddyfile,
@@ -14143,13 +14150,13 @@ fn public_web_gateway_caddyfile(
 async fn load_public_web_gateway_caddyfile(
     client: &reqwest::Client,
     config: &PublicWebGatewayConfig,
-    public_ip: Option<IpAddr>,
+    target: Option<PublicWebGatewayTarget>,
     extra: &PublicWebGatewayExtraConfig,
 ) -> anyhow::Result<()> {
     let response = client
         .post("http://localhost/load")
         .header(reqwest::header::CONTENT_TYPE, "text/caddyfile")
-        .body(public_web_gateway_caddyfile(config, public_ip, extra))
+        .body(public_web_gateway_caddyfile(config, target, extra))
         .send()
         .await
         .context("failed to reach Caddy admin socket")?;
@@ -14220,25 +14227,28 @@ async fn set_public_web_gateway_status(
     };
 }
 
-async fn desired_public_web_gateway_ip(
+async fn desired_public_web_gateway_target(
     runtime: &AgentRuntime,
     max_age: Duration,
-) -> Option<IpAddr> {
+) -> Option<PublicWebGatewayTarget> {
     let classification = runtime.status().await.nat_classification?;
     let public_ip = classification.publicly_reachable_ip()?;
     let age = chrono::Utc::now()
         .signed_duration_since(classification.assessed_at)
         .to_std()
         .ok()?;
-    (age <= max_age).then_some(public_ip)
+    (age <= max_age).then_some(PublicWebGatewayTarget {
+        public_ip,
+        bind_ip: classification.local_addr.ip(),
+    })
 }
 
 fn public_web_gateway_needs_reconciliation(
-    configured: Option<(Option<IpAddr>, [u8; 32])>,
-    desired_ip: Option<IpAddr>,
+    configured: Option<(Option<PublicWebGatewayTarget>, [u8; 32])>,
+    desired_target: Option<PublicWebGatewayTarget>,
     desired_extra_digest: [u8; 32],
 ) -> bool {
-    configured != Some((desired_ip, desired_extra_digest))
+    configured != Some((desired_target, desired_extra_digest))
 }
 
 fn start_public_web_gateway(
@@ -14260,10 +14270,11 @@ fn start_public_web_gateway(
     Ok(tokio::spawn(async move {
         // Caddy survives Agent restarts, so the first iteration must replace
         // any stale configuration even when this node is currently private.
-        let mut configured: Option<(Option<IpAddr>, [u8; 32])> = None;
+        let mut configured: Option<(Option<PublicWebGatewayTarget>, [u8; 32])> = None;
         loop {
-            let desired_ip =
-                desired_public_web_gateway_ip(&runtime, config.classification_max_age).await;
+            let desired_target =
+                desired_public_web_gateway_target(&runtime, config.classification_max_age).await;
+            let desired_ip = desired_target.map(|target| target.public_ip);
             let desired_url = desired_ip.map(public_web_gateway_url);
             let extra = match load_public_web_gateway_extra_config(&config) {
                 Ok(extra) => extra,
@@ -14273,7 +14284,7 @@ fn start_public_web_gateway(
                     if let Err(withdraw_error) = load_public_web_gateway_caddyfile(
                         &admin_client,
                         &config,
-                        desired_ip,
+                        desired_target,
                         &empty,
                     )
                     .await
@@ -14296,14 +14307,17 @@ fn start_public_web_gateway(
                     continue;
                 }
             };
-            let desired_extra_digest = if desired_ip.is_some() {
+            let desired_extra_digest = if desired_target.is_some() {
                 extra.digest
             } else {
                 Sha256::digest([]).into()
             };
-            if public_web_gateway_needs_reconciliation(configured, desired_ip, desired_extra_digest)
-            {
-                let phase = if desired_ip.is_some() {
+            if public_web_gateway_needs_reconciliation(
+                configured,
+                desired_target,
+                desired_extra_digest,
+            ) {
+                let phase = if desired_target.is_some() {
                     PublicWebGatewayPhase::Provisioning
                 } else {
                     PublicWebGatewayPhase::Standby
@@ -14316,11 +14330,16 @@ fn start_public_web_gateway(
                     None,
                 )
                 .await;
-                match load_public_web_gateway_caddyfile(&admin_client, &config, desired_ip, &extra)
-                    .await
+                match load_public_web_gateway_caddyfile(
+                    &admin_client,
+                    &config,
+                    desired_target,
+                    &extra,
+                )
+                .await
                 {
                     Ok(()) => {
-                        configured = Some((desired_ip, desired_extra_digest));
+                        configured = Some((desired_target, desired_extra_digest));
                         tracing::info!(
                             public_ip = ?desired_ip,
                             "reconciled public connectivity gateway"
@@ -14340,7 +14359,7 @@ fn start_public_web_gateway(
                 }
             }
 
-            if configured == Some((desired_ip, desired_extra_digest)) {
+            if configured == Some((desired_target, desired_extra_digest)) {
                 if let (Some(public_ip), Some(url)) = (desired_ip, desired_url) {
                     match probe_public_web_gateway(&probe_client, &url).await {
                         Ok(PublicWebGatewayProbeOutcome::Ready) => {
@@ -21829,9 +21848,13 @@ mod tests {
         config.control_plane_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 19088)));
         config.signal_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18443)));
         config.relay_admission_upstream = Some(SocketAddr::from(([10, 0, 0, 10], 18447)));
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
         let public = public_web_gateway_caddyfile(
             &config,
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            Some(PublicWebGatewayTarget {
+                public_ip,
+                bind_ip: public_ip,
+            }),
             &extra,
         );
         assert!(public.contains("https://203.0.113.10"));
@@ -21870,11 +21893,28 @@ mod tests {
                 "public gateway leaked private path {private_path}"
             );
         }
+
+        let mapped = public_web_gateway_caddyfile(
+            &config,
+            Some(PublicWebGatewayTarget {
+                public_ip,
+                bind_ip: IpAddr::V4(Ipv4Addr::new(10, 10, 10, 103)),
+            }),
+            &extra,
+        );
+        assert!(mapped.contains("https://203.0.113.10"));
+        assert!(mapped.contains("default_bind 10.10.10.103"));
+        assert!(mapped.contains("bind 10.10.10.103"));
+        assert!(!mapped.contains("bind 203.0.113.10"));
     }
 
     #[test]
     fn public_web_gateway_reconciles_once_after_agent_restart() {
         let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let target = PublicWebGatewayTarget {
+            public_ip,
+            bind_ip: public_ip,
+        };
         let empty_digest: [u8; 32] = Sha256::digest([]).into();
         let changed_digest: [u8; 32] = Sha256::digest(b"changed").into();
 
@@ -21885,7 +21925,7 @@ mod tests {
         ));
         assert!(public_web_gateway_needs_reconciliation(
             None,
-            Some(public_ip),
+            Some(target),
             empty_digest
         ));
         assert!(!public_web_gateway_needs_reconciliation(
@@ -21894,14 +21934,22 @@ mod tests {
             empty_digest
         ));
         assert!(!public_web_gateway_needs_reconciliation(
-            Some((Some(public_ip), empty_digest)),
-            Some(public_ip),
+            Some((Some(target), empty_digest)),
+            Some(target),
             empty_digest
         ));
         assert!(public_web_gateway_needs_reconciliation(
-            Some((Some(public_ip), empty_digest)),
-            Some(public_ip),
+            Some((Some(target), empty_digest)),
+            Some(target),
             changed_digest
+        ));
+        assert!(public_web_gateway_needs_reconciliation(
+            Some((Some(target), empty_digest)),
+            Some(PublicWebGatewayTarget {
+                public_ip,
+                bind_ip: IpAddr::V4(Ipv4Addr::new(10, 10, 10, 103)),
+            }),
+            empty_digest
         ));
     }
 
