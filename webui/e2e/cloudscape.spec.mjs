@@ -130,6 +130,7 @@ async function installMockBackend(page) {
     const url = new URL(route.request().url());
     const assets = {
       "/ui/": ["index.html", "text/html; charset=utf-8"],
+      "/ui/auth/wait": ["auth-wait.html", "text/html; charset=utf-8"],
       "/ui/app.js": ["app.js", "text/javascript; charset=utf-8"],
       "/ui/styles.css": ["styles.css", "text/css; charset=utf-8"],
       "/ui/theme.js": ["theme.js", "text/javascript; charset=utf-8"],
@@ -185,6 +186,59 @@ async function installMockBackend(page) {
     await route.fulfill({ status: 404, body: "not found" });
   });
 }
+
+async function installDelayedLoginBackend(page) {
+  await page.context().route("**/*", async (route) => {
+    const url = new URL(route.request().url());
+    const assets = {
+      "/ui/": ["index.html", "text/html; charset=utf-8"],
+      "/ui/auth/wait": ["auth-wait.html", "text/html; charset=utf-8"],
+      "/ui/app.js": ["app.js", "text/javascript; charset=utf-8"],
+      "/ui/styles.css": ["styles.css", "text/css; charset=utf-8"],
+      "/ui/theme.js": ["theme.js", "text/javascript; charset=utf-8"],
+      "/ui/vendor/mermaid.min.js": [
+        "vendor/mermaid.min.js",
+        "text/javascript; charset=utf-8",
+      ],
+      "/ui/fonts/noto-sans-jp-ui.ttf": ["noto-sans-jp-ui.ttf", "font/ttf"],
+    };
+    if (assets[url.pathname]) {
+      const [asset, contentType] = assets[url.pathname];
+      await route.fulfill({ path: path.join(webuiDir, asset), contentType });
+      return;
+    }
+    if (url.pathname === "/ui/config") {
+      await route.fulfill({
+        json: {
+          auth_enabled: true,
+          provider: "keycloak",
+          device_login_endpoint: "/v1/web-ui/auth/device",
+          device_login_poll_endpoint: "/v1/web-ui/auth/device/poll",
+        },
+      });
+      return;
+    }
+    if (url.pathname === "/v1/web-ui/auth/device") {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      await route.fulfill({ status: 503, json: { error: "test completed" } });
+      return;
+    }
+    await route.fulfill({ status: 404, body: "not found" });
+  });
+}
+
+test("device login shows a local waiting page before Keycloak responds", async ({ page }) => {
+  await installDelayedLoginBackend(page);
+  await page.goto("/ui/");
+
+  const popupPromise = page.waitForEvent("popup");
+  await page.getByRole("button", { name: "Keycloakでログイン" }).click();
+  const popup = await popupPromise;
+
+  await expect(popup).toHaveURL(/\/ui\/auth\/wait$/);
+  await expect(popup.getByRole("heading", { name: "Keycloakに接続しています" })).toBeVisible();
+  await popup.close();
+});
 
 test("Cloudscape console renders overview and hierarchical topology", async ({ page }) => {
   const pageErrors = [];

@@ -12,6 +12,7 @@ control_plane_service=heteronetwork-control-plane.service
 signal_service=heteronetwork-signal.service
 stun_service=heteronetwork-stun.service
 service_group=heteronetwork-services
+managed_keycloak_overlay_origin=http://console.heteronetwork.internal:18079
 
 # Tests use an isolated filesystem tree. Production always leaves this unset.
 filesystem_root=${HETERONETWORK_PUBLIC_SERVICES_TEST_ROOT:-}
@@ -679,6 +680,15 @@ load_control_bootstrap() {
   valid_enrollment_trusted_issuer_keys "$enrollment_trusted_issuer_keys" || return 1
   valid_http_url "$oidc_issuer_url" || return 1
   valid_identifier "$oidc_client_id" || return 1
+  case "$oidc_issuer_url" in
+    "$managed_keycloak_overlay_origin"/realms/*)
+      managed_realm=${oidc_issuer_url#"$managed_keycloak_overlay_origin"/realms/}
+      case "$managed_realm" in
+        ''|*/*) ;;
+        *) oidc_auth_base_url=$oidc_issuer_url ;;
+      esac
+      ;;
+  esac
   if [ -n "$oidc_auth_base_url" ]; then
     valid_http_url "$oidc_auth_base_url" || return 1
   fi

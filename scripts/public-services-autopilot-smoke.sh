@@ -815,6 +815,24 @@ run_reconciler
 rm -f "$fake_state/fail-start-heteronetwork-control-plane.service"
 assert_control_demoted_independent_active
 
+managed_issuer=http://console.heteronetwork.internal:18079/realms/heteronetwork
+managed_direct=http://10.250.0.5:18080/realms/heteronetwork
+managed_issuer_b64=$(b64 "$managed_issuer")
+managed_direct_b64=$(b64 "$managed_direct")
+sed -i \
+  -e "s|^HETERONETWORK_PUBLIC_SERVICES_OIDC_ISSUER_URL_B64=.*|HETERONETWORK_PUBLIC_SERVICES_OIDC_ISSUER_URL_B64=$managed_issuer_b64|" \
+  -e "s|^HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64=.*|HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64=$managed_direct_b64|" \
+  "$public_services_dir/bootstrap.env"
+prepare_dependencies
+reset_auto_services
+fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+write_status public "$fresh_time"
+run_reconciler
+run_reconciler
+run_reconciler
+grep -Fqx "HETERONETWORK_WEB_OIDC_AUTH_BASE_URL=\"$managed_issuer\"" \
+  "$services_env" || fail "managed Keycloak auth did not use the HA overlay origin"
+
 if grep -Fq "$secret" "$output_log" ||
   grep -Fq "$secret" "$systemctl_log" ||
   grep -Fq "$database_autopilot_token" "$output_log" ||

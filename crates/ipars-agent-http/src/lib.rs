@@ -41,6 +41,7 @@ const MAX_AGENT_API_BEARER_TOKEN_BYTES: usize = 512;
 const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WEB_UI_MANAGEMENT_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVICE_LOGIN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODE_INSTALL_PROXY_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
@@ -329,6 +330,7 @@ fn gateway_web_ui_routes() -> Router<AgentHttpState> {
         .route("/", get(local_ui_root))
         .route("/ui", get(local_ui_index))
         .route("/ui/", get(local_ui_index))
+        .route("/ui/auth/wait", get(local_ui_auth_wait))
         .route("/ui/app.js", get(local_ui_app))
         .route("/ui/theme.js", get(local_ui_theme))
         .route("/ui/styles.css", get(local_ui_styles))
@@ -666,23 +668,34 @@ async fn device_login_providers(
         }
     });
     let expected_cluster_id = expected_web_ui_cluster_id(state);
-    let mut providers = Vec::new();
+    let mut probes = JoinSet::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let client = state.control_plane_client.clone();
+        let expected_cluster_id = expected_cluster_id.clone();
+        probes.spawn(async move {
+            let result =
+                fetch_web_ui_config(&client, &candidate, expected_cluster_id.as_deref()).await;
+            (index, candidate, result)
+        });
+    }
+    let mut results = BTreeMap::new();
     let mut failures = Vec::new();
-    let mut selected_candidate = None;
-    for candidate in candidates {
-        let config = match fetch_web_ui_config(
-            &state.control_plane_client,
-            &candidate,
-            expected_cluster_id.as_deref(),
-        )
-        .await
-        {
-            Ok(config) => {
-                record_web_ui_health(state, candidate.url.clone(), true).await;
-                config
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok((index, candidate, result)) => {
+                record_web_ui_health(state, candidate.url.clone(), result.is_ok()).await;
+                results.insert(index, (candidate, result));
             }
+            Err(error) => failures.push(format!("Web UI probe task failed: {error}")),
+        }
+    }
+
+    let mut providers = Vec::new();
+    let mut selected_candidate = None;
+    for (_, (candidate, result)) in results {
+        let config = match result {
+            Ok(config) => config,
             Err(error) => {
-                record_web_ui_health(state, candidate.url.clone(), false).await;
                 failures.push(format!("{}: {}", candidate.url, truncate_error(&error)));
                 continue;
             }
@@ -757,7 +770,11 @@ async fn start_device_login(
                 ("code_challenge", code_challenge.as_str()),
                 ("code_challenge_method", "S256"),
             ])
-            .timeout(state.control_plane_request_timeout)
+            .timeout(
+                state
+                    .control_plane_request_timeout
+                    .min(DEVICE_LOGIN_ENDPOINT_TIMEOUT),
+            )
             .send()
             .await
         {
@@ -2156,6 +2173,16 @@ async fn local_ui_index(State(state): State<AgentHttpState>) -> Response {
     )
         .into_response();
     apply_local_ui_security_headers(&mut response, true, oidc_origin.as_deref());
+    response
+}
+
+async fn local_ui_auth_wait() -> Response {
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../../webui/auth-wait.html"),
+    )
+        .into_response();
+    apply_local_ui_security_headers(&mut response, true, None);
     response
 }
 
@@ -4603,6 +4630,7 @@ mod tests {
         admin_calls: Arc<AtomicUsize>,
         authorization: Arc<tokio::sync::Mutex<Option<String>>>,
         base_url: String,
+        config_delay: Duration,
         issuer_url: String,
         verification_origin: String,
         device_authorization_form: Arc<tokio::sync::Mutex<Option<BTreeMap<String, String>>>>,
@@ -4612,6 +4640,7 @@ mod tests {
     }
 
     async fn web_ui_test_config(State(state): State<WebUiTestBackend>) -> Json<Value> {
+        tokio::time::sleep(state.config_delay).await;
         Json(json!({
             "cluster_id": "cluster-a",
             "enabled": true,
@@ -4736,6 +4765,22 @@ mod tests {
         verification_origin: Option<&str>,
     ) -> Result<(String, WebUiTestBackend, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
     {
+        spawn_web_ui_test_backend_with_options(
+            admin_status,
+            issuer_url,
+            verification_origin,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn spawn_web_ui_test_backend_with_options(
+        admin_status: StatusCode,
+        issuer_url: Option<&str>,
+        verification_origin: Option<&str>,
+        config_delay: Duration,
+    ) -> Result<(String, WebUiTestBackend, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let base_url = format!("http://{addr}");
@@ -4744,6 +4789,7 @@ mod tests {
             admin_calls: Arc::new(AtomicUsize::new(0)),
             authorization: Arc::new(tokio::sync::Mutex::new(None)),
             base_url: base_url.clone(),
+            config_delay,
             issuer_url: issuer_url
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{base_url}/realms/heteronetwork")),
@@ -5248,7 +5294,7 @@ mod tests {
         assert!(mermaid_script < app_script);
 
         for host in ["10.250.0.1:9781", "console.heteronetwork.internal:9781"] {
-            for path in ["/ui/app.js", "/ui/vendor/mermaid.min.js"] {
+            for path in ["/ui/auth/wait", "/ui/app.js", "/ui/vendor/mermaid.min.js"] {
                 let response = app
                     .clone()
                     .oneshot(
@@ -5259,7 +5305,17 @@ mod tests {
                     )
                     .await?;
                 assert_eq!(response.status(), StatusCode::OK);
-                if path.ends_with("mermaid.min.js") {
+                if path == "/ui/auth/wait" {
+                    assert_eq!(
+                        response.headers().get(header::CONTENT_TYPE),
+                        Some(&HeaderValue::from_static("text/html; charset=utf-8"))
+                    );
+                    assert!(response.headers().get("content-security-policy").is_some());
+                    let body = String::from_utf8(
+                        to_bytes(response.into_body(), usize::MAX).await?.to_vec(),
+                    )?;
+                    assert!(body.contains("Keycloakに接続しています"));
+                } else if path.ends_with("mermaid.min.js") {
                     assert_eq!(
                         response
                             .headers()
@@ -5535,6 +5591,46 @@ mod tests {
                 "unsafe issuer was accepted: {unsafe_issuer}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn device_login_provider_discovery_probes_candidates_concurrently(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut backend_urls = Vec::new();
+        let mut backend_tasks = Vec::new();
+        for _ in 0..4 {
+            let (url, _, task) = spawn_web_ui_test_backend_with_options(
+                StatusCode::OK,
+                None,
+                None,
+                Duration::from_millis(500),
+            )
+            .await?;
+            backend_urls.push(url);
+            backend_tasks.push(task);
+        }
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let state = AgentHttpState::with_control_plane_urls(runtime, backend_urls);
+
+        let providers = match tokio::time::timeout(
+            Duration::from_millis(1_200),
+            device_login_providers(&state, false),
+        )
+        .await
+        {
+            Ok(Ok(providers)) => providers,
+            Ok(Err(_)) => return Err("device login provider discovery failed".into()),
+            Err(_) => return Err("device login provider probes ran serially".into()),
+        };
+
+        assert_eq!(providers.len(), 4);
+        for task in backend_tasks {
+            task.abort();
+        }
+        Ok(())
     }
 
     #[tokio::test]

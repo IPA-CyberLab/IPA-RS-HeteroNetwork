@@ -4896,7 +4896,10 @@ fn public_services_install_script(
         enrollment_trusted_issuer_keys.push(enrollment_signer_entry);
     }
     let enrollment_trusted_issuer_keys = enrollment_trusted_issuer_keys.join(";");
-    let oidc_auth_base_url = config.oidc_auth_base_url.as_deref().unwrap_or_default();
+    let oidc_auth_base_url = public_services_oidc_auth_base_url(
+        &config.oidc_issuer_url,
+        config.oidc_auth_base_url.as_deref(),
+    );
     let oidc_backchannel_base_url = managed_keycloak_edge_base_url(&config.oidc_issuer_url)
         .or_else(|| config.oidc_backchannel_base_url.clone())
         .unwrap_or_default();
@@ -5010,7 +5013,7 @@ fi
         enrollment_trusted_issuer_keys = encode(&enrollment_trusted_issuer_keys),
         oidc_issuer_url = encode(&config.oidc_issuer_url),
         oidc_client_id = encode(&config.oidc_client_id),
-        oidc_auth_base_url = encode(oidc_auth_base_url),
+        oidc_auth_base_url = encode(&oidc_auth_base_url),
         oidc_backchannel_base_url = encode(&oidc_backchannel_base_url),
         oidc_backchannel_fallback_base_urls = encode(&oidc_backchannel_fallback_base_urls),
         oidc_scopes = encode(&config.oidc_scopes),
@@ -5034,6 +5037,15 @@ fn managed_keycloak_edge_base_url(issuer_url: &str) -> Option<String> {
     Some(format!(
         "http://127.0.0.1:{KEYCLOAK_AUTOPILOT_EDGE_PORT}{issuer_path}"
     ))
+}
+
+fn public_services_oidc_auth_base_url(
+    issuer_url: &str,
+    configured_auth_base_url: Option<&str>,
+) -> String {
+    managed_keycloak_overlay_issuer_url(issuer_url)
+        .or_else(|| configured_auth_base_url.map(str::to_string))
+        .unwrap_or_default()
 }
 
 pub fn managed_keycloak_overlay_issuer_url(issuer_url: &str) -> Option<String> {
@@ -7302,6 +7314,20 @@ mod tests {
         assert!(managed_keycloak_overlay_issuer_url("https://idp.example/not-a-realm").is_none());
         assert!(
             managed_keycloak_overlay_issuer_url("https://idp.example/realms/a/nested").is_none()
+        );
+        assert_eq!(
+            public_services_oidc_auth_base_url(
+                "http://console.heteronetwork.internal:18079/realms/heteronetwork",
+                Some("http://10.250.0.5:18080/realms/heteronetwork"),
+            ),
+            "http://console.heteronetwork.internal:18079/realms/heteronetwork"
+        );
+        assert_eq!(
+            public_services_oidc_auth_base_url(
+                "https://sso.example/tenant",
+                Some("https://login.example/tenant"),
+            ),
+            "https://login.example/tenant"
         );
     }
 

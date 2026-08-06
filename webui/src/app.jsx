@@ -309,7 +309,7 @@ export function App() {
     setError(null);
     if (config.device_login_endpoint && config.device_login_poll_endpoint) {
       setLoading(true);
-      const authWindow = window.open("about:blank", "_blank");
+      const authWindow = window.open("/ui/auth/wait", "_blank");
       try {
         const response = await fetch(config.device_login_endpoint, {
           method: "POST",

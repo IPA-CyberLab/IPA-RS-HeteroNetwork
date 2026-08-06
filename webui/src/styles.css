@@ -42,6 +42,75 @@ body {
   width: min(100%, 560px);
 }
 
+.auth-wait-page {
+  min-height: 100vh;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: #f2f3f3;
+  color: #16191f;
+}
+
+.auth-wait {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.auth-wait__brand {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 4px;
+  background: #0972d3;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.auth-wait__spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid #b6bec9;
+  border-top-color: #0972d3;
+  border-radius: 50%;
+  animation: auth-wait-spin 0.8s linear infinite;
+}
+
+.auth-wait h1 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.auth-wait p {
+  margin: 0;
+  color: #5f6b7a;
+  font-size: 14px;
+  letter-spacing: 0;
+}
+
+@keyframes auth-wait-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .auth-wait-page {
+    background: #0f1b2a;
+    color: #f1f3f5;
+  }
+
+  .auth-wait p {
+    color: #b6bec9;
+  }
+}
+
 .command-output {
   position: relative;
   display: grid;
