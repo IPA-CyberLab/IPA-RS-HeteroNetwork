@@ -121,6 +121,8 @@ const overview = {
 };
 
 async function installMockBackend(page) {
+  const localOverview = JSON.parse(JSON.stringify(overview));
+  const localTopology = JSON.parse(JSON.stringify(topology));
   await page.addInitScript(() => {
     sessionStorage.setItem("heteronetwork_operator_token", "e2e-operator-token");
   });
@@ -142,13 +144,30 @@ async function installMockBackend(page) {
       await route.fulfill({ path: path.join(webuiDir, asset), contentType });
       return;
     }
+    const displayNameMatch = url.pathname.match(
+      /^\/v1\/admin\/nodes\/([^/]+)\/display-name$/,
+    );
+    if (displayNameMatch && route.request().method() === "PUT") {
+      const nodeId = decodeURIComponent(displayNameMatch[1]);
+      const request = route.request().postDataJSON();
+      const entry = localOverview.nodes.find((candidate) => candidate.node.node_id === nodeId);
+      if (!entry) {
+        await route.fulfill({ status: 404, json: { error: "node not found" } });
+        return;
+      }
+      entry.node.display_name = request.display_name || null;
+      const topologyNode = localTopology.nodes.find((candidate) => candidate.node_id === nodeId);
+      if (topologyNode) topologyNode.display_name = request.display_name || null;
+      await route.fulfill({ json: entry.node });
+      return;
+    }
     const responses = {
       "/ui/config": {
         auth_enabled: false,
         operator_token_enabled: true,
         local_agent: false,
       },
-      "/v1/admin/overview": overview,
+      "/v1/admin/overview": localOverview,
       "/v1/admin/keycloak-placement": {
         desired_replicas: 3,
         replicas: nodes.slice(0, 3).map((entry) => ({
@@ -156,7 +175,7 @@ async function installMockBackend(page) {
           ready: true,
         })),
       },
-      "/v1/admin/topology": topology,
+      "/v1/admin/topology": localTopology,
       "/v1/admin/policy": { cluster_policy: policy },
     };
     if (responses[url.pathname]) {
@@ -213,4 +232,19 @@ test("Cloudscape console remains operable on a mobile viewport", async ({ page }
   const bounds = await content.boundingBox();
   expect(bounds?.x ?? -1).toBeGreaterThanOrEqual(0);
   expect((bounds?.x ?? 0) + (bounds?.width ?? 0)).toBeLessThanOrEqual(390);
+});
+
+test("node display names can be changed without replacing the OS hostname", async ({ page }) => {
+  await installMockBackend(page);
+  await page.goto("/ui/#/nodes");
+
+  await page.getByRole("button", { name: "uc-k8sp1" }).click();
+  const dialog = page.getByRole("dialog", { name: "ノード詳細" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "ノード名を変更" }).click();
+  await dialog.getByRole("textbox", { name: "ノード名" }).fill("uc-k8sv1");
+  await dialog.getByRole("button", { name: "保存" }).click();
+
+  await expect(dialog.getByText("uc-k8sv1", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("uc-k8sp1", { exact: true })).toBeVisible();
 });

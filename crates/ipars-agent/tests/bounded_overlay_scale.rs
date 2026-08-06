@@ -32,6 +32,7 @@ fn vpn_ip(index: usize) -> VpnIp {
 fn node_record(index: usize) -> NodeRecord {
     NodeRecord {
         node_id: node_id(index),
+        display_name: None,
         hostname: None,
         cluster_id: ClusterId::from_string("bounded-overlay-scale"),
         vpn_ip: vpn_ip(index),

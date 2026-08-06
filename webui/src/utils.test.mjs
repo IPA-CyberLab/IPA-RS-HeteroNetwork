@@ -10,6 +10,14 @@ import {
 
 test("node and path presentation helpers normalize API values", () => {
   assert.equal(shortId("node-abcdefghijklmnopqrstuvwxyz").includes("…"), true);
+  assert.equal(
+    nodeDisplayName({
+      node_id: "node-a",
+      display_name: "uc-k8sv1",
+      hostname: "compute-vm",
+    }),
+    "uc-k8sv1",
+  );
   assert.equal(nodeDisplayName({ node_id: "node-a", hostname: "uc-k8sp1" }), "uc-k8sp1");
   assert.equal(nodeDisplayName({ node_id: "node-a" }), "node-a");
   assert.equal(pathState("DirectNatTraversal"), "direct_nat_traversal");

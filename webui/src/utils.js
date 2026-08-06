@@ -5,8 +5,9 @@ export function shortId(value) {
 
 export function nodeDisplayName(value) {
   const node = value?.node || value || {};
+  const displayName = String(node.display_name || "").trim();
   const hostname = String(node.hostname || "").trim();
-  return hostname || shortId(node.node_id);
+  return displayName || hostname || shortId(node.node_id);
 }
 
 export function formatDateTime(value) {

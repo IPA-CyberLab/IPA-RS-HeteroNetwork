@@ -38,19 +38,20 @@ use ipars_types::api::{
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
     endpoint_addr_is_usable, literal_http_bootstrap_socket_addr, literal_udp_bootstrap_socket_addr,
-    node_hostname_is_valid, relay_admission_url_is_usable, socket_addr_is_globally_routable,
-    validate_join_token_bootstrap_endpoints, AclAction, AclRule, AggregateOverlayRoute,
-    BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
-    EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId, NatClassification,
-    NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayNeighbor,
-    OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState, RelayCapability,
-    Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
-    TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome, TokenRevocationRecord, TokenStatus,
-    TransportProtocol, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
-    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
-    MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE, MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES,
-    MAX_PATH_SCORE_REASONS, MIN_OVERLAY_BLOCK_SIZE,
+    node_display_name_is_valid, node_hostname_is_valid, relay_admission_url_is_usable,
+    socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, AclAction, AclRule,
+    AggregateOverlayRoute, BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy,
+    EndpointCandidate, EndpointCandidateKind, HealthState, JoinTokenClaims, KeyId,
+    NatClassification, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
+    OverlayNeighbor, OverlayNeighborKind, OverlayPath, OverlayPathQuery, PathRecord, PathState,
+    RelayCapability, Role, Route, ServiceDirectory, ServiceInstance, SignedJoinToken,
+    TokenLedgerMetrics, TokenLedgerRecord, TokenPolicy, TokenRevocationOutcome,
+    TokenRevocationRecord, TokenStatus, TransportProtocol, VpnIp,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_OVERLAY_BLOCK_SIZE, MAX_OVERLAY_DEGREE,
+    MAX_OVERLAY_NODE_ROUTES, MAX_OVERLAY_ROUTE_SCOPES, MAX_PATH_SCORE_REASONS,
+    MIN_OVERLAY_BLOCK_SIZE,
 };
 use ipnet::IpNet;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -152,6 +153,8 @@ pub enum ControlPlaneError {
     NodeRequestAuthenticationCapacity,
     #[error("node {node_id} heartbeat update rejected: {reason}")]
     NodeUpdateRejected { node_id: NodeId, reason: String },
+    #[error("node display name rejected: {0}")]
+    InvalidNodeDisplayName(String),
     #[error("node {node_id} registration rejected: {reason}")]
     NodeRegistrationRejected { node_id: NodeId, reason: String },
     #[error("node not found: {0}")]
@@ -283,6 +286,11 @@ pub trait ControlPlaneStore: Send + Sync {
         node_id: &NodeId,
         candidates: Vec<EndpointCandidate>,
     ) -> Result<(), ControlPlaneError>;
+    async fn update_node_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: Option<String>,
+    ) -> Result<NodeRecord, ControlPlaneError>;
     async fn update_node_relay_capability(
         &self,
         node_id: &NodeId,
@@ -737,6 +745,19 @@ impl ControlPlaneStore for InMemoryStore {
             .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
         node.endpoint_candidates = candidates;
         Ok(())
+    }
+
+    async fn update_node_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: Option<String>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut nodes = self.nodes.write().await;
+        let node = nodes
+            .get_mut(node_id)
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.display_name = display_name;
+        Ok(node.clone())
     }
 
     async fn update_node_relay_capability(
@@ -2476,6 +2497,38 @@ where
         })
     }
 
+    pub async fn set_admin_node_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: Option<String>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let display_name = display_name
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(value) = display_name.as_deref() {
+            if !node_display_name_is_valid(value) {
+                return Err(ControlPlaneError::InvalidNodeDisplayName(
+                    "must be 1 to 253 ASCII letters, digits, '.', '_' or '-'".to_string(),
+                ));
+            }
+        }
+        let node = self
+            .store
+            .get_node(node_id)
+            .await?
+            .filter(|node| node.cluster_id == self.config.cluster_id && !node.role.is_client())
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        if node.display_name == display_name {
+            return Ok(node);
+        }
+        let node = self
+            .store
+            .update_node_display_name(node_id, display_name)
+            .await?;
+        self.invalidate_overlay_node_snapshot().await;
+        Ok(node)
+    }
+
     pub async fn set_admin_path_pin(
         &self,
         local: NodeId,
@@ -2848,6 +2901,7 @@ where
                 .allocate_next(&reserved_vpn_ips)?;
             let node = NodeRecord {
                 node_id: request.node_id.clone(),
+                display_name: None,
                 hostname: None,
                 cluster_id: claims.cluster_id.clone(),
                 vpn_ip,
@@ -3450,6 +3504,7 @@ where
                     .unwrap_or_default();
                 Ok(ControlPlaneTopologyNode {
                     node_id: node.node_id,
+                    display_name: node.display_name,
                     hostname: node.hostname,
                     vpn_ip: node.vpn_ip,
                     role: node.role,
@@ -7227,6 +7282,7 @@ mod tests {
         let identity = identity_for_node(node_id);
         NodeRecord {
             node_id: identity.node_id(),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
@@ -7266,6 +7322,46 @@ mod tests {
 
     fn node_id(label: &str) -> NodeId {
         identity_for_node(label).node_id()
+    }
+
+    #[tokio::test]
+    async fn admin_display_name_overrides_hostname_in_node_and_topology_views(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id, Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?),
+            store.clone(),
+        );
+        let mut node = node_record("admin-display-name");
+        node.hostname = Some("compute-vm".to_string());
+        let node_id = node.node_id.clone();
+        store.insert_node(node).await?;
+
+        let updated = plane
+            .set_admin_node_display_name(&node_id, Some("  uc-k8sv1  ".to_string()))
+            .await?;
+        assert_eq!(updated.display_name.as_deref(), Some("uc-k8sv1"));
+        assert_eq!(updated.hostname.as_deref(), Some("compute-vm"));
+        let topology = plane.overlay_topology_snapshot().await?;
+        let topology_node = topology
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or("renamed node was absent from topology")?;
+        assert_eq!(topology_node.display_name.as_deref(), Some("uc-k8sv1"));
+        assert_eq!(topology_node.hostname.as_deref(), Some("compute-vm"));
+
+        assert!(matches!(
+            plane
+                .set_admin_node_display_name(&node_id, Some("invalid name".to_string()))
+                .await,
+            Err(ControlPlaneError::InvalidNodeDisplayName(_))
+        ));
+        let cleared = plane.set_admin_node_display_name(&node_id, None).await?;
+        assert_eq!(cleared.display_name, None);
+        assert_eq!(cleared.hostname.as_deref(), Some("compute-vm"));
+        Ok(())
     }
 
     #[test]
@@ -8921,6 +9017,16 @@ mod tests {
             candidates: Vec<EndpointCandidate>,
         ) -> Result<(), ControlPlaneError> {
             self.inner.update_node_candidates(node_id, candidates).await
+        }
+
+        async fn update_node_display_name(
+            &self,
+            node_id: &NodeId,
+            display_name: Option<String>,
+        ) -> Result<NodeRecord, ControlPlaneError> {
+            self.inner
+                .update_node_display_name(node_id, display_name)
+                .await
         }
 
         async fn update_node_relay_capability(

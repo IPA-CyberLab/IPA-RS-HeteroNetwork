@@ -3065,6 +3065,7 @@ mod tests {
         let fourth_octet = (index % 254 + 1) as u8;
         NodeRecord {
             node_id: NodeId::from_string(format!("node-{index:04}")),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(

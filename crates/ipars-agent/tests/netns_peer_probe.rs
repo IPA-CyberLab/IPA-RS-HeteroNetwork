@@ -76,6 +76,7 @@ async fn udp_peer_probe_crosses_linux_network_namespaces() -> Result<(), Box<dyn
 fn peer_record(node_id: NodeId, vpn_ip: VpnIp) -> NodeRecord {
     NodeRecord {
         node_id,
+        display_name: None,
         hostname: None,
         cluster_id: ClusterId::from_string("cluster-netns-probe"),
         vpn_ip,

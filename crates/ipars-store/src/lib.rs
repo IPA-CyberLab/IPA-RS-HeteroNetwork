@@ -557,6 +557,36 @@ impl ControlPlaneStore for SqliteControlPlaneStore {
         Ok(())
     }
 
+    async fn update_node_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: Option<String>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.display_name = display_name;
+        sqlx::query("UPDATE nodes SET record_json = ?2 WHERE node_id = ?1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_string(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(node)
+    }
+
     async fn update_node_relay_capability(
         &self,
         node_id: &NodeId,
@@ -2059,6 +2089,32 @@ impl ControlPlaneStore for PostgresControlPlaneStore {
         Ok(())
     }
 
+    async fn update_node_display_name(
+        &self,
+        node_id: &NodeId,
+        display_name: Option<String>,
+    ) -> Result<NodeRecord, ControlPlaneError> {
+        let mut transaction = self.pool.begin().await.map_err(sql_error)?;
+        let row = sqlx::query("SELECT record_json FROM nodes WHERE node_id = $1 FOR UPDATE")
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        let mut node = row
+            .map(pg_row_to_node)
+            .transpose()?
+            .ok_or_else(|| ControlPlaneError::NodeNotFound(node_id.clone()))?;
+        node.display_name = display_name;
+        sqlx::query("UPDATE nodes SET record_json = $2 WHERE node_id = $1")
+            .bind(node_id.as_str())
+            .bind(serde_json::to_value(&node).map_err(json_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sql_error)?;
+        transaction.commit().await.map_err(sql_error)?;
+        Ok(node)
+    }
+
     async fn update_node_relay_capability(
         &self,
         node_id: &NodeId,
@@ -3550,6 +3606,7 @@ mod tests {
     fn node(id: &str, ip: Ipv4Addr) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(id),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(ip)),
@@ -3769,6 +3826,19 @@ mod tests {
                 .endpoint_candidates
                 .len(),
             1
+        );
+        let renamed = store
+            .update_node_display_name(&local.node_id, Some("uc-k8sv1".to_string()))
+            .await?;
+        assert_eq!(renamed.display_name.as_deref(), Some("uc-k8sv1"));
+        assert_eq!(
+            store
+                .get_node(&local.node_id)
+                .await?
+                .ok_or_else(|| ControlPlaneError::NodeNotFound(local.node_id.clone()))?
+                .display_name
+                .as_deref(),
+            Some("uc-k8sv1")
         );
         store
             .update_node_relay_capability(&local.node_id, Some(relay_capability()))

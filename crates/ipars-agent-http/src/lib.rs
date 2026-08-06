@@ -4217,6 +4217,7 @@ mod tests {
     fn peer_record(node_id: NodeId, vpn_ip: IpAddr, routes: Vec<Route>) -> NodeRecord {
         NodeRecord {
             node_id,
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(vpn_ip),
@@ -4452,6 +4453,7 @@ mod tests {
         *capture.request.lock().await = Some(request.clone());
         let node = NodeRecord {
             node_id: request.node_id.clone(),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
@@ -4514,6 +4516,7 @@ mod tests {
         *capture.request.lock().await = Some(request.clone());
         let node = NodeRecord {
             node_id: request.node_id.clone(),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),

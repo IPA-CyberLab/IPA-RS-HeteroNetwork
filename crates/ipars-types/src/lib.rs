@@ -1568,6 +1568,8 @@ pub struct NodeHealth {
 pub struct NodeRecord {
     pub node_id: NodeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     pub cluster_id: ClusterId,
     pub vpn_ip: VpnIp,
@@ -1593,6 +1595,10 @@ pub fn node_hostname_is_valid(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub fn node_display_name_is_valid(value: &str) -> bool {
+    node_hostname_is_valid(value)
 }
 
 pub const MAX_OVERLAY_DEGREE: u16 = 64;
@@ -3219,6 +3225,8 @@ pub mod api {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ControlPlaneTopologyNode {
         pub node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub hostname: Option<String>,
         pub vpn_ip: VpnIp,
@@ -20078,6 +20086,7 @@ mod tests {
     fn overlay_test_node(node_id: &str, cluster_id: &str, vpn_ip: IpAddr) -> NodeRecord {
         NodeRecord {
             node_id: NodeId::from_string(node_id),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string(cluster_id),
             vpn_ip: VpnIp(vpn_ip),
@@ -20096,6 +20105,7 @@ mod tests {
     #[test]
     fn node_hostname_validation_accepts_machine_names_and_rejects_unsafe_values() {
         assert!(node_hostname_is_valid("uc-k8sp1"));
+        assert!(node_display_name_is_valid("uc-k8sv1"));
         assert!(node_hostname_is_valid("server-room_1.local"));
         assert!(!node_hostname_is_valid(""));
         assert!(!node_hostname_is_valid("../server"));
@@ -20103,6 +20113,7 @@ mod tests {
         assert!(!node_hostname_is_valid(
             &"a".repeat(MAX_NODE_HOSTNAME_BYTES + 1)
         ));
+        assert!(!node_display_name_is_valid("server room"));
     }
 
     fn valid_neighbor_map() -> Result<NeighborMap, Box<dyn std::error::Error>> {
@@ -31387,6 +31398,7 @@ mod tests {
 
         let node = NodeRecord {
             node_id: NodeId::from_string("node-a"),
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 2))),

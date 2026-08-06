@@ -8808,6 +8808,7 @@ mod tests {
     ) -> NodeRecord {
         NodeRecord {
             node_id,
+            display_name: None,
             hostname: None,
             cluster_id: ClusterId::from_string("cluster-a"),
             vpn_ip: VpnIp(vpn_ip),

@@ -158,6 +158,7 @@ export function App() {
   const [pinningKey, setPinningKey] = useState(null);
   const [selectedNode, setSelectedNode] = useState(null);
   const [removingNode, setRemovingNode] = useState(false);
+  const [renamingNode, setRenamingNode] = useState(false);
   const [error, setError] = useState(null);
   const [topologyError, setTopologyError] = useState(null);
   const [navigationOpen, setNavigationOpen] = useState(true);
@@ -710,7 +711,31 @@ export function App() {
         entry={selectedNode}
         visible={Boolean(selectedNode)}
         loading={removingNode}
+        renaming={renamingNode}
         onDismiss={() => setSelectedNode(null)}
+        onRename={async (nodeId, displayName) => {
+          setRenamingNode(true);
+          try {
+            const node = await api.request(
+              `/v1/admin/nodes/${encodeURIComponent(nodeId)}/display-name`,
+              {
+                method: "PUT",
+                body: JSON.stringify({ display_name: displayName }),
+              },
+            );
+            setSelectedNode((current) =>
+              current?.node?.node_id === nodeId ? { ...current, node } : current,
+            );
+            notify(displayName ? "ノード名を変更しました。" : "OSホスト名の表示に戻しました。");
+            await loadOverview(true);
+            return true;
+          } catch (renameError) {
+            notify(renameError.message, "error");
+            return false;
+          } finally {
+            setRenamingNode(false);
+          }
+        }}
         onRemove={async (nodeId) => {
           setRemovingNode(true);
           try {

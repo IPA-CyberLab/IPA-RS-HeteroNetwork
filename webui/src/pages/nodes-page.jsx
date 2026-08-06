@@ -1,6 +1,8 @@
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
+import FormField from "@cloudscape-design/components/form-field";
+import Input from "@cloudscape-design/components/input";
 import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
 import Modal from "@cloudscape-design/components/modal";
 import SpaceBetween from "@cloudscape-design/components/space-between";
@@ -24,6 +26,17 @@ const serviceKinds = [
   ["keycloak", "Keycloak"],
   ["web_ui", "Web UI"],
 ];
+
+function validNodeDisplayName(value) {
+  return (
+    value.length > 0 &&
+    value.length <= 253 &&
+    !value.startsWith(".") &&
+    !value.endsWith(".") &&
+    !value.includes("..") &&
+    /^[A-Za-z0-9._-]+$/.test(value)
+  );
+}
 
 function serviceLeases(overview) {
   const result = new Map(
@@ -185,13 +198,29 @@ export function NodesPage({ overview, onOpenNode }) {
   );
 }
 
-export function NodeDetailModal({ entry, visible, onDismiss, onRemove, loading }) {
+export function NodeDetailModal({
+  entry,
+  visible,
+  onDismiss,
+  onRemove,
+  onRename,
+  loading,
+  renaming,
+}) {
   const [confirming, setConfirming] = useState(false);
-  useEffect(() => setConfirming(false), [entry, visible]);
+  const [editingName, setEditingName] = useState(false);
+  const [displayName, setDisplayName] = useState("");
+  useEffect(() => {
+    setConfirming(false);
+    setEditingName(false);
+    setDisplayName(entry?.node?.display_name || entry?.node?.hostname || "");
+  }, [entry, visible]);
   const node = entry?.node || {};
   const health = entry?.health || {};
   const info = connectivity(entry);
   const routes = node.routes || [];
+  const trimmedDisplayName = displayName.trim();
+  const displayNameValid = validNodeDisplayName(trimmedDisplayName);
 
   return (
     <Modal
@@ -224,10 +253,89 @@ export function NodeDetailModal({ entry, visible, onDismiss, onRemove, loading }
             このノードをクラスターから削除します。再参加には登録操作が必要です。
           </Box>
         ) : null}
+        {editingName ? (
+          <FormField
+            label="ノード名"
+            errorText={
+              trimmedDisplayName && !displayNameValid
+                ? "英数字、ピリオド、ハイフン、アンダースコアで入力してください。"
+                : null
+            }
+          >
+            <SpaceBetween size="xs">
+              <Input
+                value={displayName}
+                disabled={renaming}
+                invalid={Boolean(trimmedDisplayName && !displayNameValid)}
+                nativeInputAttributes={{ maxLength: 253 }}
+                onChange={({ detail }) => setDisplayName(detail.value)}
+                onKeyDown={({ detail }) => {
+                  if (detail.keyCode === 13 && displayNameValid) {
+                    onRename(node.node_id, displayName).then((saved) => {
+                      if (saved) setEditingName(false);
+                    });
+                  }
+                }}
+              />
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  variant="primary"
+                  iconName="check"
+                  loading={renaming}
+                  disabled={!displayNameValid}
+                  onClick={() =>
+                    onRename(node.node_id, displayName).then((saved) => {
+                      if (saved) setEditingName(false);
+                    })
+                  }
+                >
+                  保存
+                </Button>
+                <Button
+                  iconName="close"
+                  disabled={renaming}
+                  onClick={() => {
+                    setDisplayName(node.display_name || node.hostname || "");
+                    setEditingName(false);
+                  }}
+                >
+                  キャンセル
+                </Button>
+                {node.display_name ? (
+                  <Button
+                    disabled={renaming}
+                    onClick={() =>
+                      onRename(node.node_id, null).then((saved) => {
+                        if (saved) setEditingName(false);
+                      })
+                    }
+                  >
+                    OS名を使用
+                  </Button>
+                ) : null}
+              </SpaceBetween>
+            </SpaceBetween>
+          </FormField>
+        ) : null}
         <KeyValuePairs
           columns={3}
           items={[
-            { label: "ホスト名", value: node.hostname || "-" },
+            {
+              label: "ノード名",
+              value: (
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Box>{nodeDisplayName(entry)}</Box>
+                  <Button
+                    variant="icon"
+                    iconName="edit"
+                    ariaLabel="ノード名を変更"
+                    disabled={renaming}
+                    onClick={() => setEditingName(true)}
+                  />
+                </SpaceBetween>
+              ),
+            },
+            { label: "OSホスト名", value: node.hostname || "-" },
             { label: "ノードID", value: <Box variant="code">{node.node_id || "-"}</Box> },
             { label: "VPNアドレス", value: <Box variant="code">{node.vpn_ip || "-"}</Box> },
             {

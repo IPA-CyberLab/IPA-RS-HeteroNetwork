@@ -75,6 +75,7 @@ const WEB_OIDC_REFRESH_REVOCATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_ADMIN_NODE_DISPLAY_NAME_REQUEST_BYTES: usize = 1024;
 const MAX_SPONSORED_CLIENT_REGISTRATION_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_DATABASE_AUTOPILOT_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_DATABASE_AUTOPILOT_MEMBER_IDS: usize = 32;
@@ -702,6 +703,12 @@ where
         .route(
             "/v1/admin/nodes/{node_id}",
             delete(admin_remove_node::<S, L>),
+        )
+        .route(
+            "/v1/admin/nodes/{node_id}/display-name",
+            put(admin_update_node_display_name::<S, L>).layer(DefaultBodyLimit::max(
+                MAX_ADMIN_NODE_DISPLAY_NAME_REQUEST_BYTES,
+            )),
         )
         .route(
             "/v1/admin/paths/{local_node_id}/{remote_node_id}/pin",
@@ -2347,6 +2354,12 @@ struct AdminPolicyRequest {
 #[derive(Debug, Deserialize)]
 struct AdminPathPinRequest {
     pinned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminNodeDisplayNameRequest {
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5895,6 +5908,23 @@ where
     ))
 }
 
+async fn admin_update_node_display_name<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Path(node_id): Path<String>,
+    Json(request): Json<AdminNodeDisplayNameRequest>,
+) -> Result<Json<NodeRecord>, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    Ok(Json(
+        state
+            .plane
+            .set_admin_node_display_name(&NodeId::from_string(node_id), request.display_name)
+            .await?,
+    ))
+}
+
 async fn admin_pin_path<S, L>(
     State(state): State<ControlPlaneHttpState<S, L>>,
     Path((local_node_id, remote_node_id)): Path<(String, String)>,
@@ -7076,6 +7106,7 @@ impl IntoResponse for ApiError {
             | ControlPlaneError::OverlayDestinationNotFound(_)
             | ControlPlaneError::OverlayPathUnavailable { .. } => StatusCode::NOT_FOUND,
             ControlPlaneError::InvalidClusterPolicy(_) => StatusCode::BAD_REQUEST,
+            ControlPlaneError::InvalidNodeDisplayName(_) => StatusCode::BAD_REQUEST,
             ControlPlaneError::VpnPoolExhausted
             | ControlPlaneError::BoundedTopology(_)
             | ControlPlaneError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -11020,6 +11051,41 @@ exit 47
             client_configuration.cluster_policy,
             client_join.cluster_policy
         );
+
+        let renamed_node = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/admin/nodes/{}/display-name", gateway.node_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(r#"{"display_name":"uc-k8sv1"}"#))?,
+            )
+            .await?;
+        assert_eq!(renamed_node.status(), StatusCode::OK);
+        let renamed_node = axum::body::to_bytes(renamed_node.into_body(), usize::MAX).await?;
+        let renamed_node: NodeRecord = serde_json::from_slice(&renamed_node)?;
+        assert_eq!(renamed_node.display_name.as_deref(), Some("uc-k8sv1"));
+
+        let invalid_display_name = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/admin/nodes/{}/display-name", gateway.node_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {OPERATOR_API_BEARER_TOKEN}"),
+                    )
+                    .body(Body::from(r#"{"display_name":"invalid name"}"#))?,
+            )
+            .await?;
+        assert_eq!(invalid_display_name.status(), StatusCode::BAD_REQUEST);
 
         let admin_nodes = app
             .clone()
