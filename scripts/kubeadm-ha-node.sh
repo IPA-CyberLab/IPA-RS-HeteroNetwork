@@ -1346,7 +1346,8 @@ spec:
 EOF
   kubectl -n "$namespace" rollout status daemonset/network-probe --timeout=5m
 
-  local pods_json pod source target target_ip target_node source_node
+  local pods_json source target target_ip target_node source_node
+  local kubernetes_service_url="https://kubernetes.default.svc.cluster.local/healthz"
   pods_json="$(kubectl -n "$namespace" get pods -l app=network-probe -o json)"
   for source in $(jq -r '.items[].metadata.name' <<<"$pods_json"); do
     source_node="$(jq -r --arg pod "$source" '.items[] | select(.metadata.name == $pod) | .spec.nodeName' <<<"$pods_json")"
@@ -1368,9 +1369,21 @@ EOF
       ((reachable == 1)) \
         || die "cross-node Pod traffic failed from $source_node to $target_node at MTU $expected_mtu"
     done
+    reachable=0
+    for attempt in $(seq 1 15); do
+      if kubectl -n "$namespace" exec "$source" -- \
+        nslookup kubernetes.default.svc.cluster.local >/dev/null \
+        && kubectl -n "$namespace" exec "$source" -- \
+          wget -q -T 5 --no-check-certificate -O /dev/null \
+            "$kubernetes_service_url"; then
+        reachable=1
+        break
+      fi
+      sleep 2
+    done
+    ((reachable == 1)) \
+      || die "Kubernetes Service VIP failed from $source_node"
   done
-  pod="$(jq -r '.items[0].metadata.name' <<<"$pods_json")"
-  kubectl -n "$namespace" exec "$pod" -- nslookup kubernetes.default.svc.cluster.local >/dev/null
 
   local flannel_mtu flannel_link_mtu cni_link cni_link_mtu
   [[ -f /run/flannel/subnet.env ]] || die "local Flannel subnet environment is missing"
@@ -1396,7 +1409,7 @@ EOF
   fi
 
   kubectl delete namespace "$namespace" --wait=false >/dev/null
-  printf 'cluster verified: %s control planes, %s Ready nodes, full-MTU underlay and cross-node Pod traffic, DNS, and runtime Flannel MTU %s\n' \
+  printf 'cluster verified: %s control planes, %s Ready nodes, full-MTU underlay and cross-node Pod traffic, per-node DNS and Service VIP, and runtime Flannel MTU %s\n' \
     "$expected_control_planes" "$actual_nodes" "$flannel_mtu"
 }
 

@@ -186,11 +186,12 @@ registration and refuses a node carrying that tag or any `kubernetes-ha-*`
 cohort tag.
 
 `verify-cluster` requires exactly the configured control-plane count, all
-registered nodes Ready, and one running Flannel pod per node. It then runs DNS
-and full cross-node Pod ping checks at both default and maximum packet sizes. It
-also sends non-fragmenting, full-MTU packets between control planes and verifies
-the derived Flannel MTU in both Flannel state and the live `flannel.1`, `cni0`,
-and host-side CNI links:
+registered nodes Ready, and one running Flannel pod per node. It then runs full
+cross-node Pod ping checks at both default and maximum packet sizes, and checks
+DNS plus the Kubernetes API Service VIP from every node. It also sends
+non-fragmenting, full-MTU packets between control planes and verifies the
+derived Flannel MTU in both Flannel state and the live `flannel.1`, `cni0`, and
+host-side CNI links:
 
 ```bash
 sudo -E scripts/kubeadm-ha-node.sh verify-cluster
