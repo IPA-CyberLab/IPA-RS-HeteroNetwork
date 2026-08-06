@@ -7124,6 +7124,7 @@ pub struct PeerMapApplier<W, R> {
     endpoint_resolver: Arc<dyn PeerEndpointResolver>,
     wireguard_peer_inventory: Option<Arc<dyn WireGuardPeerInventorySource>>,
     lazy_runtime: Option<Arc<AgentRuntime>>,
+    route_mtu_lock: Option<u32>,
     apply_lock: tokio::sync::Mutex<()>,
     applied_peers: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
     applied_routes: tokio::sync::RwLock<BTreeMap<NodeId, Vec<Route>>>,
@@ -7143,6 +7144,7 @@ where
             endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
             wireguard_peer_inventory: None,
             lazy_runtime: None,
+            route_mtu_lock: None,
             apply_lock: tokio::sync::Mutex::new(()),
             applied_peers: tokio::sync::RwLock::new(BTreeMap::new()),
             applied_routes: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -7160,6 +7162,11 @@ where
 
     pub fn with_lazy_connect_runtime(mut self, runtime: Arc<AgentRuntime>) -> Self {
         self.lazy_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_route_mtu_lock(mut self, mtu: u32) -> Self {
+        self.route_mtu_lock = Some(mtu);
         self
     }
 
@@ -7355,6 +7362,7 @@ where
         let desired_route_plan = RoutePlan {
             owner: RoutePlanOwner::PeerMap,
             interface: self.interface.clone(),
+            mtu_lock: self.route_mtu_lock,
             routes,
             policy_rules: Vec::new(),
         };
@@ -7399,6 +7407,7 @@ where
                     .remove_routes(RoutePlan {
                         owner: RoutePlanOwner::PeerMap,
                         interface: self.interface.clone(),
+                        mtu_lock: self.route_mtu_lock,
                         routes: routes_to_remove.clone(),
                         policy_rules: Vec::new(),
                     })
@@ -7591,6 +7600,7 @@ where
                     .remove_routes(RoutePlan {
                         owner: RoutePlanOwner::PeerMap,
                         interface: self.interface.clone(),
+                        mtu_lock: self.route_mtu_lock,
                         routes: routes_to_remove.clone(),
                         policy_rules: Vec::new(),
                     })

@@ -229,10 +229,10 @@ const DIRECT_PATH_ENDPOINT_APPLY_WAIT: Duration = Duration::from_millis(500);
 const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_OVERLAY_TRANSIT_PORT: u16 = 51_822;
-// Bounded transit wraps a WireGuard datagram in another overlay path. Keep the
-// inner interface at IPv6's minimum MTU so full-sized TCP segments do not rely
-// on nested UDP fragmentation across heterogeneous underlays.
-const DEFAULT_OVERLAY_WIREGUARD_MTU: u32 = 1_280;
+// Bounded transit fragments its hop transport below this logical MTU, so
+// full-sized inner packets do not depend on nested IP fragmentation.
+const DEFAULT_OVERLAY_WIREGUARD_MTU: u32 = 1_200;
+const MIN_OVERLAY_WIREGUARD_MTU: u32 = 1_200;
 const OVERLAY_TRANSIT_DELIVERY_QUEUE_CAPACITY: usize = 1_024;
 const OVERLAY_PEER_DELIVERY_QUEUE_CAPACITY: usize = 256;
 const OVERLAY_TRANSIT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -2112,8 +2112,8 @@ fn validate_agent_runtime_config(args: &AgentArgs) -> anyhow::Result<()> {
     );
     validate_linux_interface_name(&args.wireguard_interface)?;
     anyhow::ensure!(
-        (1_280..=65_535).contains(&args.wireguard_mtu),
-        "--wireguard-mtu must be between 1280 and 65535"
+        (MIN_OVERLAY_WIREGUARD_MTU..=65_535).contains(&args.wireguard_mtu),
+        "--wireguard-mtu must be between {MIN_OVERLAY_WIREGUARD_MTU} and 65535"
     );
     if args.apply_peer_map && args.runtime_backend == AgentRuntimeBackend::LinuxCommand {
         anyhow::ensure!(
@@ -12824,7 +12824,9 @@ where
         relay_forwarder_bind = ?args.relay_forwarder_bind,
         "using negotiated path-aware endpoint resolver for WireGuard peers"
     );
-    applier = applier.with_endpoint_resolver(resolver);
+    applier = applier
+        .with_endpoint_resolver(resolver)
+        .with_route_mtu_lock(args.wireguard_mtu);
     if let Some(inventory) = agent_wireguard_peer_inventory_source(args)? {
         applier = applier.with_wireguard_peer_inventory(inventory);
     }
@@ -22418,6 +22420,7 @@ mod tests {
         Ok(RoutePlan {
             owner: RoutePlanOwner::Docker,
             interface: interface.to_string(),
+            mtu_lock: None,
             routes: cidrs
                 .iter()
                 .enumerate()
@@ -32783,7 +32786,7 @@ exec sleep 60
         assert_eq!(default.wireguard_mtu, DEFAULT_OVERLAY_WIREGUARD_MTU);
         validate_agent_runtime_config(&default)?;
 
-        for mtu in ["1279", "65536"] {
+        for mtu in ["1199", "65536"] {
             let cli = Cli::try_parse_from(["iparsd", "agent", "--wireguard-mtu", mtu])?;
             let Command::Agent(args) = cli.command else {
                 anyhow::bail!("expected agent command");
@@ -32794,7 +32797,7 @@ exec sleep 60
             };
             assert!(error
                 .to_string()
-                .contains("--wireguard-mtu must be between 1280 and 65535"));
+                .contains("--wireguard-mtu must be between 1200 and 65535"));
         }
 
         let exposed = Cli::try_parse_from(["iparsd", "agent", "--listen", "0.0.0.0:9780"])?;

@@ -5,6 +5,7 @@
 //! of the authenticated hop transport contract: callers must populate it from
 //! the same trusted neighbor map used to construct the forwarder.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -17,6 +18,7 @@ use ipars_relay::multihop::{
     MULTIHOP_PATH_ID_BYTES,
 };
 use ipars_types::{NodeId, OverlayPath};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
@@ -33,6 +35,20 @@ const DEFAULT_MAX_PENDING_OVERLAY_ACKS: usize = 4_096;
 const MAX_OVERLAY_PEER_IN_FLIGHT_SENDS: usize = 256;
 const MAX_OVERLAY_PRIMARY_IN_FLIGHT_PER_NEXT_HOP: usize = 16;
 const OVERLAY_PRIMARY_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+// Keep each hop datagram comfortably below the default logical overlay MTU.
+// Large WireGuard datagrams are split here instead of relying on IP
+// fragmentation inside the same WireGuard interface that carries transit.
+const MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES: usize = 1_024;
+const OVERLAY_FRAGMENT_MAGIC: &[u8; 8] = b"IPARS-FG";
+const OVERLAY_FRAGMENT_VERSION: u8 = 1;
+const OVERLAY_FRAGMENT_DIGEST_BYTES: usize = 16;
+const OVERLAY_FRAGMENT_HEADER_BYTES: usize = 8 + 1 + 1 + 2 + 2 + 4 + 16;
+const OVERLAY_FRAGMENT_PAYLOAD_BYTES: usize =
+    MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES - OVERLAY_FRAGMENT_HEADER_BYTES;
+const MAX_PENDING_FRAGMENTED_FRAMES: usize = 256;
+const MAX_PENDING_FRAGMENTED_FRAME_BYTES: usize =
+    MAX_PENDING_FRAGMENTED_FRAMES * MAX_MULTIHOP_FRAME_BYTES;
+const OVERLAY_FRAGMENT_REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn overlay_acknowledgement_timeout(
     base_timeout: std::time::Duration,
@@ -204,6 +220,34 @@ impl UdpOverlayNeighborSender {
     pub fn new(socket: Arc<UdpSocket>, endpoints: OverlayNeighborEndpointDirectory) -> Self {
         Self { socket, endpoints }
     }
+
+    async fn send_datagram(
+        &self,
+        next_hop: &NodeId,
+        endpoint: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<(), OverlayNeighborSendError> {
+        let sent = self
+            .socket
+            .send_to(datagram, endpoint)
+            .await
+            .map_err(|source| OverlayNeighborSendError::Io {
+                next_hop: next_hop.clone(),
+                endpoint,
+                source,
+            })?;
+        if sent != datagram.len() {
+            return Err(OverlayNeighborSendError::Io {
+                next_hop: next_hop.clone(),
+                endpoint,
+                source: io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("sent {sent} of {} bytes", datagram.len()),
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -217,26 +261,205 @@ impl OverlayNeighborSender for UdpOverlayNeighborSender {
             .endpoints
             .endpoint_for(next_hop)
             .ok_or_else(|| OverlayNeighborSendError::UnknownNeighbor(next_hop.clone()))?;
-        let sent = self
-            .socket
-            .send_to(frame, endpoint)
-            .await
-            .map_err(|source| OverlayNeighborSendError::Io {
-                next_hop: next_hop.clone(),
-                endpoint,
-                source,
-            })?;
-        if sent != frame.len() {
-            return Err(OverlayNeighborSendError::Io {
+        if frame.len() <= MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES {
+            return self.send_datagram(next_hop, endpoint, frame).await;
+        }
+
+        let fragment_count = frame.len().div_ceil(OVERLAY_FRAGMENT_PAYLOAD_BYTES);
+        let fragment_count =
+            u16::try_from(fragment_count).map_err(|_| OverlayNeighborSendError::Io {
                 next_hop: next_hop.clone(),
                 endpoint,
                 source: io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("sent {sent} of {} bytes", frame.len()),
+                    io::ErrorKind::InvalidInput,
+                    "bounded overlay frame requires too many transport fragments",
                 ),
-            });
+            })?;
+        let frame_len = u32::try_from(frame.len()).map_err(|_| OverlayNeighborSendError::Io {
+            next_hop: next_hop.clone(),
+            endpoint,
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded overlay frame length exceeds the transport header",
+            ),
+        })?;
+        let digest = overlay_fragment_digest(frame);
+        for (index, chunk) in frame.chunks(OVERLAY_FRAGMENT_PAYLOAD_BYTES).enumerate() {
+            let fragment = encode_overlay_fragment(
+                u16::try_from(index).expect("fragment count already fits in u16"),
+                fragment_count,
+                frame_len,
+                digest,
+                chunk,
+            );
+            self.send_datagram(next_hop, endpoint, &fragment).await?;
         }
         Ok(())
+    }
+}
+
+fn overlay_fragment_digest(frame: &[u8]) -> [u8; OVERLAY_FRAGMENT_DIGEST_BYTES] {
+    let digest = Sha256::digest(frame);
+    let mut truncated = [0_u8; OVERLAY_FRAGMENT_DIGEST_BYTES];
+    truncated.copy_from_slice(&digest[..OVERLAY_FRAGMENT_DIGEST_BYTES]);
+    truncated
+}
+
+fn encode_overlay_fragment(
+    index: u16,
+    count: u16,
+    frame_len: u32,
+    digest: [u8; OVERLAY_FRAGMENT_DIGEST_BYTES],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut fragment = Vec::with_capacity(OVERLAY_FRAGMENT_HEADER_BYTES + payload.len());
+    fragment.extend_from_slice(OVERLAY_FRAGMENT_MAGIC);
+    fragment.push(OVERLAY_FRAGMENT_VERSION);
+    fragment.push(0);
+    fragment.extend_from_slice(&index.to_be_bytes());
+    fragment.extend_from_slice(&count.to_be_bytes());
+    fragment.extend_from_slice(&frame_len.to_be_bytes());
+    fragment.extend_from_slice(&digest);
+    fragment.extend_from_slice(payload);
+    fragment
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OverlayFragmentKey {
+    source: SocketAddr,
+    digest: [u8; OVERLAY_FRAGMENT_DIGEST_BYTES],
+}
+
+struct PendingOverlayFrame {
+    expires_at: tokio::time::Instant,
+    frame_len: usize,
+    fragment_count: usize,
+    received_count: usize,
+    fragments: Vec<Option<Vec<u8>>>,
+}
+
+#[derive(Default)]
+struct OverlayFragmentReassembler {
+    pending: HashMap<OverlayFragmentKey, PendingOverlayFrame>,
+    reserved_bytes: usize,
+}
+
+impl OverlayFragmentReassembler {
+    fn prune_expired(&mut self, now: tokio::time::Instant) {
+        let expired = self
+            .pending
+            .iter()
+            .filter_map(|(key, frame)| (frame.expires_at <= now).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        for key in expired {
+            if let Some(frame) = self.pending.remove(&key) {
+                self.reserved_bytes = self.reserved_bytes.saturating_sub(frame.frame_len);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &OverlayFragmentKey) {
+        if let Some(frame) = self.pending.remove(key) {
+            self.reserved_bytes = self.reserved_bytes.saturating_sub(frame.frame_len);
+        }
+    }
+
+    fn push(
+        &mut self,
+        source: SocketAddr,
+        datagram: &[u8],
+        now: tokio::time::Instant,
+    ) -> Result<Option<Vec<u8>>, ()> {
+        self.prune_expired(now);
+        if datagram.len() <= OVERLAY_FRAGMENT_HEADER_BYTES
+            || datagram.len() > MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES
+            || datagram.get(..OVERLAY_FRAGMENT_MAGIC.len()) != Some(OVERLAY_FRAGMENT_MAGIC)
+            || datagram[8] != OVERLAY_FRAGMENT_VERSION
+            || datagram[9] != 0
+        {
+            return Err(());
+        }
+
+        let index = usize::from(u16::from_be_bytes([datagram[10], datagram[11]]));
+        let fragment_count = usize::from(u16::from_be_bytes([datagram[12], datagram[13]]));
+        let frame_len = usize::try_from(u32::from_be_bytes([
+            datagram[14],
+            datagram[15],
+            datagram[16],
+            datagram[17],
+        ]))
+        .map_err(|_| ())?;
+        let mut digest = [0_u8; OVERLAY_FRAGMENT_DIGEST_BYTES];
+        digest.copy_from_slice(&datagram[18..OVERLAY_FRAGMENT_HEADER_BYTES]);
+        let payload = &datagram[OVERLAY_FRAGMENT_HEADER_BYTES..];
+        if frame_len <= MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES
+            || frame_len > MAX_MULTIHOP_FRAME_BYTES
+            || fragment_count < 2
+            || index >= fragment_count
+        {
+            return Err(());
+        }
+        let expected_count = frame_len.div_ceil(OVERLAY_FRAGMENT_PAYLOAD_BYTES);
+        let expected_payload_len = if index + 1 == fragment_count {
+            frame_len - OVERLAY_FRAGMENT_PAYLOAD_BYTES * (fragment_count - 1)
+        } else {
+            OVERLAY_FRAGMENT_PAYLOAD_BYTES
+        };
+        if fragment_count != expected_count || payload.len() != expected_payload_len {
+            return Err(());
+        }
+
+        let key = OverlayFragmentKey { source, digest };
+        if !self.pending.contains_key(&key) {
+            if self.pending.len() >= MAX_PENDING_FRAGMENTED_FRAMES
+                || self.reserved_bytes.saturating_add(frame_len)
+                    > MAX_PENDING_FRAGMENTED_FRAME_BYTES
+            {
+                return Err(());
+            }
+            self.reserved_bytes += frame_len;
+            self.pending.insert(
+                key.clone(),
+                PendingOverlayFrame {
+                    expires_at: now + OVERLAY_FRAGMENT_REASSEMBLY_TIMEOUT,
+                    frame_len,
+                    fragment_count,
+                    received_count: 0,
+                    fragments: vec![None; fragment_count],
+                },
+            );
+        }
+
+        let frame = self.pending.get_mut(&key).ok_or(())?;
+        if frame.frame_len != frame_len || frame.fragment_count != fragment_count {
+            self.remove(&key);
+            return Err(());
+        }
+        match &frame.fragments[index] {
+            Some(existing) if existing == payload => return Ok(None),
+            Some(_) => {
+                self.remove(&key);
+                return Err(());
+            }
+            None => {
+                frame.fragments[index] = Some(payload.to_vec());
+                frame.received_count += 1;
+            }
+        }
+        if frame.received_count != fragment_count {
+            return Ok(None);
+        }
+
+        let frame = self.pending.remove(&key).ok_or(())?;
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(frame.frame_len);
+        let mut reassembled = Vec::with_capacity(frame.frame_len);
+        for fragment in frame.fragments {
+            reassembled.extend_from_slice(fragment.as_deref().ok_or(())?);
+        }
+        if reassembled.len() != frame.frame_len || overlay_fragment_digest(&reassembled) != digest {
+            return Err(());
+        }
+        Ok(Some(reassembled))
     }
 }
 
@@ -1322,6 +1545,7 @@ async fn run_receive_loop(
         stats,
     } = state;
     let mut datagram = vec![0_u8; MAX_MULTIHOP_FRAME_BYTES];
+    let mut fragment_reassembler = OverlayFragmentReassembler::default();
     loop {
         tokio::select! {
             biased;
@@ -1333,7 +1557,6 @@ async fn run_receive_loop(
             received = socket.recv_from(&mut datagram) => {
                 let (length, source_endpoint) =
                     received.map_err(OverlayTransitError::Receive)?;
-                stats.inner.received_frames.fetch_add(1, Ordering::Relaxed);
                 let Some(previous_hop) = endpoints.neighbor_for_endpoint(source_endpoint) else {
                     stats
                         .inner
@@ -1341,10 +1564,30 @@ async fn run_receive_loop(
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
-                let decoded = MultiHopEnvelope::decode(&datagram[..length], 1);
+                let frame = if datagram[..length].starts_with(OVERLAY_FRAGMENT_MAGIC) {
+                    match fragment_reassembler.push(
+                        source_endpoint,
+                        &datagram[..length],
+                        tokio::time::Instant::now(),
+                    ) {
+                        Ok(Some(frame)) => Cow::Owned(frame),
+                        Ok(None) => continue,
+                        Err(()) => {
+                            stats
+                                .inner
+                                .invalid_frames_dropped
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    Cow::Borrowed(&datagram[..length])
+                };
+                stats.inner.received_frames.fetch_add(1, Ordering::Relaxed);
+                let decoded = MultiHopEnvelope::decode(frame.as_ref(), 1);
                 let action = {
                     let mut forwarder = forwarder.lock().await;
-                    forwarder.receive(&previous_hop, &datagram[..length])
+                    forwarder.receive(&previous_hop, frame.as_ref())
                 };
                 match action {
                     Ok(OverlayForwardAction::Forward { next_hop, datagram }) => {
@@ -1575,6 +1818,47 @@ mod tests {
         datagram
     }
 
+    #[test]
+    fn fragmented_transport_reassembles_out_of_order_and_accepts_duplicates() -> TestResult {
+        let frame = (0..4_096).map(|value| value as u8).collect::<Vec<_>>();
+        let frame_len = u32::try_from(frame.len())?;
+        let digest = overlay_fragment_digest(&frame);
+        let chunks = frame
+            .chunks(OVERLAY_FRAGMENT_PAYLOAD_BYTES)
+            .enumerate()
+            .map(|(index, payload)| {
+                encode_overlay_fragment(
+                    u16::try_from(index).expect("test fragment index fits"),
+                    u16::try_from(frame.len().div_ceil(OVERLAY_FRAGMENT_PAYLOAD_BYTES))
+                        .expect("test fragment count fits"),
+                    frame_len,
+                    digest,
+                    payload,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(chunks
+            .iter()
+            .all(|fragment| fragment.len() <= MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES));
+
+        let source = SocketAddr::from((Ipv4Addr::LOCALHOST, 51_822));
+        let now = tokio::time::Instant::now();
+        let mut reassembler = OverlayFragmentReassembler::default();
+        assert_eq!(reassembler.push(source, &chunks[1], now), Ok(None));
+        assert_eq!(reassembler.push(source, &chunks[1], now), Ok(None));
+        assert_eq!(reassembler.push(source, &chunks[0], now), Ok(None));
+        let mut result = None;
+        for fragment in &chunks[2..] {
+            result = reassembler
+                .push(source, fragment, now)
+                .map_err(|()| "fragment reassembly failed")?;
+        }
+        assert_eq!(result, Some(frame));
+        assert!(reassembler.pending.is_empty());
+        assert_eq!(reassembler.reserved_bytes, 0);
+        Ok(())
+    }
+
     fn peer_forwarder_config(
         wireguard_endpoint: SocketAddr,
     ) -> OverlayWireGuardPeerForwarderConfig {
@@ -1761,6 +2045,69 @@ mod tests {
         assert!(delivery.acknowledgement_pending());
         assert_eq!(relay.stats().snapshot().forwarded_frames, 1);
         assert_eq!(destination.stats().snapshot().delivered_frames, 1);
+
+        source.shutdown().await?;
+        relay.shutdown().await?;
+        destination.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_udp_fragments_large_frames_across_each_hop() -> TestResult {
+        let source_socket = loopback_socket().await?;
+        let relay_socket = loopback_socket().await?;
+        let destination_socket = loopback_socket().await?;
+        let source_address = source_socket.local_addr()?;
+        let relay_address = relay_socket.local_addr()?;
+        let destination_address = destination_socket.local_addr()?;
+
+        let source_endpoints =
+            OverlayNeighborEndpointDirectory::new([endpoint("a", relay_address)])?;
+        let relay_endpoints = OverlayNeighborEndpointDirectory::new([
+            endpoint("s", source_address),
+            endpoint("d", destination_address),
+        ])?;
+        let destination_endpoints =
+            OverlayNeighborEndpointDirectory::new([endpoint("a", relay_address)])?;
+
+        let source = OverlayTransit::spawn(
+            source_socket,
+            source_endpoints,
+            forwarder("s", &["a"], 7)?,
+            8,
+        )?;
+        let relay = OverlayTransit::spawn(
+            relay_socket,
+            relay_endpoints,
+            forwarder("a", &["s", "d"], 7)?,
+            8,
+        )?;
+        let mut destination = OverlayTransit::spawn(
+            destination_socket,
+            destination_endpoints,
+            forwarder("d", &["a"], 7)?,
+            8,
+        )?;
+
+        let payload = (0..8_192).map(|value| value as u8).collect::<Vec<_>>();
+        source
+            .client()
+            .send(
+                &path(&["s", "a", "d"], None, 7),
+                [2; MULTIHOP_PATH_ID_BYTES],
+                2,
+                payload.clone(),
+            )
+            .await?;
+        let delivery = timeout(
+            Duration::from_secs(2),
+            destination.delivery_receiver().recv(),
+        )
+        .await?
+        .ok_or("delivery channel closed")?;
+        assert_eq!(delivery.source, node("s"));
+        assert_eq!(delivery.payload, payload);
+        assert_eq!(relay.stats().snapshot().forwarded_frames, 1);
 
         source.shutdown().await?;
         relay.shutdown().await?;

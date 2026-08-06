@@ -16,7 +16,10 @@ use ipnet::IpNet;
 use netlink_sys::{AsyncSocket, Socket, SocketAddr};
 use nix::sched::CloneFlags;
 use rtnetlink::packet_route::{
-    route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
+    route::{
+        RouteAddress, RouteAttribute, RouteMessage, RouteMetric, RouteProtocol, RouteScope,
+        RouteType,
+    },
     rule::{RuleAction, RuleAttribute, RuleMessage},
     AddressFamily,
 };
@@ -43,6 +46,7 @@ pub const HETERONETWORK_KUBERNETES_ROUTE_PROTOCOL: u8 = 242;
 const LINUX_ROUTE_PROTOCOL_BOOT: u8 = 3;
 const LINUX_ROUTE_PROTOCOL_STATIC: u8 = 4;
 const LINUX_MAIN_ROUTE_TABLE: u32 = 254;
+const LINUX_ROUTE_MTU_LOCK_MASK: u32 = 1 << 2;
 
 #[derive(Debug, Error)]
 pub enum RouteManagerError {
@@ -66,6 +70,7 @@ pub enum RouteManagerError {
 pub struct RoutePlan {
     pub owner: RoutePlanOwner,
     pub interface: String,
+    pub mtu_lock: Option<u32>,
     pub routes: Vec<Route>,
     pub policy_rules: Vec<PolicyRule>,
 }
@@ -682,6 +687,7 @@ pub fn docker_route_plan(intent: DockerNetworkIntent) -> RoutePlan {
     RoutePlan {
         owner: RoutePlanOwner::Docker,
         interface: intent.overlay_interface,
+        mtu_lock: None,
         routes: container_cidrs
             .into_iter()
             .map(|cidr| Route {
@@ -755,6 +761,14 @@ pub fn validate_docker_network_intent(
 
 pub fn validate_route_plan(plan: &RoutePlan) -> Result<(), RouteManagerError> {
     validate_linux_interface_name(&plan.interface).map_err(invalid_route_plan)?;
+    if plan
+        .mtu_lock
+        .is_some_and(|mtu| !(576..=65_535).contains(&mtu))
+    {
+        return Err(invalid_route_plan(
+            "route MTU lock must be between 576 and 65535",
+        ));
+    }
     let mut seen_route_ids = BTreeSet::new();
     let mut seen_routes = BTreeSet::new();
     for route in &plan.routes {
@@ -1163,6 +1177,7 @@ pub fn kubernetes_route_plan(intent: KubernetesUnderlayIntent) -> RoutePlan {
     RoutePlan {
         owner: RoutePlanOwner::Kubernetes,
         interface: intent.overlay_interface,
+        mtu_lock: None,
         routes,
         policy_rules: vec![PolicyRule {
             table: 10_064,
@@ -2101,6 +2116,13 @@ where
         }
         args.push("metric".to_string());
         args.push(route.metric.to_string());
+        if action == "replace" {
+            if let Some(mtu) = plan.mtu_lock {
+                args.push("mtu".to_string());
+                args.push("lock".to_string());
+                args.push(mtu.to_string());
+            }
+        }
         LinuxRouteCommand::new("ip", args)
     }
 
@@ -2696,6 +2718,7 @@ impl LinuxNetlinkRouteManager {
         interface_index: u32,
         table: Option<u32>,
         protocol: u8,
+        mtu_lock: Option<u32>,
     ) -> Result<(), RouteManagerError> {
         handle
             .route()
@@ -2704,6 +2727,7 @@ impl LinuxNetlinkRouteManager {
                 interface_index,
                 table,
                 protocol,
+                mtu_lock,
             ))
             .replace()
             .execute()
@@ -2730,6 +2754,7 @@ impl LinuxNetlinkRouteManager {
                 interface_index,
                 table,
                 protocol,
+                None,
             ))
             .execute()
             .await
@@ -2762,6 +2787,7 @@ impl LinuxNetlinkRouteManager {
                 Some(route.table),
                 route.protocol,
                 route.scope,
+                None,
             ))
             .execute()
             .await
@@ -2884,6 +2910,7 @@ impl RouteManager for LinuxNetlinkRouteManager {
                     interface_index,
                     table,
                     plan.owner.protocol(),
+                    plan.mtu_lock,
                 )
                 .await?;
             }
@@ -3189,6 +3216,7 @@ fn netlink_route_message(route: &Route, interface_index: u32, table: Option<u32>
         interface_index,
         table,
         HETERONETWORK_MANAGED_ROUTE_PROTOCOL,
+        None,
     )
 }
 
@@ -3197,6 +3225,7 @@ fn netlink_route_message_with_protocol(
     interface_index: u32,
     table: Option<u32>,
     protocol: u8,
+    mtu_lock: Option<u32>,
 ) -> RouteMessage {
     netlink_route_message_with_protocol_and_scope(
         route,
@@ -3204,6 +3233,7 @@ fn netlink_route_message_with_protocol(
         table,
         protocol,
         u8::from(RouteScope::Universe),
+        mtu_lock,
     )
 }
 
@@ -3213,8 +3243,9 @@ fn netlink_route_message_with_protocol_and_scope(
     table: Option<u32>,
     protocol: u8,
     scope: u8,
+    mtu_lock: Option<u32>,
 ) -> RouteMessage {
-    match route.cidr {
+    let mut message = match route.cidr {
         IpNet::V4(network) => {
             let mut builder = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
                 .destination_prefix(network.addr(), network.prefix_len())
@@ -3239,7 +3270,14 @@ fn netlink_route_message_with_protocol_and_scope(
             }
             builder.build()
         }
+    };
+    if let Some(mtu) = mtu_lock {
+        message.attributes.push(RouteAttribute::Metrics(vec![
+            RouteMetric::Lock(LINUX_ROUTE_MTU_LOCK_MASK),
+            RouteMetric::Mtu(mtu),
+        ]));
     }
+    message
 }
 
 fn netlink_rule_message(
@@ -3836,6 +3874,7 @@ mod tests {
         Ok(RoutePlan {
             owner: RoutePlanOwner::Docker,
             interface: "ipars0".to_string(),
+            mtu_lock: None,
             routes: vec![Route {
                 id: "route-a".to_string(),
                 cidr: "10.42.0.0/16".parse()?,
@@ -3955,6 +3994,20 @@ mod tests {
             RouteManagerError::InvalidRoutePlan(ref message)
                 if message.contains("route route-a metric must be greater than zero")
         ));
+
+        for mtu in [575, 65_536] {
+            let mut invalid_mtu = route_plan()?;
+            invalid_mtu.mtu_lock = Some(mtu);
+            let error = match manager.apply_routes(invalid_mtu).await {
+                Ok(()) => return Err("invalid route MTU lock should be rejected".into()),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                RouteManagerError::InvalidRoutePlan(ref message)
+                    if message.contains("route MTU lock must be between 576 and 65535")
+            ));
+        }
 
         let selector_cases = [
             (
@@ -4784,6 +4837,32 @@ mod tests {
     }
 
     #[test]
+    fn linux_netlink_route_message_sets_locked_mtu() -> Result<(), Box<dyn std::error::Error>> {
+        let route = Route {
+            id: "route-a".to_string(),
+            cidr: "10.42.0.0/16".parse()?,
+            advertised_by: NodeId::from_string("peer-a"),
+            via: None,
+            metric: 100,
+            tags: Default::default(),
+        };
+
+        let message = netlink_route_message_with_protocol(
+            &route,
+            7,
+            None,
+            HETERONETWORK_MANAGED_ROUTE_PROTOCOL,
+            Some(1_200),
+        );
+
+        assert!(message.attributes.contains(&RouteAttribute::Metrics(vec![
+            RouteMetric::Lock(LINUX_ROUTE_MTU_LOCK_MASK),
+            RouteMetric::Mtu(1_200),
+        ])));
+        Ok(())
+    }
+
+    #[test]
     fn netlink_route_inventory_extracts_current_managed_route(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let route = Route {
@@ -4867,7 +4946,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runner = RecordingRunner::default();
         let manager = LinuxRouteManager::new(runner.clone());
-        let plan = route_plan()?;
+        let mut plan = route_plan()?;
+        plan.mtu_lock = Some(1_200);
 
         manager.apply_routes(plan.clone()).await?;
         manager.remove_routes(plan).await?;
@@ -4891,6 +4971,9 @@ mod tests {
                         "10064",
                         "metric",
                         "100",
+                        "mtu",
+                        "lock",
+                        "1200",
                     ],
                 ),
                 LinuxRouteCommand::new(

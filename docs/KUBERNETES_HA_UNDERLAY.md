@@ -36,8 +36,16 @@ Service endpoint selection while still allowing multiple missed kubelet status
 updates on the WAN underlay.
 
 Flannel VXLAN uses `heteronetwork0` explicitly. Flannel derives its MTU from the
-underlay interface. With the default HeteroNetwork MTU of 1420, the expected Pod
-MTU is 1370 after the 50-byte IPv4 VXLAN overhead.
+underlay interface. With the default HeteroNetwork MTU of 1200, the expected Pod
+MTU is 1150 after the 50-byte IPv4 VXLAN overhead. Re-running `install-flannel`
+records the current underlay MTU on the DaemonSet pod template, so an MTU change
+causes an idempotent rolling restart. A capability-bounded init container
+recreates the VXLAN device and lowers an existing CNI bridge and its host-side
+links before Flannel starts, then Flannel derives the new value on every node.
+Bounded multi-hop transit splits large WireGuard frames into authenticated-hop
+UDP datagrams no larger than 1024 bytes and verifies their length and SHA-256
+digest during reassembly. This avoids recursive IP fragmentation and PMTU cache
+collapse when the transit path itself uses `heteronetwork0`.
 
 ## Automatic enrollment and setup
 
@@ -179,7 +187,10 @@ cohort tag.
 
 `verify-cluster` requires exactly the configured control-plane count, all
 registered nodes Ready, and one running Flannel pod per node. It then runs DNS
-and full cross-node Pod ping checks and verifies the derived Flannel MTU:
+and full cross-node Pod ping checks at both default and maximum packet sizes. It
+also sends non-fragmenting, full-MTU packets between control planes and verifies
+the derived Flannel MTU in both Flannel state and the live `flannel.1`, `cni0`,
+and host-side CNI links:
 
 ```bash
 sudo -E scripts/kubeadm-ha-node.sh verify-cluster

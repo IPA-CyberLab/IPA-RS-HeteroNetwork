@@ -40,6 +40,7 @@ async fn linux_route_manager_applies_and_removes_routes_inside_network_namespace
     let plan = RoutePlan {
         owner: RoutePlanOwner::PeerMap,
         interface: "lo".to_string(),
+        mtu_lock: None,
         routes: vec![Route {
             id: "netns-smoke".to_string(),
             cidr: "198.51.100.0/24".parse()?,
@@ -376,6 +377,7 @@ async fn linux_netlink_route_manager_applies_and_removes_routes_inside_network_n
     let plan = RoutePlan {
         owner: RoutePlanOwner::PeerMap,
         interface: "lo".to_string(),
+        mtu_lock: None,
         routes: vec![Route {
             id: "netns-netlink-smoke".to_string(),
             cidr: "198.51.101.0/24".parse()?,

@@ -12,6 +12,8 @@ readonly DEFAULT_STATE_DIR="/etc/heteronetwork/kubernetes"
 readonly DEFAULT_AGENT_STATE_PATH="/var/lib/heteronetwork/agent.json"
 readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly FLANNEL_VERSION="v0.28.4"
+readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
+readonly MIN_IPV4_MTU="576"
 readonly FLANNEL_MANIFEST_SHA256="d078019743c5e0194ce965125fc80ef00af0c1661ec9e12396311f1cfec860a2"
 readonly FLANNEL_MANIFEST_URL="https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml"
 
@@ -26,6 +28,7 @@ service_cidr="${HETERONETWORK_KUBEADM_SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}"
 kubernetes_minor="${HETERONETWORK_KUBEADM_KUBERNETES_MINOR:-$DEFAULT_KUBERNETES_MINOR}"
 state_dir="${HETERONETWORK_KUBEADM_STATE_DIR:-$DEFAULT_STATE_DIR}"
 agent_state_path="${HETERONETWORK_AGENT_STATE_PATH:-$DEFAULT_AGENT_STATE_PATH}"
+agent_api_token_path="${HETERONETWORK_KUBEADM_AGENT_API_TOKEN_PATH:-$state_dir/agent-api-token}"
 
 usage() {
   cat <<'EOF'
@@ -61,6 +64,8 @@ Optional environment:
   HETERONETWORK_KUBEADM_JOIN_BUNDLE      Default: state-dir/join-bundle.json
   HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE
                                          Default: state-dir/worker-join-bundle.json
+  HETERONETWORK_KUBEADM_AGENT_API_TOKEN_PATH
+                                         Default: state-dir/agent-api-token
   HETERONETWORK_AGENT_STATE_PATH          Default: /var/lib/heteronetwork/agent.json
 
 The join bundle contains credentials. Keep it root-owned with mode 0600 and transfer it
@@ -162,6 +167,7 @@ validate_common_config() {
   [[ "$kubernetes_minor" =~ ^v[0-9]+\.[0-9]+$ ]] \
     || die "Kubernetes minor must look like v1.36: $kubernetes_minor"
   [[ "$state_dir" == /* ]] || die "state directory must be absolute"
+  [[ "$agent_api_token_path" == /* ]] || die "Agent API token path must be absolute"
   resolve_node_name
   backend_addresses >/dev/null
 }
@@ -230,8 +236,8 @@ verify_interface_address() {
 
   local mtu
   mtu="$(ip -o link show dev "$interface" | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
-  [[ "$mtu" =~ ^[0-9]+$ && "$mtu" -ge 1280 ]] \
-    || die "$interface MTU is unavailable or below 1280"
+  [[ "$mtu" =~ ^[0-9]+$ && "$mtu" -ge "$MIN_IPV4_MTU" ]] \
+    || die "$interface MTU is unavailable or below $MIN_IPV4_MTU"
 }
 
 render_haproxy_config() {
@@ -596,6 +602,52 @@ nodeRegistration:
 EOF
 }
 
+render_flannel_mtu_patch() {
+  local underlay_mtu="$1"
+  [[ "$underlay_mtu" =~ ^[0-9]+$ ]] \
+    || die "invalid HeteroNetwork underlay MTU: $underlay_mtu"
+  ((10#$underlay_mtu - FLANNEL_VXLAN_IPV4_OVERHEAD >= MIN_IPV4_MTU)) \
+    || die "HeteroNetwork underlay MTU $underlay_mtu is too small for Flannel VXLAN"
+  jq -n \
+    --arg underlay_mtu "$underlay_mtu" \
+    --arg interface "$interface" \
+    --arg image "ghcr.io/flannel-io/flannel:${FLANNEL_VERSION}" \
+    --argjson overhead "$FLANNEL_VXLAN_IPV4_OVERHEAD" \
+    '{
+    spec: {
+      template: {
+        metadata: {
+          annotations: {
+            "heteronetwork.io/underlay-mtu": $underlay_mtu
+          }
+        },
+        spec: {
+          initContainers: [
+            {
+              name: "heteronetwork-mtu",
+              image: $image,
+              imagePullPolicy: "IfNotPresent",
+              command: ["/bin/sh", "-ec"],
+              args: [
+                "underlay_mtu=$(cat /sys/class/net/${HETERONETWORK_INTERFACE}/mtu)\nexpected_mtu=$((underlay_mtu - FLANNEL_OVERHEAD))\n[ \"$expected_mtu\" -ge 576 ]\nif ip link show dev flannel.1 >/dev/null 2>&1; then\n  ip link delete dev flannel.1\nfi\nif ip link show dev cni0 >/dev/null 2>&1; then\n  ip link set dev cni0 mtu \"$expected_mtu\"\n  ip -o link show master cni0 | while IFS=: read -r _ raw_name _; do\n    name=${raw_name# }\n    name=${name%%@*}\n    ip link set dev \"$name\" mtu \"$expected_mtu\"\n  done\nfi\n"
+              ],
+              env: [
+                {name: "HETERONETWORK_INTERFACE", value: $interface},
+                {name: "FLANNEL_OVERHEAD", value: ($overhead | tostring)}
+              ],
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                capabilities: {drop: ["ALL"], add: ["NET_ADMIN"]},
+                readOnlyRootFilesystem: true
+              }
+            }
+          ]
+        }
+      }
+    }
+  }'
+}
+
 install_from_stdin() {
   local destination="$1"
   local mode="$2"
@@ -803,6 +855,25 @@ HETERONETWORK_KUBEADM_KUBERNETES_MINOR=${kubernetes_minor}
 EOF
 }
 
+ensure_agent_api_token() {
+  require_command openssl
+  install -d -o root -g root -m 0700 "$(dirname -- "$agent_api_token_path")"
+  if [[ -e "$agent_api_token_path" || -L "$agent_api_token_path" ]]; then
+    [[ -f "$agent_api_token_path" && ! -L "$agent_api_token_path" ]] \
+      || die "Agent API token path is not a regular file: $agent_api_token_path"
+    [[ "$(<"$agent_api_token_path")" =~ ^[a-f0-9]{64}$ ]] \
+      || die "Agent API token must contain exactly 64 lowercase hexadecimal characters"
+    chown root:root "$agent_api_token_path"
+    chmod 0400 "$agent_api_token_path"
+    return
+  fi
+
+  local token
+  token="$(openssl rand -hex 32)"
+  printf '%s' "$token" | install_from_stdin "$agent_api_token_path" 0400
+  unset token
+}
+
 kubernetes_versions_are_aligned() {
   local expected_minor="$1"
   local kubeadm_version="$2"
@@ -832,7 +903,7 @@ install_kubernetes_packages() {
   require_command apt-get
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y apt-transport-https ca-certificates conntrack curl ethtool gpg haproxy jq libnss-resolve openssl socat
+  apt-get install -y apt-transport-https ca-certificates conntrack curl ethtool gpg haproxy iputils-ping jq libnss-resolve openssl socat
   if ! command -v containerd >/dev/null 2>&1; then
     apt-get install -y containerd
   fi
@@ -872,6 +943,7 @@ prepare_host() {
   configure_haproxy
   configure_kubelet
   configure_local_state
+  ensure_agent_api_token
   verify_host
 }
 
@@ -1012,6 +1084,7 @@ join_control_plane() {
   validate_control_plane_config
   verify_interface_address
   require_command kubeadm
+  ensure_agent_api_token
   [[ -f "$state_dir/node.env" ]] || die "run prepare before join-control-plane"
   if [[ -f /etc/kubernetes/admin.conf ]]; then
     configure_root_kubeconfig
@@ -1036,6 +1109,7 @@ join_worker() {
   validate_worker_enrollment
   verify_interface_address
   require_command kubeadm
+  ensure_agent_api_token
   [[ -f "$state_dir/node.env" ]] || die "run prepare before join-worker"
   if [[ -f /etc/kubernetes/admin.conf || -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
     die "this node is already configured as a control plane; refusing worker join"
@@ -1061,13 +1135,15 @@ join_worker() {
 install_flannel() {
   require_root
   validate_control_plane_config
+  verify_interface_address
   require_command curl
+  require_command jq
   require_command kubectl
   require_command sha256sum
   [[ -f /etc/kubernetes/admin.conf ]] || die "this node is not an initialized control plane"
   export KUBECONFIG=/etc/kubernetes/admin.conf
 
-  local manifest patched actual_hash
+  local manifest patched actual_hash underlay_mtu
   manifest="$(mktemp)"
   patched="$(mktemp)"
   curl -fL --retry 3 --connect-timeout 10 "$FLANNEL_MANIFEST_URL" -o "$manifest"
@@ -1081,6 +1157,10 @@ install_flannel() {
   [[ "$(grep -Fc -- "--iface=${interface}" "$patched")" == "1" ]] \
     || die "failed to pin Flannel to $interface"
   kubectl apply -f "$patched"
+  underlay_mtu="$(ip -o link show dev "$interface" | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
+  kubectl -n kube-flannel patch daemonset/kube-flannel-ds \
+    --type=strategic \
+    --patch "$(render_flannel_mtu_patch "$underlay_mtu")" >/dev/null
   rm -f "$manifest" "$patched"
   kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout=5m
 }
@@ -1179,10 +1259,12 @@ verify_cluster() {
   validate_control_plane_config
   require_command kubectl
   require_command jq
+  require_command ping
   export KUBECONFIG=/etc/kubernetes/admin.conf
 
   local nodes_json expected_control_planes actual_nodes ready_nodes control_plane_nodes
   local control_planes controller_managers flannel_pods coredns_pods coredns_nodes
+  local backend expected_mtu underlay_mtu underlay_ping_payload attempt reachable
   nodes_json="$(kubectl get nodes -o json)"
   expected_control_planes="$(backend_addresses | wc -l | tr -d ' ')"
   actual_nodes="$(jq '.items | length' <<<"$nodes_json")"
@@ -1203,6 +1285,23 @@ verify_cluster() {
     "$flannel_pods" \
     "$coredns_pods" \
     "$coredns_nodes"
+
+  underlay_mtu="$(ip -o link show dev "$interface" | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
+  expected_mtu=$((underlay_mtu - FLANNEL_VXLAN_IPV4_OVERHEAD))
+  underlay_ping_payload=$((underlay_mtu - 28))
+  while IFS= read -r backend; do
+    [[ "$backend" == "$node_ip" ]] && continue
+    reachable=0
+    for attempt in $(seq 1 15); do
+      if ping -c 3 -W 3 -M probe -s "$underlay_ping_payload" "$backend" >/dev/null; then
+        reachable=1
+        break
+      fi
+      sleep 2
+    done
+    ((reachable == 1)) \
+      || die "$interface cannot carry its declared MTU $underlay_mtu to control plane $backend"
+  done < <(backend_addresses)
 
   local namespace="heteronetwork-underlay-e2e"
   kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -1255,23 +1354,49 @@ EOF
       target_node="$(jq -r --arg pod "$target" '.items[] | select(.metadata.name == $pod) | .spec.nodeName' <<<"$pods_json")"
       [[ "$source_node" != "$target_node" ]] || continue
       target_ip="$(jq -r --arg pod "$target" '.items[] | select(.metadata.name == $pod) | .status.podIP' <<<"$pods_json")"
-      kubectl -n "$namespace" exec "$source" -- ping -c 3 -W 3 "$target_ip" >/dev/null
+      reachable=0
+      for attempt in $(seq 1 15); do
+        if kubectl -n "$namespace" exec "$source" -- \
+          ping -c 3 -W 3 "$target_ip" >/dev/null \
+          && kubectl -n "$namespace" exec "$source" -- \
+            ping -c 3 -W 3 -s "$((expected_mtu - 28))" "$target_ip" >/dev/null; then
+          reachable=1
+          break
+        fi
+        sleep 2
+      done
+      ((reachable == 1)) \
+        || die "cross-node Pod traffic failed from $source_node to $target_node at MTU $expected_mtu"
     done
   done
   pod="$(jq -r '.items[0].metadata.name' <<<"$pods_json")"
   kubectl -n "$namespace" exec "$pod" -- nslookup kubernetes.default.svc.cluster.local >/dev/null
 
-  local flannel_mtu expected_mtu underlay_mtu
+  local flannel_mtu flannel_link_mtu cni_link cni_link_mtu
   [[ -f /run/flannel/subnet.env ]] || die "local Flannel subnet environment is missing"
   flannel_mtu="$(awk -F= '$1 == "FLANNEL_MTU" {print $2}' /run/flannel/subnet.env)"
-  underlay_mtu="$(ip -o link show dev "$interface" | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
-  expected_mtu=$((underlay_mtu - 50))
   [[ "$flannel_mtu" == "$expected_mtu" ]] \
     || die "Flannel MTU $flannel_mtu does not match $interface MTU $underlay_mtu minus VXLAN overhead ($expected_mtu)"
+  flannel_link_mtu="$(ip -o link show dev flannel.1 | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
+  [[ "$flannel_link_mtu" == "$expected_mtu" ]] \
+    || die "flannel.1 MTU $flannel_link_mtu does not match the expected MTU $expected_mtu"
+  if ip link show dev cni0 >/dev/null 2>&1; then
+    cni_link_mtu="$(ip -o link show dev cni0 | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
+    [[ "$cni_link_mtu" == "$expected_mtu" ]] \
+      || die "cni0 MTU $cni_link_mtu does not match the expected MTU $expected_mtu"
+    while IFS= read -r cni_link; do
+      cni_link_mtu="$(ip -o link show dev "$cni_link" | sed -nE 's/.* mtu ([0-9]+).*/\1/p')"
+      [[ "$cni_link_mtu" == "$expected_mtu" ]] \
+        || die "$cni_link MTU $cni_link_mtu does not match the expected MTU $expected_mtu"
+    done < <(
+      ip -o link show master cni0 \
+        | awk -F ': ' '{print $2}' \
+        | cut -d@ -f1
+    )
+  fi
 
-  kubectl -n "$namespace" delete daemonset/network-probe --wait=true >/dev/null
-  kubectl delete namespace "$namespace" --wait=true >/dev/null
-  printf 'cluster verified: %s control planes, %s Ready nodes, cross-node Pod traffic, DNS, and Flannel MTU %s\n' \
+  kubectl delete namespace "$namespace" --wait=false >/dev/null
+  printf 'cluster verified: %s control planes, %s Ready nodes, full-MTU underlay and cross-node Pod traffic, DNS, and runtime Flannel MTU %s\n' \
     "$expected_control_planes" "$actual_nodes" "$flannel_mtu"
 }
 
@@ -1328,6 +1453,16 @@ self_test() {
   grep -Fq 'profile cri-containerd.apparmor.d flags=(attach_disconnected,mediate_deleted)' <<<"$rendered"
   grep -Fq 'network,' <<<"$rendered"
   grep -Fq 'deny mount,' <<<"$rendered"
+  rendered="$(render_flannel_mtu_patch 1200)"
+  jq -e \
+    '.spec.template.metadata.annotations["heteronetwork.io/underlay-mtu"] == "1200"
+    and (.spec.template.spec.initContainers | length == 1)
+    and (.spec.template.spec.initContainers[0].name == "heteronetwork-mtu")
+    and (.spec.template.spec.initContainers[0].image == "ghcr.io/flannel-io/flannel:v0.28.4")
+    and (.spec.template.spec.initContainers[0].env[] | select(.name == "HETERONETWORK_INTERFACE").value == "heteronetwork0")
+    and (.spec.template.spec.initContainers[0].env[] | select(.name == "FLANNEL_OVERHEAD").value == "50")
+    and (.spec.template.spec.initContainers[0].securityContext.capabilities.add == ["NET_ADMIN"])' \
+    <<<"$rendered" >/dev/null
   validate_cluster_counts 3 5 5 3 3 3 5 3 3
   if (validate_cluster_counts 3 5 4 3 3 3 5 3 3 >/dev/null 2>&1); then
     die "cluster validation accepted a non-Ready worker"
