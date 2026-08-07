@@ -211,6 +211,7 @@ async function installDelayedLoginBackend(page) {
       await route.fulfill({
         json: {
           auth_enabled: true,
+          operator_token_enabled: true,
           provider: "keycloak",
           device_login_endpoint: "/v1/web-ui/auth/device",
           device_login_poll_endpoint: "/v1/web-ui/auth/device/poll",
@@ -231,6 +232,8 @@ test("device login shows a local waiting page before Keycloak responds", async (
   await installDelayedLoginBackend(page);
   await page.goto("/ui/");
 
+  await expect(page.locator('input[type="password"]')).toHaveCount(0);
+  await expect(page.getByText("オペレータートークン")).toHaveCount(0);
   const popupPromise = page.waitForEvent("popup");
   await page.getByRole("button", { name: "Keycloakでログイン" }).click();
   const popup = await popupPromise;

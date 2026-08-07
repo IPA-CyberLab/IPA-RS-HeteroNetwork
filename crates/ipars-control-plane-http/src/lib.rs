@@ -2323,9 +2323,9 @@ where
         .map(|auth| auth.public_config(cluster_id.clone()))
         .unwrap_or_else(|| WebUiPublicConfig {
             cluster_id,
-            enabled: state.operator_api_bearer_token.is_some(),
+            enabled: false,
             auth_enabled: false,
-            operator_token_enabled: state.operator_api_bearer_token.is_some(),
+            operator_token_enabled: false,
             provider: None,
             issuer_url: None,
             client_id: None,
@@ -2340,7 +2340,6 @@ where
             node_enrollment_enabled: false,
             client_enrollment_enabled: false,
         });
-    config.operator_token_enabled = state.operator_api_bearer_token.is_some();
     config.node_enrollment_enabled = state.node_enrollment.is_some();
     config.client_enrollment_enabled = state.node_enrollment.is_some();
     Json(config)
@@ -12369,8 +12368,8 @@ exit 47
         assert_eq!(response.status(), StatusCode::OK);
         let ui_config: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
-        assert_eq!(ui_config["enabled"], true);
-        assert_eq!(ui_config["operator_token_enabled"], true);
+        assert_eq!(ui_config["enabled"], false);
+        assert_eq!(ui_config["operator_token_enabled"], false);
         assert_eq!(ui_config["node_enrollment_enabled"], false);
         assert_eq!(ui_config["session_refresh_endpoint"], Value::Null);
         assert_eq!(ui_config["session_logout_endpoint"], Value::Null);

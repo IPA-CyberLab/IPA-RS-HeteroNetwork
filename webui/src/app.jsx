@@ -40,8 +40,7 @@ function hashView() {
   return pageMetadata[view] ? view : "overview";
 }
 
-function LoginPage({ config, error, onLogin, onOperatorToken, onBootstrap, busy }) {
-  const [operatorToken, setOperatorToken] = useState("");
+function LoginPage({ config, error, onLogin, onBootstrap, busy }) {
   const [endpoint, setEndpoint] = useState("");
   const bootstrapRequired = Boolean(config?.local_agent && config?.bootstrap_required);
   const provider = config?.provider
@@ -95,45 +94,17 @@ function LoginPage({ config, error, onLogin, onOperatorToken, onBootstrap, busy 
                     </FormField>
                   </Form>
                 </form>
-              ) : (
-                <SpaceBetween size="l">
-                  {config?.auth_enabled ? (
-                    <Button
-                      variant="primary"
-                      fullWidth
-                      iconName="user-profile"
-                      loading={busy}
-                      onClick={onLogin}
-                    >
-                      {provider}でログイン
-                    </Button>
-                  ) : null}
-                  {config?.operator_token_enabled ? (
-                    <form
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        if (operatorToken.trim()) onOperatorToken(operatorToken.trim());
-                      }}
-                    >
-                      <Form
-                        actions={
-                          <Button loading={busy} formAction="submit">
-                            接続
-                          </Button>
-                        }
-                      >
-                        <FormField label="オペレータートークン">
-                          <Input
-                            type="password"
-                            value={operatorToken}
-                            onChange={({ detail }) => setOperatorToken(detail.value)}
-                          />
-                        </FormField>
-                      </Form>
-                    </form>
-                  ) : null}
-                </SpaceBetween>
-              )}
+              ) : config?.auth_enabled ? (
+                <Button
+                  variant="primary"
+                  fullWidth
+                  iconName="user-profile"
+                  loading={busy}
+                  onClick={onLogin}
+                >
+                  {provider}でログイン
+                </Button>
+              ) : null}
             </SpaceBetween>
           </Container>
           <StatusIndicator type="info">
@@ -403,11 +374,6 @@ export function App() {
         error={error || config.connection_error}
         busy={loading}
         onLogin={startLogin}
-        onOperatorToken={(token) => {
-          api.setOperatorSession(token);
-          setSession(true);
-          setError(null);
-        }}
         onBootstrap={async (endpoint) => {
           setLoading(true);
           try {
