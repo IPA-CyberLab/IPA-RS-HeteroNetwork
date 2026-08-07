@@ -3067,7 +3067,9 @@ reconcile_as_coordinator() {
 
 reconcile_once() {
   local status identity local_vpn_ip local_node_id local_underlay_ip
-  local proxy_eligible=0
+  # Every enrolled server node may host database-backed workloads. Bundle
+  # delivery is still limited to authenticated, active non-client peers.
+  local proxy_eligible=1
   status="$(read_agent_status)" || {
     reset_convergence_state
     log "waiting for the local Agent status"
@@ -3078,7 +3080,6 @@ reconcile_once() {
     log "waiting for a non-overlay local UDP underlay candidate"
     return
   }
-  agent_status_is_direct_public "$status" && proxy_eligible=1
   IFS=$'\t' read -r local_vpn_ip local_node_id local_underlay_ip <<<"$identity"
   if unmanaged_legacy_database_exists; then
     reset_convergence_state
