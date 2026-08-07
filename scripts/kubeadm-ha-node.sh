@@ -10,6 +10,7 @@ readonly DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 readonly DEFAULT_KUBERNETES_MINOR="v1.36"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/kubernetes"
 readonly DEFAULT_AGENT_STATE_PATH="/var/lib/heteronetwork/agent.json"
+readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
 readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
@@ -47,6 +48,7 @@ Commands:
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
   verify-cluster         Verify nodes, control planes, Flannel, DNS, and cross-node Pod traffic
+  reconcile-kubelet-dns  Limit kubelet's upstream resolver list to three stable entries
   self-test              Run non-privileged renderer and validation checks
 
 Required environment for prepare/init/join:
@@ -521,6 +523,7 @@ cgroupDriver: systemd
 failSwapOn: false
 memorySwap:
   swapBehavior: NoSwap
+resolvConf: "${KUBELET_RESOLV_CONF}"
 EOF
 }
 
@@ -831,7 +834,27 @@ configure_haproxy() {
     || die "local Kubernetes API load balancer did not become active"
 }
 
+reconcile_kubelet_resolver() {
+  local source_path="${HETERONETWORK_KUBELET_RESOLVER_SOURCE:-/run/systemd/resolve/resolv.conf}"
+  local temporary
+  [[ -r "$source_path" ]] || die "resolver source is missing: $source_path"
+  temporary="$(mktemp)"
+  if ! awk '
+    $1 == "nameserver" && $2 != "" && $2 != "127.0.0.53" && $2 != "::1" && !seen[$2]++ && count < 3 {
+      print "nameserver " $2
+      count++
+    }
+    END { if (count == 0) exit 1 }
+  ' "$source_path" >"$temporary"; then
+    rm -f "$temporary"
+    die "no usable nameserver found in $source_path"
+  fi
+  install -D -o root -g root -m 0644 "$temporary" "$KUBELET_RESOLV_CONF"
+  rm -f "$temporary"
+}
+
 configure_kubelet() {
+  reconcile_kubelet_resolver
   printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s"\n' "$node_ip" "$node_name" \
     | install_from_stdin /etc/default/kubelet 0644
   install -d -o root -g root -m 0755 /etc/systemd/system/kubelet.service.d
@@ -1571,6 +1594,7 @@ case "$command" in
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;
+  reconcile-kubelet-dns) require_root; reconcile_kubelet_resolver ;;
   verify-cluster) verify_cluster ;;
   self-test) self_test ;;
   -h|--help|help) usage ;;

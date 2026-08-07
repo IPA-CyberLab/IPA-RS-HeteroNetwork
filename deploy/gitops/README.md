@@ -18,8 +18,8 @@ The script performs these idempotent reconciliations:
 3. installs the pinned Argo CD Helm chart in HA mode; and
 4. installs the pinned Envoy Gateway chart and its three-replica global rate
    limit service;
-5. applies self-healing Argo CD Applications for the Envoy Gateway edge,
-   HeteroCloud, and Flow.
+5. applies self-healing Argo CD Applications for cluster DNS, the Envoy
+   Gateway edge, HeteroCloud, and Flow.
 
 The Argo CD chart is pinned by `ARGOCD_CHART_VERSION` (default `10.2.2`). Its
 three Web replicas run on the Kubernetes pod network. The separately managed
@@ -59,6 +59,19 @@ Service. It exposes the rate-limit service's Prometheus endpoint without
 modifying the Envoy Gateway-owned Service, so the existing Prometheus
 Kubernetes service discovery collects rate-limit counters after a fresh
 install as well as after reconciliation.
+
+Cluster DNS is managed by the `cluster-dns` Application. It keeps three CoreDNS
+replicas on separate nodes with a two-pod disruption budget and runs the
+upstream Kubernetes NodeLocal DNSCache DaemonSet on every Linux node. The
+NodeLocal cache keeps normal Pod DNS traffic on the local node and forwards
+cache misses to the CoreDNS Service over TCP. Run
+`sudo scripts/reconcile-kubelet-dns.sh` once on each existing node after a
+cluster upgrade; kubeadm-created nodes configure the same resolver path during
+`prepare`. The helper limits the resolver file consumed by kubelet to three
+non-loopback nameservers, avoiding the systemd-resolved/Tailscale nameserver
+overflow that produces `DNSConfigForming` events. Because NodeLocal DNSCache
+binds TCP and UDP 53 on the node's local and Service IPs, any host DNS service
+must bind only to its LAN address instead of `0.0.0.0:53`.
 
 This is an L7 abuse and overload control, not volumetric Internet DDoS
 scrubbing. It protects the Kubernetes services after traffic reaches the

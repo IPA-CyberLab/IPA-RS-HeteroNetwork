@@ -57,7 +57,7 @@ while IFS= read -r workload; do
   kubectl -n "${ARGOCD_NAMESPACE}" rollout status "${workload}" --timeout="${TIMEOUT}"
 done < <(kubectl -n "${ARGOCD_NAMESPACE}" get statefulset -o name)
 
-for application in envoy-gateway heterocloud-edge heterocloud heterocloud-flow; do
+for application in cluster-dns envoy-gateway heterocloud-edge heterocloud heterocloud-flow; do
   kubectl -n "${ARGOCD_NAMESPACE}" wait "application/${application}" \
     --for=jsonpath='{.status.sync.status}'=Synced \
     --timeout="${TIMEOUT}"

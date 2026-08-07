@@ -11,6 +11,8 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
     - docker.io/envoyproxy
   destinations:
+    - namespace: kube-system
+      server: https://kubernetes.default.svc
     - namespace: envoy-gateway-system
       server: https://kubernetes.default.svc
     - namespace: heterocloud-edge
