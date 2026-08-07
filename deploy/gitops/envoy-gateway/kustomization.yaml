@@ -6,6 +6,7 @@ resources:
   - gateway.yaml
   - client-traffic-policy.yaml
   - backend-traffic-policy.yaml
+  - flow-backend-traffic-policy.yaml
   - heterocloud-backend.yaml
   - heterocloud-route.yaml
   - heterocloud-health-route.yaml

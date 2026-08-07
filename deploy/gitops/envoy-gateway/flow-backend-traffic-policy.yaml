@@ -1,16 +1,16 @@
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: BackendTrafficPolicy
 metadata:
-  name: heterocloud-abuse-limit
-  namespace: heterocloud
+  name: flow-abuse-limit
+  namespace: heterocloud-flow
 spec:
   targetRefs:
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
-      name: heterocloud-public
+      name: flow-public
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
-      name: heterocloud-health
+      name: flow-health
   rateLimit:
     global:
       rules:

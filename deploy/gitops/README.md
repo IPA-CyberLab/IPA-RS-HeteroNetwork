@@ -36,8 +36,10 @@ gateways may reach that Service. The generated public Envoy proxy runs with
 three replicas on public-ingress nodes and keeps two available during
 voluntary disruption. Flow's HTTP API, signaling, and LiveKit
 signaling Services are private ClusterIP backends. A Redis-backed Envoy global
-rate limit applies a shared 200 requests/second bucket per client IP across
-the Gateway routes; IPv4 and IPv6 limits are declared separately. The
+rate limit applies a shared 200 requests/second bucket per client IP to the
+HeteroCloud and HeteroCloud Flow HTTPRoutes; IPv4 and IPv6 limits are declared
+separately. Route-level policies keep Envoy Gateway's rate-limit domain aligned
+with each route. The
 rate-limit deployment has three replicas and a two-pod disruption budget. The
 rate-limit service uses the Flow Redis Sentinel quorum directly (`flowmaster`
 and all three Sentinel endpoints), so Redis failover does not send writes to
