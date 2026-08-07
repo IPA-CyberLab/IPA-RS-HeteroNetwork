@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-ratelimit-metrics
+  namespace: envoy-gateway-system
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "19001"
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: heteronetwork-gitops
+    app.kubernetes.io/name: envoy-ratelimit-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: envoy-gateway
+    app.kubernetes.io/name: envoy-ratelimit
+  ports:
+    - name: metrics
+      port: 19001
+      targetPort: metrics
+      protocol: TCP

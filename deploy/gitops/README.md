@@ -46,6 +46,12 @@ proxy health-checks the Flow Redis nodes and accepts traffic only from the
 current `role:master` node, so Redis failover does not send writes to
 read-only replicas.
 
+The GitOps overlay also creates the annotated `envoy-ratelimit-metrics`
+Service. It exposes the rate-limit service's Prometheus endpoint without
+modifying the Envoy Gateway-owned Service, so the existing Prometheus
+Kubernetes service discovery collects rate-limit counters after a fresh
+install as well as after reconciliation.
+
 This is an L7 abuse and overload control, not volumetric Internet DDoS
 scrubbing. It protects the Kubernetes services after traffic reaches the
 public nodes. Prometheus also scrapes the Envoy Gateway namespace so the
