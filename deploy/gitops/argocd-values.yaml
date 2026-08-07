@@ -103,6 +103,9 @@ server:
 
 repoServer:
   replicas: 3
+  containerPorts:
+    server: 28081
+    metrics: 28084
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
   pdb:

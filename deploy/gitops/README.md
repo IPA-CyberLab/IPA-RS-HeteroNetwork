@@ -30,8 +30,11 @@ standard `argocd-initial-admin-secret`. The console URL is
 
 The three repo-server replicas use the control-plane host network so Git
 fetches use the same outbound path that is available from the Kubernetes
-nodes. `ClusterFirstWithHostNet` keeps cluster DNS resolution for Argo's
-internal services while preserving GitHub access for manifest reconciliation.
+nodes. Their host listeners use ports `28081` and `28084` to avoid the
+HeteroCloud Flow matchmaker's host port; the Argo Services keep their
+cluster-internal `8081` and `8084` ports. `ClusterFirstWithHostNet` keeps
+cluster DNS resolution for Argo's internal services while preserving GitHub
+access for manifest reconciliation.
 
 The public HTTP and WebSocket edge is declared in
 `deploy/gitops/envoy-gateway/`. Envoy Gateway is pinned to v1.8.3, its
