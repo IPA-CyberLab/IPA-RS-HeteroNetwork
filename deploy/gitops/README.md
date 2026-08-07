@@ -41,8 +41,9 @@ HeteroCloud and HeteroCloud Flow HTTPRoutes; IPv4 and IPv6 limits are declared
 separately. Route-level policies keep Envoy Gateway's rate-limit domain aligned
 with each route. The
 rate-limit deployment has three replicas and a two-pod disruption budget. The
-rate-limit service uses the Flow Redis Sentinel quorum directly (`flowmaster`
-and all three Sentinel endpoints), so Redis failover does not send writes to
+rate-limit service uses a three-replica HAProxy Redis-primary proxy. Each
+proxy health-checks the Flow Redis nodes and accepts traffic only from the
+current `role:master` node, so Redis failover does not send writes to
 read-only replicas.
 
 This is an L7 abuse and overload control, not volumetric Internet DDoS
