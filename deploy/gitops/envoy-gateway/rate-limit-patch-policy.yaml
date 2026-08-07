@@ -1,0 +1,29 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: heterocloud-rate-limit-filter
+  namespace: heterocloud-edge
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: heterocloud-edge
+  type: JSONPatch
+  jsonPatches:
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: heterocloud-edge/heterocloud-edge/http
+      operation:
+        op: remove
+        path: /default_filter_chain/filters/0/typed_config/http_filters/0
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: heterocloud-edge/heterocloud-edge/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/http_filters/0/typed_config/timeout
+        value: 1s
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: heterocloud-edge/heterocloud-edge/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/http_filters/1/typed_config/timeout
+        value: 1s

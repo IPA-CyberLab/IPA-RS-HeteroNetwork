@@ -94,6 +94,7 @@ spec:
                   minAvailable: 2
             extensionApis:
               enableBackend: true
+              enableEnvoyPatchPolicy: true
             rateLimit:
               failClosed: true
               backend:

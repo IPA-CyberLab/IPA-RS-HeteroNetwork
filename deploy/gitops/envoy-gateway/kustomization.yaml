@@ -13,3 +13,4 @@ resources:
   - heterocloud-health-route.yaml
   - flow-route.yaml
   - flow-health-route.yaml
+  - rate-limit-patch-policy.yaml
