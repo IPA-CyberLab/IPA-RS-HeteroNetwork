@@ -16,8 +16,8 @@ The script performs these idempotent reconciliations:
 2. creates or repairs Grafana's PostgreSQL role, database, and Kubernetes
    Secret while preserving existing credentials;
 3. installs the pinned Argo CD Helm chart in HA mode; and
-4. installs the pinned Envoy Gateway chart, its three-replica global rate
-   limit service, and the HA Redis-primary proxy;
+4. installs the pinned Envoy Gateway chart and its three-replica global rate
+   limit service;
 5. applies self-healing Argo CD Applications for the Envoy Gateway edge,
    HeteroCloud, and Flow.
 
@@ -38,11 +38,10 @@ voluntary disruption. Flow's HTTP API, signaling, and LiveKit
 signaling Services are private ClusterIP backends. A Redis-backed Envoy global
 rate limit applies a shared 200 requests/second bucket per client IP across
 the Gateway routes; IPv4 and IPv6 limits are declared separately. The
-rate-limit deployment has three replicas and a two-pod disruption budget.
-Its Redis endpoint is a three-replica HAProxy service. Each proxy checks the
-Flow Sentinel-managed Redis nodes with `INFO` and forwards only to the current
-`role:master`, so Redis failover does not send rate-limit writes to read-only
-replicas.
+rate-limit deployment has three replicas and a two-pod disruption budget. The
+rate-limit service uses the Flow Redis Sentinel quorum directly (`flowmaster`
+and all three Sentinel endpoints), so Redis failover does not send writes to
+read-only replicas.
 
 This is an L7 abuse and overload control, not volumetric Internet DDoS
 scrubbing. It protects the Kubernetes services after traffic reaches the

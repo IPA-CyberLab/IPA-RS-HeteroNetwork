@@ -51,6 +51,11 @@ spec:
                 rateLimitDeployment:
                   replicas: 3
                   container:
+                    env:
+                      - name: REDIS_TYPE
+                        value: sentinel
+                      - name: REDIS_URL
+                        value: flowmaster,heterocloud-flow-redis-node-0.heterocloud-flow-redis-headless.heterocloud-flow.svc.cluster.local:26379,heterocloud-flow-redis-node-1.heterocloud-flow-redis-headless.heterocloud-flow.svc.cluster.local:26379,heterocloud-flow-redis-node-2.heterocloud-flow-redis-headless.heterocloud-flow.svc.cluster.local:26379
                     resources:
                       requests:
                         cpu: 100m
@@ -68,6 +73,19 @@ spec:
                         labelSelector:
                           matchLabels:
                             app.kubernetes.io/name: envoy-ratelimit
+                  patch:
+                    type: StrategicMerge
+                    value:
+                      spec:
+                        template:
+                          spec:
+                            containers:
+                              - name: envoy-ratelimit
+                                env:
+                                  - name: REDIS_TYPE
+                                    value: sentinel
+                                  - name: REDIS_URL
+                                    value: flowmaster,heterocloud-flow-redis-node-0.heterocloud-flow-redis-headless.heterocloud-flow.svc.cluster.local:26379,heterocloud-flow-redis-node-1.heterocloud-flow-redis-headless.heterocloud-flow.svc.cluster.local:26379,heterocloud-flow-redis-node-2.heterocloud-flow-redis-headless.heterocloud-flow.svc.cluster.local:26379
                 rateLimitPDB:
                   minAvailable: 2
             extensionApis:
