@@ -5,7 +5,9 @@ metadata:
   namespace: heterocloud-flow
 spec:
   parentRefs:
-    - name: heterocloud-edge
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: heterocloud-edge
       namespace: heterocloud-edge
       sectionName: http
   rules:
@@ -14,5 +16,8 @@ spec:
             type: Exact
             value: /health/live
       backendRefs:
-        - name: heterocloud-flow-api
+        - group: ""
+          kind: Service
+          name: heterocloud-flow-api
           port: 8080
+          weight: 1

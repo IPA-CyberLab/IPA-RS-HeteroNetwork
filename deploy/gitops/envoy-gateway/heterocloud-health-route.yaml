@@ -5,7 +5,9 @@ metadata:
   namespace: heterocloud
 spec:
   parentRefs:
-    - name: heterocloud-edge
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: heterocloud-edge
       namespace: heterocloud-edge
       sectionName: http
   rules:
@@ -17,3 +19,4 @@ spec:
         - group: gateway.envoyproxy.io
           kind: Backend
           name: heterocloud-api
+          weight: 1

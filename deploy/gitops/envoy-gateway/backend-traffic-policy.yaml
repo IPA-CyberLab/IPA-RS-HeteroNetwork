@@ -15,6 +15,7 @@ spec:
             - sourceCIDR:
                 type: Distinct
                 value: 0.0.0.0/0
+                invert: false
           limit:
             requests: 200
             unit: Second
@@ -23,6 +24,7 @@ spec:
             - sourceCIDR:
                 type: Distinct
                 value: ::/0
+                invert: false
           limit:
             requests: 200
             unit: Second
