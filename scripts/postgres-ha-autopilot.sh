@@ -3306,6 +3306,8 @@ reconcile_once() {
   if full_database_bundle_exists; then
     publish_bundle_archive
     load_bundle_manifest "$bundle_dir"
+    ensure_member_overlay_proxy "$local_vpn_ip" \
+      || log "waiting to publish the database proxy on the VPN"
     local coordinator_node_id
     coordinator_node_id="$(coordinator_node_id_for_bundle)" || {
       reset_convergence_state
