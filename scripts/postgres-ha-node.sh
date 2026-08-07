@@ -37,6 +37,7 @@ interface="${HETERONETWORK_DB_INTERFACE:-$DEFAULT_INTERFACE}"
 node_name="${HETERONETWORK_DB_NODE_NAME:-}"
 node_address="${HETERONETWORK_DB_NODE_ADDRESS:-}"
 client_listen_address="${HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS:-}"
+proxy_listen_address="${HETERONETWORK_DB_PROXY_LISTEN_ADDRESS:-}"
 members="${HETERONETWORK_DB_MEMBERS:-}"
 member_identities="${HETERONETWORK_DB_MEMBER_IDENTITIES:-}"
 dcs_members="${HETERONETWORK_DB_DCS_MEMBERS:-$members}"
@@ -108,6 +109,8 @@ Optional environment:
   HETERONETWORK_DB_NETWORK_PLANE     Must be underlay-v1 (default)
   HETERONETWORK_DB_CLIENT_LISTEN_ADDRESS
                                      Optional private management address used by remote proxies
+  HETERONETWORK_DB_PROXY_LISTEN_ADDRESS
+                                     Optional VPN address for the HA primary proxy
   HETERONETWORK_DB_CLIENT_CIDRS    Additional comma-separated application source CIDRs
   HETERONETWORK_DB_EXTRA_HBA_ENTRIES
                                      Comma-separated database:user:CIDR access rules
@@ -458,6 +461,11 @@ validate_proxy_config() {
   validate_common_config
   [[ -n "$bundle_dir" ]] || die "HETERONETWORK_DB_BUNDLE_DIR is required"
   validate_absolute_path "$bundle_dir"
+  if [[ -n "$proxy_listen_address" ]]; then
+    validate_ipv4 "$proxy_listen_address"
+    [[ "$proxy_listen_address" != 127.* ]] \
+      || die "database proxy listen address must not be loopback"
+  fi
   proxy_backend_rows >/dev/null
 }
 
@@ -697,6 +705,16 @@ defaults
 frontend heteronetwork_postgres
     bind 127.0.0.1:${proxy_port}
     default_backend heteronetwork_postgres_primary
+EOF
+  if [[ -n "$proxy_listen_address" ]]; then
+    cat <<EOF
+
+frontend heteronetwork_postgres_overlay
+    bind ${proxy_listen_address}:${postgres_port}
+    default_backend heteronetwork_postgres_primary
+EOF
+  fi
+  cat <<EOF
 
 backend heteronetwork_postgres_primary
     option httpchk GET /primary
@@ -708,6 +726,23 @@ EOF
     printf '    server %s %s:%s check port %s check-ssl verify required ca-file %s/pki/ca.crt verifyhost %s\n' \
       "$name" "$address" "$postgres_port" "$rest_port" "$state_dir" "$service_name"
   done < <(proxy_backend_rows)
+  if [[ -n "$proxy_listen_address" ]]; then
+    cat <<EOF
+
+frontend heteronetwork_postgres_overlay_health
+    bind ${proxy_listen_address}:${rest_port}
+    default_backend heteronetwork_patroni_primary
+
+backend heteronetwork_patroni_primary
+    option httpchk GET /primary
+    http-check expect status 200
+    default-server inter 6s fastinter 6s downinter 6s fall 3 rise 2 on-marked-down shutdown-sessions
+EOF
+    while read -r name address; do
+      printf '    server health-%s %s:%s check check-ssl verify required ca-file %s/pki/ca.crt verifyhost %s\n' \
+        "$name" "$address" "$rest_port" "$state_dir" "$service_name"
+    done < <(proxy_backend_rows)
+  fi
   if [[ -n "$client_listen_address" ]]; then
     cat <<EOF
 
@@ -1393,6 +1428,14 @@ install_proxy() {
   require_root
   validate_proxy_config
   require_command apt-get
+  if [[ -n "$proxy_listen_address" ]]; then
+    require_command ip
+    ip -o -4 address show \
+      | awk '{print $4}' \
+      | cut -d/ -f1 \
+      | grep -Fxq "$proxy_listen_address" \
+      || die "database proxy listen address is not assigned to this node"
+  fi
   export DEBIAN_FRONTEND=noninteractive
   local -a apt=(apt-get -o DPkg::Lock::Timeout=300)
   "${apt[@]}" update
@@ -1744,6 +1787,7 @@ self_test() {
   local original_node_name="$node_name"
   local original_node_address="$node_address"
   local original_client_listen_address="$client_listen_address"
+  local original_proxy_listen_address="$proxy_listen_address"
   local original_client_cidrs="$client_cidrs"
   local original_extra_hba_entries="$extra_hba_entries"
   local original_bundle_dir="$bundle_dir"
@@ -1762,6 +1806,7 @@ self_test() {
   node_name="db-a"
   node_address="100.64.10.1"
   client_listen_address="10.250.0.1"
+  proxy_listen_address="10.250.0.2"
   client_cidrs="192.0.2.0/24,198.51.100.10/32"
   extra_hba_entries="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   bundle_dir="$test_dir/bundle"
@@ -1774,6 +1819,7 @@ self_test() {
   done
 
   validate_node_config
+  validate_proxy_config
   render_etcd_config >"$test_dir/etcd.yml"
   render_patroni_config >"$test_dir/patroni.yml"
   render_haproxy_config >"$test_dir/haproxy.cfg"
@@ -1796,6 +1842,10 @@ self_test() {
     die "unregistered voter unexpectedly appeared in the DCS bootstrap configuration"
   fi
   grep -Fq 'bind 10.250.0.1:18008' "$test_dir/haproxy.cfg"
+  grep -Fq 'bind 10.250.0.2:55432' "$test_dir/haproxy.cfg"
+  grep -Fq 'bind 10.250.0.2:18008' "$test_dir/haproxy.cfg"
+  grep -Fq 'default_backend heteronetwork_patroni_primary' \
+    "$test_dir/haproxy.cfg"
   [[ "$(grep -c '^    server db-' "$test_dir/haproxy.cfg")" == "6" ]]
   grep -Fq 'server db-a 100.64.10.1:55432 check port 18008' \
     "$test_dir/haproxy.cfg"
@@ -2022,6 +2072,7 @@ self_test() {
   node_name="$original_node_name"
   node_address="$original_node_address"
   client_listen_address="$original_client_listen_address"
+  proxy_listen_address="$original_proxy_listen_address"
   client_cidrs="$original_client_cidrs"
   extra_hba_entries="$original_extra_hba_entries"
   bundle_dir="$original_bundle_dir"

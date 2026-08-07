@@ -1373,6 +1373,9 @@ run_helper_for_bundle() {
   local directory="$1"
   shift
   load_bundle_manifest "$directory" || die "invalid database bundle manifest"
+  local helper_proxy_backends helper_proxy_listen_address
+  helper_proxy_backends="${HETERONETWORK_DB_PROXY_BACKENDS:-$manifest_members}"
+  helper_proxy_listen_address="${HETERONETWORK_DB_PROXY_LISTEN_ADDRESS:-}"
   env \
     "HETERONETWORK_DB_CLUSTER_NAME=$manifest_cluster_name" \
     "HETERONETWORK_DB_INTERFACE=${HETERONETWORK_DB_INTERFACE:-}" \
@@ -1383,7 +1386,8 @@ run_helper_for_bundle() {
     "HETERONETWORK_DB_DCS_MEMBERS=$manifest_dcs_members" \
     "HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS=$manifest_dcs_bootstrap_members" \
     "HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE=existing" \
-    "HETERONETWORK_DB_PROXY_BACKENDS=$manifest_members" \
+    "HETERONETWORK_DB_PROXY_BACKENDS=$helper_proxy_backends" \
+    "HETERONETWORK_DB_PROXY_LISTEN_ADDRESS=$helper_proxy_listen_address" \
     "HETERONETWORK_DB_CLIENT_CIDRS=$manifest_client_cidrs" \
     "HETERONETWORK_DB_EXTRA_HBA_ENTRIES=$manifest_extra_hba_entries" \
     "HETERONETWORK_DB_BUNDLE_DIR=$directory" \
@@ -2278,6 +2282,87 @@ PY
   rm -f "$temporary"
 }
 
+overlay_proxy_backends_from_selected_snapshot() {
+  [[ -f "$selected_path" && ! -L "$selected_path" ]] || return 1
+  python3 - \
+    "$selected_path" "$manifest_member_identities" \
+    "$MAX_DATABASE_MEMBER_COUNT" <<'PY'
+import ipaddress
+import sys
+
+selected_path, identities_raw, limit_raw = sys.argv[1:]
+limit = int(limit_raw)
+vpn_by_node_id = {}
+with open(selected_path, encoding="utf-8") as source:
+    for line in source:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 2:
+            raise SystemExit("invalid selected database peer row")
+        node_id, vpn_ip = fields
+        if node_id in vpn_by_node_id:
+            raise SystemExit("duplicate selected database node identity")
+        if ipaddress.ip_address(vpn_ip).version != 4:
+            raise SystemExit("database proxy backend VPN address must be IPv4")
+        vpn_by_node_id[node_id] = vpn_ip
+
+backends = []
+seen_names = set()
+seen_vpn_ips = set()
+for entry in identities_raw.split(","):
+    name, separator, node_id = entry.partition("=")
+    vpn_ip = vpn_by_node_id.get(node_id)
+    if not separator or not name or not node_id or vpn_ip is None:
+        raise SystemExit("database member is absent from the selected VPN registry")
+    if name in seen_names or vpn_ip in seen_vpn_ips:
+        raise SystemExit("duplicate database proxy backend")
+    backends.append(f"{name}={vpn_ip}")
+    seen_names.add(name)
+    seen_vpn_ips.add(vpn_ip)
+
+if not 3 <= len(backends) <= limit:
+    raise SystemExit("database proxy backend count is outside the supported range")
+print(",".join(backends))
+PY
+}
+
+proxy_config_matches_backends() {
+  local expected_backends="$1"
+  local config="/etc/heteronetwork/postgres-ha/haproxy.cfg"
+  [[ -f "$config" && ! -L "$config" ]] || return 1
+  local entry name address count=0
+  local -a entries
+  IFS=, read -r -a entries <<<"$expected_backends"
+  for entry in "${entries[@]}"; do
+    name="${entry%%=*}"
+    address="${entry#*=}"
+    grep -Fq \
+      "server $name $address:$manifest_postgres_port check port $manifest_rest_port" \
+      "$config" || return 1
+    count=$((count + 1))
+  done
+  [[ "$(grep -c '^    server db-' "$config")" == "$count" ]]
+}
+
+member_overlay_proxy_ready() {
+  local vpn_ip="$1"
+  local config="/etc/heteronetwork/postgres-ha/haproxy.cfg"
+  [[ -f "$config" && ! -L "$config" ]] || return 1
+  grep -Fq "bind $vpn_ip:$manifest_postgres_port" "$config" \
+    && grep -Fq "bind $vpn_ip:$manifest_rest_port" "$config" \
+    && proxy_config_matches_backends "$manifest_members" \
+    && systemctl is-active --quiet heteronetwork-db-proxy.service
+}
+
+ensure_member_overlay_proxy() {
+  local vpn_ip="$1"
+  member_overlay_proxy_ready "$vpn_ip" && return 0
+  log "publishing the database primary proxy on VPN address $vpn_ip"
+  HETERONETWORK_DB_PROXY_BACKENDS="$manifest_members" \
+  HETERONETWORK_DB_PROXY_LISTEN_ADDRESS="$vpn_ip" \
+    run_helper_for_bundle "$bundle_dir" install-proxy
+  member_overlay_proxy_ready "$vpn_ip"
+}
+
 publish_proxy_bundle_archive() {
   if ! full_database_bundle_exists && ! proxy_only_bundle_exists; then
     rm -f "$proxy_bundle_archive"
@@ -2790,6 +2875,7 @@ wait_for_bundle_health() {
 apply_local_bundle() {
   local local_node_id="$1"
   local local_underlay_ip="$2"
+  local local_vpn_ip="$3"
   load_bundle_manifest "$bundle_dir" || return
   local local_name expected_underlay_ip
   if ! local_name="$(
@@ -2816,6 +2902,8 @@ apply_local_bundle() {
   [[ -f "$applied_revision_path" ]] && applied_revision="$(<"$applied_revision_path")"
   if [[ "$applied_revision" == "$manifest_revision" ]] \
     && systemctl is-active --quiet heteronetwork-db.service; then
+    ensure_member_overlay_proxy "$local_vpn_ip" \
+      || log "waiting to publish the database proxy on the VPN"
     return
   fi
   local configured_revision=0
@@ -2852,18 +2940,29 @@ apply_local_bundle() {
   if ! wait_for_bundle_health; then
     return
   fi
+  ensure_member_overlay_proxy "$local_vpn_ip" \
+    || {
+      log "waiting to publish the database proxy on the VPN"
+      return
+    }
   printf '%s\n' "$manifest_revision" >"$applied_revision_path"
   chmod 0600 "$applied_revision_path"
 }
 
 apply_local_proxy_bundle() {
-  local local_underlay_ip="$1"
-  local local_underlay_interface="$2"
+  local local_vpn_ip="$1"
   validate_proxy_bundle_directory "$bundle_dir" || return 1
-  bundle_routes_use_interface \
-    "$manifest_members" "$local_underlay_ip" "$local_underlay_interface" \
+  awk -F '\t' -v vpn_ip="$local_vpn_ip" '
+    $2 == vpn_ip { found += 1 }
+    END { exit found == 1 ? 0 : 1 }
+  ' "$active_path" || {
+    log "local VPN identity is absent from the active proxy registry"
+    return 1
+  }
+  local overlay_proxy_backends
+  overlay_proxy_backends="$(overlay_proxy_backends_from_selected_snapshot)" \
     || {
-      log "database proxy backends are not reachable through $local_underlay_interface"
+      log "waiting to map every database member to an active VPN address"
       return 1
     }
   local digest applied_digest=""
@@ -2873,11 +2972,13 @@ apply_local_proxy_bundle() {
   if [[ "$applied_digest" == "$digest" \
     && -f /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt \
     && ! -L /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt ]] \
-    && systemctl is-active --quiet heteronetwork-db-proxy.service; then
+    && systemctl is-active --quiet heteronetwork-db-proxy.service \
+    && proxy_config_matches_backends "$overlay_proxy_backends"; then
     return 0
   fi
   log "applying proxy-only database topology revision $manifest_revision"
-  run_helper_for_bundle "$bundle_dir" install-proxy
+  HETERONETWORK_DB_PROXY_BACKENDS="$overlay_proxy_backends" \
+    run_helper_for_bundle "$bundle_dir" install-proxy
   systemctl is-active --quiet heteronetwork-db-proxy.service || return 1
   printf '%s\n' "$digest" >"$proxy_applied_digest_path"
   chmod 0600 "$proxy_applied_digest_path"
@@ -3130,16 +3231,11 @@ reconcile_once() {
     stop_bundle_servers
     reset_convergence_state
     if ((proxy_eligible == 1)) && proxy_only_bundle_exists; then
-      local outside_interface
-      outside_interface="$(interface_for_address "$local_underlay_ip")" || {
-        log "waiting for an unambiguous local host-underlay interface"
-        return
-      }
-      apply_local_proxy_bundle "$local_underlay_ip" "$outside_interface" \
+      apply_local_proxy_bundle "$local_vpn_ip" \
         || log "waiting to apply the retained database proxy bundle"
       log "node is outside the active database candidate pool; retained proxy-only services"
     elif ((proxy_eligible == 1)); then
-      log "public node is waiting for a rotating candidate window to receive the database proxy bundle"
+      log "server node is waiting for a rotating candidate window to receive the database proxy bundle"
     else
       log "node is outside the active database candidate pool"
     fi
@@ -3182,12 +3278,7 @@ reconcile_once() {
     stop_bundle_servers
     reset_convergence_state
     if ((proxy_eligible == 1)) && proxy_only_bundle_exists; then
-      local synchronized_interface
-      synchronized_interface="$(interface_for_address "$local_underlay_ip")" || {
-        log "waiting for an unambiguous local host-underlay interface"
-        return
-      }
-      apply_local_proxy_bundle "$local_underlay_ip" "$synchronized_interface" \
+      apply_local_proxy_bundle "$local_vpn_ip" \
         || log "waiting to apply the synchronized database proxy bundle"
       log "node left the candidate window after synchronizing proxy-only services"
     else
@@ -3222,20 +3313,20 @@ reconcile_once() {
       return
     }
     if [[ "$local_node_id" != "$coordinator_node_id" ]]; then
-      apply_local_bundle "$local_node_id" "$local_underlay_ip"
+      apply_local_bundle "$local_node_id" "$local_underlay_ip" "$local_vpn_ip"
       reset_convergence_state
       return
     fi
     if bundle_replication_quorum_reached \
         "$local_node_id" "$authoritative_digest"; then
-      apply_local_bundle "$local_node_id" "$local_underlay_ip"
+      apply_local_bundle "$local_node_id" "$local_underlay_ip" "$local_vpn_ip"
     else
       coordinator_bundle_ready=0
       log "waiting for a DCS majority to persist topology revision $manifest_revision"
     fi
   elif proxy_only_bundle_exists; then
     if ((proxy_eligible == 1)); then
-      apply_local_proxy_bundle "$local_underlay_ip" "$local_underlay_interface" \
+      apply_local_proxy_bundle "$local_vpn_ip" \
         || log "waiting for the local proxy-only database service"
     fi
     reset_convergence_state
@@ -3797,16 +3888,16 @@ JSON
     proxy_only_bundle_exists
     validate_proxy_bundle_directory "$bundle_dir"
     [[ ! -e "$bundle_dir/ca/ca.key" ]]
-    bundle_routes_use_interface() {
-      return 0
-    }
     run_helper_for_bundle() {
       [[ "${2:-}" == "install-proxy" ]]
+      [[ "$HETERONETWORK_DB_PROXY_BACKENDS" == \
+        "db-a=10.250.0.2,db-b=10.250.0.3,db-c=10.250.0.10" ]]
     }
+    proxy_config_matches_backends() { return 0; }
     systemctl() {
       [[ "${1:-}" == "is-active" ]]
     }
-    apply_local_proxy_bundle 100.123.154.79 tailscale0
+    apply_local_proxy_bundle 10.250.0.10
     [[ -s "$proxy_applied_digest_path" ]]
   )
   (
@@ -4066,7 +4157,8 @@ EOF
     systemctl() {
       return 1
     }
-    apply_local_bundle node-a 100.123.154.79 >/dev/null
+    ensure_member_overlay_proxy() { return 0; }
+    apply_local_bundle node-a 100.123.154.79 10.250.0.2 >/dev/null
   )
   grep -Fxq \
     'HETERONETWORK_DB_CLIENT_CIDRS=192.0.2.0/24,198.51.100.10/32' \
@@ -4101,9 +4193,10 @@ EOF
     sleep() {
       return 0
     }
-    apply_local_bundle node-a 100.123.154.79 >/dev/null
+    ensure_member_overlay_proxy() { return 0; }
+    apply_local_bundle node-a 100.123.154.79 10.250.0.2 >/dev/null
     touch "$temporary/database-active"
-    apply_local_bundle node-a 100.123.154.79 >/dev/null
+    apply_local_bundle node-a 100.123.154.79 10.250.0.2 >/dev/null
   )
   [[ ! -e "$applied_revision_path" ]]
   [[ "$(<"$configured_revision_path")" == "$manifest_revision" ]]
