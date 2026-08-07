@@ -28,6 +28,11 @@ control-plane VPN addresses. Initial administrator credentials remain in the
 standard `argocd-initial-admin-secret`. The console URL is
 `http://argocd.heteronetwork.internal:8088`.
 
+The three repo-server replicas use the control-plane host network so Git
+fetches use the same outbound path that is available from the Kubernetes
+nodes. `ClusterFirstWithHostNet` keeps cluster DNS resolution for Argo's
+internal services while preserving GitHub access for manifest reconciliation.
+
 The public HTTP and WebSocket edge is declared in
 `deploy/gitops/envoy-gateway/`. Envoy Gateway is pinned to v1.8.3, its
 generated proxy Service uses the HeteroNetwork `heteronetwork.io/public`
