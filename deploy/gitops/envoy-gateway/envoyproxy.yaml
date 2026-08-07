@@ -7,6 +7,28 @@ spec:
   provider:
     type: Kubernetes
     kubernetes:
+      envoyDeployment:
+        replicas: 3
+        pod:
+          nodeSelector:
+            networking.heteronetwork.io/public-ingress: "true"
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: envoy
+        container:
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      envoyPDB:
+        minAvailable: 2
       envoyService:
         type: LoadBalancer
         loadBalancerClass: heteronetwork.io/public

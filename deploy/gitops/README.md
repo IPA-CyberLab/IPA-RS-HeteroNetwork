@@ -32,7 +32,9 @@ The public HTTP and WebSocket edge is declared in
 `deploy/gitops/envoy-gateway/`. Envoy Gateway is pinned to v1.8.3, its
 generated proxy Service uses the HeteroNetwork `heteronetwork.io/public`
 LoadBalancer class on listener port 18081, and only the three managed Caddy
-gateways may reach that Service. Flow's HTTP API, signaling, and LiveKit
+gateways may reach that Service. The generated public Envoy proxy runs with
+three replicas on public-ingress nodes and keeps two available during
+voluntary disruption. Flow's HTTP API, signaling, and LiveKit
 signaling Services are private ClusterIP backends. A Redis-backed Envoy global
 rate limit applies a shared 200 requests/second bucket per client IP across
 the Gateway routes; IPv4 and IPv6 limits are declared separately. The
