@@ -1,6 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
+  - redis-primary-proxy.yaml
   - gatewayclass.yaml
   - envoyproxy.yaml
   - gateway.yaml

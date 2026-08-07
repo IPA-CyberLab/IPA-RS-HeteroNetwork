@@ -77,7 +77,7 @@ spec:
               backend:
                 type: Redis
                 redis:
-                  url: heterocloud-flow-redis.heterocloud-flow.svc.cluster.local:6379
+                  url: envoy-rate-limit-redis.envoy-gateway-system.svc.cluster.local:6379
   destination:
     server: https://kubernetes.default.svc
     namespace: envoy-gateway-system
