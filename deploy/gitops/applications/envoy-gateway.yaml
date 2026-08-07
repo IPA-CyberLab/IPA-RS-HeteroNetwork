@@ -52,6 +52,8 @@ spec:
                   replicas: 3
                   container:
                     env:
+                      - name: REDIS_TYPE
+                        value: single
                       - name: REDIS_URL
                         value: envoy-rate-limit-redis.envoy-gateway-system.svc.cluster.local:6379
                       - name: REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR
@@ -82,6 +84,8 @@ spec:
                             containers:
                               - name: envoy-ratelimit
                                 env:
+                                  - name: REDIS_TYPE
+                                    value: single
                                   - name: REDIS_URL
                                     value: envoy-rate-limit-redis.envoy-gateway-system.svc.cluster.local:6379
                                   - name: REDIS_CLOSE_CONNECTION_ON_READONLY_ERROR
