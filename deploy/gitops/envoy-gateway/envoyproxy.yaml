@@ -1,0 +1,21 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: heterocloud-edge
+  namespace: heterocloud-edge
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+        loadBalancerClass: heteronetwork.io/public
+        allocateLoadBalancerNodePorts: false
+        externalTrafficPolicy: Cluster
+        loadBalancerSourceRanges:
+          - 163.220.236.51/32
+          - 163.220.236.52/32
+          - 163.220.236.53/32
+        annotations:
+          networking.heteronetwork.io/traffic-mode: forwarded
+          networking.heteronetwork.io/ingress-replicas: "3"

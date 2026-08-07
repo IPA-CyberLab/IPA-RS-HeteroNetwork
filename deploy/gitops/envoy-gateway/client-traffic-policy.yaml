@@ -1,0 +1,13 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: heterocloud-edge-client-ip
+  namespace: heterocloud-edge
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: heterocloud-edge
+  clientIPDetection:
+    xForwardedFor:
+      numTrustedHops: 1

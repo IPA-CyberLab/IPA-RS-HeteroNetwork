@@ -6,9 +6,15 @@ metadata:
 spec:
   description: HeteroNetwork and HeteroCloud production workloads
   sourceRepos:
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
+    - docker.io/envoyproxy
   destinations:
+    - namespace: envoy-gateway-system
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-edge
+      server: https://kubernetes.default.svc
     - namespace: heterocloud
       server: https://kubernetes.default.svc
     - namespace: heterocloud-flow

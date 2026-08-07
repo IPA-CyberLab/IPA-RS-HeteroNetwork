@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: heterocloud-edge
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
+    targetRevision: master
+    path: deploy/gitops/envoy-gateway
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-edge
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true

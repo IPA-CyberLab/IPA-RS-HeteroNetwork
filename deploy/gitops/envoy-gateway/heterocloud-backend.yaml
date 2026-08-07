@@ -1,0 +1,14 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: heterocloud-api
+  namespace: heterocloud
+spec:
+  endpoints:
+    - fqdn:
+        hostname: heterocloud-heterocloud.heterocloud.svc.cluster.local
+        port: 8443
+  tls:
+    # TLS terminates at the managed Caddy edge. This is the existing private
+    # HeteroCloud TLS hop; its certificate is not a public CA certificate.
+    insecureSkipVerify: true

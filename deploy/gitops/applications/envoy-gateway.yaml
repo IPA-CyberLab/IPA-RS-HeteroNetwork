@@ -1,0 +1,98 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: envoy-gateway
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: docker.io/envoyproxy
+    chart: gateway-helm
+    targetRevision: v1.8.3
+    helm:
+      valuesObject:
+        crds:
+          enabled: true
+        deployment:
+          replicas: 3
+          pod:
+            nodeSelector:
+              node-role.kubernetes.io/control-plane: ""
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: kubernetes.io/hostname
+                whenUnsatisfiable: DoNotSchedule
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: envoy-gateway
+          envoyGateway:
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: 1
+                memory: 1Gi
+        podDisruptionBudget:
+          minAvailable: 2
+        config:
+          envoyGateway:
+            gateway:
+              controllerName: gateway.envoyproxy.io/gatewayclass-controller
+            provider:
+              type: Kubernetes
+              kubernetes:
+                rateLimitDeployment:
+                  replicas: 3
+                  container:
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 256Mi
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+                  pod:
+                    labels:
+                      app.kubernetes.io/name: envoy-ratelimit
+                    topologySpreadConstraints:
+                      - maxSkew: 1
+                        topologyKey: kubernetes.io/hostname
+                        whenUnsatisfiable: DoNotSchedule
+                        labelSelector:
+                          matchLabels:
+                            app.kubernetes.io/name: envoy-ratelimit
+                rateLimitPDB:
+                  minAvailable: 2
+            extensionApis:
+              enableBackend: true
+            rateLimit:
+              failClosed: true
+              backend:
+                type: Redis
+                redis:
+                  url: heterocloud-flow-redis.heterocloud-flow.svc.cluster.local:6379
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: envoy-gateway-system
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
