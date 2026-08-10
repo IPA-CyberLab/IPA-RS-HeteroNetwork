@@ -617,9 +617,6 @@ fn device_login_provider_for_candidate(
         endpoint
             .set_host(candidate.host_str())
             .map_err(|_| "Web UI candidate host is invalid".to_string())?;
-        endpoint
-            .set_port(candidate.port())
-            .map_err(|_| "Web UI candidate port is invalid".to_string())?;
     }
     provider.host_header = oidc_host_header(&provider.token_url)?;
     Ok(provider)
@@ -5636,17 +5633,17 @@ mod tests {
             .expect("candidate should provide a safe private backchannel");
         assert_eq!(
             provider.device_url.as_str(),
-            "http://10.250.0.6:19088/realms/heteronetwork/protocol/openid-connect/auth/device"
+            "http://10.250.0.6:18079/realms/heteronetwork/protocol/openid-connect/auth/device"
         );
         assert_eq!(
             provider.token_url.as_str(),
-            "http://10.250.0.6:19088/realms/heteronetwork/protocol/openid-connect/token"
+            "http://10.250.0.6:18079/realms/heteronetwork/protocol/openid-connect/token"
         );
         assert_eq!(
             provider.issuer_origin,
             "http://console.heteronetwork.internal:18079"
         );
-        assert_eq!(provider.host_header, "10.250.0.6:19088");
+        assert_eq!(provider.host_header, "10.250.0.6:18079");
     }
 
     #[tokio::test]
