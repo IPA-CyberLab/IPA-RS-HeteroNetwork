@@ -596,6 +596,35 @@ fn device_login_provider(config: &Value) -> Result<DeviceLoginProvider, String> 
     })
 }
 
+fn device_login_provider_for_candidate(
+    config: &Value,
+    candidate_url: &str,
+) -> Result<DeviceLoginProvider, String> {
+    let mut provider = device_login_provider(config)?;
+    let candidate = reqwest::Url::parse(candidate_url)
+        .map_err(|_| "Web UI candidate URL is invalid".to_string())?;
+    if !matches!(candidate.scheme(), "http" | "https")
+        || candidate.username() != ""
+        || candidate.password().is_some()
+        || candidate.host_str().is_none()
+    {
+        return Err("Web UI candidate URL is not a safe HTTP(S) origin".to_string());
+    }
+    for endpoint in [&mut provider.device_url, &mut provider.token_url] {
+        endpoint
+            .set_scheme(candidate.scheme())
+            .map_err(|_| "Web UI candidate scheme is invalid".to_string())?;
+        endpoint
+            .set_host(candidate.host_str())
+            .map_err(|_| "Web UI candidate host is invalid".to_string())?;
+        endpoint
+            .set_port(candidate.port())
+            .map_err(|_| "Web UI candidate port is invalid".to_string())?;
+    }
+    provider.host_header = oidc_host_header(&provider.token_url)?;
+    Ok(provider)
+}
+
 fn oidc_host_header(url: &reqwest::Url) -> Result<HeaderValue, String> {
     let host = url
         .host_str()
@@ -700,7 +729,7 @@ async fn device_login_providers(
                 continue;
             }
         };
-        match device_login_provider(&config) {
+        match device_login_provider_for_candidate(&config, &candidate.url) {
             Ok(provider)
                 if !providers.iter().any(|existing: &DeviceLoginProvider| {
                     existing.device_url == provider.device_url
@@ -5591,6 +5620,33 @@ mod tests {
                 "unsafe issuer was accepted: {unsafe_issuer}"
             );
         }
+    }
+
+    #[test]
+    fn device_login_provider_uses_reachable_candidate_as_private_backchannel() {
+        let config = json!({
+            "provider": "keycloak",
+            "issuer_url": "http://console.heteronetwork.internal:18079/realms/heteronetwork",
+            "device_authorization_endpoint": "http://console.heteronetwork.internal:18079/realms/heteronetwork/protocol/openid-connect/auth/device",
+            "token_endpoint": "http://console.heteronetwork.internal:18079/realms/heteronetwork/protocol/openid-connect/token",
+            "client_id": "heteronetwork-web",
+            "scopes": "openid profile email"
+        });
+        let provider = device_login_provider_for_candidate(&config, "http://10.250.0.6:19088")
+            .expect("candidate should provide a safe private backchannel");
+        assert_eq!(
+            provider.device_url.as_str(),
+            "http://10.250.0.6:19088/realms/heteronetwork/protocol/openid-connect/auth/device"
+        );
+        assert_eq!(
+            provider.token_url.as_str(),
+            "http://10.250.0.6:19088/realms/heteronetwork/protocol/openid-connect/token"
+        );
+        assert_eq!(
+            provider.issuer_origin,
+            "http://console.heteronetwork.internal:18079"
+        );
+        assert_eq!(provider.host_header, "10.250.0.6:19088");
     }
 
     #[tokio::test]

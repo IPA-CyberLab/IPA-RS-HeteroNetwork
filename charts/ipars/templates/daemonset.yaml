@@ -105,8 +105,8 @@
 {{- fail "agent.overlayDns.records must not contain more than 256 names" -}}
 {{- end -}}
 {{- range $name, $addresses := .Values.agent.overlayDns.records -}}
-{{- if or (eq $name "console.heteronetwork.internal") (gt (len $name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*[.]heteronetwork[.]internal$" $name)) -}}
-{{- fail (printf "agent.overlayDns.records name %q must be a lowercase subdomain below heteronetwork.internal and must not be the reserved console name" $name) -}}
+{{- if or (gt (len $name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*[.]heteronetwork[.]internal$" $name)) -}}
+{{- fail (printf "agent.overlayDns.records name %q must be a lowercase subdomain below heteronetwork.internal" $name) -}}
 {{- end -}}
 {{- if or (lt (len $addresses) 1) (gt (len $addresses) 16) -}}
 {{- fail (printf "agent.overlayDns.records[%q] must contain 1-16 addresses" $name) -}}

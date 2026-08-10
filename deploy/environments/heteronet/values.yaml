@@ -8,6 +8,10 @@ agent:
   overlayDns:
     enabled: true
     records:
+      console.heteronetwork.internal:
+        - 10.250.0.4
+        - 10.250.0.5
+        - 10.250.0.6
       grafana.heteronetwork.internal:
         - 10.250.0.4
         - 10.250.0.5

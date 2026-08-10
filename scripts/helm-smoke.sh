@@ -198,10 +198,12 @@ assert_rendered_contains overlay-dns-host-agent "name: install-overlay-dns-recor
 assert_rendered_contains overlay-dns-host-agent 'path: /var/lib/heteronetwork'
 assert_rendered_contains overlay-dns-host-agent "checksum/overlay-dns-records:"
 
-template_fails overlay-dns-reserved-console \
-  "must be a lowercase subdomain below heteronetwork.internal and must not be the reserved console name" \
+template_ok overlay-dns-ha-console \
   --set agent.overlayDns.enabled=true \
-  --set-string 'agent.overlayDns.records.console\.heteronetwork\.internal[0]=10.250.0.4'
+  --set-string 'agent.overlayDns.records.console\.heteronetwork\.internal[0]=10.250.0.4' \
+  --set-string 'agent.overlayDns.records.console\.heteronetwork\.internal[1]=10.250.0.5'
+
+assert_rendered_contains overlay-dns-ha-console '"console.heteronetwork.internal"'
 
 template_ok kubernetes-plugin-disabled \
   --set kubernetesPlugin.enabled=false

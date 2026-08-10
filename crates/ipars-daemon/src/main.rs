@@ -5469,10 +5469,6 @@ fn parse_overlay_dns_zone(bytes: &[u8]) -> anyhow::Result<OverlayDnsZone> {
             "overlay DNS name {raw_name:?} must be below heteronetwork.internal"
         );
         anyhow::ensure!(
-            name != OVERLAY_WEB_UI_DNS_NAME,
-            "overlay DNS name {raw_name:?} is reserved for the local console"
-        );
-        anyhow::ensure!(
             !addresses.is_empty()
                 && addresses.len() <= MAX_OVERLAY_DNS_ADDRESSES_PER_NAME,
             "overlay DNS name {raw_name:?} must contain 1-{MAX_OVERLAY_DNS_ADDRESSES_PER_NAME} addresses"
@@ -5719,10 +5715,12 @@ fn overlay_dns_response(
         .to_ascii()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let addresses = if query_name == OVERLAY_WEB_UI_DNS_NAME {
-        std::slice::from_ref(&answer_ip)
-    } else if let Some(addresses) = zone.records.get(&query_name) {
+    let addresses = if let Some(addresses) = zone.records.get(&query_name) {
         addresses.as_slice()
+    } else if query_name == OVERLAY_WEB_UI_DNS_NAME {
+        // Keep a useful single-node fallback for older deployments that do
+        // not yet carry the explicit HA console record.
+        std::slice::from_ref(&answer_ip)
     } else {
         response.metadata.response_code = ResponseCode::NXDomain;
         return response.to_vec().context("failed to encode DNS response");
@@ -22095,6 +22093,11 @@ mod tests {
             br#"{
                 "schema_version": 1,
                 "records": {
+                    "console.heteronetwork.internal": [
+                        "10.250.0.4",
+                        "10.250.0.5",
+                        "10.250.0.6"
+                    ],
                     "grafana.heteronetwork.internal": [
                         "10.250.0.4",
                         "10.250.0.5",
@@ -22116,12 +22119,26 @@ mod tests {
         )?;
         let response = DnsMessage::from_vec(&response)?;
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(response.answers.len(), 1);
-        assert!(matches!(
-            response.answers[0].data,
-            RData::A(value) if value.0 == Ipv4Addr::new(10, 250, 0, 7)
-        ));
-        assert_eq!(response.answers[0].ttl, OVERLAY_DNS_TTL_SECONDS);
+        assert_eq!(response.answers.len(), 3);
+        assert_eq!(
+            response
+                .answers
+                .iter()
+                .filter_map(|answer| match answer.data {
+                    RData::A(value) => Some(value.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                Ipv4Addr::new(10, 250, 0, 4),
+                Ipv4Addr::new(10, 250, 0, 5),
+                Ipv4Addr::new(10, 250, 0, 6),
+            ]
+        );
+        assert!(response
+            .answers
+            .iter()
+            .all(|answer| answer.ttl == OVERLAY_DNS_TTL_SECONDS));
 
         let mut configured = DnsMessage::query();
         configured.add_query(hickory_proto::op::Query::query(
@@ -22183,10 +22200,9 @@ mod tests {
     }
 
     #[test]
-    fn overlay_dns_records_reject_invalid_or_reserved_entries() {
+    fn overlay_dns_records_reject_invalid_entries() {
         for document in [
             br#"{"schema_version":2,"records":{}}"#.as_slice(),
-            br#"{"schema_version":1,"records":{"console.heteronetwork.internal":["10.250.0.4"]}}"#,
             br#"{"schema_version":1,"records":{"public.example":["10.250.0.4"]}}"#,
             br#"{"schema_version":1,"records":{"grafana.heteronetwork.internal":["127.0.0.1"]}}"#,
             br#"{"schema_version":1,"records":{"grafana.heteronetwork.internal":["10.250.0.4","10.250.0.4"]}}"#,
