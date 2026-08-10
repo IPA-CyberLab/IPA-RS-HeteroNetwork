@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - gatewayclass.yaml
   - envoyproxy.yaml
+  - heterocloud-edge-proxy-service.yaml
   - gateway.yaml
   - client-traffic-policy.yaml
   - backend-traffic-policy.yaml
