@@ -21,6 +21,9 @@ global:
 configs:
   cm:
     url: http://argocd.heteronetwork.internal:8088
+    # Flow's selector-free PostgreSQL proxy is backed by a managed
+    # EndpointSlice. Keep Argo CD from excluding this declared resource.
+    resource.exclusions: ""
   params:
     server.insecure: true
 
