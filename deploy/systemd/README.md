@@ -83,6 +83,14 @@ require neither a local Control Plane nor PostgreSQL or public HTTPS. Signal
 authenticates nodes through the existing HA Control Plane directory. A local VPN
 Control Plane and Web UI are added only when the PostgreSQL HA proxy and
 credentials are available. Failure of one role does not stop the other roles.
+The reconciler also installs an Agent drop-in that wants the independent
+Signal/STUN services and the local Control Plane whenever those configurations
+exist. A normal Agent restart therefore recovers the public roles without a
+manual service start. A transient loss of NAT classification retains an
+already-promoted configuration for
+`HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS` before demoting
+the node, so a short Agent/STUN probe interruption does not delete the boot
+recovery configuration.
 Pass
 `--disable-public-services` only for an explicit per-node opt-out. Automatically
 promoted Control Planes receive the root and enrollment public verification

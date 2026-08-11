@@ -150,6 +150,7 @@ database_autopilot_token_file=$public_services_dir/database-autopilot.token
 keycloak_autopilot_token_file=$public_services_dir/keycloak-autopilot.token
 agent_udp_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/30-public-udp-services.conf
 agent_gateway_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/40-public-control-services.conf
+agent_public_services_wants_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/50-public-services-autostart.conf
 legacy_agent_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.service.d/30-public-services.conf
 control_plane_enrollment_drop_in=$test_root/root/etc/systemd/system/heteronetwork-control-plane.service.d/40-node-enrollment.conf
 node_enrollment_issuer_key=$test_root/root/etc/credstore/node-enrollment-issuer.key
@@ -322,6 +323,7 @@ reset_auto_services() {
     "$keycloak_autopilot_token_file" \
     "$agent_udp_drop_in" \
     "$agent_gateway_drop_in" \
+    "$agent_public_services_wants_drop_in" \
     "$legacy_agent_drop_in" \
     "$control_plane_enrollment_drop_in"
 }
@@ -413,6 +415,8 @@ run_reconciler
 [ -f "$keycloak_autopilot_token_file" ] ||
   fail "Keycloak autopilot credential was not generated"
 [ -f "$agent_udp_drop_in" ] || fail "Agent STUN drop-in was not generated"
+[ -f "$agent_public_services_wants_drop_in" ] ||
+  fail "Agent public-services autostart drop-in was not generated"
 [ -f "$agent_gateway_drop_in" ] || fail "Agent gateway drop-in was not generated"
 [ -f "$control_plane_enrollment_drop_in" ] ||
   fail "Control Plane enrollment credential drop-in was not generated"
@@ -430,6 +434,8 @@ run_reconciler
   fail "Keycloak autopilot credential mode is not 0400"
 [ "$(stat -c '%a' "$agent_udp_drop_in")" = 644 ] ||
   fail "Agent STUN drop-in mode is not 0644"
+[ "$(stat -c '%a' "$agent_public_services_wants_drop_in")" = 644 ] ||
+  fail "Agent public-services autostart drop-in mode is not 0644"
 [ "$(stat -c '%a' "$agent_gateway_drop_in")" = 644 ] ||
   fail "Agent gateway drop-in mode is not 0644"
 [ "$(stat -c '%a' "$control_plane_enrollment_drop_in")" = 644 ] ||
@@ -510,6 +516,10 @@ grep -q 'HETERONETWORK_AGENT_ADVERTISE_STUN_URL=udp://163.220.236.51:19444' \
   "$agent_udp_drop_in" || fail "Agent STUN heartbeat advertisement is wrong"
 grep -q 'HETERONETWORK_AGENT_ADVERTISE_SIGNAL_URL=http://10.250.0.4:19443' \
   "$agent_udp_drop_in" || fail "Agent Signal heartbeat advertisement is wrong"
+grep -Fqx \
+  'Wants=heteronetwork-stun.service heteronetwork-signal.service heteronetwork-control-plane.service' \
+  "$agent_public_services_wants_drop_in" ||
+  fail "Agent public-service autostart dependencies are missing"
 grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL="udp://163.220.236.51:18445"$' \
   "$services_env" || fail "Relay advertisement is wrong"
 grep -Fq \
@@ -553,6 +563,7 @@ database_checksum=$(cksum "$database_url")
 database_autopilot_token_checksum=$(cksum "$database_autopilot_token_file")
 keycloak_autopilot_token_checksum=$(cksum "$keycloak_autopilot_token_file")
 udp_drop_in_checksum=$(cksum "$agent_udp_drop_in")
+public_services_wants_drop_in_checksum=$(cksum "$agent_public_services_wants_drop_in")
 gateway_drop_in_checksum=$(cksum "$agent_gateway_drop_in")
 enrollment_drop_in_checksum=$(cksum "$control_plane_enrollment_drop_in")
 chmod 0640 "$database_url"
@@ -575,6 +586,9 @@ run_reconciler
   fail "idempotent run rewrote the Keycloak autopilot credential"
 [ "$(cksum "$agent_udp_drop_in")" = "$udp_drop_in_checksum" ] ||
   fail "idempotent run rewrote the Agent STUN drop-in"
+[ "$(cksum "$agent_public_services_wants_drop_in")" = \
+  "$public_services_wants_drop_in_checksum" ] ||
+  fail "idempotent run rewrote the Agent public-service autostart drop-in"
 [ "$(cksum "$agent_gateway_drop_in")" = "$gateway_drop_in_checksum" ] ||
   fail "idempotent run rewrote the Agent gateway drop-in"
 [ "$(cksum "$control_plane_enrollment_drop_in")" = \
@@ -642,7 +656,14 @@ reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time"
 run_reconciler
+run_reconciler
 write_status private "$fresh_time"
+run_reconciler
+assert_active heteronetwork-control-plane.service
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+printf '%s\n' "$(( $(date +%s) - 46 ))" \
+  >"$test_root/root/run/heteronetwork-public-services-autopilot/nat-classification-loss-started"
 run_reconciler
 assert_demoted
 grep -q '^restart heteronetwork-agent.service$' "$systemctl_log" ||
@@ -653,7 +674,11 @@ reset_auto_services
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 write_status public "$fresh_time"
 run_reconciler
+run_reconciler
 write_status public '2000-01-01T00:00:00Z'
+run_reconciler
+printf '%s\n' "$(( $(date +%s) - 46 ))" \
+  >"$test_root/root/run/heteronetwork-public-services-autopilot/nat-classification-loss-started"
 run_reconciler
 assert_demoted
 

@@ -48,12 +48,14 @@ postgres_ca_file=$filesystem_root/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt
 agent_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-agent.service.d
 agent_udp_drop_in=$agent_drop_in_dir/30-public-udp-services.conf
 agent_gateway_drop_in=$agent_drop_in_dir/40-public-control-services.conf
+agent_public_services_wants_drop_in=$agent_drop_in_dir/50-public-services-autostart.conf
 legacy_agent_drop_in=$agent_drop_in_dir/30-public-services.conf
 control_plane_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-control-plane.service.d
 control_plane_enrollment_drop_in=$control_plane_drop_in_dir/40-node-enrollment.conf
 node_enrollment_issuer_key=$filesystem_root/etc/credstore/node-enrollment-issuer.key
 node_enrollment_relay_token=$filesystem_root/etc/heteronetwork/agent-relay-admission.token
 runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
+nat_loss_started_file=$runtime_dir/nat-classification-loss-started
 
 status_file=
 relay_status_file=
@@ -69,11 +71,13 @@ database_autopilot_token_tmp=
 keycloak_autopilot_token_tmp=
 agent_udp_drop_in_tmp=
 agent_gateway_drop_in_tmp=
+agent_public_services_wants_drop_in_tmp=
 control_plane_enrollment_drop_in_tmp=
 node_enrollment_enabled=0
 reconcile_finished=0
 independent_services_ready=0
 independent_activation_deferred=0
+agent_public_services_wants_drop_in_changed=0
 
 log() {
   printf '%s\n' "public-services-autopilot: $*" >&2
@@ -93,6 +97,8 @@ cleanup() {
     rm -f "$keycloak_autopilot_token_tmp"
   [ -z "$agent_udp_drop_in_tmp" ] || rm -f "$agent_udp_drop_in_tmp"
   [ -z "$agent_gateway_drop_in_tmp" ] || rm -f "$agent_gateway_drop_in_tmp"
+  [ -z "$agent_public_services_wants_drop_in_tmp" ] ||
+    rm -f "$agent_public_services_wants_drop_in_tmp"
   [ -z "$control_plane_enrollment_drop_in_tmp" ] ||
     rm -f "$control_plane_enrollment_drop_in_tmp"
 }
@@ -104,6 +110,55 @@ unit_is_active() {
 unit_is_loaded() {
   unit_load_state=$(systemctl show "$1" --property=LoadState --value 2>/dev/null) || return 1
   [ "$unit_load_state" = loaded ]
+}
+
+existing_public_services_are_staged() {
+  [ -f "$services_env" ] && [ ! -L "$services_env" ] || return 1
+  [ -f "$database_url_file" ] && [ ! -L "$database_url_file" ] || return 1
+  [ -f "$database_autopilot_token_file" ] &&
+    [ ! -L "$database_autopilot_token_file" ] || return 1
+  [ -f "$keycloak_autopilot_token_file" ] &&
+    [ ! -L "$keycloak_autopilot_token_file" ] || return 1
+  [ -f "$udp_services_env" ] && [ ! -L "$udp_services_env" ] || return 1
+}
+
+retain_existing_public_services() {
+  retain_reason=$1
+  existing_public_services_are_staged || return 1
+  mkdir -p "$runtime_dir" || return 1
+  chmod 0700 "$runtime_dir" || return 1
+
+  retain_now=$(date +%s) || return 1
+  if [ ! -s "$nat_loss_started_file" ]; then
+    printf '%s\n' "$retain_now" >"$nat_loss_started_file" || return 1
+    chmod 0600 "$nat_loss_started_file" || return 1
+  fi
+  retain_started=$(cat "$nat_loss_started_file") || return 1
+  case "$retain_started" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$retain_now" -ge "$retain_started" ] || return 1
+  [ "$((retain_now - retain_started))" -le "$classification_max_age_seconds" ] ||
+    return 1
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if unit_is_active "$agent_service"; then
+    if ! unit_is_active "$stun_service"; then
+      systemctl start "$stun_service" >/dev/null 2>&1 ||
+        log "unable to restore STUN while retaining promoted services"
+    fi
+    if ! unit_is_active "$control_plane_service"; then
+      systemctl start "$control_plane_service" >/dev/null 2>&1 ||
+        log "unable to restore Control Plane while retaining promoted services"
+    fi
+    if [ -f "$signal_services_env" ] &&
+      unit_is_loaded "$signal_service" &&
+      ! unit_is_active "$signal_service"; then
+      systemctl start "$signal_service" >/dev/null 2>&1 ||
+        log "unable to restore Signal while retaining promoted services"
+    fi
+  fi
+  log "retaining promoted public services during transient failure: $retain_reason"
 }
 
 stop_unit() {
@@ -149,6 +204,7 @@ demote_all() {
   for demote_path in \
     "$agent_udp_drop_in" \
     "$agent_gateway_drop_in" \
+    "$agent_public_services_wants_drop_in" \
     "$legacy_agent_drop_in"; do
     if [ -e "$demote_path" ] || [ -L "$demote_path" ]; then
       demote_changed=1
@@ -918,6 +974,18 @@ EOF
   agent_udp_drop_in_tmp=
   agent_udp_drop_in_changed=$CANDIDATE_CHANGED
 
+  agent_public_services_wants_drop_in_tmp=$(
+    mktemp "$agent_drop_in_dir/.50-public-services-autostart.conf.XXXXXX"
+  ) || return 1
+  cat >"$agent_public_services_wants_drop_in_tmp" <<'EOF' || return 1
+[Unit]
+Wants=heteronetwork-stun.service heteronetwork-signal.service heteronetwork-control-plane.service
+EOF
+  install_candidate "$agent_public_services_wants_drop_in_tmp" \
+    "$agent_public_services_wants_drop_in" root:root 0644 || return 1
+  agent_public_services_wants_drop_in_tmp=
+  agent_public_services_wants_drop_in_changed=$CANDIDATE_CHANGED
+
   if [ -e "$legacy_agent_drop_in" ] || [ -L "$legacy_agent_drop_in" ]; then
     rm -f "$legacy_agent_drop_in" || return 1
     agent_udp_drop_in_changed=1
@@ -926,7 +994,8 @@ EOF
 
 promote_independent_services() {
   independent_activation_deferred=0
-  if [ "$agent_udp_drop_in_changed" -eq 1 ]; then
+  if [ "$agent_udp_drop_in_changed" -eq 1 ] ||
+    [ "$agent_public_services_wants_drop_in_changed" -eq 1 ]; then
     systemctl daemon-reload || return 1
     systemctl restart --no-block "$agent_service" || return 1
     independent_activation_deferred=1
@@ -1179,6 +1248,16 @@ for required_unit in "$agent_service" "$stun_service"; do
 done
 
 if ! unit_is_active "$agent_service"; then
+  if existing_public_services_are_staged; then
+    log "Agent is inactive; attempting automatic restart from promoted configuration"
+    systemctl start "$agent_service" >/dev/null 2>&1 || true
+  fi
+fi
+if ! unit_is_active "$agent_service"; then
+  if retain_existing_public_services "Agent dependency is not active"; then
+    reconcile_finished=1
+    exit 0
+  fi
   demote_and_exit "Agent dependency is not active"
 fi
 mkdir -p "$runtime_dir"
@@ -1227,8 +1306,15 @@ if ! jq -e --argjson max_age "$classification_max_age_seconds" '
     and ($assessed <= (now + 5))
     and ($assessed >= (now - $max_age))
 ' "$status_file" >/dev/null; then
+  if retain_existing_public_services \
+    "direct-public NAT classification is absent, inconsistent, or stale"; then
+    reconcile_finished=1
+    exit 0
+  fi
   demote_and_exit "direct-public NAT classification is absent, inconsistent, or stale"
 fi
+
+rm -f "$nat_loss_started_file"
 
 node_id=$(jq -er '.node_id' "$status_file") ||
   demote_and_exit "Agent node identity is invalid"
