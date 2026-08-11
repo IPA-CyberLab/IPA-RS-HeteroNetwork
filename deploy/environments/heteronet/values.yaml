@@ -5,6 +5,10 @@ image:
 
 agent:
   mode: host
+  # Host-networked Kubernetes helpers use the node-local HAProxy, which keeps
+  # the API path on HeteroNetwork even when the physical default route is not
+  # allowed to reach the Kubernetes Service CIDR.
+
   overlayDns:
     enabled: true
     records:
@@ -23,6 +27,11 @@ agent:
         - 10.250.0.4
         - 10.250.0.5
         - 10.250.0.6
+
+kubernetesPlugin:
+  nodeReporter:
+    kubernetesServiceHost: k8s-api.heteronetwork.internal
+    kubernetesServicePort: 7443
 
 serviceExposure:
   enabled: false

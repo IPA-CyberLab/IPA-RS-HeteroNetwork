@@ -60,6 +60,10 @@ kubernetesPlugin:
     publicCandidateMaxAgeSeconds: 180
     publishNodeExternalIp: true
     healthBind: "127.0.0.1:19089"
+    # Host-networked node reporters can use the per-node HAProxy endpoint when
+    # the node's physical default route cannot reach the Kubernetes Service IP.
+    kubernetesServiceHost: ""
+    kubernetesServicePort: ""
     resources:
       requests:
         cpu: 10m

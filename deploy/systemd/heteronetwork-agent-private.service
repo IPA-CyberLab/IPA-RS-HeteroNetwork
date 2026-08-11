@@ -1,0 +1,31 @@
+[Unit]
+Description=HeteroNetwork Agent (private worker)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ENABLED=false
+ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
+Restart=on-failure
+RestartSec=5s
+StateDirectory=heteronetwork
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/heteronetwork
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

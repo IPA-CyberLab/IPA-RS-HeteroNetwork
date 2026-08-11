@@ -8,6 +8,7 @@ readonly DEFAULT_API_PROXY_PORT="7443"
 readonly DEFAULT_POD_CIDR="10.244.0.0/16"
 readonly DEFAULT_SERVICE_CIDR="10.96.0.0/12"
 readonly DEFAULT_KUBERNETES_MINOR="v1.36"
+readonly DEFAULT_MAX_PODS="240"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/kubernetes"
 readonly DEFAULT_AGENT_STATE_PATH="/var/lib/heteronetwork/agent.json"
 readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
@@ -27,6 +28,7 @@ api_proxy_port="${HETERONETWORK_KUBEADM_API_PROXY_PORT:-$DEFAULT_API_PROXY_PORT}
 pod_cidr="${HETERONETWORK_KUBEADM_POD_CIDR:-$DEFAULT_POD_CIDR}"
 service_cidr="${HETERONETWORK_KUBEADM_SERVICE_CIDR:-$DEFAULT_SERVICE_CIDR}"
 kubernetes_minor="${HETERONETWORK_KUBEADM_KUBERNETES_MINOR:-$DEFAULT_KUBERNETES_MINOR}"
+max_pods="${HETERONETWORK_KUBEADM_MAX_PODS:-$DEFAULT_MAX_PODS}"
 state_dir="${HETERONETWORK_KUBEADM_STATE_DIR:-$DEFAULT_STATE_DIR}"
 agent_state_path="${HETERONETWORK_AGENT_STATE_PATH:-$DEFAULT_AGENT_STATE_PATH}"
 agent_api_token_path="${HETERONETWORK_KUBEADM_AGENT_API_TOKEN_PATH:-$state_dir/agent-api-token}"
@@ -63,6 +65,7 @@ Optional environment:
   HETERONETWORK_KUBEADM_POD_CIDR         Default: 10.244.0.0/16
   HETERONETWORK_KUBEADM_SERVICE_CIDR     Default: 10.96.0.0/12
   HETERONETWORK_KUBEADM_KUBERNETES_MINOR Default: v1.36
+  HETERONETWORK_KUBEADM_MAX_PODS          Default: 240 (must fit the CNI node CIDR)
   HETERONETWORK_KUBEADM_JOIN_BUNDLE      Default: state-dir/join-bundle.json
   HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE
                                          Default: state-dir/worker-join-bundle.json
@@ -168,6 +171,9 @@ validate_common_config() {
   validate_cidr_literal "$service_cidr"
   [[ "$kubernetes_minor" =~ ^v[0-9]+\.[0-9]+$ ]] \
     || die "Kubernetes minor must look like v1.36: $kubernetes_minor"
+  [[ "$max_pods" =~ ^[0-9]+$ ]] || die "max Pods must be an integer: $max_pods"
+  ((10#$max_pods >= 1 && 10#$max_pods <= 240)) \
+    || die "max Pods must be between 1 and 240 for the default Flannel /24 node CIDR: $max_pods"
   [[ "$state_dir" == /* ]] || die "state directory must be absolute"
   [[ "$agent_api_token_path" == /* ]] || die "Agent API token path must be absolute"
   resolve_node_name
@@ -855,7 +861,7 @@ reconcile_kubelet_resolver() {
 
 configure_kubelet() {
   reconcile_kubelet_resolver
-  printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s"\n' "$node_ip" "$node_name" \
+  printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s --max-pods=%s"\n' "$node_ip" "$node_name" "$max_pods" \
     | install_from_stdin /etc/default/kubelet 0644
   install -d -o root -g root -m 0755 /etc/systemd/system/kubelet.service.d
   render_kubelet_dropin \
@@ -875,6 +881,7 @@ HETERONETWORK_KUBEADM_API_PROXY_PORT=${api_proxy_port}
 HETERONETWORK_KUBEADM_POD_CIDR=${pod_cidr}
 HETERONETWORK_KUBEADM_SERVICE_CIDR=${service_cidr}
 HETERONETWORK_KUBEADM_KUBERNETES_MINOR=${kubernetes_minor}
+HETERONETWORK_KUBEADM_MAX_PODS=${max_pods}
 EOF
 }
 

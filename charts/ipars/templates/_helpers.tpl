@@ -900,6 +900,20 @@
 {{- end -}}
 {{- $nodeReporterHealthBind := printf "%v" .Values.kubernetesPlugin.nodeReporter.healthBind -}}
 {{- include "heteronetwork.validateBindSocketAddress" (dict "path" "kubernetesPlugin.nodeReporter.healthBind" "value" $nodeReporterHealthBind) -}}
+{{- $nodeReporterKubernetesServiceHost := printf "%v" .Values.kubernetesPlugin.nodeReporter.kubernetesServiceHost -}}
+{{- $nodeReporterKubernetesServicePort := printf "%v" .Values.kubernetesPlugin.nodeReporter.kubernetesServicePort -}}
+{{- if and (ne $nodeReporterKubernetesServiceHost "") (eq $nodeReporterKubernetesServicePort "") -}}
+{{- fail "kubernetesPlugin.nodeReporter.kubernetesServicePort is required when kubernetesServiceHost is set" -}}
+{{- end -}}
+{{- if and (eq $nodeReporterKubernetesServiceHost "") (ne $nodeReporterKubernetesServicePort "") -}}
+{{- fail "kubernetesPlugin.nodeReporter.kubernetesServiceHost is required when kubernetesServicePort is set" -}}
+{{- end -}}
+{{- if ne $nodeReporterKubernetesServicePort "" -}}
+{{- include "heteronetwork.validateNonNegativeIntegerMax" (dict "path" "kubernetesPlugin.nodeReporter.kubernetesServicePort" "value" $nodeReporterKubernetesServicePort "max" 65535) -}}
+{{- if lt (int $nodeReporterKubernetesServicePort) 1 -}}
+{{- fail "kubernetesPlugin.nodeReporter.kubernetesServicePort must be between 1 and 65535" -}}
+{{- end -}}
+{{- end -}}
 {{- $webhookBind := printf "%v" .Values.kubernetesPlugin.controller.webhookBind -}}
 {{- include "heteronetwork.validateBindSocketAddress" (dict "path" "kubernetesPlugin.controller.webhookBind" "value" $webhookBind) -}}
 {{- $webhookServicePort := printf "%v" .Values.kubernetesPlugin.webhook.servicePort -}}
