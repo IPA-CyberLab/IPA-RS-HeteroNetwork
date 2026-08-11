@@ -91,6 +91,12 @@ already-promoted configuration for
 `HETERONETWORK_PUBLIC_SERVICES_CLASSIFICATION_MAX_AGE_SECONDS` before demoting
 the node, so a short Agent/STUN probe interruption does not delete the boot
 recovery configuration.
+Nodes installed with the private-worker unit also keep the automatic promotion
+path enabled. Once the Agent reports a signed public NAT classification, the
+Control Plane returns a short-lived, node-authenticated promotion installer;
+the root bootstrap unit applies it once. The normal public-services autopilot
+then promotes or demotes the local Signal, STUN, Relay, gateway, and Control
+Plane services as connectivity changes. No operator-side file copy is needed.
 Pass
 `--disable-public-services` only for an explicit per-node opt-out. Automatically
 promoted Control Planes receive the root and enrollment public verification

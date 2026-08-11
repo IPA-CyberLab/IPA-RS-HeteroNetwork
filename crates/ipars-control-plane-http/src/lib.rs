@@ -26,19 +26,20 @@ use ipars_types::api::{
     ClientControlRequest, ClientRequestKind, ControlPlaneMetricsResponse, ControlPlaneNodeOverview,
     ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest, ControlPlaneOverviewResponse,
     ControlPlanePathsResponse, ControlPlanePolicyResponse, ControlPlaneTopologyResponse,
-    HeartbeatRequest, HeartbeatResponse, JoinClientRequest, JoinNodeRequest, PeerMap,
-    RegisterClientResponse, RegisterNodeResponse, RemoveClientResponse, RemoveNodeRequest,
-    RemoveNodeResponse, RevokeTokenRequest, RevokeTokenResponse, RotateWireGuardKeyRequest,
-    RotateWireGuardKeyResponse, SignalNodeAuthenticationResponse, SignalNodeUpsertRequest,
-    SponsoredClientRegistrationRequest,
+    HeartbeatRequest, HeartbeatResponse, JoinClientRequest, JoinNodeRequest,
+    NodePublicServicesBootstrapResponse, PeerMap, RegisterClientResponse, RegisterNodeResponse,
+    RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
+    RevokeTokenResponse, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    SignalNodeAuthenticationResponse, SignalNodeUpsertRequest, SponsoredClientRegistrationRequest,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, ip_addr_is_globally_routable, BootstrapEndpoint,
     BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidateKind, HealthState,
-    JoinTokenClaims, KeyId, NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath,
-    OverlayPathQuery, PathRecord, PathState, Role, ServiceInstance, SignedJoinToken, Tag,
-    TokenLedgerMetrics, TokenPolicy, VpnIp, JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS,
-    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
+    JoinTokenClaims, KeyId, NatConnectivityState, NatMappingBehavior, NatTraversalStrategy,
+    NeighborMap, NodeHealth, NodeId, NodeRecord, OverlayPath, OverlayPathQuery, PathRecord,
+    PathState, Role, ServiceInstance, SignedJoinToken, Tag, TokenLedgerMetrics, TokenPolicy, VpnIp,
+    JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
+    MAX_JOIN_TOKEN_TAGS, MAX_JOIN_TOKEN_TTL_SECONDS,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::redirect::Policy as RedirectPolicy;
@@ -75,6 +76,8 @@ const WEB_OIDC_REFRESH_REVOCATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MIN_NODE_ENROLLMENT_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_REUSABLE_NODE_ENROLLMENT_USES: u32 = 10;
 const MAX_NODE_ENROLLMENT_REQUEST_BYTES: usize = 16 * 1024;
+#[cfg(test)]
+const MAX_NODE_ENROLLMENT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ADMIN_NODE_DISPLAY_NAME_REQUEST_BYTES: usize = 1024;
 const MAX_SPONSORED_CLIENT_REGISTRATION_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_DATABASE_AUTOPILOT_REQUEST_BYTES: usize = 8 * 1024;
@@ -120,6 +123,12 @@ const PUBLIC_SERVICES_AUTOPILOT_UNIT: &str =
     include_str!("../../../deploy/systemd/heteronetwork-public-services-autopilot.service");
 const PUBLIC_SERVICES_AUTOPILOT_TIMER: &str =
     include_str!("../../../deploy/systemd/heteronetwork-public-services-autopilot.timer");
+const PUBLIC_SERVICES_BOOTSTRAP_SCRIPT: &str =
+    include_str!("../../../scripts/public-services-bootstrap.sh");
+const PUBLIC_SERVICES_BOOTSTRAP_UNIT: &str =
+    include_str!("../../../deploy/systemd/heteronetwork-public-services-bootstrap.service");
+const PUBLIC_SERVICES_BOOTSTRAP_TIMER: &str =
+    include_str!("../../../deploy/systemd/heteronetwork-public-services-bootstrap.timer");
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT_SECONDS: u64 = 20;
 const MAX_DYNAMIC_WEB_GATEWAY_CONFIG_BYTES: u64 = 256 * 1024;
 const NODE_ENROLLMENT_CADDY_VERSION: &str = "2.11.4";
@@ -616,6 +625,10 @@ where
         .route(
             "/v1/nodes/authenticate-signal-upsert",
             post(authenticate_signal_node_upsert::<S, L>),
+        )
+        .route(
+            "/v1/nodes/public-services/bootstrap",
+            post(node_public_services_bootstrap::<S, L>),
         )
         .route("/v1/nodes/{node_id}", delete(remove_node::<S, L>))
         .route(
@@ -3161,9 +3174,13 @@ set -eu
 
 relay_enabled=1
 public_services_enabled=1
+promote_existing=0
 mapped_public_ip=
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --promote-existing)
+      promote_existing=1
+      ;;
     --mapped-public-ip)
       shift
       if [ "$#" -eq 0 ]; then
@@ -3184,7 +3201,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     *)
       echo "Unknown HeteroNetwork installer argument: $1" >&2
-      echo "Usage: $0 [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]" >&2
+      echo "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]" >&2
       exit 2
       ;;
   esac
@@ -3256,7 +3273,7 @@ iparsd_previous_snapshot="$tmp_dir/iparsd.previous"
 iparsd_snapshot_ready=0
 iparsd_was_present=0
 iparsd_replaced=0
-ipars_path=/usr/local/bin/ipars
+ipars_path=/opt/heteronetwork/bin/ipars
 ipars_previous_snapshot="$tmp_dir/ipars.previous"
 ipars_snapshot_ready=0
 ipars_was_present=0
@@ -3882,21 +3899,27 @@ chmod 0755 "$tmp_dir/caddy"
 install -m 0755 "$tmp_dir/caddy" /opt/heteronetwork/bin/.caddy.new
 mv -f /opt/heteronetwork/bin/.caddy.new /opt/heteronetwork/bin/caddy
 
-token_file="$tmp_dir/join-token.json"
-printf '%s' "$auth" | base64 -d >"$token_file"
-chmod 0600 "$token_file"
-/opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only
-heteronetwork_enrolled_node_id=$(
-  jq -er '.node_id | select(type == "string" and length > 0 and length <= 255)' \
-    /var/lib/heteronetwork/agent.json
-)
-case "$heteronetwork_enrolled_node_id" in
-  *[!A-Za-z0-9_.-]*)
-    echo "Enrolled HeteroNetwork node ID is invalid" >&2
-    exit 1
-    ;;
-esac
-rm -f "$token_file"
+if [ "$promote_existing" -eq 0 ]; then
+  token_file="$tmp_dir/join-token.json"
+  printf '%s' "$auth" | base64 -d >"$token_file"
+  chmod 0600 "$token_file"
+  /opt/heteronetwork/bin/iparsd agent --join-token-path "$token_file" --enroll-only
+  heteronetwork_enrolled_node_id=$(
+    jq -er '.node_id | select(type == "string" and length > 0 and length <= 255)' \
+      /var/lib/heteronetwork/agent.json
+  )
+  case "$heteronetwork_enrolled_node_id" in
+    *[!A-Za-z0-9_.-]*)
+      echo "Enrolled HeteroNetwork node ID is invalid" >&2
+      exit 1
+      ;;
+  esac
+  rm -f "$token_file"
+else
+  jq -e '.registered_node.node_id | type == "string" and length > 0 and length <= 255' \
+    /var/lib/heteronetwork/agent.json >/dev/null \
+    || { echo "--promote-existing requires an already registered HeteroNetwork Agent" >&2; exit 1; }
+fi
 
 install -d -o root -g root -m 0755 /etc/heteronetwork
 install -d -o root -g root -m 0755 /etc/sysusers.d
@@ -3963,6 +3986,7 @@ After=network-online.target heteronetwork-gateway.service
 
 [Service]
 Type=simple
+Environment=HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=__DISABLE_PUBLIC_SERVICES_AUTOPROMOTION__
 SupplementaryGroups=heteronetwork-gateway
 ExecStart=/opt/heteronetwork/bin/iparsd agent --apply-peer-map --wireguard-backend kernel-netlink --route-backend kernel-netlink --packet-flow-detector conntrack-netlink-events --packet-flow-poll-interval-seconds 1
 Restart=on-failure
@@ -4045,6 +4069,14 @@ echo "HeteroNetwork node enrolled and started"
         .replace("__CLI_SHA256__", &enrollment.cli_binary.sha256)
         .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
         .replace("__CADDY_SHA256__", NODE_ENROLLMENT_CADDY_SHA256)
+        .replace(
+            "__DISABLE_PUBLIC_SERVICES_AUTOPROMOTION__",
+            if enrollment.public_services.is_some() {
+                "0"
+            } else {
+                "1"
+            },
+        )
         .replace("__RELAY_ADMISSION_INSTALL__", &relay_admission_install)
         .replace("__PUBLIC_SERVICES_INSTALL__", &public_services_install)
         .replace("__KEYCLOAK_INSTALL__", &keycloak_install)
@@ -4915,8 +4947,10 @@ fn public_services_install_script(
         .collect::<Vec<_>>()
         .join(",");
     let autopilot = STANDARD.encode(PUBLIC_SERVICES_AUTOPILOT_SCRIPT.as_bytes());
+    let bootstrap_script = STANDARD.encode(PUBLIC_SERVICES_BOOTSTRAP_SCRIPT.as_bytes());
     format!(
         r#"if [ "$public_services_enabled" -eq 1 ]; then
+  rm -f /etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf
   install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
   install -d -o root -g root -m 0755 /etc/sysusers.d
   cat >/etc/sysusers.d/heteronetwork-services.conf <<'HETERONETWORK_PUBLIC_SERVICES_SYSUSERS'
@@ -4928,6 +4962,10 @@ HETERONETWORK_PUBLIC_SERVICES_SYSUSERS
   chown root:root /opt/heteronetwork/libexec/.public-services-autopilot.sh.new
   chmod 0755 /opt/heteronetwork/libexec/.public-services-autopilot.sh.new
   mv -f /opt/heteronetwork/libexec/.public-services-autopilot.sh.new /opt/heteronetwork/libexec/public-services-autopilot.sh
+  printf '%s' '{bootstrap_script}' | base64 -d >/opt/heteronetwork/libexec/.public-services-bootstrap.sh.new
+  chown root:root /opt/heteronetwork/libexec/.public-services-bootstrap.sh.new
+  chmod 0755 /opt/heteronetwork/libexec/.public-services-bootstrap.sh.new
+  mv -f /opt/heteronetwork/libexec/.public-services-bootstrap.sh.new /opt/heteronetwork/libexec/public-services-bootstrap.sh
   cat >/etc/heteronetwork/public-services/.bootstrap.env.new <<'HETERONETWORK_PUBLIC_SERVICES_ENV'
 HETERONETWORK_PUBLIC_SERVICES_CLUSTER_ID_B64={cluster_id}
 HETERONETWORK_PUBLIC_SERVICES_VPN_POOL_B64={vpn_pool}
@@ -4966,24 +5004,46 @@ HETERONETWORK_PUBLIC_SERVICES_AUTOPILOT_UNIT
   cat >/etc/systemd/system/heteronetwork-public-services-autopilot.timer <<'HETERONETWORK_PUBLIC_SERVICES_AUTOPILOT_TIMER'
 {autopilot_timer}
 HETERONETWORK_PUBLIC_SERVICES_AUTOPILOT_TIMER
+  cat >/etc/systemd/system/heteronetwork-public-services-bootstrap.service <<'HETERONETWORK_PUBLIC_SERVICES_BOOTSTRAP_UNIT'
+{bootstrap_unit}
+HETERONETWORK_PUBLIC_SERVICES_BOOTSTRAP_UNIT
+  cat >/etc/systemd/system/heteronetwork-public-services-bootstrap.timer <<'HETERONETWORK_PUBLIC_SERVICES_BOOTSTRAP_TIMER'
+{bootstrap_timer}
+HETERONETWORK_PUBLIC_SERVICES_BOOTSTRAP_TIMER
   chown root:root \
     /etc/systemd/system/heteronetwork-control-plane.service \
     /etc/systemd/system/heteronetwork-signal.service \
     /etc/systemd/system/heteronetwork-stun.service \
     /etc/systemd/system/heteronetwork-public-services-autopilot.service \
-    /etc/systemd/system/heteronetwork-public-services-autopilot.timer
+    /etc/systemd/system/heteronetwork-public-services-autopilot.timer \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.service \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.timer
   chmod 0644 \
     /etc/systemd/system/heteronetwork-control-plane.service \
     /etc/systemd/system/heteronetwork-signal.service \
     /etc/systemd/system/heteronetwork-stun.service \
     /etc/systemd/system/heteronetwork-public-services-autopilot.service \
-    /etc/systemd/system/heteronetwork-public-services-autopilot.timer
+    /etc/systemd/system/heteronetwork-public-services-autopilot.timer \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.service \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.timer
 else
+  install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
+  cat >/etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf <<'HETERONETWORK_PUBLIC_SERVICES_OPTOUT'
+[Service]
+Environment=HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=1
+HETERONETWORK_PUBLIC_SERVICES_OPTOUT
+  chown root:root /etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf
+  chmod 0644 /etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf
   if ! systemctl disable heteronetwork-public-services-autopilot.timer >/dev/null 2>&1; then
     echo "Automatic public-service timer was already disabled" >&2
   fi
   stop_systemd_unit_with_kill heteronetwork-public-services-autopilot.timer
   stop_systemd_unit_with_kill heteronetwork-public-services-autopilot.service
+  if ! systemctl disable heteronetwork-public-services-bootstrap.timer >/dev/null 2>&1; then
+    echo "Automatic public-services bootstrap timer was already disabled" >&2
+  fi
+  stop_systemd_unit_with_kill heteronetwork-public-services-bootstrap.timer
+  stop_systemd_unit_with_kill heteronetwork-public-services-bootstrap.service
   stop_systemd_unit_with_kill heteronetwork-control-plane.service
   stop_systemd_unit_with_kill heteronetwork-signal.service
   stop_systemd_unit_with_kill heteronetwork-stun.service
@@ -4995,14 +5055,19 @@ else
     /etc/heteronetwork/public-services/database-autopilot.token \
     /etc/heteronetwork/public-services/keycloak-autopilot.token \
     /opt/heteronetwork/libexec/public-services-autopilot.sh \
+    /opt/heteronetwork/libexec/public-services-bootstrap.sh \
     /etc/systemd/system/heteronetwork-control-plane.service \
     /etc/systemd/system/heteronetwork-signal.service \
     /etc/systemd/system/heteronetwork-stun.service \
     /etc/systemd/system/heteronetwork-public-services-autopilot.service \
-    /etc/systemd/system/heteronetwork-public-services-autopilot.timer
+    /etc/systemd/system/heteronetwork-public-services-autopilot.timer \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.service \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.timer \
+    /var/lib/heteronetwork/public-services-promotion.sh
 fi
 "#,
         autopilot = autopilot,
+        bootstrap_script = bootstrap_script,
         cluster_id = encode(token.claims.cluster_id.as_str()),
         vpn_pool = encode(&config.vpn_pool),
         issuer_node_id = encode(&config.issuer_node_id),
@@ -5026,6 +5091,8 @@ fi
         stun_unit = PUBLIC_SERVICES_STUN_UNIT,
         autopilot_unit = PUBLIC_SERVICES_AUTOPILOT_UNIT,
         autopilot_timer = PUBLIC_SERVICES_AUTOPILOT_TIMER,
+        bootstrap_unit = PUBLIC_SERVICES_BOOTSTRAP_UNIT,
+        bootstrap_timer = PUBLIC_SERVICES_BOOTSTRAP_TIMER,
     )
 }
 
@@ -5067,6 +5134,7 @@ fn public_services_start_script(enrollment: &NodeEnrollmentConfig) -> String {
   stop_systemd_unit_with_kill heteronetwork-signal.service
   stop_systemd_unit_with_kill heteronetwork-stun.service
   systemctl enable --now heteronetwork-public-services-autopilot.timer
+  systemctl enable --now heteronetwork-public-services-bootstrap.timer
   systemctl start --no-block heteronetwork-public-services-autopilot.service
   echo "Automatic public-service promotion scheduled"
 fi
@@ -6327,6 +6395,140 @@ where
         node,
         authenticated_at,
     }))
+}
+
+async fn node_public_services_bootstrap<S, L>(
+    State(state): State<ControlPlaneHttpState<S, L>>,
+    Json(request): Json<SignalNodeUpsertRequest>,
+) -> Result<Response, ApiError>
+where
+    S: ControlPlaneStore,
+    L: TokenLedger,
+{
+    let authenticated_at = Utc::now();
+    let node = state
+        .plane
+        .authenticate_signal_node_upsert(&request, authenticated_at)
+        .await?;
+    let nat = request.nat_classification.as_ref().ok_or_else(|| {
+        ApiError(ControlPlaneError::NodeUpdateRejected {
+            node_id: node.node_id.clone(),
+            reason:
+                "automatic public-service promotion requires a current public NAT classification"
+                    .to_string(),
+        })
+    })?;
+    let public_classification = match nat.connectivity_state {
+        NatConnectivityState::Public => {
+            nat.mapping_behavior == NatMappingBehavior::NoNat
+                && nat.strategy == NatTraversalStrategy::DirectCandidate
+                && nat.observed_endpoint == Some(nat.local_addr)
+        }
+        NatConnectivityState::MappedPublic => {
+            nat.mapping_behavior == NatMappingBehavior::EndpointIndependent
+                && nat
+                    .observed_endpoint
+                    .is_some_and(|endpoint| endpoint != nat.local_addr)
+        }
+        _ => false,
+    };
+    if !public_classification {
+        return Err(ApiError(ControlPlaneError::NodeUpdateRejected {
+            node_id: node.node_id,
+            reason: "automatic public-service promotion requires a direct or mapped-public NAT classification"
+                .to_string(),
+        }));
+    }
+
+    let enrollment = state.node_enrollment.as_deref().ok_or_else(|| {
+        ApiError(ControlPlaneError::Store(
+            "node enrollment is not configured".to_string(),
+        ))
+    })?;
+    if !node_enrollment_role_is_allowed(&node.role) {
+        return Err(ApiError(ControlPlaneError::NodeUpdateRejected {
+            node_id: node.node_id,
+            reason: "registered node role is not eligible for automatic public-service promotion"
+                .to_string(),
+        }));
+    }
+
+    let directory = state
+        .plane
+        .enrollment_service_directory(Duration::from_secs(enrollment.max_ttl_seconds))
+        .await?;
+    require_ha_node_enrollment_directory(&directory, true)
+        .map_err(|error| ApiError(ControlPlaneError::Store(error.message)))?;
+    let bootstrap_endpoints = node_enrollment_bootstrap_endpoints(
+        enrollment.install_base_url.as_ref(),
+        &directory.bootstrap_endpoints,
+        &state.plane.config().vpn_pool,
+    )
+    .map_err(|error| ApiError(ControlPlaneError::Store(error.message)))?;
+
+    let now = Utc::now();
+    let expires_at = now
+        .checked_add_signed(ChronoDuration::minutes(15))
+        .ok_or_else(|| {
+            ApiError(ControlPlaneError::Store(
+                "automatic public-service promotion token expiration is out of range".to_string(),
+            ))
+        })?;
+    let claims = JoinTokenClaims {
+        cluster_id: state.plane.config().cluster_id.clone(),
+        bootstrap_endpoints: bootstrap_endpoints.clone(),
+        expires_at,
+        not_before: now - ChronoDuration::seconds(JOIN_TOKEN_NOT_BEFORE_SKEW_SECONDS),
+        role: node.role.clone(),
+        tags: node.tags.clone(),
+        issuer: enrollment.issuer.node_id(),
+        key_id: enrollment.key_id.clone(),
+        policy: TokenPolicy {
+            allow_join: true,
+            allow_relay: true,
+            allowed_routes: node.token_policy.allowed_routes.clone(),
+            allowed_tags: node.tags.clone(),
+            max_token_uses: Some(1),
+        },
+        nonce: format!("auto-promote-{}", random_oidc_value(24)),
+    };
+    let token = enrollment
+        .issuer
+        .sign_join_token(claims)
+        .map_err(|error| ApiError(ControlPlaneError::Store(error.to_string())))?;
+    state.join_service.issue_join_token(&token, now).await?;
+    let encoded_token = encode_node_enrollment_authorization(&token)
+        .map_err(|error| ApiError(ControlPlaneError::Store(error.message)))?;
+    let database_autopilot_bearer_token = state
+        .resolved_database_autopilot_bearer_token()
+        .ok_or_else(|| {
+            ApiError(ControlPlaneError::Store(
+                "database autopilot API bearer token is not configured".to_string(),
+            ))
+        })?;
+    let keycloak_autopilot_bearer_token = state
+        .resolved_keycloak_autopilot_bearer_token()
+        .ok_or_else(|| {
+            ApiError(ControlPlaneError::Store(
+                "Keycloak autopilot API bearer token is not configured".to_string(),
+            ))
+        })?;
+    let install_script = node_enrollment_install_script(
+        enrollment,
+        &token,
+        &encoded_token,
+        &bootstrap_endpoints,
+        &database_autopilot_bearer_token,
+        &keycloak_autopilot_bearer_token,
+    );
+    let mut response = Json(NodePublicServicesBootstrapResponse {
+        node_id: node.node_id,
+        expires_at,
+        install_script,
+    })
+    .into_response();
+    apply_node_enrollment_security_headers(&mut response);
+    Ok(response)
 }
 
 async fn peers<S, L>(
@@ -8872,7 +9074,7 @@ mod tests {
             7 * 24 * 60 * 60,
         );
         let enrollment = NodeEnrollmentConfig::new(
-            issuer,
+            issuer.clone(),
             key_id.as_str().to_string(),
             "http://127.0.0.1:8443".to_string(),
             binary_path.clone(),
@@ -8915,6 +9117,77 @@ mod tests {
                 .require_operator_api_bearer_token(OPERATOR_API_BEARER_TOKEN.to_string())
                 .enable_node_enrollment(enrollment),
         );
+        let promotion_identity = identity_for_node("automatic-promotion-node");
+        let promotion_assessed_at = Utc::now();
+        let promotion_public_addr = SocketAddr::from(([9, 9, 9, 9], 51_820));
+        let promotion_classification = NatClassification::from_observations(
+            promotion_public_addr,
+            vec![NatProbeObservation {
+                local_addr: promotion_public_addr,
+                stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: promotion_public_addr,
+                observed_at: promotion_assessed_at,
+            }],
+            promotion_assessed_at,
+        );
+        let mut promotion_registration = registration("automatic-promotion-node");
+        promotion_registration.candidates = vec![EndpointCandidate {
+            node_id: node_id("automatic-promotion-node"),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: promotion_public_addr,
+            observed_at: promotion_assessed_at,
+            priority: 100,
+            cost: 10,
+            source: CandidateSource::StunProbe,
+        }];
+        promotion_registration.nat_classification = Some(promotion_classification.clone());
+        let mut promotion_claims = claims(cluster_id.clone(), issuer.node_id(), key_id.clone());
+        promotion_claims.role = Role::from_string("worker");
+        let promotion_node = plane
+            .register_with_claims(promotion_claims, promotion_registration)
+            .await?
+            .node;
+        let mut promotion_request = SignalNodeUpsertRequest {
+            node: promotion_node,
+            nat_classification: Some(promotion_classification),
+            health: Some(NodeHealth {
+                state: HealthState::Healthy,
+                last_seen_at: promotion_assessed_at,
+                latency_ms: Some(1.0),
+                relay_load: Some(0.0),
+                message: Some("automatic promotion test".to_string()),
+            }),
+            request_signature: None,
+        };
+        promotion_request.request_signature = Some(
+            promotion_identity.sign_signal_node_upsert_request(&promotion_request, Utc::now())?,
+        );
+        let promotion_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/nodes/public-services/bootstrap")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&promotion_request)?))?,
+            )
+            .await?;
+        assert_eq!(promotion_response.status(), StatusCode::OK);
+        let promotion_response_body = axum::body::to_bytes(
+            promotion_response.into_body(),
+            MAX_NODE_ENROLLMENT_RESPONSE_BYTES,
+        )
+        .await?;
+        let promotion_response: NodePublicServicesBootstrapResponse =
+            serde_json::from_slice(&promotion_response_body)?;
+        assert_eq!(promotion_response.node_id, promotion_request.node.node_id);
+        assert!(promotion_response
+            .install_script
+            .contains("--promote-existing"));
+        assert!(promotion_response
+            .install_script
+            .contains("promote_existing=0"));
+
         let request_body = serde_json::json!({
             "expires_in_seconds": 86_400,
             "role": "edge",
@@ -9331,8 +9604,14 @@ mod tests {
         assert!(generated_script.contains("systemctl restart heteronetwork-gateway.service"));
         assert!(generated_script.contains("systemctl restart heteronetwork-agent.service"));
         assert!(generated_script.contains(
-            "Usage: $0 [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]"
+            "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]"
         ));
+        assert!(generated_script.contains("promote_existing=0"));
+        assert!(generated_script
+            .contains("--promote-existing requires an already registered HeteroNetwork Agent"));
+        assert!(generated_script.contains("/opt/heteronetwork/bin/ipars"));
+        assert!(generated_script
+            .contains("HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=0"));
         assert!(generated_script.contains("HETERONETWORK_AGENT_MAPPED_PUBLIC_IP="));
         assert!(generated_script
             .contains("/etc/systemd/system/heteronetwork-agent.service.d/05-mapped-public.conf"));
@@ -9343,6 +9622,11 @@ mod tests {
         ));
         assert!(generated_script.contains("heteronetwork-public-services-autopilot.service"));
         assert!(generated_script.contains("heteronetwork-public-services-autopilot.timer"));
+        assert!(generated_script.contains("heteronetwork-public-services-bootstrap.service"));
+        assert!(generated_script.contains("heteronetwork-public-services-bootstrap.timer"));
+        assert!(generated_script.contains("public-services-bootstrap.sh"));
+        assert!(generated_script
+            .contains("systemctl enable --now heteronetwork-public-services-bootstrap.timer"));
         assert!(generated_script.contains(
             "ReadWritePaths=/etc/heteronetwork/public-services /etc/systemd/system/heteronetwork-agent.service.d /etc/systemd/system/heteronetwork-control-plane.service.d"
         ));
@@ -10934,7 +11218,7 @@ exit 47
         let client_join_body = axum::body::to_bytes(client_join.into_body(), usize::MAX).await?;
         let client_join: RegisterClientResponse = serde_json::from_slice(&client_join_body)?;
         assert!(client_join.client.role.is_client());
-        assert_eq!(client_join.peer_map.peers.len(), 3);
+        assert_eq!(client_join.peer_map.peers.len(), 4);
         assert_eq!(client_join.peer_map.peers[0].node_id, gateway.node_id);
 
         let client_heartbeat = signed_heartbeat(
@@ -11068,7 +11352,7 @@ exit 47
         let peer_map_body = axum::body::to_bytes(peer_map.into_body(), usize::MAX).await?;
         let client_configuration: RegisterClientResponse = serde_json::from_slice(&peer_map_body)?;
         assert_eq!(client_configuration.client, client_join.client);
-        assert_eq!(client_configuration.peer_map.peers.len(), 3);
+        assert_eq!(client_configuration.peer_map.peers.len(), 4);
         assert_eq!(
             client_configuration.peer_map.peers[0].node_id,
             gateway.node_id
@@ -11148,7 +11432,7 @@ exit 47
         let metrics = axum::body::to_bytes(metrics.into_body(), usize::MAX).await?;
         let metrics: ControlPlaneMetricsResponse = serde_json::from_slice(&metrics)?;
         assert_eq!(metrics.client_count, 1);
-        assert_eq!(metrics.node_count, 4);
+        assert_eq!(metrics.node_count, 5);
 
         let stale_lease = Utc::now() - ChronoDuration::days(8);
         let mut stale_public_a =

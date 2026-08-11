@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
@@ -84,12 +85,13 @@ use ipars_types::api::{
     AgentPacketFlowTcpState, AgentRelayAdmissionFailureReason, AgentRelayForwarderMetrics,
     AuthenticatedSignalPathRequest, ControlPlaneMetricsResponse, ControlPlaneNodeQueryKind,
     ControlPlaneNodeQueryRequest, HeartbeatRequest, HeartbeatResponse, JoinNodeRequest,
-    NatTraversalStrategyCount, NodeServiceAdvertisement, PathStateCount, PeerConnectionIntent,
-    PeerMap, RegisterNodeRequest, RegisterNodeResponse, RelayAdmissionFailureReason,
-    RelayAdmissionRequest, RelayAdmissionResponse, RelayDataplaneDropReason, RelayDataplaneMetrics,
-    RelayStatusResponse, SignalHolePunchPlanRequest, SignalHolePunchPlanResponse,
-    SignalMetricsResponse, SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest,
-    SignalPathResponse, StunMetricsResponse,
+    NatTraversalStrategyCount, NodePublicServicesBootstrapResponse, NodeServiceAdvertisement,
+    PathStateCount, PeerConnectionIntent, PeerMap, RegisterNodeRequest, RegisterNodeResponse,
+    RelayAdmissionFailureReason, RelayAdmissionRequest, RelayAdmissionResponse,
+    RelayDataplaneDropReason, RelayDataplaneMetrics, RelayStatusResponse,
+    SignalHolePunchPlanRequest, SignalHolePunchPlanResponse, SignalMetricsResponse,
+    SignalNodeUpsertRequest, SignalNodeUpsertResponse, SignalPathRequest, SignalPathResponse,
+    StunMetricsResponse,
 };
 #[cfg(test)]
 use ipars_types::ebpf::PACKET_FLOW_EVENT_LEN;
@@ -111,11 +113,12 @@ use ipars_types::{
     http_url_is_usable_endpoint, node_hostname_is_valid, relay_pair_rendezvous_ordering,
     socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, AclRule,
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
-    HealthState, KeyId, NatTraversalStrategy, NeighborMap, NodeHealth, NodeId, NodeRecord,
-    OverlayPath, PathMetrics, PathRecord, PathScore, PathState, RelayCapability, Route,
-    ServiceInstance, SignedJoinToken, TokenLedgerMetrics, TransportProtocol, VpnIp,
-    LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX, MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND,
-    MAX_JOIN_TOKEN_TTL_SECONDS, MAX_PATH_SCORE_REASONS,
+    HealthState, KeyId, NatConnectivityState, NatTraversalStrategy, NeighborMap, NodeHealth,
+    NodeId, NodeRecord, OverlayPath, PathMetrics, PathRecord, PathScore, PathState,
+    RelayCapability, Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
+    TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
+    MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
+    MAX_PATH_SCORE_REASONS,
 };
 use ipnet::IpNet;
 use netlink_sys::{
@@ -183,6 +186,7 @@ const MAX_DOCKER_API_IPAM_CONFIGS_PER_NETWORK: usize = 64;
 const MAX_DOCKER_API_SUBNET_BYTES: usize = 128;
 const MAX_DOCKER_API_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_AGENT_CONTROL_PLANE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PUBLIC_SERVICES_BOOTSTRAP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AGENT_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_ERROR_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_AGENT_SIGNAL_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
@@ -217,6 +221,9 @@ const MAX_RELAY_ADMISSION_RATE_LIMIT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 const RELAY_NODE_ID_STATE_WAIT_SECONDS: u64 = 60;
 const DEFAULT_AGENT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const PUBLIC_SERVICES_BOOTSTRAP_ENV_PATH: &str = "/etc/heteronetwork/public-services/bootstrap.env";
+const PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH: &str =
+    "/var/lib/heteronetwork/public-services-promotion.sh";
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const ADVERTISED_SIGNAL_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -952,6 +959,12 @@ struct AgentArgs {
         default_value_t = true
     )]
     public_web_gateway_enabled: bool,
+    #[arg(
+        long,
+        env = "HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION",
+        default_value_t = false
+    )]
+    disable_public_services_autopromotion: bool,
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_PUBLIC_WEB_GATEWAY_ADMIN_SOCKET",
@@ -5242,7 +5255,7 @@ fn control_plane_node_enrollment_config(
             if sibling.is_file() {
                 sibling
             } else {
-                PathBuf::from("/usr/local/bin/ipars")
+                PathBuf::from("/opt/heteronetwork/bin/ipars")
             }
         }
     };
@@ -9208,14 +9221,15 @@ async fn run_agent(
     if !args.disable_heartbeat && !control_plane_bases.is_empty() {
         let heartbeat_route_reporter =
             heartbeat_route_reporter(&args, runtime.state().node_id.clone());
+        let heartbeat_identity = runtime
+            .state()
+            .identity_key_pair()
+            .context("failed to load agent identity key for heartbeat signing")?;
         background_tasks.push(start_heartbeat_reporting(HeartbeatReporterConfig {
             runtime: runtime.clone(),
             state_store: store.clone(),
             client: http_client.clone(),
-            identity: runtime
-                .state()
-                .identity_key_pair()
-                .context("failed to load agent identity key for heartbeat signing")?,
+            identity: heartbeat_identity.clone(),
             control_plane_urls: control_plane_bases.clone(),
             interval: Duration::from_secs(args.heartbeat_interval_seconds),
             advertised_signal_url: args.advertise_signal_url.clone(),
@@ -9223,6 +9237,15 @@ async fn run_agent(
             relay_capability_reporter: relay_capability_reporter.clone(),
             route_reporter: heartbeat_route_reporter,
         }));
+        if !args.disable_public_services_autopromotion {
+            background_tasks.push(start_public_services_bootstrap_reporting(
+                runtime.clone(),
+                http_client.clone(),
+                heartbeat_identity,
+                control_plane_bases.clone(),
+                Duration::from_secs(args.heartbeat_interval_seconds),
+            ));
+        }
     }
     let peer_map_handle = if args.apply_peer_map {
         anyhow::ensure!(
@@ -14150,7 +14173,7 @@ fn public_web_gateway_caddyfile(
         if let Some(control_plane_upstream) = config.control_plane_upstream {
             let _ = writeln!(
                 caddyfile,
-                "\t@control_plane_bootstrap path /v1/join /v1/heartbeat /v1/nodes/authenticate-signal-upsert /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
+                "\t@control_plane_bootstrap path /v1/join /v1/heartbeat /v1/nodes/authenticate-signal-upsert /v1/nodes/public-services/bootstrap /v1/peers/query /v1/neighbors/query /v1/paths/query /v1/overlay-paths/query /v1/install/*\n\thandle @control_plane_bootstrap {{\n\t\treverse_proxy http://{control_plane_upstream}\n\t}}"
             );
         }
         if let Some(signal_upstream) = config.signal_upstream {
@@ -14771,6 +14794,195 @@ async fn apply_heartbeat_connection_intents(
             .record_remote_peer_activity(intent.peer, intent.observed_at)
             .await;
     }
+}
+
+fn public_services_bootstrap_is_configured_or_pending() -> bool {
+    Path::new(PUBLIC_SERVICES_BOOTSTRAP_ENV_PATH).is_file()
+        || Path::new(PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH).is_file()
+}
+
+fn public_nat_classification_is_eligible(classification: &ipars_types::NatClassification) -> bool {
+    match classification.connectivity_state {
+        NatConnectivityState::Public => {
+            classification.mapping_behavior == ipars_types::NatMappingBehavior::NoNat
+                && classification.strategy == NatTraversalStrategy::DirectCandidate
+                && classification.observed_endpoint == Some(classification.local_addr)
+        }
+        NatConnectivityState::MappedPublic => {
+            classification.mapping_behavior == ipars_types::NatMappingBehavior::EndpointIndependent
+                && classification
+                    .observed_endpoint
+                    .is_some_and(|endpoint| endpoint != classification.local_addr)
+        }
+        _ => false,
+    }
+}
+
+fn persist_public_services_bootstrap_script(script: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !script.trim().is_empty(),
+        "public-services bootstrap script is empty"
+    );
+    anyhow::ensure!(
+        script.len() <= MAX_PUBLIC_SERVICES_BOOTSTRAP_RESPONSE_BYTES as usize,
+        "public-services bootstrap script is too large"
+    );
+    let pending_path = Path::new(PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH);
+    let parent = pending_path
+        .parent()
+        .context("public-services bootstrap path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let temporary_path = parent.join(format!(
+        ".public-services-promotion.sh.{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary_path, script).with_context(|| {
+        format!(
+            "failed to write public-services bootstrap script {}",
+            temporary_path.display()
+        )
+    })?;
+    let result = (|| {
+        let mut permissions = std::fs::metadata(&temporary_path)?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&temporary_path, permissions)?;
+        std::fs::rename(&temporary_path, pending_path)?;
+        Ok::<(), anyhow::Error>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn public_services_bootstrap_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/v1/nodes/public-services/bootstrap",
+        control_plane_url.trim_end_matches('/')
+    )
+}
+
+async fn send_public_services_bootstrap(
+    client: &reqwest::Client,
+    control_plane_urls: &[String],
+    request: SignalNodeUpsertRequest,
+) -> anyhow::Result<NodePublicServicesBootstrapResponse> {
+    anyhow::ensure!(
+        !control_plane_urls.is_empty(),
+        "control-plane URL is required for public-services bootstrap"
+    );
+    let mut failures = Vec::new();
+    for control_plane_url in control_plane_urls_for_node(control_plane_urls, &request.node.node_id)
+    {
+        let url = public_services_bootstrap_url(control_plane_url);
+        match client.post(&url).json(&request).send().await {
+            Ok(response) if response.status().is_success() => {
+                return read_bounded_agent_json_response(
+                    response,
+                    MAX_PUBLIC_SERVICES_BOOTSTRAP_RESPONSE_BYTES,
+                    "public-services bootstrap",
+                )
+                .await;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = read_bounded_agent_response_body(
+                    response,
+                    MAX_AGENT_ERROR_RESPONSE_BYTES,
+                    "public-services bootstrap error",
+                )
+                .await
+                .unwrap_or_default();
+                let reason = serde_json::from_slice::<AgentApiErrorResponse>(&body)
+                    .ok()
+                    .map(|response| response.error)
+                    .filter(|reason| !reason.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        "control plane returned no structured error reason".to_string()
+                    });
+                failures.push(format!("{url}: HTTP {status}: {reason}"));
+            }
+            Err(error) => failures.push(format!("{url}: {error}")),
+        }
+    }
+    anyhow::bail!(
+        "all control-plane public-services bootstrap endpoints failed: {}",
+        failures.join("; ")
+    )
+}
+
+fn start_public_services_bootstrap_reporting(
+    runtime: Arc<AgentRuntime>,
+    client: reqwest::Client,
+    identity: IdentityKeyPair,
+    control_plane_urls: Vec<String>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        wait_for_initial_poll(
+            initial_poll_delay(interval),
+            runtime.heartbeat_report_notifier().as_ref(),
+        )
+        .await;
+        loop {
+            if public_services_bootstrap_is_configured_or_pending() {
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+
+            let status = runtime.status().await;
+            let eligible = status
+                .nat_classification
+                .as_ref()
+                .is_some_and(public_nat_classification_is_eligible);
+            if !eligible {
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+            let Some(node) = runtime.state().registered_node else {
+                tokio::time::sleep(interval).await;
+                continue;
+            };
+            let request = match signal_node_upsert_request(&runtime, &identity, node, None).await {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to prepare public-services bootstrap request");
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
+            let active_control_plane_urls = match runtime_control_plane_urls(
+                &runtime,
+                &control_plane_urls,
+            ) {
+                Ok(urls) => urls,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to resolve control-plane directory for public-services bootstrap");
+                    control_plane_urls.clone()
+                }
+            };
+            match send_public_services_bootstrap(&client, &active_control_plane_urls, request).await
+            {
+                Ok(response) => {
+                    match persist_public_services_bootstrap_script(&response.install_script) {
+                        Ok(()) => tracing::info!(
+                            node_id = %response.node_id,
+                            expires_at = %response.expires_at,
+                            "received automatic public-services promotion"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to persist public-services promotion")
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "public-services promotion is not currently available")
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
 }
 
 fn heartbeat_response_has_peer_delta(response: &anyhow::Result<HeartbeatResponse>) -> bool {

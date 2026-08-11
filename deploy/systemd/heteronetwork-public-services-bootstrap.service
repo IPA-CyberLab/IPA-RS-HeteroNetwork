@@ -1,0 +1,24 @@
+[Unit]
+Description=Apply an automatically issued HeteroNetwork public-services promotion
+Wants=network-online.target
+After=network-online.target heteronetwork-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/public-services-bootstrap.sh
+TimeoutStartSec=15min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/heteronetwork /etc/heteronetwork /etc/systemd/system /etc/systemd/system/heteronetwork-agent.service.d /etc/systemd/system/heteronetwork-control-plane.service.d /etc/sysusers.d /etc/credstore /opt/heteronetwork /run
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

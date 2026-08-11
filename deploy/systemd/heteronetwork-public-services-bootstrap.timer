@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry automatic HeteroNetwork public-services promotion
+
+[Timer]
+OnBootSec=10s
+OnUnitInactiveSec=15s
+RandomizedDelaySec=3s
+AccuracySec=1s
+Unit=heteronetwork-public-services-bootstrap.service
+
+[Install]
+WantedBy=timers.target

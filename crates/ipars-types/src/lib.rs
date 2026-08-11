@@ -3583,6 +3583,13 @@ pub mod api {
         pub registered_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NodePublicServicesBootstrapResponse {
+        pub node_id: NodeId,
+        pub expires_at: DateTime<Utc>,
+        pub install_script: String,
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SignalNodeAuthenticationResponse {
         pub node: NodeRecord,

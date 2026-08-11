@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly DEFAULT_INTERFACE="heteronetwork0"
 readonly DEFAULT_API_NAME="k8s-api.heteronetwork.internal"
 readonly DEFAULT_OVERLAY_DNS_ZONE="heteronetwork.internal"
@@ -904,6 +905,22 @@ ensure_agent_api_token() {
   unset token
 }
 
+install_public_services_bootstrap_autopilot() {
+  local helper="${SCRIPT_DIR}/public-services-bootstrap.sh"
+  local service="${SCRIPT_DIR}/../deploy/systemd/heteronetwork-public-services-bootstrap.service"
+  local timer="${SCRIPT_DIR}/../deploy/systemd/heteronetwork-public-services-bootstrap.timer"
+  [[ -f "$helper" && -f "$service" && -f "$timer" ]] \
+    || die "automatic public-services bootstrap files are missing from the checkout"
+  install -D -o root -g root -m 0755 "$helper" \
+    /opt/heteronetwork/libexec/public-services-bootstrap.sh
+  install -D -o root -g root -m 0644 "$service" \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.service
+  install -D -o root -g root -m 0644 "$timer" \
+    /etc/systemd/system/heteronetwork-public-services-bootstrap.timer
+  systemctl daemon-reload
+  systemctl enable heteronetwork-public-services-bootstrap.timer >/dev/null
+}
+
 kubernetes_versions_are_aligned() {
   local expected_minor="$1"
   local kubeadm_version="$2"
@@ -974,6 +991,7 @@ prepare_host() {
   configure_kubelet
   configure_local_state
   ensure_agent_api_token
+  install_public_services_bootstrap_autopilot
   verify_host
 }
 
