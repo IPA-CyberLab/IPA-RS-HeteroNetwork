@@ -29,15 +29,15 @@ use ipars_route_manager::{
 use ipars_route_manager::{ManagedRoute, ManagedRouteInventory};
 use ipars_stun::{StunError, UdpStunProbe};
 use ipars_types::api::{
-    packet_flow_destination_drop_reason, AgentManagedProcessState, AgentManagedProcessStatus,
-    AgentMetricsResponse, AgentPacketFlowApplication, AgentPacketFlowApplicationCount,
-    AgentPacketFlowClassification, AgentPacketFlowClassificationCount, AgentPacketFlowDropReason,
-    AgentPacketFlowDropReasonCount, AgentPacketFlowDuplicateSource,
-    AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch, AgentPacketFlowMatchKind,
-    AgentPacketFlowObservation, AgentPathProbeRequest, AgentRelayAdmissionFailureReason,
-    AgentRelayAdmissionFailureReasonCount, AgentRelayForwarderMetrics, AgentStatusResponse,
-    LazyConnectMetrics, PathStateCount, PeerMap, RemoveNodeRequest, RotateWireGuardKeyRequest,
-    SignalHolePunchPlanResponse,
+    packet_flow_destination_drop_reason, AgentBuildInfo, AgentManagedProcessState,
+    AgentManagedProcessStatus, AgentMetricsResponse, AgentPacketFlowApplication,
+    AgentPacketFlowApplicationCount, AgentPacketFlowClassification,
+    AgentPacketFlowClassificationCount, AgentPacketFlowDropReason, AgentPacketFlowDropReasonCount,
+    AgentPacketFlowDuplicateSource, AgentPacketFlowDuplicateSourceCount, AgentPacketFlowMatch,
+    AgentPacketFlowMatchKind, AgentPacketFlowObservation, AgentPathProbeRequest,
+    AgentRelayAdmissionFailureReason, AgentRelayAdmissionFailureReasonCount,
+    AgentRelayForwarderMetrics, AgentStatusResponse, LazyConnectMetrics, PathStateCount, PeerMap,
+    RemoveNodeRequest, RotateWireGuardKeyRequest, SignalHolePunchPlanResponse,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
@@ -65,6 +65,22 @@ use netlink_packet_wireguard::{
 };
 #[cfg(target_os = "linux")]
 use rtnetlink::{LinkUnspec, LinkWireguard};
+
+const AGENT_BUILD_VERSION: &str = match option_env!("HETERONETWORK_BUILD_VERSION") {
+    Some(value) if !value.is_empty() => value,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+const AGENT_BUILD_HASH: &str = match option_env!("HETERONETWORK_BUILD_HASH") {
+    Some(value) if !value.is_empty() => value,
+    _ => "dev",
+};
+
+fn current_agent_build_info() -> AgentBuildInfo {
+    AgentBuildInfo {
+        version: AGENT_BUILD_VERSION.to_string(),
+        commit: AGENT_BUILD_HASH.chars().take(7).collect(),
+    }
+}
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
 const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2199,6 +2215,7 @@ impl AgentRuntime {
             candidates,
             nat_classification,
             userspace_wireguard_process,
+            build: Some(current_agent_build_info()),
             state_updated_at: state.updated_at,
         }
     }

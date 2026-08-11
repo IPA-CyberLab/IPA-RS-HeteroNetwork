@@ -5762,6 +5762,7 @@ where
             health: plane.health_for_node(&node.node_id).await?,
             nat_classification,
             public_ips: public_ips.into_iter().collect(),
+            agent_build: plane.agent_build_for_node(&node.node_id).await,
             node,
         });
     }
@@ -11603,6 +11604,7 @@ exit 47
                 service_advertisement: Some(ipars_types::api::NodeServiceAdvertisement {
                     hostname: Some("uc-k8sp3".to_string()),
                     endpoints: Vec::new(),
+                    agent_build: None,
                 }),
                 path_state: Vec::new(),
                 nat_classification: Some(updated),

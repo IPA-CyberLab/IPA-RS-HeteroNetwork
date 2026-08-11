@@ -2996,6 +2996,8 @@ pub mod api {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub hostname: Option<String>,
         pub endpoints: Vec<BootstrapEndpoint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_build: Option<AgentBuildInfo>,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3393,6 +3395,8 @@ pub mod api {
         pub nat_classification: Option<NatClassification>,
         #[serde(default)]
         pub public_ips: Vec<IpAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_build: Option<AgentBuildInfo>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3758,6 +3762,12 @@ pub mod api {
         pub right_addr: SocketAddr,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AgentBuildInfo {
+        pub version: String,
+        pub commit: String,
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct AgentStatusResponse {
         pub node_id: NodeId,
@@ -3770,6 +3780,8 @@ pub mod api {
         pub nat_classification: Option<NatClassification>,
         #[serde(default)]
         pub userspace_wireguard_process: Option<AgentManagedProcessStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub build: Option<AgentBuildInfo>,
         pub state_updated_at: DateTime<Utc>,
     }
 

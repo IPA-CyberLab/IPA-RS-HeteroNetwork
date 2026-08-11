@@ -1,12 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  agentBuild,
   connectivity,
   nodeDisplayName,
   pathState,
   shortId,
   topologyMermaid,
 } from "./utils.js";
+
+test("agent build metadata is normalized for node views", () => {
+  assert.deepEqual(agentBuild({ agent_build: { version: "0.1.0", commit: "abc1234" } }), {
+    version: "0.1.0",
+    commit: "abc1234",
+  });
+  assert.equal(agentBuild({}), null);
+});
 
 test("node and path presentation helpers normalize API values", () => {
   assert.equal(shortId("node-abcdefghijklmnopqrstuvwxyz").includes("…"), true);

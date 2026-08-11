@@ -11,6 +11,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ResourceTable, Status } from "../components.jsx";
 import {
   age,
+  agentBuild,
   connectivity,
   formatDateTime,
   nodeDisplayName,
@@ -124,6 +125,25 @@ export function NodesPage({ overview, onOpenNode }) {
         ),
       },
       {
+        id: "agentBuild",
+        header: "展開バージョン",
+        cell: (entry) => {
+          const build = agentBuild(entry);
+          return build ? (
+            <SpaceBetween size="xxs">
+              <Box>{build.version}</Box>
+              <Box variant="code">{build.commit}</Box>
+            </SpaceBetween>
+          ) : (
+            "未報告"
+          );
+        },
+        sortingComparator: (a, b) =>
+          `${agentBuild(a)?.version || ""}-${agentBuild(a)?.commit || ""}`.localeCompare(
+            `${agentBuild(b)?.version || ""}-${agentBuild(b)?.commit || ""}`,
+          ),
+      },
+      {
         id: "role",
         header: "ロール",
         cell: (entry) => <Badge>{pretty(entry.node?.role)}</Badge>,
@@ -189,6 +209,8 @@ export function NodesPage({ overview, onOpenNode }) {
           entry.node?.role,
           ...(entry.node?.tags || []),
           entry.health?.state,
+          entry.agent_build?.version,
+          entry.agent_build?.commit,
         ].join(" ")
       }
       emptyTitle="登録済みノードがありません"
@@ -218,6 +240,7 @@ export function NodeDetailModal({
   const node = entry?.node || {};
   const health = entry?.health || {};
   const info = connectivity(entry);
+  const build = agentBuild(entry);
   const routes = node.routes || [];
   const trimmedDisplayName = displayName.trim();
   const displayNameValid = validNodeDisplayName(trimmedDisplayName);
@@ -353,6 +376,11 @@ export function NodeDetailModal({
             },
             { label: "登録日時", value: formatDateTime(node.registered_at) },
             { label: "最終確認", value: formatDateTime(health.last_seen_at) },
+            { label: "エージェントバージョン", value: build?.version || "未報告" },
+            {
+              label: "エージェントハッシュ",
+              value: build ? <Box variant="code">{build.commit}</Box> : "未報告",
+            },
             {
               label: "タグ",
               value: (node.tags || []).join(", ") || "-",

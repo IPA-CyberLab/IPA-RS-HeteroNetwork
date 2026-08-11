@@ -973,6 +973,7 @@ mod tests {
                     kind: BootstrapEndpointKind::Stun,
                     url: "udp://203.0.113.10:19444".to_string(),
                 }],
+                agent_build: None,
             }),
             path_state: Vec::new(),
             node_signature: None,

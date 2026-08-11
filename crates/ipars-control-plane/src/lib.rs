@@ -22,18 +22,18 @@ use ipars_crypto::{
     verify_wireguard_key_rotation_signature, CryptoError,
 };
 use ipars_types::api::{
-    ClientControlRequest, ClientGatewaySelection, ClientRequestKind, ControlPlaneMetricsResponse,
-    ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind, ControlPlaneNodeQueryRequest,
-    ControlPlanePathsResponse, ControlPlaneTopologyEdge, ControlPlaneTopologyEdgeKind,
-    ControlPlaneTopologyEdgePlacement, ControlPlaneTopologyEdgeStatus, ControlPlaneTopologyGroup,
-    ControlPlaneTopologyNode, ControlPlaneTopologyRepresentative,
-    ControlPlaneTopologyRepresentativeAssignment, ControlPlaneTopologyResponse, HeartbeatRequest,
-    HeartbeatResponse, NatTraversalStrategyCount, PathStateCount, PeerConnectionIntent, PeerMap,
-    RegisterClientRequest, RegisterClientResponse, RegisterNodeRequest, RegisterNodeResponse,
-    RelayMap, RemoveClientResponse, RemoveNodeRequest, RemoveNodeResponse, RevokeTokenRequest,
-    RotateWireGuardKeyRequest, RotateWireGuardKeyResponse, SignalNodeUpsertRequest,
-    SponsoredClientRegistrationRequest, CLIENT_REGISTRATION_SCHEMA_VERSION,
-    MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS,
+    AgentBuildInfo, ClientControlRequest, ClientGatewaySelection, ClientRequestKind,
+    ControlPlaneMetricsResponse, ControlPlaneNatDiscoveryOverview, ControlPlaneNodeQueryKind,
+    ControlPlaneNodeQueryRequest, ControlPlanePathsResponse, ControlPlaneTopologyEdge,
+    ControlPlaneTopologyEdgeKind, ControlPlaneTopologyEdgePlacement,
+    ControlPlaneTopologyEdgeStatus, ControlPlaneTopologyGroup, ControlPlaneTopologyNode,
+    ControlPlaneTopologyRepresentative, ControlPlaneTopologyRepresentativeAssignment,
+    ControlPlaneTopologyResponse, HeartbeatRequest, HeartbeatResponse, NatTraversalStrategyCount,
+    PathStateCount, PeerConnectionIntent, PeerMap, RegisterClientRequest, RegisterClientResponse,
+    RegisterNodeRequest, RegisterNodeResponse, RelayMap, RemoveClientResponse, RemoveNodeRequest,
+    RemoveNodeResponse, RevokeTokenRequest, RotateWireGuardKeyRequest, RotateWireGuardKeyResponse,
+    SignalNodeUpsertRequest, SponsoredClientRegistrationRequest,
+    CLIENT_REGISTRATION_SCHEMA_VERSION, MAX_CLIENT_REGISTRATION_VALIDITY_SECONDS,
 };
 use ipars_types::{
     bootstrap_endpoints_include_core_services, canonical_bootstrap_endpoint_url,
@@ -1865,6 +1865,7 @@ pub struct ControlPlane<S> {
     operation_metrics: ControlPlaneOperationMetrics,
     admin_path_pins: RwLock<BTreeMap<(NodeId, NodeId), bool>>,
     connection_intent_notifiers: Mutex<BTreeMap<NodeId, Arc<Notify>>>,
+    agent_builds: RwLock<BTreeMap<NodeId, AgentBuildInfo>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1940,6 +1941,7 @@ where
             overlay_topology_cache: Mutex::new(BTreeMap::new()),
             admin_path_pins: RwLock::new(BTreeMap::new()),
             connection_intent_notifiers: Mutex::new(BTreeMap::new()),
+            agent_builds: RwLock::new(BTreeMap::new()),
             config,
             store,
         }
@@ -2410,6 +2412,10 @@ where
         self.store.get_health(node_id).await
     }
 
+    pub async fn agent_build_for_node(&self, node_id: &NodeId) -> Option<AgentBuildInfo> {
+        self.agent_builds.read().await.get(node_id).cloned()
+    }
+
     pub async fn nat_classification_for(
         &self,
         node_id: &NodeId,
@@ -2482,6 +2488,7 @@ where
         node_id: &NodeId,
     ) -> Result<RemoveNodeResponse, ControlPlaneError> {
         let result = self.store.remove_node(node_id).await?;
+        self.agent_builds.write().await.remove(node_id);
         self.invalidate_overlay_node_snapshot().await;
         self.admin_path_pins
             .write()
@@ -3852,6 +3859,7 @@ where
         }
         self.validate_remove_node_request(&request, &node, Utc::now())?;
         let removed = self.store.remove_node(&request.node_id).await?;
+        self.agent_builds.write().await.remove(&request.node_id);
         self.invalidate_overlay_node_snapshot().await;
         *self.allocator.write().await = VpnAllocator::new(self.config.vpn_pool);
         Ok(RemoveNodeResponse {
@@ -4028,6 +4036,10 @@ where
             .get_heartbeat_signature_timestamp(&request.node_id)
             .await?;
         let now = Utc::now();
+        let agent_build = request
+            .service_advertisement
+            .as_ref()
+            .and_then(|advertisement| advertisement.agent_build.clone());
         self.validate_heartbeat_request(&request, &node, &policy, previous_signature_at, now)?;
         let heartbeat_service_instance =
             heartbeat_service_instance(&request, &node, &self.config.cluster_id, now)?;
@@ -4156,6 +4168,12 @@ where
                 paths: request.path_state,
             })
             .await?;
+        if let Some(agent_build) = agent_build {
+            self.agent_builds
+                .write()
+                .await
+                .insert(request_node_id.clone(), agent_build);
+        }
         if let Some(instance) = heartbeat_service_instance {
             self.advertise_service_instance(instance).await?;
         }
@@ -4468,6 +4486,20 @@ where
             node_id: request.node_id.clone(),
             reason,
         })?;
+        if let Some(build) = request
+            .service_advertisement
+            .as_ref()
+            .and_then(|advertisement| advertisement.agent_build.as_ref())
+        {
+            if !valid_agent_build_field(&build.version, 128)
+                || !valid_agent_build_field(&build.commit, 64)
+            {
+                return Err(ControlPlaneError::NodeUpdateRejected {
+                    node_id: request.node_id.clone(),
+                    reason: "agent build metadata is invalid".to_string(),
+                });
+            }
+        }
         if let Some(classification) = request.nat_classification.as_ref() {
             validate_nat_classification_shape(
                 &request.node_id,
@@ -6270,6 +6302,12 @@ fn timestamp_not_after_skew(
         return false;
     };
     timestamp <= now + max_skew
+}
+
+fn valid_agent_build_field(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().all(|byte| !byte.is_ascii_control())
 }
 
 fn validate_node_health_shape(
@@ -12891,6 +12929,10 @@ mod tests {
                                 url: format!("udp://{relay_addr}"),
                             },
                         ],
+                        agent_build: Some(AgentBuildInfo {
+                            version: "0.1.0".to_string(),
+                            commit: "abc1234".to_string(),
+                        }),
                     }),
                     path_state: Vec::new(),
                     node_signature: None,
@@ -12906,6 +12948,13 @@ mod tests {
             heartbeat_service_instance_id(&node_id("service-node"))
         );
         assert_eq!(directory.instances[0].endpoints.len(), 3);
+        assert_eq!(
+            plane.agent_build_for_node(&node_id("service-node")).await,
+            Some(AgentBuildInfo {
+                version: "0.1.0".to_string(),
+                commit: "abc1234".to_string(),
+            })
+        );
         assert_eq!(
             plane
                 .list_nodes()
@@ -12932,6 +12981,7 @@ mod tests {
                             kind: BootstrapEndpointKind::Signal,
                             url: "http://100.64.0.2:19443".to_string(),
                         }],
+                        agent_build: None,
                     }),
                     path_state: Vec::new(),
                     node_signature: None,
@@ -12961,6 +13011,7 @@ mod tests {
                             kind: BootstrapEndpointKind::Stun,
                             url: "udp://1.1.1.1:19444".to_string(),
                         }],
+                        agent_build: None,
                     }),
                     path_state: Vec::new(),
                     node_signature: None,

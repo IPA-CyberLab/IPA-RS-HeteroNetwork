@@ -14897,6 +14897,7 @@ async fn heartbeat_request(
         advertised_signal_url,
         advertised_stun_url,
         relay_capability.as_ref(),
+        status.build.as_ref(),
     )?;
     let mut request = HeartbeatRequest {
         node_id: status.node_id,
@@ -14922,6 +14923,7 @@ fn heartbeat_service_advertisement(
     advertised_signal_url: Option<&str>,
     advertised_stun_url: Option<&str>,
     relay_capability: Option<&RelayCapability>,
+    agent_build: Option<&ipars_types::api::AgentBuildInfo>,
 ) -> anyhow::Result<Option<NodeServiceAdvertisement>> {
     let mut endpoints = Vec::new();
     if let Some(url) = advertised_signal_url {
@@ -14949,7 +14951,7 @@ fn heartbeat_service_advertisement(
             url: format!("udp://{public_endpoint}"),
         });
     }
-    if endpoints.is_empty() && hostname.is_none() {
+    if endpoints.is_empty() && hostname.is_none() && agent_build.is_none() {
         return Ok(None);
     }
     validate_join_token_bootstrap_endpoints(&endpoints)
@@ -14957,6 +14959,7 @@ fn heartbeat_service_advertisement(
     Ok(Some(NodeServiceAdvertisement {
         hostname,
         endpoints,
+        agent_build: agent_build.cloned(),
     }))
 }
 
@@ -22264,6 +22267,7 @@ mod tests {
             candidates,
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         }
     }
@@ -37962,6 +37966,7 @@ exec sleep 60
             ],
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         };
         let mut peer_record = node_record("peer-a");
@@ -38012,6 +38017,7 @@ exec sleep 60
             }],
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         };
         let mut peer_record = node_record("node-a");
@@ -38523,6 +38529,7 @@ exec sleep 60
             }],
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");
@@ -38650,6 +38657,7 @@ exec sleep 60
             }],
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");
@@ -39190,6 +39198,7 @@ exec sleep 60
             }],
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         };
         let mut peer = node_record("peer-a");
@@ -40317,7 +40326,7 @@ exec sleep 60
             e2e_only: true,
         };
 
-        let advertisement = heartbeat_service_advertisement(None, None, None, Some(&relay))?
+        let advertisement = heartbeat_service_advertisement(None, None, None, Some(&relay), None)?
             .context("healthy Relay should be advertised")?;
 
         assert_eq!(

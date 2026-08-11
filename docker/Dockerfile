@@ -3,6 +3,10 @@
 FROM rust:1.88-bookworm AS build
 WORKDIR /src
 COPY . .
+ARG HETERONETWORK_BUILD_VERSION=0.1.0
+ARG HETERONETWORK_BUILD_HASH=unknown
+ENV HETERONETWORK_BUILD_VERSION=${HETERONETWORK_BUILD_VERSION}
+ENV HETERONETWORK_BUILD_HASH=${HETERONETWORK_BUILD_HASH}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \

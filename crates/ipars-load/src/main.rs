@@ -11887,6 +11887,7 @@ ipars_relay_datagrams_dropped_by_reason_total{relay_node="relay-a",reason="unkno
                 candidates: response.node.endpoint_candidates,
                 nat_classification: None,
                 userspace_wireguard_process: None,
+                build: None,
                 state_updated_at: Utc::now(),
             });
         }
@@ -12877,6 +12878,7 @@ fi
             candidates,
             nat_classification: None,
             userspace_wireguard_process: None,
+            build: None,
             state_updated_at: Utc::now(),
         }
     }

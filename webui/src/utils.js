@@ -10,6 +10,15 @@ export function nodeDisplayName(value) {
   return displayName || hostname || shortId(node.node_id);
 }
 
+export function agentBuild(value) {
+  const build = value?.agent_build || value?.build;
+  if (!build?.version && !build?.commit) return null;
+  return {
+    version: String(build.version || "不明"),
+    commit: String(build.commit || "不明"),
+  };
+}
+
 export function formatDateTime(value) {
   if (!value) return "-";
   const date = new Date(value);

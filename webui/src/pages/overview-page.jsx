@@ -9,6 +9,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import { ResourceTable, Status } from "../components.jsx";
 import {
   age,
+  agentBuild,
   connectivity,
   nodeDisplayName,
   pathLabels,
@@ -109,6 +110,14 @@ export function OverviewPage({ overview, onNavigate, onOpenNode }) {
           {entry.health?.state === "healthy" ? "正常" : "要確認"}
         </Status>
       ),
+    },
+    {
+      id: "agentBuild",
+      header: "展開バージョン",
+      cell: (entry) => {
+        const build = agentBuild(entry);
+        return build ? `${build.version} / ${build.commit}` : "未報告";
+      },
     },
     {
       id: "connectivity",
