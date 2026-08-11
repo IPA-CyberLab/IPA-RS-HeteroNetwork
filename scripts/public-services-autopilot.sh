@@ -54,6 +54,7 @@ control_plane_drop_in_dir=$filesystem_root/etc/systemd/system/heteronetwork-cont
 control_plane_enrollment_drop_in=$control_plane_drop_in_dir/40-node-enrollment.conf
 node_enrollment_issuer_key=$filesystem_root/etc/credstore/node-enrollment-issuer.key
 node_enrollment_relay_token=$filesystem_root/etc/heteronetwork/agent-relay-admission.token
+node_enrollment_cli_binary=$filesystem_root/opt/heteronetwork/bin/ipars
 runtime_dir=$filesystem_root/run/heteronetwork-public-services-autopilot
 nat_loss_started_file=$runtime_dir/nat-classification-loss-started
 
@@ -563,6 +564,12 @@ detect_node_enrollment_credentials() {
       ;;
   esac
   enrollment_relay_token=
+  if [ ! -f "$node_enrollment_cli_binary" ] ||
+    [ -L "$node_enrollment_cli_binary" ] ||
+    [ ! -x "$node_enrollment_cli_binary" ]; then
+    log "node enrollment remains disabled without an executable CLI binary"
+    return 0
+  fi
   node_enrollment_enabled=1
 }
 

@@ -155,6 +155,7 @@ legacy_agent_drop_in=$test_root/root/etc/systemd/system/heteronetwork-agent.serv
 control_plane_enrollment_drop_in=$test_root/root/etc/systemd/system/heteronetwork-control-plane.service.d/40-node-enrollment.conf
 node_enrollment_issuer_key=$test_root/root/etc/credstore/node-enrollment-issuer.key
 node_enrollment_relay_token=$test_root/root/etc/heteronetwork/agent-relay-admission.token
+node_enrollment_cli_binary=$test_root/root/opt/heteronetwork/bin/ipars
 
 b64() {
   printf '%s' "$1" | base64 | tr -d '\r\n'
@@ -194,6 +195,9 @@ mkdir -p "$(dirname "$node_enrollment_issuer_key")" \
 printf '%s\n' "$enrollment_private_key" >"$node_enrollment_issuer_key"
 printf '%s\n' "$enrollment_relay_token" >"$node_enrollment_relay_token"
 chmod 0400 "$node_enrollment_issuer_key" "$node_enrollment_relay_token"
+mkdir -p "$(dirname "$node_enrollment_cli_binary")"
+printf '%s\n' 'test-ipars-cli' >"$node_enrollment_cli_binary"
+chmod 0755 "$node_enrollment_cli_binary"
 
 write_status() {
   status_state=$1
@@ -618,6 +622,20 @@ grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="true"' "$services_env" ||
   fail "automatic Control Plane did not restore enrollment after signer provisioning"
 [ -f "$control_plane_enrollment_drop_in" ] ||
   fail "enrollment credential drop-in was not restored"
+
+rm -f "$node_enrollment_cli_binary"
+run_reconciler
+grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="false"' "$services_env" ||
+  fail "automatic Control Plane retained enrollment without its CLI binary"
+[ ! -e "$control_plane_enrollment_drop_in" ] ||
+  fail "enrollment credential drop-in survived CLI removal"
+printf '%s\n' 'test-ipars-cli' >"$node_enrollment_cli_binary"
+chmod 0755 "$node_enrollment_cli_binary"
+run_reconciler
+grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="true"' "$services_env" ||
+  fail "automatic Control Plane did not restore enrollment after CLI provisioning"
+[ -f "$control_plane_enrollment_drop_in" ] ||
+  fail "enrollment credential drop-in was not restored after CLI provisioning"
 
 sed -i \
   's/^HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=.*/HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/' \
