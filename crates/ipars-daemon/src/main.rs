@@ -160,6 +160,7 @@ const DEFAULT_PUBLIC_STUN_URLS: [&str; 2] = [
     "udp://stun.cloudflare.com:53",
 ];
 const OVERLAY_WEB_UI_DNS_NAME: &str = "console.heteronetwork.internal";
+const OVERLAY_GRAFANA_DNS_NAME: &str = "grafana.heteronetwork.internal";
 const OVERLAY_DNS_SUFFIX: &str = ".heteronetwork.internal";
 const DEFAULT_OVERLAY_DNS_RECORDS_PATH: &str = "/var/lib/heteronetwork/overlay-dns-records.json";
 const OVERLAY_SERVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -5728,19 +5729,33 @@ fn overlay_dns_response(
         .to_ascii()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let addresses = if query_name == OVERLAY_WEB_UI_DNS_NAME {
+    let addresses: Vec<IpAddr> = if query_name == OVERLAY_WEB_UI_DNS_NAME {
         // The Mac/Windows tunnel sends split-DNS queries to its active gateway.
         // Return that gateway's own VPN address so the UI never resolves to a
         // different lazy-connect branch that the client cannot currently route.
-        std::slice::from_ref(&answer_ip)
+        vec![answer_ip]
+    } else if query_name == OVERLAY_GRAFANA_DNS_NAME {
+        let Some(configured) = zone.records.get(&query_name) else {
+            response.metadata.response_code = ResponseCode::NXDomain;
+            return response.to_vec().context("failed to encode DNS response");
+        };
+        // Grafana is host-networked on its eligible nodes. Prefer the local
+        // endpoint so a lazy-connect gateway does not send clients down a
+        // different branch; use the first configured endpoint for gateways
+        // without a local Grafana replica.
+        if configured.contains(&answer_ip) {
+            vec![answer_ip]
+        } else {
+            vec![configured[0]]
+        }
     } else if let Some(addresses) = zone.records.get(&query_name) {
-        addresses.as_slice()
+        addresses.clone()
     } else {
         response.metadata.response_code = ResponseCode::NXDomain;
         return response.to_vec().context("failed to encode DNS response");
     };
 
-    for address in addresses {
+    for address in &addresses {
         let rdata = match (query.query_type, address) {
             (RecordType::A | RecordType::ANY, IpAddr::V4(ip)) => Some(RData::A((*ip).into())),
             (RecordType::AAAA | RecordType::ANY, IpAddr::V6(ip)) => Some(RData::AAAA((*ip).into())),
@@ -22315,9 +22330,10 @@ mod tests {
                         "10.250.0.6"
                     ],
                     "grafana.heteronetwork.internal": [
-                        "10.250.0.4",
+                        "10.250.0.10",
                         "10.250.0.5",
-                        "10.250.0.6"
+                        "10.250.0.6",
+                        "10.250.0.8"
                     ],
                     "ipv6.heteronetwork.internal": ["fd00::1"]
                 }
@@ -22359,12 +22375,12 @@ mod tests {
         ));
         let response = overlay_dns_response(
             &configured.to_vec()?,
-            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 7)),
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 5)),
             &zone,
         )?;
         let response = DnsMessage::from_vec(&response)?;
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(response.answers.len(), 3);
+        assert_eq!(response.answers.len(), 1);
         assert_eq!(
             response
                 .answers
@@ -22374,11 +22390,26 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![
-                Ipv4Addr::new(10, 250, 0, 4),
-                Ipv4Addr::new(10, 250, 0, 5),
-                Ipv4Addr::new(10, 250, 0, 6),
-            ]
+            vec![Ipv4Addr::new(10, 250, 0, 5)]
+        );
+
+        let fallback_response = overlay_dns_response(
+            &configured.to_vec()?,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 4)),
+            &zone,
+        )?;
+        let fallback_response = DnsMessage::from_vec(&fallback_response)?;
+        assert_eq!(fallback_response.answers.len(), 1);
+        assert_eq!(
+            fallback_response
+                .answers
+                .iter()
+                .filter_map(|answer| match answer.data {
+                    RData::A(value) => Some(value.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![Ipv4Addr::new(10, 250, 0, 10)]
         );
 
         let mut wrong_family = DnsMessage::query();

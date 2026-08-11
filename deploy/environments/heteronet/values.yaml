@@ -15,6 +15,11 @@ agent:
     # clients always connect to the gateway that currently carries their VPN.
     records:
       grafana.heteronetwork.internal:
+        # Grafana runs host-networked on these VPN nodes. The first address is
+        # the fallback for gateways that do not host a local Grafana replica.
+        - 10.250.0.10
+        - 10.250.0.2
+        - 10.250.0.3
         - 10.250.0.8
         - 10.250.0.5
         - 10.250.0.6
