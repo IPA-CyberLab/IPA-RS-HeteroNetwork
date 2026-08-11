@@ -15,7 +15,7 @@ agent:
     # clients always connect to the gateway that currently carries their VPN.
     records:
       grafana.heteronetwork.internal:
-        - 10.250.0.4
+        - 10.250.0.8
         - 10.250.0.5
         - 10.250.0.6
       prometheus.heteronetwork.internal:
