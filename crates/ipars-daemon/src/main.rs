@@ -5728,12 +5728,13 @@ fn overlay_dns_response(
         .to_ascii()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    let addresses = if let Some(addresses) = zone.records.get(&query_name) {
-        addresses.as_slice()
-    } else if query_name == OVERLAY_WEB_UI_DNS_NAME {
-        // Keep a useful single-node fallback for older deployments that do
-        // not yet carry the explicit HA console record.
+    let addresses = if query_name == OVERLAY_WEB_UI_DNS_NAME {
+        // The Mac/Windows tunnel sends split-DNS queries to its active gateway.
+        // Return that gateway's own VPN address so the UI never resolves to a
+        // different lazy-connect branch that the client cannot currently route.
         std::slice::from_ref(&answer_ip)
+    } else if let Some(addresses) = zone.records.get(&query_name) {
+        addresses.as_slice()
     } else {
         response.metadata.response_code = ResponseCode::NXDomain;
         return response.to_vec().context("failed to encode DNS response");
@@ -22334,7 +22335,7 @@ mod tests {
         )?;
         let response = DnsMessage::from_vec(&response)?;
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(response.answers.len(), 3);
+        assert_eq!(response.answers.len(), 1);
         assert_eq!(
             response
                 .answers
@@ -22344,11 +22345,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![
-                Ipv4Addr::new(10, 250, 0, 4),
-                Ipv4Addr::new(10, 250, 0, 5),
-                Ipv4Addr::new(10, 250, 0, 6),
-            ]
+            vec![Ipv4Addr::new(10, 250, 0, 7)]
         );
         assert!(response
             .answers

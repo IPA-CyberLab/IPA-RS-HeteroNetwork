@@ -11,10 +11,9 @@ agent:
 
   overlayDns:
     enabled: true
+    # The console name is synthesized by each gateway's split-DNS listener so
+    # clients always connect to the gateway that currently carries their VPN.
     records:
-      console.heteronetwork.internal:
-        - 10.250.0.5
-        - 10.250.0.6
       grafana.heteronetwork.internal:
         - 10.250.0.4
         - 10.250.0.5
