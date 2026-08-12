@@ -209,3 +209,36 @@ services before testing another node.
 
 Do not stop two stacked-etcd members at once. A three-member etcd cluster only
 tolerates one failed member.
+
+## Expand an existing cluster to five control planes
+
+Use an odd-sized etcd membership. To promote two existing workers, first set the
+same five-address backend list on every Kubernetes host and reconcile the local
+HAProxy and split-DNS configuration:
+
+```bash
+export HETERONETWORK_KUBEADM_NODE_IP=<this-node-vpn-ip>
+export HETERONETWORK_KUBEADM_NODE_NAME=<this-node-name>
+export HETERONETWORK_KUBEADM_CONTROL_PLANES=10.250.0.6,10.250.0.8,10.250.0.10,10.250.0.4,10.250.0.5
+sudo -E scripts/kubeadm-ha-node.sh reconcile-control-plane-backends
+```
+
+Refresh and securely transfer a control-plane join bundle from a healthy
+control plane. Cordon and drain one target worker at a time, delete its stale
+Node object, then run the explicit promotion command on that host:
+
+```bash
+export HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER=1
+sudo -E scripts/kubeadm-ha-node.sh promote-control-plane
+```
+
+The command records an in-progress marker, preserves non-system Node labels,
+resets the worker kubeadm state, and rejoins it with a stacked etcd member. It
+also removes the control-plane scheduling taint and the external load-balancer
+exclusion label so the promoted worker keeps its previous workload role. It can
+be retried after a failed join and refuses to reset a worker unless the
+confirmation variable is set. Wait for the new API server and etcd member to
+become healthy before promoting the next worker. A five-member etcd cluster
+tolerates two failed members; a four-member intermediate state still tolerates
+only one. The local API proxy checks `/readyz`, so an API server whose local etcd
+is alive but unable to serve requests is removed from client traffic.

@@ -46,7 +46,10 @@ Commands:
   refresh-worker-join-bundle
                          Rotate worker-only kubeadm join credentials
   join-control-plane     Join this host as another stacked-etcd control-plane node
+  promote-control-plane  Reset an existing worker and rejoin it as a control plane
   join-worker            Join this host as a regular worker node
+  reconcile-control-plane-backends
+                         Update the local API proxy and split-DNS control-plane set
   install-flannel        Install pinned Flannel on the initialized cluster
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
@@ -73,6 +76,8 @@ Optional environment:
   HETERONETWORK_KUBEADM_AGENT_API_TOKEN_PATH
                                          Default: state-dir/agent-api-token
   HETERONETWORK_AGENT_STATE_PATH          Default: /var/lib/heteronetwork/agent.json
+  HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER
+                                         Must be 1 for promote-control-plane
 
 The join bundle contains credentials. Keep it root-owned with mode 0600 and transfer it
 over an authenticated channel. Commands do not print tokens or certificate keys.
@@ -272,8 +277,9 @@ frontend kubernetes_api
     default_backend kubernetes_control_planes
 
 backend kubernetes_control_planes
-    option tcp-check
-    default-server check inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
+    option httpchk GET /readyz
+    http-check expect status 200
+    default-server check check-ssl verify none inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
 EOF
   local backend backup preferred_backend
   if node_is_control_plane_backend; then
@@ -995,6 +1001,19 @@ prepare_host() {
   verify_host
 }
 
+reconcile_control_plane_backends() {
+  require_root
+  validate_common_config
+  verify_interface_address
+  require_command systemctl
+  configure_hosts_entry
+  configure_overlay_dns
+  configure_haproxy
+  configure_local_state
+  verify_host
+  printf 'control-plane backends reconciled for %s\n' "$node_name"
+}
+
 installed_kubernetes_version() {
   kubeadm version -o short | sed -nE 's/^(v[0-9]+\.[0-9]+\.[0-9]+).*$/\1/p'
 }
@@ -1149,6 +1168,87 @@ join_control_plane() {
   kubeadm join --config "$config"
   rm -f "$config"
   configure_root_kubeconfig
+}
+
+filter_preserved_node_labels() {
+  jq -ce '
+    .metadata.labels // {}
+    | with_entries(select(
+        .key
+        | test("^(kubernetes\\.io/|beta\\.kubernetes\\.io/|node\\.kubernetes\\.io/|node-role\\.kubernetes\\.io/)")
+        | not
+      ))
+  '
+}
+
+snapshot_promoted_node_labels() {
+  local destination="$1"
+  local labels
+  labels="$(
+    kubectl \
+      --kubeconfig /etc/kubernetes/kubelet.conf \
+      --request-timeout=30s \
+      get node "$node_name" -o json \
+      | filter_preserved_node_labels
+  )" || die "failed to preserve labels from worker $node_name"
+  printf '%s\n' "$labels" | install_from_stdin "$destination" 0600
+}
+
+restore_promoted_node_labels() {
+  local source="$1"
+  local patch
+  if [[ -e "$source" ]]; then
+    [[ -f "$source" && ! -L "$source" ]] \
+      || die "preserved worker labels are not a regular file"
+    patch="$(jq -cn --slurpfile labels "$source" '{metadata: {labels: $labels[0]}}')"
+    kubectl --kubeconfig /etc/kubernetes/admin.conf \
+      patch node "$node_name" --type=merge --patch "$patch" >/dev/null
+  fi
+  kubectl --kubeconfig /etc/kubernetes/admin.conf \
+    label node "$node_name" node.kubernetes.io/exclude-from-external-load-balancers- \
+    >/dev/null 2>&1 || true
+  kubectl --kubeconfig /etc/kubernetes/admin.conf \
+    taint node "$node_name" node-role.kubernetes.io/control-plane- \
+    >/dev/null 2>&1 || true
+}
+
+promote_control_plane() {
+  require_root
+  validate_control_plane_config
+  verify_interface_address
+  require_command kubeadm
+  ensure_agent_api_token
+  [[ -f "$state_dir/node.env" ]] || die "run prepare before promote-control-plane"
+  local marker="$state_dir/control-plane-promotion.in-progress"
+  local preserved_labels="$state_dir/control-plane-promotion-labels.json"
+  if [[ -f /etc/kubernetes/admin.conf && ! -e "$marker" ]]; then
+    configure_root_kubeconfig
+    printf 'control plane is already joined\n'
+    return
+  fi
+  [[ "${HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER:-}" == "1" ]] \
+    || die "set HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER=1 after draining this worker"
+
+  if [[ ! -e "$marker" ]]; then
+    [[ -f /etc/kubernetes/kubelet.conf ]] \
+      || die "this host is not an existing Kubernetes worker"
+    require_command kubectl
+    require_command jq
+    snapshot_promoted_node_labels "$preserved_labels"
+    printf 'promotion requested for %s\n' "$node_name" \
+      | install_from_stdin "$marker" 0600
+  else
+    [[ -f "$marker" && ! -L "$marker" ]] \
+      || die "control-plane promotion marker is not a regular file"
+  fi
+
+  systemctl stop kubelet
+  kubeadm reset --force --cri-socket unix:///run/containerd/containerd.sock
+  join_control_plane
+  restore_promoted_node_labels "$preserved_labels"
+  rm -f "$marker"
+  rm -f "$preserved_labels"
+  printf 'worker %s promoted to a stacked-etcd control plane\n' "$node_name"
 }
 
 join_worker() {
@@ -1489,10 +1589,21 @@ self_test() {
   grep -Fq 'retries 2' <<<"$rendered"
   grep -Fq 'timeout connect 5s' <<<"$rendered"
   grep -Fq 'timeout check 5s' <<<"$rendered"
+  grep -Fxq '    option httpchk GET /readyz' <<<"$rendered"
+  grep -Fxq '    http-check expect status 200' <<<"$rendered"
+  grep -Fq 'default-server check check-ssl verify none' <<<"$rendered"
   grep -Fq 'fall 2 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
   grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3,10.250.0.4,10.250.0.5"
+  rendered="$(render_haproxy_config)"
+  [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "5" ]]
+  grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
+  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "4" ]]
+  control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3"
+  rendered="$(filter_preserved_node_labels <<< '{"metadata":{"labels":{"kubernetes.io/hostname":"worker-a","beta.kubernetes.io/arch":"amd64","node.kubernetes.io/exclude-from-external-load-balancers":"","node-role.kubernetes.io/control-plane":"","database.heteronetwork.io/proxy-ready":"true","workload.heteronetwork.io/capacity-tier":"high"}}}')"
+  [[ "$rendered" == '{"database.heteronetwork.io/proxy-ready":"true","workload.heteronetwork.io/capacity-tier":"high"}' ]]
   rendered="$(render_haproxy_service)"
   grep -Fq 'ExecReload=/bin/kill -USR2 $MAINPID' <<<"$rendered"
   rendered="$(render_overlay_dns_helper)"
@@ -1615,7 +1726,9 @@ case "$command" in
   refresh-join-bundle) refresh_join_bundle ;;
   refresh-worker-join-bundle) refresh_worker_join_bundle ;;
   join-control-plane) join_control_plane ;;
+  promote-control-plane) promote_control_plane ;;
   join-worker) join_worker ;;
+  reconcile-control-plane-backends) reconcile_control_plane_backends ;;
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;
