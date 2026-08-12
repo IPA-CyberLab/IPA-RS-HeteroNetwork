@@ -17,6 +17,7 @@ readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
 readonly MIN_IPV4_MTU="576"
+readonly POD_CIDR_POLICY_PRIORITY="50"
 readonly FLANNEL_MANIFEST_SHA256="d078019743c5e0194ce965125fc80ef00af0c1661ec9e12396311f1cfec860a2"
 readonly FLANNEL_MANIFEST_URL="https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml"
 
@@ -53,6 +54,7 @@ Commands:
                          Update the local API proxy and split-DNS control-plane set
   reconcile-apiserver-etcd
                          Point the local API server at selected stacked-etcd members
+  reconcile-pod-routing Reconcile host-network traffic routing to the Flannel Pod CIDR
   install-flannel        Install pinned Flannel on the initialized cluster
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
@@ -361,6 +363,69 @@ render_kubelet_dropin() {
 [Unit]
 Wants=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
 After=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
+EOF
+}
+
+render_pod_cidr_routing_helper() {
+  cat <<'EOF'
+#!/bin/sh
+set -eu
+
+action="${1:-}"
+pod_cidr="${2:-}"
+priority="${3:-}"
+
+[ -n "$pod_cidr" ] || {
+  echo "missing Pod CIDR" >&2
+  exit 2
+}
+case "$priority" in
+  ''|*[!0-9]*)
+    echo "invalid policy-routing priority" >&2
+    exit 2
+    ;;
+esac
+
+remove_rule() {
+  while /usr/sbin/ip -4 rule delete \
+    priority "$priority" to "$pod_cidr" lookup main 2>/dev/null; do
+    :
+  done
+}
+
+case "$action" in
+  apply)
+    remove_rule
+    /usr/sbin/ip -4 rule add priority "$priority" to "$pod_cidr" lookup main
+    /usr/sbin/ip -4 route flush cache
+    ;;
+  remove)
+    remove_rule
+    /usr/sbin/ip -4 route flush cache
+    ;;
+  *)
+    echo "Usage: $0 apply|remove POD_CIDR PRIORITY" >&2
+    exit 2
+    ;;
+esac
+EOF
+}
+
+render_pod_cidr_routing_service() {
+  cat <<EOF
+[Unit]
+Description=HeteroNetwork Kubernetes Pod CIDR policy routing
+After=network-pre.target
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/kubernetes-pod-cidr-routing apply ${pod_cidr} ${POD_CIDR_POLICY_PRIORITY}
+ExecStop=/opt/heteronetwork/libexec/kubernetes-pod-cidr-routing remove ${pod_cidr} ${POD_CIDR_POLICY_PRIORITY}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
 }
 
@@ -876,6 +941,44 @@ EOF
   sysctl --system >/dev/null
 }
 
+verify_pod_cidr_policy_rule() {
+  ip -4 rule show | awk -v priority="${POD_CIDR_POLICY_PRIORITY}:" -v pod_cidr="$pod_cidr" '
+    $1 == priority {
+      for (field = 1; field < NF; field++) {
+        if ($field == "to" && $(field + 1) == pod_cidr && $(NF - 1) == "lookup" && $NF == "main") {
+          found = 1
+        }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' || die "Pod CIDR $pod_cidr is not pinned to the main routing table at priority $POD_CIDR_POLICY_PRIORITY"
+}
+
+configure_pod_cidr_routing() {
+  require_root
+  require_command ip
+  require_command systemctl
+  install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+  render_pod_cidr_routing_helper \
+    | install_from_stdin /opt/heteronetwork/libexec/kubernetes-pod-cidr-routing 0755
+  render_pod_cidr_routing_service \
+    | install_from_stdin /etc/systemd/system/heteronetwork-kubernetes-pod-routing.service 0644
+  systemctl daemon-reload
+  systemctl enable heteronetwork-kubernetes-pod-routing.service >/dev/null
+  systemctl restart heteronetwork-kubernetes-pod-routing.service
+  systemctl is-active --quiet heteronetwork-kubernetes-pod-routing.service \
+    || die "Kubernetes Pod CIDR policy routing did not become active"
+  verify_pod_cidr_policy_rule
+}
+
+reconcile_pod_cidr_routing() {
+  require_root
+  validate_common_config
+  configure_pod_cidr_routing
+  printf 'Pod CIDR policy routing reconciled for %s via main table priority %s\n' \
+    "$pod_cidr" "$POD_CIDR_POLICY_PRIORITY"
+}
+
 configure_haproxy() {
   render_haproxy_config | install_from_stdin "$state_dir/haproxy.cfg" 0644
   /usr/sbin/haproxy -c -f "$state_dir/haproxy.cfg" >/dev/null
@@ -1030,6 +1133,7 @@ prepare_host() {
   install -d -o root -g root -m 0700 "$state_dir"
   install_kubernetes_packages
   configure_kernel
+  configure_pod_cidr_routing
   configure_containerd
   configure_hosts_entry
   configure_overlay_dns
@@ -1049,6 +1153,7 @@ reconcile_control_plane_backends() {
   configure_hosts_entry
   configure_overlay_dns
   configure_haproxy
+  configure_pod_cidr_routing
   configure_local_state
   if [[ -n "$apiserver_etcd_backends" && -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
     reconcile_apiserver_etcd
@@ -1458,6 +1563,9 @@ verify_host() {
     [[ "$(sysctl -n net.ipv4.ip_forward)" == "1" ]] || die "IPv4 forwarding is disabled"
     [[ "$(sysctl -n net.bridge.bridge-nf-call-iptables)" == "1" ]] \
       || die "bridge netfilter is disabled"
+    systemctl is-active --quiet heteronetwork-kubernetes-pod-routing.service \
+      || die "Kubernetes Pod CIDR policy routing is inactive"
+    verify_pod_cidr_policy_rule
   fi
   printf 'host prerequisites verified for %s (%s on %s)\n' "$node_name" "$node_ip" "$interface"
 }
@@ -1718,6 +1826,12 @@ self_test() {
   grep -Fq 'BindsTo=heteronetwork-agent.service' <<<"$rendered"
   grep -Fq 'PartOf=heteronetwork-agent.service' <<<"$rendered"
   grep -Fq 'RemainAfterExit=yes' <<<"$rendered"
+  rendered="$(render_pod_cidr_routing_helper)"
+  grep -Fq 'ip -4 rule add priority "$priority" to "$pod_cidr" lookup main' <<<"$rendered"
+  rendered="$(render_pod_cidr_routing_service)"
+  grep -Fq 'Before=kubelet.service' <<<"$rendered"
+  grep -Fq 'apply 10.244.0.0/16 50' <<<"$rendered"
+  grep -Fq 'RemainAfterExit=yes' <<<"$rendered"
   rendered="$(render_init_config v1.36.1)"
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"
@@ -1833,6 +1947,7 @@ case "$command" in
   join-worker) join_worker ;;
   reconcile-control-plane-backends) reconcile_control_plane_backends ;;
   reconcile-apiserver-etcd) reconcile_apiserver_etcd ;;
+  reconcile-pod-routing) reconcile_pod_cidr_routing ;;
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;

@@ -94,7 +94,13 @@ sudo -E scripts/kubeadm-ha-node.sh prepare
 `prepare` installs Kubernetes from the signed `pkgs.k8s.io` v1.36 repository,
 configures containerd with the systemd cgroup driver and CRI enabled, loads
 `overlay` and `br_netfilter`, enables forwarding, and starts the dedicated API
-load balancer. It also enables `heteronetwork-overlay-dns.service`, which
+load balancer. It also enables
+`heteronetwork-kubernetes-pod-routing.service`. The service installs a
+destination-priority policy rule for the Pod CIDR before any interface-specific
+source rule, ensuring that host-network processes and NodeLocal DNS send
+DNATed Service traffic through Flannel instead of a site's physical LAN routing
+table. This is required on multi-homed nodes whose netplan configuration uses
+source-based routing. `prepare` also enables `heteronetwork-overlay-dns.service`, which
 idempotently registers `heteronetwork.internal` as a route-only domain on
 `heteronetwork0` with `systemd-resolved`. The service follows Agent restarts and
 removes its per-link resolver state when stopped. An existing Docker-provided
@@ -116,6 +122,16 @@ sudo -E scripts/kubeadm-ha-node.sh configure-overlay-dns
 The command preserves existing NSS databases, installs `libnss-resolve` when
 needed, and verifies the private console name through the normal host resolver.
 It is safe to rerun with the same inputs.
+
+To install or repair only the Pod CIDR policy rule on an existing Kubernetes
+node, use the same per-node environment as `prepare`:
+
+```bash
+sudo -E scripts/kubeadm-ha-node.sh reconcile-pod-routing
+```
+
+The command is idempotent and persists the rule through systemd. It is also run
+automatically by `reconcile-control-plane-backends`.
 
 Host swap remains available to non-Pod processes. kubelet uses
 `failSwapOn: false` with `NoSwap`, so Kubernetes workloads cannot consume it.
