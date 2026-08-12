@@ -5443,6 +5443,7 @@ fn start_overlay_web_ui(listen: SocketAddr, app: Router) -> tokio::task::JoinHan
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OverlayDnsZone {
     records: BTreeMap<String, Vec<IpAddr>>,
+    gateway_records: BTreeMap<String, BTreeMap<IpAddr, Vec<IpAddr>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5450,6 +5451,8 @@ struct OverlayDnsZone {
 struct OverlayDnsRecordsDocument {
     schema_version: u32,
     records: BTreeMap<String, Vec<IpAddr>>,
+    #[serde(default)]
+    gateway_records: BTreeMap<String, BTreeMap<String, Vec<IpAddr>>>,
 }
 
 fn parse_overlay_dns_zone(bytes: &[u8]) -> anyhow::Result<OverlayDnsZone> {
@@ -5504,7 +5507,63 @@ fn parse_overlay_dns_zone(bytes: &[u8]) -> anyhow::Result<OverlayDnsZone> {
             "overlay DNS name {name:?} is repeated after normalization"
         );
     }
-    Ok(OverlayDnsZone { records })
+
+    let mut gateway_records = BTreeMap::new();
+    anyhow::ensure!(
+        document.gateway_records.len() <= MAX_OVERLAY_DNS_NAMES,
+        "overlay DNS gateway records document exceeds the {MAX_OVERLAY_DNS_NAMES}-name limit"
+    );
+    for (raw_name, gateways) in document.gateway_records {
+        let name = raw_name.trim_end_matches('.').to_ascii_lowercase();
+        anyhow::ensure!(
+            records.contains_key(&name),
+            "overlay DNS gateway records name {raw_name:?} has no base record"
+        );
+        anyhow::ensure!(
+            !gateways.is_empty(),
+            "overlay DNS gateway records name {raw_name:?} must contain at least one gateway"
+        );
+        let mut normalized_gateways = BTreeMap::new();
+        for (raw_gateway, addresses) in gateways {
+            let gateway = raw_gateway.parse::<IpAddr>().with_context(|| {
+                format!("overlay DNS gateway address {raw_gateway:?} is invalid")
+            })?;
+            anyhow::ensure!(
+                !gateway.is_unspecified() && !gateway.is_loopback() && !gateway.is_multicast(),
+                "overlay DNS gateway address {gateway} is unusable"
+            );
+            anyhow::ensure!(
+                !addresses.is_empty()
+                    && addresses.len() <= MAX_OVERLAY_DNS_ADDRESSES_PER_NAME,
+                "overlay DNS gateway record {raw_name:?}/{gateway} must contain 1-{MAX_OVERLAY_DNS_ADDRESSES_PER_NAME} addresses"
+            );
+            let mut unique = BTreeSet::new();
+            for address in &addresses {
+                anyhow::ensure!(
+                    !address.is_unspecified() && !address.is_loopback() && !address.is_multicast(),
+                    "overlay DNS gateway record {raw_name:?}/{gateway} contains unusable address {address}"
+                );
+                anyhow::ensure!(
+                    unique.insert(*address),
+                    "overlay DNS gateway record {raw_name:?}/{gateway} repeats address {address}"
+                );
+            }
+            anyhow::ensure!(
+                normalized_gateways.insert(gateway, addresses).is_none(),
+                "overlay DNS gateway address {gateway} is repeated after normalization"
+            );
+        }
+        anyhow::ensure!(
+            gateway_records
+                .insert(name.clone(), normalized_gateways)
+                .is_none(),
+            "overlay DNS gateway record name {name:?} is repeated after normalization"
+        );
+    }
+    Ok(OverlayDnsZone {
+        records,
+        gateway_records,
+    })
 }
 
 async fn load_overlay_dns_zone(path: &Path) -> anyhow::Result<OverlayDnsZone> {
@@ -5739,15 +5798,18 @@ fn overlay_dns_response(
             response.metadata.response_code = ResponseCode::NXDomain;
             return response.to_vec().context("failed to encode DNS response");
         };
-        // Grafana is host-networked on its eligible nodes. Prefer the local
-        // endpoint so a lazy-connect gateway does not send clients down a
-        // different branch; use the first configured endpoint for gateways
-        // without a local Grafana replica.
-        if configured.contains(&answer_ip) {
-            vec![answer_ip]
-        } else {
-            vec![configured[0]]
-        }
+        // LazyConnect can make different gateway branches reach different
+        // host-networked Grafana replicas. Prefer an explicitly tested route
+        // for this gateway, then fall back to the local endpoint or the base
+        // record for older installations.
+        let selected = zone
+            .gateway_records
+            .get(&query_name)
+            .and_then(|gateways| gateways.get(&answer_ip))
+            .and_then(|addresses| addresses.first().copied())
+            .or_else(|| configured.contains(&answer_ip).then_some(answer_ip))
+            .unwrap_or(configured[0]);
+        vec![selected]
     } else if let Some(addresses) = zone.records.get(&query_name) {
         addresses.clone()
     } else {
@@ -22330,12 +22392,16 @@ mod tests {
                         "10.250.0.6"
                     ],
                     "grafana.heteronetwork.internal": [
-                        "10.250.0.10",
                         "10.250.0.5",
-                        "10.250.0.6",
                         "10.250.0.8"
                     ],
                     "ipv6.heteronetwork.internal": ["fd00::1"]
+                },
+                "gateway_records": {
+                    "grafana.heteronetwork.internal": {
+                        "10.250.0.4": ["10.250.0.10"],
+                        "10.250.0.6": ["10.250.0.5"]
+                    }
                 }
             }"#,
         )?;
@@ -22410,6 +22476,24 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![Ipv4Addr::new(10, 250, 0, 10)]
+        );
+
+        let routed_response = overlay_dns_response(
+            &configured.to_vec()?,
+            IpAddr::V4(Ipv4Addr::new(10, 250, 0, 6)),
+            &zone,
+        )?;
+        let routed_response = DnsMessage::from_vec(&routed_response)?;
+        assert_eq!(
+            routed_response
+                .answers
+                .iter()
+                .filter_map(|answer| match answer.data {
+                    RData::A(value) => Some(value.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![Ipv4Addr::new(10, 250, 0, 5)]
         );
 
         let mut wrong_family = DnsMessage::query();

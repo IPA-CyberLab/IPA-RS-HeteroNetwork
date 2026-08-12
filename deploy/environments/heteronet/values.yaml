@@ -15,14 +15,10 @@ agent:
     # clients always connect to the gateway that currently carries their VPN.
     records:
       grafana.heteronetwork.internal:
-        # Grafana runs host-networked on these VPN nodes. The first address is
-        # the fallback for gateways that do not host a local Grafana replica.
+        # Base fallback for gateways without an explicit route below.
         - 10.250.0.10
-        - 10.250.0.2
-        - 10.250.0.3
-        - 10.250.0.8
         - 10.250.0.5
-        - 10.250.0.6
+        - 10.250.0.8
       prometheus.heteronetwork.internal:
         - 10.250.0.4
         - 10.250.0.5
@@ -31,6 +27,18 @@ agent:
         - 10.250.0.4
         - 10.250.0.5
         - 10.250.0.6
+    gatewayRecords:
+      grafana.heteronetwork.internal:
+        10.250.0.4:
+          - 10.250.0.10
+        10.250.0.5:
+          - 10.250.0.5
+        10.250.0.6:
+          - 10.250.0.5
+        10.250.0.8:
+          - 10.250.0.8
+        10.250.0.10:
+          - 10.250.0.10
 
 kubernetesPlugin:
   nodeReporter:

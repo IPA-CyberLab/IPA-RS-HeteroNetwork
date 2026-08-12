@@ -8,5 +8,5 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
 data:
   records.json: |
-    {{ dict "schema_version" 1 "records" .Values.agent.overlayDns.records | toPrettyJson | nindent 4 }}
+    {{ dict "schema_version" 1 "records" .Values.agent.overlayDns.records "gateway_records" .Values.agent.overlayDns.gatewayRecords | toPrettyJson | nindent 4 }}
 {{- end }}
