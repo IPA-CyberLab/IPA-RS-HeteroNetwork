@@ -24,6 +24,7 @@ interface="${HETERONETWORK_KUBEADM_INTERFACE:-$DEFAULT_INTERFACE}"
 node_ip="${HETERONETWORK_KUBEADM_NODE_IP:-}"
 node_name="${HETERONETWORK_KUBEADM_NODE_NAME:-}"
 control_plane_backends="${HETERONETWORK_KUBEADM_CONTROL_PLANES:-}"
+apiserver_etcd_backends="${HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS:-}"
 api_name="${HETERONETWORK_KUBEADM_API_NAME:-$DEFAULT_API_NAME}"
 api_proxy_port="${HETERONETWORK_KUBEADM_API_PROXY_PORT:-$DEFAULT_API_PROXY_PORT}"
 pod_cidr="${HETERONETWORK_KUBEADM_POD_CIDR:-$DEFAULT_POD_CIDR}"
@@ -50,6 +51,8 @@ Commands:
   join-worker            Join this host as a regular worker node
   reconcile-control-plane-backends
                          Update the local API proxy and split-DNS control-plane set
+  reconcile-apiserver-etcd
+                         Point the local API server at selected stacked-etcd members
   install-flannel        Install pinned Flannel on the initialized cluster
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
@@ -70,6 +73,8 @@ Optional environment:
   HETERONETWORK_KUBEADM_SERVICE_CIDR     Default: 10.96.0.0/12
   HETERONETWORK_KUBEADM_KUBERNETES_MINOR Default: v1.36
   HETERONETWORK_KUBEADM_MAX_PODS          Default: 240 (must fit the CNI node CIDR)
+  HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS
+                                         Comma-separated control-plane VPN IPv4 addresses
   HETERONETWORK_KUBEADM_JOIN_BUNDLE      Default: state-dir/join-bundle.json
   HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE
                                          Default: state-dir/worker-join-bundle.json
@@ -166,6 +171,40 @@ backend_addresses() {
     seen[$raw]=1
     printf '%s\n' "$raw"
   done
+}
+
+apiserver_etcd_addresses() {
+  [[ -n "$apiserver_etcd_backends" ]] \
+    || die "at least three API server etcd endpoints are required"
+
+  local raw backend
+  local -a values
+  local -A control_planes=()
+  local -A seen=()
+  while IFS= read -r backend; do
+    control_planes[$backend]=1
+  done < <(backend_addresses)
+  IFS=, read -r -a values <<<"$apiserver_etcd_backends"
+  ((${#values[@]} >= 3)) || die "at least three API server etcd endpoints are required"
+
+  for raw in "${values[@]}"; do
+    [[ "$raw" == "${raw//[[:space:]]/}" ]] \
+      || die "API server etcd endpoints must not contain whitespace"
+    validate_ipv4 "$raw"
+    [[ -n "${control_planes[$raw]:-}" ]] \
+      || die "API server etcd endpoint is not a control-plane address: $raw"
+    [[ -z "${seen[$raw]:-}" ]] || die "duplicate API server etcd endpoint: $raw"
+    seen[$raw]=1
+    printf '%s\n' "$raw"
+  done
+}
+
+render_apiserver_etcd_servers() {
+  local address rendered=""
+  while IFS= read -r address; do
+    rendered="${rendered:+${rendered},}https://${address}:2379"
+  done < <(apiserver_etcd_addresses)
+  printf '%s\n' "$rendered"
 }
 
 validate_common_config() {
@@ -883,6 +922,7 @@ HETERONETWORK_KUBEADM_INTERFACE=${interface}
 HETERONETWORK_KUBEADM_NODE_IP=${node_ip}
 HETERONETWORK_KUBEADM_NODE_NAME=${node_name}
 HETERONETWORK_KUBEADM_CONTROL_PLANES=${control_plane_backends}
+HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS=${apiserver_etcd_backends}
 HETERONETWORK_KUBEADM_API_NAME=${api_name}
 HETERONETWORK_KUBEADM_API_PROXY_PORT=${api_proxy_port}
 HETERONETWORK_KUBEADM_POD_CIDR=${pod_cidr}
@@ -1010,8 +1050,55 @@ reconcile_control_plane_backends() {
   configure_overlay_dns
   configure_haproxy
   configure_local_state
+  if [[ -n "$apiserver_etcd_backends" && -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
+    reconcile_apiserver_etcd
+  fi
   verify_host
   printf 'control-plane backends reconciled for %s\n' "$node_name"
+}
+
+reconcile_apiserver_etcd() {
+  require_root
+  validate_control_plane_config
+  require_command awk
+  require_command curl
+  local manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
+  [[ -f "$manifest" && ! -L "$manifest" ]] \
+    || die "kube-apiserver static Pod manifest is missing or is a symlink"
+
+  local endpoints current desired temporary mode
+  endpoints="$(render_apiserver_etcd_servers)"
+  desired="    - --etcd-servers=${endpoints}"
+  current="$(grep -E '^    - --etcd-servers=' "$manifest" || true)"
+  [[ "$(grep -Ec '^    - --etcd-servers=' "$manifest")" == "1" ]] \
+    || die "kube-apiserver manifest must contain exactly one etcd-servers argument"
+  configure_local_state
+  if [[ "$current" != "$desired" ]]; then
+    temporary="$(mktemp)"
+    if ! awk -v replacement="$desired" '
+      /^    - --etcd-servers=/ { print replacement; next }
+      { print }
+    ' "$manifest" >"$temporary"; then
+      rm -f "$temporary"
+      die "failed to render the kube-apiserver manifest"
+    fi
+    mode="$(stat -c '%a' "$manifest")"
+    install -o root -g root -m "$mode" "$temporary" "$manifest"
+    rm -f "$temporary"
+  fi
+
+  local attempt
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    if curl --fail --silent --show-error \
+      --connect-timeout 2 --max-time 5 \
+      --cacert /etc/kubernetes/pki/ca.crt \
+      "https://${node_ip}:6443/readyz" >/dev/null 2>&1; then
+      printf 'API server etcd endpoints reconciled on %s\n' "$node_name"
+      return
+    fi
+    sleep 2
+  done
+  die "local API server did not become ready after reconciling etcd endpoints"
 }
 
 installed_kubernetes_version() {
@@ -1566,6 +1653,7 @@ self_test() {
   node_ip="10.250.0.2"
   node_name="control-plane-2"
   control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3"
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.3"
   api_name="k8s-api.heteronetwork.internal"
   api_proxy_port="7443"
   pod_cidr="10.244.0.0/16"
@@ -1573,6 +1661,21 @@ self_test() {
   kubernetes_minor="v1.36"
   state_dir="/etc/heteronetwork/kubernetes"
   validate_control_plane_config
+  rendered="$(render_apiserver_etcd_servers)"
+  [[ "$rendered" == "https://10.250.0.1:2379,https://10.250.0.2:2379,https://10.250.0.3:2379" ]]
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.99"
+  if (apiserver_etcd_addresses >/dev/null 2>&1); then
+    die "API server etcd validation accepted a non-control-plane address"
+  fi
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2"
+  if (apiserver_etcd_addresses >/dev/null 2>&1); then
+    die "API server etcd validation accepted fewer than three endpoints"
+  fi
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.2"
+  if (apiserver_etcd_addresses >/dev/null 2>&1); then
+    die "API server etcd validation accepted duplicate endpoints"
+  fi
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.3"
   kubernetes_versions_are_aligned "v1.36" "v1.36.2" "v1.36.2" "v1.36.2"
   if kubernetes_versions_are_aligned "v1.36" "v1.36.2" "v1.36.3" "v1.36.2"; then
     die "Kubernetes toolchain validation accepted mixed patch versions"
@@ -1729,6 +1832,7 @@ case "$command" in
   promote-control-plane) promote_control_plane ;;
   join-worker) join_worker ;;
   reconcile-control-plane-backends) reconcile_control_plane_backends ;;
+  reconcile-apiserver-etcd) reconcile_apiserver_etcd ;;
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;

@@ -242,3 +242,28 @@ become healthy before promoting the next worker. A five-member etcd cluster
 tolerates two failed members; a four-member intermediate state still tolerates
 only one. The local API proxy checks `/readyz`, so an API server whose local etcd
 is alive but unable to serve requests is removed from client traffic.
+
+### Keep API servers off overloaded local etcd clients
+
+Stacked etcd membership remains one member per control-plane host. On a small
+control-plane host with sustained disk I/O pressure, the local etcd member can
+miss the API server's startup deadline even while the etcd quorum remains
+healthy. In that case, point only that host's API server client at three healthy
+stacked-etcd members over HeteroNetwork:
+
+```bash
+set -a
+source /etc/heteronetwork/kubernetes/node.env
+set +a
+export HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS=10.250.0.6,10.250.0.8,10.250.0.10
+sudo -E /opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-apiserver-etcd
+```
+
+Every selected address must also be in
+`HETERONETWORK_KUBEADM_CONTROL_PLANES`, and at least three unique addresses are
+required. The command atomically updates the static API server manifest, waits
+for its local `/readyz`, and records the setting in `node.env`. It does not
+remove or replace the host's etcd member, so a five-member etcd cluster retains
+its two-member failure tolerance. Use this only for API servers whose local
+etcd client is affected by persistent host I/O pressure; healthy control planes
+should continue using `https://127.0.0.1:2379`.
