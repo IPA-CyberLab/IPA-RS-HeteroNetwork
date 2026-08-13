@@ -15,12 +15,11 @@ agent:
     # clients always connect to the gateway that currently carries their VPN.
     records:
       grafana.heteronetwork.internal:
-        # Base fallback for gateways without an explicit route below.
-        - 10.250.0.10
+        # Healthy host-networked replicas; gateway records put the nearest
+        # endpoint first while retaining alternatives for failover.
         - 10.250.0.5
-        - 10.250.0.8
+        - 10.250.0.6
       prometheus.heteronetwork.internal:
-        - 10.250.0.4
         - 10.250.0.5
         - 10.250.0.6
       argocd.heteronetwork.internal:
@@ -30,15 +29,31 @@ agent:
     gatewayRecords:
       grafana.heteronetwork.internal:
         10.250.0.4:
-          - 10.250.0.10
+          - 10.250.0.6
+          - 10.250.0.5
         10.250.0.5:
           - 10.250.0.5
+          - 10.250.0.6
         10.250.0.6:
+          - 10.250.0.6
           - 10.250.0.5
         10.250.0.8:
-          - 10.250.0.8
+          - 10.250.0.6
+          - 10.250.0.5
         10.250.0.10:
-          - 10.250.0.10
+          - 10.250.0.6
+          - 10.250.0.5
+      prometheus.heteronetwork.internal:
+        10.250.0.4: [10.250.0.6, 10.250.0.5]
+        10.250.0.5: [10.250.0.5, 10.250.0.6]
+        10.250.0.6: [10.250.0.6, 10.250.0.5]
+        10.250.0.8: [10.250.0.6, 10.250.0.5]
+        10.250.0.10: [10.250.0.6, 10.250.0.5]
+      argocd.heteronetwork.internal:
+        10.250.0.4: [10.250.0.4, 10.250.0.6, 10.250.0.5]
+        10.250.0.5: [10.250.0.5, 10.250.0.6, 10.250.0.4]
+        10.250.0.6: [10.250.0.6, 10.250.0.5, 10.250.0.4]
+        10.250.0.8: [10.250.0.6, 10.250.0.5, 10.250.0.4]
 
 kubernetesPlugin:
   nodeReporter:

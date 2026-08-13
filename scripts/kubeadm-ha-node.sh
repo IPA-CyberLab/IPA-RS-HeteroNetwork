@@ -24,6 +24,7 @@ interface="${HETERONETWORK_KUBEADM_INTERFACE:-$DEFAULT_INTERFACE}"
 node_ip="${HETERONETWORK_KUBEADM_NODE_IP:-}"
 node_name="${HETERONETWORK_KUBEADM_NODE_NAME:-}"
 control_plane_backends="${HETERONETWORK_KUBEADM_CONTROL_PLANES:-}"
+preferred_control_plane="${HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE:-}"
 api_name="${HETERONETWORK_KUBEADM_API_NAME:-$DEFAULT_API_NAME}"
 api_proxy_port="${HETERONETWORK_KUBEADM_API_PROXY_PORT:-$DEFAULT_API_PROXY_PORT}"
 pod_cidr="${HETERONETWORK_KUBEADM_POD_CIDR:-$DEFAULT_POD_CIDR}"
@@ -51,12 +52,16 @@ Commands:
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
   verify-cluster         Verify nodes, control planes, Flannel, DNS, and cross-node Pod traffic
+  configure-api-ha       Reconcile API health checks and kubelet HA endpoint
+  reconcile-kubelet-api  Route kubelet through the local HA API proxy
   reconcile-kubelet-dns  Limit kubelet's upstream resolver list to three stable entries
   self-test              Run non-privileged renderer and validation checks
 
 Required environment for prepare/init/join:
   HETERONETWORK_KUBEADM_NODE_IP
   HETERONETWORK_KUBEADM_CONTROL_PLANES   Comma-separated HeteroNetwork IPv4 addresses
+  HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE
+                                         Optional API backend preferred by every local proxy
 
 Optional environment:
   HETERONETWORK_KUBEADM_INTERFACE        Default: heteronetwork0
@@ -179,6 +184,11 @@ validate_common_config() {
   [[ "$agent_api_token_path" == /* ]] || die "Agent API token path must be absolute"
   resolve_node_name
   backend_addresses >/dev/null
+  if [[ -n "$preferred_control_plane" ]]; then
+    validate_ipv4 "$preferred_control_plane"
+    backend_addresses | grep -Fx "$preferred_control_plane" >/dev/null \
+      || die "preferred control plane is not present in the backend list: $preferred_control_plane"
+  fi
 }
 
 validate_overlay_dns_config() {
@@ -272,11 +282,14 @@ frontend kubernetes_api
     default_backend kubernetes_control_planes
 
 backend kubernetes_control_planes
-    option tcp-check
-    default-server check inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
+    option httpchk GET /livez
+    http-check expect rstatus ^[234]
+    default-server check check-ssl verify none inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
 EOF
   local backend backup preferred_backend
-  if node_is_control_plane_backend; then
+  if [[ -n "$preferred_control_plane" ]]; then
+    preferred_backend="$preferred_control_plane"
+  elif node_is_control_plane_backend; then
     preferred_backend="$node_ip"
   else
     preferred_backend="$(backend_addresses | sed -n '1p')"
@@ -841,6 +854,17 @@ configure_haproxy() {
     || die "local Kubernetes API load balancer did not become active"
 }
 
+configure_kubelet_api_ha() {
+  require_root
+  validate_common_config
+  configure_haproxy
+  reconcile_kubelet_api_endpoint
+  systemctl restart heteronetwork-kube-apiserver-lb.service kubelet.service
+  systemctl is-active --quiet heteronetwork-kube-apiserver-lb.service \
+    || die "local Kubernetes API load balancer did not remain active"
+  systemctl is-active --quiet kubelet.service || die "kubelet did not remain active"
+}
+
 reconcile_kubelet_resolver() {
   local source_path="${HETERONETWORK_KUBELET_RESOLVER_SOURCE:-/run/systemd/resolve/resolv.conf}"
   local temporary
@@ -860,6 +884,24 @@ reconcile_kubelet_resolver() {
   rm -f "$temporary"
 }
 
+reconcile_kubelet_api_endpoint() {
+  local endpoint="https://${api_name}:${api_proxy_port}"
+  local kubeconfig temporary
+  local found=0
+  for kubeconfig in /etc/kubernetes/kubelet.conf /etc/kubernetes/bootstrap-kubelet.conf; do
+    [[ -f "$kubeconfig" ]] || continue
+    found=1
+    temporary="$(mktemp)"
+    sed -E "s#^([[:space:]]*server:[[:space:]]*)https://[^[:space:]]+#\\1${endpoint}#" \
+      "$kubeconfig" >"$temporary"
+    [[ "$(grep -Ec "^[[:space:]]*server:[[:space:]]*${endpoint}$" "$temporary")" == "1" ]] \
+      || { rm -f "$temporary"; die "failed to set the kubelet API endpoint to $endpoint in $kubeconfig"; }
+    install -o root -g root -m 0600 "$temporary" "$kubeconfig"
+    rm -f "$temporary"
+  done
+  ((found == 1)) || die "kubelet kubeconfig is missing"
+}
+
 configure_kubelet() {
   reconcile_kubelet_resolver
   printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s --max-pods=%s"\n' "$node_ip" "$node_name" "$max_pods" \
@@ -877,6 +919,7 @@ HETERONETWORK_KUBEADM_INTERFACE=${interface}
 HETERONETWORK_KUBEADM_NODE_IP=${node_ip}
 HETERONETWORK_KUBEADM_NODE_NAME=${node_name}
 HETERONETWORK_KUBEADM_CONTROL_PLANES=${control_plane_backends}
+HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE=${preferred_control_plane}
 HETERONETWORK_KUBEADM_API_NAME=${api_name}
 HETERONETWORK_KUBEADM_API_PROXY_PORT=${api_proxy_port}
 HETERONETWORK_KUBEADM_POD_CIDR=${pod_cidr}
@@ -1106,6 +1149,7 @@ initialize_cluster() {
   require_command kubeadm
   [[ -f "$state_dir/node.env" ]] || die "run prepare before init"
   if [[ -f /etc/kubernetes/admin.conf ]]; then
+    reconcile_kubelet_api_endpoint
     configure_root_kubeconfig
     refresh_join_bundle
     printf 'control plane is already initialized\n'
@@ -1123,6 +1167,7 @@ initialize_cluster() {
   kubeadm config validate --config "$config"
   kubeadm init --config "$config"
   rm -f "$config"
+  reconcile_kubelet_api_endpoint
   configure_root_kubeconfig
   refresh_join_bundle
 }
@@ -1135,6 +1180,7 @@ join_control_plane() {
   ensure_agent_api_token
   [[ -f "$state_dir/node.env" ]] || die "run prepare before join-control-plane"
   if [[ -f /etc/kubernetes/admin.conf ]]; then
+    reconcile_kubelet_api_endpoint
     configure_root_kubeconfig
     printf 'control plane is already joined\n'
     return
@@ -1148,6 +1194,7 @@ join_control_plane() {
   kubeadm config validate --config "$config"
   kubeadm join --config "$config"
   rm -f "$config"
+  reconcile_kubelet_api_endpoint
   configure_root_kubeconfig
 }
 
@@ -1163,6 +1210,7 @@ join_worker() {
     die "this node is already configured as a control plane; refusing worker join"
   fi
   if [[ -f /etc/kubernetes/kubelet.conf ]]; then
+    reconcile_kubelet_api_endpoint
     printf 'worker is already joined\n'
     return
   fi
@@ -1175,6 +1223,7 @@ join_worker() {
   render_worker_join_config "$bundle" >"$config"
   kubeadm config validate --config "$config"
   kubeadm join --config "$config"
+  reconcile_kubelet_api_endpoint
   rm -f "$bundle"
   rm -f "$config"
   trap - EXIT
@@ -1466,6 +1515,7 @@ self_test() {
   node_ip="10.250.0.2"
   node_name="control-plane-2"
   control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3"
+  preferred_control_plane=""
   api_name="k8s-api.heteronetwork.internal"
   api_proxy_port="7443"
   pod_cidr="10.244.0.0/16"
@@ -1486,6 +1536,15 @@ self_test() {
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
   grep -Fq 'option dontlog-normal' <<<"$rendered"
   grep -Fq 'option redispatch' <<<"$rendered"
+  grep -Fq 'option httpchk GET /livez' <<<"$rendered"
+  grep -Fq 'http-check expect rstatus ^[234]' <<<"$rendered"
+  grep -Fq 'default-server check check-ssl verify none' <<<"$rendered"
+  preferred_control_plane="10.250.0.3"
+  rendered="$(render_haproxy_config)"
+  grep -Fxq '    server control-plane-3 10.250.0.3:6443' <<<"$rendered"
+  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  preferred_control_plane=""
+  rendered="$(render_haproxy_config)"
   grep -Fq 'retries 2' <<<"$rendered"
   grep -Fq 'timeout connect 5s' <<<"$rendered"
   grep -Fq 'timeout check 5s' <<<"$rendered"
@@ -1619,7 +1678,9 @@ case "$command" in
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;
+  configure-api-ha) configure_kubelet_api_ha ;;
   reconcile-kubelet-dns) require_root; reconcile_kubelet_resolver ;;
+  reconcile-kubelet-api) require_root; reconcile_kubelet_api_endpoint ;;
   verify-cluster) verify_cluster ;;
   self-test) self_test ;;
   -h|--help|help) usage ;;

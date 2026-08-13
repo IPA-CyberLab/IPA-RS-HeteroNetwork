@@ -866,7 +866,7 @@ spec:
       {{- if or $overlayDnsEnabled .Values.agent.podAnnotations }}
       annotations:
         {{- if $overlayDnsEnabled }}
-        checksum/overlay-dns-records: {{ toJson .Values.agent.overlayDns.records | sha256sum | quote }}
+        checksum/overlay-dns-records: {{ toJson (dict "records" .Values.agent.overlayDns.records "gatewayRecords" .Values.agent.overlayDns.gatewayRecords) | sha256sum | quote }}
         {{- end }}
         {{- range $key, $value := .Values.agent.podAnnotations }}
         {{ $key }}: {{ $value | quote }}

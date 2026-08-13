@@ -7715,6 +7715,7 @@ mod tests {
                 on_demand_peer_limit: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: Vec::new(),
+                pinned_peers: Vec::new(),
                 aggregate_routes: vec![AggregateOverlayRoute {
                     cidr: "10.44.0.0/16".parse()?,
                 }],
@@ -7772,6 +7773,7 @@ mod tests {
                 on_demand_peer_limit: 4,
                 vpn_cidr: "100.64.0.0/10".parse()?,
                 neighbors: Vec::new(),
+                pinned_peers: Vec::new(),
                 aggregate_routes: Vec::new(),
                 client_route_peers: Vec::new(),
                 bootstrap_endpoints: Vec::new(),

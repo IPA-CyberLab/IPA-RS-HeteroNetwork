@@ -864,6 +864,7 @@ mod tests {
                     kind: OverlayNeighborKind::BackbonePrimary,
                 })
                 .collect(),
+            pinned_peers: Vec::new(),
             aggregate_routes: Vec::new(),
             client_route_peers: Vec::new(),
             bootstrap_endpoints: Vec::new(),

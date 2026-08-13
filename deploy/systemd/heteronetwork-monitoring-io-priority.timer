@@ -1,0 +1,12 @@
+[Unit]
+Description=Continuously lower monitoring workload I/O priority
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=heteronetwork-monitoring-io-priority.service
+
+[Install]
+WantedBy=timers.target

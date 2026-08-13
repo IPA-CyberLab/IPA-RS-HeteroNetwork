@@ -87,6 +87,7 @@ fn neighbor_map(index: usize, topology_epoch: u64) -> NeighborMap {
                 kind,
             })
             .collect(),
+        pinned_peers: Vec::new(),
         aggregate_routes: Vec::new(),
         client_route_peers: Vec::new(),
         bootstrap_endpoints: Vec::new(),

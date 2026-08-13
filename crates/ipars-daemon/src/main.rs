@@ -5793,25 +5793,19 @@ fn overlay_dns_response(
         // Return that gateway's own VPN address so the UI never resolves to a
         // different lazy-connect branch that the client cannot currently route.
         vec![answer_ip]
-    } else if query_name == OVERLAY_GRAFANA_DNS_NAME {
-        let Some(configured) = zone.records.get(&query_name) else {
-            response.metadata.response_code = ResponseCode::NXDomain;
-            return response.to_vec().context("failed to encode DNS response");
-        };
-        // LazyConnect can make different gateway branches reach different
-        // host-networked Grafana replicas. Prefer an explicitly tested route
-        // for this gateway, then fall back to the local endpoint or the base
-        // record for older installations.
-        let selected = zone
-            .gateway_records
+    } else if let Some(configured) = zone.records.get(&query_name) {
+        // A gateway-specific list is ordered by local preference but retains
+        // multiple endpoints for failover. Older Grafana-only configurations
+        // without gateway records still prefer the local host-networked pod.
+        zone.gateway_records
             .get(&query_name)
             .and_then(|gateways| gateways.get(&answer_ip))
-            .and_then(|addresses| addresses.first().copied())
-            .or_else(|| configured.contains(&answer_ip).then_some(answer_ip))
-            .unwrap_or(configured[0]);
-        vec![selected]
-    } else if let Some(addresses) = zone.records.get(&query_name) {
-        addresses.clone()
+            .cloned()
+            .or_else(|| {
+                (query_name == OVERLAY_GRAFANA_DNS_NAME && configured.contains(&answer_ip))
+                    .then(|| vec![answer_ip])
+            })
+            .unwrap_or_else(|| configured.clone())
     } else {
         response.metadata.response_code = ResponseCode::NXDomain;
         return response.to_vec().context("failed to encode DNS response");
@@ -20868,6 +20862,11 @@ impl PeerMapSource for HttpPeerMapSource {
             .iter()
             .map(|peer| peer.node_id.clone())
             .collect::<BTreeSet<_>>();
+        for peer in neighbor_map.pinned_peers.iter().cloned() {
+            if peer_ids.insert(peer.node_id.clone()) {
+                peers.push(peer);
+            }
+        }
         for peer in self.runtime.retained_overlay_neighbors().await {
             if peer_ids.insert(peer.node_id.clone()) {
                 peers.push(peer);
@@ -22399,8 +22398,8 @@ mod tests {
                 },
                 "gateway_records": {
                     "grafana.heteronetwork.internal": {
-                        "10.250.0.4": ["10.250.0.10"],
-                        "10.250.0.6": ["10.250.0.5"]
+                        "10.250.0.4": ["10.250.0.10", "10.250.0.5"],
+                        "10.250.0.6": ["10.250.0.5", "10.250.0.8"]
                     }
                 }
             }"#,
@@ -22465,7 +22464,7 @@ mod tests {
             &zone,
         )?;
         let fallback_response = DnsMessage::from_vec(&fallback_response)?;
-        assert_eq!(fallback_response.answers.len(), 1);
+        assert_eq!(fallback_response.answers.len(), 2);
         assert_eq!(
             fallback_response
                 .answers
@@ -22475,7 +22474,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![Ipv4Addr::new(10, 250, 0, 10)]
+            vec![Ipv4Addr::new(10, 250, 0, 10), Ipv4Addr::new(10, 250, 0, 5)]
         );
 
         let routed_response = overlay_dns_response(
@@ -22493,7 +22492,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![Ipv4Addr::new(10, 250, 0, 5)]
+            vec![Ipv4Addr::new(10, 250, 0, 5), Ipv4Addr::new(10, 250, 0, 8)]
         );
 
         let mut wrong_family = DnsMessage::query();
@@ -23194,6 +23193,7 @@ mod tests {
             on_demand_peer_limit: 4,
             vpn_cidr: "100.64.0.0/10".parse()?,
             neighbors: Vec::new(),
+            pinned_peers: Vec::new(),
             aggregate_routes: Vec::new(),
             client_route_peers: Vec::new(),
             bootstrap_endpoints: Vec::new(),
@@ -23251,6 +23251,11 @@ mod tests {
         let mut client_peer = node_record("direct-client");
         client_peer.role = Role::client();
         client_peer.vpn_ip = VpnIp("100.64.0.3".parse()?);
+        let mut pinned_peer = node_record("kubernetes-control-plane");
+        pinned_peer.vpn_ip = VpnIp("100.64.0.5".parse()?);
+        pinned_peer
+            .tags
+            .insert(ipars_types::Tag::kubernetes_control_plane());
         let generated_at = Utc::now();
         runtime
             .record_neighbor_map_snapshot(NeighborMap {
@@ -23265,6 +23270,7 @@ mod tests {
                     node: retained_neighbor.clone(),
                     kind: ipars_types::OverlayNeighborKind::BackbonePrimary,
                 }],
+                pinned_peers: Vec::new(),
                 aggregate_routes: Vec::new(),
                 client_route_peers: Vec::new(),
                 bootstrap_endpoints: Vec::new(),
@@ -23283,6 +23289,7 @@ mod tests {
                 node: neighbor.clone(),
                 kind: ipars_types::OverlayNeighborKind::BackbonePrimary,
             }],
+            pinned_peers: vec![pinned_peer.clone()],
             aggregate_routes: Vec::new(),
             client_route_peers: vec![client_peer.clone()],
             bootstrap_endpoints: Vec::new(),
@@ -23305,7 +23312,7 @@ mod tests {
 
         let peer_map = source.fetch_peer_map(&local_node).await?;
 
-        assert_eq!(peer_map.peers.len(), 3);
+        assert_eq!(peer_map.peers.len(), 4);
         assert!(peer_map
             .peers
             .iter()
@@ -23318,6 +23325,10 @@ mod tests {
             .peers
             .iter()
             .any(|peer| peer.node_id == client_peer.node_id && peer.role.is_client()));
+        assert!(peer_map
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == pinned_peer.node_id));
         assert_eq!(
             runtime
                 .neighbor_map_snapshot()
@@ -23689,6 +23700,7 @@ mod tests {
                     })
                     .into_iter()
                     .collect(),
+                pinned_peers: Vec::new(),
                 aggregate_routes: Vec::new(),
                 client_route_peers: Vec::new(),
                 bootstrap_endpoints: Vec::new(),
@@ -37956,6 +37968,7 @@ exec sleep 60
                         kind: ipars_types::OverlayNeighborKind::BackbonePrimary,
                     })
                     .collect(),
+                pinned_peers: Vec::new(),
                 aggregate_routes: Vec::new(),
                 client_route_peers: Vec::new(),
                 bootstrap_endpoints: Vec::new(),

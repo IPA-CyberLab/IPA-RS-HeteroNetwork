@@ -1603,6 +1603,7 @@ pub fn node_display_name_is_valid(value: &str) -> bool {
 
 pub const MAX_OVERLAY_DEGREE: u16 = 64;
 pub const MAX_OVERLAY_NEIGHBORS: usize = MAX_OVERLAY_DEGREE as usize;
+pub const MAX_OVERLAY_PINNED_PEERS: usize = MAX_OVERLAY_DEGREE as usize;
 pub const MAX_OVERLAY_ROUTE_SCOPES: usize = 64;
 pub const MAX_AGGREGATE_OVERLAY_ROUTES: usize = MAX_OVERLAY_ROUTE_SCOPES;
 pub const MAX_OVERLAY_CLIENT_ROUTE_PEERS: usize = 4096;
@@ -1663,6 +1664,11 @@ pub struct NeighborMap {
     pub on_demand_peer_limit: u16,
     pub vpn_cidr: IpNet,
     pub neighbors: Vec<OverlayNeighbor>,
+    /// Policy-pinned peers are permanent direct connections outside the
+    /// bounded backbone degree. This keeps quorum-bearing and route-provider
+    /// nodes reachable even when they are not selected as topology neighbors.
+    #[serde(default)]
+    pub pinned_peers: Vec<NodeRecord>,
     pub aggregate_routes: Vec<AggregateOverlayRoute>,
     #[serde(default)]
     pub client_route_peers: Vec<NodeRecord>,
@@ -1712,6 +1718,15 @@ impl NeighborMap {
                     "neighbor count {} exceeds configured maximum degree {}",
                     self.neighbors.len(),
                     self.max_degree
+                ),
+            ));
+        }
+        if self.pinned_peers.len() > MAX_OVERLAY_PINNED_PEERS {
+            return Err(OverlayValidationError::new(
+                "pinned_peers",
+                format!(
+                    "pinned peer count {} exceeds maximum {MAX_OVERLAY_PINNED_PEERS}",
+                    self.pinned_peers.len()
                 ),
             ));
         }
@@ -1799,6 +1814,55 @@ impl NeighborMap {
                     format!(
                         "backbone neighbor {} must not include advertised routes",
                         neighbor.node.node_id
+                    ),
+                ));
+            }
+        }
+
+        let mut pinned_peer_ids = BTreeSet::new();
+        let mut pinned_peer_vpn_ips = BTreeSet::new();
+        for (index, peer) in self.pinned_peers.iter().enumerate() {
+            validate_overlay_node_record(peer, "pinned_peers").map_err(|error| {
+                OverlayValidationError::new(
+                    "pinned_peers",
+                    format!("pinned peer {index} is invalid: {}", error.reason()),
+                )
+            })?;
+            if peer.cluster_id != self.cluster_id {
+                return Err(OverlayValidationError::new(
+                    "pinned_peers",
+                    format!(
+                        "pinned peer {} belongs to cluster {} instead of {}",
+                        peer.node_id, peer.cluster_id, self.cluster_id
+                    ),
+                ));
+            }
+            if peer.node_id == self.node_id {
+                return Err(OverlayValidationError::new(
+                    "pinned_peers",
+                    format!("node {} cannot pin itself", self.node_id),
+                ));
+            }
+            if neighbor_kinds.contains_key(&peer.node_id)
+                || !pinned_peer_ids.insert(peer.node_id.clone())
+            {
+                return Err(OverlayValidationError::new(
+                    "pinned_peers",
+                    format!("pinned peer {} is duplicated", peer.node_id),
+                ));
+            }
+            if !pinned_peer_vpn_ips.insert(peer.vpn_ip) {
+                return Err(OverlayValidationError::new(
+                    "pinned_peers",
+                    format!("pinned peer VPN address {} is duplicated", peer.vpn_ip),
+                ));
+            }
+            if !self.vpn_cidr.contains(&peer.vpn_ip.0) {
+                return Err(OverlayValidationError::new(
+                    "pinned_peers",
+                    format!(
+                        "pinned peer {} VPN address {} is outside {}",
+                        peer.node_id, peer.vpn_ip, self.vpn_cidr
                     ),
                 ));
             }
@@ -20156,6 +20220,7 @@ mod tests {
                     kind: OverlayNeighborKind::BackboneSecondary,
                 },
             ],
+            pinned_peers: Vec::new(),
             aggregate_routes: vec![AggregateOverlayRoute {
                 cidr: "10.42.0.0/16".parse()?,
             }],
@@ -20185,6 +20250,23 @@ mod tests {
         );
         let decoded: NeighborMap = serde_json::from_value(encoded)?;
         assert_eq!(decoded, neighbor_map);
+        Ok(())
+    }
+
+    #[test]
+    fn neighbor_map_accepts_policy_pins_outside_bounded_degree(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut neighbor_map = valid_neighbor_map()?;
+        neighbor_map.max_degree = 2;
+        neighbor_map.pinned_peers.push(overlay_test_node(
+            "node-d",
+            "cluster-a",
+            "10.250.0.5".parse()?,
+        ));
+
+        neighbor_map.validate()?;
+        assert_eq!(neighbor_map.neighbors.len(), 2);
+        assert_eq!(neighbor_map.pinned_peers.len(), 1);
         Ok(())
     }
 

@@ -3803,6 +3803,12 @@ impl AgentRuntime {
         let topology_pins = backbone_peer_ids
             .iter()
             .cloned()
+            .chain(
+                neighbor_map
+                    .pinned_peers
+                    .iter()
+                    .map(|peer| peer.node_id.clone()),
+            )
             .chain(retained_topology_pins)
             .collect::<BTreeSet<_>>();
         let on_demand_peer_limit = usize::from(neighbor_map.on_demand_peer_limit);
@@ -4367,12 +4373,20 @@ impl AgentRuntime {
     }
 
     pub async fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
-        if !self.lazy_connect.read().await.should_connect_peer(peer) {
+        let lazy_connect = self.lazy_connect.read().await;
+        if !lazy_connect.should_connect_peer(peer) {
             return false;
         }
-        if peer.role.is_client() {
+        // Pinned peers are deliberately outside the bounded, on-demand part of
+        // the overlay. The control plane also projects reciprocal pins so the
+        // receiving side keeps an active WireGuard key and AllowedIPs entry.
+        if peer.role.is_client()
+            || lazy_connect.is_pinned_by_policy(&peer.role, &peer.tags)
+            || lazy_connect.is_pinned(&peer.node_id)
+        {
             return true;
         }
+        drop(lazy_connect);
         let Some(neighbor_map) = self.latest_neighbor_map.read().await.clone() else {
             return true;
         };
@@ -8878,6 +8892,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            pinned_peers: Vec::new(),
             aggregate_routes: Vec::new(),
             client_route_peers: Vec::new(),
             bootstrap_endpoints: Vec::new(),
@@ -12970,6 +12985,72 @@ mod tests {
             .take_pending_overlay_destinations(8)
             .await
             .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_overlay_keeps_policy_pinned_non_neighbors_connected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        state.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8))));
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let neighbor = peer_record(
+            NodeId::from_string("backbone-neighbor"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 10)),
+            "wg-backbone-neighbor",
+            Vec::new(),
+            Vec::new(),
+        );
+        runtime
+            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node, vec![neighbor], 7))
+            .await?;
+
+        let mut control_plane = peer_record(
+            NodeId::from_string("kubernetes-control-plane"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 11)),
+            "wg-kubernetes-control-plane",
+            Vec::new(),
+            Vec::new(),
+        );
+        control_plane.tags.insert(Tag::kubernetes_control_plane());
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&control_plane))
+            .await;
+
+        assert!(runtime.should_connect_peer(&control_plane).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_overlay_keeps_reciprocal_pinned_non_neighbors_connected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        let local_node = state.node_id.clone();
+        state.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8))));
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let neighbor = peer_record(
+            NodeId::from_string("backbone-neighbor"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 10)),
+            "wg-backbone-neighbor",
+            Vec::new(),
+            Vec::new(),
+        );
+        let reciprocal = peer_record(
+            NodeId::from_string("reciprocal-policy-pin"),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 8, 11)),
+            "wg-reciprocal-policy-pin",
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut neighbor_map = bounded_neighbor_map(local_node, vec![neighbor], 7);
+        neighbor_map.pinned_peers.push(reciprocal.clone());
+        runtime.record_neighbor_map_snapshot(neighbor_map).await?;
+        runtime
+            .observe_peer_map_for_lazy_connect(std::slice::from_ref(&reciprocal))
+            .await;
+
+        assert!(runtime.should_connect_peer(&reciprocal).await);
         Ok(())
     }
 

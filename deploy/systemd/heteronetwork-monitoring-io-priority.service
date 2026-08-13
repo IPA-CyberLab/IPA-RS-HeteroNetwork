@@ -1,0 +1,16 @@
+[Unit]
+Description=Prioritize HeteroNetwork control-plane storage over monitoring workloads
+After=kubelet.service
+ConditionPathExists=/opt/heteronetwork/libexec/reconcile-monitoring-io-priority
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/reconcile-monitoring-io-priority
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+

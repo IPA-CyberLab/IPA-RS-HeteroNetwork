@@ -3284,6 +3284,34 @@ where
                     })
             })
             .collect::<Vec<_>>();
+        let source_is_policy_pinned = policy.pinned_roles.contains(&source.role)
+            || source
+                .tags
+                .iter()
+                .any(|tag| policy.pinned_tags.contains(tag));
+        let pinned_peers = snapshot
+            .nodes
+            .iter()
+            .filter(|peer| peer.node_id != source.node_id && !neighbor_ids.contains(&peer.node_id))
+            .filter_map(|peer| {
+                let peer_is_policy_pinned = policy.pinned_roles.contains(&peer.role)
+                    || peer.tags.iter().any(|tag| policy.pinned_tags.contains(tag));
+                if peer_is_policy_pinned {
+                    return acl_filter_peer(&source, peer, &policy);
+                }
+                // A policy-pinned peer must also retain the remote endpoint that
+                // connects to it. WireGuard validates the inner source address
+                // against the receiving peer's AllowedIPs, so projecting only
+                // the initiating side creates an unusable asymmetric tunnel.
+                if source_is_policy_pinned && acl_filter_peer(&source, peer, &policy).is_some() {
+                    let mut reciprocal = peer.clone();
+                    reciprocal.routes.clear();
+                    return Some(reciprocal);
+                }
+                None
+            })
+            .map(|peer| filter_served_endpoint_candidates(peer, now, &policy))
+            .collect::<Vec<_>>();
         let client_route_peers = if snapshot.clients.is_empty() {
             Vec::new()
         } else {
@@ -3308,6 +3336,7 @@ where
             on_demand_peer_limit: policy.overlay_on_demand_peer_limit,
             vpn_cidr: IpNet::V4(self.config.vpn_pool),
             neighbors,
+            pinned_peers,
             aggregate_routes,
             client_route_peers,
             bootstrap_endpoints: directory.bootstrap_endpoints,
@@ -7787,6 +7816,97 @@ mod tests {
             plane_a.set_cluster_policy(invalid).await,
             Err(ControlPlaneError::InvalidClusterPolicy(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn neighbor_map_projects_policy_pinned_non_neighbors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 24)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let mut source_id = None;
+        for index in 0..12 {
+            let mut node = node_record(&format!("pinned-projection-{index}"));
+            node.cluster_id = cluster_id.clone();
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+                100,
+                64,
+                0,
+                u8::try_from(index + 1)?,
+            )));
+            if index == 0 {
+                source_id = Some(node.node_id.clone());
+            } else {
+                node.tags.insert(Tag::kubernetes_control_plane());
+            }
+            store.insert_node(node).await?;
+        }
+
+        let source_id = source_id.ok_or("source node was not created")?;
+        let map = plane.neighbor_map_for(&source_id).await?;
+        let topology_ids = map
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(map
+            .pinned_peers
+            .iter()
+            .all(|peer| peer.tags.contains(&Tag::kubernetes_control_plane())));
+        assert!(map
+            .pinned_peers
+            .iter()
+            .all(|peer| !topology_ids.contains(&peer.node_id)));
+        assert_eq!(map.neighbors.len() + map.pinned_peers.len(), 11);
+        map.validate()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn neighbor_map_projects_reciprocal_peers_for_policy_pinned_source(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cluster_id = ClusterId::from_string("cluster-a");
+        let vpn_pool = Ipv4Net::new(Ipv4Addr::new(100, 64, 1, 0), 24)?;
+        let store = Arc::new(InMemoryStore::default());
+        let plane = ControlPlane::new(
+            ControlPlaneConfig::new(cluster_id.clone(), vpn_pool),
+            store.clone(),
+        );
+        let mut source_id = None;
+        for index in 0..12 {
+            let mut node = node_record(&format!("reciprocal-pinned-projection-{index}"));
+            node.cluster_id = cluster_id.clone();
+            node.vpn_ip = VpnIp(IpAddr::V4(Ipv4Addr::new(
+                100,
+                64,
+                1,
+                u8::try_from(index + 1)?,
+            )));
+            if index == 0 {
+                node.tags.insert(Tag::kubernetes_control_plane());
+                source_id = Some(node.node_id.clone());
+            }
+            store.insert_node(node).await?;
+        }
+
+        let source_id = source_id.ok_or("source node was not created")?;
+        let map = plane.neighbor_map_for(&source_id).await?;
+        let topology_ids = map
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(map
+            .pinned_peers
+            .iter()
+            .all(|peer| !topology_ids.contains(&peer.node_id)));
+        assert_eq!(map.neighbors.len() + map.pinned_peers.len(), 11);
+        map.validate()?;
         Ok(())
     }
 
