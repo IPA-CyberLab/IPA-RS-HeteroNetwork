@@ -15,6 +15,7 @@ spec:
     - cloud-a.heterocloud.mizuame.app
     - cloud-b.heterocloud.mizuame.app
     - cloud-c.heterocloud.mizuame.app
+    - cloud-d.heterocloud.mizuame.app
   rules:
     - matches:
         - path:
