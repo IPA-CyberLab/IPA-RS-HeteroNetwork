@@ -2343,6 +2343,17 @@ proxy_config_matches_backends() {
   [[ "$(grep -c '^    server db-' "$config")" == "$count" ]]
 }
 
+proxy_only_overlay_ready() {
+  local vpn_ip="$1"
+  local expected_backends="$2"
+  local config="/etc/heteronetwork/postgres-ha/haproxy.cfg"
+  [[ -f "$config" && ! -L "$config" ]] || return 1
+  grep -Fq "bind $vpn_ip:$manifest_postgres_port" "$config" \
+    && grep -Fq "bind $vpn_ip:$manifest_rest_port" "$config" \
+    && proxy_config_matches_backends "$expected_backends" \
+    && systemctl is-active --quiet heteronetwork-db-proxy.service
+}
+
 member_overlay_proxy_ready() {
   local vpn_ip="$1"
   local config="/etc/heteronetwork/postgres-ha/haproxy.cfg"
@@ -2972,14 +2983,14 @@ apply_local_proxy_bundle() {
   if [[ "$applied_digest" == "$digest" \
     && -f /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt \
     && ! -L /etc/ssl/certs/heteronetwork-postgres-ha-ca.crt ]] \
-    && systemctl is-active --quiet heteronetwork-db-proxy.service \
-    && proxy_config_matches_backends "$overlay_proxy_backends"; then
+    && proxy_only_overlay_ready "$local_vpn_ip" "$overlay_proxy_backends"; then
     return 0
   fi
   log "applying proxy-only database topology revision $manifest_revision"
   HETERONETWORK_DB_PROXY_BACKENDS="$overlay_proxy_backends" \
+  HETERONETWORK_DB_PROXY_LISTEN_ADDRESS="$local_vpn_ip" \
     run_helper_for_bundle "$bundle_dir" install-proxy
-  systemctl is-active --quiet heteronetwork-db-proxy.service || return 1
+  proxy_only_overlay_ready "$local_vpn_ip" "$overlay_proxy_backends" || return 1
   printf '%s\n' "$digest" >"$proxy_applied_digest_path"
   chmod 0600 "$proxy_applied_digest_path"
 }
@@ -3894,11 +3905,9 @@ JSON
       [[ "${2:-}" == "install-proxy" ]]
       [[ "$HETERONETWORK_DB_PROXY_BACKENDS" == \
         "db-a=10.250.0.2,db-b=10.250.0.3,db-c=10.250.0.10" ]]
+      [[ "$HETERONETWORK_DB_PROXY_LISTEN_ADDRESS" == "10.250.0.10" ]]
     }
-    proxy_config_matches_backends() { return 0; }
-    systemctl() {
-      [[ "${1:-}" == "is-active" ]]
-    }
+    proxy_only_overlay_ready() { return 0; }
     apply_local_proxy_bundle 10.250.0.10
     [[ -s "$proxy_applied_digest_path" ]]
   )

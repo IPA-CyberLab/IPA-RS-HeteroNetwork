@@ -3,6 +3,7 @@ Description=HeteroNetwork automatic PostgreSQL HA placement and reconciliation
 Wants=network-online.target
 After=network-online.target heteronetwork-agent.service
 Requires=heteronetwork-agent.service
+PartOf=heteronetwork-agent.service
 StartLimitIntervalSec=0
 
 [Service]
