@@ -94,7 +94,13 @@ sudo -E scripts/kubeadm-ha-node.sh prepare
 `prepare` installs Kubernetes from the signed `pkgs.k8s.io` v1.36 repository,
 configures containerd with the systemd cgroup driver and CRI enabled, loads
 `overlay` and `br_netfilter`, enables forwarding, and starts the dedicated API
-load balancer. It also enables `heteronetwork-overlay-dns.service`, which
+load balancer. It also enables
+`heteronetwork-kubernetes-pod-routing.service`. The service installs a
+destination-priority policy rule for the Pod CIDR before any interface-specific
+source rule, ensuring that host-network processes and NodeLocal DNS send
+DNATed Service traffic through Flannel instead of a site's physical LAN routing
+table. This is required on multi-homed nodes whose netplan configuration uses
+source-based routing. `prepare` also enables `heteronetwork-overlay-dns.service`, which
 idempotently registers `heteronetwork.internal` as a route-only domain on
 `heteronetwork0` with `systemd-resolved`. The service follows Agent restarts and
 removes its per-link resolver state when stopped. An existing Docker-provided
@@ -116,6 +122,16 @@ sudo -E scripts/kubeadm-ha-node.sh configure-overlay-dns
 The command preserves existing NSS databases, installs `libnss-resolve` when
 needed, and verifies the private console name through the normal host resolver.
 It is safe to rerun with the same inputs.
+
+To install or repair only the Pod CIDR policy rule on an existing Kubernetes
+node, use the same per-node environment as `prepare`:
+
+```bash
+sudo -E scripts/kubeadm-ha-node.sh reconcile-pod-routing
+```
+
+The command is idempotent and persists the rule through systemd. It is also run
+automatically by `reconcile-control-plane-backends`.
 
 Host swap remains available to non-Pod processes. kubelet uses
 `failSwapOn: false` with `NoSwap`, so Kubernetes workloads cannot consume it.
@@ -209,3 +225,61 @@ services before testing another node.
 
 Do not stop two stacked-etcd members at once. A three-member etcd cluster only
 tolerates one failed member.
+
+## Expand an existing cluster to five control planes
+
+Use an odd-sized etcd membership. To promote two existing workers, first set the
+same five-address backend list on every Kubernetes host and reconcile the local
+HAProxy and split-DNS configuration:
+
+```bash
+export HETERONETWORK_KUBEADM_NODE_IP=<this-node-vpn-ip>
+export HETERONETWORK_KUBEADM_NODE_NAME=<this-node-name>
+export HETERONETWORK_KUBEADM_CONTROL_PLANES=10.250.0.6,10.250.0.8,10.250.0.10,10.250.0.4,10.250.0.5
+sudo -E scripts/kubeadm-ha-node.sh reconcile-control-plane-backends
+```
+
+Refresh and securely transfer a control-plane join bundle from a healthy
+control plane. Cordon and drain one target worker at a time, delete its stale
+Node object, then run the explicit promotion command on that host:
+
+```bash
+export HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER=1
+sudo -E scripts/kubeadm-ha-node.sh promote-control-plane
+```
+
+The command records an in-progress marker, preserves non-system Node labels,
+resets the worker kubeadm state, and rejoins it with a stacked etcd member. It
+also removes the control-plane scheduling taint and the external load-balancer
+exclusion label so the promoted worker keeps its previous workload role. It can
+be retried after a failed join and refuses to reset a worker unless the
+confirmation variable is set. Wait for the new API server and etcd member to
+become healthy before promoting the next worker. A five-member etcd cluster
+tolerates two failed members; a four-member intermediate state still tolerates
+only one. The local API proxy checks `/readyz`, so an API server whose local etcd
+is alive but unable to serve requests is removed from client traffic.
+
+### Keep API servers off overloaded local etcd clients
+
+Stacked etcd membership remains one member per control-plane host. On a small
+control-plane host with sustained disk I/O pressure, the local etcd member can
+miss the API server's startup deadline even while the etcd quorum remains
+healthy. In that case, point only that host's API server client at three healthy
+stacked-etcd members over HeteroNetwork:
+
+```bash
+set -a
+source /etc/heteronetwork/kubernetes/node.env
+set +a
+export HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS=10.250.0.6,10.250.0.8,10.250.0.10
+sudo -E /opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-apiserver-etcd
+```
+
+Every selected address must also be in
+`HETERONETWORK_KUBEADM_CONTROL_PLANES`, and at least three unique addresses are
+required. The command atomically updates the static API server manifest, waits
+for its local `/readyz`, and records the setting in `node.env`. It does not
+remove or replace the host's etcd member, so a five-member etcd cluster retains
+its two-member failure tolerance. Use this only for API servers whose local
+etcd client is affected by persistent host I/O pressure; healthy control planes
+should continue using `https://127.0.0.1:2379`.

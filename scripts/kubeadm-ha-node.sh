@@ -17,6 +17,7 @@ readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
 readonly MIN_IPV4_MTU="576"
+readonly POD_CIDR_POLICY_PRIORITY="50"
 readonly FLANNEL_MANIFEST_SHA256="d078019743c5e0194ce965125fc80ef00af0c1661ec9e12396311f1cfec860a2"
 readonly FLANNEL_MANIFEST_URL="https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml"
 
@@ -25,6 +26,7 @@ node_ip="${HETERONETWORK_KUBEADM_NODE_IP:-}"
 node_name="${HETERONETWORK_KUBEADM_NODE_NAME:-}"
 control_plane_backends="${HETERONETWORK_KUBEADM_CONTROL_PLANES:-}"
 preferred_control_plane="${HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE:-}"
+apiserver_etcd_backends="${HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS:-}"
 api_name="${HETERONETWORK_KUBEADM_API_NAME:-$DEFAULT_API_NAME}"
 api_proxy_port="${HETERONETWORK_KUBEADM_API_PROXY_PORT:-$DEFAULT_API_PROXY_PORT}"
 pod_cidr="${HETERONETWORK_KUBEADM_POD_CIDR:-$DEFAULT_POD_CIDR}"
@@ -47,7 +49,13 @@ Commands:
   refresh-worker-join-bundle
                          Rotate worker-only kubeadm join credentials
   join-control-plane     Join this host as another stacked-etcd control-plane node
+  promote-control-plane  Reset an existing worker and rejoin it as a control plane
   join-worker            Join this host as a regular worker node
+  reconcile-control-plane-backends
+                         Update the local API proxy and split-DNS control-plane set
+  reconcile-apiserver-etcd
+                         Point the local API server at selected stacked-etcd members
+  reconcile-pod-routing Reconcile host-network traffic routing to the Flannel Pod CIDR
   install-flannel        Install pinned Flannel on the initialized cluster
   finalize               Allow workloads on control-plane nodes and wait for readiness
   verify-host            Verify the local HeteroNetwork and Kubernetes prerequisites
@@ -60,24 +68,28 @@ Commands:
 Required environment for prepare/init/join:
   HETERONETWORK_KUBEADM_NODE_IP
   HETERONETWORK_KUBEADM_CONTROL_PLANES   Comma-separated HeteroNetwork IPv4 addresses
-  HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE
-                                         Optional API backend preferred by every local proxy
 
 Optional environment:
   HETERONETWORK_KUBEADM_INTERFACE        Default: heteronetwork0
   HETERONETWORK_KUBEADM_NODE_NAME        Default: normalized short hostname
+  HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE
+                                         API backend preferred by every local proxy
   HETERONETWORK_KUBEADM_API_NAME         Default: k8s-api.heteronetwork.internal
   HETERONETWORK_KUBEADM_API_PROXY_PORT   Default: 7443
   HETERONETWORK_KUBEADM_POD_CIDR         Default: 10.244.0.0/16
   HETERONETWORK_KUBEADM_SERVICE_CIDR     Default: 10.96.0.0/12
   HETERONETWORK_KUBEADM_KUBERNETES_MINOR Default: v1.36
   HETERONETWORK_KUBEADM_MAX_PODS          Default: 240 (must fit the CNI node CIDR)
+  HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS
+                                         Comma-separated control-plane VPN IPv4 addresses
   HETERONETWORK_KUBEADM_JOIN_BUNDLE      Default: state-dir/join-bundle.json
   HETERONETWORK_KUBEADM_WORKER_JOIN_BUNDLE
                                          Default: state-dir/worker-join-bundle.json
   HETERONETWORK_KUBEADM_AGENT_API_TOKEN_PATH
                                          Default: state-dir/agent-api-token
   HETERONETWORK_AGENT_STATE_PATH          Default: /var/lib/heteronetwork/agent.json
+  HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER
+                                         Must be 1 for promote-control-plane
 
 The join bundle contains credentials. Keep it root-owned with mode 0600 and transfer it
 over an authenticated channel. Commands do not print tokens or certificate keys.
@@ -166,6 +178,40 @@ backend_addresses() {
     seen[$raw]=1
     printf '%s\n' "$raw"
   done
+}
+
+apiserver_etcd_addresses() {
+  [[ -n "$apiserver_etcd_backends" ]] \
+    || die "at least three API server etcd endpoints are required"
+
+  local raw backend
+  local -a values
+  local -A control_planes=()
+  local -A seen=()
+  while IFS= read -r backend; do
+    control_planes[$backend]=1
+  done < <(backend_addresses)
+  IFS=, read -r -a values <<<"$apiserver_etcd_backends"
+  ((${#values[@]} >= 3)) || die "at least three API server etcd endpoints are required"
+
+  for raw in "${values[@]}"; do
+    [[ "$raw" == "${raw//[[:space:]]/}" ]] \
+      || die "API server etcd endpoints must not contain whitespace"
+    validate_ipv4 "$raw"
+    [[ -n "${control_planes[$raw]:-}" ]] \
+      || die "API server etcd endpoint is not a control-plane address: $raw"
+    [[ -z "${seen[$raw]:-}" ]] || die "duplicate API server etcd endpoint: $raw"
+    seen[$raw]=1
+    printf '%s\n' "$raw"
+  done
+}
+
+render_apiserver_etcd_servers() {
+  local address rendered=""
+  while IFS= read -r address; do
+    rendered="${rendered:+${rendered},}https://${address}:2379"
+  done < <(apiserver_etcd_addresses)
+  printf '%s\n' "$rendered"
 }
 
 validate_common_config() {
@@ -282,8 +328,8 @@ frontend kubernetes_api
     default_backend kubernetes_control_planes
 
 backend kubernetes_control_planes
-    option httpchk GET /livez
-    http-check expect rstatus ^[234]
+    option httpchk GET /readyz
+    http-check expect status 200
     default-server check check-ssl verify none inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
 EOF
   local backend backup preferred_backend
@@ -329,6 +375,69 @@ render_kubelet_dropin() {
 [Unit]
 Wants=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
 After=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
+EOF
+}
+
+render_pod_cidr_routing_helper() {
+  cat <<'EOF'
+#!/bin/sh
+set -eu
+
+action="${1:-}"
+pod_cidr="${2:-}"
+priority="${3:-}"
+
+[ -n "$pod_cidr" ] || {
+  echo "missing Pod CIDR" >&2
+  exit 2
+}
+case "$priority" in
+  ''|*[!0-9]*)
+    echo "invalid policy-routing priority" >&2
+    exit 2
+    ;;
+esac
+
+remove_rule() {
+  while /usr/sbin/ip -4 rule delete \
+    priority "$priority" to "$pod_cidr" lookup main 2>/dev/null; do
+    :
+  done
+}
+
+case "$action" in
+  apply)
+    remove_rule
+    /usr/sbin/ip -4 rule add priority "$priority" to "$pod_cidr" lookup main
+    /usr/sbin/ip -4 route flush cache
+    ;;
+  remove)
+    remove_rule
+    /usr/sbin/ip -4 route flush cache
+    ;;
+  *)
+    echo "Usage: $0 apply|remove POD_CIDR PRIORITY" >&2
+    exit 2
+    ;;
+esac
+EOF
+}
+
+render_pod_cidr_routing_service() {
+  cat <<EOF
+[Unit]
+Description=HeteroNetwork Kubernetes Pod CIDR policy routing
+After=network-pre.target
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/kubernetes-pod-cidr-routing apply ${pod_cidr} ${POD_CIDR_POLICY_PRIORITY}
+ExecStop=/opt/heteronetwork/libexec/kubernetes-pod-cidr-routing remove ${pod_cidr} ${POD_CIDR_POLICY_PRIORITY}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
 }
 
@@ -844,6 +953,44 @@ EOF
   sysctl --system >/dev/null
 }
 
+verify_pod_cidr_policy_rule() {
+  ip -4 rule show | awk -v priority="${POD_CIDR_POLICY_PRIORITY}:" -v pod_cidr="$pod_cidr" '
+    $1 == priority {
+      for (field = 1; field < NF; field++) {
+        if ($field == "to" && $(field + 1) == pod_cidr && $(NF - 1) == "lookup" && $NF == "main") {
+          found = 1
+        }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' || die "Pod CIDR $pod_cidr is not pinned to the main routing table at priority $POD_CIDR_POLICY_PRIORITY"
+}
+
+configure_pod_cidr_routing() {
+  require_root
+  require_command ip
+  require_command systemctl
+  install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+  render_pod_cidr_routing_helper \
+    | install_from_stdin /opt/heteronetwork/libexec/kubernetes-pod-cidr-routing 0755
+  render_pod_cidr_routing_service \
+    | install_from_stdin /etc/systemd/system/heteronetwork-kubernetes-pod-routing.service 0644
+  systemctl daemon-reload
+  systemctl enable heteronetwork-kubernetes-pod-routing.service >/dev/null
+  systemctl restart heteronetwork-kubernetes-pod-routing.service
+  systemctl is-active --quiet heteronetwork-kubernetes-pod-routing.service \
+    || die "Kubernetes Pod CIDR policy routing did not become active"
+  verify_pod_cidr_policy_rule
+}
+
+reconcile_pod_cidr_routing() {
+  require_root
+  validate_common_config
+  configure_pod_cidr_routing
+  printf 'Pod CIDR policy routing reconciled for %s via main table priority %s\n' \
+    "$pod_cidr" "$POD_CIDR_POLICY_PRIORITY"
+}
+
 configure_haproxy() {
   render_haproxy_config | install_from_stdin "$state_dir/haproxy.cfg" 0644
   /usr/sbin/haproxy -c -f "$state_dir/haproxy.cfg" >/dev/null
@@ -920,6 +1067,7 @@ HETERONETWORK_KUBEADM_NODE_IP=${node_ip}
 HETERONETWORK_KUBEADM_NODE_NAME=${node_name}
 HETERONETWORK_KUBEADM_CONTROL_PLANES=${control_plane_backends}
 HETERONETWORK_KUBEADM_PREFERRED_CONTROL_PLANE=${preferred_control_plane}
+HETERONETWORK_KUBEADM_APISERVER_ETCD_ENDPOINTS=${apiserver_etcd_backends}
 HETERONETWORK_KUBEADM_API_NAME=${api_name}
 HETERONETWORK_KUBEADM_API_PROXY_PORT=${api_proxy_port}
 HETERONETWORK_KUBEADM_POD_CIDR=${pod_cidr}
@@ -1027,6 +1175,7 @@ prepare_host() {
   install -d -o root -g root -m 0700 "$state_dir"
   install_kubernetes_packages
   configure_kernel
+  configure_pod_cidr_routing
   configure_containerd
   configure_hosts_entry
   configure_overlay_dns
@@ -1036,6 +1185,67 @@ prepare_host() {
   ensure_agent_api_token
   install_public_services_bootstrap_autopilot
   verify_host
+}
+
+reconcile_control_plane_backends() {
+  require_root
+  validate_common_config
+  verify_interface_address
+  require_command systemctl
+  configure_hosts_entry
+  configure_overlay_dns
+  configure_haproxy
+  configure_pod_cidr_routing
+  configure_local_state
+  if [[ -n "$apiserver_etcd_backends" && -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
+    reconcile_apiserver_etcd
+  fi
+  verify_host
+  printf 'control-plane backends reconciled for %s\n' "$node_name"
+}
+
+reconcile_apiserver_etcd() {
+  require_root
+  validate_control_plane_config
+  require_command awk
+  require_command curl
+  local manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
+  [[ -f "$manifest" && ! -L "$manifest" ]] \
+    || die "kube-apiserver static Pod manifest is missing or is a symlink"
+
+  local endpoints current desired temporary mode
+  endpoints="$(render_apiserver_etcd_servers)"
+  desired="    - --etcd-servers=${endpoints}"
+  current="$(grep -E '^    - --etcd-servers=' "$manifest" || true)"
+  [[ "$(grep -Ec '^    - --etcd-servers=' "$manifest")" == "1" ]] \
+    || die "kube-apiserver manifest must contain exactly one etcd-servers argument"
+  configure_local_state
+  if [[ "$current" != "$desired" ]]; then
+    temporary="$(mktemp)"
+    if ! awk -v replacement="$desired" '
+      /^    - --etcd-servers=/ { print replacement; next }
+      { print }
+    ' "$manifest" >"$temporary"; then
+      rm -f "$temporary"
+      die "failed to render the kube-apiserver manifest"
+    fi
+    mode="$(stat -c '%a' "$manifest")"
+    install -o root -g root -m "$mode" "$temporary" "$manifest"
+    rm -f "$temporary"
+  fi
+
+  local attempt
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    if curl --fail --silent --show-error \
+      --connect-timeout 2 --max-time 5 \
+      --cacert /etc/kubernetes/pki/ca.crt \
+      "https://${node_ip}:6443/readyz" >/dev/null 2>&1; then
+      printf 'API server etcd endpoints reconciled on %s\n' "$node_name"
+      return
+    fi
+    sleep 2
+  done
+  die "local API server did not become ready after reconciling etcd endpoints"
 }
 
 installed_kubernetes_version() {
@@ -1198,6 +1408,87 @@ join_control_plane() {
   configure_root_kubeconfig
 }
 
+filter_preserved_node_labels() {
+  jq -ce '
+    .metadata.labels // {}
+    | with_entries(select(
+        .key
+        | test("^(kubernetes\\.io/|beta\\.kubernetes\\.io/|node\\.kubernetes\\.io/|node-role\\.kubernetes\\.io/)")
+        | not
+      ))
+  '
+}
+
+snapshot_promoted_node_labels() {
+  local destination="$1"
+  local labels
+  labels="$(
+    kubectl \
+      --kubeconfig /etc/kubernetes/kubelet.conf \
+      --request-timeout=30s \
+      get node "$node_name" -o json \
+      | filter_preserved_node_labels
+  )" || die "failed to preserve labels from worker $node_name"
+  printf '%s\n' "$labels" | install_from_stdin "$destination" 0600
+}
+
+restore_promoted_node_labels() {
+  local source="$1"
+  local patch
+  if [[ -e "$source" ]]; then
+    [[ -f "$source" && ! -L "$source" ]] \
+      || die "preserved worker labels are not a regular file"
+    patch="$(jq -cn --slurpfile labels "$source" '{metadata: {labels: $labels[0]}}')"
+    kubectl --kubeconfig /etc/kubernetes/admin.conf \
+      patch node "$node_name" --type=merge --patch "$patch" >/dev/null
+  fi
+  kubectl --kubeconfig /etc/kubernetes/admin.conf \
+    label node "$node_name" node.kubernetes.io/exclude-from-external-load-balancers- \
+    >/dev/null 2>&1 || true
+  kubectl --kubeconfig /etc/kubernetes/admin.conf \
+    taint node "$node_name" node-role.kubernetes.io/control-plane- \
+    >/dev/null 2>&1 || true
+}
+
+promote_control_plane() {
+  require_root
+  validate_control_plane_config
+  verify_interface_address
+  require_command kubeadm
+  ensure_agent_api_token
+  [[ -f "$state_dir/node.env" ]] || die "run prepare before promote-control-plane"
+  local marker="$state_dir/control-plane-promotion.in-progress"
+  local preserved_labels="$state_dir/control-plane-promotion-labels.json"
+  if [[ -f /etc/kubernetes/admin.conf && ! -e "$marker" ]]; then
+    configure_root_kubeconfig
+    printf 'control plane is already joined\n'
+    return
+  fi
+  [[ "${HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER:-}" == "1" ]] \
+    || die "set HETERONETWORK_KUBEADM_PROMOTE_EXISTING_WORKER=1 after draining this worker"
+
+  if [[ ! -e "$marker" ]]; then
+    [[ -f /etc/kubernetes/kubelet.conf ]] \
+      || die "this host is not an existing Kubernetes worker"
+    require_command kubectl
+    require_command jq
+    snapshot_promoted_node_labels "$preserved_labels"
+    printf 'promotion requested for %s\n' "$node_name" \
+      | install_from_stdin "$marker" 0600
+  else
+    [[ -f "$marker" && ! -L "$marker" ]] \
+      || die "control-plane promotion marker is not a regular file"
+  fi
+
+  systemctl stop kubelet
+  kubeadm reset --force --cri-socket unix:///run/containerd/containerd.sock
+  join_control_plane
+  restore_promoted_node_labels "$preserved_labels"
+  rm -f "$marker"
+  rm -f "$preserved_labels"
+  printf 'worker %s promoted to a stacked-etcd control plane\n' "$node_name"
+}
+
 join_worker() {
   require_root
   validate_worker_config
@@ -1320,6 +1611,9 @@ verify_host() {
     [[ "$(sysctl -n net.ipv4.ip_forward)" == "1" ]] || die "IPv4 forwarding is disabled"
     [[ "$(sysctl -n net.bridge.bridge-nf-call-iptables)" == "1" ]] \
       || die "bridge netfilter is disabled"
+    systemctl is-active --quiet heteronetwork-kubernetes-pod-routing.service \
+      || die "Kubernetes Pod CIDR policy routing is inactive"
+    verify_pod_cidr_policy_rule
   fi
   printf 'host prerequisites verified for %s (%s on %s)\n' "$node_name" "$node_ip" "$interface"
 }
@@ -1516,6 +1810,7 @@ self_test() {
   node_name="control-plane-2"
   control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3"
   preferred_control_plane=""
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.3"
   api_name="k8s-api.heteronetwork.internal"
   api_proxy_port="7443"
   pod_cidr="10.244.0.0/16"
@@ -1523,6 +1818,21 @@ self_test() {
   kubernetes_minor="v1.36"
   state_dir="/etc/heteronetwork/kubernetes"
   validate_control_plane_config
+  rendered="$(render_apiserver_etcd_servers)"
+  [[ "$rendered" == "https://10.250.0.1:2379,https://10.250.0.2:2379,https://10.250.0.3:2379" ]]
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.99"
+  if (apiserver_etcd_addresses >/dev/null 2>&1); then
+    die "API server etcd validation accepted a non-control-plane address"
+  fi
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2"
+  if (apiserver_etcd_addresses >/dev/null 2>&1); then
+    die "API server etcd validation accepted fewer than three endpoints"
+  fi
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.2"
+  if (apiserver_etcd_addresses >/dev/null 2>&1); then
+    die "API server etcd validation accepted duplicate endpoints"
+  fi
+  apiserver_etcd_backends="10.250.0.1,10.250.0.2,10.250.0.3"
   kubernetes_versions_are_aligned "v1.36" "v1.36.2" "v1.36.2" "v1.36.2"
   if kubernetes_versions_are_aligned "v1.36" "v1.36.2" "v1.36.3" "v1.36.2"; then
     die "Kubernetes toolchain validation accepted mixed patch versions"
@@ -1536,8 +1846,8 @@ self_test() {
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
   grep -Fq 'option dontlog-normal' <<<"$rendered"
   grep -Fq 'option redispatch' <<<"$rendered"
-  grep -Fq 'option httpchk GET /livez' <<<"$rendered"
-  grep -Fq 'http-check expect rstatus ^[234]' <<<"$rendered"
+  grep -Fq 'option httpchk GET /readyz' <<<"$rendered"
+  grep -Fq 'http-check expect status 200' <<<"$rendered"
   grep -Fq 'default-server check check-ssl verify none' <<<"$rendered"
   preferred_control_plane="10.250.0.3"
   rendered="$(render_haproxy_config)"
@@ -1548,10 +1858,21 @@ self_test() {
   grep -Fq 'retries 2' <<<"$rendered"
   grep -Fq 'timeout connect 5s' <<<"$rendered"
   grep -Fq 'timeout check 5s' <<<"$rendered"
+  grep -Fxq '    option httpchk GET /readyz' <<<"$rendered"
+  grep -Fxq '    http-check expect status 200' <<<"$rendered"
+  grep -Fq 'default-server check check-ssl verify none' <<<"$rendered"
   grep -Fq 'fall 2 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
   grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3,10.250.0.4,10.250.0.5"
+  rendered="$(render_haproxy_config)"
+  [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "5" ]]
+  grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
+  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "4" ]]
+  control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3"
+  rendered="$(filter_preserved_node_labels <<< '{"metadata":{"labels":{"kubernetes.io/hostname":"worker-a","beta.kubernetes.io/arch":"amd64","node.kubernetes.io/exclude-from-external-load-balancers":"","node-role.kubernetes.io/control-plane":"","database.heteronetwork.io/proxy-ready":"true","workload.heteronetwork.io/capacity-tier":"high"}}}')"
+  [[ "$rendered" == '{"database.heteronetwork.io/proxy-ready":"true","workload.heteronetwork.io/capacity-tier":"high"}' ]]
   rendered="$(render_haproxy_service)"
   grep -Fq 'ExecReload=/bin/kill -USR2 $MAINPID' <<<"$rendered"
   rendered="$(render_overlay_dns_helper)"
@@ -1562,6 +1883,12 @@ self_test() {
   rendered="$(render_overlay_dns_service)"
   grep -Fq 'BindsTo=heteronetwork-agent.service' <<<"$rendered"
   grep -Fq 'PartOf=heteronetwork-agent.service' <<<"$rendered"
+  grep -Fq 'RemainAfterExit=yes' <<<"$rendered"
+  rendered="$(render_pod_cidr_routing_helper)"
+  grep -Fq 'ip -4 rule add priority "$priority" to "$pod_cidr" lookup main' <<<"$rendered"
+  rendered="$(render_pod_cidr_routing_service)"
+  grep -Fq 'Before=kubelet.service' <<<"$rendered"
+  grep -Fq 'apply 10.244.0.0/16 50' <<<"$rendered"
   grep -Fq 'RemainAfterExit=yes' <<<"$rendered"
   rendered="$(render_init_config v1.36.1)"
   grep -Fq 'controlPlaneEndpoint: "k8s-api.heteronetwork.internal:7443"' <<<"$rendered"
@@ -1674,7 +2001,11 @@ case "$command" in
   refresh-join-bundle) refresh_join_bundle ;;
   refresh-worker-join-bundle) refresh_worker_join_bundle ;;
   join-control-plane) join_control_plane ;;
+  promote-control-plane) promote_control_plane ;;
   join-worker) join_worker ;;
+  reconcile-control-plane-backends) reconcile_control_plane_backends ;;
+  reconcile-apiserver-etcd) reconcile_apiserver_etcd ;;
+  reconcile-pod-routing) reconcile_pod_cidr_routing ;;
   install-flannel) install_flannel ;;
   finalize) finalize_cluster ;;
   verify-host) verify_host ;;
