@@ -872,8 +872,20 @@ EOF
     || die "the host resolver did not use HeteroNetwork split DNS"
 }
 
+render_cloud_init_hosts_config() {
+  cat <<'EOF'
+# Managed by HeteroNetwork. The kubelet API endpoint is pinned to the local
+# HAProxy in /etc/hosts and must survive cloud-init's per-boot reconciliation.
+manage_etc_hosts: false
+EOF
+}
+
 configure_hosts_entry() {
   local temporary
+  if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+    render_cloud_init_hosts_config \
+      | install_from_stdin /etc/cloud/cloud.cfg.d/99-heteronetwork-hosts.cfg 0644
+  fi
   temporary="$(mktemp)"
   awk '$0 != "127.0.0.1 k8s-api.heteronetwork.internal # heteronetwork-kubeadm" && $0 !~ / # heteronetwork-kubeadm$/' /etc/hosts >"$temporary"
   printf '127.0.0.1 %s # heteronetwork-kubeadm\n' "$api_name" >>"$temporary"
@@ -1892,6 +1904,8 @@ self_test() {
   rendered="$(render_kubelet_dropin)"
   grep -Fq 'Wants=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service' <<<"$rendered"
   grep -Fq 'After=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service' <<<"$rendered"
+  rendered="$(render_cloud_init_hosts_config)"
+  grep -Fq 'manage_etc_hosts: false' <<<"$rendered"
   rendered="$(render_pod_cidr_routing_helper)"
   grep -Fq 'ip -4 rule add priority "$priority" to "$pod_cidr" lookup main' <<<"$rendered"
   rendered="$(render_pod_cidr_routing_service)"
