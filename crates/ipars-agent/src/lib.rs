@@ -4011,6 +4011,12 @@ impl AgentRuntime {
                     .neighbors
                     .iter()
                     .map(|neighbor| neighbor.node.node_id.clone())
+                    .chain(
+                        neighbor_map
+                            .pinned_peers
+                            .iter()
+                            .map(|peer| peer.node_id.clone()),
+                    )
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
@@ -4301,6 +4307,10 @@ impl AgentRuntime {
                 .neighbors
                 .iter()
                 .any(|neighbor| neighbor.node.node_id == *peer)
+                || neighbor_map
+                    .pinned_peers
+                    .iter()
+                    .any(|pinned| pinned.node_id == *peer)
             {
                 return true;
             }
@@ -4351,7 +4361,9 @@ impl AgentRuntime {
 
             let snapshot = {
                 let active_epochs = self.active_overlay_topology_epochs().await;
-                let active_neighbor_ids = self.active_overlay_neighbor_ids().await;
+                let mut active_direct_peer_ids = self.active_overlay_neighbor_ids().await;
+                active_direct_peer_ids
+                    .extend(self.lazy_connect.read().await.direct_pinned_peer_ids());
                 let current_routing_epoch = self.current_overlay_routing_epoch().await;
                 let resolved = self.resolved_overlay_paths.read().await;
                 let resolved_overlay_peers = resolved
@@ -4361,7 +4373,7 @@ impl AgentRuntime {
                         active_epochs.contains(&lease.path.topology_epoch)
                             && Some(lease.path.routing_epoch) == current_routing_epoch
                     })
-                    .filter(|(peer, _)| !active_neighbor_ids.contains(*peer))
+                    .filter(|(peer, _)| !active_direct_peer_ids.contains(*peer))
                     .map(|(peer, _)| peer.clone())
                     .collect::<BTreeSet<_>>();
                 Arc::new(OverlayShortcutSnapshot {
@@ -8368,6 +8380,15 @@ impl LazyConnectManager {
 
     fn has_activity(&self, peer: &NodeId) -> bool {
         self.last_used.contains_key(peer)
+    }
+
+    fn direct_pinned_peer_ids(&self) -> BTreeSet<NodeId> {
+        self.pins
+            .iter()
+            .chain(&self.observed_policy_pins)
+            .chain(&self.topology_pins)
+            .cloned()
+            .collect()
     }
 
     fn is_durably_pinned(&self, peer: &NodeId) -> bool {
@@ -13485,7 +13506,7 @@ mod tests {
         let mut state = AgentNodeState::generate(Utc::now());
         let local_node = state.node_id.clone();
         state.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 8, 8))));
-        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
         let neighbor = peer_record(
             NodeId::from_string("backbone-neighbor"),
             IpAddr::V4(Ipv4Addr::new(100, 64, 8, 10)),
@@ -13494,14 +13515,29 @@ mod tests {
             Vec::new(),
         );
         runtime
-            .record_neighbor_map_snapshot(bounded_neighbor_map(local_node, vec![neighbor], 7))
+            .record_neighbor_map_snapshot(bounded_neighbor_map(
+                local_node.clone(),
+                vec![neighbor],
+                7,
+            ))
             .await?;
 
+        let control_plane_id = NodeId::from_string("kubernetes-control-plane");
+        let direct_endpoint = SocketAddr::from(([8, 8, 8, 8], 51_820));
+        let direct_candidate = EndpointCandidate {
+            node_id: control_plane_id.clone(),
+            kind: EndpointCandidateKind::PublicUdp,
+            addr: direct_endpoint,
+            observed_at: Utc::now(),
+            priority: 100,
+            cost: 1,
+            source: CandidateSource::ControlPlane,
+        };
         let mut control_plane = peer_record(
-            NodeId::from_string("kubernetes-control-plane"),
+            control_plane_id.clone(),
             IpAddr::V4(Ipv4Addr::new(100, 64, 8, 11)),
             "wg-kubernetes-control-plane",
-            Vec::new(),
+            vec![direct_candidate.clone()],
             Vec::new(),
         );
         control_plane.tags.insert(Tag::kubernetes_control_plane());
@@ -13510,6 +13546,48 @@ mod tests {
             .await;
 
         assert!(runtime.should_connect_peer(&control_plane).await);
+        runtime
+            .upsert_overlay_forwarder_endpoint(
+                control_plane_id.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 52_120)),
+            )
+            .await;
+        runtime
+            .record_resolved_overlay_path(
+                bounded_overlay_path(local_node, control_plane.clone(), control_plane.vpn_ip.0, 7),
+                Utc::now(),
+            )
+            .await?;
+        runtime
+            .record_path_probe(
+                AgentPathProbeRequest {
+                    peer: control_plane_id.clone(),
+                    selected_state: PathState::DirectPublic,
+                    selected_candidate: Some(direct_candidate),
+                    relay_node: None,
+                    metrics: PathMetrics {
+                        latency_ms: Some(1.0),
+                        loss_ppm: 0,
+                        jitter_ms: Some(0.1),
+                        relay_load: None,
+                        stability: 1.0,
+                    },
+                    policy_allowed: true,
+                    cost: 1,
+                    pin: false,
+                },
+                Utc::now(),
+            )
+            .await?;
+
+        let shortcuts = runtime.overlay_shortcut_snapshot().await;
+        assert!(!shortcuts.requires_overlay_forwarder(&control_plane_id));
+        assert_eq!(
+            RuntimePeerEndpointResolver::new(runtime)
+                .endpoint_for_peer(&control_plane)
+                .await?,
+            Some(direct_endpoint.to_string())
+        );
         Ok(())
     }
 
