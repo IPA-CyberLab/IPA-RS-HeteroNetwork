@@ -58,6 +58,11 @@ a strict zero-failed-request HA criterion.
    PostgreSQL proxy while the proxy Service used `internalTrafficPolicy:
    Local`. Flow commit `14780e3` changes it to `Cluster`; Argo CD applied the
    change and the six crash-looping Pods recovered.
+6. HeteroCloud's `capacity-tier=high` hard selector left two of four API and
+   worker replicas Pending when one high-capacity node was already offline.
+   HeteroCloud commit `ed05297` keeps database proxy readiness mandatory but
+   makes the capacity tier a scheduling preference. Argo CD converged both
+   Deployments to 4/4 across four hosts.
 
 The first targeted regression reboot at 06:04:37 UTC confirmed that the
 cloud-init guard in `515af89` was insufficient and again required manual host
@@ -78,6 +83,8 @@ at 06:13:36 UTC. Without manual intervention:
 - etcd: 5/5 endpoints healthy, 15-93 ms in the final check
 - Flow Deployments: all desired replicas Ready
 - Flow Redis StatefulSet: 3/3 Ready
+- HeteroCloud API and worker Deployments: 4/4 Ready each after scheduling
+  remediation
 - HeteroNetwork Web UI over the VPN: 36/36 source/destination combinations
   returned HTTP 200 across the six Ready nodes
 - Each direct Flow origin (`.51`, `.52`, `.53`, `.61`): 20/20 HTTP 200
@@ -90,15 +97,12 @@ at 06:13:36 UTC. Without manual intervention:
 
 1. `mizuame` is still offline. This run proves the six-node active set, not the
    unavailable seventh Kubernetes node.
-2. HeteroCloud requests four API and four worker replicas, but only two of each
-   are schedulable with the current capacity-tier constraints. A single reboot
-   therefore leaves only one available replica.
-3. Flow uses multiple direct A records because TURN cannot sit behind the
+2. Flow uses multiple direct A records because TURN cannot sit behind the
    normal Cloudflare HTTP proxy. DNS does not remove an unhealthy origin, so a
    client can still select a rebooting public node. Health-aware authoritative
    DNS or a separate health-managed API hostname is required for a strict
    zero-failed-request objective.
-4. The initial public-node reboots produced 500/502/503 responses while Pods,
+3. The initial public-node reboots produced 500/502/503 responses while Pods,
    etcd, Keycloak, and gateways converged. Retries reduce user-visible impact,
    but they do not make the current result zero-downtime.
 
