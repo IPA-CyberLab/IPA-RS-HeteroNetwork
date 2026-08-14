@@ -42,6 +42,8 @@ const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const WEB_UI_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WEB_UI_MANAGEMENT_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEVICE_LOGIN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEVICE_LOGIN_ENDPOINT_ATTEMPTS: usize = 3;
+const DEVICE_LOGIN_RETRY_DELAY: Duration = Duration::from_millis(750);
 const MAX_WEB_UI_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_WEB_UI_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODE_INSTALL_PROXY_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
@@ -784,49 +786,74 @@ async fn start_device_login(
     let (code_verifier, code_challenge) = device_login_pkce();
     let mut failures = Vec::new();
     let mut started = None;
-    for candidate in &providers {
-        let response = match state
-            .control_plane_client
-            .post(candidate.device_url.clone())
-            .header(header::HOST, candidate.host_header.clone())
-            .header(header::ACCEPT, "application/json")
-            .form(&[
-                ("client_id", candidate.client_id.as_str()),
-                ("scope", candidate.scopes.as_str()),
-                ("code_challenge", code_challenge.as_str()),
-                ("code_challenge_method", "S256"),
-            ])
-            .timeout(
-                state
-                    .control_plane_request_timeout
-                    .min(DEVICE_LOGIN_ENDPOINT_TIMEOUT),
-            )
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                failures.push(format!("{}: {error}", candidate.device_url));
-                continue;
-            }
-        };
-        if response.status().is_success() {
-            started = Some((candidate.clone(), response));
-            break;
+    'attempts: for attempt in 1..=DEVICE_LOGIN_ENDPOINT_ATTEMPTS {
+        let mut requests = JoinSet::new();
+        for candidate in providers.iter().cloned() {
+            let client = state.control_plane_client.clone();
+            let code_challenge = code_challenge.clone();
+            let timeout = state
+                .control_plane_request_timeout
+                .min(DEVICE_LOGIN_ENDPOINT_TIMEOUT);
+            requests.spawn(async move {
+                let response = client
+                    .post(candidate.device_url.clone())
+                    .header(header::HOST, candidate.host_header.clone())
+                    .header(header::ACCEPT, "application/json")
+                    .form(&[
+                        ("client_id", candidate.client_id.as_str()),
+                        ("scope", candidate.scopes.as_str()),
+                        ("code_challenge", code_challenge.as_str()),
+                        ("code_challenge_method", "S256"),
+                    ])
+                    .timeout(timeout)
+                    .send()
+                    .await;
+                (candidate, response)
+            });
         }
-        if response.status().is_server_error() {
+        let mut fatal_status = None;
+        while let Some(result) = requests.join_next().await {
+            let (candidate, response) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push(format!("attempt {attempt} task failed: {error}"));
+                    continue;
+                }
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!(
+                        "attempt {attempt} {}: {error}",
+                        candidate.device_url
+                    ));
+                    continue;
+                }
+            };
+            if response.status().is_success() {
+                requests.abort_all();
+                started = Some((candidate, response));
+                break 'attempts;
+            }
+            if !response.status().is_server_error() {
+                fatal_status.get_or_insert(response.status());
+            }
             failures.push(format!(
-                "{}: HTTP {}",
+                "attempt {attempt} {}: HTTP {}",
                 candidate.device_url,
                 response.status()
             ));
-            continue;
         }
-        return Err(AgentError::ControlPlaneClient(format!(
-            "Keycloak device authorization request returned HTTP {}",
-            response.status()
-        ))
-        .into());
+        if let Some(status) = fatal_status {
+            return Err(AgentError::ControlPlaneClient(format!(
+                "Keycloak device authorization request returned HTTP {}",
+                status
+            ))
+            .into());
+        }
+        if attempt < DEVICE_LOGIN_ENDPOINT_ATTEMPTS {
+            tokio::time::sleep(DEVICE_LOGIN_RETRY_DELAY).await;
+        }
     }
     let (selected_provider, response) = started.ok_or_else(|| {
         AgentError::ControlPlaneClient(format!(
@@ -4660,6 +4687,7 @@ mod tests {
         issuer_url: String,
         verification_origin: String,
         device_authorization_form: Arc<tokio::sync::Mutex<Option<BTreeMap<String, String>>>>,
+        device_authorization_failures_remaining: Arc<AtomicUsize>,
         device_token_calls: Arc<AtomicUsize>,
         device_token_forms: Arc<tokio::sync::Mutex<Vec<BTreeMap<String, String>>>>,
         refresh_token_calls: Arc<AtomicUsize>,
@@ -4689,7 +4717,20 @@ mod tests {
     async fn web_ui_test_device_authorization(
         State(state): State<WebUiTestBackend>,
         axum::extract::Form(form): axum::extract::Form<BTreeMap<String, String>>,
-    ) -> Json<Value> {
+    ) -> Response {
+        if state
+            .device_authorization_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "temporarily_unavailable"})),
+            )
+                .into_response();
+        }
         *state.device_authorization_form.lock().await = Some(form);
         Json(json!({
             "device_code": "device-code",
@@ -4699,6 +4740,7 @@ mod tests {
             "expires_in": 60,
             "interval": 1
         }))
+        .into_response()
     }
 
     async fn web_ui_test_device_token(
@@ -4823,6 +4865,7 @@ mod tests {
                 .map(|origin| origin.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| base_url.clone()),
             device_authorization_form: Arc::new(tokio::sync::Mutex::new(None)),
+            device_authorization_failures_remaining: Arc::new(AtomicUsize::new(0)),
             device_token_calls: Arc::new(AtomicUsize::new(0)),
             device_token_forms: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             refresh_token_calls: Arc::new(AtomicUsize::new(0)),
@@ -5973,6 +6016,82 @@ mod tests {
             .await?;
         assert_eq!(stale_replay.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(backend.refresh_token_calls.load(Ordering::SeqCst), 1);
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_web_ui_retries_transient_keycloak_device_authorization_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (backend_url, backend, backend_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        backend
+            .device_authorization_failures_remaining
+            .store(1, Ordering::SeqCst);
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(
+            AgentHttpState::with_control_plane_urls(runtime, vec![backend_url])
+                .enable_local_web_ui(true),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            backend
+                .device_authorization_failures_remaining
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(backend.device_authorization_form.lock().await.is_some());
+
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_web_ui_device_login_does_not_wait_for_a_stalled_ha_endpoint(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (stalled_url, stalled_task) = spawn_stalled_http_service().await?;
+        let (backend_url, backend, backend_task) =
+            spawn_web_ui_test_backend(StatusCode::OK).await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(
+            AgentHttpState::with_control_plane_urls(runtime, vec![stalled_url, backend_url])
+                .enable_local_web_ui(true),
+        );
+        let started_at = Instant::now();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(4),
+            "healthy HA endpoint was blocked by a stalled endpoint"
+        );
+        assert!(backend.device_authorization_form.lock().await.is_some());
+        stalled_task.abort();
         backend_task.abort();
         Ok(())
     }

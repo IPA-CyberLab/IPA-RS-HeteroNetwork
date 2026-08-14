@@ -83,6 +83,7 @@ fn current_agent_build_info() -> AgentBuildInfo {
 }
 
 const MAX_PATH_CHANGE_EVENTS: usize = 1024;
+pub const MAX_BOOTSTRAP_PEER_CACHE_PEERS: usize = 8;
 const DEFAULT_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SYSTEM_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
@@ -187,6 +188,10 @@ pub struct AgentNodeState {
     pub control_plane_seed_urls: Vec<String>,
     #[serde(default)]
     pub web_ui_seed_urls: Vec<String>,
+    /// A bounded, non-authoritative peer subset used only to restore an overlay route to the
+    /// control plane after the host loses its in-kernel WireGuard state.
+    #[serde(default)]
+    pub bootstrap_peer_cache: Option<PeerMap>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -207,6 +212,7 @@ impl AgentNodeState {
             seed_bootstrap_endpoints: Some(Vec::new()),
             control_plane_seed_urls: Vec::new(),
             web_ui_seed_urls: Vec::new(),
+            bootstrap_peer_cache: None,
             created_at: now,
             updated_at: now,
         }
@@ -274,6 +280,14 @@ impl AgentNodeState {
         }
         validate_control_plane_seed_urls(&self.control_plane_seed_urls)?;
         validate_web_ui_seed_urls(&self.web_ui_seed_urls)?;
+        if let Some(peer_map) = &self.bootstrap_peer_cache {
+            let expected_cluster = self
+                .registered_node
+                .as_ref()
+                .map(|node| &node.cluster_id)
+                .unwrap_or(&peer_map.cluster_id);
+            validate_bootstrap_peer_cache(peer_map, &self.node_id, expected_cluster)?;
+        }
         if let Some(node) = &self.registered_node {
             if node.node_id != self.node_id {
                 return Err(AgentError::InvalidState(format!(
@@ -2078,6 +2092,31 @@ impl AgentRuntime {
         Ok(Some(state.clone()))
     }
 
+    pub fn replace_bootstrap_peer_cache(
+        &self,
+        peer_map: &PeerMap,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AgentNodeState>, AgentError> {
+        let local_node = self.state().node_id;
+        let Some(cache) = bootstrap_peer_map_cache(peer_map, &local_node)? else {
+            return Ok(None);
+        };
+        let mut state = match self.state.write() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state
+            .bootstrap_peer_cache
+            .as_ref()
+            .is_some_and(|current| bootstrap_peer_cache_recovery_eq(current, &cache))
+        {
+            return Ok(None);
+        }
+        state.bootstrap_peer_cache = Some(cache);
+        state.updated_at = updated_at;
+        Ok(Some(state.clone()))
+    }
+
     pub fn upsert_web_ui_seed_url(
         &self,
         url: String,
@@ -3691,6 +3730,24 @@ impl AgentRuntime {
             .collect::<BTreeSet<_>>();
         let active_epochs = self.active_overlay_topology_epochs().await;
         let current_routing_epoch = self.current_overlay_routing_epoch().await;
+        let direct_peer_ids = self
+            .latest_neighbor_map
+            .read()
+            .await
+            .as_ref()
+            .map(|neighbor_map| {
+                neighbor_map
+                    .neighbors
+                    .iter()
+                    .map(|neighbor| neighbor.node.node_id.clone())
+                    .chain(
+                        neighbor_map
+                            .pinned_peers
+                            .iter()
+                            .map(|peer| peer.node_id.clone()),
+                    )
+                    .collect::<BTreeSet<_>>()
+            });
         let resolved_peer_ids = self
             .resolved_overlay_paths
             .read()
@@ -3706,7 +3763,10 @@ impl AgentRuntime {
         let mut lazy_connect = self.lazy_connect.write().await;
         lazy_connect.retain_observed_peers(&peer_ids);
         for peer in peers {
-            if resolved_peer_ids.contains(&peer.node_id) {
+            let is_direct_peer = direct_peer_ids
+                .as_ref()
+                .is_none_or(|direct_peer_ids| direct_peer_ids.contains(&peer.node_id));
+            if resolved_peer_ids.contains(&peer.node_id) || !is_direct_peer {
                 lazy_connect.observe_overlay_shortcut(peer, &local_route_cidrs);
             } else {
                 lazy_connect.observe_peer(peer, &local_route_cidrs);
@@ -3888,23 +3948,26 @@ impl AgentRuntime {
     }
 
     pub async fn retained_overlay_neighbors(&self) -> Vec<NodeRecord> {
-        let current_neighbor_ids = self
-            .latest_neighbor_map
-            .read()
-            .await
-            .as_ref()
-            .map(|neighbor_map| {
+        let current_topology_pins = self.latest_neighbor_map.read().await.as_ref().map_or_else(
+            BTreeSet::new,
+            |neighbor_map| {
                 neighbor_map
                     .neighbors
                     .iter()
                     .map(|neighbor| neighbor.node.node_id.clone())
+                    .chain(
+                        neighbor_map
+                            .pinned_peers
+                            .iter()
+                            .map(|peer| peer.node_id.clone()),
+                    )
                     .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
+            },
+        );
         let now = Instant::now();
         let mut retained = self.retained_neighbor_maps.write().await;
         retained.retain(|previous| previous.expires_at > now);
-        let mut selected_ids = current_neighbor_ids;
+        let mut selected_ids = current_topology_pins;
         let mut selected = Vec::new();
         for previous in retained.iter().rev() {
             for neighbor in &previous.neighbors {
@@ -3913,6 +3976,11 @@ impl AgentRuntime {
                 }
             }
         }
+        drop(retained);
+        self.lazy_connect
+            .write()
+            .await
+            .replace_topology_pins(selected_ids);
         selected
     }
 
@@ -4374,15 +4442,15 @@ impl AgentRuntime {
 
     pub async fn should_connect_peer(&self, peer: &NodeRecord) -> bool {
         let lazy_connect = self.lazy_connect.read().await;
-        if !lazy_connect.should_connect_peer(peer) {
+        let non_topology_pinned = lazy_connect.is_non_topology_pinned(&peer.node_id);
+        let topology_pinned = lazy_connect.is_topology_pinned(&peer.node_id);
+        let recently_active = lazy_connect.has_activity(&peer.node_id);
+        if !non_topology_pinned && !topology_pinned && !recently_active {
             return false;
         }
-        // Pinned peers are deliberately outside the bounded, on-demand part of
-        // the overlay. The control plane also projects reciprocal pins so the
-        // receiving side keeps an active WireGuard key and AllowedIPs entry.
         if peer.role.is_client()
             || lazy_connect.is_pinned_by_policy(&peer.role, &peer.tags)
-            || lazy_connect.is_pinned(&peer.node_id)
+            || non_topology_pinned
         {
             return true;
         }
@@ -4394,16 +4462,22 @@ impl AgentRuntime {
             .neighbors
             .iter()
             .any(|neighbor| neighbor.node.node_id == peer.node_id)
+            || neighbor_map
+                .pinned_peers
+                .iter()
+                .any(|pinned| pinned.node_id == peer.node_id)
         {
             return true;
         }
-        if self
-            .retained_overlay_neighbors()
-            .await
-            .iter()
-            .any(|neighbor| neighbor.node_id == peer.node_id)
-        {
-            return true;
+        if topology_pinned {
+            if self
+                .retained_overlay_neighbors()
+                .await
+                .iter()
+                .any(|neighbor| neighbor.node_id == peer.node_id)
+            {
+                return true;
+            }
         }
         let active_epochs = self.active_overlay_topology_epochs().await;
         let current_routing_epoch = self.current_overlay_routing_epoch().await;
@@ -6930,6 +7004,13 @@ pub trait PeerMapSink: Send + Sync {
         &self,
         peer_map: PeerMap,
     ) -> Result<PeerMapApplySummary, AgentError>;
+
+    async fn apply_bootstrap_peer_map_update(
+        &self,
+        peer_map: PeerMap,
+    ) -> Result<PeerMapApplySummary, AgentError> {
+        self.apply_peer_map_update(peer_map).await
+    }
 }
 
 #[async_trait]
@@ -7661,6 +7742,102 @@ where
             routes_removed,
         })
     }
+
+    /// Adds only the direct peers and host routes needed to regain the control plane. Unlike an
+    /// authoritative peer-map application, this deliberately leaves existing peers and routes
+    /// untouched until a fresh signed map can reconcile the complete data plane.
+    pub async fn apply_bootstrap_peer_map(
+        &self,
+        peer_map: PeerMap,
+    ) -> Result<PeerMapApplySummary, AgentError> {
+        let _apply_guard = self.apply_lock.lock().await;
+        let local_state = self
+            .lazy_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                AgentError::InvalidState(
+                    "bootstrap peer recovery requires the agent runtime".to_string(),
+                )
+            })?
+            .state();
+        let expected_cluster = local_state
+            .registered_node
+            .as_ref()
+            .map(|node| &node.cluster_id)
+            .unwrap_or(&peer_map.cluster_id);
+        validate_bootstrap_peer_cache(&peer_map, &local_state.node_id, expected_cluster)?;
+        self.wireguard
+            .configure_private_key(&local_state.wireguard_private_key_b64)
+            .await?;
+        self.endpoint_resolver.prepare_for_peer_map().await?;
+
+        let mut configs = Vec::with_capacity(peer_map.peers.len());
+        let mut routes = Vec::with_capacity(peer_map.peers.len());
+        for peer in &peer_map.peers {
+            if local_state.wireguard_public_key_b64 == peer.wireguard_public_key {
+                return Err(AgentError::WireGuard(format!(
+                    "bootstrap peer {} reuses the local WireGuard public key",
+                    peer.node_id
+                )));
+            }
+            let endpoint = self.endpoint_resolver.endpoint_for_peer(peer).await?;
+            if endpoint.is_none() {
+                return Err(AgentError::WireGuard(format!(
+                    "bootstrap peer {} has no directly usable endpoint",
+                    peer.node_id
+                )));
+            }
+            let persistent_keepalive_seconds = self
+                .endpoint_resolver
+                .persistent_keepalive_seconds_for_peer(peer, endpoint.as_deref())
+                .await?;
+            configs.push(WireGuardPeerConfig {
+                peer: peer.node_id.clone(),
+                public_key: peer.wireguard_public_key.clone(),
+                endpoint,
+                allowed_ips: vec![peer_overlay_cidr(&peer.vpn_ip)],
+                persistent_keepalive_seconds,
+            });
+            routes.push(peer_host_route(peer)?);
+        }
+        let route_plan = RoutePlan {
+            owner: RoutePlanOwner::PeerMap,
+            interface: self.interface.clone(),
+            mtu_lock: self.route_mtu_lock,
+            routes,
+            policy_rules: Vec::new(),
+        };
+        validate_route_plan(&route_plan)?;
+
+        for config in configs {
+            self.wireguard.upsert_peer(config.clone()).await?;
+            self.applied_peers
+                .write()
+                .await
+                .insert(config.peer.clone(), config.public_key);
+            self.applied_active_peers.write().await.insert(config.peer);
+        }
+        let routes_applied = route_plan.routes.len();
+        if routes_applied > 0 {
+            self.route_manager.apply_routes(route_plan.clone()).await?;
+        }
+        let mut applied_routes = self.applied_routes.write().await;
+        for route in route_plan.routes {
+            let peer_routes = applied_routes
+                .entry(route.advertised_by.clone())
+                .or_default();
+            if !peer_routes.contains(&route) {
+                peer_routes.push(route);
+            }
+        }
+
+        Ok(PeerMapApplySummary {
+            peers_applied: peer_map.peers.len(),
+            peers_removed: 0,
+            routes_applied,
+            routes_removed: 0,
+        })
+    }
 }
 
 #[async_trait]
@@ -7674,6 +7851,13 @@ where
         peer_map: PeerMap,
     ) -> Result<PeerMapApplySummary, AgentError> {
         self.apply_peer_map(peer_map).await
+    }
+
+    async fn apply_bootstrap_peer_map_update(
+        &self,
+        peer_map: PeerMap,
+    ) -> Result<PeerMapApplySummary, AgentError> {
+        self.apply_bootstrap_peer_map(peer_map).await
     }
 }
 
@@ -7876,6 +8060,165 @@ fn validate_local_advertised_routes(
     Ok(())
 }
 
+pub fn bootstrap_peer_map_cache(
+    peer_map: &PeerMap,
+    local_node: &NodeId,
+) -> Result<Option<PeerMap>, AgentError> {
+    validate_join_token_bootstrap_endpoints(&peer_map.bootstrap_endpoints).map_err(|error| {
+        AgentError::InvalidState(format!(
+            "peer-map bootstrap endpoints are invalid: {}",
+            error.reason()
+        ))
+    })?;
+
+    let control_plane_role = Role::control_plane();
+    let kubernetes_control_plane = Tag::kubernetes_control_plane();
+    let route_provider = Tag::route_provider();
+    let mut peers = peer_map
+        .peers
+        .iter()
+        .enumerate()
+        .filter(|(_, peer)| &peer.node_id != local_node && preferred_endpoint(peer).is_some())
+        .map(|(index, peer)| {
+            let priority = if peer.role == control_plane_role
+                || peer.tags.contains(&kubernetes_control_plane)
+            {
+                0
+            } else if peer.tags.contains(&route_provider) {
+                1
+            } else if peer
+                .relay_capability
+                .as_ref()
+                .is_some_and(|relay| relay.enabled_by_policy && relay.public_endpoint.is_some())
+            {
+                2
+            } else {
+                3
+            };
+            (priority, index, peer.clone())
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by_key(|(priority, index, _)| (*priority, *index));
+    peers.truncate(MAX_BOOTSTRAP_PEER_CACHE_PEERS);
+
+    let peers = peers
+        .into_iter()
+        .map(|(_, _, mut peer)| {
+            // Host routes are sufficient to recover the authoritative map and avoid retaining
+            // stale workload routes across a reboot.
+            peer.routes.clear();
+            peer
+        })
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return Ok(None);
+    }
+
+    let cache = PeerMap {
+        cluster_id: peer_map.cluster_id.clone(),
+        peers,
+        bootstrap_endpoints: peer_map.bootstrap_endpoints.clone(),
+        generated_at: peer_map.generated_at,
+    };
+    validate_bootstrap_peer_cache(&cache, local_node, &peer_map.cluster_id)?;
+    Ok(Some(cache))
+}
+
+fn bootstrap_peer_cache_recovery_eq(left: &PeerMap, right: &PeerMap) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.bootstrap_endpoints == right.bootstrap_endpoints
+        && left.peers.len() == right.peers.len()
+        && left.peers.iter().zip(&right.peers).all(|(left, right)| {
+            left.node_id == right.node_id
+                && left.cluster_id == right.cluster_id
+                && left.vpn_ip == right.vpn_ip
+                && left.identity_public_key == right.identity_public_key
+                && left.wireguard_public_key == right.wireguard_public_key
+                && left.role == right.role
+                && left.tags == right.tags
+                && left.endpoint_candidates.len() == right.endpoint_candidates.len()
+                && left
+                    .endpoint_candidates
+                    .iter()
+                    .zip(&right.endpoint_candidates)
+                    .all(|(left, right)| {
+                        selected_candidate_path_identity_eq(Some(left), Some(right))
+                    })
+        })
+}
+
+fn validate_bootstrap_peer_cache(
+    peer_map: &PeerMap,
+    local_node: &NodeId,
+    expected_cluster: &ipars_types::ClusterId,
+) -> Result<(), AgentError> {
+    if peer_map.cluster_id != *expected_cluster {
+        return Err(AgentError::InvalidState(format!(
+            "bootstrap peer cache belongs to cluster {} instead of {}",
+            peer_map.cluster_id, expected_cluster
+        )));
+    }
+    if peer_map.peers.is_empty() || peer_map.peers.len() > MAX_BOOTSTRAP_PEER_CACHE_PEERS {
+        return Err(AgentError::InvalidState(format!(
+            "bootstrap peer cache must contain between 1 and {MAX_BOOTSTRAP_PEER_CACHE_PEERS} peers"
+        )));
+    }
+    validate_join_token_bootstrap_endpoints(&peer_map.bootstrap_endpoints).map_err(|error| {
+        AgentError::InvalidState(format!(
+            "bootstrap peer cache endpoints are invalid: {}",
+            error.reason()
+        ))
+    })?;
+
+    let mut node_ids = BTreeSet::new();
+    let mut vpn_ips = BTreeSet::new();
+    let mut wireguard_keys = BTreeSet::new();
+    for peer in &peer_map.peers {
+        if peer.cluster_id != peer_map.cluster_id {
+            return Err(AgentError::InvalidState(format!(
+                "bootstrap peer {} belongs to cluster {} instead of {}",
+                peer.node_id, peer.cluster_id, peer_map.cluster_id
+            )));
+        }
+        if &peer.node_id == local_node {
+            return Err(AgentError::InvalidState(format!(
+                "bootstrap peer cache cannot contain local node {local_node}"
+            )));
+        }
+        if !node_ids.insert(peer.node_id.clone()) {
+            return Err(AgentError::InvalidState(format!(
+                "bootstrap peer cache repeats node {}",
+                peer.node_id
+            )));
+        }
+        if !vpn_ips.insert(peer.vpn_ip) {
+            return Err(AgentError::InvalidState(format!(
+                "bootstrap peer cache repeats VPN address {}",
+                peer.vpn_ip
+            )));
+        }
+        validate_wireguard_public_key(&peer.wireguard_public_key)?;
+        if !wireguard_keys.insert(peer.wireguard_public_key.clone()) {
+            return Err(AgentError::InvalidState(
+                "bootstrap peer cache repeats a WireGuard public key".to_string(),
+            ));
+        }
+        if !peer.routes.is_empty() {
+            return Err(AgentError::InvalidState(format!(
+                "bootstrap peer {} must not retain advertised routes",
+                peer.node_id
+            )));
+        }
+        if preferred_endpoint(peer).is_none() {
+            return Err(AgentError::InvalidState(format!(
+                "bootstrap peer {} has no usable direct endpoint",
+                peer.node_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn preferred_endpoint(peer: &NodeRecord) -> Option<String> {
     peer.endpoint_candidates
         .iter()
@@ -8011,6 +8354,20 @@ impl LazyConnectManager {
             || self.observed_policy_pins.contains(peer)
             || self.observed_route_pins.contains(peer)
             || self.topology_pins.contains(peer)
+    }
+
+    fn is_non_topology_pinned(&self, peer: &NodeId) -> bool {
+        self.pins.contains(peer)
+            || self.observed_policy_pins.contains(peer)
+            || self.observed_route_pins.contains(peer)
+    }
+
+    fn is_topology_pinned(&self, peer: &NodeId) -> bool {
+        self.topology_pins.contains(peer)
+    }
+
+    fn has_activity(&self, peer: &NodeId) -> bool {
+        self.last_used.contains_key(peer)
     }
 
     fn is_durably_pinned(&self, peer: &NodeId) -> bool {
@@ -9334,6 +9691,76 @@ mod tests {
         assert!(!manager.should_connect_peer(&relay));
         assert!(!manager.should_connect_peer(&ordinary));
         assert_eq!(manager.metrics().pinned_peer_count, 4);
+    }
+
+    #[test]
+    fn bootstrap_peer_cache_is_bounded_and_prioritizes_control_plane_peers(
+    ) -> Result<(), AgentError> {
+        let local_node = NodeId::from_string("local-node");
+        let mut peers = Vec::new();
+        for index in 0..12_u8 {
+            let node_id = NodeId::from_string(format!("peer-{index}"));
+            let wireguard = WireGuardKeyPair::generate();
+            let mut peer = peer_record(
+                node_id.clone(),
+                IpAddr::V4(Ipv4Addr::new(100, 64, 0, index.saturating_add(2))),
+                &wireguard.public_key_b64,
+                vec![reflexive_candidate(
+                    &node_id,
+                    SocketAddr::from(([8, 8, 4, index.saturating_add(1)], 51820)),
+                )],
+                vec![Route {
+                    id: format!("route-{index}"),
+                    cidr: format!("10.{index}.0.0/16").parse().map_err(|error| {
+                        AgentError::RoutePlanning(format!("test route is invalid: {error}"))
+                    })?,
+                    advertised_by: node_id.clone(),
+                    via: Some(node_id),
+                    metric: 10,
+                    tags: BTreeSet::new(),
+                }],
+            );
+            if index == 11 {
+                peer.tags.insert(Tag::kubernetes_control_plane());
+            }
+            peers.push(peer);
+        }
+        let peer_map = PeerMap {
+            cluster_id: ClusterId::from_string("cluster-a"),
+            peers,
+            bootstrap_endpoints: Vec::new(),
+            generated_at: Utc::now(),
+        };
+
+        let cache = bootstrap_peer_map_cache(&peer_map, &local_node)?
+            .ok_or_else(|| AgentError::InvalidState("cache should not be empty".to_string()))?;
+
+        assert_eq!(cache.peers.len(), MAX_BOOTSTRAP_PEER_CACHE_PEERS);
+        assert!(cache
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == NodeId::from_string("peer-11")));
+        assert!(cache.peers.iter().all(|peer| peer.routes.is_empty()));
+        validate_bootstrap_peer_cache(&cache, &local_node, &peer_map.cluster_id)?;
+
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        assert!(runtime
+            .replace_bootstrap_peer_cache(&peer_map, Utc::now())?
+            .is_some());
+        let mut refreshed = peer_map.clone();
+        refreshed.generated_at += chrono::Duration::seconds(1);
+        for peer in &mut refreshed.peers {
+            for candidate in &mut peer.endpoint_candidates {
+                candidate.observed_at += chrono::Duration::seconds(1);
+            }
+        }
+        assert!(runtime
+            .replace_bootstrap_peer_cache(&refreshed, Utc::now())?
+            .is_none());
+        Ok(())
     }
 
     #[test]
@@ -11893,6 +12320,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&preferred_route]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_peer_map_adds_recovery_path_without_pruning_existing_peers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let wireguard = MemoryWireGuardBackend::default();
+        let existing_peer = NodeId::from_string("existing-peer");
+        wireguard
+            .upsert_peer(WireGuardPeerConfig {
+                peer: existing_peer.clone(),
+                public_key: WireGuardKeyPair::generate().public_key_b64,
+                endpoint: Some("8.8.8.8:51820".to_string()),
+                allowed_ips: vec!["100.64.0.9/32".to_string()],
+                persistent_keepalive_seconds: Some(25),
+            })
+            .await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let recovery_peer = NodeId::from_string("recovery-peer");
+        let recovery_key = WireGuardKeyPair::generate().public_key_b64;
+        let peer = peer_record(
+            recovery_peer.clone(),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 10)),
+            &recovery_key,
+            vec![EndpointCandidate {
+                node_id: recovery_peer.clone(),
+                kind: EndpointCandidateKind::PublicUdp,
+                addr: SocketAddr::from(([8, 8, 4, 4], 51820)),
+                observed_at: Utc::now(),
+                priority: 100,
+                cost: 1,
+                source: CandidateSource::ControlPlane,
+            }],
+            Vec::new(),
+        );
+        let applier = PeerMapApplier::new("ipars0", wireguard, RecordingRouteManager::default())
+            .with_lazy_connect_runtime(runtime);
+
+        let summary = applier
+            .apply_bootstrap_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: vec![peer],
+                bootstrap_endpoints: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(summary.peers_applied, 1);
+        assert_eq!(summary.peers_removed, 0);
+        assert_eq!(summary.routes_applied, 1);
+        assert_eq!(summary.routes_removed, 0);
+        let peers = applier.wireguard.peers.read().await;
+        assert!(peers.contains_key(&existing_peer));
+        assert!(peers.contains_key(&recovery_peer));
+        assert!(applier.route_manager.removed.read().await.is_empty());
+        assert!(applier
+            .route_manager
+            .managed_removed
+            .read()
+            .await
+            .is_empty());
         Ok(())
     }
 

@@ -9152,6 +9152,7 @@ async fn run_agent(
             &store,
             &response.peer_map.bootstrap_endpoints,
         )?;
+        persist_agent_bootstrap_peer_cache(runtime.as_ref(), &store, &response.peer_map)?;
         runtime
             .replace_local_advertised_routes(response.node.routes.clone())
             .await
@@ -10898,7 +10899,7 @@ async fn start_peer_map_sync(
                 DryRunLinuxRouteManager,
             );
             let applier = configure_peer_map_endpoint_resolver(args, runtime.clone(), applier)?;
-            start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
+            start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await
         }
     }
 }
@@ -12625,7 +12626,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with Linux command runtime backend"
     );
-    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await
 }
 
 async fn start_peer_map_sync_with_kernel_wireguard<R>(
@@ -12662,7 +12663,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with kernel WireGuard netlink backend"
     );
-    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await
 }
 
 async fn start_peer_map_sync_with_command_wireguard_netlink_routes<W>(
@@ -12699,7 +12700,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with command WireGuard and kernel route netlink backends"
     );
-    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await
 }
 
 async fn start_peer_map_sync_with_userspace_wireguard<W, R>(
@@ -12737,7 +12738,7 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with userspace WireGuard command backend"
     );
-    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await
 }
 
 async fn start_peer_map_sync_with_boringtun<W, R>(
@@ -12817,7 +12818,8 @@ where
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with in-process BoringTun userspace backend"
     );
-    let mut handle = start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)?;
+    let mut handle =
+        start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await?;
     handle.telemetry_source = Some(telemetry);
     Ok(handle)
 }
@@ -12852,7 +12854,7 @@ async fn start_peer_map_sync_with_kernel_backends(
         linux_netns = ?args.linux_netns,
         "starting peer-map sync with kernel WireGuard and route netlink backends"
     );
-    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier)
+    start_peer_map_sync_with_sink(args, runtime, control_plane_urls, applier).await
 }
 
 fn kernel_wireguard_backend(
@@ -12926,7 +12928,7 @@ where
     Ok(applier.with_lazy_connect_runtime(runtime))
 }
 
-fn start_peer_map_sync_with_sink<A>(
+async fn start_peer_map_sync_with_sink<A>(
     args: &AgentArgs,
     runtime: Arc<AgentRuntime>,
     control_plane_urls: Vec<String>,
@@ -12935,6 +12937,9 @@ fn start_peer_map_sync_with_sink<A>(
 where
     A: PeerMapSink + 'static,
 {
+    let restored_from_cache =
+        restore_bootstrap_peer_cache(runtime.as_ref(), &sink, args.wireguard_interface.as_str())
+            .await;
     let sync = PeerMapSync::new(
         runtime.state().node_id.clone(),
         HttpPeerMapSource::new(
@@ -12948,12 +12953,47 @@ where
     let interval = Duration::from_secs(args.peer_map_poll_interval_seconds);
     let interface = args.wireguard_interface.clone();
     let peer_map_sync_notify = runtime.peer_map_sync_notifier();
+    let task_notify = peer_map_sync_notify.clone();
+    let task = tokio::spawn(async move {
+        run_peer_map_sync_loop(sync, interval, interface, peer_map_sync_notify).await;
+    });
+    if restored_from_cache {
+        task_notify.notify_one();
+    }
     Ok(PeerMapSyncHandle {
-        task: tokio::spawn(async move {
-            run_peer_map_sync_loop(sync, interval, interface, peer_map_sync_notify).await;
-        }),
+        task,
         telemetry_source: None,
     })
+}
+
+async fn restore_bootstrap_peer_cache<A>(runtime: &AgentRuntime, sink: &A, interface: &str) -> bool
+where
+    A: PeerMapSink,
+{
+    let Some(peer_map) = runtime.state().bootstrap_peer_cache else {
+        return false;
+    };
+    match sink.apply_bootstrap_peer_map_update(peer_map).await {
+        Ok(summary) => {
+            tracing::info!(
+                peers_applied = summary.peers_applied,
+                peers_removed = summary.peers_removed,
+                routes_applied = summary.routes_applied,
+                routes_removed = summary.routes_removed,
+                interface,
+                "restored bootstrap peers from the persisted cache"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                interface,
+                "failed to restore persisted bootstrap peers; continuing with control-plane polling"
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20879,12 +20919,15 @@ impl PeerMapSource for HttpPeerMapSource {
             }
             merge_resolved_overlay_peer(&mut peers, peer);
         }
-        Ok(PeerMap {
+        let peer_map = PeerMap {
             cluster_id: neighbor_map.cluster_id,
             peers,
             bootstrap_endpoints: neighbor_map.bootstrap_endpoints,
             generated_at: neighbor_map.generated_at,
-        })
+        };
+        persist_agent_bootstrap_peer_cache(self.runtime.as_ref(), &self.state_store, &peer_map)
+            .map_err(|error| AgentError::ControlPlaneClient(format!("{error:#}")))?;
+        Ok(peer_map)
     }
 }
 
@@ -21585,6 +21628,23 @@ fn persist_agent_control_plane_seed_urls(
     store
         .save(&state)
         .context("failed to persist trusted control-plane seed URLs")?;
+    Ok(true)
+}
+
+fn persist_agent_bootstrap_peer_cache(
+    runtime: &AgentRuntime,
+    store: &FileAgentStateStore,
+    peer_map: &PeerMap,
+) -> anyhow::Result<bool> {
+    let Some(state) = runtime
+        .replace_bootstrap_peer_cache(peer_map, chrono::Utc::now())
+        .context("failed to update the Agent bootstrap peer cache")?
+    else {
+        return Ok(false);
+    };
+    store
+        .save(&state)
+        .context("failed to persist the Agent bootstrap peer cache")?;
     Ok(true)
 }
 
@@ -23638,6 +23698,56 @@ mod tests {
                 routes_removed: 0,
             })
         }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingBootstrapPeerMapSink {
+        applied: Arc<tokio::sync::Mutex<Vec<PeerMap>>>,
+    }
+
+    #[async_trait]
+    impl PeerMapSink for RecordingBootstrapPeerMapSink {
+        async fn apply_peer_map_update(
+            &self,
+            peer_map: PeerMap,
+        ) -> Result<ipars_agent::PeerMapApplySummary, AgentError> {
+            self.applied.lock().await.push(peer_map);
+            Ok(ipars_agent::PeerMapApplySummary {
+                peers_applied: 1,
+                peers_removed: 0,
+                routes_applied: 1,
+                routes_removed: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_bootstrap_peers_are_restored_before_control_plane_polling(
+    ) -> anyhow::Result<()> {
+        let mut state = AgentNodeState::generate(Utc::now());
+        let mut peer = node_record("bootstrap-control-plane");
+        peer.wireguard_public_key = ipars_crypto::WireGuardKeyPair::generate().public_key_b64;
+        peer.role = Role::control_plane();
+        peer.endpoint_candidates = vec![candidate(
+            peer.node_id.as_str(),
+            EndpointCandidateKind::PublicUdp,
+            10,
+        )];
+        let source = PeerMap {
+            cluster_id: peer.cluster_id.clone(),
+            peers: vec![peer],
+            bootstrap_endpoints: Vec::new(),
+            generated_at: Utc::now(),
+        };
+        let cache = ipars_agent::bootstrap_peer_map_cache(&source, &state.node_id)?
+            .context("bootstrap peer cache should be created")?;
+        state.bootstrap_peer_cache = Some(cache.clone());
+        let runtime = AgentRuntime::new(state, ClusterPolicy::default());
+        let sink = RecordingBootstrapPeerMapSink::default();
+
+        assert!(restore_bootstrap_peer_cache(&runtime, &sink, "heteronetwork0").await);
+        assert_eq!(sink.applied.lock().await.as_slice(), &[cache]);
+        Ok(())
     }
 
     #[tokio::test]

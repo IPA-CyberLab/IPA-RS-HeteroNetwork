@@ -11,7 +11,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
-use ipars_agent::{merge_bootstrap_endpoint_sets, AgentNodeState, FileAgentStateStore};
+use ipars_agent::{
+    bootstrap_peer_map_cache, merge_bootstrap_endpoint_sets, AgentNodeState, FileAgentStateStore,
+};
 use ipars_crypto::{
     node_id_from_public_key_b64, validate_node_api_request_nonce,
     validate_wireguard_public_key_b64, verify_client_registration_bundle_signature,
@@ -2098,6 +2100,7 @@ fn prepare_init_relay_agent(
             seed_bootstrap_endpoints: Some(Vec::new()),
             control_plane_seed_urls: Vec::new(),
             web_ui_seed_urls: Vec::new(),
+            bootstrap_peer_cache: None,
             created_at: now,
             updated_at: now,
         })
@@ -2664,6 +2667,7 @@ fn persist_joined_agent_state(
         seed_bootstrap_endpoints,
         control_plane_seed_urls,
         web_ui_seed_urls: Vec::new(),
+        bootstrap_peer_cache: bootstrap_peer_map_cache(&response.peer_map, &identity.node_id())?,
         created_at: now,
         updated_at: now,
     };
