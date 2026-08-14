@@ -63,6 +63,7 @@ Commands:
   configure-api-ha       Reconcile API health checks and kubelet HA endpoint
   reconcile-kubelet-api  Route kubelet through the local HA API proxy
   reconcile-kubelet-dns  Limit kubelet's upstream resolver list to three stable entries
+  reconcile-api-host     Restore the local API hostname after cloud-init and before kubelet
   self-test              Run non-privileged renderer and validation checks
 
 Required environment for prepare/init/join:
@@ -874,23 +875,104 @@ EOF
 
 render_cloud_init_hosts_config() {
   cat <<'EOF'
-# Managed by HeteroNetwork. The kubelet API endpoint is pinned to the local
-# HAProxy in /etc/hosts and must survive cloud-init's per-boot reconciliation.
+# Managed by HeteroNetwork. This prevents cloud-init from reconciling
+# /etc/hosts unless higher-precedence instance user-data explicitly overrides it.
 manage_etc_hosts: false
 EOF
 }
 
+render_kube_api_hosts_helper() {
+  cat <<'EOF'
+#!/bin/sh
+set -eu
+
+action="${1:-}"
+api_name="${2:-}"
+hosts_path=/etc/hosts
+marker='# heteronetwork-kubeadm'
+
+case "$api_name" in
+  ''|*[!A-Za-z0-9.-]*)
+    echo "invalid Kubernetes API hostname: $api_name" >&2
+    exit 2
+    ;;
+esac
+
+case "$action" in
+  ensure)
+    [ -f "$hosts_path" ] && [ ! -L "$hosts_path" ] || {
+      echo "$hosts_path must be a regular file" >&2
+      exit 1
+    }
+    temporary="$(mktemp /etc/hosts.heteronetwork.XXXXXX)"
+    cleanup() {
+      [ -z "$temporary" ] || rm -f "$temporary"
+    }
+    trap cleanup EXIT HUP INT TERM
+    awk -v marker="$marker" 'index($0, marker) == 0 { print }' "$hosts_path" >"$temporary"
+    printf '127.0.0.1 %s %s\n' "$api_name" "$marker" >>"$temporary"
+    chown root:root "$temporary"
+    chmod 0644 "$temporary"
+    if cmp -s "$temporary" "$hosts_path"; then
+      exit 0
+    fi
+    mv "$temporary" "$hosts_path"
+    temporary=''
+    ;;
+  verify)
+    grep -Fxq "127.0.0.1 $api_name $marker" "$hosts_path"
+    ;;
+  *)
+    echo "Usage: $0 ensure|verify API_NAME" >&2
+    exit 2
+    ;;
+esac
+EOF
+}
+
+render_kube_api_hosts_service() {
+  cat <<EOF
+[Unit]
+Description=HeteroNetwork Kubernetes API hostname
+After=local-fs.target cloud-init-local.service cloud-init.service
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/heteronetwork/libexec/kubernetes-api-hosts ensure ${api_name}
+ExecStartPost=/opt/heteronetwork/libexec/kubernetes-api-hosts verify ${api_name}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_kube_api_hosts_kubelet_dropin() {
+  cat <<'EOF'
+[Unit]
+Requires=heteronetwork-kube-api-host.service
+After=heteronetwork-kube-api-host.service
+EOF
+}
+
 configure_hosts_entry() {
-  local temporary
+  require_command systemctl
   if [[ -d /etc/cloud/cloud.cfg.d ]]; then
     render_cloud_init_hosts_config \
       | install_from_stdin /etc/cloud/cloud.cfg.d/99-heteronetwork-hosts.cfg 0644
   fi
-  temporary="$(mktemp)"
-  awk '$0 != "127.0.0.1 k8s-api.heteronetwork.internal # heteronetwork-kubeadm" && $0 !~ / # heteronetwork-kubeadm$/' /etc/hosts >"$temporary"
-  printf '127.0.0.1 %s # heteronetwork-kubeadm\n' "$api_name" >>"$temporary"
-  install -o root -g root -m 0644 "$temporary" /etc/hosts
-  rm -f "$temporary"
+  install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
+  install -d -o root -g root -m 0755 /etc/systemd/system/kubelet.service.d
+  render_kube_api_hosts_helper \
+    | install_from_stdin /opt/heteronetwork/libexec/kubernetes-api-hosts 0755
+  render_kube_api_hosts_service \
+    | install_from_stdin /etc/systemd/system/heteronetwork-kube-api-host.service 0644
+  render_kube_api_hosts_kubelet_dropin \
+    | install_from_stdin /etc/systemd/system/kubelet.service.d/15-heteronetwork-api-host.conf 0644
+  systemctl daemon-reload
+  systemctl enable heteronetwork-kube-api-host.service >/dev/null
+  systemctl restart heteronetwork-kube-api-host.service
 }
 
 configure_containerd() {
@@ -1906,6 +1988,18 @@ self_test() {
   grep -Fq 'After=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service' <<<"$rendered"
   rendered="$(render_cloud_init_hosts_config)"
   grep -Fq 'manage_etc_hosts: false' <<<"$rendered"
+  rendered="$(render_kube_api_hosts_helper)"
+  grep -Fq 'mktemp /etc/hosts.heteronetwork.XXXXXX' <<<"$rendered"
+  grep -Fq '127.0.0.1 %s %s' <<<"$rendered"
+  grep -Fq 'cmp -s "$temporary" "$hosts_path"' <<<"$rendered"
+  api_name="k8s-api.heteronetwork.internal"
+  rendered="$(render_kube_api_hosts_service)"
+  grep -Fq 'After=local-fs.target cloud-init-local.service cloud-init.service' <<<"$rendered"
+  grep -Fq 'Before=kubelet.service' <<<"$rendered"
+  grep -Fq 'ExecStart=/opt/heteronetwork/libexec/kubernetes-api-hosts ensure k8s-api.heteronetwork.internal' <<<"$rendered"
+  rendered="$(render_kube_api_hosts_kubelet_dropin)"
+  grep -Fq 'Requires=heteronetwork-kube-api-host.service' <<<"$rendered"
+  grep -Fq 'After=heteronetwork-kube-api-host.service' <<<"$rendered"
   rendered="$(render_pod_cidr_routing_helper)"
   grep -Fq 'ip -4 rule add priority "$priority" to "$pod_cidr" lookup main' <<<"$rendered"
   rendered="$(render_pod_cidr_routing_service)"
@@ -2034,6 +2128,7 @@ case "$command" in
   configure-api-ha) configure_kubelet_api_ha ;;
   reconcile-kubelet-dns) require_root; reconcile_kubelet_resolver ;;
   reconcile-kubelet-api) require_root; reconcile_kubelet_api_endpoint ;;
+  reconcile-api-host) require_root; configure_hosts_entry ;;
   verify-cluster) verify_cluster ;;
   self-test) self_test ;;
   -h|--help|help) usage ;;
