@@ -373,8 +373,8 @@ EOF
 render_kubelet_dropin() {
   cat <<'EOF'
 [Unit]
-Wants=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
-After=network-online.target heteronetwork-agent.service heteronetwork-kube-apiserver-lb.service
+Wants=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service
+After=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service
 EOF
 }
 
@@ -531,11 +531,13 @@ EnvironmentFile=/etc/heteronetwork/kubernetes/overlay-dns.env
 ExecStart=/opt/heteronetwork/libexec/overlay-dns-resolved apply
 ExecStop=/opt/heteronetwork/libexec/overlay-dns-resolved revert
 RemainAfterExit=yes
-TimeoutStartSec=45s
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=75s
 TimeoutStopSec=10s
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target heteronetwork-agent.service
 EOF
 }
 
@@ -1884,6 +1886,12 @@ self_test() {
   grep -Fq 'BindsTo=heteronetwork-agent.service' <<<"$rendered"
   grep -Fq 'PartOf=heteronetwork-agent.service' <<<"$rendered"
   grep -Fq 'RemainAfterExit=yes' <<<"$rendered"
+  grep -Fq 'Restart=on-failure' <<<"$rendered"
+  grep -Fq 'TimeoutStartSec=75s' <<<"$rendered"
+  grep -Fq 'WantedBy=multi-user.target heteronetwork-agent.service' <<<"$rendered"
+  rendered="$(render_kubelet_dropin)"
+  grep -Fq 'Wants=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service' <<<"$rendered"
+  grep -Fq 'After=network-online.target heteronetwork-agent.service heteronetwork-overlay-dns.service heteronetwork-kube-apiserver-lb.service' <<<"$rendered"
   rendered="$(render_pod_cidr_routing_helper)"
   grep -Fq 'ip -4 rule add priority "$priority" to "$pod_cidr" lookup main' <<<"$rendered"
   rendered="$(render_pod_cidr_routing_service)"
