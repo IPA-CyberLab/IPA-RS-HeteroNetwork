@@ -915,7 +915,11 @@ descriptor_is_current() {
       | select(.underlay_ip == $underlay_ip)
       | select(.network_plane == $network_plane)
       | select(.authoritative_digest == $authoritative_digest)
-      | select(.selection_epoch == $selection_epoch)
+      | select(
+          (.selection_epoch | type == "number" and floor == . and . >= 0)
+          and .selection_epoch >= ($selection_epoch - 1)
+          and .selection_epoch <= ($selection_epoch + 1)
+        )
       | select(.selection_digest == $selection_digest)
       | select(
           (
@@ -3997,6 +4001,24 @@ JSON
     cp "$state_dir/member.json" "$state_dir/descriptor-${node_id}.json"
   done <"$local_reachability_path"
   cp "$state_dir/descriptor-node-a.json" "$state_dir/member.json"
+  local descriptor_fixture
+  descriptor_fixture="$(<"$state_dir/descriptor-node-b.json")"
+  printf '1\n' >"$selection_epoch_path"
+  descriptor_is_current \
+    "$descriptor_fixture" node-b 100.89.33.61 "$authoritative_digest"
+  printf '2\n' >"$selection_epoch_path"
+  if descriptor_is_current \
+      "$descriptor_fixture" node-b 100.89.33.61 "$authoritative_digest"; then
+    die "descriptor outside the adjacent candidate epoch was accepted"
+  fi
+  printf '0\n' >"$selection_epoch_path"
+  cp "$selected_path" "$temporary/selected.before-digest-change"
+  printf '%s\n' $'node-extra\t10.250.0.30' >>"$selected_path"
+  if descriptor_is_current \
+      "$descriptor_fixture" node-b 100.89.33.61 "$authoritative_digest"; then
+    die "descriptor for a different candidate selection was accepted"
+  fi
+  mv "$temporary/selected.before-digest-change" "$selected_path"
   peer_member_descriptor() {
     cat "$state_dir/descriptor-$2.json"
   }
