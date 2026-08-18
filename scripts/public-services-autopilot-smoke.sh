@@ -683,9 +683,11 @@ assert_active heteronetwork-stun.service
 printf '%s\n' "$(( $(date +%s) - 46 ))" \
   >"$test_root/root/run/heteronetwork-public-services-autopilot/nat-classification-loss-started"
 run_reconciler
-assert_demoted
-grep -q '^restart heteronetwork-agent.service$' "$systemctl_log" ||
-  fail "Agent was not restarted after route withdrawal"
+assert_active heteronetwork-control-plane.service
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
+! grep -q '^restart heteronetwork-agent.service$' "$systemctl_log" ||
+  fail "transient NAT loss restarted the Agent and broke service recovery"
 
 prepare_dependencies
 reset_auto_services
@@ -698,7 +700,9 @@ run_reconciler
 printf '%s\n' "$(( $(date +%s) - 46 ))" \
   >"$test_root/root/run/heteronetwork-public-services-autopilot/nat-classification-loss-started"
 run_reconciler
-assert_demoted
+assert_active heteronetwork-control-plane.service
+assert_active heteronetwork-signal.service
+assert_active heteronetwork-stun.service
 
 prepare_dependencies
 reset_auto_services

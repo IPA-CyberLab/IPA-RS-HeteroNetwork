@@ -129,18 +129,15 @@ retain_existing_public_services() {
   mkdir -p "$runtime_dir" || return 1
   chmod 0700 "$runtime_dir" || return 1
 
-  retain_now=$(date +%s) || return 1
+  # NAT discovery depends on the promoted STUN and overlay control services.
+  # Expiring this fallback can make every public node demote at once and leaves
+  # the cluster with no service capable of producing a fresh classification.
+  # Keep the last validated configuration until a new classification replaces
+  # it or an operator explicitly disables public services.
   if [ ! -s "$nat_loss_started_file" ]; then
-    printf '%s\n' "$retain_now" >"$nat_loss_started_file" || return 1
+    date +%s >"$nat_loss_started_file" || return 1
     chmod 0600 "$nat_loss_started_file" || return 1
   fi
-  retain_started=$(cat "$nat_loss_started_file") || return 1
-  case "$retain_started" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$retain_now" -ge "$retain_started" ] || return 1
-  [ "$((retain_now - retain_started))" -le "$classification_max_age_seconds" ] ||
-    return 1
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   if unit_is_active "$agent_service"; then

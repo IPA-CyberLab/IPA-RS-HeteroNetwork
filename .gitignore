@@ -3,6 +3,7 @@
 /playwright-report/
 /test-results/
 /artifacts/chaos/
+/core
 __pycache__/
 *.py[cod]
 ebpf/*/target/
