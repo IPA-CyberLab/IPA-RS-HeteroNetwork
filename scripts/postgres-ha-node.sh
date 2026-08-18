@@ -1604,7 +1604,8 @@ dcs_control_endpoint() {
   local _name address endpoint
   while read -r _name address; do
     endpoint="https://${address}:${dcs_client_port}"
-    if dcs_etcdctl_at "$endpoint" endpoint health >/dev/null 2>&1; then
+    # An etcd learner passes endpoint health but rejects cluster-management RPCs.
+    if dcs_etcdctl_at "$endpoint" member list --write-out=json >/dev/null 2>&1; then
       printf '%s' "$endpoint"
       return 0
     fi
@@ -2358,7 +2359,9 @@ self_test() {
   (
     dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3"
     dcs_etcdctl_at() {
-      [[ "$1" == "https://100.64.10.2:${dcs_client_port}" ]]
+      [[ "$1" == "https://100.64.10.2:${dcs_client_port}" \
+        && "$2" == "member" && "$3" == "list" \
+        && "$4" == "--write-out=json" ]]
     }
     [[ "$(dcs_control_endpoint)" == \
       "https://100.64.10.2:${dcs_client_port}" ]]
