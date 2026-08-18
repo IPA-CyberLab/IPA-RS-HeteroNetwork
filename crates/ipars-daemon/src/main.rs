@@ -113,8 +113,8 @@ use ipars_types::{
     http_url_is_usable_endpoint, node_hostname_is_valid, relay_pair_rendezvous_ordering,
     socket_addr_is_globally_routable, validate_join_token_bootstrap_endpoints, AclRule,
     BootstrapEndpoint, BootstrapEndpointKind, ClusterId, ClusterPolicy, EndpointCandidate,
-    HealthState, KeyId, NatConnectivityState, NatTraversalStrategy, NeighborMap, NodeHealth,
-    NodeId, NodeRecord, OverlayPath, PathMetrics, PathRecord, PathScore, PathState,
+    HealthState, KeyId, NatClassification, NatConnectivityState, NatTraversalStrategy, NeighborMap,
+    NodeHealth, NodeId, NodeRecord, OverlayPath, PathMetrics, PathRecord, PathScore, PathState,
     RelayCapability, Route, ServiceInstance, SignedJoinToken, TokenLedgerMetrics,
     TransportProtocol, VpnIp, LAZY_CONNECT_LOCAL_ACTIVITY_REASON_PREFIX,
     MAX_JOIN_TOKEN_BOOTSTRAP_ENDPOINTS_PER_KIND, MAX_JOIN_TOKEN_TTL_SECONDS,
@@ -15221,6 +15221,7 @@ async fn heartbeat_request(
         advertised_signal_url,
         advertised_stun_url,
         relay_capability.as_ref(),
+        status.nat_classification.as_ref(),
         status.build.as_ref(),
     )?;
     let mut request = HeartbeatRequest {
@@ -15247,29 +15248,41 @@ fn heartbeat_service_advertisement(
     advertised_signal_url: Option<&str>,
     advertised_stun_url: Option<&str>,
     relay_capability: Option<&RelayCapability>,
+    nat_classification: Option<&NatClassification>,
     agent_build: Option<&ipars_types::api::AgentBuildInfo>,
 ) -> anyhow::Result<Option<NodeServiceAdvertisement>> {
     let mut endpoints = Vec::new();
+    let public_ip = nat_classification.and_then(NatClassification::publicly_reachable_ip);
     if let Some(url) = advertised_signal_url {
         endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::Signal,
             url: url.to_string(),
         });
     }
-    if let Some(url) = advertised_stun_url {
+    if let Some(url) = advertised_stun_url.filter(|url| {
+        public_ip.is_some_and(|public_ip| {
+            ipars_types::literal_udp_bootstrap_socket_addr(url)
+                .is_some_and(|endpoint| endpoint.ip() == public_ip)
+        })
+    }) {
         endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::Stun,
             url: url.to_string(),
         });
     }
-    if let Some(public_endpoint) = relay_capability.and_then(|capability| {
-        let mut policy_authorized = capability.clone();
-        policy_authorized.enabled_by_policy = true;
-        policy_authorized
-            .is_eligible_relay()
-            .then_some(capability.public_endpoint)
-            .flatten()
-    }) {
+    if let Some(public_endpoint) = relay_capability
+        .and_then(|capability| {
+            let mut policy_authorized = capability.clone();
+            policy_authorized.enabled_by_policy = true;
+            policy_authorized
+                .is_eligible_relay()
+                .then_some(capability.public_endpoint)
+                .flatten()
+        })
+        .filter(|public_endpoint| {
+            public_ip.is_some_and(|public_ip| public_endpoint.ip() == public_ip)
+        })
+    {
         endpoints.push(BootstrapEndpoint {
             kind: BootstrapEndpointKind::Relay,
             url: format!("udp://{public_endpoint}"),
@@ -40680,6 +40693,7 @@ exec sleep 60
         assert!(request.node_signature.is_some());
         assert_eq!(request.candidates.len(), 1);
         assert!(request.candidates[0].observed_at > stale_observed_at);
+        assert!(request.nat_classification.is_none());
         assert!(request.relay_capability.is_none());
         assert_eq!(request.routes, Some(vec![advertised_route]));
         assert_eq!(
@@ -40688,16 +40702,10 @@ exec sleep 60
                 .as_ref()
                 .map(|advertisement| advertisement.endpoints.as_slice()),
             Some(
-                [
-                    BootstrapEndpoint {
-                        kind: BootstrapEndpointKind::Signal,
-                        url: "http://10.250.0.10:19443".to_string(),
-                    },
-                    BootstrapEndpoint {
-                        kind: BootstrapEndpointKind::Stun,
-                        url: "udp://203.0.113.10:19444".to_string(),
-                    },
-                ]
+                [BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Signal,
+                    url: "http://10.250.0.10:19443".to_string(),
+                }]
                 .as_slice()
             )
         );
@@ -40760,8 +40768,64 @@ exec sleep 60
         Ok(())
     }
 
+    fn public_nat_classification(public_endpoint: SocketAddr) -> NatClassification {
+        let observed_at = Utc::now();
+        let classification = NatClassification::from_observations(
+            public_endpoint,
+            vec![ipars_types::NatProbeObservation {
+                local_addr: public_endpoint,
+                stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: public_endpoint,
+                observed_at,
+            }],
+            observed_at,
+        );
+        assert_eq!(
+            classification.publicly_reachable_ip(),
+            Some(public_endpoint.ip())
+        );
+        classification
+    }
+
+    #[tokio::test]
+    async fn heartbeat_request_sends_relay_capability_before_public_nat_classification(
+    ) -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        );
+        let relay = RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(SocketAddr::from(([8, 8, 8, 8], 18_445))),
+            admission_url: Some("http://100.64.0.8:18447".to_string()),
+            max_sessions: 10_000,
+            active_sessions: 2,
+            max_mbps: 1_000,
+            e2e_only: true,
+        };
+
+        let request = heartbeat_request(
+            &runtime,
+            &runtime.state().identity_key_pair()?,
+            Some(relay.clone()),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(request.relay_capability, Some(relay));
+        assert!(request.nat_classification.is_none());
+        assert!(request
+            .service_advertisement
+            .as_ref()
+            .is_none_or(|advertisement| advertisement.endpoints.is_empty()));
+        Ok(())
+    }
+
     #[test]
-    fn heartbeat_service_advertisement_includes_relay_before_policy_ack() -> anyhow::Result<()> {
+    fn heartbeat_service_advertisement_omits_public_endpoints_until_nat_matches(
+    ) -> anyhow::Result<()> {
         let relay_endpoint = SocketAddr::from(([8, 8, 8, 8], 18_445));
         let relay = RelayCapability {
             enabled_by_policy: false,
@@ -40773,15 +40837,66 @@ exec sleep 60
             e2e_only: true,
         };
 
-        let advertisement = heartbeat_service_advertisement(None, None, None, Some(&relay), None)?
-            .context("healthy Relay should be advertised")?;
+        let unclassified = heartbeat_service_advertisement(
+            None,
+            None,
+            Some("udp://8.8.8.8:19444"),
+            Some(&relay),
+            None,
+            None,
+        )?;
+        assert!(unclassified.is_none());
+
+        let other_public_ip = public_nat_classification(SocketAddr::from(([9, 9, 9, 9], 51_820)));
+        let mismatched = heartbeat_service_advertisement(
+            None,
+            None,
+            Some("udp://8.8.8.8:19444"),
+            Some(&relay),
+            Some(&other_public_ip),
+            None,
+        )?;
+        assert!(mismatched.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_service_advertisement_includes_public_endpoints_after_matching_nat(
+    ) -> anyhow::Result<()> {
+        let relay_endpoint = SocketAddr::from(([8, 8, 8, 8], 18_445));
+        let relay = RelayCapability {
+            enabled_by_policy: false,
+            public_endpoint: Some(relay_endpoint),
+            admission_url: Some("http://100.64.0.8:18447".to_string()),
+            max_sessions: 10_000,
+            active_sessions: 2,
+            max_mbps: 1_000,
+            e2e_only: true,
+        };
+        let classification = public_nat_classification(relay_endpoint);
+
+        let advertisement = heartbeat_service_advertisement(
+            None,
+            None,
+            Some("udp://8.8.8.8:19444"),
+            Some(&relay),
+            Some(&classification),
+            None,
+        )?
+        .context("public STUN and Relay endpoints should be advertised")?;
 
         assert_eq!(
             advertisement.endpoints,
-            vec![BootstrapEndpoint {
-                kind: BootstrapEndpointKind::Relay,
-                url: format!("udp://{relay_endpoint}"),
-            }]
+            vec![
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Stun,
+                    url: "udp://8.8.8.8:19444".to_string(),
+                },
+                BootstrapEndpoint {
+                    kind: BootstrapEndpointKind::Relay,
+                    url: format!("udp://{relay_endpoint}"),
+                },
+            ]
         );
         Ok(())
     }
