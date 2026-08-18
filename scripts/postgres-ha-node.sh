@@ -1638,9 +1638,17 @@ for member in document.get("members", []):
     name = member.get("name", "")
     urls = member.get("peerURLs", [])
     learner = member.get("isLearner", False)
-    if not isinstance(name, str) or not isinstance(urls, list) or len(urls) != 1:
+    if (
+        not isinstance(name, str)
+        or "|" in name
+        or not isinstance(urls, list)
+        or len(urls) != 1
+        or not isinstance(urls[0], str)
+        or "|" in urls[0]
+    ):
         raise SystemExit("invalid etcd member record")
-    print(f"{member_id:x}\t{name}\t{urls[0]}\t{str(bool(learner)).lower()}")
+    # A non-whitespace delimiter preserves the empty name of an unstarted learner in Bash read.
+    print(f"{member_id:x}|{name}|{urls[0]}|{str(bool(learner)).lower()}")
 '
 }
 
@@ -1658,7 +1666,7 @@ current_dcs_members() {
   [[ -n "$snapshot" ]] || die "DCS membership is empty"
   local output="" desired_name desired_address desired_url
   local id actual_name peer_url learner found actual_count=0 matched_count=0
-  while IFS=$'\t' read -r id actual_name peer_url learner; do
+  while IFS='|' read -r id actual_name peer_url learner; do
     actual_count=$((actual_count + 1))
     found=0
     while read -r desired_name desired_address; do
@@ -1676,7 +1684,7 @@ current_dcs_members() {
   while read -r desired_name desired_address; do
     desired_url="https://${desired_address}:${dcs_peer_port}"
     found=0
-    while IFS=$'\t' read -r id actual_name peer_url learner; do
+    while IFS='|' read -r id actual_name peer_url learner; do
       if [[ "$peer_url" == "$desired_url" ]]; then
         found=1
         break
@@ -1794,7 +1802,7 @@ reconcile_dcs_unlocked() {
   [[ -n "$snapshot" ]] || die "DCS membership is empty"
   local id actual_name peer_url learner
   local desired_name desired_address desired_url found
-  while IFS=$'\t' read -r id actual_name peer_url learner; do
+  while IFS='|' read -r id actual_name peer_url learner; do
     found=0
     while read -r desired_name desired_address; do
       desired_url="https://${desired_address}:${dcs_peer_port}"
@@ -1813,7 +1821,7 @@ reconcile_dcs_unlocked() {
     IFS=' ' read -r retiring_name retiring_address <<<"$retiring_row"
   fi
 
-  while IFS=$'\t' read -r id actual_name peer_url learner; do
+  while IFS='|' read -r id actual_name peer_url learner; do
     [[ "$learner" == "true" ]] || continue
     if [[ -n "$retiring_name" ]]; then
       local target_match=0 target_name target_address target_url
@@ -1835,7 +1843,7 @@ reconcile_dcs_unlocked() {
       fi
       local retired_id="" retired_id_candidate retired_actual_name
       local retired_peer_url retired_learner
-      while IFS=$'\t' read -r retired_id_candidate retired_actual_name \
+      while IFS='|' read -r retired_id_candidate retired_actual_name \
           retired_peer_url retired_learner; do
         if [[ "$retired_actual_name" == "$retiring_name" \
           && "$retired_peer_url" == "https://${retiring_address}:${dcs_peer_port}" \
@@ -1865,7 +1873,7 @@ reconcile_dcs_unlocked() {
   while read -r desired_name desired_address; do
     desired_url="https://${desired_address}:${dcs_peer_port}"
     found=0
-    while IFS=$'\t' read -r id actual_name peer_url learner; do
+    while IFS='|' read -r id actual_name peer_url learner; do
       if [[ "$peer_url" == "$desired_url" ]]; then
         found=1
         break
@@ -1898,7 +1906,7 @@ reconcile_dcs_unlocked() {
     fi
     local retired_id="" retired_id_candidate retired_actual_name
     local retired_peer_url retired_learner
-    while IFS=$'\t' read -r retired_id_candidate retired_actual_name \
+    while IFS='|' read -r retired_id_candidate retired_actual_name \
         retired_peer_url retired_learner; do
       if [[ "$retired_actual_name" == "$retiring_name" \
         && "$retired_peer_url" == "https://${retiring_address}:${dcs_peer_port}" \
@@ -2419,33 +2427,52 @@ self_test() {
   replacement_target="db-f=100.64.10.6,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
   replacement_old="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
   replacement_union="${replacement_target},db-a=100.64.10.1"
+  (
+    dcs_members="$replacement_target"
+    dcs_bootstrap_members="$replacement_union"
+    require_root() { return 0; }
+    validate_node_config() { return 0; }
+    verify_interface_address() { return 0; }
+    verify_member_routes() { return 0; }
+    require_command() { return 0; }
+    require_installed_etcdctl() { return 0; }
+    validate_bundle_authority() { return 0; }
+    dcs_member_snapshot() { printf '%s\n' \
+      '1|db-a|https://100.64.10.1:12380|false' \
+      '2|db-b|https://100.64.10.2:12380|false' \
+      '3|db-c|https://100.64.10.3:12380|false' \
+      '4|db-d|https://100.64.10.4:12380|false' \
+      '5|db-e|https://100.64.10.5:12380|false' \
+      '6||https://100.64.10.6:12380|true'; }
+    [[ "$(current_dcs_members)" == "$replacement_union" ]]
+  )
   run_dcs_replacement_phase_test healthy-retiring "$replacement_old" "$(printf '%s\n' \
-    $'1\tdb-a\thttps://100.64.10.1:12380\tfalse' \
-    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
-    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
-    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
-    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse')" "" true
+    '1|db-a|https://100.64.10.1:12380|false' \
+    '2|db-b|https://100.64.10.2:12380|false' \
+    '3|db-c|https://100.64.10.3:12380|false' \
+    '4|db-d|https://100.64.10.4:12380|false' \
+    '5|db-e|https://100.64.10.5:12380|false')" "" true
   run_dcs_replacement_phase_test add "$replacement_old" "$(printf '%s\n' \
-    $'1\tdb-a\thttps://100.64.10.1:12380\tfalse' \
-    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
-    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
-    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
-    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse')" \
+    '1|db-a|https://100.64.10.1:12380|false' \
+    '2|db-b|https://100.64.10.2:12380|false' \
+    '3|db-c|https://100.64.10.3:12380|false' \
+    '4|db-d|https://100.64.10.4:12380|false' \
+    '5|db-e|https://100.64.10.5:12380|false')" \
     "member add db-f --peer-urls=https://100.64.10.6:12380 --learner"
   run_dcs_replacement_phase_test remove "$replacement_union" "$(printf '%s\n' \
-    $'1\tdb-a\thttps://100.64.10.1:12380\tfalse' \
-    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
-    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
-    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
-    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse' \
-    $'6\tdb-f\thttps://100.64.10.6:12380\ttrue')" \
+    '1|db-a|https://100.64.10.1:12380|false' \
+    '2|db-b|https://100.64.10.2:12380|false' \
+    '3|db-c|https://100.64.10.3:12380|false' \
+    '4|db-d|https://100.64.10.4:12380|false' \
+    '5|db-e|https://100.64.10.5:12380|false' \
+    '6||https://100.64.10.6:12380|true')" \
     "member remove 1"
   run_dcs_replacement_phase_test promote "$replacement_target" "$(printf '%s\n' \
-    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
-    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
-    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
-    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse' \
-    $'6\tdb-f\thttps://100.64.10.6:12380\ttrue')" \
+    '2|db-b|https://100.64.10.2:12380|false' \
+    '3|db-c|https://100.64.10.3:12380|false' \
+    '4|db-d|https://100.64.10.4:12380|false' \
+    '5|db-e|https://100.64.10.5:12380|false' \
+    '6|db-f|https://100.64.10.6:12380|true')" \
     "member promote 6"
   unset -f run_dcs_replacement_phase_test
   node_name="db-f"
