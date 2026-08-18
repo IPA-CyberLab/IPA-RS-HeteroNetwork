@@ -51,6 +51,7 @@ reciprocal_stability_path="$state_dir/reciprocal-stability.tsv"
 applied_revision_path="$state_dir/applied-revision"
 configured_revision_path="$state_dir/configured-revision"
 proxy_applied_digest_path="$state_dir/proxy-applied-digest"
+hosts_path="${HETERONETWORK_DB_HOSTS_PATH:-/etc/hosts}"
 curl_config_path="$state_dir/curl.conf"
 underlay_health_handler="${HETERONETWORK_DB_UNDERLAY_HEALTH_HANDLER:-/opt/heteronetwork/libexec/postgres-underlay-health.py}"
 underlay_health_handler_changed=0
@@ -2412,6 +2413,15 @@ proxy_config_matches_backends() {
   [[ "$(grep -c '^    server db-' "$config")" == "$count" ]]
 }
 
+service_hosts_entry_ready() {
+  local marker="# heteronetwork-postgres-ha"
+  [[ -f "$hosts_path" ]] || return 1
+  awk -v service="$manifest_service_name" -v marker="$marker" '
+    $1 == "127.0.0.1" && $2 == service && index($0, marker) > 0 { found += 1 }
+    END { exit found == 1 ? 0 : 1 }
+  ' "$hosts_path"
+}
+
 proxy_only_overlay_ready() {
   local vpn_ip="$1"
   local expected_backends="$2"
@@ -2420,6 +2430,7 @@ proxy_only_overlay_ready() {
   grep -Fq "bind $vpn_ip:$manifest_postgres_port" "$config" \
     && grep -Fq "bind $vpn_ip:$manifest_rest_port" "$config" \
     && proxy_config_matches_backends "$expected_backends" \
+    && service_hosts_entry_ready \
     && systemctl is-active --quiet heteronetwork-db-proxy.service
 }
 
@@ -2430,6 +2441,7 @@ member_overlay_proxy_ready() {
   grep -Fq "bind $vpn_ip:$manifest_postgres_port" "$config" \
     && grep -Fq "bind $vpn_ip:$manifest_rest_port" "$config" \
     && proxy_config_matches_backends "$manifest_members" \
+    && service_hosts_entry_ready \
     && systemctl is-active --quiet heteronetwork-db-proxy.service
 }
 
@@ -3615,6 +3627,7 @@ self_test() {
   applied_revision_path="$state_dir/applied-revision"
   configured_revision_path="$state_dir/configured-revision"
   proxy_applied_digest_path="$state_dir/proxy-applied-digest"
+  hosts_path="$temporary/hosts"
   underlay_health_handler="$state_dir/postgres-underlay-health.py"
   install -d -m 0700 "$state_dir"
   legacy_database_service_path="$temporary/heteronetwork-db.service"
@@ -3629,6 +3642,20 @@ self_test() {
   reconcile_interval_seconds=30
   dcs_replacement_absence_seconds="$DEFAULT_DCS_REPLACEMENT_ABSENCE_SECONDS"
   validate_config
+  printf '127.0.0.1 localhost\n' >"$hosts_path"
+  manifest_service_name="postgres.heteronetwork.internal"
+  if service_hosts_entry_ready; then
+    die "missing managed database hosts entry was accepted"
+  fi
+  printf '127.0.0.1 %s # heteronetwork-postgres-ha\n' \
+    "$manifest_service_name" >>"$hosts_path"
+  service_hosts_entry_ready
+  printf '127.0.0.1 %s # heteronetwork-postgres-ha\n' \
+    "$manifest_service_name" >>"$hosts_path"
+  if service_hosts_entry_ready; then
+    die "duplicate managed database hosts entries were accepted"
+  fi
+  sed -i '$d' "$hosts_path"
   if (
     HETERONETWORK_DB_CLIENT_CIDRS="192.0.2.0/24,"
     validate_config >/dev/null 2>&1
