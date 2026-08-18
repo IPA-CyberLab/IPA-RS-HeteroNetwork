@@ -18,7 +18,7 @@ readonly PROXY_BUNDLE_FORMAT_VERSION="1"
 readonly REQUIRED_CONVERGENCE_RECONCILES="3"
 readonly BUNDLE_HEALTH_RETRY_ATTEMPTS="6"
 readonly BUNDLE_HEALTH_RETRY_SECONDS="5"
-readonly UNDERLAY_HEALTH_MAX_CONNECTIONS="8"
+readonly UNDERLAY_HEALTH_MAX_CONNECTIONS="128"
 readonly UNDERLAY_HEALTH_READ_TIMEOUT_SECONDS="2"
 readonly MAX_BUNDLE_ARCHIVE_BYTES="4194304"
 readonly MAX_BUNDLE_UNPACKED_BYTES="8388608"
@@ -1984,7 +1984,7 @@ def main():
     parser.add_argument("--max-connections", required=True, type=int)
     parser.add_argument("--read-timeout", required=True, type=float)
     args = parser.parse_args()
-    if not 1 <= args.max_connections <= 32 or not 0.1 <= args.read_timeout <= 10:
+    if not 1 <= args.max_connections <= 256 or not 0.1 <= args.read_timeout <= 10:
         raise SystemExit("invalid health listener bounds")
 
     selector = selectors.DefaultSelector()
@@ -2136,7 +2136,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 TasksMax=4
 MemoryMax=64M
-LimitNOFILE=64
+LimitNOFILE=256
 UMask=0077
 
 [Install]
@@ -3823,9 +3823,10 @@ EOF
     >"$temporary/underlay.service"
   grep -Fq 'DynamicUser=yes' "$temporary/underlay.service"
   grep -Fq -- '--listen-address 100.123.154.79' "$temporary/underlay.service"
-  grep -Fq -- '--max-connections 8 --read-timeout 2' "$temporary/underlay.service"
+  grep -Fq -- '--max-connections 128 --read-timeout 2' "$temporary/underlay.service"
   grep -Fq 'TasksMax=4' "$temporary/underlay.service"
   grep -Fq 'MemoryMax=64M' "$temporary/underlay.service"
+  grep -Fq 'LimitNOFILE=256' "$temporary/underlay.service"
   if grep -Fq 'socat' "$temporary/underlay.service"; then
     die "underlay probe unexpectedly uses a forking listener"
   fi
