@@ -548,7 +548,9 @@ read_cluster_secret() {
   ensure_private_source_file "$path"
   local value
   value="$(tr -d '\r\n' <"$path")"
-  [[ "$value" =~ ^[A-Za-z0-9]{32,128}$ ]] || die "invalid generated secret file: $path"
+  [[ ${#value} -ge 32 && ${#value} -le 128 \
+    && "$value" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
+    || die "invalid generated secret file: $path"
   printf '%s' "$value"
 }
 
@@ -2133,6 +2135,23 @@ self_test() {
       "$test_dir/generated-bundle/secrets/${generated_secret}.password" \
       "$test_dir/${generated_secret}.before"
   done
+  local base64_secret_bundle="$test_dir/base64-secret"
+  cp -a "$test_dir/generated-bundle" "$base64_secret_bundle"
+  printf '%062s+/\n' '' | tr ' ' A \
+    >"$base64_secret_bundle/secrets/keycloak.password"
+  (
+    bundle_dir="$base64_secret_bundle"
+    read_cluster_secret keycloak >/dev/null
+  )
+  printf '%063s:\n' '' | tr ' ' A \
+    >"$base64_secret_bundle/secrets/keycloak.password"
+  if (
+    bundle_dir="$base64_secret_bundle"
+    read_cluster_secret keycloak >/dev/null 2>&1
+  ); then
+    die "bundle credential with a non-Base64 character was accepted"
+  fi
+  rm -rf "$base64_secret_bundle"
   local invalid_secret_bundle
   for generated_secret in keycloak keycloak-bootstrap-admin; do
     invalid_secret_bundle="$test_dir/missing-${generated_secret}"
