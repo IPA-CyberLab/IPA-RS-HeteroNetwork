@@ -3285,6 +3285,12 @@ relay_autopilot_service_was_active=0
 relay_service_was_active=0
 relay_agent_enable_state=not-found
 relay_agent_was_active=0
+legacy_relay_timer_enable_state=not-found
+legacy_relay_timer_was_active=0
+legacy_relay_service_enable_state=not-found
+legacy_relay_service_was_active=0
+legacy_relay_timer_unit_path=/etc/systemd/system/ipars-relay.timer
+legacy_relay_service_unit_path=/etc/systemd/system/ipars-relay.service
 relay_snapshot_ready=0
 relay_snapshot_dir="$tmp_dir/relay-rollback"
 relay_snapshot_manifest="$relay_snapshot_dir/manifest"
@@ -3301,6 +3307,8 @@ relay_transaction_paths='
 /etc/systemd/system/heteronetwork-relay.service
 /etc/systemd/system/heteronetwork-relay-autopilot.service
 /etc/systemd/system/heteronetwork-relay-autopilot.timer
+/etc/systemd/system/ipars-relay.service
+/etc/systemd/system/ipars-relay.timer
 '
 relay_transaction_temporary_paths='
 /etc/heteronetwork/.relay-admission.token.new
@@ -3402,6 +3410,48 @@ masked|masked-runtime|generated|transient|not-found)
       return 1
       ;;
   esac
+}
+
+remove_legacy_relay_units() {
+  if ! stop_systemd_unit_with_kill ipars-relay.timer; then
+    echo "Unable to stop legacy ipars-relay.timer" >&2
+    return 1
+  fi
+  if ! stop_systemd_unit_with_kill ipars-relay.service; then
+    echo "Unable to stop legacy ipars-relay.service" >&2
+    return 1
+  fi
+  for legacy_relay_unit in ipars-relay.timer ipars-relay.service; do
+    if ! systemctl disable "$legacy_relay_unit" >/dev/null 2>&1; then
+      echo "$legacy_relay_unit disable command reported an error; verifying final state" >&2
+    fi
+    legacy_relay_enable_state=$(systemd_unit_enable_state "$legacy_relay_unit") || return 1
+    case "$legacy_relay_enable_state" in
+      enabled|enabled-runtime|linked|linked-runtime|alias)
+        echo "$legacy_relay_unit remains enabled; refusing to remove it" >&2
+        return 1
+        ;;
+    esac
+  done
+  if ! rm -f "$legacy_relay_timer_unit_path" "$legacy_relay_service_unit_path"; then
+    echo "Unable to remove legacy Relay unit files" >&2
+    return 1
+  fi
+  if ! systemctl daemon-reload; then
+    echo "Unable to reload systemd after removing legacy Relay units" >&2
+    return 1
+  fi
+  for legacy_relay_unit in ipars-relay.timer ipars-relay.service; do
+    legacy_relay_load_state=$(systemctl show \
+      --property=LoadState --value "$legacy_relay_unit" 2>/dev/null) || {
+      echo "Unable to inspect removed legacy Relay unit $legacy_relay_unit" >&2
+      return 1
+    }
+    if [ "$legacy_relay_load_state" != "not-found" ]; then
+      echo "$legacy_relay_unit remains loaded after removal" >&2
+      return 1
+    fi
+  done
 }
 
 restore_systemd_unit_enable_state() {
@@ -3697,10 +3747,18 @@ begin_relay_autopilot_transaction() {
   relay_agent_enable_state=$(
     systemd_unit_enable_state heteronetwork-agent.service
   )
+  legacy_relay_timer_enable_state=$(
+    systemd_unit_enable_state ipars-relay.timer
+  )
+  legacy_relay_service_enable_state=$(
+    systemd_unit_enable_state ipars-relay.service
+  )
   relay_autopilot_timer_was_active=0
   relay_autopilot_service_was_active=0
   relay_service_was_active=0
   relay_agent_was_active=0
+  legacy_relay_timer_was_active=0
+  legacy_relay_service_was_active=0
   if systemctl is-active --quiet heteronetwork-relay-autopilot.timer; then
     relay_autopilot_timer_was_active=1
   fi
@@ -3713,9 +3771,17 @@ begin_relay_autopilot_transaction() {
   if systemctl is-active --quiet heteronetwork-agent.service; then
     relay_agent_was_active=1
   fi
+  if systemctl is-active --quiet ipars-relay.timer; then
+    legacy_relay_timer_was_active=1
+  fi
+  if systemctl is-active --quiet ipars-relay.service; then
+    legacy_relay_service_was_active=1
+  fi
   relay_autopilot_transaction_active=1
   stop_systemd_unit_with_kill heteronetwork-relay-autopilot.timer
   stop_systemd_unit_with_kill heteronetwork-relay-autopilot.service
+  stop_systemd_unit_with_kill ipars-relay.timer
+  stop_systemd_unit_with_kill ipars-relay.service
   remove_relay_transaction_temporary_files
   snapshot_relay_transaction_files
 }
@@ -3740,10 +3806,20 @@ restore_relay_autopilot_transaction() {
     echo "Refusing Relay rollback because the Relay runtime could not be stopped" >&2
     return 1
   fi
+  if ! stop_systemd_unit_with_kill ipars-relay.timer; then
+    echo "Refusing Relay rollback because legacy ipars-relay.timer could not be stopped" >&2
+    return 1
+  fi
+  if ! stop_systemd_unit_with_kill ipars-relay.service; then
+    echo "Refusing Relay rollback because legacy ipars-relay.service could not be stopped" >&2
+    return 1
+  fi
 
   relay_rollback_failed=0
   systemctl disable heteronetwork-relay-autopilot.timer >/dev/null 2>&1 || true
   systemctl disable heteronetwork-agent.service >/dev/null 2>&1 || true
+  systemctl disable ipars-relay.timer >/dev/null 2>&1 || true
+  systemctl disable ipars-relay.service >/dev/null 2>&1 || true
   if ! restore_relay_transaction_files; then
     echo "Unable to restore the previous Relay files" >&2
     relay_rollback_failed=1
@@ -3771,6 +3847,16 @@ restore_relay_autopilot_transaction() {
     "$relay_agent_enable_state"; then
     relay_rollback_failed=1
   fi
+  if ! restore_systemd_unit_enable_state \
+    ipars-relay.timer \
+    "$legacy_relay_timer_enable_state"; then
+    relay_rollback_failed=1
+  fi
+  if ! restore_systemd_unit_enable_state \
+    ipars-relay.service \
+    "$legacy_relay_service_enable_state"; then
+    relay_rollback_failed=1
+  fi
   if [ "$relay_rollback_failed" -ne 0 ]; then
     return 1
   fi
@@ -3785,6 +3871,19 @@ restore_relay_autopilot_transaction() {
   if [ "$relay_agent_was_active" -eq 1 ]; then
     if ! systemctl start heteronetwork-agent.service; then
       echo "Unable to restore the previously active HeteroNetwork Agent" >&2
+      return 1
+    fi
+  fi
+
+  if [ "$legacy_relay_service_was_active" -eq 1 ]; then
+    if ! systemctl start ipars-relay.service; then
+      echo "Unable to restore the previously active legacy Relay service" >&2
+      return 1
+    fi
+  fi
+  if [ "$legacy_relay_timer_was_active" -eq 1 ]; then
+    if ! systemctl start ipars-relay.timer; then
+      echo "Unable to restore the previously active legacy Relay timer" >&2
       return 1
     fi
   fi
@@ -3856,10 +3955,16 @@ if [ -z "$downloaded" ]; then
   exit 1
 fi
 chmod 0755 "$binary"
-snapshot_iparsd_binary
-install -m 0755 "$binary" "$iparsd_path.new"
-mv -f "$iparsd_path.new" "$iparsd_path"
-iparsd_replaced=1
+if [ -f "$iparsd_path" ] \
+  && [ ! -L "$iparsd_path" ] \
+  && cmp -s "$binary" "$iparsd_path"; then
+  :
+else
+  snapshot_iparsd_binary
+  install -m 0755 "$binary" "$iparsd_path.new"
+  mv -f "$iparsd_path.new" "$iparsd_path"
+  iparsd_replaced=1
+fi
 
 cli_binary="$tmp_dir/ipars"
 cli_downloaded=
@@ -4241,8 +4346,9 @@ if [ "$relay_cleanup_failed" -ne 0 ]; then
 fi
 "#;
     const TEMPLATE: &str = r#"relay_restart_required=$iparsd_replaced
+begin_relay_autopilot_transaction
+remove_legacy_relay_units
 if [ "$relay_enabled" -eq 1 ]; then
-  begin_relay_autopilot_transaction
   install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
   install -d -o root -g root -m 0755 /opt/heteronetwork/libexec
 
@@ -4261,18 +4367,33 @@ HETERONETWORK_RELAY_SYSUSERS
   install -o root -g root -m 0400 \
     "$tmp_dir/relay-admission.token" \
     /etc/heteronetwork/.relay-admission.token.new
-  mv -f /etc/heteronetwork/.relay-admission.token.new \
-    /etc/heteronetwork/relay-admission.token
+  if [ -f /etc/heteronetwork/relay-admission.token ] \
+    && [ ! -L /etc/heteronetwork/relay-admission.token ] \
+    && cmp -s /etc/heteronetwork/.relay-admission.token.new \
+      /etc/heteronetwork/relay-admission.token; then
+    rm -f /etc/heteronetwork/.relay-admission.token.new
+    chown root:root /etc/heteronetwork/relay-admission.token
+    chmod 0400 /etc/heteronetwork/relay-admission.token
+  else
+    mv -f /etc/heteronetwork/.relay-admission.token.new \
+      /etc/heteronetwork/relay-admission.token
+  fi
   install -o heteronetwork-relay -g heteronetwork-relay -m 0400 \
     "$tmp_dir/relay-admission.token" \
     /etc/heteronetwork/.relay-server-admission.token.new
-  if [ ! -f /etc/heteronetwork/relay-server-admission.token ] \
-    || ! cmp -s /etc/heteronetwork/.relay-server-admission.token.new \
+  if [ -f /etc/heteronetwork/relay-server-admission.token ] \
+    && [ ! -L /etc/heteronetwork/relay-server-admission.token ] \
+    && cmp -s /etc/heteronetwork/.relay-server-admission.token.new \
       /etc/heteronetwork/relay-server-admission.token; then
+    rm -f /etc/heteronetwork/.relay-server-admission.token.new
+    chown heteronetwork-relay:heteronetwork-relay \
+      /etc/heteronetwork/relay-server-admission.token
+    chmod 0400 /etc/heteronetwork/relay-server-admission.token
+  else
     relay_restart_required=1
+    mv -f /etc/heteronetwork/.relay-server-admission.token.new \
+      /etc/heteronetwork/relay-server-admission.token
   fi
-  mv -f /etc/heteronetwork/.relay-server-admission.token.new \
-    /etc/heteronetwork/relay-server-admission.token
 
   cat >"$tmp_dir/10-relay-admission.conf" <<'HETERONETWORK_RELAY_ADMISSION_UNIT'
 [Service]
@@ -4850,7 +4971,7 @@ else
 __RELAY_CLEANUP__fi
 "#;
     if !token.claims.policy.allow_relay {
-        return CLEANUP.to_string();
+        return format!("begin_relay_autopilot_transaction\nremove_legacy_relay_units\n{CLEANUP}");
     }
     let encoded_bearer_token = STANDARD.encode(enrollment.relay_admission_bearer_token.as_bytes());
     TEMPLATE
@@ -5484,6 +5605,7 @@ struct DatabaseAutopilotRegistryNode {
     vpn_ip: String,
     role: String,
     active: bool,
+    last_seen_age_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -5553,24 +5675,25 @@ struct DatabaseAutopilotRegistrySnapshot {
     active_node_ids: Vec<NodeId>,
 }
 
-fn database_autopilot_node_is_active(
+fn database_autopilot_node_activity(
     node: &NodeRecord,
     health: Option<&NodeHealth>,
     generated_at: DateTime<Utc>,
     ttl: Duration,
-) -> bool {
+) -> (bool, u64) {
     if node.role.is_client() {
-        return false;
+        return (false, 0);
     }
+    let explicitly_unhealthy = health.is_some_and(|health| health.state == HealthState::Unhealthy);
     let last_seen_at = match health {
-        Some(health) if health.state == HealthState::Unhealthy => return false,
         Some(health) => health.last_seen_at,
         None => node.registered_at,
     };
-    match generated_at.signed_duration_since(last_seen_at).to_std() {
-        Ok(age) => age <= ttl,
-        Err(_) => true,
-    }
+    let age = generated_at
+        .signed_duration_since(last_seen_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    (!explicitly_unhealthy && age <= ttl, age.as_secs())
 }
 
 fn select_database_autopilot_registry_nodes(
@@ -5653,7 +5776,7 @@ where
         .into_iter()
         .filter(|node| node.cluster_id == *cluster_id)
     {
-        let active = database_autopilot_node_is_active(
+        let (active, last_seen_age_seconds) = database_autopilot_node_activity(
             &node,
             health_by_node.get(&node.node_id),
             generated_at,
@@ -5665,6 +5788,7 @@ where
             vpn_ip: node.vpn_ip.to_string(),
             role: node.role.to_string(),
             active,
+            last_seen_age_seconds,
         };
         if active {
             active_node_ids.push(node_id.clone());
@@ -8630,6 +8754,7 @@ mod tests {
                 vpn_ip: format!("10.250.{}.{}", index / 250, index % 250 + 1),
                 role: "worker".to_string(),
                 active: index != 999,
+                last_seen_age_seconds: u64::from(index == 999) * 86_400,
             })
             .collect::<Vec<_>>();
         let mut active_node_ids = identities[..999].to_vec();
@@ -9237,6 +9362,9 @@ mod tests {
             gateway.node_id.as_str()
         );
         assert_eq!(authenticated_registry["nodes"][0]["active"], true);
+        assert!(authenticated_registry["nodes"][0]["last_seen_age_seconds"]
+            .as_u64()
+            .is_some());
 
         let keycloak_request = serde_json::to_vec(&serde_json::json!({
             "node_id": gateway.node_id.as_str(),
@@ -9692,12 +9820,26 @@ mod tests {
         }));
         assert!(generated_script.contains("iparsd_replaced=0"));
         assert!(generated_script.contains(
-            "snapshot_iparsd_binary\ninstall -m 0755 \"$binary\" \"$iparsd_path.new\"\nmv -f \"$iparsd_path.new\" \"$iparsd_path\"\niparsd_replaced=1"
+            "cmp -s \"$binary\" \"$iparsd_path\"; then\n  :\nelse\n  snapshot_iparsd_binary"
         ));
         assert!(generated_script.contains("restore_iparsd_binary"));
         assert!(generated_script.contains("discard_iparsd_snapshot"));
         assert!(generated_script.contains("commit_installer_transaction"));
         assert!(generated_script.contains("relay_restart_required=$iparsd_replaced"));
+        assert!(generated_script.contains("remove_legacy_relay_units"));
+        assert!(generated_script.contains("stop_systemd_unit_with_kill ipars-relay.timer"));
+        assert!(generated_script.contains("stop_systemd_unit_with_kill ipars-relay.service"));
+        assert!(generated_script.contains("systemctl disable \"$legacy_relay_unit\""));
+        assert!(generated_script.contains("rm -f \"$legacy_relay_timer_unit_path\""));
+        assert!(generated_script.contains("$legacy_relay_service_unit_path"));
+        assert!(generated_script.contains("$legacy_relay_load_state\" != \"not-found"));
+        assert!(generated_script.contains("legacy_relay_timer_enable_state"));
+        assert!(generated_script.contains("legacy_relay_service_enable_state"));
+        assert!(generated_script.contains("legacy_relay_timer_was_active"));
+        assert!(generated_script.contains("legacy_relay_service_was_active"));
+        assert!(generated_script.contains("/etc/systemd/system/ipars-relay.timer"));
+        assert!(generated_script.contains("/etc/systemd/system/ipars-relay.service"));
+        assert!(generated_script.contains("cmp -s /etc/heteronetwork/.relay-admission.token.new"));
         assert!(generated_script
             .contains("cmp -s /etc/heteronetwork/.relay-server-admission.token.new"));
         assert!(generated_script.contains("if [ \"$relay_restart_required\" -eq 1 ]"));
@@ -9778,6 +9920,127 @@ mod tests {
             "printf '%s' '{encoded_relay_bearer}' | base64 -d >\"$tmp_dir/relay-admission.token\""
         )));
         assert!(!generated_script.contains(RELAY_ADMISSION_BEARER_TOKEN));
+        let relay_token_marker = format!(
+            "  printf '%s' '{encoded_relay_bearer}' | base64 -d >\"$tmp_dir/relay-admission.token\"\n"
+        );
+        let relay_token_install = generated_script
+            .split_once(&relay_token_marker)
+            .and_then(|(_, tail)| {
+                tail.split_once("\n\n  cat >\"$tmp_dir/10-relay-admission.conf\"")
+                    .map(|(body, _)| format!("{relay_token_marker}{body}"))
+            })
+            .ok_or("generated installer omitted Relay admission credential installation")?;
+        let relay_restart_guard = generated_script
+            .split_once(
+                "  if [ \"$relay_restart_required\" -eq 1 ] \\\n    && systemctl is-active --quiet heteronetwork-relay.service; then\n",
+            )
+            .and_then(|(_, tail)| {
+                tail.split_once("  systemctl enable --now heteronetwork-relay-autopilot.timer")
+                    .map(|(body, _)| {
+                        format!(
+                            "if [ \"$relay_restart_required\" -eq 1 ] \\\n  && systemctl is-active --quiet heteronetwork-relay.service; then\n{body}"
+                        )
+                    })
+            })
+            .ok_or("generated installer omitted conditional Relay restart")?;
+        let global_agent_restart = generated_script
+            .find("systemctl enable heteronetwork-gateway.service heteronetwork-agent.service\nsystemctl restart heteronetwork-gateway.service\nsystemctl restart heteronetwork-agent.service")
+            .ok_or("generated installer omitted its Agent restart")?;
+        let agent_token_install = generated_script
+            .find("/etc/heteronetwork/.relay-admission.token.new")
+            .ok_or("generated installer omitted its Agent Relay credential")?;
+        assert!(agent_token_install < global_agent_restart);
+
+        for (agent_token_matches, server_token_matches, expected_relay_restart) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            let credential_dir = std::env::temp_dir().join(format!(
+                "heteronetwork-relay-credential-{}",
+                random_oidc_value(12)
+            ));
+            let token_tmp_dir = credential_dir.join("tmp");
+            let token_target_dir = credential_dir.join("etc-heteronetwork");
+            let restart_log = credential_dir.join("restart.log");
+            std::fs::create_dir_all(&token_tmp_dir)?;
+            std::fs::create_dir_all(&token_target_dir)?;
+            std::fs::write(
+                token_tmp_dir.join("relay-admission.token"),
+                RELAY_ADMISSION_BEARER_TOKEN,
+            )?;
+            std::fs::write(
+                token_target_dir.join("relay-admission.token"),
+                if agent_token_matches {
+                    RELAY_ADMISSION_BEARER_TOKEN
+                } else {
+                    "stale-agent-relay-admission-token"
+                },
+            )?;
+            std::fs::write(
+                token_target_dir.join("relay-server-admission.token"),
+                if server_token_matches {
+                    RELAY_ADMISSION_BEARER_TOKEN
+                } else {
+                    "stale-server-relay-admission-token"
+                },
+            )?;
+            let token_install = relay_token_install
+                .replace(
+                    "/etc/heteronetwork",
+                    &token_target_dir.display().to_string(),
+                )
+                .replace("install -o root -g root -m 0400", "install -m 0400")
+                .replace(
+                    "install -o heteronetwork-relay -g heteronetwork-relay -m 0400",
+                    "install -m 0400",
+                );
+            let credential_harness = format!(
+                r#"set -eu
+tmp_dir=$1
+restart_log=$2
+relay_restart_required=0
+chown() {{ :; }}
+systemctl() {{
+  case "$1" in
+    is-active) return 0 ;;
+    restart) printf '%s\n' "$*" >>"$restart_log" ;;
+    *) return 1 ;;
+  esac
+}}
+{token_install}
+{relay_restart_guard}
+"#
+            );
+            let credential_result = std::process::Command::new("sh")
+                .args(["-c", &credential_harness, "sh"])
+                .arg(&token_tmp_dir)
+                .arg(&restart_log)
+                .output()?;
+            assert!(
+                credential_result.status.success(),
+                "Relay credential reconciliation failed: {}",
+                String::from_utf8_lossy(&credential_result.stderr)
+            );
+            assert_eq!(
+                std::fs::read(token_target_dir.join("relay-admission.token"))?,
+                RELAY_ADMISSION_BEARER_TOKEN.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(token_target_dir.join("relay-server-admission.token"))?,
+                RELAY_ADMISSION_BEARER_TOKEN.as_bytes()
+            );
+            assert!(!token_target_dir.join(".relay-admission.token.new").exists());
+            assert!(!token_target_dir
+                .join(".relay-server-admission.token.new")
+                .exists());
+            let relay_restarted = restart_log.exists()
+                && std::fs::read_to_string(&restart_log)?
+                    .contains("restart heteronetwork-relay.service");
+            assert_eq!(relay_restarted, expected_relay_restart);
+            std::fs::remove_dir_all(credential_dir)?;
+        }
         assert!(install_command.contains("sudo sh \"$tmp\" \"$@\""));
         assert!(install_command.ends_with("' sh"));
         let relay_autopilot = generated_script
@@ -9883,12 +10146,20 @@ agent_enable_state=$7
 autopilot_active=$8
 relay_active=1
 agent_active=1
+legacy_timer_enable_state=enabled
+legacy_timer_active=1
+legacy_service_enable_state=enabled-runtime
+legacy_service_active=1
+legacy_relay_timer_unit_path="$target_dir/ipars-relay.timer"
+legacy_relay_service_unit_path="$target_dir/ipars-relay.service"
 fail_mutator_stop=0
 
 persist_systemd_state() {{
-  printf '%s %s %s %s %s %s\n' \
+  printf '%s %s %s %s %s %s %s %s %s %s\n' \
     "$timer_enable_state" "$timer_active" "$relay_active" \
     "$agent_enable_state" "$agent_active" "$autopilot_active" \
+    "$legacy_timer_enable_state" "$legacy_timer_active" \
+    "$legacy_service_enable_state" "$legacy_service_active" \
     >"$systemctl_state"
 }}
 
@@ -9905,6 +10176,12 @@ unit_is_active() {{
       ;;
     heteronetwork-agent.service)
       [ "$agent_active" -eq 1 ]
+      ;;
+    ipars-relay.timer)
+      [ "$legacy_timer_active" -eq 1 ]
+      ;;
+    ipars-relay.service)
+      [ "$legacy_service_active" -eq 1 ]
       ;;
     *)
       return 1
@@ -9926,6 +10203,12 @@ set_unit_active() {{
     heteronetwork-agent.service)
       agent_active=$2
       ;;
+    ipars-relay.timer)
+      legacy_timer_active=$2
+      ;;
+    ipars-relay.service)
+      legacy_service_active=$2
+      ;;
   esac
   persist_systemd_state
 }}
@@ -9937,6 +10220,12 @@ unit_enable_state() {{
       ;;
     heteronetwork-agent.service)
       printf '%s\n' "$agent_enable_state"
+      ;;
+    ipars-relay.timer)
+      printf '%s\n' "$legacy_timer_enable_state"
+      ;;
+    ipars-relay.service)
+      printf '%s\n' "$legacy_service_enable_state"
       ;;
     *)
       printf '%s\n' not-found
@@ -9951,6 +10240,12 @@ set_unit_enable_state() {{
       ;;
     heteronetwork-agent.service)
       agent_enable_state=$2
+      ;;
+    ipars-relay.timer)
+      legacy_timer_enable_state=$2
+      ;;
+    ipars-relay.service)
+      legacy_service_enable_state=$2
       ;;
   esac
   persist_systemd_state
@@ -9981,7 +10276,13 @@ systemctl() {{
     show)
       case "$1" in
         --property=LoadState)
-          if [ "$(unit_enable_state "$systemctl_unit")" = not-found ]; then
+          if [ "$systemctl_unit" = ipars-relay.timer ] \
+            && [ ! -e "$legacy_relay_timer_unit_path" ]; then
+            printf '%s\n' not-found
+          elif [ "$systemctl_unit" = ipars-relay.service ] \
+            && [ ! -e "$legacy_relay_service_unit_path" ]; then
+            printf '%s\n' not-found
+          elif [ "$(unit_enable_state "$systemctl_unit")" = not-found ]; then
             printf '%s\n' not-found
           else
             printf '%s\n' loaded
@@ -10048,9 +10349,11 @@ systemctl() {{
 }}
 persist_systemd_state
 {installer_transaction_support}
+legacy_relay_timer_unit_path="$target_dir/ipars-relay.timer"
+legacy_relay_service_unit_path="$target_dir/ipars-relay.service"
 iparsd_path="$target_dir/iparsd"
 iparsd_previous_snapshot="$tmp_dir/iparsd.previous"
-relay_transaction_paths="$target_dir/existing $target_dir/created"
+relay_transaction_paths="$target_dir/existing $target_dir/created $legacy_relay_timer_unit_path $legacy_relay_service_unit_path"
 relay_transaction_temporary_paths="$target_dir/temporary.new"
 relay_transaction_random_temporary_globs="$target_dir/.relay.env.* $target_dir/.agent.conf.*"
 relay_transaction_directories="$target_dir/existing-dir $target_dir/created-dir"
@@ -10060,10 +10363,13 @@ relay_snapshot_directory_manifest="$relay_snapshot_dir/directories"
 mkdir "$target_dir/existing-dir"
 chmod 0750 "$target_dir/existing-dir"
 printf '%s\n' old-binary >"$iparsd_path"
+printf '%s\n' legacy-timer >"$legacy_relay_timer_unit_path"
+printf '%s\n' legacy-service >"$legacy_relay_service_unit_path"
 snapshot_iparsd_binary
 printf '%s\n' new-binary >"$iparsd_path"
 iparsd_replaced=1
 begin_relay_autopilot_transaction
+remove_legacy_relay_units
 printf '%s\n' after-upgrade >"$target_dir/existing"
 printf '%s\n' created-during-upgrade >"$target_dir/created"
 printf '%s\n' partial-temporary >"$target_dir/temporary.new"
@@ -10109,6 +10415,14 @@ exit 37
             assert!(!target_dir.join("temporary.new").exists());
             assert!(!target_dir.join(".relay.env.orphan").exists());
             assert!(!target_dir.join("created-dir").exists());
+            assert_eq!(
+                std::fs::read(target_dir.join("ipars-relay.timer"))?,
+                b"legacy-timer\n"
+            );
+            assert_eq!(
+                std::fs::read(target_dir.join("ipars-relay.service"))?,
+                b"legacy-service\n"
+            );
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -10121,7 +10435,7 @@ exit 37
                 );
             }
             let expected_state = format!(
-                "{} {} 1 {} 1 {}\n",
+                "{} {} 1 {} 1 {} enabled 1 enabled-runtime 1\n",
                 timer_enable_state,
                 u8::from(timer_was_active),
                 agent_enable_state,
@@ -10136,6 +10450,115 @@ exit 37
             std::fs::remove_file(systemctl_state)?;
             std::fs::remove_file(systemctl_log)?;
         }
+
+        let remove_legacy_relay_units = installer_transaction_support
+            .split_once("remove_legacy_relay_units() {\n")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n}\n\nrestore_systemd_unit_enable_state()")
+                    .map(|(body, _)| format!("remove_legacy_relay_units() {{\n{body}\n}}"))
+            })
+            .ok_or("generated installer omitted legacy Relay unit cleanup")?;
+        let legacy_cleanup_dir = std::env::temp_dir().join(format!(
+            "heteronetwork-legacy-relay-cleanup-{}",
+            random_oidc_value(12)
+        ));
+        std::fs::create_dir(&legacy_cleanup_dir)?;
+        let legacy_timer_path = legacy_cleanup_dir.join("ipars-relay.timer");
+        let legacy_service_path = legacy_cleanup_dir.join("ipars-relay.service");
+        let legacy_cleanup_log = legacy_cleanup_dir.join("systemctl.log");
+        std::fs::write(&legacy_timer_path, b"legacy timer")?;
+        std::fs::write(&legacy_service_path, b"legacy service")?;
+        let legacy_cleanup_harness = format!(
+            r#"set -eu
+legacy_relay_timer_unit_path=$1
+legacy_relay_service_unit_path=$2
+legacy_cleanup_log=$3
+legacy_timer_enable_state=enabled
+legacy_service_enable_state=enabled-runtime
+legacy_timer_active=1
+legacy_service_active=1
+
+stop_systemd_unit_with_kill() {{
+  printf 'stop %s\n' "$1" >>"$legacy_cleanup_log"
+  case "$1" in
+    ipars-relay.timer) legacy_timer_active=0 ;;
+    ipars-relay.service) legacy_service_active=0 ;;
+  esac
+}}
+systemd_unit_enable_state() {{
+  case "$1" in
+    ipars-relay.timer)
+      if [ -e "$legacy_relay_timer_unit_path" ]; then
+        printf '%s\n' "$legacy_timer_enable_state"
+      else
+        printf '%s\n' not-found
+      fi
+      ;;
+    ipars-relay.service)
+      if [ -e "$legacy_relay_service_unit_path" ]; then
+        printf '%s\n' "$legacy_service_enable_state"
+      else
+        printf '%s\n' not-found
+      fi
+      ;;
+  esac
+}}
+systemctl() {{
+  printf '%s\n' "$*" >>"$legacy_cleanup_log"
+  command_name=$1
+  shift
+  unit=
+  for argument in "$@"; do unit=$argument; done
+  case "$command_name" in
+    disable)
+      case "$unit" in
+        ipars-relay.timer) legacy_timer_enable_state=disabled ;;
+        ipars-relay.service) legacy_service_enable_state=disabled ;;
+      esac
+      ;;
+    daemon-reload)
+      ;;
+    show)
+      case "$unit" in
+        ipars-relay.timer)
+          [ ! -e "$legacy_relay_timer_unit_path" ] && printf '%s\n' not-found \
+            || printf '%s\n' loaded
+          ;;
+        ipars-relay.service)
+          [ ! -e "$legacy_relay_service_unit_path" ] && printf '%s\n' not-found \
+            || printf '%s\n' loaded
+          ;;
+      esac
+      ;;
+  esac
+}}
+{remove_legacy_relay_units}
+remove_legacy_relay_units
+remove_legacy_relay_units
+[ "$legacy_timer_active" -eq 0 ]
+[ "$legacy_service_active" -eq 0 ]
+[ ! -e "$legacy_relay_timer_unit_path" ]
+[ ! -e "$legacy_relay_service_unit_path" ]
+"#
+        );
+        let legacy_cleanup_result = std::process::Command::new("sh")
+            .args(["-c", &legacy_cleanup_harness, "sh"])
+            .arg(&legacy_timer_path)
+            .arg(&legacy_service_path)
+            .arg(&legacy_cleanup_log)
+            .output()?;
+        assert!(
+            legacy_cleanup_result.status.success(),
+            "legacy Relay cleanup is not idempotent: {}",
+            String::from_utf8_lossy(&legacy_cleanup_result.stderr)
+        );
+        let legacy_cleanup_calls = std::fs::read_to_string(&legacy_cleanup_log)?;
+        assert!(legacy_cleanup_calls.contains("stop ipars-relay.timer"));
+        assert!(legacy_cleanup_calls.contains("stop ipars-relay.service"));
+        assert!(legacy_cleanup_calls.contains("disable ipars-relay.timer"));
+        assert!(legacy_cleanup_calls.contains("disable ipars-relay.service"));
+        assert!(!legacy_cleanup_calls.contains("heteronetwork-relay.service"));
+        std::fs::remove_dir_all(legacy_cleanup_dir)?;
 
         let mutator_case_id = random_oidc_value(12);
         let mutator_cleanup_dir = std::env::temp_dir().join(format!(

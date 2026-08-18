@@ -4,6 +4,9 @@ set -euo pipefail
 readonly DEFAULT_AGENT_API_URL="http://127.0.0.1:9780"
 readonly DEFAULT_STATE_DIR="/etc/heteronetwork/postgres-autopilot"
 readonly DEFAULT_RECONCILE_INTERVAL_SECONDS="30"
+readonly DEFAULT_DCS_REPLACEMENT_ABSENCE_SECONDS="86400"
+readonly MIN_DCS_REPLACEMENT_ABSENCE_SECONDS="3600"
+readonly MAX_DCS_REPLACEMENT_ABSENCE_SECONDS="31536000"
 readonly MIN_DATABASE_MEMBER_COUNT="3"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
 readonly MAX_DATABASE_CANDIDATE_COUNT="64"
@@ -26,6 +29,7 @@ state_dir="${HETERONETWORK_DB_AUTOPILOT_STATE_DIR:-$DEFAULT_STATE_DIR}"
 config_path="${HETERONETWORK_DB_AUTOPILOT_CONFIG:-$state_dir/autopilot.env}"
 agent_api_url="${HETERONETWORK_AGENT_API_URL:-$DEFAULT_AGENT_API_URL}"
 reconcile_interval_seconds="${HETERONETWORK_DB_RECONCILE_INTERVAL_SECONDS:-$DEFAULT_RECONCILE_INTERVAL_SECONDS}"
+dcs_replacement_absence_seconds="${HETERONETWORK_DB_DCS_REPLACEMENT_ABSENCE_SECONDS:-$DEFAULT_DCS_REPLACEMENT_ABSENCE_SECONDS}"
 helper="/opt/heteronetwork/libexec/postgres-ha-node.sh"
 bundle_dir="$state_dir/bundle"
 bundle_archive="$state_dir/bundle.tar.gz"
@@ -36,6 +40,7 @@ proxy_bundle_marker_name=".proxy-only"
 eligible_path="$state_dir/eligible.tsv"
 authoritative_path="$state_dir/authoritative.tsv"
 active_path="$state_dir/active.tsv"
+activity_path="$state_dir/activity.tsv"
 registered_vpn_path="$state_dir/registered-vpn.tsv"
 vpn_cidr_path="$state_dir/vpn-cidr"
 selected_path="$state_dir/selected.tsv"
@@ -105,6 +110,11 @@ validate_config() {
   if [[ ! "$reconcile_interval_seconds" =~ ^[0-9]+$ ]] \
     || ((10#$reconcile_interval_seconds < 5 || 10#$reconcile_interval_seconds > 3600)); then
     die "reconcile interval must be between 5 and 3600 seconds"
+  fi
+  if [[ ! "$dcs_replacement_absence_seconds" =~ ^[0-9]+$ ]] \
+    || ((10#$dcs_replacement_absence_seconds < MIN_DCS_REPLACEMENT_ABSENCE_SECONDS \
+      || 10#$dcs_replacement_absence_seconds > MAX_DCS_REPLACEMENT_ABSENCE_SECONDS)); then
+    die "DCS replacement absence must be between $MIN_DCS_REPLACEMENT_ABSENCE_SECONDS and $MAX_DCS_REPLACEMENT_ABSENCE_SECONDS seconds"
   fi
   if [[ -n "${HETERONETWORK_DB_UNDERLAY_INTERFACE:-}" ]]; then
     [[ "$HETERONETWORK_DB_UNDERLAY_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] \
@@ -201,6 +211,14 @@ read_authoritative_node_registry() {
           and (.vpn_ip | type == "string")
           and (.role | type == "string")
           and (.active | type == "boolean")
+          and (
+            .last_seen_age_seconds == null
+            or (
+              .last_seen_age_seconds | type == "number"
+              and floor == .
+              and . >= 0
+            )
+          )
         )))
     ' <<<"$registry" >/dev/null; then
       printf '%s' "$registry"
@@ -582,11 +600,32 @@ validate_active_snapshot() {
   done <"$path"
 }
 
+validate_activity_snapshot() {
+  local path="$1"
+  local node_id vpn_ip active last_seen_age_seconds extra
+  local -A seen_node_ids=()
+  local -A seen_vpn_ips=()
+  while IFS=$'\t' read -r node_id vpn_ip active last_seen_age_seconds extra; do
+    [[ -n "$node_id" && -n "$vpn_ip" && "$active" =~ ^[01]$ \
+      && "$last_seen_age_seconds" =~ ^(-1|[0-9]+)$ && -z "${extra:-}" ]] \
+      || return 1
+    is_valid_node_id "$node_id" || return 1
+    is_valid_ipv4 "$vpn_ip" || return 1
+    grep -Fqx "$node_id"$'\t'"$vpn_ip" "$authoritative_path" || return 1
+    [[ -z "${seen_node_ids[$node_id]:-}" ]] || return 1
+    [[ -z "${seen_vpn_ips[$vpn_ip]:-}" ]] || return 1
+    seen_node_ids["$node_id"]=1
+    seen_vpn_ips["$vpn_ip"]=1
+  done <"$path"
+  ((${#seen_node_ids[@]} > 0))
+}
+
 write_registry_snapshots() {
   local local_vpn_ip="$1"
   local local_node_id="$2"
   local registry vpn_cidr vpn_cidr_temporary
   local registered_temporary authoritative_temporary active_temporary
+  local activity_temporary
   registry="$(read_authoritative_node_registry)" || return 1
 
   vpn_cidr="$(jq -er '.vpn_cidr | select(type == "string")' <<<"$registry")" \
@@ -596,6 +635,7 @@ write_registry_snapshots() {
   registered_temporary="$(mktemp "$state_dir/registered-vpn.XXXXXX")"
   authoritative_temporary="$(mktemp "$state_dir/authoritative.XXXXXX")"
   active_temporary="$(mktemp "$state_dir/active.XXXXXX")"
+  activity_temporary="$(mktemp "$state_dir/activity.XXXXXX")"
   printf '%s\n' "$vpn_cidr" >"$vpn_cidr_temporary"
   {
     printf '%s\t%s\n' "$local_vpn_ip" "$local_node_id"
@@ -604,7 +644,7 @@ write_registry_snapshots() {
   if ! validate_registered_vpn_snapshot "$registered_temporary"; then
     rm -f \
       "$vpn_cidr_temporary" "$registered_temporary" \
-      "$authoritative_temporary" "$active_temporary"
+      "$authoritative_temporary" "$active_temporary" "$activity_temporary"
     return 1
   fi
   install -m 0600 "$vpn_cidr_temporary" "$vpn_cidr_path"
@@ -621,7 +661,7 @@ write_registry_snapshots() {
   if ! validate_authoritative_snapshot "$authoritative_temporary"; then
     rm -f \
       "$vpn_cidr_temporary" "$registered_temporary" \
-      "$authoritative_temporary" "$active_temporary"
+      "$authoritative_temporary" "$active_temporary" "$activity_temporary"
     return 1
   fi
   install -m 0600 "$authoritative_temporary" "$authoritative_path"
@@ -636,13 +676,32 @@ write_registry_snapshots() {
   if ! validate_active_snapshot "$active_temporary"; then
     rm -f \
       "$vpn_cidr_temporary" "$registered_temporary" \
-      "$authoritative_temporary" "$active_temporary"
+      "$authoritative_temporary" "$active_temporary" "$activity_temporary"
     return 1
   fi
   install -m 0600 "$active_temporary" "$active_path"
+  jq -r '
+    .nodes[]
+    | select(.role != "client")
+    | [
+        .node_id,
+        .vpn_ip,
+        (if .active then 1 else 0 end),
+        (.last_seen_age_seconds // -1)
+      ]
+    | @tsv
+  ' <<<"$registry" \
+    | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 -u >"$activity_temporary"
+  if ! validate_activity_snapshot "$activity_temporary"; then
+    rm -f \
+      "$vpn_cidr_temporary" "$registered_temporary" \
+      "$authoritative_temporary" "$active_temporary" "$activity_temporary"
+    return 1
+  fi
+  install -m 0600 "$activity_temporary" "$activity_path"
   rm -f \
     "$vpn_cidr_temporary" "$registered_temporary" \
-    "$authoritative_temporary" "$active_temporary"
+    "$authoritative_temporary" "$active_temporary" "$activity_temporary"
 }
 
 registered_vpn_contains() {
@@ -1555,8 +1614,18 @@ for name, address in dcs.items():
     if members.get(name) != address:
         raise SystemExit("DCS member is absent from database members")
 for name, address in dcs_bootstrap.items():
-    if dcs.get(name) != address:
-        raise SystemExit("DCS bootstrap member is absent from requested DCS members")
+    if members.get(name) != address:
+        raise SystemExit("DCS bootstrap member is absent from database members")
+retiring = {
+    name for name, address in dcs_bootstrap.items() if dcs.get(name) != address
+}
+joining = {name for name, address in dcs.items() if dcs_bootstrap.get(name) != address}
+if retiring and not (
+    len(retiring) == 1
+    and len(joining) <= 1
+    and len(dcs_bootstrap) in {len(dcs), len(dcs) + 1}
+):
+    raise SystemExit("DCS bootstrap topology is not a single-member replacement transition")
 PY
   then
     return 1
@@ -2762,6 +2831,103 @@ print(",".join(members[:target]))
 PY
 }
 
+replacement_dcs_topology() {
+  local members_input="$1"
+  local identities_input="$2"
+  local current_dcs_input="$3"
+  python3 - \
+    "$members_input" "$identities_input" "$current_dcs_input" \
+    "$eligible_path" "$activity_path" \
+    "$dcs_replacement_absence_seconds" "$TARGET_DCS_MEMBER_COUNT" <<'PY'
+import sys
+
+(
+    members_raw,
+    identities_raw,
+    dcs_raw,
+    eligible_path,
+    activity_path,
+    absence_raw,
+    target_count_raw,
+) = sys.argv[1:]
+absence = int(absence_raw)
+target_count = int(target_count_raw)
+
+
+def mapping(raw, label):
+    result = {}
+    order = []
+    for entry in raw.split(",") if raw else []:
+        name, separator, value = entry.partition("=")
+        if not separator or not name or not value or name in result:
+            raise SystemExit(f"invalid {label}")
+        result[name] = value
+        order.append(name)
+    return result, order
+
+
+members, member_order = mapping(members_raw, "database member map")
+identities, identity_order = mapping(identities_raw, "database identity map")
+dcs, dcs_order = mapping(dcs_raw, "DCS member map")
+if member_order != identity_order:
+    raise SystemExit("database member and identity orders differ")
+if len(dcs_order) != target_count:
+    raise SystemExit(1)
+if any(members.get(name) != address for name, address in dcs.items()):
+    raise SystemExit("DCS member is absent from database members")
+
+activity = {}
+with open(activity_path, encoding="utf-8") as source:
+    for line in source:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 4:
+            raise SystemExit("invalid database activity row")
+        node_id, _vpn_ip, active_raw, inactive_raw = fields
+        if node_id in activity or active_raw not in {"0", "1"}:
+            raise SystemExit("invalid database activity identity")
+        activity[node_id] = (active_raw == "1", int(inactive_raw))
+
+stale_name = None
+for name in dcs_order:
+    node_id = identities.get(name)
+    if not node_id:
+        raise SystemExit("DCS member has no persisted identity")
+    active, inactive_for = activity.get(node_id, (False, -1))
+    if not active and inactive_for >= absence:
+        stale_name = name
+        break
+if stale_name is None:
+    raise SystemExit(1)
+
+name_by_node_id = {node_id: name for name, node_id in identities.items()}
+if len(name_by_node_id) != len(identities):
+    raise SystemExit("duplicate database member identity")
+dcs_node_ids = {identities[name] for name in dcs_order}
+replacement_name = None
+with open(eligible_path, encoding="utf-8") as source:
+    for line in source:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 3:
+            raise SystemExit("invalid eligible database member row")
+        _vpn_ip, node_id, underlay_ip = fields
+        name = name_by_node_id.get(node_id)
+        if name is None or node_id in dcs_node_ids:
+            continue
+        active, _inactive_for = activity.get(node_id, (False, -1))
+        if active and members.get(name) == underlay_ip:
+            replacement_name = name
+            break
+if replacement_name is None:
+    raise SystemExit(1)
+
+result = []
+for name in dcs_order:
+    selected_name = replacement_name if name == stale_name else name
+    result.append(f"{selected_name}={members[selected_name]}")
+print(",".join(result))
+PY
+}
+
 member_name_for_ip() {
   local input="$1"
   local address="$2"
@@ -3116,7 +3282,7 @@ reconcile_as_coordinator() {
     return
   fi
 
-  local expanded new_members new_member_identities new_dcs
+  local expanded new_members new_member_identities new_dcs replacement_dcs
   local members_changed=0 dcs_changed=0
   expanded="$(
     expand_members_from_snapshot \
@@ -3145,6 +3311,17 @@ reconcile_as_coordinator() {
     && [[ "$actual_dcs" == "$manifest_dcs_members" ]]; then
     new_dcs="$(target_dcs_topology "$new_members")"
     dcs_changed=1
+  fi
+  if ((members_changed == 0 \
+      && 10#$dcs_count == TARGET_DCS_MEMBER_COUNT)) \
+    && [[ "$actual_dcs" == "$manifest_dcs_members" ]] \
+    && replacement_dcs="$(replacement_dcs_topology \
+      "$new_members" "$new_member_identities" "$manifest_dcs_members" \
+      2>/dev/null)" \
+    && [[ "$replacement_dcs" != "$manifest_dcs_members" ]]; then
+    new_dcs="$replacement_dcs"
+    dcs_changed=1
+    log "staging replacement for a DCS voter absent at least $dcs_replacement_absence_seconds seconds"
   fi
   if ((members_changed == 1 || dcs_changed == 1)); then
     local next_revision stage
@@ -3427,6 +3604,7 @@ self_test() {
   eligible_path="$state_dir/eligible.tsv"
   authoritative_path="$state_dir/authoritative.tsv"
   active_path="$state_dir/active.tsv"
+  activity_path="$state_dir/activity.tsv"
   registered_vpn_path="$state_dir/registered-vpn.tsv"
   vpn_cidr_path="$state_dir/vpn-cidr"
   selected_path="$state_dir/selected.tsv"
@@ -3449,6 +3627,7 @@ self_test() {
   HETERONETWORK_DB_CLIENT_CIDRS="192.0.2.0/24,198.51.100.10/32"
   HETERONETWORK_DB_EXTRA_HBA_ENTRIES="keycloak:keycloak:10.250.0.4/32,keycloak:keycloak:10.250.0.5/32"
   reconcile_interval_seconds=30
+  dcs_replacement_absence_seconds="$DEFAULT_DCS_REPLACEMENT_ABSENCE_SECONDS"
   validate_config
   if (
     HETERONETWORK_DB_CLIENT_CIDRS="192.0.2.0/24,"
@@ -3461,6 +3640,12 @@ self_test() {
     validate_config >/dev/null 2>&1
   ); then
     die "invalid extra HBA entry was accepted"
+  fi
+  if (
+    dcs_replacement_absence_seconds="$((MIN_DCS_REPLACEMENT_ABSENCE_SECONDS - 1))"
+    validate_config >/dev/null 2>&1
+  ); then
+    die "unsafe DCS replacement absence threshold was accepted"
   fi
   if (
     HETERONETWORK_DB_UNDERLAY_INTERFACE="heteronetwork0"
@@ -3647,6 +3832,7 @@ nodes = [
         "vpn_ip": f"10.250.0.{index + 1}",
         "role": "worker",
         "active": True,
+        "last_seen_age_seconds": 0,
     }
     for index in range(64)
 ]
@@ -3687,11 +3873,11 @@ PY
   "vpn_cidr": "10.250.0.0/16",
   "selection_epoch": 0,
   "nodes": [
-    {"node_id":"node-a","vpn_ip":"10.250.0.2","role":"worker","active":true},
-    {"node_id":"node-b","vpn_ip":"10.250.0.3","role":"worker","active":true},
-    {"node_id":"node-c","vpn_ip":"10.250.0.10","role":"worker","active":true},
-    {"node_id":"node-down","vpn_ip":"10.250.0.20","role":"worker","active":false},
-    {"node_id":"node-client","vpn_ip":"10.250.0.99","role":"client","active":true}
+    {"node_id":"node-a","vpn_ip":"10.250.0.2","role":"worker","active":true,"last_seen_age_seconds":0},
+    {"node_id":"node-b","vpn_ip":"10.250.0.3","role":"worker","active":true,"last_seen_age_seconds":0},
+    {"node_id":"node-c","vpn_ip":"10.250.0.10","role":"worker","active":true,"last_seen_age_seconds":0},
+    {"node_id":"node-down","vpn_ip":"10.250.0.20","role":"worker","active":false,"last_seen_age_seconds":172800},
+    {"node_id":"node-client","vpn_ip":"10.250.0.99","role":"client","active":true,"last_seen_age_seconds":0}
   ]
 }
 JSON
@@ -3699,7 +3885,16 @@ JSON
   [[ "$(snapshot_count "$authoritative_path")" == "4" ]]
   [[ "$(snapshot_count "$active_path")" == "3" ]]
   [[ "$(snapshot_count "$registered_vpn_path")" == "5" ]]
+  [[ "$(snapshot_count "$activity_path")" == "4" ]]
+  grep -Fxq $'node-down\t10.250.0.20\t0\t172800' "$activity_path"
   cp "$registry_fixture" "$temporary/registry-with-active.json"
+  jq 'del(.nodes[] | select(.node_id == "node-down") | .last_seen_age_seconds)' \
+    "$registry_fixture" >"$temporary/registry-without-age.json"
+  install -m 0600 "$temporary/registry-without-age.json" "$registry_fixture"
+  write_registry_snapshots 10.250.0.2 node-a
+  grep -Fxq $'node-down\t10.250.0.20\t0\t-1' "$activity_path"
+  install -m 0600 "$temporary/registry-with-active.json" "$registry_fixture"
+  write_registry_snapshots 10.250.0.2 node-a
   jq '(.nodes[] | select(.role != "client") | .active) = false' \
     "$registry_fixture" >"$temporary/registry-without-active.json"
   install -m 0600 "$temporary/registry-without-active.json" "$registry_fixture"
@@ -4117,7 +4312,57 @@ JSON
   local dcs_five staged_five
   dcs_five="$(target_dcs_topology "$generated")"
   [[ "$(member_count "$dcs_five")" == "5" ]]
+  local replacement_members replacement_identities replacement_dcs
+  local staged_replacement
+  replacement_members="${generated},db-f=192.0.2.50"
+  replacement_identities="${generated_identities},db-f=node-f"
+  printf '%s\n' \
+    $'10.250.0.2\tnode-a\t100.123.154.79' \
+    $'10.250.0.3\tnode-b\t100.89.33.61' \
+    $'10.250.0.10\tnode-c\t163.220.236.52' \
+    $'10.250.0.4\tnode-d\t163.220.236.51' \
+    $'10.250.0.5\tnode-e\t100.94.130.38' \
+    $'10.250.0.6\tnode-f\t192.0.2.50' \
+    >"$eligible_path"
+  printf '%s\n' \
+    $'node-a\t10.250.0.2\t0\t172800' \
+    $'node-b\t10.250.0.3\t1\t0' \
+    $'node-c\t10.250.0.10\t1\t0' \
+    $'node-d\t10.250.0.4\t1\t0' \
+    $'node-e\t10.250.0.5\t1\t0' \
+    $'node-f\t10.250.0.6\t1\t0' \
+    >"$activity_path"
+  replacement_dcs="$(replacement_dcs_topology \
+    "$replacement_members" "$replacement_identities" "$dcs_five")"
+  [[ "$replacement_dcs" == \
+    "db-f=192.0.2.50,db-b=100.89.33.61,db-c=163.220.236.52,db-d=163.220.236.51,db-e=100.94.130.38" ]]
+  sed -i 's/node-a\t10.250.0.2\t0\t172800/node-a\t10.250.0.2\t0\t3600/' \
+    "$activity_path"
+  if replacement_dcs_topology \
+      "$replacement_members" "$replacement_identities" "$dcs_five" \
+      >/dev/null 2>&1; then
+    die "short DCS member absence triggered automatic replacement"
+  fi
+  sed -i 's/node-a\t10.250.0.2\t0\t3600/node-a\t10.250.0.2\t0\t172800/' \
+    "$activity_path"
+  sed -i 's/node-f\t192.0.2.50/node-f\t192.0.2.51/' "$eligible_path"
+  if replacement_dcs_topology \
+      "$replacement_members" "$replacement_identities" "$dcs_five" \
+      >/dev/null 2>&1; then
+    die "DCS replacement accepted candidate underlay address drift"
+  fi
+  sed -i 's/node-f\t192.0.2.51/node-f\t192.0.2.50/' "$eligible_path"
   HETERONETWORK_DB_INTERFACE=tailscale0
+  staged_replacement="$(stage_topology \
+    "$replacement_members" "$replacement_identities" \
+    "$replacement_dcs" "$dcs_five" 2 \
+    node-a 100.123.154.79)"
+  load_bundle_manifest "$staged_replacement"
+  [[ "$manifest_dcs_members" == "$replacement_dcs" ]]
+  [[ "$manifest_dcs_bootstrap_members" == "$dcs_five" ]]
+  [[ "$(member_count "$manifest_members")" == "6" ]]
+  rm -rf "$staged_replacement"
+  load_bundle_manifest "$bundle_dir"
   staged_five="$(stage_topology \
     "$generated" "$generated_identities" \
     "$dcs_five" "$manifest_dcs_bootstrap_members" 2 \

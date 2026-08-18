@@ -68,6 +68,27 @@ PostgreSQL standbys, so an acknowledged write is present on the primary and two
 replicas. The steady-state topology can lose any two correctly distributed
 database/DCS members without losing acknowledged data or DCS quorum.
 
+A voter that remains absent from the authoritative Control Plane health ledger
+for 24 hours is eligible for automatic replacement once a mutually reachable
+non-voter replica is available. The threshold can be increased with
+`HETERONETWORK_DB_DCS_REPLACEMENT_ABSENCE_SECONDS`; values below one hour are
+refused. Replacement never rebinds a database member name, HeteroNetwork node
+identity, or underlay address. The old PostgreSQL member remains in the replica
+map as a non-voter, and the replacement uses its own existing identity and a
+new member name.
+
+The replacement target is replicated to a majority of the current DCS before
+membership mutation. Under the existing distributed etcd lock, the autopilot
+adds the replacement as a learner, waits for every endpoint in the final
+five-member target to be healthy and for the learner's applied index to catch
+up, removes the unavailable voter, and only then promotes the learner. The
+intermediate four-voter quorum therefore remains available with three voters;
+the workflow never creates a six-voter quorum that would require all four
+surviving old voters. A retiring endpoint that still answers authenticated etcd
+health checks blocks replacement even when its HeteroNetwork Agent is offline.
+Unexpected peer URLs, more than one retiring member, cross-cluster status, and
+identity or address drift are fail-closed.
+
 ## Network Plane Contract
 
 The Control Plane response supplies the selected node IDs, roles, active state,

@@ -22,6 +22,7 @@ readonly MIN_DATABASE_MEMBER_COUNT="3"
 readonly MAX_DATABASE_MEMBER_COUNT="32"
 readonly MIN_DCS_MEMBER_COUNT="3"
 readonly MAX_DCS_MEMBER_COUNT="9"
+readonly DCS_REPLACEMENT_MAX_APPLIED_INDEX_LAG="128"
 readonly -a BUNDLE_SECRET_NAMES=(
   superuser
   replication
@@ -101,6 +102,7 @@ Optional environment:
   HETERONETWORK_DB_DCS_MEMBERS     Odd 3-9 voter entries; defaults to DB members
   HETERONETWORK_DB_DCS_BOOTSTRAP_MEMBERS
                                      Actual 3-9 DCS entries while joining a learner;
+                                     may include one retiring voter during replacement;
                                      defaults to HETERONETWORK_DB_DCS_MEMBERS
   HETERONETWORK_DB_DCS_INITIAL_CLUSTER_STATE
                                      new for a fresh quorum, existing when joining one
@@ -277,6 +279,35 @@ dcs_bootstrap_member_rows() {
     "$MIN_DCS_MEMBER_COUNT" "$MAX_DCS_MEMBER_COUNT" false
 }
 
+managed_dcs_member_rows() {
+  local name address desired_name desired_address found
+  dcs_member_rows
+  while read -r name address; do
+    found=0
+    while read -r desired_name desired_address; do
+      if [[ "$name" == "$desired_name" && "$address" == "$desired_address" ]]; then
+        found=1
+        break
+      fi
+    done < <(dcs_member_rows)
+    ((found == 1)) || printf '%s %s\n' "$name" "$address"
+  done < <(dcs_bootstrap_member_rows)
+}
+
+retiring_dcs_member_rows() {
+  local name address desired_name desired_address found
+  while read -r name address; do
+    found=0
+    while read -r desired_name desired_address; do
+      if [[ "$name" == "$desired_name" && "$address" == "$desired_address" ]]; then
+        found=1
+        break
+      fi
+    done < <(dcs_member_rows)
+    ((found == 1)) || printf '%s %s\n' "$name" "$address"
+  done < <(dcs_bootstrap_member_rows)
+}
+
 proxy_backend_rows() {
   member_rows_for "$proxy_backends" proxy \
     "$MIN_DATABASE_MEMBER_COUNT" "$MAX_DATABASE_MEMBER_COUNT" false
@@ -404,6 +435,7 @@ validate_common_config() {
     || die "a fresh DCS must bootstrap with the complete requested topology"
   local -A database_members=()
   local -A desired_dcs_members=()
+  local -A actual_dcs_members=()
   local name address
   while read -r name address; do
     database_members["$name"]="$address"
@@ -416,9 +448,25 @@ validate_common_config() {
   while read -r name address; do
     [[ "${database_members[$name]:-}" == "$address" ]] \
       || die "DCS bootstrap member $name=$address is not present in HETERONETWORK_DB_MEMBERS"
-    [[ "${desired_dcs_members[$name]:-}" == "$address" ]] \
-      || die "DCS bootstrap member $name=$address is not present in HETERONETWORK_DB_DCS_MEMBERS"
+    actual_dcs_members["$name"]="$address"
   done < <(dcs_bootstrap_member_rows)
+  local retiring_count=0 joining_count=0
+  for name in "${!actual_dcs_members[@]}"; do
+    [[ "${desired_dcs_members[$name]:-}" == "${actual_dcs_members[$name]}" ]] \
+      || retiring_count=$((retiring_count + 1))
+  done
+  for name in "${!desired_dcs_members[@]}"; do
+    [[ "${actual_dcs_members[$name]:-}" == "${desired_dcs_members[$name]}" ]] \
+      || joining_count=$((joining_count + 1))
+  done
+  if ((retiring_count > 0)); then
+    local desired_count actual_count
+    desired_count="${#desired_dcs_members[@]}"
+    actual_count="${#actual_dcs_members[@]}"
+    ((retiring_count == 1 && joining_count <= 1 \
+        && (actual_count == desired_count || actual_count == desired_count + 1))) \
+      || die "DCS bootstrap topology is not a single-member replacement transition"
+  fi
   application_cidrs >/dev/null
   extra_hba_rows >/dev/null
 }
@@ -475,7 +523,7 @@ node_is_dcs_member() {
     if [[ "$name" == "$node_name" && "$address" == "$node_address" ]]; then
       found=0
     fi
-  done < <(dcs_member_rows)
+  done < <(dcs_bootstrap_member_rows)
   return "$found"
 }
 
@@ -1497,7 +1545,10 @@ reconfigure_node() {
     render_dcs_service \
       | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/heteronetwork-db-dcs.service
   elif [[ -f /etc/systemd/system/heteronetwork-db-dcs.service ]]; then
-    die "automatic DCS voter removal is intentionally refused"
+    # The bundle's bootstrap map is the persisted actual etcd membership.
+    # Demotion is safe only after the coordinator has removed this member and
+    # replicated that newer bundle; retain its data for operator recovery.
+    systemctl disable --now heteronetwork-db-dcs.service
   fi
 
   render_patroni_config | install -o root -g postgres -m 0640 /dev/stdin "$state_dir/patroni.yml"
@@ -1520,19 +1571,39 @@ etcd_endpoints() {
   while read -r name address; do
     [[ -z "$output" ]] || output+=","
     output+="https://${address}:${dcs_client_port}"
+  done < <(dcs_bootstrap_member_rows)
+  printf '%s' "$output"
+}
+
+target_dcs_endpoints() {
+  local output="" name address
+  while read -r name address; do
+    [[ -z "$output" ]] || output+=","
+    output+="https://${address}:${dcs_client_port}"
   done < <(dcs_member_rows)
   printf '%s' "$output"
 }
 
-dcs_etcdctl() {
+dcs_etcdctl_at() {
+  local endpoints="$1"
+  shift
   /opt/heteronetwork/postgres-ha/etcdctl \
-    --endpoints="$(etcd_endpoints)" \
+    --endpoints="$endpoints" \
     --dial-timeout=3s \
     --command-timeout=10s \
     --cacert="$bundle_dir/ca/ca.crt" \
     --cert="$bundle_dir/nodes/$node_name/node.crt" \
     --key="$bundle_dir/nodes/$node_name/node.key" \
     "$@"
+}
+
+dcs_etcdctl() {
+  dcs_etcdctl_at "$(etcd_endpoints)" "$@"
+}
+
+require_installed_etcdctl() {
+  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] \
+    || die "etcdctl is not installed"
 }
 
 dcs_member_snapshot() {
@@ -1561,7 +1632,7 @@ current_dcs_members() {
   verify_interface_address
   verify_member_routes
   require_command python3
-  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
+  require_installed_etcdctl
   validate_bundle_authority "$bundle_dir"
 
   local snapshot
@@ -1580,7 +1651,7 @@ current_dcs_members() {
         found=1
         break
       fi
-    done < <(dcs_member_rows)
+    done < <(managed_dcs_member_rows)
     ((found == 1)) || die "DCS contains an unmanaged peer URL: $peer_url"
   done <<<"$snapshot"
 
@@ -1598,10 +1669,95 @@ current_dcs_members() {
       output+="${desired_name}=${desired_address}"
       matched_count=$((matched_count + 1))
     fi
-  done < <(dcs_member_rows)
+  done < <(managed_dcs_member_rows)
   ((matched_count == actual_count)) \
     || die "DCS membership could not be mapped to the requested topology"
   printf '%s\n' "$output"
+}
+
+dcs_replacement_status_is_ready() {
+  local document="$1"
+  local endpoints="$2"
+  local learner_id="${3:-}"
+  python3 - "$endpoints" "$learner_id" \
+    "$DCS_REPLACEMENT_MAX_APPLIED_INDEX_LAG" 3<<<"$document" <<'PY'
+import json
+import os
+import sys
+
+endpoints_raw, learner_id_raw, maximum_lag_raw = sys.argv[1:]
+expected_endpoints = set(endpoints_raw.split(","))
+maximum_lag = int(maximum_lag_raw)
+document = json.load(os.fdopen(3))
+if not isinstance(document, list) or len(document) != len(expected_endpoints):
+    raise SystemExit(1)
+
+statuses = {}
+cluster_ids = set()
+leader_ids = set()
+member_ids = set()
+for row in document:
+    endpoint = row.get("Endpoint")
+    status = row.get("Status")
+    if endpoint not in expected_endpoints or endpoint in statuses or not isinstance(status, dict):
+        raise SystemExit(1)
+    header = status.get("header")
+    errors = status.get("errors", [])
+    member_id = header.get("member_id") if isinstance(header, dict) else None
+    cluster_id = header.get("cluster_id") if isinstance(header, dict) else None
+    leader = status.get("leader")
+    applied = status.get("raftAppliedIndex")
+    if (
+        not isinstance(member_id, int)
+        or member_id <= 0
+        or not isinstance(cluster_id, int)
+        or cluster_id <= 0
+        or not isinstance(leader, int)
+        or leader <= 0
+        or not isinstance(applied, int)
+        or applied <= 0
+        or not isinstance(errors, list)
+        or errors
+    ):
+        raise SystemExit(1)
+    statuses[endpoint] = (member_id, applied)
+    cluster_ids.add(cluster_id)
+    leader_ids.add(leader)
+    member_ids.add(member_id)
+
+if (
+    set(statuses) != expected_endpoints
+    or len(cluster_ids) != 1
+    or len(leader_ids) != 1
+    or len(member_ids) != len(statuses)
+):
+    raise SystemExit(1)
+if not leader_ids.issubset(member_ids):
+    raise SystemExit(1)
+if learner_id_raw:
+    learner_id = int(learner_id_raw, 16)
+    learner_indexes = [applied for member_id, applied in statuses.values() if member_id == learner_id]
+    if len(learner_indexes) != 1:
+        raise SystemExit(1)
+    if max(applied for _member_id, applied in statuses.values()) - learner_indexes[0] > maximum_lag:
+        raise SystemExit(1)
+PY
+}
+
+dcs_replacement_is_ready() {
+  local learner_id="${1:-}"
+  local endpoints document
+  endpoints="$(target_dcs_endpoints)"
+  document="$(
+    dcs_etcdctl_at "$endpoints" endpoint status --write-out=json 2>/dev/null
+  )" || return 1
+  dcs_replacement_status_is_ready "$document" "$endpoints" "$learner_id"
+}
+
+dcs_endpoint_is_healthy() {
+  local address="$1"
+  dcs_etcdctl_at "https://${address}:${dcs_client_port}" \
+    endpoint health >/dev/null 2>&1
 }
 
 reconcile_dcs_unlocked() {
@@ -1612,7 +1768,7 @@ reconcile_dcs_unlocked() {
   verify_interface_address
   verify_member_routes
   require_command python3
-  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
+  require_installed_etcdctl
   validate_bundle_authority "$bundle_dir"
 
   local snapshot
@@ -1629,12 +1785,56 @@ reconcile_dcs_unlocked() {
           || die "DCS peer $peer_url is registered as unexpected name $actual_name"
         found=1
       fi
-    done < <(dcs_member_rows)
+    done < <(managed_dcs_member_rows)
     ((found == 1)) || die "DCS contains an unmanaged peer URL: $peer_url"
   done <<<"$snapshot"
 
+  local retiring_row retiring_name="" retiring_address=""
+  retiring_row="$(retiring_dcs_member_rows)"
+  if [[ -n "$retiring_row" ]]; then
+    IFS=' ' read -r retiring_name retiring_address <<<"$retiring_row"
+  fi
+
   while IFS=$'\t' read -r id actual_name peer_url learner; do
     [[ "$learner" == "true" ]] || continue
+    if [[ -n "$retiring_name" ]]; then
+      local target_match=0 target_name target_address target_url
+      while read -r target_name target_address; do
+        target_url="https://${target_address}:${dcs_peer_port}"
+        [[ "$peer_url" != "$target_url" ]] || target_match=1
+      done < <(dcs_member_rows)
+      ((target_match == 1)) \
+        || die "replacement learner is absent from the requested DCS topology"
+      if dcs_endpoint_is_healthy "$retiring_address"; then
+        printf 'DCS replacement is waiting because retiring voter %s is healthy.\n' \
+          "$retiring_name"
+        return
+      fi
+      if ! dcs_replacement_is_ready "$id"; then
+        printf 'DCS replacement learner %s is not healthy and caught up yet.\n' \
+          "${actual_name:-$peer_url}"
+        return
+      fi
+      local retired_id="" retired_id_candidate retired_actual_name
+      local retired_peer_url retired_learner
+      while IFS=$'\t' read -r retired_id_candidate retired_actual_name \
+          retired_peer_url retired_learner; do
+        if [[ "$retired_actual_name" == "$retiring_name" \
+          && "$retired_peer_url" == "https://${retiring_address}:${dcs_peer_port}" \
+          && "$retired_learner" == "false" ]]; then
+          retired_id="$retired_id_candidate"
+          break
+        fi
+      done <<<"$snapshot"
+      if [[ -z "$retired_id" ]]; then
+        printf 'DCS replacement is waiting for actual membership to be persisted.\n'
+        return
+      fi
+      dcs_etcdctl member remove "$retired_id" >/dev/null
+      printf 'Removed retired DCS voter %s after learner catch-up.\n' \
+        "$retiring_name"
+      return
+    fi
     if dcs_etcdctl member promote "$id" >/dev/null 2>&1; then
       printf 'Promoted DCS learner %s.\n' "${actual_name:-$peer_url}"
     else
@@ -1654,6 +1854,12 @@ reconcile_dcs_unlocked() {
       fi
     done <<<"$snapshot"
     if ((found == 0 && added == 0)); then
+      if [[ -n "$retiring_name" ]] \
+        && dcs_endpoint_is_healthy "$retiring_address"; then
+        printf 'DCS replacement is waiting because retiring voter %s is healthy.\n' \
+          "$retiring_name"
+        return
+      fi
       dcs_etcdctl member add "$desired_name" \
         --peer-urls="$desired_url" \
         --learner >/dev/null
@@ -1662,6 +1868,33 @@ reconcile_dcs_unlocked() {
     fi
   done < <(dcs_member_rows)
   ((added == 0)) || return 0
+  if [[ -n "$retiring_name" ]]; then
+    if dcs_endpoint_is_healthy "$retiring_address"; then
+      printf 'DCS replacement is waiting because retiring voter %s is healthy.\n' \
+        "$retiring_name"
+      return
+    fi
+    if ! dcs_replacement_is_ready; then
+      printf 'DCS replacement is waiting for every requested endpoint to be healthy.\n'
+      return
+    fi
+    local retired_id="" retired_id_candidate retired_actual_name
+    local retired_peer_url retired_learner
+    while IFS=$'\t' read -r retired_id_candidate retired_actual_name \
+        retired_peer_url retired_learner; do
+      if [[ "$retired_actual_name" == "$retiring_name" \
+        && "$retired_peer_url" == "https://${retiring_address}:${dcs_peer_port}" \
+        && "$retired_learner" == "false" ]]; then
+        retired_id="$retired_id_candidate"
+        break
+      fi
+    done <<<"$snapshot"
+    [[ -n "$retired_id" ]] || die "retiring DCS voter is absent from actual membership"
+    dcs_etcdctl member remove "$retired_id" >/dev/null
+    printf 'Removed retired DCS voter %s after replacement endpoint verification.\n' \
+      "$retiring_name"
+    return
+  fi
   printf 'DCS membership already matches the requested topology.\n'
 }
 
@@ -1670,7 +1903,7 @@ reconcile_dcs() {
   validate_node_config
   verify_interface_address
   verify_member_routes
-  [[ -x /opt/heteronetwork/postgres-ha/etcdctl ]] || die "etcdctl is not installed"
+  require_installed_etcdctl
   validate_bundle_authority "$bundle_dir"
   /opt/heteronetwork/postgres-ha/etcdctl \
     --endpoints="$(etcd_endpoints)" \
@@ -2054,6 +2287,115 @@ self_test() {
   ); then
     die "DCS bootstrap member outside the requested voter set unexpectedly succeeded"
   fi
+  (
+    dcs_members="db-f=100.64.10.6,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+    dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+    validate_common_config
+    node_name="db-f"
+    node_address="100.64.10.6"
+    if node_is_dcs_member; then
+      die "replacement candidate became a voter before joining actual membership"
+    fi
+    dcs_bootstrap_members="${dcs_bootstrap_members},db-f=100.64.10.6"
+    validate_common_config
+    node_is_dcs_member
+  )
+  if (
+    members="${members},db-g=100.64.10.7"
+    member_identities="${member_identities},db-g=node-g"
+    dcs_members="db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5,db-f=100.64.10.6,db-g=100.64.10.7"
+    dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+    validate_common_config >/dev/null 2>&1
+  ); then
+    die "multi-member DCS replacement transition was accepted"
+  fi
+  local replacement_status
+  replacement_status='[
+    {"Endpoint":"https://100.64.10.2:12379","Status":{"header":{"cluster_id":99,"member_id":2},"leader":2,"raftAppliedIndex":1000,"errors":[]}},
+    {"Endpoint":"https://100.64.10.3:12379","Status":{"header":{"cluster_id":99,"member_id":3},"leader":2,"raftAppliedIndex":998,"errors":[]}},
+    {"Endpoint":"https://100.64.10.4:12379","Status":{"header":{"cluster_id":99,"member_id":4},"leader":2,"raftAppliedIndex":995,"errors":[]}},
+    {"Endpoint":"https://100.64.10.5:12379","Status":{"header":{"cluster_id":99,"member_id":5},"leader":2,"raftAppliedIndex":900,"errors":[]}},
+    {"Endpoint":"https://100.64.10.6:12379","Status":{"header":{"cluster_id":99,"member_id":6},"leader":2,"raftAppliedIndex":999,"errors":[]}}
+  ]'
+  dcs_replacement_status_is_ready "$replacement_status" \
+    "https://100.64.10.2:12379,https://100.64.10.3:12379,https://100.64.10.4:12379,https://100.64.10.5:12379,https://100.64.10.6:12379" 6
+  if dcs_replacement_status_is_ready \
+      "$(sed 's/\"raftAppliedIndex\":999/\"raftAppliedIndex\":700/' \
+        <<<"$replacement_status")" \
+      "https://100.64.10.2:12379,https://100.64.10.3:12379,https://100.64.10.4:12379,https://100.64.10.5:12379,https://100.64.10.6:12379" 6; then
+    die "lagging DCS replacement learner was accepted"
+  fi
+  if dcs_replacement_status_is_ready \
+      "$(sed '0,/\"cluster_id\":99/s//\"cluster_id\":98/' \
+        <<<"$replacement_status")" \
+      "https://100.64.10.2:12379,https://100.64.10.3:12379,https://100.64.10.4:12379,https://100.64.10.5:12379,https://100.64.10.6:12379" 6; then
+    die "cross-cluster DCS replacement status was accepted"
+  fi
+  run_dcs_replacement_phase_test() {
+    local phase="$1"
+    local bootstrap="$2"
+    local fixture_snapshot="$3"
+    local expected_action="$4"
+    local retiring_endpoint_healthy="${5:-false}"
+    local action_log="$test_dir/dcs-replacement-${phase}.log"
+    (
+      dcs_members="db-f=100.64.10.6,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+      dcs_bootstrap_members="$bootstrap"
+      ETCD_LOCK_KEY="test-lock"
+      ETCD_LOCK_REV="1"
+      require_root() { return 0; }
+      validate_node_config() { return 0; }
+      verify_interface_address() { return 0; }
+      verify_member_routes() { return 0; }
+      require_command() { return 0; }
+      require_installed_etcdctl() { return 0; }
+      validate_bundle_authority() { return 0; }
+      dcs_member_snapshot() { printf '%s\n' "$fixture_snapshot"; }
+      dcs_endpoint_is_healthy() { [[ "$retiring_endpoint_healthy" == "true" ]]; }
+      dcs_replacement_is_ready() { return 0; }
+      dcs_etcdctl() { printf '%s\n' "$*" >>"$action_log"; }
+      reconcile_dcs_unlocked >/dev/null
+    )
+    if [[ -n "$expected_action" ]]; then
+      [[ "$(wc -l <"$action_log" | tr -d ' ')" == "1" ]]
+      grep -Fxq "$expected_action" "$action_log"
+    else
+      [[ ! -s "$action_log" ]]
+    fi
+  }
+  local replacement_target replacement_old replacement_union
+  replacement_target="db-f=100.64.10.6,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+  replacement_old="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4,db-e=100.64.10.5"
+  replacement_union="${replacement_target},db-a=100.64.10.1"
+  run_dcs_replacement_phase_test healthy-retiring "$replacement_old" "$(printf '%s\n' \
+    $'1\tdb-a\thttps://100.64.10.1:12380\tfalse' \
+    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
+    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
+    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
+    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse')" "" true
+  run_dcs_replacement_phase_test add "$replacement_old" "$(printf '%s\n' \
+    $'1\tdb-a\thttps://100.64.10.1:12380\tfalse' \
+    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
+    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
+    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
+    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse')" \
+    "member add db-f --peer-urls=https://100.64.10.6:12380 --learner"
+  run_dcs_replacement_phase_test remove "$replacement_union" "$(printf '%s\n' \
+    $'1\tdb-a\thttps://100.64.10.1:12380\tfalse' \
+    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
+    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
+    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
+    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse' \
+    $'6\tdb-f\thttps://100.64.10.6:12380\ttrue')" \
+    "member remove 1"
+  run_dcs_replacement_phase_test promote "$replacement_target" "$(printf '%s\n' \
+    $'2\tdb-b\thttps://100.64.10.2:12380\tfalse' \
+    $'3\tdb-c\thttps://100.64.10.3:12380\tfalse' \
+    $'4\tdb-d\thttps://100.64.10.4:12380\tfalse' \
+    $'5\tdb-e\thttps://100.64.10.5:12380\tfalse' \
+    $'6\tdb-f\thttps://100.64.10.6:12380\ttrue')" \
+    "member promote 6"
+  unset -f run_dcs_replacement_phase_test
   node_name="db-f"
   node_address="100.64.10.6"
   render_patroni_service >"$test_dir/non-voter.service"
