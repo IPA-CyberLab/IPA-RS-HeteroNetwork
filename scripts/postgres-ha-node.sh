@@ -1257,7 +1257,8 @@ install_postgresql_packages() {
 }
 
 install_etcd() {
-  if [[ -x /opt/heteronetwork/postgres-ha/etcd ]] \
+  if [[ -x /opt/heteronetwork/postgres-ha/etcd \
+    && -x /opt/heteronetwork/postgres-ha/etcdctl ]] \
     && /opt/heteronetwork/postgres-ha/etcd --version 2>/dev/null \
       | grep -Fq "etcd Version: ${ETCD_VERSION#v}"; then
     return 0
@@ -1444,9 +1445,9 @@ install_node() {
   fi
   install -d -o postgres -g postgres -m 0755 /run/postgresql
 
-  if node_is_dcs_member; then
-    install_etcd
-  fi
+  # Any active database member can become the reconciliation coordinator,
+  # while only requested DCS voters start the etcd server unit.
+  install_etcd
   install_patroni
   install_pki_and_secrets
   install_bootstrap_script
