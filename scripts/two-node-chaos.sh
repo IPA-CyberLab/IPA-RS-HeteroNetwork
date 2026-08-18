@@ -444,7 +444,7 @@ available heterocloud deployment heterocloud-heterocloud 1
 available heterocloud-flow deployment heterocloud-flow-api 1
 available heterocloud-flow deployment heterocloud-flow-signaling 1
 available heterocloud-flow deployment heterocloud-flow-livekit 1
-available heterocloud-flow statefulset heterocloud-flow-redis-node 1
+available heterocloud-flow statefulset heterocloud-flow-redis-node 3
 available heterocloud-flow deployment heterocloud-flow-coturn 1
 '
 }
@@ -521,6 +521,64 @@ vpn_mesh() {
     wait "$target" || status=1
   done
   return "$status"
+}
+
+pod_network_mesh() {
+  local label="$1"
+  shift
+  local -a nodes=("$@")
+  local run_id manifest="" index=0 node pod_name encoded_manifest remote_script
+  run_id="$(printf '%s-%s-%s' "$label" "$$" "$RANDOM" | tr -cd '[:alnum:]-' | tr '[:upper:]' '[:lower:]' | cut -c1-40)"
+  for node in "${nodes[@]}"; do
+    index=$((index + 1))
+    pod_name="hn-chaos-net-${run_id}-${index}"
+    manifest+="apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: default
+  labels:
+    heteronetwork.io/chaos-network-run: ${run_id}
+spec:
+  nodeName: ${node}
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: probe
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: [\"sh\", \"-c\", \"sleep 300\"]
+---
+"
+  done
+  encoded_manifest="$(printf '%s' "$manifest" | base64 -w0)"
+  remote_script="set -eu
+cleanup() {
+  kubectl -n default delete pod -l 'heteronetwork.io/chaos-network-run=${run_id}' --wait=false >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+printf '%s' '${encoded_manifest}' | base64 -d | kubectl apply -f - >/dev/null
+kubectl -n default wait --for=condition=Ready pod -l 'heteronetwork.io/chaos-network-run=${run_id}' --timeout=90s >/dev/null
+pods=\"\$(kubectl -n default get pods -l 'heteronetwork.io/chaos-network-run=${run_id}' -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}')\"
+addresses=\"\$(kubectl -n default get pods -l 'heteronetwork.io/chaos-network-run=${run_id}' -o jsonpath='{range .items[*]}{.status.podIP}{\"\\n\"}{end}')\"
+[ \"\$(printf '%s\\n' \"\$pods\" | sed '/^$/d' | wc -l)\" -eq '${#nodes[@]}' ]
+[ \"\$(printf '%s\\n' \"\$addresses\" | sed '/^$/d' | wc -l)\" -eq '${#nodes[@]}' ]
+status=0
+for source in \$pods; do
+  source_node=\"\$(kubectl -n default get pod \"\$source\" -o jsonpath='{.spec.nodeName}')\"
+  for address in \$addresses; do
+    if kubectl -n default exec \"\$source\" -- ping -c 1 -W 3 \"\$address\" >/dev/null 2>&1; then
+      printf '%s -> %s PASS\\n' \"\$source_node\" \"\$address\"
+    else
+      printf '%s -> %s FAIL\\n' \"\$source_node\" \"\$address\"
+      status=1
+    fi
+  done
+done
+exit \"\$status\"
+"
+  root_node "$active_jump" "$remote_script" >"$output_dir/${label}-pod-mesh.log" 2>&1
 }
 
 keycloak_oidc_probe() {
@@ -779,6 +837,8 @@ run_baseline() {
   prepare_database_probe || die "database write probe could not be prepared"
   database_write_probe || die "baseline synchronous database write failed"
   vpn_mesh baseline "${NODE_NAMES[@]}" || die "baseline VPN all-to-all mesh failed"
+  pod_network_mesh baseline "${NODE_NAMES[@]}" \
+    || die "baseline Pod-network all-to-all mesh failed; see $output_dir/baseline-pod-mesh.log"
   keycloak_oidc_probe "$observer" || die "baseline Keycloak/OIDC probe failed"
   external_baseline_probe || die "baseline public endpoint probe failed"
   flow_api_write_probe || die "baseline Flow room creation failed"
@@ -786,7 +846,7 @@ run_baseline() {
     || die "baseline Flow normal WebRTC E2E failed; see $output_dir/baseline-flow-normal.log"
   flow_e2e_probe relay "$output_dir/baseline-flow-relay.log" \
     || die "baseline Flow relay WebRTC E2E failed; see $output_dir/baseline-flow-relay.log"
-  log "baseline passed: ready=$ready_count control-planes=$control_planes VPN mesh and Flow normal/relay E2E passed"
+  log "baseline passed: ready=$ready_count control-planes=$control_planes VPN/Pod mesh and Flow normal/relay E2E passed"
 }
 
 status_word() {
@@ -803,7 +863,7 @@ run_pair() {
   local first="${pair%%+*}"
   local second="${pair#*+}"
   local observer case_directory unit_prefix started_at started_epoch duration
-  local fault_observed kubernetes vpn patroni db_write oidc flow_api flow_normal flow_relay recovery
+  local fault_observed kubernetes vpn pod_network patroni db_write oidc flow_api flow_normal flow_relay recovery
   local external_failures
 
   active_fault_a="$first"
@@ -839,12 +899,6 @@ run_pair() {
   fi
   log "case $order pair=$pair: simultaneous NotReady observation=$fault_observed"
 
-  if api_ready "$observer" >/dev/null 2>&1 && degraded_services_available "$observer" >/dev/null 2>&1; then
-    kubernetes=PASS
-  else
-    kubernetes=FAIL
-  fi
-
   local -a survivors=()
   local node
   for node in "${NODE_NAMES[@]}"; do
@@ -853,15 +907,24 @@ run_pair() {
     fi
   done
   vpn="$(status_word vpn_mesh "case-${order}-degraded" "${survivors[@]}")"
+  pod_network="$(status_word pod_network_mesh "case-${order}-degraded" "${survivors[@]}")"
+  if api_ready "$observer" >/dev/null 2>&1 \
+    && degraded_services_available "$observer" >/dev/null 2>&1 \
+    && [[ "$pod_network" == PASS ]]; then
+    kubernetes=PASS
+  else
+    kubernetes=FAIL
+  fi
   patroni="$(status_word patroni_has_leader)"
   db_write="$(status_word database_write_probe)"
   oidc="$(status_word keycloak_oidc_probe "$observer")"
   flow_api="$(status_word flow_api_write_probe)"
   flow_normal="$(status_word flow_e2e_probe all "$case_directory/flow-normal.log")"
   flow_relay="$(status_word flow_e2e_probe relay "$case_directory/flow-relay.log")"
-  log "case $order degraded: k8s=$kubernetes vpn=$vpn patroni=$patroni db-write=$db_write oidc=$oidc flow-api=$flow_api normal=$flow_normal relay=$flow_relay"
+  log "case $order degraded: k8s=$kubernetes vpn=$vpn pod-network=$pod_network patroni=$patroni db-write=$db_write oidc=$oidc flow-api=$flow_api normal=$flow_normal relay=$flow_relay"
 
-  if wait_for_full_recovery "$observer"; then
+  if wait_for_full_recovery "$observer" \
+    && pod_network_mesh "case-${order}-recovered" "${NODE_NAMES[@]}"; then
     recovery=PASS
   else
     recovery=FAIL
