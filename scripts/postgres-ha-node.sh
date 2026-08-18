@@ -1599,8 +1599,23 @@ dcs_etcdctl_at() {
     "$@"
 }
 
+dcs_control_endpoint() {
+  local _name address endpoint
+  while read -r _name address; do
+    endpoint="https://${address}:${dcs_client_port}"
+    if dcs_etcdctl_at "$endpoint" endpoint health >/dev/null 2>&1; then
+      printf '%s' "$endpoint"
+      return 0
+    fi
+  done < <(dcs_bootstrap_member_rows)
+  return 1
+}
+
 dcs_etcdctl() {
-  dcs_etcdctl_at "$(etcd_endpoints)" "$@"
+  local control_endpoint
+  control_endpoint="$(dcs_control_endpoint)" \
+    || die "no healthy DCS control endpoint is available"
+  dcs_etcdctl_at "$control_endpoint" "$@"
 }
 
 require_installed_etcdctl() {
@@ -1907,8 +1922,11 @@ reconcile_dcs() {
   verify_member_routes
   require_installed_etcdctl
   validate_bundle_authority "$bundle_dir"
+  local control_endpoint
+  control_endpoint="$(dcs_control_endpoint)" \
+    || die "no healthy DCS control endpoint is available"
   /opt/heteronetwork/postgres-ha/etcdctl \
-    --endpoints="$(etcd_endpoints)" \
+    --endpoints="$control_endpoint" \
     --dial-timeout=3s \
     --command-timeout=45s \
     --cacert="$bundle_dir/ca/ca.crt" \
@@ -2327,6 +2345,20 @@ self_test() {
     validate_common_config >/dev/null 2>&1
   ); then
     die "multi-member DCS replacement transition was accepted"
+  fi
+  (
+    dcs_bootstrap_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3"
+    dcs_etcdctl_at() {
+      [[ "$1" == "https://100.64.10.2:${dcs_client_port}" ]]
+    }
+    [[ "$(dcs_control_endpoint)" == \
+      "https://100.64.10.2:${dcs_client_port}" ]]
+  )
+  if (
+    dcs_etcdctl_at() { return 1; }
+    dcs_control_endpoint >/dev/null
+  ); then
+    die "DCS endpoint selection accepted an unhealthy endpoint set"
   fi
   local replacement_status
   replacement_status='[
