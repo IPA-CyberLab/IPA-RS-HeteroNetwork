@@ -15,7 +15,7 @@ spec:
       operation:
         op: add
         path: /default_filter_chain/filters/0/typed_config/http_filters/1/typed_config/timeout
-        value: 200ms
+        value: 0.200s
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: heterocloud-edge/heterocloud-edge/http
       operation:
@@ -27,7 +27,7 @@ spec:
       operation:
         op: add
         path: /default_filter_chain/filters/0/typed_config/http_filters/2/typed_config/timeout
-        value: 200ms
+        value: 0.200s
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: heterocloud-edge/heterocloud-edge/http
       operation:
@@ -39,7 +39,7 @@ spec:
       operation:
         op: add
         path: /default_filter_chain/filters/0/typed_config/http_filters/3/typed_config/timeout
-        value: 200ms
+        value: 0.200s
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: heterocloud-edge/heterocloud-edge/http
       operation:
