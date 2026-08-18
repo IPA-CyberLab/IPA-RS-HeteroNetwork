@@ -535,14 +535,24 @@ keycloak_oidc_probe() {
 }
 
 external_baseline_probe() {
-  local flow_code cloud_code oidc_code
-  flow_code="$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' \
-    'https://flow.heterocloud.mizuame.app/openapi.json' || true)"
-  cloud_code="$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' \
-    'https://heterocloud.mizuame.app/' || true)"
-  oidc_code="$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' \
-    'https://heterocloud.mizuame.app/api/v1/auth/oidc/start' || true)"
-  [[ "$flow_code" == 200 && "$cloud_code" == 200 && "$oidc_code" =~ ^30[12378]$ ]]
+  baseline_endpoint_available 200 'https://flow.heterocloud.mizuame.app/openapi.json' \
+    && baseline_endpoint_available 200 'https://heterocloud.mizuame.app/' \
+    && baseline_endpoint_available redirect 'https://heterocloud.mizuame.app/api/v1/auth/oidc/start'
+}
+
+baseline_endpoint_available() {
+  local expected="$1"
+  local url="$2"
+  local code attempt
+  for attempt in 1 2 3 4 5; do
+    code="$(curl -sS -o /dev/null --connect-timeout 5 --max-time 15 -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ "$expected" == redirect && "$code" =~ ^30[12378]$ ]] \
+      || [[ "$code" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 patroni_document() {
