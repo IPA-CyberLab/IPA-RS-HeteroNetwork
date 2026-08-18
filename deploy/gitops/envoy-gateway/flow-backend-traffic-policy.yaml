@@ -12,6 +12,27 @@ spec:
       kind: HTTPRoute
       name: flow-health
   rateLimit:
+    # Keep an independent edge limit active if the shared Redis-backed
+    # limiter fails open. Under normal operation the global rule remains
+    # the stricter cluster-wide 200 req/s ceiling.
+    local:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
     global:
       rules:
         - clientSelectors:

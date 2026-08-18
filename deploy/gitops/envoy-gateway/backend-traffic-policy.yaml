@@ -12,6 +12,27 @@ spec:
       kind: HTTPRoute
       name: heterocloud-health
   rateLimit:
+    # This per-proxy limit remains active when the global Redis-backed
+    # limiter is unavailable. The global rule below still provides the
+    # normal shared 200 req/s ceiling across all Envoy replicas.
+    local:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
     global:
       rules:
         - clientSelectors:
