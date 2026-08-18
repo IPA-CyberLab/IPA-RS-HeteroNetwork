@@ -1535,6 +1535,7 @@ reconfigure_node() {
   install -d -o root -g postgres -m 0750 "$state_dir/secrets"
   install_pki_and_secrets
   install_bootstrap_script
+  install_etcd
 
   if node_is_dcs_member; then
     id -u heteronetwork-dcs >/dev/null 2>&1 \
@@ -1542,7 +1543,6 @@ reconfigure_node() {
         --gid heteronetwork-db-ha heteronetwork-dcs
     usermod --home "$dcs_data_dir" heteronetwork-dcs
     install -d -o heteronetwork-dcs -g heteronetwork-db-ha -m 0700 "$dcs_data_dir"
-    install_etcd
     render_etcd_config \
       | install -o root -g heteronetwork-db-ha -m 0640 /dev/stdin "$state_dir/etcd.yml"
     render_dcs_service \
