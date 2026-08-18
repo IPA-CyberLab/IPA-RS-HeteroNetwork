@@ -512,7 +512,8 @@ vpn_mesh() {
   for source in "${sources[@]}"; do
     local source_log="$output_dir/${label}-${source}.log"
     logs+=("$source_log")
-    printf -v command 'status=0; for address in %s; do ping -c 1 -W 3 "$address" >/dev/null 2>&1 || status=1; done; exit "$status"' "$target_list"
+    printf -v command 'status=0; for address in %s; do if ping -c 1 -W 3 "$address" >/dev/null 2>&1; then printf "%%s -> %%s PASS\\n" %q "$address"; else printf "%%s -> %%s FAIL\\n" %q "$address"; status=1; fi; done; exit "$status"' \
+      "$target_list" "$source" "$source"
     (ssh_node "$source" "$command" >"$source_log" 2>&1) &
     pids+=("$!")
   done
@@ -710,7 +711,7 @@ arm_reboot() {
   local unit="$2"
   host_root_node "$node" "set -eu
 systemctl stop '${unit}.timer' '${unit}.service' >/dev/null 2>&1 || true
-systemd-run --quiet --unit='$unit' --on-active='${reboot_delay_seconds}s' --timer-property=AccuracySec=1s /usr/bin/systemctl reboot
+systemd-run --quiet --unit='$unit' --on-active='${reboot_delay_seconds}s' --timer-property=AccuracySec=1s /usr/bin/systemctl reboot --force
 systemctl is-active --quiet '${unit}.timer'
 "
 }
@@ -866,7 +867,9 @@ run_pair() {
   [[ "$recovery" == PASS ]] || die "pair $pair did not recover; stop before injecting another fault"
 }
 
-trap 'stop_external_monitor' EXIT INT TERM
+trap 'stop_external_monitor' EXIT
+trap 'stop_external_monitor; exit 130' INT
+trap 'stop_external_monitor; exit 143' TERM
 
 log "two-node chaos seed=$seed output=$output_dir execute=$execute"
 if [[ "$execute" != "true" && "$baseline_only" != "true" ]]; then
