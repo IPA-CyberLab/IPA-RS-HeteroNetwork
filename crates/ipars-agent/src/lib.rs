@@ -4481,15 +4481,14 @@ impl AgentRuntime {
         {
             return true;
         }
-        if topology_pinned {
-            if self
+        if topology_pinned
+            && self
                 .retained_overlay_neighbors()
                 .await
                 .iter()
                 .any(|neighbor| neighbor.node_id == peer.node_id)
-            {
-                return true;
-            }
+        {
+            return true;
         }
         let active_epochs = self.active_overlay_topology_epochs().await;
         let current_routing_epoch = self.current_overlay_routing_epoch().await;

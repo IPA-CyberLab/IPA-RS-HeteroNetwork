@@ -285,13 +285,15 @@ impl OverlayNeighborSender for UdpOverlayNeighborSender {
         })?;
         let digest = overlay_fragment_digest(frame);
         for (index, chunk) in frame.chunks(OVERLAY_FRAGMENT_PAYLOAD_BYTES).enumerate() {
-            let fragment = encode_overlay_fragment(
-                u16::try_from(index).expect("fragment count already fits in u16"),
-                fragment_count,
-                frame_len,
-                digest,
-                chunk,
-            );
+            let index = u16::try_from(index).map_err(|_| OverlayNeighborSendError::Io {
+                next_hop: next_hop.clone(),
+                endpoint,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bounded overlay frame requires too many transport fragments",
+                ),
+            })?;
+            let fragment = encode_overlay_fragment(index, fragment_count, frame_len, digest, chunk);
             self.send_datagram(next_hop, endpoint, &fragment).await?;
         }
         Ok(())
@@ -1824,20 +1826,16 @@ mod tests {
         let frame = (0..4_096).map(|value| value as u8).collect::<Vec<_>>();
         let frame_len = u32::try_from(frame.len())?;
         let digest = overlay_fragment_digest(&frame);
+        let fragment_count = u16::try_from(frame.len().div_ceil(OVERLAY_FRAGMENT_PAYLOAD_BYTES))?;
         let chunks = frame
             .chunks(OVERLAY_FRAGMENT_PAYLOAD_BYTES)
             .enumerate()
             .map(|(index, payload)| {
-                encode_overlay_fragment(
-                    u16::try_from(index).expect("test fragment index fits"),
-                    u16::try_from(frame.len().div_ceil(OVERLAY_FRAGMENT_PAYLOAD_BYTES))
-                        .expect("test fragment count fits"),
-                    frame_len,
-                    digest,
-                    payload,
-                )
+                u16::try_from(index).map(|index| {
+                    encode_overlay_fragment(index, fragment_count, frame_len, digest, payload)
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         assert!(chunks
             .iter()
             .all(|fragment| fragment.len() <= MAX_OVERLAY_TRANSIT_DATAGRAM_BYTES));
