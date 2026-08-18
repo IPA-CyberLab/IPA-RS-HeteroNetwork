@@ -262,6 +262,7 @@ ssh_node() {
   local address="${MANAGEMENT_ADDRESS[$node]}"
   local -a arguments=(
     ssh
+    -n
     -i "$ssh_key"
     -o BatchMode=yes
     -o ConnectTimeout=10
