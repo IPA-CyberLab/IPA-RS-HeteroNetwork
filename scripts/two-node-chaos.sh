@@ -205,8 +205,16 @@ known_hosts="$output_dir/known_hosts"
 run_log="$output_dir/run.log"
 results_file="$output_dir/results.tsv"
 order_file="$output_dir/order.tsv"
+seed_file="$output_dir/seed"
 touch "$known_hosts" "$run_log"
 chmod 600 "$known_hosts"
+
+if [[ -f "$seed_file" ]]; then
+  seed="$(<"$seed_file")"
+  validate_positive_integer stored-seed "$seed"
+else
+  printf '%s\n' "$seed" >"$seed_file"
+fi
 
 if [[ ! -f "$order_file" ]]; then
   pairs=""
