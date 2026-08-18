@@ -3057,12 +3057,110 @@ wait_for_bundle_health() {
       log "$output"
       return 0
     fi
+    if transition_bundle_health_ready; then
+      log "database topology revision $manifest_revision is healthy across every active transition member"
+      return 0
+    fi
     if ((attempt == BUNDLE_HEALTH_RETRY_ATTEMPTS)); then
       log "database topology revision $manifest_revision is not healthy yet: $output"
       return 1
     fi
     sleep "$BUNDLE_HEALTH_RETRY_SECONDS"
   done
+}
+
+transition_active_member_rows() {
+  python3 - \
+    "$manifest_members" "$manifest_member_identities" "$activity_path" \
+    "$dcs_replacement_absence_seconds" "$MIN_DATABASE_MEMBER_COUNT" <<'PY'
+import sys
+
+members_raw, identities_raw, activity_path, absence_raw, minimum_raw = sys.argv[1:]
+absence = int(absence_raw)
+minimum = int(minimum_raw)
+
+
+def mapping(raw, label):
+    result = {}
+    order = []
+    for entry in raw.split(",") if raw else []:
+        name, separator, value = entry.partition("=")
+        if not separator or not name or not value or name in result:
+            raise SystemExit(f"invalid {label}")
+        result[name] = value
+        order.append(name)
+    return result, order
+
+
+members, member_order = mapping(members_raw, "database member map")
+identities, identity_order = mapping(identities_raw, "database identity map")
+if member_order != identity_order:
+    raise SystemExit("database member and identity orders differ")
+
+activity = {}
+with open(activity_path, encoding="utf-8") as source:
+    for line in source:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 4:
+            raise SystemExit("invalid database activity row")
+        node_id, _vpn_ip, active_raw, inactive_raw = fields
+        if node_id in activity or active_raw not in {"0", "1"}:
+            raise SystemExit("invalid database activity identity")
+        activity[node_id] = (active_raw == "1", int(inactive_raw))
+
+active_members = []
+stale_members = 0
+for name in member_order:
+    node_id = identities[name]
+    active, inactive_for = activity.get(node_id, (False, -1))
+    if active:
+        active_members.append((name, members[name]))
+    elif inactive_for >= absence:
+        stale_members += 1
+    else:
+        raise SystemExit("database member is neither active nor durably absent")
+
+if stale_members < 1 or len(active_members) < minimum:
+    raise SystemExit("database transition has no safe active member quorum")
+for name, address in active_members:
+    print(f"{name}\t{address}")
+PY
+}
+
+transition_bundle_health_ready() {
+  load_bundle_manifest "$bundle_dir" || return 1
+  local active_members
+  active_members="$(transition_active_member_rows 2>/dev/null)" || return 1
+  local name address status count=0 primaries=0
+  while IFS=$'\t' read -r name address; do
+    [[ -n "$name" && -n "$address" ]] || return 1
+    status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 3 --max-time 10 \
+      --cacert "$bundle_dir/ca/ca.crt" \
+      --connect-to \
+        "${manifest_service_name}:${manifest_rest_port}:${address}:${manifest_rest_port}" \
+      "https://${manifest_service_name}:${manifest_rest_port}/health")" || return 1
+    [[ "$status" == "200" ]] || return 1
+    status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 3 --max-time 10 \
+      --cacert "$bundle_dir/ca/ca.crt" \
+      --connect-to \
+        "${manifest_service_name}:${manifest_rest_port}:${address}:${manifest_rest_port}" \
+      "https://${manifest_service_name}:${manifest_rest_port}/primary")" || return 1
+    if [[ "$status" == "200" ]]; then
+      primaries=$((primaries + 1))
+    else
+      status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 3 --max-time 10 \
+        --cacert "$bundle_dir/ca/ca.crt" \
+        --connect-to \
+          "${manifest_service_name}:${manifest_rest_port}:${address}:${manifest_rest_port}" \
+        "https://${manifest_service_name}:${manifest_rest_port}/replica")" || return 1
+      [[ "$status" == "200" ]] || return 1
+    fi
+    count=$((count + 1))
+  done <<<"$active_members"
+  ((count >= MIN_DATABASE_MEMBER_COUNT && primaries == 1))
 }
 
 apply_local_bundle() {
@@ -3934,6 +4032,27 @@ JSON
   [[ "$(snapshot_count "$active_path")" == "0" ]]
   install -m 0600 "$temporary/registry-with-active.json" "$registry_fixture"
   write_registry_snapshots 10.250.0.2 node-a
+  (
+    manifest_members="db-a=100.64.10.1,db-b=100.64.10.2,db-c=100.64.10.3,db-d=100.64.10.4"
+    manifest_member_identities="db-a=node-a,db-b=node-b,db-c=node-c,db-d=node-d"
+    dcs_replacement_absence_seconds=3600
+    activity_path="$temporary/transition-activity.tsv"
+    printf '%s\n' \
+      $'node-a\t10.250.0.2\t1\t0' \
+      $'node-b\t10.250.0.3\t1\t0' \
+      $'node-c\t10.250.0.4\t1\t0' \
+      $'node-d\t10.250.0.5\t0\t7200' \
+      >"$activity_path"
+    cmp -s <(transition_active_member_rows) <(printf '%s\n' \
+      $'db-a\t100.64.10.1' \
+      $'db-b\t100.64.10.2' \
+      $'db-c\t100.64.10.3')
+    sed -i 's/node-d\t10.250.0.5\t0\t7200/node-d\t10.250.0.5\t0\t60/' \
+      "$activity_path"
+    if transition_active_member_rows >/dev/null 2>&1; then
+      die "briefly inactive database member was accepted as retired"
+    fi
+  )
   HETERONETWORK_DB_CANDIDATE_EPOCH=0
   write_selected_snapshot
   unset HETERONETWORK_DB_CANDIDATE_EPOCH
