@@ -13,6 +13,7 @@ output_dir=""
 pair_filter=""
 seed="${HETERONETWORK_CHAOS_SEED:-$(date +%s)}"
 reboot_delay_seconds="${HETERONETWORK_CHAOS_REBOOT_DELAY_SECONDS:-180}"
+fault_observation_timeout_seconds="${HETERONETWORK_CHAOS_FAULT_OBSERVATION_TIMEOUT_SECONDS:-120}"
 recovery_timeout_seconds="${HETERONETWORK_CHAOS_RECOVERY_TIMEOUT_SECONDS:-900}"
 ssh_user="${HETERONETWORK_CHAOS_SSH_USER:-mizuame}"
 ssh_key="${HETERONETWORK_CHAOS_SSH_KEY:-${REPOSITORY_ROOT}/.key}"
@@ -80,6 +81,7 @@ Options:
   --output-dir DIR           New result directory.
   --resume DIR               Continue an existing result directory.
   --reboot-delay SECONDS     Automatic reboot delay. Default: 180.
+  --fault-timeout SECONDS    Maximum wait for both nodes to become NotReady. Default: 120.
   --recovery-timeout SECONDS Maximum convergence wait per pair. Default: 900.
   -h, --help                 Show this help.
 
@@ -172,6 +174,11 @@ while (($# > 0)); do
       recovery_timeout_seconds="$2"
       shift 2
       ;;
+    --fault-timeout)
+      (($# >= 2)) || die "--fault-timeout requires a value"
+      fault_observation_timeout_seconds="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -184,8 +191,11 @@ done
 
 validate_positive_integer seed "$seed"
 validate_positive_integer reboot-delay "$reboot_delay_seconds"
+validate_positive_integer fault-timeout "$fault_observation_timeout_seconds"
 validate_positive_integer recovery-timeout "$recovery_timeout_seconds"
 ((reboot_delay_seconds >= 90)) || die "reboot delay must be at least 90 seconds"
+((fault_observation_timeout_seconds >= 60)) \
+  || die "fault observation timeout must be at least 60 seconds"
 ((recovery_timeout_seconds >= 180)) || die "recovery timeout must be at least 180 seconds"
 [[ -z "$resume_dir" || -z "$output_dir" ]] \
   || die "--resume and --output-dir cannot be used together"
@@ -488,7 +498,7 @@ wait_for_fault_state() {
   local observer="$1"
   local first="$2"
   local second="$3"
-  local deadline=$((SECONDS + 75))
+  local deadline=$((SECONDS + fault_observation_timeout_seconds))
   local document ready_count
   while ((SECONDS < deadline)); do
     document="$(fetch_nodes_json "$observer" 2>/dev/null || true)"
