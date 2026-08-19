@@ -13695,7 +13695,7 @@ impl RelayForwarderSupervisor {
         self.ensure_capacity(&session.peer).await?;
         self.ensure_start_allowed(&session.peer).await?;
         self.remove_forwarder(runtime, &session.peer, false).await;
-        let socket = match self.bind_socket().await {
+        let socket = match self.bind_socket(session.relay_endpoint).await {
             Ok(socket) => socket,
             Err(error) => {
                 self.record_start_failure(&session.peer).await;
@@ -13788,14 +13788,18 @@ impl RelayForwarderSupervisor {
         finished_count
     }
 
-    async fn bind_socket(&self) -> anyhow::Result<tokio::net::UdpSocket> {
+    async fn bind_socket(
+        &self,
+        relay_endpoint: SocketAddr,
+    ) -> anyhow::Result<tokio::net::UdpSocket> {
         self.config.placement.validate_current_process()?;
-        tokio::net::UdpSocket::bind(self.config.bind_addr)
+        let bind_addr = relay_forwarder_socket_bind_endpoint(self.config.bind_addr, relay_endpoint);
+        tokio::net::UdpSocket::bind(bind_addr)
             .await
             .with_context(|| {
                 format!(
-                    "failed to bind relay forwarder UDP socket in {}",
-                    self.config.placement.description()
+                    "failed to bind relay forwarder UDP socket at {bind_addr} in {}",
+                    self.config.placement.description(),
                 )
             })
     }
@@ -13966,6 +13970,21 @@ fn relay_forwarder_local_endpoint(
         ));
     }
     Ok(bound_endpoint)
+}
+
+fn relay_forwarder_socket_bind_endpoint(
+    configured_bind: SocketAddr,
+    relay_endpoint: SocketAddr,
+) -> SocketAddr {
+    if !configured_bind.ip().is_loopback() || relay_endpoint.ip().is_loopback() {
+        return configured_bind;
+    }
+
+    let unspecified = match configured_bind {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(unspecified, configured_bind.port())
 }
 
 #[cfg(unix)]
@@ -34338,6 +34357,39 @@ exec sleep 60
         assert!(
             relay_forwarder_local_endpoint("0.0.0.0:42000".parse()?, "[::1]:51820".parse()?,)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relay_forwarder_migrates_legacy_loopback_bind_for_remote_relays() -> anyhow::Result<()> {
+        assert_eq!(
+            relay_forwarder_socket_bind_endpoint(
+                "127.0.0.1:0".parse()?,
+                "198.51.100.10:18445".parse()?,
+            ),
+            "0.0.0.0:0".parse()?
+        );
+        assert_eq!(
+            relay_forwarder_socket_bind_endpoint(
+                "[::1]:0".parse()?,
+                "[2001:db8::10]:18445".parse()?,
+            ),
+            "[::]:0".parse()?
+        );
+        assert_eq!(
+            relay_forwarder_socket_bind_endpoint(
+                "127.0.0.1:0".parse()?,
+                "127.0.0.1:18445".parse()?,
+            ),
+            "127.0.0.1:0".parse()?
+        );
+        assert_eq!(
+            relay_forwarder_socket_bind_endpoint(
+                "192.0.2.10:0".parse()?,
+                "198.51.100.10:18445".parse()?,
+            ),
+            "192.0.2.10:0".parse()?
         );
         Ok(())
     }
