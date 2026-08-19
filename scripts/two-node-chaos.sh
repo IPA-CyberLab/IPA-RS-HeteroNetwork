@@ -285,7 +285,7 @@ ssh_node() {
   local node="$1"
   local remote_command="$2"
   local address="${MANAGEMENT_ADDRESS[$node]}"
-  local -a arguments=(
+  local -a base_arguments=(
     ssh
     -n
     -i "$ssh_key"
@@ -298,18 +298,28 @@ ssh_node() {
     -o "UserKnownHostsFile=$known_hosts"
     -o LogLevel=ERROR
   )
-  if [[ -z "$address" ]]; then
-    [[ -n "$active_jump" ]] || die "no active jump host for $node"
-    local jump_address="${MANAGEMENT_ADDRESS[$active_jump]}"
-    local proxy
-    printf -v proxy \
-      'ssh -i %q -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=%q -o LogLevel=ERROR -W %%h:%%p %q' \
-      "$ssh_key" "$known_hosts" "${ssh_user}@${jump_address}"
-    arguments+=(-o "ProxyCommand=$proxy")
-    address="${VPN_ADDRESS[$node]}"
+  if [[ -n "$address" ]]; then
+    local -a direct_arguments=("${base_arguments[@]}" "${ssh_user}@${address}" "$remote_command")
+    "${direct_arguments[@]}" && return 0
+    local direct_status=$?
+    if ((direct_status != 255)) || [[ -z "$active_jump" || "$node" == "$active_jump" ]]; then
+      return "$direct_status"
+    fi
   fi
-  arguments+=("${ssh_user}@${address}" "$remote_command")
-  "${arguments[@]}"
+
+  [[ -n "$active_jump" ]] || die "no active jump host for $node"
+  local jump_address="${MANAGEMENT_ADDRESS[$active_jump]}"
+  local proxy
+  printf -v proxy \
+    'ssh -i %q -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=%q -o LogLevel=ERROR -W %%h:%%p %q' \
+    "$ssh_key" "$known_hosts" "${ssh_user}@${jump_address}"
+  local -a overlay_arguments=(
+    "${base_arguments[@]}"
+    -o "ProxyCommand=$proxy"
+    "${ssh_user}@${VPN_ADDRESS[$node]}"
+    "$remote_command"
+  )
+  "${overlay_arguments[@]}"
 }
 
 root_node() {
