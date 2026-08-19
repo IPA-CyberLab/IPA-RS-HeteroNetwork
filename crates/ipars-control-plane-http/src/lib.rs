@@ -4049,7 +4049,13 @@ install -d -o root -g root -m 0755 /etc/sysusers.d
 cat >/etc/sysusers.d/heteronetwork-gateway.conf <<'SYSUSERS'
 u heteronetwork-gateway - "HeteroNetwork Dynamic Public Web Gateway" /var/lib/heteronetwork-gateway
 SYSUSERS
-systemd-sysusers /etc/sysusers.d/heteronetwork-gateway.conf
+if ! id -u heteronetwork-gateway >/dev/null 2>&1; then
+  if [ "$promote_existing" -eq 1 ]; then
+    echo "existing promotion is missing the heteronetwork-gateway system user" >&2
+    exit 1
+  fi
+  systemd-sysusers /etc/sysusers.d/heteronetwork-gateway.conf
+fi
 cat >/etc/heteronetwork/gateway.Caddyfile <<'CADDYFILE'
 {
   admin unix//run/heteronetwork-gateway/admin.sock|0660
@@ -4401,7 +4407,13 @@ HETERONETWORK_RELAY_SYSUSERS
     /etc/sysusers.d/.heteronetwork-relay.conf.new
   mv -f /etc/sysusers.d/.heteronetwork-relay.conf.new \
     /etc/sysusers.d/heteronetwork-relay.conf
-  systemd-sysusers /etc/sysusers.d/heteronetwork-relay.conf
+  if ! id -u heteronetwork-relay >/dev/null 2>&1; then
+    if [ "$promote_existing" -eq 1 ]; then
+      echo "existing promotion is missing the heteronetwork-relay system user" >&2
+      exit 1
+    fi
+    systemd-sysusers /etc/sysusers.d/heteronetwork-relay.conf
+  fi
   install -d -o root -g heteronetwork-relay -m 0750 \
     /etc/heteronetwork/relay-autopilot
 
@@ -5119,7 +5131,13 @@ fn public_services_install_script(
   cat >/etc/sysusers.d/heteronetwork-services.conf <<'HETERONETWORK_PUBLIC_SERVICES_SYSUSERS'
 u heteronetwork-services - "HeteroNetwork automatic public services" /nonexistent
 HETERONETWORK_PUBLIC_SERVICES_SYSUSERS
-  systemd-sysusers /etc/sysusers.d/heteronetwork-services.conf
+  if ! id -u heteronetwork-services >/dev/null 2>&1; then
+    if [ "$promote_existing" -eq 1 ]; then
+      echo "existing promotion is missing the heteronetwork-services system user" >&2
+      exit 1
+    fi
+    systemd-sysusers /etc/sysusers.d/heteronetwork-services.conf
+  fi
   install -d -o root -g heteronetwork-services -m 0750 /etc/heteronetwork/public-services
   printf '%s' '{autopilot}' | base64 -d >/opt/heteronetwork/libexec/.public-services-autopilot.sh.new
   chown root:root /opt/heteronetwork/libexec/.public-services-autopilot.sh.new
