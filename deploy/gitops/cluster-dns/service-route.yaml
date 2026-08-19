@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubernetes-service-route
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kubernetes-service-route
+    app.kubernetes.io/part-of: heteronetwork
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubernetes-service-route
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubernetes-service-route
+        app.kubernetes.io/part-of: heteronetwork
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: reconciler
+          image: ghcr.io/flannel-io/flannel:v0.28.4
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              while true; do
+                if cni_ip="$(ip -4 -o address show dev cni0 2>/dev/null | awk 'NR == 1 {split($4, address, "/"); print address[1]}')" \
+                  && [ -n "$cni_ip" ]; then
+                  ip -4 route replace "$SERVICE_CIDR" dev cni0 src "$cni_ip"
+                fi
+                sleep 10
+              done
+          env:
+            - name: SERVICE_CIDR
+              value: 10.96.0.0/12
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  cni_ip="$(ip -4 -o address show dev cni0 | awk 'NR == 1 {split($4, address, "/"); print address[1]}')"
+                  [ -n "$cni_ip" ]
+                  route="$(ip -4 route show "$SERVICE_CIDR")"
+                  printf '%s\n' "$route" | grep -Fq "$SERVICE_CIDR dev cni0"
+                  printf '%s\n' "$route" | grep -Fq "src $cni_ip"
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_ADMIN
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi

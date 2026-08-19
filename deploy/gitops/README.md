@@ -64,7 +64,11 @@ Cluster DNS is managed by the `cluster-dns` Application. It keeps three CoreDNS
 replicas on separate nodes with a two-pod disruption budget and runs the
 upstream Kubernetes NodeLocal DNSCache DaemonSet on every Linux node. The
 NodeLocal cache keeps normal Pod DNS traffic on the local node and forwards
-cache misses to the CoreDNS Service over TCP. Run
+cache misses to the CoreDNS Service over TCP. The same Application runs a
+privileged, capability-limited `kubernetes-service-route` DaemonSet. It pins
+host-originated Service traffic to each node's `cni0` source address so return
+traffic remains routable when Kubernetes nodes are spread across unrelated
+physical LANs. Run
 `sudo scripts/reconcile-kubelet-dns.sh` once on each existing node after a
 cluster upgrade; kubeadm-created nodes configure the same resolver path during
 `prepare`. The helper limits the resolver file consumed by kubelet to three

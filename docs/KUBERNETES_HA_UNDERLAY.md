@@ -213,6 +213,12 @@ host-side CNI links:
 sudo -E scripts/kubeadm-ha-node.sh verify-cluster
 ```
 
+The GitOps `cluster-dns` Application also reconciles a Service-CIDR route on
+every node. Host-networked workloads use the local `cni0` address as their
+source when kube-proxy translates a ClusterIP to a remote Pod. This is required
+for replies to cross the HeteroNetwork underlay instead of an unrelated LAN
+default route.
+
 ## Failure test
 
 Keep an authenticated shell open through HeteroNetwork before disabling any

@@ -4,3 +4,4 @@ kind: Kustomization
 resources:
   - coredns.yaml
   - nodelocaldns.yaml
+  - service-route.yaml
