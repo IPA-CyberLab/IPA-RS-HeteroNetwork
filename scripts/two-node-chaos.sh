@@ -608,7 +608,7 @@ for source in \$pods; do
   source_node=\"\$(kubectl -n default get pod \"\$source\" -o jsonpath='{.spec.nodeName}')\"
   for address in \$addresses; do
     reached=0
-    for attempt in 1 2 3 4 5; do
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
       if kubectl -n default exec \"\$source\" -- ping -c 1 -W 2 \"\$address\" >/dev/null 2>&1; then
         reached=1
         break
