@@ -9324,6 +9324,10 @@ async fn run_agent(
             route_reporter: heartbeat_route_reporter,
         }));
         if !args.disable_public_services_autopromotion {
+            tracing::info!(
+                interval_seconds = args.heartbeat_interval_seconds,
+                "automatic public-services bootstrap reporting enabled"
+            );
             background_tasks.push(start_public_services_bootstrap_reporting(
                 runtime.clone(),
                 http_client.clone(),
@@ -9331,6 +9335,8 @@ async fn run_agent(
                 control_plane_bases.clone(),
                 Duration::from_secs(args.heartbeat_interval_seconds),
             ));
+        } else {
+            tracing::info!("automatic public-services bootstrap reporting disabled");
         }
     }
     let peer_map_handle = if args.apply_peer_map {
@@ -15073,6 +15079,7 @@ fn start_public_services_bootstrap_reporting(
         .await;
         loop {
             if public_services_bootstrap_is_configured_or_pending() {
+                tracing::debug!("public-services bootstrap generation is current or pending");
                 tokio::time::sleep(interval).await;
                 continue;
             }
@@ -15083,10 +15090,20 @@ fn start_public_services_bootstrap_reporting(
                 .as_ref()
                 .is_some_and(public_nat_classification_is_eligible);
             if !eligible {
+                tracing::debug!(
+                    connectivity = ?status
+                        .nat_classification
+                        .as_ref()
+                        .map(|classification| classification.connectivity_state),
+                    "public-services bootstrap is waiting for an eligible NAT classification"
+                );
                 tokio::time::sleep(interval).await;
                 continue;
             }
             let Some(node) = runtime.state().registered_node else {
+                tracing::warn!(
+                    "public-services bootstrap is waiting for a persisted node registration"
+                );
                 tokio::time::sleep(interval).await;
                 continue;
             };
@@ -15108,6 +15125,11 @@ fn start_public_services_bootstrap_reporting(
                     control_plane_urls.clone()
                 }
             };
+            tracing::info!(
+                node_id = %request.node.node_id,
+                control_planes = active_control_plane_urls.len(),
+                "requesting automatic public-services bootstrap"
+            );
             match send_public_services_bootstrap(&client, &active_control_plane_urls, request).await
             {
                 Ok(response) => {
@@ -15123,7 +15145,7 @@ fn start_public_services_bootstrap_reporting(
                     }
                 }
                 Err(error) => {
-                    tracing::debug!(%error, "public-services promotion is not currently available")
+                    tracing::warn!(%error, "public-services promotion is not currently available")
                 }
             }
             tokio::time::sleep(interval).await;
