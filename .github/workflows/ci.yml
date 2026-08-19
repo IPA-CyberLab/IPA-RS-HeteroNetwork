@@ -61,7 +61,10 @@ jobs:
         run: |
           sh -n scripts/public-services-autopilot.sh
           sh -n scripts/public-services-autopilot-smoke.sh
+          sh -n scripts/public-services-bootstrap.sh
+          sh -n scripts/public-services-bootstrap-smoke.sh
           scripts/public-services-autopilot-smoke.sh
+          scripts/public-services-bootstrap-smoke.sh
 
       - name: Validate automatic Keycloak HA placement
         run: |
