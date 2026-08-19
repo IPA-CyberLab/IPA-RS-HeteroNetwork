@@ -5672,8 +5672,11 @@ mod tests {
             "client_id": "heteronetwork-web",
             "scopes": "openid profile email"
         });
-        let provider = device_login_provider_for_candidate(&config, "http://10.250.0.6:19088")
-            .expect("candidate should provide a safe private backchannel");
+        let provider = match device_login_provider_for_candidate(&config, "http://10.250.0.6:19088")
+        {
+            Ok(provider) => provider,
+            Err(error) => panic!("candidate should provide a safe private backchannel: {error}"),
+        };
         assert_eq!(
             provider.device_url.as_str(),
             "http://10.250.0.6:18079/realms/heteronetwork/protocol/openid-connect/auth/device"
