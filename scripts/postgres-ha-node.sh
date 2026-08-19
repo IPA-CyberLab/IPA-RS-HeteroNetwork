@@ -14,6 +14,7 @@ readonly DEFAULT_DCS_PEER_PORT="12380"
 readonly DEFAULT_DCS_METRICS_PORT="12381"
 readonly DEFAULT_PROXY_PORT="25432"
 readonly DEFAULT_POSTGRES_MAJOR="17"
+readonly DEFAULT_MAX_CONNECTIONS="300"
 readonly DEFAULT_NETWORK_PLANE="underlay-v1"
 readonly PATRONI_VERSION="4.1.4"
 readonly ETCD_VERSION="v3.6.11"
@@ -657,7 +658,7 @@ bootstrap:
         wal_log_hints: "on"
         max_wal_senders: ${replication_capacity}
         max_replication_slots: ${replication_capacity}
-        max_connections: 200
+        max_connections: ${DEFAULT_MAX_CONNECTIONS}
         ssl: "on"
         ssl_min_protocol_version: TLSv1.2
         ssl_cert_file: ${state_dir}/pki/node.crt
@@ -1960,9 +1961,10 @@ reconcile_patroni_config() {
     -c "$state_dir/patroni.yml" \
     edit-config "$cluster_name" \
     --set "synchronous_node_count=${synchronous_count}" \
+    --set "postgresql.parameters.max_connections=${DEFAULT_MAX_CONNECTIONS}" \
     --force >/dev/null
-  printf 'Patroni requires %s synchronous standbys for this topology.\n' \
-    "$synchronous_count"
+  printf 'Patroni requires %s synchronous standbys and allows %s client connections.\n' \
+    "$synchronous_count" "$DEFAULT_MAX_CONNECTIONS"
 }
 
 status_cluster() {
@@ -2097,6 +2099,7 @@ self_test() {
   grep -Fq 'synchronous_node_count: 2' "$test_dir/patroni.yml"
   grep -Fq 'max_wal_senders: 36' "$test_dir/patroni.yml"
   grep -Fq 'max_replication_slots: 36' "$test_dir/patroni.yml"
+  grep -Fq 'max_connections: 300' "$test_dir/patroni.yml"
   grep -Fq 'listen: 100.64.10.1,10.250.0.1:55432' "$test_dir/patroni.yml"
   [[ "$(grep -c 'hostssl keycloak keycloak 10.250.0.[45]/32 scram-sha-256' \
     "$test_dir/patroni.yml")" == "4" ]]
