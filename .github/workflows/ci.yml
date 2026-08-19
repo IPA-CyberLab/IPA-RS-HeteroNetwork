@@ -473,3 +473,61 @@ jobs:
           HETERONETWORK_KIND_K8S_SMOKE_AGENT_RUNTIME_BACKEND: linux-command
           HETERONETWORK_KIND_K8S_SMOKE_CLUSTER_WAIT_SECONDS: "300"
         run: scripts/kind-k8s-smoke.sh
+
+  container-image:
+    name: Publish release container
+    needs:
+      - rust-quality
+      - macos-client
+      - netns-smoke
+      - docker-compose-smoke
+      - rootless-docker-smoke
+      - load-smoke
+      - init-spawn-smoke
+      - helm-smoke
+      - kind-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
+            echo "Release tag is not a supported container tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish immutable image
+        env:
+          IMAGE: ghcr.io/ipa-cyberlab/heteronetwork
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          version="${RELEASE_TAG#v}"
+          docker build \
+            --build-arg "HETERONETWORK_BUILD_VERSION=$version" \
+            --build-arg "HETERONETWORK_BUILD_HASH=$GITHUB_SHA" \
+            --tag "$IMAGE:$short_sha" \
+            --tag "$IMAGE:$RELEASE_TAG" \
+            --tag "$IMAGE:latest" \
+            --file docker/Dockerfile \
+            .
+          docker push "$IMAGE:$short_sha"
+          docker push "$IMAGE:$RELEASE_TAG"
+          docker push "$IMAGE:latest"
