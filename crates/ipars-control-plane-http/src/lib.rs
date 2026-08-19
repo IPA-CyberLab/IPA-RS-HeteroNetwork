@@ -4081,9 +4081,16 @@ if [ "$promote_existing" -eq 0 ]; then
   esac
   rm -f "$token_file"
 else
-  jq -e '.registered_node.node_id | type == "string" and length > 0 and length <= 255' \
-    /var/lib/heteronetwork/agent.json >/dev/null \
-    || { echo "--promote-existing requires an already registered HeteroNetwork Agent" >&2; exit 1; }
+  heteronetwork_enrolled_node_id=$(
+    jq -er '.registered_node.node_id | select(type == "string" and length > 0 and length <= 255)' \
+      /var/lib/heteronetwork/agent.json
+  ) || { echo "--promote-existing requires an already registered HeteroNetwork Agent" >&2; exit 1; }
+  case "$heteronetwork_enrolled_node_id" in
+    *[!A-Za-z0-9_.-]*)
+      echo "Existing HeteroNetwork node ID is invalid" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 install -d -o root -g root -m 0755 /etc/heteronetwork
@@ -9886,6 +9893,9 @@ mod tests {
         ));
         assert!(generated_script
             .contains("--promote-existing requires an already registered HeteroNetwork Agent"));
+        assert!(generated_script
+            .contains("heteronetwork_enrolled_node_id=$(\n    jq -er '.registered_node.node_id"));
+        assert!(generated_script.contains("Existing HeteroNetwork node ID is invalid"));
         assert!(generated_script.contains("/opt/heteronetwork/bin/ipars"));
         assert!(generated_script
             .contains("HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=false"));
