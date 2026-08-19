@@ -3256,6 +3256,37 @@ if ! command -v systemd-sysusers >/dev/null 2>&1; then
   exit 1
 fi
 
+ensure_system_user() {
+  user_name=$1
+  sysusers_config=$2
+  unit_suffix=$3
+  if id -u "$user_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ "$promote_existing" -eq 1 ]; then
+    if ! command -v systemd-run >/dev/null 2>&1; then
+      echo "HeteroNetwork promotion requires systemd-run to create $user_name" >&2
+      return 1
+    fi
+    systemd-run \
+      --quiet \
+      --wait \
+      --collect \
+      --pipe \
+      --unit="heteronetwork-bootstrap-sysusers-${unit_suffix}-$$" \
+      "$(command -v systemd-sysusers)" \
+      "$sysusers_config"
+  else
+    systemd-sysusers "$sysusers_config"
+  fi
+
+  if ! id -u "$user_name" >/dev/null 2>&1; then
+    echo "systemd-sysusers did not create $user_name" >&2
+    return 1
+  fi
+}
+
 install_dependencies() {
   if command -v apt-get >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update
@@ -4049,13 +4080,10 @@ install -d -o root -g root -m 0755 /etc/sysusers.d
 cat >/etc/sysusers.d/heteronetwork-gateway.conf <<'SYSUSERS'
 u heteronetwork-gateway - "HeteroNetwork Dynamic Public Web Gateway" /var/lib/heteronetwork-gateway
 SYSUSERS
-if ! id -u heteronetwork-gateway >/dev/null 2>&1; then
-  if [ "$promote_existing" -eq 1 ]; then
-    echo "existing promotion is missing the heteronetwork-gateway system user" >&2
-    exit 1
-  fi
-  systemd-sysusers /etc/sysusers.d/heteronetwork-gateway.conf
-fi
+ensure_system_user \
+  heteronetwork-gateway \
+  /etc/sysusers.d/heteronetwork-gateway.conf \
+  gateway
 cat >/etc/heteronetwork/gateway.Caddyfile <<'CADDYFILE'
 {
   admin unix//run/heteronetwork-gateway/admin.sock|0660
@@ -4407,13 +4435,10 @@ HETERONETWORK_RELAY_SYSUSERS
     /etc/sysusers.d/.heteronetwork-relay.conf.new
   mv -f /etc/sysusers.d/.heteronetwork-relay.conf.new \
     /etc/sysusers.d/heteronetwork-relay.conf
-  if ! id -u heteronetwork-relay >/dev/null 2>&1; then
-    if [ "$promote_existing" -eq 1 ]; then
-      echo "existing promotion is missing the heteronetwork-relay system user" >&2
-      exit 1
-    fi
-    systemd-sysusers /etc/sysusers.d/heteronetwork-relay.conf
-  fi
+  ensure_system_user \
+    heteronetwork-relay \
+    /etc/sysusers.d/heteronetwork-relay.conf \
+    relay
   install -d -o root -g heteronetwork-relay -m 0750 \
     /etc/heteronetwork/relay-autopilot
 
@@ -5131,13 +5156,10 @@ fn public_services_install_script(
   cat >/etc/sysusers.d/heteronetwork-services.conf <<'HETERONETWORK_PUBLIC_SERVICES_SYSUSERS'
 u heteronetwork-services - "HeteroNetwork automatic public services" /nonexistent
 HETERONETWORK_PUBLIC_SERVICES_SYSUSERS
-  if ! id -u heteronetwork-services >/dev/null 2>&1; then
-    if [ "$promote_existing" -eq 1 ]; then
-      echo "existing promotion is missing the heteronetwork-services system user" >&2
-      exit 1
-    fi
-    systemd-sysusers /etc/sysusers.d/heteronetwork-services.conf
-  fi
+  ensure_system_user \
+    heteronetwork-services \
+    /etc/sysusers.d/heteronetwork-services.conf \
+    services
   install -d -o root -g heteronetwork-services -m 0750 /etc/heteronetwork/public-services
   printf '%s' '{autopilot}' | base64 -d >/opt/heteronetwork/libexec/.public-services-autopilot.sh.new
   chown root:root /opt/heteronetwork/libexec/.public-services-autopilot.sh.new
@@ -9806,6 +9828,12 @@ mod tests {
             "Usage: $0 [--promote-existing] [--mapped-public-ip IP] [--disable-relay] [--disable-public-services]"
         ));
         assert!(generated_script.contains("promote_existing=0"));
+        assert!(generated_script.contains("ensure_system_user()"));
+        assert!(generated_script
+            .contains("--unit=\"heteronetwork-bootstrap-sysusers-${unit_suffix}-$$\""));
+        assert!(generated_script.contains(
+            "ensure_system_user \\\n    heteronetwork-relay \\\n    /etc/sysusers.d/heteronetwork-relay.conf \\\n    relay"
+        ));
         assert!(generated_script
             .contains("--promote-existing requires an already registered HeteroNetwork Agent"));
         assert!(generated_script.contains("/opt/heteronetwork/bin/ipars"));
