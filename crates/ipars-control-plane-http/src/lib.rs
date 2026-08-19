@@ -90,7 +90,7 @@ const KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS: usize = 3;
 const KEYCLOAK_AUTOPILOT_MAX_CANDIDATES: usize = 64;
 const KEYCLOAK_AUTOPILOT_LEASE_SECONDS: u64 = 45;
 const KEYCLOAK_AUTOPILOT_RECONCILE_SECONDS: u64 = 15;
-const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "3";
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "4";
 const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
@@ -4507,7 +4507,7 @@ HETERONETWORK_RELAY_SYSUSERS
   cat >"$tmp_dir/10-relay-admission.conf" <<'HETERONETWORK_RELAY_ADMISSION_UNIT'
 [Service]
 Environment=HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token
-Environment=HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=127.0.0.1:0
+Environment=HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=0.0.0.0:0
 HETERONETWORK_RELAY_ADMISSION_UNIT
   install -o root -g root -m 0644 "$tmp_dir/10-relay-admission.conf" \
     /etc/systemd/system/heteronetwork-agent.service.d/.10-relay-admission.conf.new
@@ -9980,7 +9980,7 @@ mod tests {
         assert!(generated_script.contains(
             "HETERONETWORK_AGENT_RELAY_ADMISSION_BEARER_TOKEN_PATH=/etc/heteronetwork/relay-admission.token"
         ));
-        assert!(generated_script.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=127.0.0.1:0"));
+        assert!(generated_script.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_BIND=0.0.0.0:0"));
         assert!(
             !generated_script.contains("HETERONETWORK_AGENT_RELAY_FORWARDER_WIREGUARD_ENDPOINT=")
         );

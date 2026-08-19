@@ -13702,9 +13702,11 @@ impl RelayForwarderSupervisor {
                 return Err(error);
             }
         };
-        let local_endpoint = socket
+        let bound_endpoint = socket
             .local_addr()
             .context("failed to read relay forwarder local endpoint")?;
+        let local_endpoint =
+            relay_forwarder_local_endpoint(bound_endpoint, self.config.wireguard_endpoint)?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let metrics = Arc::new(RelayForwarderStats::new(
             session.peer.clone(),
@@ -13735,6 +13737,8 @@ impl RelayForwarderSupervisor {
         tracing::info!(
             peer = %session.peer,
             relay = %session.relay_node,
+            relay_endpoint = %session.relay_endpoint,
+            bound_endpoint = %bound_endpoint,
             local_endpoint = %local_endpoint,
             wireguard_endpoint = %self.config.wireguard_endpoint,
             placement = %self.config.placement.description(),
@@ -13945,6 +13949,23 @@ impl RelayForwarderSupervisor {
             }
         }
     }
+}
+
+fn relay_forwarder_local_endpoint(
+    bound_endpoint: SocketAddr,
+    wireguard_endpoint: SocketAddr,
+) -> anyhow::Result<SocketAddr> {
+    anyhow::ensure!(
+        bound_endpoint.is_ipv4() == wireguard_endpoint.is_ipv4(),
+        "relay forwarder bind and WireGuard endpoints must use the same address family"
+    );
+    if bound_endpoint.ip().is_unspecified() {
+        return Ok(SocketAddr::new(
+            wireguard_endpoint.ip(),
+            bound_endpoint.port(),
+        ));
+    }
+    Ok(bound_endpoint)
 }
 
 #[cfg(unix)]
@@ -34255,6 +34276,69 @@ exec sleep 60
 
         supervisor.shutdown_all(&runtime).await;
         assert!(runtime.relay_forwarder_endpoints().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_forwarder_supervisor_uses_loopback_for_wildcard_listener() -> anyhow::Result<()>
+    {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let relay = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let supervisor = RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 1,
+            restart_backoff: Duration::ZERO,
+            crash_policy: test_crash_policy(),
+        });
+        let peer = NodeId::from_string("peer-wildcard");
+        let endpoint = supervisor
+            .upsert(
+                &runtime,
+                RelaySessionState {
+                    peer: peer.clone(),
+                    relay_node: NodeId::from_string("relay-wildcard"),
+                    relay_endpoint: relay.local_addr()?,
+                    admitted_local_addr: SocketAddr::from(([198, 51, 100, 10], 40_001)),
+                    admitted_peer_addr: SocketAddr::from(([198, 51, 100, 20], 40_002)),
+                    session_id: "local-node:peer-wildcard".to_string(),
+                    session_token: "token-wildcard".to_string(),
+                    expires_at: Utc::now() + ChronoDuration::minutes(5),
+                },
+            )
+            .await?;
+
+        assert_eq!(endpoint.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(endpoint.port(), 0);
+        assert_eq!(
+            runtime.relay_forwarder_endpoints().await.get(&peer),
+            Some(&endpoint)
+        );
+        let mut announcement = [0_u8; 2048];
+        tokio::time::timeout(Duration::from_secs(1), relay.recv_from(&mut announcement)).await??;
+
+        supervisor.shutdown_all(&runtime).await;
+        Ok(())
+    }
+
+    #[test]
+    fn relay_forwarder_local_endpoint_normalizes_wildcard_addresses() -> anyhow::Result<()> {
+        assert_eq!(
+            relay_forwarder_local_endpoint("0.0.0.0:42000".parse()?, "127.0.0.1:51820".parse()?,)?,
+            "127.0.0.1:42000".parse()?
+        );
+        assert_eq!(
+            relay_forwarder_local_endpoint("[::]:42000".parse()?, "[::1]:51820".parse()?)?,
+            "[::1]:42000".parse()?
+        );
+        assert!(
+            relay_forwarder_local_endpoint("0.0.0.0:42000".parse()?, "[::1]:51820".parse()?,)
+                .is_err()
+        );
         Ok(())
     }
 
