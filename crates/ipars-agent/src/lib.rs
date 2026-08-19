@@ -19,7 +19,10 @@ use ipars_crypto::{
     decode_wireguard_private_key_b64, decode_wireguard_public_key_b64, encode_bytes, CryptoError,
     IdentityKeyPair, WireGuardKeyPair,
 };
-use ipars_relay::{encode_relay_datagram_with_route, encode_relay_endpoint_announcement};
+use ipars_relay::{
+    encode_relay_datagram_with_route, encode_relay_endpoint_announcement,
+    wireguard_datagram_payload,
+};
 use ipars_route_manager::{
     desired_managed_route_inventory, validate_route_plan, warn_if_linux_netns_is_current,
     with_linux_network_namespace, with_netlink_namespace, LinuxNetlinkSocket,
@@ -1724,19 +1727,6 @@ fn wireguard_sender_matches_configured(configured: SocketAddr, observed: SocketA
         (IpAddr::V6(configured), IpAddr::V6(observed)) => {
             configured.is_unspecified() || configured == observed
         }
-        _ => false,
-    }
-}
-
-fn wireguard_datagram_payload(payload: &[u8]) -> bool {
-    if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
-        return false;
-    }
-    match payload[0] {
-        1 => payload.len() == 148,
-        2 => payload.len() == 92,
-        3 => payload.len() == 64,
-        4 => payload.len() >= 32 && payload.len().is_multiple_of(16),
         _ => false,
     }
 }

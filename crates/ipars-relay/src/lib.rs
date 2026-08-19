@@ -1,7 +1,7 @@
 pub mod multihop;
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -72,6 +72,8 @@ pub struct RelaySession {
     pub bytes_forwarded: u64,
     left_addr_learned: bool,
     right_addr_learned: bool,
+    left_wireguard_sender_indices: Vec<u32>,
+    right_wireguard_sender_indices: Vec<u32>,
     window_started_at: DateTime<Utc>,
     window_bytes: u64,
     max_bytes_per_second: u64,
@@ -126,6 +128,7 @@ const MAX_RELAY_SESSION_ID_BYTES: usize = 4096;
 const MAX_RELAY_SESSION_TOKEN_BYTES: usize = 256;
 const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 const MAX_RELAY_CIPHERTEXT_PAYLOAD_BYTES: usize = 128 * 1024;
+const MAX_WIREGUARD_SENDER_INDICES_PER_SIDE: usize = 8;
 
 pub fn encode_relay_datagram(
     session_id: &str,
@@ -247,6 +250,7 @@ pub fn encode_relay_endpoint_announcement(
 #[derive(Debug, Default)]
 pub struct RelayTable {
     sessions: BTreeMap<RelaySessionId, RelaySession>,
+    wireguard_return_routes: BTreeMap<u32, Vec<WireGuardReturnRoute>>,
     dataplane: RelayDataplaneMetrics,
 }
 
@@ -322,11 +326,13 @@ impl RelayTable {
             }
             existing.expires_at = expires_at;
             existing.max_bytes_per_second = megabits_to_bytes_per_second(capability.max_mbps);
-            return Ok(RelaySessionCredentials {
+            let credentials = RelaySessionCredentials {
                 session_id: existing.id.clone(),
                 session_token: existing.session_token.clone(),
                 expires_at,
-            });
+            };
+            self.rebuild_wireguard_return_routes();
+            return Ok(credentials);
         }
         if !capability.can_admit() {
             return Err(RelayError::AdmissionDenied);
@@ -345,6 +351,8 @@ impl RelayTable {
                 bytes_forwarded: 0,
                 left_addr_learned: false,
                 right_addr_learned: false,
+                left_wireguard_sender_indices: Vec::new(),
+                right_wireguard_sender_indices: Vec::new(),
                 window_started_at: now,
                 window_bytes: 0,
                 max_bytes_per_second: megabits_to_bytes_per_second(capability.max_mbps),
@@ -453,49 +461,218 @@ impl RelayTable {
         datagram: &[u8],
         now: DateTime<Utc>,
     ) -> Result<RelayDatagramForward, RelayError> {
-        let datagram = decode_relay_datagram(datagram)?;
+        let datagram = match decode_relay_datagram(datagram) {
+            Ok(datagram) => datagram,
+            Err(RelayError::MalformedFrame) if wireguard_datagram_payload(datagram) => {
+                return self.forward_wireguard_return_datagram(source_addr, datagram, now);
+            }
+            Err(error) => return Err(error),
+        };
         self.remove_expired_session(&datagram.session_id, now)?;
+        let session_id = datagram.session_id.clone();
+        let (forward, route_update) = {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .ok_or(RelayError::UnknownSession)?;
+            session.verify_token(&datagram.session_token)?;
+            let (target, source_side) =
+                match (datagram.source.as_ref(), datagram.destination.as_ref()) {
+                    (Some(source), Some(destination))
+                        if source == &session.left && destination == &session.right =>
+                    {
+                        session.left_addr = source_addr;
+                        session.left_addr_learned = true;
+                        (session.right_addr, RelaySessionSide::Left)
+                    }
+                    (Some(source), Some(destination))
+                        if source == &session.right && destination == &session.left =>
+                    {
+                        session.right_addr = source_addr;
+                        session.right_addr_learned = true;
+                        (session.left_addr, RelaySessionSide::Right)
+                    }
+                    (Some(_), Some(_)) => return Err(RelayError::UnknownSession),
+                    _ if session.left_addr == source_addr => {
+                        (session.right_addr, RelaySessionSide::Left)
+                    }
+                    _ if session.right_addr == source_addr => {
+                        (session.left_addr, RelaySessionSide::Right)
+                    }
+                    _ => return Err(RelayError::UnknownSession),
+                };
+
+            session.consume_rate_limit(datagram.ciphertext_payload.len(), now)?;
+            let route_update = if datagram.endpoint_announcement {
+                None
+            } else {
+                session
+                    .record_wireguard_sender_index(source_side, &datagram.ciphertext_payload)
+                    .map(|(receiver_index, evicted_index)| {
+                        let (raw_source_side, raw_source_ip) = match source_side {
+                            RelaySessionSide::Left => {
+                                (RelaySessionSide::Right, session.right_addr.ip())
+                            }
+                            RelaySessionSide::Right => {
+                                (RelaySessionSide::Left, session.left_addr.ip())
+                            }
+                        };
+                        (
+                            receiver_index,
+                            evicted_index,
+                            WireGuardReturnRoute {
+                                session_id: session_id.clone(),
+                                source_side: raw_source_side,
+                                source_ip: raw_source_ip,
+                            },
+                        )
+                    })
+            };
+            session.bytes_forwarded = session
+                .bytes_forwarded
+                .saturating_add(datagram.ciphertext_payload.len() as u64);
+            (
+                RelayDatagramForward {
+                    target,
+                    payload: datagram.ciphertext_payload,
+                    should_forward: !datagram.endpoint_announcement,
+                },
+                route_update,
+            )
+        };
+        if let Some((receiver_index, evicted_index, route)) = route_update {
+            self.upsert_wireguard_return_route(receiver_index, evicted_index, route);
+        }
+        Ok(forward)
+    }
+
+    fn forward_wireguard_return_datagram(
+        &mut self,
+        source_addr: SocketAddr,
+        datagram: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<RelayDatagramForward, RelayError> {
+        let receiver_index =
+            wireguard_receiver_index(datagram).ok_or(RelayError::MalformedFrame)?;
+        self.purge_expired(now);
+
+        let mut matching_session = None;
+        for route in self
+            .wireguard_return_routes
+            .get(&receiver_index)
+            .into_iter()
+            .flatten()
+            .filter(|route| route.source_ip == source_addr.ip())
+        {
+            let Some(session) = self.sessions.get(&route.session_id) else {
+                continue;
+            };
+            let target_is_authenticated = match route.source_side {
+                RelaySessionSide::Left => session.right_addr_learned,
+                RelaySessionSide::Right => session.left_addr_learned,
+            };
+            if !target_is_authenticated {
+                continue;
+            }
+            if matching_session.is_some() {
+                return Err(RelayError::UnknownSession);
+            }
+            matching_session = Some((route.session_id.clone(), route.source_side));
+        }
+
+        let (session_id, source_side) = matching_session.ok_or(RelayError::UnknownSession)?;
         let session = self
             .sessions
-            .get_mut(&datagram.session_id)
+            .get_mut(&session_id)
             .ok_or(RelayError::UnknownSession)?;
-        session.verify_token(&datagram.session_token)?;
-        let target = match (datagram.source.as_ref(), datagram.destination.as_ref()) {
-            (Some(source), Some(destination))
-                if source == &session.left && destination == &session.right =>
-            {
+        session.consume_rate_limit(datagram.len(), now)?;
+        let target = match source_side {
+            RelaySessionSide::Left => {
                 session.left_addr = source_addr;
-                session.left_addr_learned = true;
                 session.right_addr
             }
-            (Some(source), Some(destination))
-                if source == &session.right && destination == &session.left =>
-            {
+            RelaySessionSide::Right => {
                 session.right_addr = source_addr;
-                session.right_addr_learned = true;
                 session.left_addr
             }
-            (Some(_), Some(_)) => return Err(RelayError::UnknownSession),
-            _ if session.left_addr == source_addr => session.right_addr,
-            _ if session.right_addr == source_addr => session.left_addr,
-            _ => return Err(RelayError::UnknownSession),
         };
-
-        session.consume_rate_limit(datagram.ciphertext_payload.len(), now)?;
         session.bytes_forwarded = session
             .bytes_forwarded
-            .saturating_add(datagram.ciphertext_payload.len() as u64);
+            .saturating_add(datagram.len() as u64);
         Ok(RelayDatagramForward {
             target,
-            payload: datagram.ciphertext_payload,
-            should_forward: !datagram.endpoint_announcement,
+            payload: datagram.to_vec(),
+            should_forward: true,
         })
+    }
+
+    fn upsert_wireguard_return_route(
+        &mut self,
+        receiver_index: u32,
+        evicted_index: Option<u32>,
+        route: WireGuardReturnRoute,
+    ) {
+        if let Some(evicted_index) = evicted_index {
+            let remove_entry =
+                if let Some(routes) = self.wireguard_return_routes.get_mut(&evicted_index) {
+                    routes.retain(|existing| {
+                        existing.session_id != route.session_id
+                            || existing.source_side != route.source_side
+                    });
+                    routes.is_empty()
+                } else {
+                    false
+                };
+            if remove_entry {
+                self.wireguard_return_routes.remove(&evicted_index);
+            }
+        }
+
+        let routes = self
+            .wireguard_return_routes
+            .entry(receiver_index)
+            .or_default();
+        routes.retain(|existing| {
+            existing.session_id != route.session_id || existing.source_side != route.source_side
+        });
+        routes.push(route);
+    }
+
+    fn rebuild_wireguard_return_routes(&mut self) {
+        let mut routes = BTreeMap::<u32, Vec<WireGuardReturnRoute>>::new();
+        for (session_id, session) in &self.sessions {
+            for receiver_index in &session.left_wireguard_sender_indices {
+                routes
+                    .entry(*receiver_index)
+                    .or_default()
+                    .push(WireGuardReturnRoute {
+                        session_id: session_id.clone(),
+                        source_side: RelaySessionSide::Right,
+                        source_ip: session.right_addr.ip(),
+                    });
+            }
+            for receiver_index in &session.right_wireguard_sender_indices {
+                routes
+                    .entry(*receiver_index)
+                    .or_default()
+                    .push(WireGuardReturnRoute {
+                        session_id: session_id.clone(),
+                        source_side: RelaySessionSide::Left,
+                        source_ip: session.left_addr.ip(),
+                    });
+            }
+        }
+        self.wireguard_return_routes = routes;
     }
 
     pub fn purge_expired(&mut self, now: DateTime<Utc>) -> usize {
         let before = self.sessions.len();
         self.sessions.retain(|_, session| !session.is_expired(now));
-        before.saturating_sub(self.sessions.len())
+        let removed = before.saturating_sub(self.sessions.len());
+        if removed > 0 {
+            self.rebuild_wireguard_return_routes();
+        }
+        removed
     }
 
     pub fn session_count(&self) -> usize {
@@ -536,6 +713,7 @@ impl RelayTable {
             .unwrap_or(false);
         if expired {
             self.sessions.remove(session_id);
+            self.rebuild_wireguard_return_routes();
             return Err(RelayError::SessionExpired);
         }
         Ok(())
@@ -549,6 +727,19 @@ struct RelayDatagramForward {
     should_forward: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaySessionSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WireGuardReturnRoute {
+    session_id: RelaySessionId,
+    source_side: RelaySessionSide,
+    source_ip: IpAddr,
+}
+
 impl RelaySession {
     fn is_expired(&self, now: DateTime<Utc>) -> bool {
         now >= self.expires_at
@@ -560,6 +751,25 @@ impl RelaySession {
         } else {
             Err(RelayError::InvalidSessionCredential)
         }
+    }
+
+    fn record_wireguard_sender_index(
+        &mut self,
+        side: RelaySessionSide,
+        payload: &[u8],
+    ) -> Option<(u32, Option<u32>)> {
+        let sender_index = wireguard_sender_index(payload)?;
+        let indices = match side {
+            RelaySessionSide::Left => &mut self.left_wireguard_sender_indices,
+            RelaySessionSide::Right => &mut self.right_wireguard_sender_indices,
+        };
+        if let Some(existing) = indices.iter().position(|index| *index == sender_index) {
+            indices.remove(existing);
+        }
+        let evicted =
+            (indices.len() >= MAX_WIREGUARD_SENDER_INDICES_PER_SIDE).then(|| indices.remove(0));
+        indices.push(sender_index);
+        Some((sender_index, evicted))
     }
 
     fn consume_rate_limit(
@@ -579,6 +789,47 @@ impl RelaySession {
         self.window_bytes = self.window_bytes.saturating_add(payload_len);
         Ok(())
     }
+}
+
+pub fn wireguard_datagram_payload(payload: &[u8]) -> bool {
+    if payload.len() < 4 || payload.get(1..4) != Some(&[0, 0, 0]) {
+        return false;
+    }
+    match payload[0] {
+        1 => payload.len() == 148,
+        2 => payload.len() == 92,
+        3 => payload.len() == 64,
+        4 => payload.len() >= 32 && payload.len().is_multiple_of(16),
+        _ => false,
+    }
+}
+
+fn wireguard_sender_index(payload: &[u8]) -> Option<u32> {
+    match payload
+        .first()
+        .copied()
+        .filter(|_| wireguard_datagram_payload(payload))?
+    {
+        1 | 2 => read_wireguard_index(payload, 4),
+        _ => None,
+    }
+}
+
+fn wireguard_receiver_index(payload: &[u8]) -> Option<u32> {
+    match payload
+        .first()
+        .copied()
+        .filter(|_| wireguard_datagram_payload(payload))?
+    {
+        2 => read_wireguard_index(payload, 8),
+        3 | 4 => read_wireguard_index(payload, 4),
+        _ => None,
+    }
+}
+
+fn read_wireguard_index(payload: &[u8], offset: usize) -> Option<u32> {
+    let bytes = payload.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 fn megabits_to_bytes_per_second(max_mbps: u32) -> u64 {
@@ -1194,6 +1445,28 @@ mod tests {
         }
     }
 
+    fn wireguard_handshake_initiation(sender_index: u32) -> Vec<u8> {
+        let mut payload = vec![0_u8; 148];
+        payload[0] = 1;
+        payload[4..8].copy_from_slice(&sender_index.to_le_bytes());
+        payload
+    }
+
+    fn wireguard_handshake_response(sender_index: u32, receiver_index: u32) -> Vec<u8> {
+        let mut payload = vec![0_u8; 92];
+        payload[0] = 2;
+        payload[4..8].copy_from_slice(&sender_index.to_le_bytes());
+        payload[8..12].copy_from_slice(&receiver_index.to_le_bytes());
+        payload
+    }
+
+    fn wireguard_transport_data(receiver_index: u32) -> Vec<u8> {
+        let mut payload = vec![0_u8; 32];
+        payload[0] = 4;
+        payload[4..8].copy_from_slice(&receiver_index.to_le_bytes());
+        payload
+    }
+
     #[test]
     fn relay_session_id_is_direction_independent() {
         let left = NodeId::from_string("node-a");
@@ -1761,6 +2034,139 @@ mod tests {
             b"left-after-announcement".len() as u64
         );
         assert_eq!(metrics.datagrams_forwarded, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_routes_one_sided_wireguard_returns_by_receiver_index() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let admitted_left_addr = SocketAddr::from(([198, 51, 100, 10], 40000));
+        let admitted_right_addr = SocketAddr::from(([198, 51, 100, 20], 51820));
+        let learned_left_addr = SocketAddr::from(([198, 51, 100, 10], 41000));
+        let rebound_right_addr = SocketAddr::from(([198, 51, 100, 20], 1604));
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            admitted_left_addr,
+            admitted_right_addr,
+            "relay-secret".to_string(),
+        )?;
+
+        let announcement = encode_relay_endpoint_announcement(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+        )?;
+        table.forward_datagram_for_addr(learned_left_addr, &announcement)?;
+
+        let initiation = wireguard_handshake_initiation(0x1020_3040);
+        let framed_initiation = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+            &initiation,
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_left_addr, &framed_initiation)?;
+        assert_eq!(target, admitted_right_addr);
+        assert_eq!(payload, initiation);
+
+        let response = wireguard_handshake_response(0x5060_7080, 0x1020_3040);
+        let (target, payload) = table.forward_datagram_for_addr(rebound_right_addr, &response)?;
+        assert_eq!(target, learned_left_addr);
+        assert_eq!(payload, response);
+
+        let transport = wireguard_transport_data(0x5060_7080);
+        let framed_transport = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+            &transport,
+        )?;
+        let (target, payload) =
+            table.forward_datagram_for_addr(learned_left_addr, &framed_transport)?;
+        assert_eq!(target, rebound_right_addr);
+        assert_eq!(payload, transport);
+
+        let metrics = table.dataplane_metrics();
+        assert_eq!(metrics.datagrams_forwarded, 3);
+        assert_eq!(metrics.datagrams_dropped, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_one_sided_wireguard_return_from_wrong_ip() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let left = NodeId::from_string("left");
+        let right = NodeId::from_string("right");
+        let credentials = table.admit_with_token(
+            &capability,
+            left.clone(),
+            right.clone(),
+            SocketAddr::from(([198, 51, 100, 10], 40000)),
+            SocketAddr::from(([198, 51, 100, 20], 51820)),
+            "relay-secret".to_string(),
+        )?;
+        let initiation = wireguard_handshake_initiation(7);
+        let framed = encode_relay_datagram_with_route(
+            credentials.session_id.as_str(),
+            &credentials.session_token,
+            &left,
+            &right,
+            &initiation,
+        )?;
+        table.forward_datagram_for_addr(SocketAddr::from(([198, 51, 100, 10], 41000)), &framed)?;
+
+        let response = wireguard_handshake_response(9, 7);
+        let rejected =
+            table.forward_datagram_for_addr(SocketAddr::from(([203, 0, 113, 99], 1604)), &response);
+        assert!(matches!(rejected, Err(RelayError::UnknownSession)));
+        Ok(())
+    }
+
+    #[test]
+    fn relay_rejects_ambiguous_one_sided_wireguard_return() -> Result<(), RelayError> {
+        let mut table = RelayTable::default();
+        let capability = relay_capability(SocketAddr::from(([203, 0, 113, 10], 51820)), 1000);
+        let shared_receiver_index = 0x1020_3040;
+        let raw_side_ip = [198, 51, 100, 20];
+
+        for suffix in ["a", "b"] {
+            let left = NodeId::from_string(format!("left-{suffix}"));
+            let right = NodeId::from_string(format!("right-{suffix}"));
+            let credentials = table.admit_with_token(
+                &capability,
+                left.clone(),
+                right.clone(),
+                SocketAddr::from(([198, 51, 100, if suffix == "a" { 10 } else { 11 }], 40000)),
+                SocketAddr::from((raw_side_ip, if suffix == "a" { 51820 } else { 51821 })),
+                format!("relay-secret-{suffix}"),
+            )?;
+            let framed = encode_relay_datagram_with_route(
+                credentials.session_id.as_str(),
+                &credentials.session_token,
+                &left,
+                &right,
+                &wireguard_handshake_initiation(shared_receiver_index),
+            )?;
+            table.forward_datagram_for_addr(
+                SocketAddr::from(([198, 51, 100, if suffix == "a" { 10 } else { 11 }], 41000)),
+                &framed,
+            )?;
+        }
+
+        let response = wireguard_handshake_response(7, shared_receiver_index);
+        let rejected =
+            table.forward_datagram_for_addr(SocketAddr::from((raw_side_ip, 1604)), &response);
+        assert!(matches!(rejected, Err(RelayError::UnknownSession)));
         Ok(())
     }
 
