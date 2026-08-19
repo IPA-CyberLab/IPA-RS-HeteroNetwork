@@ -2608,6 +2608,7 @@ where
         &token,
         &encoded_token,
         &bootstrap_endpoints,
+        &directory.bootstrap_endpoints,
         &database_autopilot_bearer_token,
         &keycloak_autopilot_bearer_token,
     );
@@ -3079,11 +3080,17 @@ where
                 "Keycloak autopilot API bearer token is not configured",
             )
         })?;
+    let directory = state
+        .plane
+        .enrollment_service_directory(Duration::from_secs(enrollment.max_ttl_seconds))
+        .await
+        .map_err(|error| NodeEnrollmentApiError::unavailable(error.to_string()))?;
     let script = node_enrollment_install_script(
         &enrollment,
         &token,
         &encoded_token,
         &token.claims.bootstrap_endpoints,
+        &directory.bootstrap_endpoints,
         &database_autopilot_bearer_token,
         &keycloak_autopilot_bearer_token,
     );
@@ -3184,6 +3191,7 @@ fn node_enrollment_install_script(
     token: &SignedJoinToken,
     encoded_token: &str,
     bootstrap_endpoints: &[BootstrapEndpoint],
+    promotion_download_endpoints: &[BootstrapEndpoint],
     database_autopilot_bearer_token: &str,
     keycloak_autopilot_bearer_token: &str,
 ) -> String {
@@ -3986,6 +3994,9 @@ trap 'exit 143' TERM
 auth='__AUTH__'
 binary="$tmp_dir/iparsd"
 download_bases='__DOWNLOAD_BASES__'
+if [ "$promote_existing" -eq 1 ]; then
+  download_bases='__PROMOTION_DOWNLOAD_BASES__ '"$download_bases"
+fi
 downloaded=
 for encoded_base in $download_bases; do
   base=$(printf '%s' "$encoded_base" | base64 -d) || continue
@@ -4202,6 +4213,12 @@ echo "HeteroNetwork node enrolled and started"
         .map(|base| STANDARD.encode(base.as_bytes()))
         .collect::<Vec<_>>()
         .join(" ");
+    let promotion_download_bases =
+        node_enrollment_promotion_download_bases(promotion_download_endpoints)
+            .into_iter()
+            .map(|base| STANDARD.encode(base.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(" ");
     let setup_install = kubernetes_ha_enrollment_setup(token, encoded_token)
         .map(kubernetes_ha_install_script)
         .unwrap_or_default();
@@ -4242,6 +4259,7 @@ fi
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
+        .replace("__PROMOTION_DOWNLOAD_BASES__", &promotion_download_bases)
         .replace("__SHA256__", &enrollment.daemon_binary.sha256)
         .replace("__CLI_SHA256__", &enrollment.cli_binary.sha256)
         .replace("__CADDY_VERSION__", NODE_ENROLLMENT_CADDY_VERSION)
@@ -5686,6 +5704,30 @@ fn node_enrollment_download_bases(
     bases
 }
 
+fn node_enrollment_promotion_download_bases(
+    service_endpoints: &[BootstrapEndpoint],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    service_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::ControlPlane)
+        .filter_map(|endpoint| {
+            let parsed = Url::parse(&endpoint.url).ok()?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || !matches!(parsed.path(), "" | "/")
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return None;
+            }
+            Some(endpoint.url.trim_end_matches('/').to_string())
+        })
+        .filter(|base| seen.insert(base.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DatabaseAutopilotRegistryNode {
     node_id: String,
@@ -6729,6 +6771,7 @@ where
         &token,
         &encoded_token,
         &bootstrap_endpoints,
+        &directory.bootstrap_endpoints,
         &database_autopilot_bearer_token,
         &keycloak_autopilot_bearer_token,
     );
@@ -8756,6 +8799,13 @@ mod tests {
         assert_eq!(
             enrollment_control_planes,
             vec!["https://enroll.example", "https://signal-gateway.example"]
+        );
+        assert_eq!(
+            node_enrollment_promotion_download_bases(&service_endpoints),
+            vec![
+                "http://10.250.0.4:19088",
+                "https://direct-control.example:8443",
+            ]
         );
         assert!(enrollment_endpoints.iter().any(|endpoint| {
             endpoint.kind == BootstrapEndpointKind::Signal
