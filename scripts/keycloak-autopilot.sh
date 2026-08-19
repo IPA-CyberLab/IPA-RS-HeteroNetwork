@@ -11,7 +11,7 @@ readonly MAX_CONFIG_BYTES="65536"
 readonly MAX_SECRET_BYTES="4096"
 readonly MAX_RESPONSE_BYTES="262144"
 readonly MAX_CONTROL_PLANE_URLS="16"
-readonly MAX_CONTROL_PLANE_ATTEMPTS="3"
+readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"
 readonly MAX_REPLICAS="3"
 readonly MAX_GENERATION="9223372036854775807"
 readonly REPLICA_PORT="18080"
@@ -416,7 +416,7 @@ write_curl_config() {
       'silent' \
       'show-error' \
       'connect-timeout = 1' \
-      'max-time = 4' \
+      'max-time = 2' \
       "max-filesize = $MAX_RESPONSE_BYTES"
     printf 'header = "Authorization: Bearer %s"\n' "$autopilot_bearer_token"
   } >"$curl_config_file"

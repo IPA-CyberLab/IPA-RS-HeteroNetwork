@@ -90,6 +90,7 @@ const KEYCLOAK_AUTOPILOT_DESIRED_REPLICAS: usize = 3;
 const KEYCLOAK_AUTOPILOT_MAX_CANDIDATES: usize = 64;
 const KEYCLOAK_AUTOPILOT_LEASE_SECONDS: u64 = 45;
 const KEYCLOAK_AUTOPILOT_RECONCILE_SECONDS: u64 = 15;
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "2";
 const MAX_NODE_ENROLLMENT_AUTHORIZATION_BYTES: usize = 24 * 1024;
 const MAX_NODE_ENROLLMENT_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const NODE_ENROLLMENT_AUTH_SCHEME: &str = "HeteroNetworkJoin";
@@ -4142,6 +4143,7 @@ __KEYCLOAK_START__
 __PUBLIC_SERVICES_START__
 __SETUP_INSTALL__
 commit_installer_transaction
+__PUBLIC_SERVICES_GENERATION__
 echo "HeteroNetwork node enrolled and started"
 "#;
     let download_bases = node_enrollment_download_bases(enrollment, bootstrap_endpoints)
@@ -4167,6 +4169,25 @@ echo "HeteroNetwork node enrolled and started"
     let keycloak_install =
         keycloak_autopilot_install_script(enrollment, token, keycloak_autopilot_bearer_token);
     let keycloak_start = keycloak_autopilot_start_script(enrollment);
+    let public_services_generation = if enrollment.public_services.is_some() {
+        format!(
+            r#"if [ "$public_services_enabled" -eq 1 ]; then
+  install -d -o root -g heteronetwork-services -m 0750 /etc/heteronetwork/public-services
+  printf '%s\n' '{PUBLIC_SERVICES_BOOTSTRAP_GENERATION}' \
+    >/etc/heteronetwork/public-services/.bootstrap-generation.new
+  chown root:heteronetwork-services \
+    /etc/heteronetwork/public-services/.bootstrap-generation.new
+  chmod 0640 /etc/heteronetwork/public-services/.bootstrap-generation.new
+  mv -f /etc/heteronetwork/public-services/.bootstrap-generation.new \
+    /etc/heteronetwork/public-services/bootstrap-generation
+else
+  rm -f /etc/heteronetwork/public-services/bootstrap-generation
+fi
+"#
+        )
+    } else {
+        String::new()
+    };
     TEMPLATE
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
@@ -4189,6 +4210,10 @@ echo "HeteroNetwork node enrolled and started"
         .replace("__DATABASE_INSTALL__", &database_install)
         .replace("__KEYCLOAK_START__", &keycloak_start)
         .replace("__PUBLIC_SERVICES_START__", &public_services_start)
+        .replace(
+            "__PUBLIC_SERVICES_GENERATION__",
+            &public_services_generation,
+        )
         .replace("__SETUP_INSTALL__", &setup_install)
 }
 
@@ -9796,6 +9821,12 @@ mod tests {
         assert!(generated_script
             .contains("/etc/heteronetwork/public-services/keycloak-autopilot.token"));
         assert!(generated_script.contains("Automatic public-service promotion scheduled"));
+        assert!(generated_script.contains(&format!(
+            "printf '%s\\n' '{PUBLIC_SERVICES_BOOTSTRAP_GENERATION}'"
+        )));
+        assert!(
+            generated_script.contains("/etc/heteronetwork/public-services/bootstrap-generation")
+        );
         assert!(generated_script.contains("if [ \"$relay_enabled\" -eq 1 ]; then"));
         assert!(generated_script.contains(
             "apt-get install -y ca-certificates coreutils curl iproute2 jq tar wireguard-tools"

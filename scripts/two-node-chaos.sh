@@ -383,7 +383,7 @@ fetch_nodes_json() {
 
 fetch_workloads_json() {
   local observer="$1"
-  root_node "$observer" 'timeout 25 kubectl get deployments,statefulsets -A -o json'
+  root_node "$observer" 'timeout 25 kubectl get deployments,statefulsets,daemonsets -A -o json'
 }
 
 api_ready() {
@@ -427,13 +427,18 @@ workloads_fully_ready() {
         ((.status.availableReplicas // 0) >= (.spec.replicas // 1))
       elif .kind == "StatefulSet" then
         ((.status.readyReplicas // 0) >= (.spec.replicas // 1))
+      elif .kind == "DaemonSet" then
+        ((.status.numberReady // 0) >= (.status.desiredNumberScheduled // 0))
       else false end
     )' <<<"$1" >/dev/null
 }
 
 degraded_services_available() {
   local observer="$1"
-  root_node "$observer" 'set -eu
+  local expected_survivors="$2"
+  root_node "$observer" 'expected_survivors='"$expected_survivors"'
+set -u
+status=0
 available() {
   namespace="$1"
   kind="$2"
@@ -443,7 +448,26 @@ available() {
   if [ "$kind" = statefulset ]; then
     value="$(kubectl -n "$namespace" get "$kind" "$name" -o jsonpath="{.status.readyReplicas}" 2>/dev/null || true)"
   fi
-  [ "${value:-0}" -ge "$minimum" ]
+  if [ "${value:-0}" -ge "$minimum" ]; then
+    result=PASS
+  else
+    result=FAIL
+    status=1
+  fi
+  printf "%s/%s %s %s/%s %s\n" "$namespace" "$kind" "$name" "${value:-0}" "$minimum" "$result"
+}
+daemon_available() {
+  namespace="$1"
+  name="$2"
+  minimum="$3"
+  value="$(kubectl -n "$namespace" get daemonset "$name" -o jsonpath="{.status.numberReady}" 2>/dev/null || true)"
+  if [ "${value:-0}" -ge "$minimum" ]; then
+    result=PASS
+  else
+    result=FAIL
+    status=1
+  fi
+  printf "%s/daemonset %s %s/%s %s\n" "$namespace" "$name" "${value:-0}" "$minimum" "$result"
 }
 available kube-system deployment coredns 1
 available heterocloud deployment heterocloud-heterocloud 1
@@ -452,6 +476,11 @@ available heterocloud-flow deployment heterocloud-flow-signaling 1
 available heterocloud-flow deployment heterocloud-flow-livekit 1
 available heterocloud-flow statefulset heterocloud-flow-redis-node 3
 available heterocloud-flow deployment heterocloud-flow-coturn 1
+daemon_available kube-flannel kube-flannel-ds "$expected_survivors"
+daemon_available kube-system kube-proxy "$expected_survivors"
+daemon_available kube-system node-local-dns "$expected_survivors"
+daemon_available kube-system kubernetes-service-route "$expected_survivors"
+exit "$status"
 '
 }
 
@@ -565,7 +594,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 printf '%s' '${encoded_manifest}' | base64 -d | kubectl apply -f - >/dev/null
-kubectl -n default wait --for=condition=Ready pod -l 'heteronetwork.io/chaos-network-run=${run_id}' --timeout=90s >/dev/null
+if ! kubectl -n default wait --for=condition=Ready pod -l 'heteronetwork.io/chaos-network-run=${run_id}' --timeout=90s; then
+  kubectl -n default get pod -l 'heteronetwork.io/chaos-network-run=${run_id}' -o wide || true
+  kubectl -n default describe pod -l 'heteronetwork.io/chaos-network-run=${run_id}' || true
+  exit 1
+fi
 pods=\"\$(kubectl -n default get pods -l 'heteronetwork.io/chaos-network-run=${run_id}' -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}')\"
 addresses=\"\$(kubectl -n default get pods -l 'heteronetwork.io/chaos-network-run=${run_id}' -o jsonpath='{range .items[*]}{.status.podIP}{\"\\n\"}{end}')\"
 [ \"\$(printf '%s\\n' \"\$pods\" | sed '/^$/d' | wc -l)\" -eq '${#nodes[@]}' ]
@@ -914,8 +947,9 @@ run_pair() {
   done
   vpn="$(status_word vpn_mesh "case-${order}-degraded" "${survivors[@]}")"
   pod_network="$(status_word pod_network_mesh "case-${order}-degraded" "${survivors[@]}")"
-  if api_ready "$observer" >/dev/null 2>&1 \
-    && degraded_services_available "$observer" >/dev/null 2>&1 \
+  if api_ready "$observer" >"$case_directory/kubernetes-api.log" 2>&1 \
+    && degraded_services_available "$observer" "${#survivors[@]}" \
+      >"$case_directory/kubernetes-services.log" 2>&1 \
     && [[ "$pod_network" == PASS ]]; then
     kubernetes=PASS
   else

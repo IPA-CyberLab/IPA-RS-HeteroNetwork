@@ -511,8 +511,8 @@ requests_before_outage="$(count_reconcile_requests)"
 touch "$fake_state/api-down"
 run_autopilot reconcile
 rm -f "$fake_state/api-down"
-[[ "$(count_reconcile_requests)" == "$((requests_before_outage + 3))" ]] \
-  || fail "sixteen dead Control Planes were not bounded to three attempts"
+[[ "$(count_reconcile_requests)" == "$((requests_before_outage + 16))" ]] \
+  || fail "autopilot did not exhaust the bounded Control Plane directory"
 first_outage_url="$(reconcile_url_at "$((requests_before_outage + 1))")"
 [[ "$(find "$fake_state/active" -maxdepth 1 -type f -printf '%f\n' | sort)" \
   == "$state_before_outage" ]] \
@@ -533,8 +533,8 @@ touch "$fake_state/api-down"
 run_autopilot reconcile
 rm -f "$fake_state/api-down"
 second_outage_url="$(reconcile_url_at "$((requests_before_expiry + 1))")"
-[[ "$second_outage_url" != "$first_outage_url" ]] \
-  || fail "Control Plane retries did not rotate after an outage"
+[[ "$second_outage_url" == "$first_outage_url" ]] \
+  || fail "a full bounded directory scan did not return to its start"
 assert_inactive heteronetwork-keycloak.service
 assert_inactive heteronetwork-keycloak-backchannel.service
 [[ "$(count_helper_command deactivate)" \
@@ -682,8 +682,13 @@ grep -Fq 'ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS="2"' "$helper_contract" \
   || fail "helper activation readiness request is not lease-safe"
 grep -Fq 'readonly ACTIVATION_TIMEOUT_SECONDS="90"' "$autopilot" \
   || fail "autopilot activation window is not bounded"
-grep -Fq 'readonly MAX_CONTROL_PLANE_ATTEMPTS="3"' "$autopilot" \
-  || fail "Control Plane retries are not bounded"
+grep -Fq 'readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"' "$autopilot" \
+  || fail "Control Plane retries do not cover the bounded directory"
+grep -Fq "'max-time = 2'" "$autopilot" \
+  || fail "a full Control Plane directory scan can outlive the assignment lease"
+grep -Fqx 'ReadWritePaths=-/opt/heteronetwork/keycloak-26.6.4/conf' \
+  "$systemd_dir/heteronetwork-keycloak-autopilot.service" \
+  || fail "edge-only reconciliation still requires the full Keycloak tree"
 grep -Fq '"http://127.0.0.1:${REPLICA_PORT}${oidc_probe_path}"' "$autopilot" \
   || fail "autopilot readiness omits realm discovery"
 grep -Fq '"http://127.0.0.1:${management_port}/health/ready"' "$helper_contract" \

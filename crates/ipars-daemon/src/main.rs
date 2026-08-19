@@ -225,6 +225,9 @@ const DEFAULT_AGENT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const PUBLIC_SERVICES_BOOTSTRAP_ENV_PATH: &str = "/etc/heteronetwork/public-services/bootstrap.env";
 const PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH: &str =
     "/var/lib/heteronetwork/public-services-promotion.sh";
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION_PATH: &str =
+    "/etc/heteronetwork/public-services/bootstrap-generation";
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "2";
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const ADVERTISED_SIGNAL_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -14923,9 +14926,25 @@ async fn apply_heartbeat_connection_intents(
     }
 }
 
+fn public_services_bootstrap_state_is_current(
+    environment_path: &Path,
+    pending_path: &Path,
+    generation_path: &Path,
+) -> bool {
+    if pending_path.is_file() {
+        return true;
+    }
+    environment_path.is_file()
+        && std::fs::read_to_string(generation_path)
+            .is_ok_and(|generation| generation.trim() == PUBLIC_SERVICES_BOOTSTRAP_GENERATION)
+}
+
 fn public_services_bootstrap_is_configured_or_pending() -> bool {
-    Path::new(PUBLIC_SERVICES_BOOTSTRAP_ENV_PATH).is_file()
-        || Path::new(PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH).is_file()
+    public_services_bootstrap_state_is_current(
+        Path::new(PUBLIC_SERVICES_BOOTSTRAP_ENV_PATH),
+        Path::new(PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH),
+        Path::new(PUBLIC_SERVICES_BOOTSTRAP_GENERATION_PATH),
+    )
 }
 
 fn public_nat_classification_is_eligible(classification: &ipars_types::NatClassification) -> bool {
@@ -22143,6 +22162,46 @@ mod tests {
             nat_discovery_refresh_interval(true, public, regular),
             public
         );
+    }
+
+    #[test]
+    fn public_services_bootstrap_reinstalls_stale_generations() -> anyhow::Result<()> {
+        let root = unique_test_dir("public-services-generation")?;
+        let environment = root.join("bootstrap.env");
+        let pending = root.join("promotion.sh");
+        let generation = root.join("bootstrap-generation");
+        std::fs::write(&environment, b"configured\n")?;
+
+        assert!(!public_services_bootstrap_state_is_current(
+            &environment,
+            &pending,
+            &generation
+        ));
+        std::fs::write(&generation, b"1\n")?;
+        assert!(!public_services_bootstrap_state_is_current(
+            &environment,
+            &pending,
+            &generation
+        ));
+        std::fs::write(
+            &generation,
+            format!("{PUBLIC_SERVICES_BOOTSTRAP_GENERATION}\n"),
+        )?;
+        assert!(public_services_bootstrap_state_is_current(
+            &environment,
+            &pending,
+            &generation
+        ));
+
+        std::fs::remove_file(&generation)?;
+        std::fs::write(&pending, b"pending\n")?;
+        assert!(public_services_bootstrap_state_is_current(
+            &environment,
+            &pending,
+            &generation
+        ));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
