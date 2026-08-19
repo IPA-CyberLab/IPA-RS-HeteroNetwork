@@ -64,6 +64,7 @@ order_file=""
 external_monitor_pid=""
 external_monitor_stop=""
 baseline_control_plane_count=0
+baseline_database_member_count=0
 
 usage() {
   cat <<'EOF'
@@ -528,7 +529,11 @@ wait_for_full_recovery() {
       if [[ "$ready_count" == "${#NODE_NAMES[@]}" \
         && "$control_planes" == "$baseline_control_plane_count" ]] \
         && workloads_fully_ready "$workloads" \
-        && api_ready "$observer" >/dev/null 2>&1; then
+        && api_ready "$observer" >/dev/null 2>&1 \
+        && patroni_cluster_fully_ready \
+        && database_write_probe \
+        && keycloak_oidc_probe "$observer" \
+        && flow_api_write_probe; then
         return 0
       fi
       if ((SECONDS >= next_log)); then
@@ -682,6 +687,32 @@ patroni_has_leader() {
   document="$(patroni_document 2>/dev/null)" || return 1
   jq -e '[.[] | select((.Role | ascii_downcase) == "leader" or (.Role | ascii_downcase) == "primary") | select((.State | ascii_downcase) == "running")] | length == 1' \
     <<<"$document" >/dev/null
+}
+
+patroni_healthy_member_count() {
+  local document
+  document="$(patroni_document 2>/dev/null)" || return 1
+  jq '[
+    .[]
+    | ((.State // "") | ascii_downcase) as $state
+    | select($state == "running" or $state == "streaming")
+  ] | length' <<<"$document"
+}
+
+patroni_cluster_fully_ready() {
+  local document
+  document="$(patroni_document 2>/dev/null)" || return 1
+  jq -e --argjson expected "$baseline_database_member_count" '
+    ([.[]
+      | ((.State // "") | ascii_downcase) as $state
+      | select($state == "running" or $state == "streaming")
+    ] | length) >= $expected
+    and
+    ([.[]
+      | select((.Role | ascii_downcase) == "leader" or (.Role | ascii_downcase) == "primary")
+      | select(((.State // "") | ascii_downcase) == "running")
+    ] | length) == 1
+  ' <<<"$document" >/dev/null
 }
 
 prepare_database_probe() {
@@ -892,6 +923,10 @@ run_baseline() {
   workloads="$(fetch_workloads_json "$observer")" || die "cannot query Kubernetes workloads"
   workloads_fully_ready "$workloads" || die "not all Deployments and StatefulSets are Ready"
   patroni_has_leader || die "Patroni does not have exactly one running leader"
+  baseline_database_member_count="$(patroni_healthy_member_count)" \
+    || die "cannot count healthy Patroni members"
+  ((baseline_database_member_count >= 5)) \
+    || die "baseline requires at least five healthy Patroni members; found $baseline_database_member_count"
   prepare_database_probe || die "database write probe could not be prepared"
   database_write_probe || die "baseline synchronous database write failed"
   vpn_mesh baseline "${NODE_NAMES[@]}" || die "baseline VPN all-to-all mesh failed"
@@ -983,6 +1018,7 @@ run_pair() {
   log "case $order degraded: k8s=$kubernetes vpn=$vpn pod-network=$pod_network patroni=$patroni db-write=$db_write oidc=$oidc flow-api=$flow_api normal=$flow_normal relay=$flow_relay"
 
   if wait_for_full_recovery "$observer" \
+    && vpn_mesh "case-${order}-recovered" "${NODE_NAMES[@]}" \
     && pod_network_mesh "case-${order}-recovered" "${NODE_NAMES[@]}"; then
     recovery=PASS
   else
