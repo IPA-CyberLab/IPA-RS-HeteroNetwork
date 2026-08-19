@@ -517,7 +517,7 @@ wait_for_fault_state() {
 
 wait_for_full_recovery() {
   local observer="$1"
-  local deadline=$((SECONDS + recovery_timeout_seconds))
+  local deadline="${2:-$((SECONDS + recovery_timeout_seconds))}"
   local next_log=$SECONDS
   local document workloads ready_count control_planes
   while ((SECONDS < deadline)); do
@@ -545,6 +545,32 @@ wait_for_full_recovery() {
       next_log=$((SECONDS + 30))
     fi
     sleep 5
+  done
+  return 1
+}
+
+wait_for_data_plane_recovery() {
+  local label="$1"
+  local deadline="$2"
+  local attempt=0
+  local vpn_ready pod_network_ready
+  while ((SECONDS < deadline)); do
+    attempt=$((attempt + 1))
+    if vpn_mesh "${label}-attempt-${attempt}" "${NODE_NAMES[@]}"; then
+      vpn_ready=PASS
+    else
+      vpn_ready=FAIL
+    fi
+    if pod_network_mesh "${label}-attempt-${attempt}" "${NODE_NAMES[@]}"; then
+      pod_network_ready=PASS
+    else
+      pod_network_ready=FAIL
+    fi
+    if [[ "$vpn_ready" == PASS && "$pod_network_ready" == PASS ]]; then
+      return 0
+    fi
+    log "recovery data plane pending: attempt=$attempt vpn=$vpn_ready pod-network=$pod_network_ready"
+    sleep 10
   done
   return 1
 }
@@ -955,7 +981,7 @@ run_pair() {
   local pair="$2"
   local first="${pair%%+*}"
   local second="${pair#*+}"
-  local observer case_directory unit_prefix started_at started_epoch duration
+  local observer case_directory unit_prefix started_at started_epoch duration recovery_deadline
   local fault_observed kubernetes vpn pod_network patroni db_write oidc flow_api flow_normal flow_relay recovery
   local external_failures
 
@@ -1017,9 +1043,9 @@ run_pair() {
   flow_relay="$(status_word flow_e2e_probe relay "$case_directory/flow-relay.log")"
   log "case $order degraded: k8s=$kubernetes vpn=$vpn pod-network=$pod_network patroni=$patroni db-write=$db_write oidc=$oidc flow-api=$flow_api normal=$flow_normal relay=$flow_relay"
 
-  if wait_for_full_recovery "$observer" \
-    && vpn_mesh "case-${order}-recovered" "${NODE_NAMES[@]}" \
-    && pod_network_mesh "case-${order}-recovered" "${NODE_NAMES[@]}"; then
+  recovery_deadline=$((SECONDS + recovery_timeout_seconds))
+  if wait_for_full_recovery "$observer" "$recovery_deadline" \
+    && wait_for_data_plane_recovery "case-${order}-recovered" "$recovery_deadline"; then
     recovery=PASS
   else
     recovery=FAIL
