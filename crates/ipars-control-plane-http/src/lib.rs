@@ -3196,6 +3196,7 @@ fn node_enrollment_install_script(
     keycloak_autopilot_bearer_token: &str,
 ) -> String {
     const TEMPLATE: &str = r#"#!/bin/sh
+# HETERONETWORK_PUBLIC_SERVICES_GENERATION=__PUBLIC_SERVICES_TARGET_GENERATION__
 set -eu
 
 relay_enabled=1
@@ -4264,6 +4265,10 @@ fi
         String::new()
     };
     TEMPLATE
+        .replace(
+            "__PUBLIC_SERVICES_TARGET_GENERATION__",
+            PUBLIC_SERVICES_BOOTSTRAP_GENERATION,
+        )
         .replace("__AUTH__", encoded_token)
         .replace("__DOWNLOAD_BASES__", &download_bases)
         .replace("__PROMOTION_DOWNLOAD_BASES__", &promotion_download_bases)
@@ -9896,6 +9901,9 @@ mod tests {
         assert!(generated_script
             .contains("heteronetwork_enrolled_node_id=$(\n    jq -er '.registered_node.node_id"));
         assert!(generated_script.contains("Existing HeteroNetwork node ID is invalid"));
+        assert!(generated_script.starts_with(&format!(
+            "#!/bin/sh\n# HETERONETWORK_PUBLIC_SERVICES_GENERATION={PUBLIC_SERVICES_BOOTSTRAP_GENERATION}\n"
+        )));
         assert!(generated_script.contains("/opt/heteronetwork/bin/ipars"));
         assert!(generated_script
             .contains("HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=false"));
