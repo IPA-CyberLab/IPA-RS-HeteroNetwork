@@ -818,7 +818,8 @@ arm_reboot() {
   local unit="$2"
   host_root_node "$node" "set -eu
 systemctl stop '${unit}.timer' '${unit}.service' >/dev/null 2>&1 || true
-systemd-run --quiet --unit='$unit' --on-active='${reboot_delay_seconds}s' --timer-property=AccuracySec=1s /usr/bin/systemctl reboot --force
+reboot_at=\$((\$(date +%s) + ${reboot_delay_seconds}))
+systemd-run --quiet --unit='$unit' --on-calendar=\"@\$reboot_at\" --timer-property=AccuracySec=1s /usr/bin/systemctl reboot --force
 systemctl is-active --quiet '${unit}.timer'
 "
 }
