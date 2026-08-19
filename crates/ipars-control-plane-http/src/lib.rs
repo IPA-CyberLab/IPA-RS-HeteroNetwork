@@ -2793,13 +2793,22 @@ fn node_enrollment_bootstrap_endpoints(
 ) -> Result<Vec<BootstrapEndpoint>, NodeEnrollmentApiError> {
     let mut bootstrap_endpoints = Vec::new();
     let mut seen = BTreeSet::new();
-    let gateway_urls = std::iter::once(install_base_url).chain(
-        service_endpoints
-            .iter()
-            .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
-            .map(|endpoint| endpoint.url.as_str()),
-    );
-    for url in gateway_urls.filter_map(|url| node_enrollment_gateway_url(url, vpn_pool)) {
+    let gateway_urls = std::iter::once(node_enrollment_gateway_url(install_base_url, vpn_pool))
+        .flatten()
+        .chain(
+            service_endpoints
+                .iter()
+                .filter_map(|endpoint| match endpoint.kind {
+                    BootstrapEndpointKind::Signal => {
+                        node_enrollment_signal_gateway_url(&endpoint.url, vpn_pool)
+                    }
+                    BootstrapEndpointKind::WebUi => {
+                        node_enrollment_gateway_url(&endpoint.url, vpn_pool)
+                    }
+                    _ => None,
+                }),
+        );
+    for url in gateway_urls {
         if seen.insert((BootstrapEndpointKind::ControlPlane, url.clone())) {
             bootstrap_endpoints.push(BootstrapEndpoint {
                 kind: BootstrapEndpointKind::ControlPlane,
@@ -2876,6 +2885,14 @@ fn node_enrollment_gateway_url(url: &str, vpn_pool: &ipnet::Ipv4Net) -> Option<S
         _ => {}
     }
     Some(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn node_enrollment_signal_gateway_url(url: &str, vpn_pool: &ipnet::Ipv4Net) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.scheme() != "https" || parsed.port_or_known_default() != Some(443) {
+        return None;
+    }
+    node_enrollment_gateway_url(url, vpn_pool)
 }
 
 fn required_node_enrollment_service_kinds(require_relay: bool) -> Vec<BootstrapEndpointKind> {
@@ -5612,7 +5629,12 @@ fn node_enrollment_download_bases(
         .chain(
             bootstrap_endpoints
                 .iter()
-                .filter(|endpoint| endpoint.kind == BootstrapEndpointKind::WebUi)
+                .filter(|endpoint| {
+                    matches!(
+                        endpoint.kind,
+                        BootstrapEndpointKind::ControlPlane | BootstrapEndpointKind::WebUi
+                    )
+                })
                 .map(|endpoint| endpoint.url.as_str()),
         )
     {
@@ -8663,16 +8685,16 @@ mod tests {
                 url: "http://10.250.0.4:19443".to_string(),
             },
             BootstrapEndpoint {
+                kind: BootstrapEndpointKind::Signal,
+                url: "https://signal-gateway.example".to_string(),
+            },
+            BootstrapEndpoint {
                 kind: BootstrapEndpointKind::Stun,
                 url: "udp://203.0.113.10:19444".to_string(),
             },
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::Relay,
                 url: "udp://203.0.113.10:18445".to_string(),
-            },
-            BootstrapEndpoint {
-                kind: BootstrapEndpointKind::WebUi,
-                url: "https://gateway.example".to_string(),
             },
             BootstrapEndpoint {
                 kind: BootstrapEndpointKind::WebUi,
@@ -8693,7 +8715,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             enrollment_control_planes,
-            vec!["https://enroll.example", "https://gateway.example"]
+            vec!["https://enroll.example", "https://signal-gateway.example"]
         );
         assert!(enrollment_endpoints.iter().any(|endpoint| {
             endpoint.kind == BootstrapEndpointKind::Signal
@@ -8757,6 +8779,8 @@ mod tests {
             node_enrollment_download_bases(&enrollment, &endpoints),
             vec![
                 "https://static.example".to_string(),
+                "https://control.example:8443".to_string(),
+                "http://10.250.0.4:19088".to_string(),
                 "https://203.0.113.10".to_string(),
             ]
         );
