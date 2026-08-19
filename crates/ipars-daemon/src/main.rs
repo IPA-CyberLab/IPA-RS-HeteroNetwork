@@ -227,7 +227,7 @@ const PUBLIC_SERVICES_BOOTSTRAP_PENDING_PATH: &str =
     "/var/lib/heteronetwork/public-services-promotion.sh";
 const PUBLIC_SERVICES_BOOTSTRAP_GENERATION_PATH: &str =
     "/etc/heteronetwork/public-services/bootstrap-generation";
-const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "2";
+const PUBLIC_SERVICES_BOOTSTRAP_GENERATION: &str = "3";
 const MAX_HEARTBEAT_CONNECTION_INTENT_WAIT: Duration = Duration::from_secs(20);
 const ADVERTISED_SIGNAL_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_AGENT_HTTP_TIMEOUT_SECONDS: u64 = 60 * 60;
