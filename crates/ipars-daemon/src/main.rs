@@ -14188,6 +14188,13 @@ struct PublicWebGatewayTarget {
     bind_ip: IpAddr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicWebGatewayTargetState {
+    Retain,
+    Standby,
+    Public(PublicWebGatewayTarget),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PublicWebGatewayExtraConfig {
     contents: String,
@@ -14457,17 +14464,40 @@ async fn set_public_web_gateway_status(
 async fn desired_public_web_gateway_target(
     runtime: &AgentRuntime,
     max_age: Duration,
-) -> Option<PublicWebGatewayTarget> {
-    let classification = runtime.status().await.nat_classification?;
-    let public_ip = classification.publicly_reachable_ip()?;
-    let age = chrono::Utc::now()
+) -> PublicWebGatewayTargetState {
+    let status = runtime.status().await;
+    public_web_gateway_target_state(
+        status.nat_classification.as_ref(),
+        chrono::Utc::now(),
+        max_age,
+    )
+}
+
+fn public_web_gateway_target_state(
+    classification: Option<&NatClassification>,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: Duration,
+) -> PublicWebGatewayTargetState {
+    let Some(classification) = classification else {
+        return PublicWebGatewayTargetState::Retain;
+    };
+    let Some(age) = now
         .signed_duration_since(classification.assessed_at)
         .to_std()
-        .ok()?;
-    (age <= max_age).then_some(PublicWebGatewayTarget {
-        public_ip,
-        bind_ip: classification.local_addr.ip(),
-    })
+        .ok()
+    else {
+        return PublicWebGatewayTargetState::Retain;
+    };
+    if age > max_age {
+        return PublicWebGatewayTargetState::Retain;
+    }
+    match classification.publicly_reachable_ip() {
+        Some(public_ip) => PublicWebGatewayTargetState::Public(PublicWebGatewayTarget {
+            public_ip,
+            bind_ip: classification.local_addr.ip(),
+        }),
+        None => PublicWebGatewayTargetState::Standby,
+    }
 }
 
 fn public_web_gateway_needs_reconciliation(
@@ -14495,12 +14525,27 @@ fn start_public_web_gateway(
         .build()
         .context("failed to build public Web UI probe client")?;
     Ok(tokio::spawn(async move {
-        // Caddy survives Agent restarts, so the first iteration must replace
-        // any stale configuration even when this node is currently private.
+        // Caddy survives Agent restarts. Keep its last validated configuration
+        // while NAT classification is unavailable, and only withdraw it after
+        // a fresh classification explicitly proves this node is private.
         let mut configured: Option<(Option<PublicWebGatewayTarget>, [u8; 32])> = None;
         loop {
-            let desired_target =
-                desired_public_web_gateway_target(&runtime, config.classification_max_age).await;
+            let desired_target = match desired_public_web_gateway_target(
+                &runtime,
+                config.classification_max_age,
+            )
+            .await
+            {
+                PublicWebGatewayTargetState::Public(target) => Some(target),
+                PublicWebGatewayTargetState::Standby => None,
+                PublicWebGatewayTargetState::Retain => {
+                    tracing::debug!(
+                        "retaining public connectivity gateway while NAT classification is unavailable"
+                    );
+                    tokio::time::sleep(config.reconcile_interval).await;
+                    continue;
+                }
+            };
             let desired_ip = desired_target.map(|target| target.public_ip);
             let desired_url = desired_ip.map(public_web_gateway_url);
             let extra = match load_public_web_gateway_extra_config(&config) {
@@ -22586,6 +22631,50 @@ mod tests {
             }),
             empty_digest
         ));
+    }
+
+    #[test]
+    fn public_web_gateway_retains_config_until_fresh_private_classification() {
+        let now = Utc::now();
+        let max_age = Duration::from_secs(45);
+        assert_eq!(
+            public_web_gateway_target_state(None, now, max_age),
+            PublicWebGatewayTargetState::Retain
+        );
+
+        let public_endpoint = SocketAddr::from(([8, 8, 8, 8], 51_820));
+        let mut public = public_nat_classification(public_endpoint);
+        public.assessed_at = now;
+        assert_eq!(
+            public_web_gateway_target_state(Some(&public), now, max_age),
+            PublicWebGatewayTargetState::Public(PublicWebGatewayTarget {
+                public_ip: public_endpoint.ip(),
+                bind_ip: public_endpoint.ip(),
+            })
+        );
+
+        public.assessed_at = now - ChronoDuration::seconds(46);
+        assert_eq!(
+            public_web_gateway_target_state(Some(&public), now, max_age),
+            PublicWebGatewayTargetState::Retain
+        );
+
+        let private_endpoint = SocketAddr::from(([10, 0, 0, 10], 51_820));
+        let private = NatClassification::from_observations(
+            private_endpoint,
+            vec![ipars_types::NatProbeObservation {
+                local_addr: private_endpoint,
+                stun_server: SocketAddr::from(([1, 1, 1, 1], 3478)),
+                reflexive_addr: private_endpoint,
+                observed_at: now,
+            }],
+            now,
+        );
+        assert_eq!(private.publicly_reachable_ip(), None);
+        assert_eq!(
+            public_web_gateway_target_state(Some(&private), now, max_age),
+            PublicWebGatewayTargetState::Standby
+        );
     }
 
     #[test]
