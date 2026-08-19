@@ -36,8 +36,8 @@ Service endpoint selection while still allowing multiple missed kubelet status
 updates on the WAN underlay.
 
 Flannel VXLAN uses `heteronetwork0` explicitly. Flannel derives its MTU from the
-underlay interface. With the default HeteroNetwork MTU of 1200, the expected Pod
-MTU is 1150 after the 50-byte IPv4 VXLAN overhead. Re-running `install-flannel`
+underlay interface. With the default HeteroNetwork MTU of 1280, the expected Pod
+MTU is 1230 after the 50-byte IPv4 VXLAN overhead. Re-running `install-flannel`
 records the current underlay MTU on the DaemonSet pod template, so an MTU change
 causes an idempotent rolling restart. A capability-bounded init container
 recreates the VXLAN device and lowers an existing CNI bridge and its host-side

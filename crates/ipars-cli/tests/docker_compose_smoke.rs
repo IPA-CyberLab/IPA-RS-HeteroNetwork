@@ -1430,6 +1430,12 @@ fn assert_compose_linux_wireguard_dataplane(repo_root: &Path) -> Result<()> {
         agent_vpn_ip,
         agent_b_vpn_ip,
     )?;
+    assert_compose_recovers_deleted_wireguard_interface(
+        &compose,
+        "agent",
+        agent_vpn_ip,
+        agent_b_vpn_ip,
+    )?;
     let agent_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent", workload_a_cidr)?;
     let agent_b_workload_ip = compose_service_ipv4_in_subnet(&compose, "agent-b", workload_b_cidr)?;
     let workload_a_ip = compose_service_ipv4_in_subnet(&compose, "workload-a", workload_a_cidr)?;
@@ -2941,6 +2947,29 @@ fn assert_compose_reconciles_unknown_managed_route(
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+
+    wait_for_compose_wireguard_path(compose, service, local_vpn_ip, remote_vpn_ip)
+}
+
+fn assert_compose_recovers_deleted_wireguard_interface(
+    compose: &ComposeProject,
+    service: &str,
+    local_vpn_ip: IpAddr,
+    remote_vpn_ip: IpAddr,
+) -> Result<()> {
+    run_compose_with_diagnostics(
+        compose,
+        [
+            "exec",
+            "-T",
+            service,
+            "ip",
+            "link",
+            "delete",
+            "dev",
+            "heteronetwork0",
+        ],
+    )?;
 
     wait_for_compose_wireguard_path(compose, service, local_vpn_ip, remote_vpn_ip)
 }

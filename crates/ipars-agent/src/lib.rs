@@ -22,8 +22,8 @@ use ipars_crypto::{
 use ipars_relay::{encode_relay_datagram_with_route, encode_relay_endpoint_announcement};
 use ipars_route_manager::{
     desired_managed_route_inventory, validate_route_plan, warn_if_linux_netns_is_current,
-    with_netlink_namespace, LinuxNetlinkSocket, LinuxNetworkNamespace, RouteManager,
-    RouteManagerError, RoutePlan, RoutePlanOwner,
+    with_linux_network_namespace, with_netlink_namespace, LinuxNetlinkSocket,
+    LinuxNetworkNamespace, RouteManager, RouteManagerError, RoutePlan, RoutePlanOwner,
 };
 #[cfg(test)]
 use ipars_route_manager::{ManagedRoute, ManagedRouteInventory};
@@ -4805,9 +4805,36 @@ pub struct WireGuardPeerConfig {
     pub persistent_keepalive_seconds: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireGuardInterfaceConfig {
+    pub vpn_ip: VpnIp,
+    pub mtu: u32,
+    pub listen_port: u16,
+}
+
 #[async_trait]
 pub trait WireGuardBackend: Send + Sync {
     async fn configure_private_key(&self, _private_key_b64: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    async fn recover_interface(
+        &self,
+        private_key_b64: &str,
+        _config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.configure_private_key(private_key_b64).await
+    }
+
+    async fn recreate_interface(
+        &self,
+        private_key_b64: &str,
+        config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.recover_interface(private_key_b64, config).await
+    }
+
+    async fn enable_ipv6(&self) -> Result<(), AgentError> {
         Ok(())
     }
 
@@ -6200,6 +6227,20 @@ where
     fn upsert_command(&self, config: &WireGuardPeerConfig) -> LinuxCommand {
         wireguard_upsert_peer_command(&self.interface, config)
     }
+
+    async fn enable_interface_ipv6(&self, interface: &str) -> Result<(), AgentError> {
+        if self
+            .runner
+            .run(wireguard_ipv6_enabled_command(interface)?)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.runner
+            .run(wireguard_enable_ipv6_command(interface)?)
+            .await
+    }
 }
 
 #[async_trait]
@@ -6209,6 +6250,36 @@ where
 {
     async fn configure_private_key(&self, private_key_b64: &str) -> Result<(), AgentError> {
         self.configure_interface_private_key(private_key_b64).await
+    }
+
+    async fn recover_interface(
+        &self,
+        private_key_b64: &str,
+        config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.ensure_interface().await?;
+        self.configure_interface_mtu(config.mtu).await?;
+        self.configure_interface_private_key(private_key_b64)
+            .await?;
+        self.configure_interface_listen_port(config.listen_port)
+            .await?;
+        self.configure_interface_address(config.vpn_ip).await
+    }
+
+    async fn recreate_interface(
+        &self,
+        private_key_b64: &str,
+        config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.runner
+            .run(wireguard_interface_delete_command(&self.interface))
+            .await?;
+        self.peer_public_keys.write().await.clear();
+        self.recover_interface(private_key_b64, config).await
+    }
+
+    async fn enable_ipv6(&self) -> Result<(), AgentError> {
+        self.enable_interface_ipv6(&self.interface).await
     }
 
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
@@ -6328,6 +6399,34 @@ where
         self.configure_interface_private_key(private_key_b64).await
     }
 
+    async fn recover_interface(
+        &self,
+        private_key_b64: &str,
+        config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.ensure_interface().await?;
+        self.configure_interface_mtu(config.mtu).await?;
+        self.configure_interface_private_key(private_key_b64)
+            .await?;
+        self.configure_interface_listen_port(config.listen_port)
+            .await?;
+        self.configure_interface_address(config.vpn_ip).await
+    }
+
+    async fn enable_ipv6(&self) -> Result<(), AgentError> {
+        if self
+            .runner
+            .run(wireguard_ipv6_enabled_command(&self.interface)?)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.runner
+            .run(wireguard_enable_ipv6_command(&self.interface)?)
+            .await
+    }
+
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
         self.runner
             .run(wireguard_upsert_peer_command(&self.interface, &config))
@@ -6417,6 +6516,40 @@ fn wireguard_interface_mtu_command(interface: &str, mtu: u32) -> LinuxCommand {
             mtu.to_string(),
         ],
     )
+}
+
+fn wireguard_interface_delete_command(interface: &str) -> LinuxCommand {
+    LinuxCommand::new("ip", ["link", "delete", "dev", interface])
+}
+
+fn wireguard_ipv6_sysctl_path(interface: &str) -> Result<PathBuf, AgentError> {
+    if interface.is_empty()
+        || interface.len() > 15
+        || interface == "."
+        || interface == ".."
+        || interface.as_bytes().contains(&0)
+        || interface.contains('/')
+    {
+        return Err(AgentError::WireGuard(format!(
+            "invalid WireGuard interface name `{interface}` for IPv6 configuration"
+        )));
+    }
+    Ok(Path::new("/proc/sys/net/ipv6/conf")
+        .join(interface)
+        .join("disable_ipv6"))
+}
+
+fn wireguard_enable_ipv6_command(interface: &str) -> Result<LinuxCommand, AgentError> {
+    let path = wireguard_ipv6_sysctl_path(interface)?;
+    Ok(LinuxCommand::new("tee", [path.to_string_lossy().into_owned()]).with_stdin(b"0\n".to_vec()))
+}
+
+fn wireguard_ipv6_enabled_command(interface: &str) -> Result<LinuxCommand, AgentError> {
+    let path = wireguard_ipv6_sysctl_path(interface)?;
+    Ok(LinuxCommand::new(
+        "grep",
+        ["-F", "-x", "0", path.to_string_lossy().as_ref()],
+    ))
 }
 
 #[derive(Debug)]
@@ -6602,6 +6735,36 @@ impl KernelWireGuardBackend {
         .await
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn delete_interface(&self) -> Result<(), AgentError> {
+        let (connection, handle, _) = with_netlink_namespace(self.namespace.as_ref(), || {
+            rtnetlink::new_connection_with_socket::<LinuxNetlinkSocket>()
+        })
+        .map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to open route netlink connection for deleting WireGuard interface {}{}: {error}",
+                self.interface,
+                wireguard_namespace_suffix(self.namespace.as_ref())
+            ))
+        })?;
+        tokio::spawn(connection);
+
+        let index = find_link_index(&handle, &self.interface)
+            .await?
+            .ok_or_else(|| {
+                AgentError::WireGuard(format!(
+                    "WireGuard interface {} was not visible before replacement",
+                    self.interface
+                ))
+            })?;
+        handle.link().del(index).execute().await.map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to delete WireGuard interface {} through rtnetlink: {error}",
+                self.interface
+            ))
+        })
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub async fn ensure_interface(&self) -> Result<(), AgentError> {
         Err(AgentError::WireGuard(
@@ -6660,6 +6823,49 @@ fn overlay_interface_prefix_len(vpn_ip: IpAddr) -> u8 {
 impl WireGuardBackend for KernelWireGuardBackend {
     async fn configure_private_key(&self, private_key_b64: &str) -> Result<(), AgentError> {
         self.configure_interface_private_key(private_key_b64).await
+    }
+
+    async fn recover_interface(
+        &self,
+        private_key_b64: &str,
+        config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.ensure_interface().await?;
+        self.configure_interface_mtu(config.mtu).await?;
+        self.configure_interface_private_key(private_key_b64)
+            .await?;
+        self.configure_interface_listen_port(config.listen_port)
+            .await?;
+        self.configure_interface_address(config.vpn_ip).await
+    }
+
+    async fn recreate_interface(
+        &self,
+        private_key_b64: &str,
+        config: &WireGuardInterfaceConfig,
+    ) -> Result<(), AgentError> {
+        self.delete_interface().await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.peer_public_keys.write().await.clear();
+        self.recover_interface(private_key_b64, config).await
+    }
+
+    async fn enable_ipv6(&self) -> Result<(), AgentError> {
+        let path = wireguard_ipv6_sysctl_path(&self.interface)?;
+        with_linux_network_namespace(self.namespace.as_ref(), || {
+            match std::fs::read_to_string(&path) {
+                Ok(value) if value.trim() == "0" => Ok(()),
+                Ok(_) => std::fs::write(&path, b"0\n"),
+                Err(error) => Err(error),
+            }
+        })
+        .map_err(|error| {
+            AgentError::WireGuard(format!(
+                "failed to enable IPv6 on WireGuard interface {} through {}: {error}",
+                self.interface,
+                path.display()
+            ))
+        })
     }
 
     async fn upsert_peer(&self, config: WireGuardPeerConfig) -> Result<(), AgentError> {
@@ -7247,6 +7453,7 @@ pub struct PeerMapApplier<W, R> {
     endpoint_resolver: Arc<dyn PeerEndpointResolver>,
     wireguard_peer_inventory: Option<Arc<dyn WireGuardPeerInventorySource>>,
     lazy_runtime: Option<Arc<AgentRuntime>>,
+    wireguard_interface_config: Option<WireGuardInterfaceConfig>,
     route_mtu_lock: Option<u32>,
     apply_lock: tokio::sync::Mutex<()>,
     applied_peers: tokio::sync::RwLock<BTreeMap<NodeId, String>>,
@@ -7267,6 +7474,7 @@ where
             endpoint_resolver: Arc::new(DirectPeerEndpointResolver),
             wireguard_peer_inventory: None,
             lazy_runtime: None,
+            wireguard_interface_config: None,
             route_mtu_lock: None,
             apply_lock: tokio::sync::Mutex::new(()),
             applied_peers: tokio::sync::RwLock::new(BTreeMap::new()),
@@ -7285,6 +7493,11 @@ where
 
     pub fn with_lazy_connect_runtime(mut self, runtime: Arc<AgentRuntime>) -> Self {
         self.lazy_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_wireguard_interface_recovery(mut self, config: WireGuardInterfaceConfig) -> Self {
+        self.wireguard_interface_config = Some(config);
         self
     }
 
@@ -7307,8 +7520,7 @@ where
     ) -> Result<PeerMapApplySummary, AgentError> {
         let _apply_guard = self.apply_lock.lock().await;
         if let Some(runtime) = &self.lazy_runtime {
-            self.wireguard
-                .configure_private_key(&runtime.state().wireguard_private_key_b64)
+            self.configure_local_wireguard(&runtime.state().wireguard_private_key_b64)
                 .await?;
             runtime
                 .observe_peer_map_for_lazy_connect(&peer_map.peers)
@@ -7490,6 +7702,13 @@ where
             policy_rules: Vec::new(),
         };
         validate_route_plan(&desired_route_plan)?;
+        if desired_route_plan
+            .routes
+            .iter()
+            .any(|route| route.cidr.addr().is_ipv6())
+        {
+            self.configure_local_wireguard_ipv6().await?;
+        }
         let desired_managed_inventory = desired_managed_route_inventory(&desired_route_plan)?;
         let actual_managed_inventory = self
             .route_manager
@@ -7754,6 +7973,54 @@ where
         })
     }
 
+    async fn configure_local_wireguard(&self, private_key_b64: &str) -> Result<(), AgentError> {
+        let initial_error = match self.wireguard.configure_private_key(private_key_b64).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(config) = self.wireguard_interface_config.as_ref() else {
+            return Err(initial_error);
+        };
+        self.wireguard
+            .recover_interface(private_key_b64, config)
+            .await
+            .map_err(|recovery_error| {
+                AgentError::WireGuard(format!(
+                    "WireGuard interface {} configuration failed ({initial_error}); recovery failed ({recovery_error})",
+                    self.interface
+                ))
+            })
+    }
+
+    async fn configure_local_wireguard_ipv6(&self) -> Result<(), AgentError> {
+        let initial_error = match self.wireguard.enable_ipv6().await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(runtime) = self.lazy_runtime.as_ref() else {
+            return Err(initial_error);
+        };
+        let Some(config) = self.wireguard_interface_config.as_ref() else {
+            return Err(initial_error);
+        };
+        let private_key_b64 = runtime.state().wireguard_private_key_b64;
+        self.wireguard
+            .recreate_interface(&private_key_b64, config)
+            .await
+            .map_err(|recovery_error| {
+                AgentError::WireGuard(format!(
+                    "WireGuard interface {} IPv6 initialization failed ({initial_error}); interface recreation failed ({recovery_error})",
+                    self.interface
+                ))
+            })?;
+        self.wireguard.enable_ipv6().await.map_err(|retry_error| {
+            AgentError::WireGuard(format!(
+                "WireGuard interface {} IPv6 initialization failed ({initial_error}); retry after interface recreation failed ({retry_error})",
+                self.interface
+            ))
+        })
+    }
+
     /// Adds only the direct peers and host routes needed to regain the control plane. Unlike an
     /// authoritative peer-map application, this deliberately leaves existing peers and routes
     /// untouched until a fresh signed map can reconcile the complete data plane.
@@ -7777,8 +8044,7 @@ where
             .map(|node| &node.cluster_id)
             .unwrap_or(&peer_map.cluster_id);
         validate_bootstrap_peer_cache(&peer_map, &local_state.node_id, expected_cluster)?;
-        self.wireguard
-            .configure_private_key(&local_state.wireguard_private_key_b64)
+        self.configure_local_wireguard(&local_state.wireguard_private_key_b64)
             .await?;
         self.endpoint_resolver.prepare_for_peer_map().await?;
 
@@ -7819,6 +8085,13 @@ where
             policy_rules: Vec::new(),
         };
         validate_route_plan(&route_plan)?;
+        if route_plan
+            .routes
+            .iter()
+            .any(|route| route.cidr.addr().is_ipv6())
+        {
+            self.configure_local_wireguard_ipv6().await?;
+        }
 
         for config in configs {
             self.wireguard.upsert_peer(config.clone()).await?;
@@ -8662,14 +8935,22 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct RecordingRunner {
         commands: Arc<tokio::sync::RwLock<Vec<LinuxCommand>>>,
-        fail_interface_show: bool,
+        interface_missing: Arc<std::sync::atomic::AtomicBool>,
+        fail_ipv6_check: bool,
         fail_remove: bool,
     }
 
     impl RecordingRunner {
         fn with_missing_interface() -> Self {
             Self {
-                fail_interface_show: true,
+                interface_missing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                ..Self::default()
+            }
+        }
+
+        fn with_disabled_ipv6() -> Self {
+            Self {
+                fail_ipv6_check: true,
                 ..Self::default()
             }
         }
@@ -8689,18 +8970,38 @@ mod tests {
     #[async_trait]
     impl LinuxCommandRunner for RecordingRunner {
         async fn run(&self, command: LinuxCommand) -> Result<(), AgentError> {
-            let should_fail_show = self.fail_interface_show
+            use std::sync::atomic::Ordering;
+
+            let interface_missing = self.interface_missing.load(Ordering::SeqCst);
+            let should_fail_show = interface_missing
                 && command.program == "ip"
                 && command
                     .args
                     .iter()
                     .map(String::as_str)
                     .eq(["link", "show", "dev", "ipars0"]);
+            let should_fail_wireguard = interface_missing
+                && command.program == "wg"
+                && command.args.first().is_some_and(|arg| arg == "set")
+                && command.args.get(1).is_some_and(|arg| arg == "ipars0");
+            let creates_interface = command.program == "ip"
+                && command.args.iter().map(String::as_str).eq([
+                    "link",
+                    "add",
+                    "dev",
+                    "ipars0",
+                    "type",
+                    "wireguard",
+                ]);
             let should_fail_remove = self.fail_remove
                 && command.program == "wg"
                 && command.args.last().is_some_and(|arg| arg == "remove");
+            let should_fail_ipv6_check = self.fail_ipv6_check && command.program == "grep";
             self.commands.write().await.push(command);
-            if should_fail_show {
+            if creates_interface {
+                self.interface_missing.store(false, Ordering::SeqCst);
+            }
+            if should_fail_show || should_fail_wireguard || should_fail_ipv6_check {
                 Err(AgentError::WireGuard("interface missing".to_string()))
             } else if should_fail_remove {
                 Err(AgentError::WireGuard("remove failed".to_string()))
@@ -11591,6 +11892,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_wireguard_backend_enables_ipv6_on_the_overlay_interface(
+    ) -> Result<(), AgentError> {
+        let runner = RecordingRunner::default();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
+
+        backend.enable_ipv6().await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![LinuxCommand::new(
+                "grep",
+                [
+                    "-F",
+                    "-x",
+                    "0",
+                    "/proc/sys/net/ipv6/conf/ipars0/disable_ipv6"
+                ],
+            )]
+        );
+
+        let runner = RecordingRunner::with_disabled_ipv6();
+        let backend = LinuxWireGuardBackend::new("ipars0", runner.clone());
+        backend.enable_ipv6().await?;
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new(
+                    "grep",
+                    [
+                        "-F",
+                        "-x",
+                        "0",
+                        "/proc/sys/net/ipv6/conf/ipars0/disable_ipv6"
+                    ],
+                ),
+                LinuxCommand::new("tee", ["/proc/sys/net/ipv6/conf/ipars0/disable_ipv6"],)
+                    .with_stdin(b"0\n".to_vec())
+            ]
+        );
+        assert!(wireguard_enable_ipv6_command("../all").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn peer_map_application_refreshes_rotated_local_private_key() -> Result<(), AgentError> {
         let first_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let second_private_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
@@ -11627,6 +11972,55 @@ mod tests {
                     .with_stdin(format!("{first_private_key}\n").into_bytes()),
                 LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
                     .with_stdin(format!("{second_private_key}\n").into_bytes()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_map_application_recovers_a_missing_wireguard_interface() -> Result<(), AgentError>
+    {
+        let state = AgentNodeState::generate(Utc::now());
+        let private_key = state.wireguard_private_key_b64.clone();
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
+        let runner = RecordingRunner::with_missing_interface();
+        let applier = PeerMapApplier::new(
+            "ipars0",
+            LinuxWireGuardBackend::new("ipars0", runner.clone()),
+            DryRunLinuxRouteManager,
+        )
+        .with_lazy_connect_runtime(runtime)
+        .with_wireguard_interface_recovery(WireGuardInterfaceConfig {
+            vpn_ip: VpnIp(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2))),
+            mtu: 1_280,
+            listen_port: 51_820,
+        });
+
+        applier
+            .apply_peer_map(PeerMap {
+                cluster_id: ClusterId::from_string("cluster-a"),
+                peers: Vec::new(),
+                bootstrap_endpoints: Vec::new(),
+                generated_at: Utc::now(),
+            })
+            .await?;
+
+        assert_eq!(
+            runner.commands().await,
+            vec![
+                LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
+                    .with_stdin(format!("{private_key}\n").into_bytes()),
+                LinuxCommand::new("ip", ["link", "show", "dev", "ipars0"]),
+                LinuxCommand::new("ip", ["link", "add", "dev", "ipars0", "type", "wireguard"],),
+                LinuxCommand::new("ip", ["link", "set", "up", "dev", "ipars0"]),
+                LinuxCommand::new("ip", ["link", "set", "dev", "ipars0", "mtu", "1280"]),
+                LinuxCommand::new("wg", ["set", "ipars0", "private-key", "/dev/stdin"])
+                    .with_stdin(format!("{private_key}\n").into_bytes()),
+                LinuxCommand::new("wg", ["set", "ipars0", "listen-port", "51820"]),
+                LinuxCommand::new(
+                    "ip",
+                    ["address", "replace", "100.64.0.2/32", "dev", "ipars0"],
+                ),
             ]
         );
         Ok(())

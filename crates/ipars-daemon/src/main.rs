@@ -36,7 +36,7 @@ use ipars_agent::{
     PeerMapApplier, PeerMapSink, PeerMapSource, PeerMapSync, PeerProbeConfig,
     PendingDirectPathProbe, RelayForwarderStats, RelaySessionState, RuntimePeerEndpointResolver,
     TimedSystemCommandRunner, UdpHolePuncher, UdpPeerProbe, UdpPeerProbeResponder,
-    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend,
+    UdpRelayFrameForwarder, UserspaceWireGuardBackend, WireGuardBackend, WireGuardInterfaceConfig,
     WireGuardPeerInventorySource, WireGuardPeerTelemetry, WireGuardPeerTelemetrySource,
     DEFAULT_PEER_PROBE_PORT,
 };
@@ -238,9 +238,10 @@ const DEFAULT_DIRECT_HANDSHAKE_MAX_AGE_SECONDS: u64 = 180;
 const MAX_DIRECT_PATH_VERIFICATION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_OVERLAY_TRANSIT_PORT: u16 = 51_822;
 // Bounded transit fragments its hop transport below this logical MTU, so
-// full-sized inner packets do not depend on nested IP fragmentation.
-const DEFAULT_OVERLAY_WIREGUARD_MTU: u32 = 1_200;
-const MIN_OVERLAY_WIREGUARD_MTU: u32 = 1_200;
+// full-sized inner packets do not depend on nested IP fragmentation. Linux
+// detaches IPv6 from links below the protocol minimum MTU of 1280.
+const DEFAULT_OVERLAY_WIREGUARD_MTU: u32 = 1_280;
+const MIN_OVERLAY_WIREGUARD_MTU: u32 = 1_280;
 const OVERLAY_TRANSIT_DELIVERY_QUEUE_CAPACITY: usize = 1_024;
 const OVERLAY_PEER_DELIVERY_QUEUE_CAPACITY: usize = 256;
 const OVERLAY_TRANSIT_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1699,6 +1700,7 @@ fn effective_packet_flow_detector(args: &AgentArgs) -> PacketFlowDetector {
 struct RuntimePreflightNeeds {
     ip_command: bool,
     wg_command: bool,
+    ipv6_interface_commands: bool,
     userspace_wireguard_command: bool,
     tun_device: bool,
     route_netlink: bool,
@@ -1724,6 +1726,7 @@ impl RuntimePreflightNeeds {
         Self {
             ip_command: false,
             wg_command: false,
+            ipv6_interface_commands: false,
             userspace_wireguard_command: false,
             tun_device: false,
             route_netlink: false,
@@ -1748,6 +1751,7 @@ impl RuntimePreflightNeeds {
     fn is_empty(self) -> bool {
         !self.ip_command
             && !self.wg_command
+            && !self.ipv6_interface_commands
             && !self.userspace_wireguard_command
             && !self.tun_device
             && !self.route_netlink
@@ -1980,6 +1984,10 @@ fn preflight_agent_runtime_with_path_and_checks(
     }
     if needs.wg_command {
         ensure_program_in_path("wg", path)?;
+    }
+    if needs.ipv6_interface_commands {
+        ensure_program_in_path("grep", path)?;
+        ensure_program_in_path("tee", path)?;
     }
     if needs.userspace_wireguard_command {
         let command = args
@@ -3198,6 +3206,8 @@ fn runtime_preflight_needs(args: &AgentArgs) -> RuntimePreflightNeeds {
         wg_command: applies_wireguard_with_command
             || applies_wireguard_with_userspace_command
             || starts_userspace_wireguard,
+        ipv6_interface_commands: applies_wireguard_with_command
+            || applies_wireguard_with_userspace_command,
         userspace_wireguard_command: starts_userspace_wireguard,
         tun_device: applies_wireguard_with_boringtun,
         route_netlink: applies_routes_with_netlink || applies_wireguard_with_netlink,
@@ -12921,6 +12931,11 @@ where
     );
     applier = applier
         .with_endpoint_resolver(resolver)
+        .with_wireguard_interface_recovery(WireGuardInterfaceConfig {
+            vpn_ip: runtime_local_vpn_ip(&runtime)?,
+            mtu: args.wireguard_mtu,
+            listen_port: args.wireguard_listen_port,
+        })
         .with_route_mtu_lock(args.wireguard_mtu);
     if let Some(inventory) = agent_wireguard_peer_inventory_source(args)? {
         applier = applier.with_wireguard_peer_inventory(inventory);
@@ -30555,6 +30570,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             let needs = runtime_preflight_needs(&args);
             assert!(needs.ip_command);
             assert!(needs.wg_command);
+            assert!(needs.ipv6_interface_commands);
             assert!(needs.cap_net_admin);
             assert!(needs.cap_net_raw);
             assert!(!needs.cap_sys_admin);
@@ -30955,6 +30971,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             let needs = runtime_preflight_needs(&args);
             assert!(needs.ip_command);
             assert!(!needs.wg_command);
+            assert!(!needs.ipv6_interface_commands);
             assert!(needs.route_netlink);
             assert!(needs.generic_netlink);
             assert!(needs.netfilter_netlink);
@@ -30989,6 +31006,7 @@ ipv4 2 udp 17 29 src=192.0.2.20 dst=100.64.0.12 sport=50000 dport=51820 src=100.
             let needs = runtime_preflight_needs(&args);
             assert!(!needs.ip_command);
             assert!(needs.wg_command);
+            assert!(needs.ipv6_interface_commands);
             assert!(needs.route_netlink);
             assert!(!needs.generic_netlink);
             assert!(needs.netfilter_netlink);
@@ -32263,6 +32281,8 @@ exec sleep 60
             let bin = base.join("bin");
             std::fs::create_dir(&bin)?;
             write_trusted_test_executable(&bin.join("wg"), "#!/bin/sh\n")?;
+            write_trusted_test_executable(&bin.join("grep"), "#!/bin/sh\n")?;
+            write_trusted_test_executable(&bin.join("tee"), "#!/bin/sh\n")?;
 
             let mut checks = test_preflight_checks(preflight_noop_netlink);
             checks.cap_net_raw = preflight_fail_cap_net_raw;
@@ -33265,7 +33285,7 @@ exec sleep 60
         assert_eq!(default.wireguard_mtu, DEFAULT_OVERLAY_WIREGUARD_MTU);
         validate_agent_runtime_config(&default)?;
 
-        for mtu in ["1199", "65536"] {
+        for mtu in ["1279", "65536"] {
             let cli = Cli::try_parse_from(["iparsd", "agent", "--wireguard-mtu", mtu])?;
             let Command::Agent(args) = cli.command else {
                 anyhow::bail!("expected agent command");
@@ -33276,7 +33296,7 @@ exec sleep 60
             };
             assert!(error
                 .to_string()
-                .contains("--wireguard-mtu must be between 1200 and 65535"));
+                .contains("--wireguard-mtu must be between 1280 and 65535"));
         }
 
         let exposed = Cli::try_parse_from(["iparsd", "agent", "--listen", "0.0.0.0:9780"])?;
