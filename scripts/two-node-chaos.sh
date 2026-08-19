@@ -31,10 +31,10 @@ readonly -a NODE_NAMES=(
 readonly -a DIRECT_NODE_NAMES=(ichikawap1 uc-k8s3p uc-k8sp1 uc-k8sp2)
 readonly -a DATABASE_NODE_NAMES=(
   ichikawap1
-  mizuame-nucboxg5
   uc-k8s3p
   uc-k8sp1
   uc-k8sp2
+  mizuame-nucboxg5
 )
 
 declare -Ar VPN_ADDRESS=(
@@ -622,7 +622,7 @@ baseline_endpoint_available() {
 patroni_document() {
   local observer
   observer="$(select_database_observer)" || return 1
-  root_node "$observer" \
+  host_root_node "$observer" \
     'timeout 20 /opt/heteronetwork/postgres-ha/patroni/bin/patronictl -c /etc/heteronetwork/postgres-ha/patroni.yml list -f json'
 }
 
@@ -636,7 +636,7 @@ patroni_has_leader() {
 prepare_database_probe() {
   local observer
   observer="$(select_database_observer)" || return 1
-  root_node "$observer" \
+  host_root_node "$observer" \
     "PGPASSWORD=\$(cat /etc/heteronetwork/postgres-ha/secrets/superuser.password) PGSSLMODE=verify-full PGSSLROOTCERT=/etc/heteronetwork/postgres-ha/pki/ca.crt timeout 30 psql -U postgres -h postgres.heteronetwork.internal -p 25432 -d postgres -v ON_ERROR_STOP=1 -qAtc 'CREATE TABLE IF NOT EXISTS public.heteronetwork_chaos_probe (id uuid PRIMARY KEY, observed_at timestamptz NOT NULL)'"
 }
 
@@ -644,14 +644,14 @@ database_write_probe() {
   local observer probe_id
   observer="$(select_database_observer)" || return 1
   probe_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-  root_node "$observer" \
+  host_root_node "$observer" \
     "PGPASSWORD=\$(cat /etc/heteronetwork/postgres-ha/secrets/superuser.password) PGSSLMODE=verify-full PGSSLROOTCERT=/etc/heteronetwork/postgres-ha/pki/ca.crt timeout 25 psql -U postgres -h postgres.heteronetwork.internal -p 25432 -d postgres -v ON_ERROR_STOP=1 -qAtc \"BEGIN; INSERT INTO public.heteronetwork_chaos_probe VALUES ('$probe_id', now()); DELETE FROM public.heteronetwork_chaos_probe WHERE id = '$probe_id'; COMMIT\""
 }
 
 cleanup_database_probe() {
   local observer
   observer="$(select_database_observer 2>/dev/null)" || return 0
-  root_node "$observer" \
+  host_root_node "$observer" \
     "PGPASSWORD=\$(cat /etc/heteronetwork/postgres-ha/secrets/superuser.password) PGSSLMODE=verify-full PGSSLROOTCERT=/etc/heteronetwork/postgres-ha/pki/ca.crt timeout 30 psql -U postgres -h postgres.heteronetwork.internal -p 25432 -d postgres -qAtc 'DROP TABLE IF EXISTS public.heteronetwork_chaos_probe'" \
     >/dev/null 2>&1 || true
 }
@@ -661,10 +661,10 @@ flow_context() {
   observer="$(select_database_observer)" || return 1
   query="SELECT organization_id, project_id, id FROM flow_service_instances WHERE status->>'phase' = 'ready' ORDER BY created_at DESC LIMIT 1"
   printf -v quoted_query '%q' "$query"
-  ids="$(root_node "$observer" "timeout 20 runuser -u postgres -- psql -h /run/postgresql -p 55432 -d heterocloud_flow -v ON_ERROR_STOP=1 -qAtF '|' -c $quoted_query" 2>/dev/null)" \
+  ids="$(host_root_node "$observer" "timeout 20 runuser -u postgres -- psql -h /run/postgresql -p 55432 -d heterocloud_flow -v ON_ERROR_STOP=1 -qAtF '|' -c $quoted_query" 2>/dev/null)" \
     || return 1
   [[ "$ids" == *'|'*'|'* ]] || return 1
-  secret="$(root_node "$observer" 'timeout 20 kubectl -n heterocloud-flow get secret heterocloud-flow-secrets -o jsonpath="{.data.flow-principal-context-hmac-secret}"' 2>/dev/null)" \
+  secret="$(host_root_node "$observer" 'timeout 20 kubectl -n heterocloud-flow get secret heterocloud-flow-secrets -o jsonpath="{.data.flow-principal-context-hmac-secret}"' 2>/dev/null)" \
     || return 1
   [[ -n "$secret" ]] || return 1
   FLOW_IDS="$ids" FLOW_SECRET_B64="$secret" python3 - <<'PY'
