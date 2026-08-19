@@ -257,7 +257,7 @@ test("Cloudscape console renders overview and hierarchical topology", async ({ p
   );
   await expect(page.getByRole("link", { name: "Grafana" })).toHaveAttribute(
     "href",
-    "http://grafana.heteronetwork.internal:33000",
+    "http://grafana.heteronetwork.internal:13000",
   );
   await expect(page.getByRole("link", { name: "Prometheus" })).toHaveAttribute(
     "href",

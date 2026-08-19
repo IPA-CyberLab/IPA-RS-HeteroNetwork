@@ -23,7 +23,7 @@ const operationsConsoles = [
   },
   {
     label: "Grafana",
-    href: "http://grafana.heteronetwork.internal:33000",
+    href: "http://grafana.heteronetwork.internal:13000",
   },
   {
     label: "Prometheus",
