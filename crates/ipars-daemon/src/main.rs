@@ -22751,10 +22751,9 @@ mod tests {
         assert!(args.relay_forwarder_endpoint.is_none());
         assert!(args.relay_forwarder_bind.is_none());
 
-        let runtime = Arc::new(AgentRuntime::new(
-            AgentNodeState::generate(Utc::now()),
-            ClusterPolicy::default(),
-        ));
+        let mut state = AgentNodeState::generate(Utc::now());
+        state.vpn_ip = Some(VpnIp(IpAddr::V4(Ipv4Addr::new(10, 250, 0, 10))));
+        let runtime = Arc::new(AgentRuntime::new(state, ClusterPolicy::default()));
         let local = runtime.state().node_id.clone();
         let peer_id = NodeId::from_string("peer-path-aware");
         let selected_candidate = EndpointCandidate {
