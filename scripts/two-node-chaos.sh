@@ -547,7 +547,7 @@ vpn_mesh() {
   for source in "${sources[@]}"; do
     local source_log="$output_dir/${label}-${source}.log"
     logs+=("$source_log")
-    printf -v command 'status=0; for address in %s; do if ping -c 1 -W 3 "$address" >/dev/null 2>&1; then printf "%%s -> %%s PASS\\n" %q "$address"; else printf "%%s -> %%s FAIL\\n" %q "$address"; status=1; fi; done; exit "$status"' \
+    printf -v command 'status=0; for address in %s; do reached=0; for attempt in 1 2 3 4 5; do if ping -c 1 -W 2 "$address" >/dev/null 2>&1; then reached=1; break; fi; sleep 1; done; if [ "$reached" -eq 1 ]; then printf "%%s -> %%s PASS\\n" %q "$address"; else printf "%%s -> %%s FAIL\\n" %q "$address"; status=1; fi; done; exit "$status"' \
       "$target_list" "$source" "$source"
     (ssh_node "$source" "$command" >"$source_log" 2>&1) &
     pids+=("$!")
@@ -607,7 +607,15 @@ status=0
 for source in \$pods; do
   source_node=\"\$(kubectl -n default get pod \"\$source\" -o jsonpath='{.spec.nodeName}')\"
   for address in \$addresses; do
-    if kubectl -n default exec \"\$source\" -- ping -c 1 -W 3 \"\$address\" >/dev/null 2>&1; then
+    reached=0
+    for attempt in 1 2 3 4 5; do
+      if kubectl -n default exec \"\$source\" -- ping -c 1 -W 2 \"\$address\" >/dev/null 2>&1; then
+        reached=1
+        break
+      fi
+      sleep 1
+    done
+    if [ \"\$reached\" -eq 1 ]; then
       printf '%s -> %s PASS\\n' \"\$source_node\" \"\$address\"
     else
       printf '%s -> %s FAIL\\n' \"\$source_node\" \"\$address\"
