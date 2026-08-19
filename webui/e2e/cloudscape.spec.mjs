@@ -170,8 +170,8 @@ async function installMockBackend(page) {
       },
       "/v1/admin/overview": localOverview,
       "/v1/admin/keycloak-placement": {
-        desired_replicas: 3,
-        replicas: nodes.slice(0, 3).map((entry) => ({
+        desired_replicas: 5,
+        replicas: nodes.slice(0, 5).map((entry) => ({
           node_id: entry.node.node_id,
           ready: true,
         })),

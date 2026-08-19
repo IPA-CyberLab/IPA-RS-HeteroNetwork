@@ -416,7 +416,7 @@ The standard node enrollment script installs the pinned Keycloak helper and
 automatic placement timer. Do not copy another node's PostgreSQL bundle,
 Keycloak passwords, or node identity. A node becomes an eligible candidate only
 after its local database member, database proxy, and protected credentials are
-ready. The Control Plane then selects at most three eligible replicas and every
+ready. The Control Plane then selects at most five eligible replicas and every
 node configures an edge proxy for the selected HeteroNetwork addresses.
 
 ```bash
@@ -429,13 +429,13 @@ sudo systemctl start --no-block heteronetwork-keycloak-autopilot.service
 The helper binds application HTTP to loopback, uses the local HeteroNetwork
 address for JGroups, and stores runtime secrets in owner-restricted files.
 Automatically promoted Control Planes validate OIDC tokens through their local
-Keycloak edge proxy. The edge proxy follows the current three-replica placement,
+Keycloak edge proxy. The edge proxy follows the current five-replica placement,
 so a replica promotion does not leave authentication pinned to stopped nodes.
 Configured private backchannel URLs remain ordered fallbacks for the local edge
 route.
 Inspect placement through the Web UI or
 `GET /v1/admin/keycloak-placement`. A healthy placement reports
-`desired_replicas=3` and three entries with `ready=true`. An unassigned prepared
+`desired_replicas=5` and five entries with `ready=true`. An unassigned prepared
 node remains an inactive standby while its edge proxy continues forwarding to
 the selected replicas.
 

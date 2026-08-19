@@ -12,7 +12,8 @@ readonly MAX_SECRET_BYTES="4096"
 readonly MAX_RESPONSE_BYTES="262144"
 readonly MAX_CONTROL_PLANE_URLS="16"
 readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"
-readonly MAX_REPLICAS="3"
+readonly DESIRED_REPLICAS="5"
+readonly MAX_REPLICAS="$DESIRED_REPLICAS"
 readonly MAX_GENERATION="9223372036854775807"
 readonly REPLICA_PORT="18080"
 readonly EDGE_PORT="18079"
@@ -466,12 +467,13 @@ validate_response() {
     --arg vpn_ip "$vpn_ip" \
     --arg version "$KEYCLOAK_VERSION" \
     --argjson generation "$request_generation" \
+    --argjson desired "$DESIRED_REPLICAS" \
     --argjson maximum "$MAX_REPLICAS" '
       type == "object"
       and (.cluster_id == $cluster_id)
       and (.generation == $generation)
       and (.placement_id | type == "string" and test("^[a-f0-9]{64}$"))
-      and (.desired_replicas == 3)
+      and (.desired_replicas == $desired)
       and (.lease_ttl_seconds
         | type == "number" and floor == . and . >= 15 and . <= 300)
       and (.reconcile_after_seconds | type == "number" and . >= 5 and . <= 60)

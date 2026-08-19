@@ -92,7 +92,7 @@ write_response() {
     --argjson assigned "$assigned" '{
       cluster_id: $cluster_id,
       placement_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      desired_replicas: 3,
+      desired_replicas: 5,
       lease_ttl_seconds: 45,
       reconcile_after_seconds: 15,
       generation: 0,

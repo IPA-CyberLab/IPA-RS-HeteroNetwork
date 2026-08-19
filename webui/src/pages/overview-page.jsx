@@ -67,7 +67,7 @@ export function OverviewPage({ overview, onNavigate, onOpenNode }) {
   const keycloakPlacement = overview.keycloak_placement || {};
   const keycloakReplicas = keycloakPlacement.replicas || [];
   const keycloakReady = keycloakReplicas.filter((replica) => replica.ready).length;
-  const keycloakDesired = keycloakPlacement.desired_replicas || 3;
+  const keycloakDesired = keycloakPlacement.desired_replicas || 5;
   const haReady = Boolean(metrics.ha_ready) && keycloakReady >= keycloakDesired;
   const serviceHealth = [
     ["コントロールプレーン", metrics.active_control_plane_count || 0],
