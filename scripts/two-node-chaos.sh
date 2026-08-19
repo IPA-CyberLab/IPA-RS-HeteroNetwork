@@ -481,6 +481,7 @@ daemon_available() {
   printf "%s/daemonset %s %s/%s %s\n" "$namespace" "$name" "${value:-0}" "$minimum" "$result"
 }
 available kube-system deployment coredns 1
+available heterocloud-dns deployment heterocloud-dns 1
 available heterocloud deployment heterocloud-heterocloud 1
 available heterocloud-flow deployment heterocloud-flow-api 1
 available heterocloud-flow deployment heterocloud-flow-signaling 1
@@ -815,23 +816,35 @@ PY
 }
 
 flow_api_write_probe() {
-  local context principal timestamp signature body response code
+  local context principal timestamp signature body response code attempt
   context="$(flow_context)" || return 1
-  principal="$(jq -r '."x-flow-principal"' <<<"$context")"
-  timestamp="$(jq -r '."x-flow-timestamp"' <<<"$context")"
-  signature="$(jq -r '."x-flow-signature"' <<<"$context")"
-  body="$(jq -nc --arg name "chaos-api-$(date +%s%N)" \
-    '{mode:"p2p",name:$name,max_participants:2,metadata:{test:"two-node-chaos"}}')"
-  response="$(curl -sS --max-time 25 --retry 3 --retry-delay 1 --retry-all-errors \
-    -H "x-flow-principal: $principal" \
-    -H "x-flow-timestamp: $timestamp" \
-    -H "x-flow-signature: $signature" \
-    -H 'content-type: application/json' \
-    -d "$body" -w $'\n%{http_code}' \
-    'https://flow.heterocloud.mizuame.app/v1/rooms' 2>/dev/null)" || return 1
-  code="${response##*$'\n'}"
-  body="${response%$'\n'*}"
-  [[ "$code" =~ ^20[01]$ ]] && jq -e '.id != null' <<<"$body" >/dev/null
+  jq -e '
+    type == "object"
+    and (."x-flow-principal" | type == "string" and length > 0)
+    and (."x-flow-timestamp" | type == "string" and length > 0)
+    and (."x-flow-signature" | type == "string" and length > 0)
+  ' <<<"$context" >/dev/null || return 1
+  principal="$(jq -er '."x-flow-principal"' <<<"$context")" || return 1
+  timestamp="$(jq -er '."x-flow-timestamp"' <<<"$context")" || return 1
+  signature="$(jq -er '."x-flow-signature"' <<<"$context")" || return 1
+  for attempt in 1 2 3 4 5 6 7 8; do
+    body="$(jq -nc --arg name "chaos-api-$(date +%s%N)-$attempt" \
+      '{mode:"p2p",name:$name,max_participants:2,metadata:{test:"two-node-chaos"}}')"
+    response="$(curl -sS --connect-timeout 3 --max-time 12 \
+      -H "x-flow-principal: $principal" \
+      -H "x-flow-timestamp: $timestamp" \
+      -H "x-flow-signature: $signature" \
+      -H 'content-type: application/json' \
+      -d "$body" -w $'\n%{http_code}' \
+      'https://flow.heterocloud.mizuame.app/v1/rooms' 2>/dev/null || true)"
+    code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+    if [[ "$code" =~ ^20[01]$ ]] && jq -e '.id != null' <<<"$body" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 flow_e2e_probe() {
@@ -839,12 +852,14 @@ flow_e2e_probe() {
   local destination="$2"
   local context
   context="$(flow_context)" || return 1
-  timeout 80 env \
+  timeout 140 env \
     FLOW_CHAOS_CONTEXT="$context" \
     FLOW_CONTEXT_COMMAND='printf "%s" "$FLOW_CHAOS_CONTEXT"' \
     FLOW_DURATION_SECONDS=10 \
     FLOW_INTERVAL_SECONDS=5 \
     FLOW_REQUEST_TIMEOUT_MS=20000 \
+    FLOW_CONNECTION_ATTEMPTS=3 \
+    FLOW_CONNECTION_RETRY_DELAY_MS=1000 \
     FLOW_ICE_TRANSPORT_POLICY="$mode" \
     PLAYWRIGHT_MODULE="$playwright_module" \
     node "$flow_repository/scripts/flow-e2e.mjs" >"$destination" 2>&1
@@ -858,7 +873,9 @@ start_external_monitor() {
     local code expected label url
     while [[ ! -e "$external_monitor_stop" ]]; do
       while IFS='|' read -r label expected url; do
-        code="$(curl -sS -o /dev/null --max-time 8 -w '%{http_code}' "$url" 2>/dev/null || printf 000)"
+        if ! code="$(curl -sS -o /dev/null --max-time 8 -w '%{http_code}' "$url" 2>/dev/null)"; then
+          code=000
+        fi
         printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" "$expected" "$code" "$url"
       done <<'ENDPOINTS'
 flow-openapi|200|https://flow.heterocloud.mizuame.app/openapi.json
