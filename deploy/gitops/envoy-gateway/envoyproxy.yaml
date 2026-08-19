@@ -8,7 +8,7 @@ spec:
     type: Kubernetes
     kubernetes:
       envoyDeployment:
-        replicas: 3
+        replicas: 5
         pod:
           nodeSelector:
             networking.heteronetwork.io/public-ingress: "true"
@@ -28,16 +28,18 @@ spec:
               cpu: "2"
               memory: 1Gi
       envoyPDB:
-        minAvailable: 2
+        minAvailable: 3
       envoyService:
         type: LoadBalancer
         loadBalancerClass: heteronetwork.io/public
         allocateLoadBalancerNodePorts: false
         externalTrafficPolicy: Cluster
         loadBalancerSourceRanges:
+          - 163.220.236.45/32
           - 163.220.236.51/32
           - 163.220.236.52/32
           - 163.220.236.53/32
+          - 163.220.236.61/32
         annotations:
           networking.heteronetwork.io/traffic-mode: forwarded
-          networking.heteronetwork.io/ingress-replicas: "3"
+          networking.heteronetwork.io/ingress-replicas: "5"

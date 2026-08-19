@@ -7,6 +7,7 @@ metadata:
     app.kubernetes.io/part-of: heterocloud-edge
 spec:
   type: ClusterIP
+  internalTrafficPolicy: Local
   selector:
     app.kubernetes.io/component: proxy
     app.kubernetes.io/managed-by: envoy-gateway
