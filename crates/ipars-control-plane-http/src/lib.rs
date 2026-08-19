@@ -9728,7 +9728,10 @@ mod tests {
         assert_eq!(response_body["setup"], "network_only");
         assert!(!generated_script.contains("kubeadm-ha-autopilot"));
         assert!(generated_script.contains("heteronetwork-postgres-autopilot.service"));
-        assert!(generated_script.contains("PartOf=heteronetwork-agent.service"));
+        assert!(
+            generated_script.contains("Wants=network-online.target heteronetwork-agent.service")
+        );
+        assert!(!generated_script.contains("PartOf=heteronetwork-agent.service"));
         assert!(generated_script.contains("postgres-ha-node.sh"));
         assert!(generated_script.contains("postgres-ha-autopilot.sh"));
         assert!(generated_script.contains("HETERONETWORK_DB_CONTROL_PLANE_URLS_B64='"));
@@ -11505,7 +11508,8 @@ exit 47
         assert!(script.contains("--packet-flow-poll-interval-seconds 1"));
         assert!(script.contains("heteronetwork-gateway.service"));
         assert!(script.contains("heteronetwork-postgres-autopilot.service"));
-        assert!(script.contains("PartOf=heteronetwork-agent.service"));
+        assert!(script.contains("Wants=network-online.target heteronetwork-agent.service"));
+        assert!(!script.contains("PartOf=heteronetwork-agent.service"));
         assert!(script.contains("HETERONETWORK_DB_AUTOPILOT_BEARER_TOKEN="));
         assert!(script.contains("HETERONETWORK_DB_CLUSTER_ID_B64="));
         assert!(script.contains("HETERONETWORK_DB_LOCAL_ROLE=edge"));
