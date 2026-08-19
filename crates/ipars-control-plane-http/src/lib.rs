@@ -4249,9 +4249,9 @@ fi
         .replace(
             "__DISABLE_PUBLIC_SERVICES_AUTOPROMOTION__",
             if enrollment.public_services.is_some() {
-                "0"
+                "false"
             } else {
-                "1"
+                "true"
             },
         )
         .replace("__RELAY_ADMISSION_INSTALL__", &relay_admission_install)
@@ -5233,7 +5233,7 @@ else
   install -d -o root -g root -m 0755 /etc/systemd/system/heteronetwork-agent.service.d
   cat >/etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf <<'HETERONETWORK_PUBLIC_SERVICES_OPTOUT'
 [Service]
-Environment=HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=1
+Environment=HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=true
 HETERONETWORK_PUBLIC_SERVICES_OPTOUT
   chown root:root /etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf
   chmod 0644 /etc/systemd/system/heteronetwork-agent.service.d/90-public-services-opt-out.conf
@@ -9838,7 +9838,7 @@ mod tests {
             .contains("--promote-existing requires an already registered HeteroNetwork Agent"));
         assert!(generated_script.contains("/opt/heteronetwork/bin/ipars"));
         assert!(generated_script
-            .contains("HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=0"));
+            .contains("HETERONETWORK_AGENT_DISABLE_PUBLIC_SERVICES_AUTOPROMOTION=false"));
         assert!(generated_script.contains("HETERONETWORK_AGENT_MAPPED_PUBLIC_IP="));
         assert!(generated_script
             .contains("/etc/systemd/system/heteronetwork-agent.service.d/05-mapped-public.conf"));
