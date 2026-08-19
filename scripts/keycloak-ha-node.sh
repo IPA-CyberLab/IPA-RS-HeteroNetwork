@@ -11,6 +11,7 @@ readonly DEFAULT_MANAGEMENT_PORT="19000"
 readonly DEFAULT_BACKCHANNEL_PORT="18080"
 readonly DEFAULT_EDGE_PORT="18079"
 readonly DEFAULT_DB_URL="jdbc:postgresql://postgres.heteronetwork.internal:25432/keycloak?sslmode=verify-full&sslrootcert=/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt"
+readonly MAX_EDGE_UPSTREAMS="5"
 readonly MAX_SECRET_BYTES="4096"
 readonly MAX_ARCHIVE_BYTES="1073741824"
 readonly ACTIVATION_READY_ATTEMPTS="3"
@@ -140,8 +141,8 @@ validate_edge_upstreams() {
   local -A seen=()
   local -a endpoints=()
   IFS=, read -r -a endpoints <<<"$edge_upstreams"
-  ((${#endpoints[@]} >= 1 && ${#endpoints[@]} <= 3)) \
-    || die "edge proxy requires one to three private upstreams"
+  ((${#endpoints[@]} >= 1 && ${#endpoints[@]} <= MAX_EDGE_UPSTREAMS)) \
+    || die "edge proxy requires one to ${MAX_EDGE_UPSTREAMS} private upstreams"
   for endpoint in "${endpoints[@]}"; do
     [[ -n "$endpoint" && "$endpoint" != *[[:space:]]* && "$endpoint" == *:* ]] \
       || die "edge upstreams must be comma-separated IPv4:port values"

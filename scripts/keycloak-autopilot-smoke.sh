@@ -680,6 +680,16 @@ grep -Fq 'ACTIVATION_READY_INTERVAL_SECONDS="3"' "$helper_contract" \
   || fail "helper activation readiness interval is not lease-safe"
 grep -Fq 'ACTIVATION_READY_REQUEST_TIMEOUT_SECONDS="2"' "$helper_contract" \
   || fail "helper activation readiness request is not lease-safe"
+five_edge_upstreams="10.250.0.1:18080,10.250.0.2:18080,10.250.0.3:18080,10.250.0.4:18080,10.250.0.5:18080"
+HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS="$five_edge_upstreams" \
+  bash -c 'source "$1" help >/dev/null; validate_edge_upstreams' \
+    _ "$helper_contract" \
+  || fail "helper rejects the five-replica Keycloak placement"
+if HETERONETWORK_KEYCLOAK_EDGE_UPSTREAMS="${five_edge_upstreams},10.250.0.6:18080" \
+  bash -c 'source "$1" help >/dev/null; validate_edge_upstreams' \
+    _ "$helper_contract" >/dev/null 2>&1; then
+  fail "helper accepts more Keycloak edge upstreams than the placement allows"
+fi
 grep -Fq 'readonly ACTIVATION_TIMEOUT_SECONDS="90"' "$autopilot" \
   || fail "autopilot activation window is not bounded"
 grep -Fq 'readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"' "$autopilot" \
