@@ -29,7 +29,13 @@ readonly -a NODE_NAMES=(
   uc-k8sv1
 )
 readonly -a DIRECT_NODE_NAMES=(ichikawap1 uc-k8s3p uc-k8sp1 uc-k8sp2)
-readonly -a DATABASE_NODE_NAMES=(uc-k8sp1 uc-k8sp2 uc-k8s3p mizuame-nucboxg5)
+readonly -a DATABASE_NODE_NAMES=(
+  ichikawap1
+  mizuame-nucboxg5
+  uc-k8s3p
+  uc-k8sp1
+  uc-k8sp2
+)
 
 declare -Ar VPN_ADDRESS=(
   [ichikawap1]="10.250.0.10"
