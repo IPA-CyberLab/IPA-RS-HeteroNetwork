@@ -37,6 +37,16 @@ readonly -a DATABASE_NODE_NAMES=(
   uc-k8sp2
   mizuame-nucboxg5
 )
+readonly -a RECOVERY_SCRIPT_NAMES=(
+  keycloak-autopilot.sh
+  keycloak-ha-node.sh
+  kubeadm-ha-autopilot.sh
+  kubeadm-ha-node.sh
+  postgres-ha-autopilot.sh
+  postgres-ha-node.sh
+  public-services-autopilot.sh
+  public-services-bootstrap.sh
+)
 
 declare -Ar VPN_ADDRESS=(
   [ichikawap1]="10.250.0.10"
@@ -201,7 +211,7 @@ validate_positive_integer recovery-timeout "$recovery_timeout_seconds"
 [[ -z "$resume_dir" || -z "$output_dir" ]] \
   || die "--resume and --output-dir cannot be used together"
 
-for command in ssh curl jq python3 base64 timeout; do
+for command in ssh curl jq python3 base64 diff sha256sum timeout; do
   command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
 done
 [[ -f "$ssh_key" ]] || die "SSH key does not exist: $ssh_key"
@@ -384,6 +394,32 @@ host_root_node() {
     return 0
   fi
   return 1
+}
+
+deployed_recovery_scripts_match() {
+  local expected="" remote="" node script_name digest remote_arguments=""
+  for script_name in "${RECOVERY_SCRIPT_NAMES[@]}"; do
+    digest="$(sha256sum "${SCRIPT_DIR}/${script_name}" | awk '{print $1}')" \
+      || return 1
+    expected+="${digest}  ${script_name}"$'\n'
+    printf -v remote_arguments '%s %q' "$remote_arguments" "$script_name"
+  done
+  expected="${expected%$'\n'}"
+
+  for node in "${NODE_NAMES[@]}"; do
+    remote="$(ssh_node "$node" \
+      "cd /opt/heteronetwork/libexec && sha256sum${remote_arguments}")" \
+      || {
+        log "recovery script hash query failed: node=$node"
+        return 1
+      }
+    if [[ "$remote" != "$expected" ]]; then
+      log "recovery script drift detected: node=$node"
+      diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$remote") \
+        | tee -a "$run_log" >&2 || true
+      return 1
+    fi
+  done
 }
 
 select_database_observer() {
@@ -972,6 +1008,8 @@ run_baseline() {
   [[ "$ready_count" == "${#NODE_NAMES[@]}" ]] \
     || die "baseline requires ${#NODE_NAMES[@]} Ready target nodes; found $ready_count"
   ((control_planes >= 5)) || die "baseline requires at least five Ready control planes; found $control_planes"
+  deployed_recovery_scripts_match \
+    || die "deployed recovery scripts do not match this checkout"
   api_ready "$observer" || die "Kubernetes /readyz failed"
   workloads="$(fetch_workloads_json "$observer")" || die "cannot query Kubernetes workloads"
   workloads_fully_ready "$workloads" || die "not all Deployments and StatefulSets are Ready"
