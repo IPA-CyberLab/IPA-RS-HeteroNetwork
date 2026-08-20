@@ -16327,7 +16327,20 @@ fn direct_path_endpoint_matches(
     telemetry: &WireGuardPeerTelemetry,
 ) -> bool {
     let expected_endpoint = candidate.addr.to_string();
-    telemetry.endpoint.as_deref() == Some(expected_endpoint.as_str())
+    let Some(observed_endpoint) = telemetry.endpoint.as_deref() else {
+        return false;
+    };
+    if observed_endpoint == expected_endpoint {
+        return true;
+    }
+
+    // A NAT may accept the advertised listener port but translate the source
+    // port on the authenticated WireGuard response. WireGuard then roams to
+    // that translated endpoint. The peer key authenticates the response, so a
+    // same-address port change is valid direct-path evidence.
+    observed_endpoint
+        .parse::<SocketAddr>()
+        .is_ok_and(|observed| observed.ip() == candidate.addr.ip())
 }
 
 fn direct_path_record_targets(
