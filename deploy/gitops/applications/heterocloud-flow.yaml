@@ -15,9 +15,8 @@ spec:
       releaseName: heterocloud-flow
       valueFiles:
         - ../../environments/heteronet/values.yaml
-      # Monitoring is isolated from the low-IOPS bootstrap control plane.
-      # Four host-network replicas with minAvailable=3 tolerate one complete
-      # monitoring-node failure without competing with etcd on uc-k8sp1.
+      # Monitoring is isolated from the low-IOPS control-plane members. Three
+      # host-network replicas retain one endpoint after any two node faults.
       values: |
         monitoring:
           prometheus:
@@ -28,9 +27,9 @@ spec:
               monitoring.heteronetwork.io/ha: "true"
       parameters:
         - name: monitoring.prometheus.replicaCount
-          value: "4"
+          value: "3"
         - name: monitoring.grafana.replicaCount
-          value: "4"
+          value: "3"
   destination:
     server: https://kubernetes.default.svc
     namespace: heterocloud-flow
