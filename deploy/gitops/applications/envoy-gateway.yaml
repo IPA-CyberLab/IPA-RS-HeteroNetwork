@@ -16,7 +16,7 @@ spec:
         crds:
           enabled: true
         deployment:
-          replicas: 3
+          replicas: 5
           pod:
             nodeSelector:
               node-role.kubernetes.io/control-plane: ""
@@ -24,6 +24,13 @@ spec:
               - key: node-role.kubernetes.io/control-plane
                 operator: Exists
                 effect: NoSchedule
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: envoy-gateway
+                    topologyKey: kubernetes.io/hostname
             topologySpreadConstraints:
               - maxSkew: 1
                 topologyKey: kubernetes.io/hostname
@@ -34,13 +41,13 @@ spec:
           envoyGateway:
             resources:
               requests:
-                cpu: 100m
-                memory: 256Mi
+                cpu: 25m
+                memory: 32Mi
               limits:
                 cpu: 1
                 memory: 1Gi
         podDisruptionBudget:
-          minAvailable: 2
+          minAvailable: 3
         config:
           envoyGateway:
             gateway:

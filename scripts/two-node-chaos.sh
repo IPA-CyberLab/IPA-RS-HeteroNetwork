@@ -972,14 +972,16 @@ flow_e2e_probe() {
   local destination="$2"
   local context
   context="$(flow_context)" || return 1
-  timeout 140 env \
+  # Public A records have a 60-second TTL. Keep retrying through one stale
+  # cache lifetime, but still require a real WebRTC connection to pass.
+  timeout 210 env \
     FLOW_CHAOS_CONTEXT="$context" \
     FLOW_CONTEXT_COMMAND='printf "%s" "$FLOW_CHAOS_CONTEXT"' \
     FLOW_DURATION_SECONDS=10 \
     FLOW_INTERVAL_SECONDS=5 \
-    FLOW_REQUEST_TIMEOUT_MS=20000 \
-    FLOW_CONNECTION_ATTEMPTS=3 \
-    FLOW_CONNECTION_RETRY_DELAY_MS=1000 \
+    FLOW_REQUEST_TIMEOUT_MS=10000 \
+    FLOW_CONNECTION_ATTEMPTS=8 \
+    FLOW_CONNECTION_RETRY_DELAY_MS=5000 \
     FLOW_ICE_TRANSPORT_POLICY="$mode" \
     PLAYWRIGHT_MODULE="$playwright_module" \
     node "$flow_repository/scripts/flow-e2e.mjs" >"$destination" 2>&1

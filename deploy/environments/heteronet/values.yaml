@@ -56,6 +56,10 @@ agent:
         10.250.0.8: [10.250.0.6, 10.250.0.5, 10.250.0.4]
 
 kubernetesPlugin:
+  controller:
+    # Remove failed public ingress addresses before the 60-second public DNS
+    # TTL expires so clients converge within one cache lifetime.
+    reconcileIntervalSeconds: 5
   nodeReporter:
     kubernetesServiceHost: k8s-api.heteronetwork.internal
     kubernetesServicePort: 7443
