@@ -925,7 +925,28 @@ select_discovered_control_plane_addresses() {
               vpn_ip: $node.vpn_ip,
               configured: ($configured | index($node.vpn_ip) != null)
             }
-        ]
+        ] as $observed
+      | (if ($observed | any(.vpn_ip == $local_node[0].vpn_ip))
+          or (($configured | index($local_node[0].vpn_ip)) == null) then
+          []
+        else
+          [
+            $observed
+            | group_by(.cohort)[]
+            | select(([
+                .[]
+                | select(.configured)
+                | .vpn_ip
+              ] | unique | length) >= 2)
+            | {
+                cohort: .[0].cohort,
+                vpn_ip: $local_node[0].vpn_ip,
+                configured: true
+              }
+          ]
+        end) as $inferred_local
+      | ($observed + $inferred_local) as $candidates
+      | $candidates
       | group_by(.cohort)
       | map({
           cohort: .[0].cohort,
@@ -947,9 +968,8 @@ select_discovered_control_plane_addresses() {
           error("ambiguous Kubernetes HA cohorts")
         end) as $selected
       | [
-          $nodes[]
-          | select(has_tag($generic_tag))
-          | select(any(.tags[]; . == $selected))
+          $candidates[]
+          | select(.cohort == $selected)
           | .vpn_ip
         ]
       | unique[]
