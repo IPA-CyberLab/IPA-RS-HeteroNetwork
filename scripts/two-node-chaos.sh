@@ -530,15 +530,23 @@ degraded_services_available() {
   root_node "$observer" 'expected_survivors='"$expected_survivors"'
 set -u
 status=0
+document="$(timeout 25 kubectl get deployments,statefulsets,daemonsets -A -o json)" || exit 1
 available() {
   namespace="$1"
   kind="$2"
   name="$3"
   minimum="$4"
-  value="$(kubectl -n "$namespace" get "$kind" "$name" -o jsonpath="{.status.availableReplicas}" 2>/dev/null || true)"
+  field=availableReplicas
   if [ "$kind" = statefulset ]; then
-    value="$(kubectl -n "$namespace" get "$kind" "$name" -o jsonpath="{.status.readyReplicas}" 2>/dev/null || true)"
+    field=readyReplicas
   fi
+  value="$(jq -r --arg namespace "$namespace" --arg kind "$kind" --arg name "$name" --arg field "$field" '\''
+    [.items[]
+      | select((.kind | ascii_downcase) == $kind)
+      | select(.metadata.namespace == $namespace and .metadata.name == $name)
+      | .status[$field] // 0
+    ][0] // 0
+  '\'' <<<"$document")"
   if [ "${value:-0}" -ge "$minimum" ]; then
     result=PASS
   else
@@ -551,7 +559,13 @@ daemon_available() {
   namespace="$1"
   name="$2"
   minimum="$3"
-  value="$(kubectl -n "$namespace" get daemonset "$name" -o jsonpath="{.status.numberReady}" 2>/dev/null || true)"
+  value="$(jq -r --arg namespace "$namespace" --arg name "$name" '\''
+    [.items[]
+      | select(.kind == "DaemonSet")
+      | select(.metadata.namespace == $namespace and .metadata.name == $name)
+      | .status.numberReady // 0
+    ][0] // 0
+  '\'' <<<"$document")"
   if [ "${value:-0}" -ge "$minimum" ]; then
     result=PASS
   else
@@ -574,6 +588,32 @@ daemon_available kube-system node-local-dns "$expected_survivors"
 daemon_available kube-system kubernetes-service-route "$expected_survivors"
 exit "$status"
 '
+}
+
+wait_for_degraded_kubernetes_services() {
+  local observer="$1"
+  local expected_survivors="$2"
+  local case_directory="$3"
+  local deadline=$((SECONDS + 180))
+  local attempt=0
+  while ((SECONDS < deadline)); do
+    attempt=$((attempt + 1))
+    if api_ready "$observer" >"$case_directory/kubernetes-api-attempt-${attempt}.log" 2>&1 \
+      && degraded_services_available "$observer" "$expected_survivors" \
+        >"$case_directory/kubernetes-services-attempt-${attempt}.log" 2>&1; then
+      cp "$case_directory/kubernetes-api-attempt-${attempt}.log" \
+        "$case_directory/kubernetes-api.log"
+      cp "$case_directory/kubernetes-services-attempt-${attempt}.log" \
+        "$case_directory/kubernetes-services.log"
+      return 0
+    fi
+    sleep 5
+  done
+  cp "$case_directory/kubernetes-api-attempt-${attempt}.log" \
+    "$case_directory/kubernetes-api.log" 2>/dev/null || true
+  cp "$case_directory/kubernetes-services-attempt-${attempt}.log" \
+    "$case_directory/kubernetes-services.log" 2>/dev/null || true
+  return 1
 }
 
 wait_for_fault_state() {
@@ -1032,12 +1072,14 @@ systemctl is-active --quiet '${unit}.timer'
 
 request_reboot_after_checks() {
   local node="$1"
+  local unit="$2"
   if [[ "$node" == "mizuame-nucboxg5" ]]; then
     log "node=$node has no independent management path; retaining the failsafe reboot timer"
     return 0
   fi
   log "node=$node: requesting reboot after degraded checks"
-  root_node "$node" '/usr/bin/systemctl reboot --force' >/dev/null 2>&1 || true
+  root_node "$node" "systemctl stop '${unit}.timer' '${unit}.service' >/dev/null 2>&1 || true
+/usr/bin/systemctl reboot --force" >/dev/null 2>&1 || true
 }
 
 run_baseline() {
@@ -1092,8 +1134,8 @@ run_pair() {
   local pair="$2"
   local first="${pair%%+*}"
   local second="${pair#*+}"
-  local observer case_directory unit_prefix started_at started_epoch duration recovery_deadline
-  local fault_observed kubernetes vpn pod_network patroni db_write oidc flow_api flow_normal flow_relay recovery
+  local observer case_directory unit_prefix started_at started_epoch duration recovery_deadline attempt
+  local fault_observed kubernetes kubernetes_services vpn pod_network patroni db_write oidc flow_api flow_normal flow_relay recovery
   local external_failures
 
   active_fault_a="$first"
@@ -1136,12 +1178,18 @@ run_pair() {
       survivors+=("$node")
     fi
   done
+  kubernetes_services="$(status_word wait_for_degraded_kubernetes_services \
+    "$observer" "${#survivors[@]}" "$case_directory")"
   vpn="$(status_word vpn_mesh "case-${order}-degraded" "${survivors[@]}")"
-  pod_network="$(status_word pod_network_mesh "case-${order}-degraded" "${survivors[@]}")"
-  if api_ready "$observer" >"$case_directory/kubernetes-api.log" 2>&1 \
-    && degraded_services_available "$observer" "${#survivors[@]}" \
-      >"$case_directory/kubernetes-services.log" 2>&1 \
-    && [[ "$pod_network" == PASS ]]; then
+  pod_network=FAIL
+  for attempt in 1 2; do
+    if pod_network_mesh "case-${order}-degraded-attempt-${attempt}" "${survivors[@]}"; then
+      pod_network=PASS
+      break
+    fi
+    sleep 10
+  done
+  if [[ "$kubernetes_services" == PASS && "$pod_network" == PASS ]]; then
     kubernetes=PASS
   else
     kubernetes=FAIL
@@ -1154,8 +1202,8 @@ run_pair() {
   flow_relay="$(status_word flow_e2e_probe relay "$case_directory/flow-relay.log")"
   log "case $order degraded: k8s=$kubernetes vpn=$vpn pod-network=$pod_network patroni=$patroni db-write=$db_write oidc=$oidc flow-api=$flow_api normal=$flow_normal relay=$flow_relay"
 
-  request_reboot_after_checks "$first"
-  request_reboot_after_checks "$second"
+  request_reboot_after_checks "$first" "${unit_prefix}-a"
+  request_reboot_after_checks "$second" "${unit_prefix}-b"
 
   recovery_deadline=$((SECONDS + recovery_timeout_seconds))
   if wait_for_full_recovery "$observer" "$recovery_deadline" \
