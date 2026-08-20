@@ -77,6 +77,10 @@ Commands:
   configure-api-ha       Reconcile API health checks and kubelet HA endpoint
   reconcile-kubelet-api  Route kubelet through the local HA API proxy
   reconcile-kubelet-dns  Limit kubelet's upstream resolver list to three stable entries
+  reconcile-kubelet-resources
+                         Reserve CPU and memory for Kubernetes and the host OS
+  reconcile-etcd-resources
+                         Reserve control-plane capacity for the local etcd member
   reconcile-api-host     Restore the local API hostname after cloud-init and before kubelet
   self-test              Run non-privileged renderer and validation checks
 
@@ -1475,13 +1479,56 @@ reconcile_kubelet_api_endpoint() {
 
 configure_kubelet() {
   reconcile_kubelet_resolver
-  printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s --max-pods=%s"\n' "$node_ip" "$node_name" "$max_pods" \
+  printf 'KUBELET_EXTRA_ARGS="--node-ip=%s --hostname-override=%s --max-pods=%s --kube-reserved=cpu=500m,memory=512Mi --system-reserved=cpu=500m,memory=512Mi"\n' \
+    "$node_ip" "$node_name" "$max_pods" \
     | install_from_stdin /etc/default/kubelet 0644
   install -d -o root -g root -m 0755 /etc/systemd/system/kubelet.service.d
   render_kubelet_dropin \
     | install_from_stdin /etc/systemd/system/kubelet.service.d/20-heteronetwork-underlay.conf 0644
   systemctl daemon-reload
   systemctl enable kubelet
+}
+
+reconcile_kubelet_resources() {
+  require_root
+  load_local_node_state
+  verify_interface_address
+  configure_kubelet
+  systemctl restart kubelet.service
+  systemctl is-active --quiet kubelet.service \
+    || die "kubelet did not remain active after reserving node resources"
+  printf 'kubelet resource reservations reconciled on %s\n' "$node_name"
+}
+
+reconcile_etcd_resources() {
+  require_root
+  load_local_node_state
+  validate_control_plane_config
+  local manifest=/etc/kubernetes/manifests/etcd.yaml
+  [[ -f "$manifest" && ! -L "$manifest" ]] \
+    || die "etcd static Pod manifest is missing or is a symlink"
+
+  local temporary mode
+  temporary="$(mktemp)"
+  if ! awk '
+    BEGIN { resources = 0; requests = 0; cpu = 0; memory = 0 }
+    /^    resources:$/ { resources++; in_resources = 1; print; next }
+    in_resources && /^      requests:$/ { requests++; in_requests = 1; print; next }
+    in_requests && /^        cpu:/ { cpu++; print "        cpu: 500m"; next }
+    in_requests && /^        memory:/ { memory++; print "        memory: 512Mi"; next }
+    in_resources && /^    [a-zA-Z]/ { in_resources = 0; in_requests = 0 }
+    { print }
+    END { if (resources != 1 || requests != 1 || cpu != 1 || memory != 1) exit 1 }
+  ' "$manifest" >"$temporary"; then
+    rm -f "$temporary"
+    die "failed to update etcd resource requests"
+  fi
+  if ! cmp -s "$temporary" "$manifest"; then
+    mode="$(stat -c '%a' "$manifest")"
+    install -o root -g root -m "$mode" "$temporary" "$manifest"
+  fi
+  rm -f "$temporary"
+  printf 'etcd resource reservations reconciled on %s\n' "$node_name"
 }
 
 configure_local_state() {
@@ -1677,13 +1724,30 @@ reconcile_discovered_control_plane_backends() {
 reconcile_container_runtime() {
   require_command ctr
   require_command timeout
+  local failure_file="$state_dir/containerd-health-failures"
   if systemctl is-active --quiet containerd.service \
-    && timeout --kill-after=2s 5s \
+    && timeout --kill-after=2s 15s \
       ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
+    rm -f "$failure_file"
     return
   fi
 
-  printf 'containerd is unresponsive on %s; restarting the runtime and kubelet\n' "$node_name" >&2
+  local failures=0
+  if [[ -f "$failure_file" && ! -L "$failure_file" ]]; then
+    read -r failures <"$failure_file" || failures=0
+  fi
+  [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+  failures=$((failures + 1))
+  printf '%s\n' "$failures" | install_from_stdin "$failure_file" 0600
+  if ((failures < 3)); then
+    printf 'containerd health probe failed on %s (%s/3); deferring recovery\n' \
+      "$node_name" "$failures" >&2
+    return
+  fi
+  rm -f "$failure_file"
+
+  printf 'containerd failed three health probes on %s; restarting the runtime and kubelet\n' \
+    "$node_name" >&2
   systemctl stop kubelet.service >/dev/null 2>&1 || true
   if ! timeout --kill-after=5s 30s systemctl restart containerd.service; then
     systemctl kill --kill-who=all --signal=KILL containerd.service >/dev/null 2>&1 || true
@@ -1693,8 +1757,8 @@ reconcile_container_runtime() {
   systemctl start kubelet.service
 
   local attempt
-  for ((attempt = 1; attempt <= 15; attempt++)); do
-    if timeout --kill-after=2s 5s \
+  for ((attempt = 1; attempt <= 6; attempt++)); do
+    if timeout --kill-after=2s 10s \
       ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
       return
     fi
@@ -2583,6 +2647,8 @@ case "$command" in
   configure-api-ha) configure_kubelet_api_ha ;;
   reconcile-kubelet-dns) require_root; reconcile_kubelet_resolver ;;
   reconcile-kubelet-api) require_root; reconcile_kubelet_api_endpoint ;;
+  reconcile-kubelet-resources) reconcile_kubelet_resources ;;
+  reconcile-etcd-resources) reconcile_etcd_resources ;;
   reconcile-api-host) require_root; configure_hosts_entry ;;
   verify-cluster) verify_cluster ;;
   self-test) self_test ;;
