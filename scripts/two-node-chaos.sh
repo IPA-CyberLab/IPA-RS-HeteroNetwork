@@ -1067,21 +1067,26 @@ fault_node() {
   local unit="$2"
   local fault_script encoded
   fault_script='set +e
-systemctl stop \
-  kubelet.service \
-  containerd.service \
-  heteronetwork-keycloak-backchannel.service \
-  heteronetwork-keycloak-edge-proxy.service \
-  heteronetwork-keycloak.service \
-  heteronetwork-db-proxy.service \
-  heteronetwork-db.service \
-  heteronetwork-db-dcs.service \
-  heteronetwork-control-plane.service \
-  heteronetwork-signal.service \
-  heteronetwork-stun.service \
-  heteronetwork-relay.service \
-  heteronetwork-gateway.service \
-  heteronetwork-agent.service >/dev/null 2>&1
+units=(
+  kubelet.service
+  containerd.service
+  heteronetwork-keycloak-backchannel.service
+  heteronetwork-keycloak-edge-proxy.service
+  heteronetwork-keycloak.service
+  heteronetwork-db-proxy.service
+  heteronetwork-db.service
+  heteronetwork-db-dcs.service
+  heteronetwork-control-plane.service
+  heteronetwork-signal.service
+  heteronetwork-stun.service
+  heteronetwork-relay.service
+  heteronetwork-gateway.service
+  heteronetwork-agent.service
+)
+# Autopilot timers must not undo the injected outage before it is observed.
+# Runtime masks disappear automatically when the failsafe reboot occurs.
+systemctl mask --runtime "${units[@]}" >/dev/null 2>&1
+systemctl stop "${units[@]}" >/dev/null 2>&1
 printf "FAULT_APPLIED\n"
 sync
 sleep 1

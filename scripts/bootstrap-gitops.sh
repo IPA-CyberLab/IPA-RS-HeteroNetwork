@@ -45,6 +45,12 @@ helm upgrade --install "${ARGOCD_RELEASE}" argo/argo-cd \
   --timeout "${TIMEOUT}" \
   --history-max 10
 
+# Keep Sentinel discovery available while every Redis replica is recovering.
+# The bundled redis-ha chart does not expose this Service field as a value.
+kubectl -n "${ARGOCD_NAMESPACE}" patch service "${ARGOCD_RELEASE}-redis-ha" \
+  --type=merge \
+  --patch '{"spec":{"publishNotReadyAddresses":true}}'
+
 kubectl apply --server-side --field-manager=heteronetwork-bootstrap \
   -f "${ROOT_DIR}/deploy/gitops/argocd-overlay-service.yaml" \
   -f "${ROOT_DIR}/deploy/gitops/project.yaml" \
