@@ -1160,6 +1160,16 @@ run_pair() {
     >>"$results_file"
   log "case $order pair=$pair complete: recovery=$recovery external-failed-samples=$external_failures duration=${duration}s"
   [[ "$recovery" == PASS ]] || die "pair $pair did not recover; stop before injecting another fault"
+  [[ "$fault_observed" == PASS \
+    && "$kubernetes" == PASS \
+    && "$vpn" == PASS \
+    && "$patroni" == PASS \
+    && "$db_write" == PASS \
+    && "$oidc" == PASS \
+    && "$flow_api" == PASS \
+    && "$flow_normal" == PASS \
+    && "$flow_relay" == PASS ]] \
+    || die "pair $pair lost continuity; stop before injecting another fault"
 }
 
 trap 'stop_external_monitor' EXIT
@@ -1194,8 +1204,16 @@ while IFS=$'\t' read -r order pair; do
     second="${pair_filter#*+}"
     [[ "$pair" == "$pair_filter" || "$pair" == "$second+$first" ]] || continue
   fi
-  if awk -F '\t' -v pair="$pair" 'NR > 1 && $2 == pair {recovery=$13} END {exit !(recovery == "PASS")}' "$results_file"; then
-    log "case $order pair=$pair already recovered; skipping"
+  if awk -F '\t' -v pair="$pair" '
+    NR > 1 && $2 == pair {
+      passed = 1
+      for (column = 4; column <= 13; column += 1) {
+        if ($column != "PASS") passed = 0
+      }
+    }
+    END {exit !passed}
+  ' "$results_file"; then
+    log "case $order pair=$pair already passed every continuity and recovery gate; skipping"
     continue
   fi
   run_pair "$order" "$pair"

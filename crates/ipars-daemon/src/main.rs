@@ -16508,6 +16508,30 @@ async fn negotiate_signal_paths(
                 }
             };
         let relay_candidates = selected_relay_candidates(&response);
+        if let Some(session) = active_relay_session(runtime, &peer.node_id).await {
+            let relay_is_still_eligible = relay_candidates
+                .iter()
+                .any(|candidate| candidate.node_id == session.relay_node);
+            if !relay_is_still_eligible {
+                tracing::warn!(
+                    peer = %peer.node_id,
+                    relay = %session.relay_node,
+                    "discarding relay session after its relay left the eligible directory"
+                );
+                remove_relay_session_for_peer(
+                    runtime,
+                    options.relay_forwarder_supervisor.as_ref(),
+                    &peer.node_id,
+                    None,
+                    "removed relay session after relay left the eligible directory",
+                )
+                .await;
+                runtime
+                    .remove_pending_direct_path_probe(&peer.node_id)
+                    .await;
+                runtime.clear_direct_path_probe_retry(&peer.node_id).await;
+            }
+        }
         let candidate_record = signal_path_record_with_local_candidates(
             response,
             chrono::Utc::now(),
