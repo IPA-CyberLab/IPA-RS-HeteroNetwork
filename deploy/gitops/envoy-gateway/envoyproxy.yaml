@@ -32,9 +32,9 @@ spec:
                   gateway.envoyproxy.io/owning-gateway-name: heterocloud-edge
         container:
           resources:
-              requests:
-                cpu: 25m
-                memory: 32Mi
+            requests:
+              cpu: 25m
+              memory: 32Mi
             limits:
               cpu: "2"
               memory: 1Gi
