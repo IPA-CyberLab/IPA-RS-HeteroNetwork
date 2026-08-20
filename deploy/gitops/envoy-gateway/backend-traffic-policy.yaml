@@ -11,6 +11,17 @@ spec:
     - group: gateway.networking.k8s.io
       kind: HTTPRoute
       name: heterocloud-health
+  # The TLS Backend resolves to a ClusterIP. During the node-not-ready grace
+  # period kube-proxy can still select a stale Pod endpoint, so force each
+  # failed connection/503 onto a fresh upstream connection until a surviving
+  # API replica is selected.
+  retry:
+    numRetries: 7
+    perRetry:
+      timeout: 3s
+  timeout:
+    http:
+      requestTimeout: 25s
   rateLimit:
     # This per-proxy limit remains active when the global Redis-backed
     # limiter is unavailable. The global rule below still provides the
