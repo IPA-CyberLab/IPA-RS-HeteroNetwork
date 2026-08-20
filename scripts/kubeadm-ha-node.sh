@@ -1641,10 +1641,14 @@ reconcile_discovered_control_plane_backends() {
 
   load_local_node_state
   verify_interface_address
-  local discovered existing_preferred
+  local discovered existing_preferred reconcile_remote_etcd=false
   existing_preferred="$preferred_control_plane"
   discovered="$(discover_control_plane_addresses)"
   control_plane_backends="$discovered"
+  if [[ -n "$apiserver_etcd_backends" ]]; then
+    apiserver_etcd_backends="$discovered"
+    reconcile_remote_etcd=true
+  fi
   if backend_addresses | grep -Fxq "$node_ip"; then
     preferred_control_plane="$node_ip"
   elif [[ -n "$existing_preferred" ]] \
@@ -1656,6 +1660,10 @@ reconcile_discovered_control_plane_backends() {
   validate_common_config
   configure_haproxy
   configure_local_state
+  if [[ "$reconcile_remote_etcd" == "true" \
+    && -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
+    reconcile_apiserver_etcd
+  fi
   printf 'discovered Kubernetes API backends reconciled for %s: %s\n' \
     "$node_name" "$control_plane_backends"
 }
