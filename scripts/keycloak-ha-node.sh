@@ -10,6 +10,9 @@ readonly DEFAULT_HTTP_PORT="18080"
 readonly DEFAULT_MANAGEMENT_PORT="19000"
 readonly DEFAULT_BACKCHANNEL_PORT="18080"
 readonly DEFAULT_EDGE_PORT="18079"
+readonly DEFAULT_DB_POOL_INITIAL_SIZE="2"
+readonly DEFAULT_DB_POOL_MIN_SIZE="2"
+readonly DEFAULT_DB_POOL_MAX_SIZE="12"
 readonly DEFAULT_DB_URL="jdbc:postgresql://postgres.heteronetwork.internal:25432/keycloak?sslmode=verify-full&sslrootcert=/etc/ssl/certs/heteronetwork-postgres-ha-ca.crt"
 readonly MAX_EDGE_UPSTREAMS="5"
 readonly MAX_SECRET_BYTES="4096"
@@ -22,6 +25,9 @@ archive="${HETERONETWORK_KEYCLOAK_ARCHIVE:-}"
 archive_url="${HETERONETWORK_KEYCLOAK_ARCHIVE_URL:-$DEFAULT_KEYCLOAK_ARCHIVE_URL}"
 cluster_bind_address="${HETERONETWORK_KEYCLOAK_CLUSTER_BIND_ADDRESS:-}"
 db_url="${HETERONETWORK_KEYCLOAK_DB_URL:-$DEFAULT_DB_URL}"
+db_pool_initial_size="${HETERONETWORK_KEYCLOAK_DB_POOL_INITIAL_SIZE:-$DEFAULT_DB_POOL_INITIAL_SIZE}"
+db_pool_min_size="${HETERONETWORK_KEYCLOAK_DB_POOL_MIN_SIZE:-$DEFAULT_DB_POOL_MIN_SIZE}"
+db_pool_max_size="${HETERONETWORK_KEYCLOAK_DB_POOL_MAX_SIZE:-$DEFAULT_DB_POOL_MAX_SIZE}"
 db_password_file="${HETERONETWORK_KEYCLOAK_DB_PASSWORD_FILE:-}"
 bootstrap_admin_password_file="${HETERONETWORK_KEYCLOAK_BOOTSTRAP_ADMIN_PASSWORD_FILE:-}"
 import_dir="${HETERONETWORK_KEYCLOAK_IMPORT_DIR:-}"
@@ -66,6 +72,9 @@ Optional environment:
   HETERONETWORK_KEYCLOAK_ARCHIVE_URL
   HETERONETWORK_KEYCLOAK_IMPORT_DIR
   HETERONETWORK_KEYCLOAK_DB_URL
+  HETERONETWORK_KEYCLOAK_DB_POOL_INITIAL_SIZE
+  HETERONETWORK_KEYCLOAK_DB_POOL_MIN_SIZE
+  HETERONETWORK_KEYCLOAK_DB_POOL_MAX_SIZE
   HETERONETWORK_KEYCLOAK_HTTP_PORT
   HETERONETWORK_KEYCLOAK_MANAGEMENT_PORT
   HETERONETWORK_KEYCLOAK_BACKCHANNEL_PORT
@@ -94,6 +103,18 @@ validate_port() {
   [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a TCP port"
   ((10#$value >= 1024 && 10#$value <= 65535)) \
     || die "$name is outside 1024-65535"
+}
+
+validate_db_pool_sizes() {
+  local value
+  for value in "$db_pool_initial_size" "$db_pool_min_size" "$db_pool_max_size"; do
+    [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 ]] \
+      || die "Keycloak database pool sizes must be positive integers"
+  done
+  ((10#$db_pool_initial_size <= 10#$db_pool_max_size)) \
+    || die "initial database pool size exceeds maximum"
+  ((10#$db_pool_min_size <= 10#$db_pool_max_size)) \
+    || die "minimum database pool size exceeds maximum"
 }
 
 validate_ipv4() {
@@ -532,6 +553,7 @@ configure_replica() {
   validate_private_ipv4 "$cluster_bind_address"
   validate_port "$http_port" "HETERONETWORK_KEYCLOAK_HTTP_PORT"
   validate_port "$management_port" "HETERONETWORK_KEYCLOAK_MANAGEMENT_PORT"
+  validate_db_pool_sizes
   [[ "$http_port" != "$management_port" ]] \
     || die "HTTP and management ports must differ"
   [[ "$db_url" == jdbc:postgresql://* ]] \
@@ -563,6 +585,9 @@ configure_replica() {
 db=postgres
 db-url=${db_url}
 db-username=keycloak
+db-pool-initial-size=${db_pool_initial_size}
+db-pool-min-size=${db_pool_min_size}
+db-pool-max-size=${db_pool_max_size}
 http-enabled=true
 http-host=127.0.0.1
 http-port=${http_port}
