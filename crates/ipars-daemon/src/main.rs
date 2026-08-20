@@ -16807,13 +16807,13 @@ async fn negotiate_signal_paths(
             .is_some_and(|probe| probe.is_active_at(direct_path_probe_now));
         let overlay_probe_required = options.direct_path_data_plane_probe.is_some();
         // Without an overlay probe, a newer handshake is usable only after the
-        // relay forwarder has been suspended. With an overlay probe, preserve
-        // the suspension after the direct endpoint is observed until the
-        // probe confirms or expires, so relay traffic cannot reset the probe.
+        // relay forwarder has been suspended. An overlay probe performs its
+        // measurement synchronously while forwarding is paused, so restore the
+        // relay immediately when that measurement does not promote the direct
+        // path. Keeping it paused until the probe timeout creates a data-plane
+        // outage while direct-path verification is backing off.
         let pause_relay_forwarding = if overlay_probe_required {
-            pending_direct_path_probe.as_ref().is_some_and(|probe| {
-                probe.is_active_at(direct_path_probe_now) && probe.relay_forwarder_suspended
-            })
+            false
         } else {
             pending_direct_path_probe.as_ref().is_some_and(|probe| {
                 probe.is_active_at(direct_path_probe_now)
