@@ -111,6 +111,17 @@ repoServer:
     metrics: 28084
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
+  startupProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 30
+    timeoutSeconds: 3
+  readinessProbe:
+    timeoutSeconds: 3
+  livenessProbe:
+    failureThreshold: 6
+    timeoutSeconds: 3
   pdb:
     enabled: true
     minAvailable: 2
