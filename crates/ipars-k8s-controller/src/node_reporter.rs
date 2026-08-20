@@ -12,7 +12,8 @@ use chrono::Utc;
 use ipars_agent::FileAgentStateStore;
 use ipars_k8s_controller::{
     locally_owned_public_ip, MANAGED_EXTERNAL_IP_ANNOTATION, NODE_ID_ANNOTATION,
-    PUBLIC_INGRESS_LABEL, PUBLIC_IP_ANNOTATION, VPN_IP_ANNOTATION,
+    PUBLIC_INGRESS_ENABLED_ANNOTATION, PUBLIC_INGRESS_LABEL, PUBLIC_IP_ANNOTATION,
+    VPN_IP_ANNOTATION,
 };
 use ipars_types::api::AgentStatusResponse;
 use ipars_types::EndpointCandidate;
@@ -315,7 +316,17 @@ async fn patch_metadata(
     let public_ip = public_ip.map(|value| value.to_string());
     let managed_external_ip = managed_external_ip.map(|value| value.to_string());
     let vpn_ip = snapshot.vpn_ip.map(|value| value.to_string());
-    let desired_public_label = if public_ip.is_some() { "true" } else { "false" };
+    let public_ingress_enabled = current
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(PUBLIC_INGRESS_ENABLED_ANNOTATION))
+        .is_none_or(|value| value != "false");
+    let desired_public_label = if public_ip.is_some() && public_ingress_enabled {
+        "true"
+    } else {
+        "false"
+    };
     if current
         .metadata
         .labels

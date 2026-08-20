@@ -121,6 +121,14 @@ carry `networking.heteronetwork.io/public-ingress: "true"` plus the
 eligible only while its node is Ready and the address is locally owned by that
 node.
 
+Nodes behind a partial DNAT or firewall can keep their discovered public IP
+without accepting arbitrary Kubernetes Service ports. Set
+`networking.heteronetwork.io/public-ingress-enabled: "false"` on such a Node.
+The reporter then publishes `public-ingress: "false"`, and the controller also
+enforces the annotation directly so existing assignments are withdrawn before
+the next five-minute full metadata reconciliation. Omitting the annotation is
+the default automatic behavior.
+
 The reporter exposes readiness only after both the local Agent status read and
 the Kubernetes Node reconciliation succeed. Controllers require the matching
 Agent DaemonSet Pod and the Kubernetes Node to be Ready before using its public

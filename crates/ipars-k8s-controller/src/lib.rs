@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const LOAD_BALANCER_CLASS: &str = "heteronetwork.io/public";
 pub const TRAFFIC_MODE_KEY: &str = "networking.heteronetwork.io/traffic-mode";
 pub const PUBLIC_INGRESS_LABEL: &str = "networking.heteronetwork.io/public-ingress";
+pub const PUBLIC_INGRESS_ENABLED_ANNOTATION: &str =
+    "networking.heteronetwork.io/public-ingress-enabled";
 pub const NODE_ID_ANNOTATION: &str = "networking.heteronetwork.io/node-id";
 pub const VPN_IP_ANNOTATION: &str = "networking.heteronetwork.io/vpn-ip";
 pub const PUBLIC_IP_ANNOTATION: &str = "networking.heteronetwork.io/public-ip";
@@ -279,6 +281,13 @@ pub fn public_nodes(nodes: &[Node], ready_agent_nodes: &BTreeSet<String>) -> Vec
                 .as_ref()
                 .and_then(|values| values.get(PUBLIC_INGRESS_LABEL))
                 .is_some_and(|value| value == "true")
+        })
+        .filter(|node| {
+            node.metadata
+                .annotations
+                .as_ref()
+                .and_then(|values| values.get(PUBLIC_INGRESS_ENABLED_ANNOTATION))
+                .is_none_or(|value| value != "false")
         })
         .filter_map(|node| {
             let annotations = node.metadata.annotations.as_ref()?;
@@ -890,6 +899,21 @@ mod tests {
         assert_eq!(selected[0].name, "public-a");
 
         assert!(public_nodes(std::slice::from_ref(&node), &BTreeSet::new()).is_empty());
+
+        let mut disabled = node.clone();
+        disabled
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                PUBLIC_INGRESS_ENABLED_ANNOTATION.to_string(),
+                "false".to_string(),
+            );
+        assert!(public_nodes(
+            std::slice::from_ref(&disabled),
+            &BTreeSet::from(["public-a".to_string()]),
+        )
+        .is_empty());
 
         let mut duplicate = node.clone();
         duplicate.metadata.name = Some("public-b".to_string());

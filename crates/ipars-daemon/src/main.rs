@@ -19568,7 +19568,7 @@ async fn record_conntrack_netlink_event_flows(
     let matched_count =
         record_packet_flow_observations(runtime, flows, pin, "conntrack-netlink-events").await;
     if matched_count > 0 {
-        tracing::info!(
+        tracing::debug!(
             matched = matched_count,
             reconciled,
             "recorded packet-flow lazy-connect activity from conntrack netlink events"
