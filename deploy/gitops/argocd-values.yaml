@@ -38,7 +38,8 @@ redis:
 
 redis-ha:
   enabled: true
-  replicas: 3
+  replicas: 5
+  podManagementPolicy: Parallel
   hardAntiAffinity: true
   nodeSelector:
     node-role.kubernetes.io/control-plane: ""
@@ -51,7 +52,9 @@ redis-ha:
   exporter:
     enabled: true
   podDisruptionBudget:
-    minAvailable: 2
+    minAvailable: 3
+  sentinel:
+    quorum: 3
   haproxy:
     enabled: true
     replicas: 3
