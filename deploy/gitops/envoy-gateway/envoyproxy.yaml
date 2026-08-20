@@ -12,6 +12,10 @@ spec:
         pod:
           nodeSelector:
             networking.heteronetwork.io/public-ingress: "true"
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
           affinity:
             podAntiAffinity:
               preferredDuringSchedulingIgnoredDuringExecution:
