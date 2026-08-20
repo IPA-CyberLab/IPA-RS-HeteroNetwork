@@ -397,7 +397,7 @@ ConditionPathExists=/etc/heteronetwork/kubernetes/node.env
 [Service]
 Type=oneshot
 ExecStart=/opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-discovered-control-plane-backends
-TimeoutStartSec=90s
+TimeoutStartSec=180s
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -1746,6 +1746,8 @@ reconcile_apiserver_etcd() {
     if curl --fail --silent --show-error \
       --connect-timeout 2 --max-time 5 \
       --cacert /etc/kubernetes/pki/ca.crt \
+      --cert /etc/kubernetes/pki/apiserver-kubelet-client.crt \
+      --key /etc/kubernetes/pki/apiserver-kubelet-client.key \
       "https://${node_ip}:6443/readyz" >/dev/null 2>&1; then
       printf 'API server etcd endpoints reconciled on %s\n' "$node_name"
       return
