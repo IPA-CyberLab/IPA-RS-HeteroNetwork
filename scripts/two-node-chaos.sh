@@ -30,6 +30,13 @@ readonly -a NODE_NAMES=(
   uc-k8sv1
 )
 readonly -a DIRECT_NODE_NAMES=(ichikawap1 uc-k8s3p uc-k8sp1 uc-k8sp2)
+readonly -a CONTROL_PLANE_NODE_NAMES=(
+  ichikawap1
+  uc-k8s3p
+  uc-k8sp1
+  uc-k8sp2
+  uc-k8sv1
+)
 readonly -a DATABASE_NODE_NAMES=(
   ichikawap1
   uc-k8s3p
@@ -417,6 +424,33 @@ deployed_recovery_scripts_match() {
       log "recovery script drift detected: node=$node"
       diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$remote") \
         | tee -a "$run_log" >&2 || true
+      return 1
+    fi
+  done
+}
+
+kubernetes_api_backends_ready() {
+  local expected="" node remote
+  for node in "${CONTROL_PLANE_NODE_NAMES[@]}"; do
+    expected+="${VPN_ADDRESS[$node]}"$'\n'
+  done
+  expected="$(LC_ALL=C sort -V -u <<<"$expected" | sed '/^$/d' | paste -sd, -)"
+
+  for node in "${NODE_NAMES[@]}"; do
+    remote="$(host_root_node "$node" 'set -eu
+systemctl is-enabled --quiet heteronetwork-kubeadm-backend-autopilot.timer
+systemctl is-active --quiet heteronetwork-kubeadm-backend-autopilot.timer
+systemctl start heteronetwork-kubeadm-backend-autopilot.service
+[ "$(systemctl show --property=Result --value heteronetwork-kubeadm-backend-autopilot.service)" = success ]
+config="$(awk '\''/^[[:space:]]+server control-plane-/ {split($3, endpoint, ":"); print endpoint[1]}'\'' /etc/heteronetwork/kubernetes/haproxy.cfg | LC_ALL=C sort -V -u | paste -sd, -)"
+. /etc/heteronetwork/kubernetes/node.env
+curl --fail --silent --show-error --insecure --connect-timeout 2 --max-time 5 https://127.0.0.1:7443/readyz >/dev/null
+printf "%s\t%s\n" "$config" "$HETERONETWORK_KUBEADM_CONTROL_PLANES"')" || {
+      log "Kubernetes API backend autopilot check failed: node=$node"
+      return 1
+    }
+    if [[ "$remote" != "$expected"$'\t'"$expected" ]]; then
+      log "Kubernetes API backend drift detected: node=$node expected=$expected actual=$remote"
       return 1
     fi
   done
@@ -1010,6 +1044,8 @@ run_baseline() {
   ((control_planes >= 5)) || die "baseline requires at least five Ready control planes; found $control_planes"
   deployed_recovery_scripts_match \
     || die "deployed recovery scripts do not match this checkout"
+  kubernetes_api_backends_ready \
+    || die "Kubernetes API backend autopilot is not converged on every node"
   api_ready "$observer" || die "Kubernetes /readyz failed"
   workloads="$(fetch_workloads_json "$observer")" || die "cannot query Kubernetes workloads"
   workloads_fully_ready "$workloads" || die "not all Deployments and StatefulSets are Ready"
@@ -1158,7 +1194,7 @@ while IFS=$'\t' read -r order pair; do
     second="${pair_filter#*+}"
     [[ "$pair" == "$pair_filter" || "$pair" == "$second+$first" ]] || continue
   fi
-  if awk -F '\t' -v pair="$pair" 'NR > 1 && $2 == pair && $13 == "PASS" {found=1} END {exit !found}' "$results_file"; then
+  if awk -F '\t' -v pair="$pair" 'NR > 1 && $2 == pair {recovery=$13} END {exit !(recovery == "PASS")}' "$results_file"; then
     log "case $order pair=$pair already recovered; skipping"
     continue
   fi
@@ -1166,11 +1202,22 @@ while IFS=$'\t' read -r order pair; do
 done <"$order_file"
 
 cleanup_database_probe
-continuity_failures="$(awk -F '\t' 'NR > 1 {
-  for (column = 4; column <= 12; column += 1) if ($column != "PASS") failures += 1
-} END {print failures + 0}' "$results_file")"
-recovery_failures="$(awk -F '\t' 'NR > 1 && $13 != "PASS" {failures += 1} END {print failures + 0}' "$results_file")"
-completed_cases="$(awk 'END {print NR - 1}' "$results_file")"
+read -r completed_cases continuity_failures recovery_failures < <(awk -F '\t' '
+  NR > 1 {
+    seen[$2] = 1
+    for (column = 4; column <= 13; column += 1) latest[$2, column] = $column
+  }
+  END {
+    for (pair in seen) {
+      completed += 1
+      for (column = 4; column <= 12; column += 1) {
+        if (latest[pair, column] != "PASS") continuity += 1
+      }
+      if (latest[pair, 13] != "PASS") recovery += 1
+    }
+    print completed + 0, continuity + 0, recovery + 0
+  }
+' "$results_file")
 log "matrix complete: cases=$completed_cases continuity-failures=$continuity_failures recovery-failures=$recovery_failures"
 ((recovery_failures == 0)) || exit 1
 ((continuity_failures == 0)) || exit 2
