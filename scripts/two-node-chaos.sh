@@ -12,7 +12,7 @@ resume_dir=""
 output_dir=""
 pair_filter=""
 seed="${HETERONETWORK_CHAOS_SEED:-$(date +%s)}"
-reboot_delay_seconds="${HETERONETWORK_CHAOS_REBOOT_DELAY_SECONDS:-180}"
+reboot_delay_seconds="${HETERONETWORK_CHAOS_REBOOT_DELAY_SECONDS:-600}"
 fault_observation_timeout_seconds="${HETERONETWORK_CHAOS_FAULT_OBSERVATION_TIMEOUT_SECONDS:-120}"
 recovery_timeout_seconds="${HETERONETWORK_CHAOS_RECOVERY_TIMEOUT_SECONDS:-900}"
 ssh_user="${HETERONETWORK_CHAOS_SSH_USER:-mizuame}"
@@ -98,7 +98,7 @@ Options:
   --seed INTEGER             Shuffle seed. Default: current Unix time.
   --output-dir DIR           New result directory.
   --resume DIR               Continue an existing result directory.
-  --reboot-delay SECONDS     Automatic reboot delay. Default: 180.
+  --reboot-delay SECONDS     Failsafe reboot delay. Default: 600.
   --fault-timeout SECONDS    Maximum wait for both nodes to become NotReady. Default: 120.
   --recovery-timeout SECONDS Maximum convergence wait per pair. Default: 900.
   -h, --help                 Show this help.
@@ -211,7 +211,7 @@ validate_positive_integer seed "$seed"
 validate_positive_integer reboot-delay "$reboot_delay_seconds"
 validate_positive_integer fault-timeout "$fault_observation_timeout_seconds"
 validate_positive_integer recovery-timeout "$recovery_timeout_seconds"
-((reboot_delay_seconds >= 90)) || die "reboot delay must be at least 90 seconds"
+((reboot_delay_seconds >= 300)) || die "reboot delay must be at least 300 seconds"
 ((fault_observation_timeout_seconds >= 60)) \
   || die "fault observation timeout must be at least 60 seconds"
 ((recovery_timeout_seconds >= 180)) || die "recovery timeout must be at least 180 seconds"
@@ -1030,6 +1030,16 @@ systemctl is-active --quiet '${unit}.timer'
 "
 }
 
+request_reboot_after_checks() {
+  local node="$1"
+  if [[ "$node" == "mizuame-nucboxg5" ]]; then
+    log "node=$node has no independent management path; retaining the failsafe reboot timer"
+    return 0
+  fi
+  log "node=$node: requesting reboot after degraded checks"
+  root_node "$node" '/usr/bin/systemctl reboot --force' >/dev/null 2>&1 || true
+}
+
 run_baseline() {
   local observer document workloads ready_count control_planes
   observer="$(select_jump)" || die "no direct observer is available"
@@ -1143,6 +1153,9 @@ run_pair() {
   flow_normal="$(status_word flow_e2e_probe all "$case_directory/flow-normal.log")"
   flow_relay="$(status_word flow_e2e_probe relay "$case_directory/flow-relay.log")"
   log "case $order degraded: k8s=$kubernetes vpn=$vpn pod-network=$pod_network patroni=$patroni db-write=$db_write oidc=$oidc flow-api=$flow_api normal=$flow_normal relay=$flow_relay"
+
+  request_reboot_after_checks "$first"
+  request_reboot_after_checks "$second"
 
   recovery_deadline=$((SECONDS + recovery_timeout_seconds))
   if wait_for_full_recovery "$observer" "$recovery_deadline" \

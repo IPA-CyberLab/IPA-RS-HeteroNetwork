@@ -16490,6 +16490,13 @@ async fn negotiate_signal_paths(
                 options.peer_probe_observation_max_age,
             )
             .await;
+        let failed_relay_node = path_observation.as_ref().and_then(|observation| {
+            (observation.selected_state == PathState::Relay
+                && observation.sample_count > 0
+                && observation.successful_sample_count == 0)
+                .then(|| observation.relay_node.clone())
+                .flatten()
+        });
         let request = authenticated_signal_path_request(
             &identity,
             signal_path_request(&status, &peer),
@@ -16507,7 +16514,18 @@ async fn negotiate_signal_paths(
                     continue;
                 }
             };
-        let relay_candidates = selected_relay_candidates(&response);
+        let mut relay_candidates = selected_relay_candidates(&response);
+        if let Some(failed_relay_node) = failed_relay_node.as_ref() {
+            let previous_count = relay_candidates.len();
+            relay_candidates.retain(|candidate| candidate.node_id != *failed_relay_node);
+            if relay_candidates.len() != previous_count {
+                tracing::warn!(
+                    peer = %peer.node_id,
+                    relay = %failed_relay_node,
+                    "excluding relay after an end-to-end peer probe failure"
+                );
+            }
+        }
         if let Some(session) = active_relay_session(runtime, &peer.node_id).await {
             let relay_is_still_eligible = relay_candidates
                 .iter()

@@ -2787,6 +2787,8 @@ impl AgentRuntime {
             .cloned();
         let observation =
             measurement.to_path_observation(&current_path, previous.as_ref(), observed_at)?;
+        let relay_path_failed = current_path.selected_state == PathState::Relay
+            && measurement.successful_sample_count() == 0;
         observation
             .metrics
             .validate()
@@ -2797,6 +2799,9 @@ impl AgentRuntime {
             .insert(target.peer.node_id.clone(), observation.clone());
         self.peer_probe_measurement_count
             .fetch_add(1, Ordering::Relaxed);
+        if relay_path_failed {
+            self.signal_path_notify.notify_one();
+        }
         Ok(Some(observation))
     }
 
