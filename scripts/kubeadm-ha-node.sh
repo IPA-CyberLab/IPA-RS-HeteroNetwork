@@ -407,7 +407,7 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
-ReadWritePaths=/etc/heteronetwork/kubernetes /etc/systemd/system
+ReadWritePaths=/etc/heteronetwork/kubernetes /etc/kubernetes/manifests /etc/systemd/system
 RestrictAddressFamilies=AF_INET AF_NETLINK AF_UNIX
 RestrictNamespaces=true
 RestrictRealtime=true
@@ -1655,10 +1655,10 @@ reconcile_discovered_control_plane_backends() {
     apiserver_etcd_backends="$discovered"
     reconcile_remote_etcd=true
   fi
-  if backend_addresses | grep -Fxq "$node_ip"; then
+  if backend_addresses | grep -Fx "$node_ip" >/dev/null; then
     preferred_control_plane="$node_ip"
   elif [[ -n "$existing_preferred" ]] \
-    && backend_addresses | grep -Fxq "$existing_preferred"; then
+    && backend_addresses | grep -Fx "$existing_preferred" >/dev/null; then
     preferred_control_plane="$existing_preferred"
   else
     preferred_control_plane="$(backend_addresses | sed -n '1p')"
