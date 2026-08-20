@@ -397,7 +397,7 @@ ConditionPathExists=/etc/heteronetwork/kubernetes/node.env
 [Service]
 Type=oneshot
 ExecStart=/opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-discovered-control-plane-backends
-TimeoutStartSec=30s
+TimeoutStartSec=90s
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -1641,11 +1641,17 @@ reconcile_discovered_control_plane_backends() {
 
   load_local_node_state
   verify_interface_address
+  systemctl is-active --quiet heteronetwork-agent.service \
+    || die "HeteroNetwork Agent is inactive"
+  reconcile_container_runtime
   local discovered existing_preferred reconcile_remote_etcd=false
   existing_preferred="$preferred_control_plane"
   discovered="$(discover_control_plane_addresses)"
   control_plane_backends="$discovered"
-  if [[ -n "$apiserver_etcd_backends" ]]; then
+  if [[ -n "$apiserver_etcd_backends" ]] \
+    || { [[ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]] \
+      && ! grep -Eq '^    - --etcd-servers=https://127\.0\.0\.1:2379$' \
+        /etc/kubernetes/manifests/kube-apiserver.yaml; }; then
     apiserver_etcd_backends="$discovered"
     reconcile_remote_etcd=true
   fi
@@ -1666,6 +1672,35 @@ reconcile_discovered_control_plane_backends() {
   fi
   printf 'discovered Kubernetes API backends reconciled for %s: %s\n' \
     "$node_name" "$control_plane_backends"
+}
+
+reconcile_container_runtime() {
+  require_command ctr
+  require_command timeout
+  if systemctl is-active --quiet containerd.service \
+    && timeout --kill-after=2s 5s \
+      ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
+    return
+  fi
+
+  printf 'containerd is unresponsive on %s; restarting the runtime and kubelet\n' "$node_name" >&2
+  systemctl stop kubelet.service >/dev/null 2>&1 || true
+  if ! timeout --kill-after=5s 30s systemctl restart containerd.service; then
+    systemctl kill --kill-who=all --signal=KILL containerd.service >/dev/null 2>&1 || true
+    systemctl reset-failed containerd.service >/dev/null 2>&1 || true
+    systemctl start containerd.service
+  fi
+  systemctl start kubelet.service
+
+  local attempt
+  for ((attempt = 1; attempt <= 15; attempt++)); do
+    if timeout --kill-after=2s 5s \
+      ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
+      return
+    fi
+    sleep 2
+  done
+  die "containerd remained unresponsive after automatic recovery"
 }
 
 install_api_backend_autopilot_command() {
