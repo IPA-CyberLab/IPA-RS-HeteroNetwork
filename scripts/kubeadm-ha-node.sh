@@ -343,11 +343,12 @@ frontend kubernetes_api
     default_backend kubernetes_control_planes
 
 backend kubernetes_control_planes
+    balance leastconn
     option httpchk GET /readyz
     http-check expect status 200
     default-server check check-ssl verify none inter 2s fastinter 1s downinter 2s fall 2 rise 2 on-marked-down shutdown-sessions
 EOF
-  local backend backup preferred_backend
+  local backend server_options preferred_backend
   if [[ -n "$preferred_control_plane" ]]; then
     preferred_backend="$preferred_control_plane"
   elif node_is_control_plane_backend; then
@@ -358,9 +359,9 @@ EOF
   local index=0
   while IFS= read -r backend; do
     index=$((index + 1))
-    backup=""
-    [[ "$backend" == "$preferred_backend" ]] || backup=" backup"
-    printf '    server control-plane-%d %s:6443%s\n' "$index" "$backend" "$backup"
+    server_options=""
+    [[ "$backend" == "$preferred_backend" ]] && server_options=" weight 2"
+    printf '    server control-plane-%d %s:6443%s\n' "$index" "$backend" "$server_options"
   done < <(backend_addresses)
 }
 
@@ -2310,13 +2311,14 @@ self_test() {
   grep -Fq 'bind 127.0.0.1:7443' <<<"$rendered"
   grep -Fq 'option dontlog-normal' <<<"$rendered"
   grep -Fq 'option redispatch' <<<"$rendered"
+  grep -Fq 'balance leastconn' <<<"$rendered"
   grep -Fq 'option httpchk GET /readyz' <<<"$rendered"
   grep -Fq 'http-check expect status 200' <<<"$rendered"
   grep -Fq 'default-server check check-ssl verify none' <<<"$rendered"
   preferred_control_plane="10.250.0.3"
   rendered="$(render_haproxy_config)"
-  grep -Fxq '    server control-plane-3 10.250.0.3:6443' <<<"$rendered"
-  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  grep -Fxq '    server control-plane-3 10.250.0.3:6443 weight 2' <<<"$rendered"
+  ! grep -q ' backup$' <<<"$rendered"
   preferred_control_plane=""
   rendered="$(render_haproxy_config)"
   grep -Fq 'retries 2' <<<"$rendered"
@@ -2327,13 +2329,13 @@ self_test() {
   grep -Fq 'default-server check check-ssl verify none' <<<"$rendered"
   grep -Fq 'fall 2 rise 2 on-marked-down shutdown-sessions' <<<"$rendered"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "3" ]]
-  grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
-  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  grep -Fxq '    server control-plane-2 10.250.0.2:6443 weight 2' <<<"$rendered"
+  ! grep -q ' backup$' <<<"$rendered"
   control_plane_backends="10.250.0.1,10.250.0.2,10.250.0.3,10.250.0.4,10.250.0.5"
   rendered="$(render_haproxy_config)"
   [[ "$(grep -c '^    server control-plane-' <<<"$rendered")" == "5" ]]
-  grep -Fxq '    server control-plane-2 10.250.0.2:6443' <<<"$rendered"
-  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "4" ]]
+  grep -Fxq '    server control-plane-2 10.250.0.2:6443 weight 2' <<<"$rendered"
+  ! grep -q ' backup$' <<<"$rendered"
   discovery_peers="$(mktemp)"
   discovery_local="$(mktemp)"
   jq -n \
@@ -2476,8 +2478,8 @@ self_test() {
     die "worker enrollment accepted a different HeteroNetwork VPN IP"
   fi
   rendered="$(render_haproxy_config)"
-  grep -Fxq '    server control-plane-1 10.250.0.1:6443' <<<"$rendered"
-  [[ "$(grep -c '^    server control-plane-.* backup$' <<<"$rendered")" == "2" ]]
+  grep -Fxq '    server control-plane-1 10.250.0.1:6443 weight 2' <<<"$rendered"
+  ! grep -q ' backup$' <<<"$rendered"
   if (render_worker_join_config "$bundle" >/dev/null 2>&1); then
     die "worker join accepted a control-plane join bundle"
   fi
