@@ -1076,8 +1076,10 @@ fi
 fault_node() {
   local node="$1"
   local unit="$2"
-  local fault_script encoded
-  fault_script='set +e
+  local fault_script encoded script_path marker_path verification
+  script_path="/run/${unit}.sh"
+  marker_path="/run/${unit}.applied"
+  fault_script='set -u
 units=(
   kubelet.service
   containerd.service
@@ -1096,19 +1098,52 @@ units=(
 )
 # Autopilot timers must not undo the injected outage before it is observed.
 # Runtime masks disappear automatically when the failsafe reboot occurs.
-systemctl mask --runtime "${units[@]}" >/dev/null 2>&1
-systemctl stop "${units[@]}" >/dev/null 2>&1
-printf "FAULT_APPLIED\n"
+systemctl mask --runtime "${units[@]}" >/dev/null 2>&1 || exit 20
+systemctl stop "${units[@]}" >/dev/null 2>&1 || true
+deadline=$((SECONDS + 90))
+while ((SECONDS < deadline)); do
+  active=false
+  for service in "${units[@]}"; do
+    if systemctl is-active --quiet "$service"; then
+      active=true
+      break
+    fi
+  done
+  [[ "$active" == false ]] && break
+  sleep 1
+done
+for service in "${units[@]}"; do
+  systemctl is-active --quiet "$service" && exit 21
+done
+printf "FAULT_APPLIED\n" >"$1" || exit 22
 sync
 sleep 1
 ip link set dev heteronetwork0 down >/dev/null 2>&1
 exit 0
 '
   encoded="$(printf '%s' "$fault_script" | base64 -w0)"
+  verification=""
+  if [[ -n "${MANAGEMENT_ADDRESS[$node]}" ]]; then
+    verification="
+deadline=\$((SECONDS + 120))
+while ((SECONDS < deadline)); do
+  if grep -qx FAULT_APPLIED '$marker_path' 2>/dev/null; then
+    exit 0
+  fi
+  sleep 1
+done
+systemctl status '${unit}.timer' '${unit}.service' --no-pager >&2 || true
+journalctl -u '${unit}.service' --no-pager -n 100 >&2 || true
+exit 1"
+  fi
   host_root_node "$node" "set -eu
 systemctl stop '${unit}.timer' '${unit}.service' >/dev/null 2>&1 || true
-systemd-run --quiet --unit='$unit' --on-active=5s --timer-property=AccuracySec=1s /bin/bash -c \"\$(printf '%s' '$encoded' | base64 -d)\"
+rm -f '$script_path' '$marker_path'
+printf '%s' '$encoded' | base64 -d >'$script_path'
+chmod 700 '$script_path'
+systemd-run --quiet --unit='$unit' --on-active=5s --timer-property=AccuracySec=1s /bin/bash '$script_path' '$marker_path'
 systemctl is-active --quiet '${unit}.timer'
+$verification
 "
 }
 
@@ -1206,15 +1241,41 @@ run_pair() {
   local first_pid="$!"
   fault_node "$second" "${unit_prefix}-fault-b" >"$case_directory/fault-${second}.log" 2>&1 &
   local second_pid="$!"
-  wait "$first_pid" 2>/dev/null || true
-  wait "$second_pid" 2>/dev/null || true
+  local first_fault_status=0
+  local second_fault_status=0
+  wait "$first_pid" 2>/dev/null || first_fault_status="$?"
+  wait "$second_pid" 2>/dev/null || second_fault_status="$?"
 
-  if wait_for_fault_state "$observer" "$first" "$second"; then
+  if ((first_fault_status == 0 && second_fault_status == 0)) \
+    && wait_for_fault_state "$observer" "$first" "$second"; then
     fault_observed=PASS
   else
     fault_observed=FAIL
   fi
   log "case $order pair=$pair: simultaneous NotReady observation=$fault_observed"
+
+  if [[ "$fault_observed" != PASS ]]; then
+    log "case $order pair=$pair: fault injection was incomplete; recovering before continuity checks"
+    request_reboot_after_checks "$first" "${unit_prefix}-a"
+    request_reboot_after_checks "$second" "${unit_prefix}-b"
+    recovery_deadline=$((SECONDS + recovery_timeout_seconds))
+    if wait_for_full_recovery "$observer" "$recovery_deadline" \
+      && wait_for_data_plane_recovery "case-${order}-injection-failed-recovered" "$recovery_deadline"; then
+      recovery=PASS
+    else
+      recovery=FAIL
+    fi
+    stop_external_monitor
+    external_failures="$(external_failure_count "$case_directory/external.tsv")"
+    duration=$(($(date +%s) - started_epoch))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$order" "$pair" "$started_at" "$fault_observed" NOT_RUN NOT_RUN NOT_RUN NOT_RUN \
+      NOT_RUN NOT_RUN NOT_RUN NOT_RUN "$recovery" "$external_failures" "$duration" \
+      >>"$results_file"
+    [[ "$recovery" == PASS ]] \
+      || die "pair $pair did not recover after incomplete fault injection"
+    die "pair $pair fault injection was incomplete; stop before continuity checks"
+  fi
 
   local -a survivors=()
   local node
