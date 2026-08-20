@@ -22,6 +22,8 @@ readonly KUBERNETES_CONTROL_PLANE_TAG="kubernetes-control-plane"
 readonly KUBERNETES_HA_TAG_PREFIX="kubernetes-ha-"
 readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
 readonly NODE_MONITOR_GRACE_PERIOD="20s"
+readonly ETCD_HEARTBEAT_INTERVAL_MILLISECONDS="500"
+readonly ETCD_ELECTION_TIMEOUT_MILLISECONDS="5000"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
 readonly MIN_IPV4_MTU="576"
@@ -714,6 +716,11 @@ controllerManager:
 etcd:
   local:
     dataDir: "/var/lib/etcd"
+    extraArgs:
+    - name: "heartbeat-interval"
+      value: "${ETCD_HEARTBEAT_INTERVAL_MILLISECONDS}"
+    - name: "election-timeout"
+      value: "${ETCD_ELECTION_TIMEOUT_MILLISECONDS}"
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -1510,18 +1517,31 @@ reconcile_etcd_resources() {
 
   local temporary mode
   temporary="$(mktemp)"
-  if ! awk '
-    BEGIN { resources = 0; requests = 0; cpu = 0; memory = 0 }
+  if ! awk \
+    -v heartbeat="$ETCD_HEARTBEAT_INTERVAL_MILLISECONDS" \
+    -v election="$ETCD_ELECTION_TIMEOUT_MILLISECONDS" '
+    BEGIN { resources = 0; requests = 0; cpu = 0; memory = 0; peer_urls = 0 }
+    /^    - --heartbeat-interval=/ { next }
+    /^    - --election-timeout=/ { next }
+    /^    - --initial-advertise-peer-urls=/ {
+      peer_urls++
+      print "    - --heartbeat-interval=" heartbeat
+      print "    - --election-timeout=" election
+      print
+      next
+    }
     /^    resources:$/ { resources++; in_resources = 1; print; next }
     in_resources && /^      requests:$/ { requests++; in_requests = 1; print; next }
     in_requests && /^        cpu:/ { cpu++; print "        cpu: 500m"; next }
     in_requests && /^        memory:/ { memory++; print "        memory: 512Mi"; next }
     in_resources && /^    [a-zA-Z]/ { in_resources = 0; in_requests = 0 }
     { print }
-    END { if (resources != 1 || requests != 1 || cpu != 1 || memory != 1) exit 1 }
+    END {
+      if (resources != 1 || requests != 1 || cpu != 1 || memory != 1 || peer_urls != 1) exit 1
+    }
   ' "$manifest" >"$temporary"; then
     rm -f "$temporary"
-    die "failed to update etcd resource requests"
+    die "failed to update etcd static Pod settings"
   fi
   if ! cmp -s "$temporary" "$manifest"; then
     mode="$(stat -c '%a' "$manifest")"
@@ -2528,6 +2548,8 @@ self_test() {
   grep -Fq 'advertiseAddress: "10.250.0.2"' <<<"$rendered"
   grep -Fq 'swapBehavior: NoSwap' <<<"$rendered"
   grep -Fq 'value: "20s"' <<<"$rendered"
+  grep -Fq 'value: "500"' <<<"$rendered"
+  grep -Fq 'value: "5000"' <<<"$rendered"
   rendered="$(render_containerd_apparmor_profile)"
   grep -Fq 'abi <abi/3.0>,' <<<"$rendered"
   grep -Fq 'profile cri-containerd.apparmor.d flags=(attach_disconnected,mediate_deleted)' <<<"$rendered"
