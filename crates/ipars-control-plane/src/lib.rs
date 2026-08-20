@@ -4356,10 +4356,19 @@ where
             .filter(|node| node.cluster_id == self.config.cluster_id)
             .map(|node| (node.node_id.clone(), node))
             .collect::<BTreeMap<_, _>>();
+        let health_by_id = self.store.get_health_by_node_ids(&peer_ids).await?;
         let mut intents = paths
             .into_iter()
             .filter_map(|(path, observed_at)| {
                 let peer = peers_by_id.get(&path.key.local)?;
+                if !overlay_node_health_allows(
+                    peer,
+                    health_by_id.get(&peer.node_id),
+                    now,
+                    policy.relay_health_ttl_seconds,
+                ) {
+                    return None;
+                }
                 acl_filter_peer(&target, peer, &policy).map(|visible| PeerConnectionIntent {
                     peer: visible.node_id,
                     peer_vpn_ip: visible.vpn_ip,

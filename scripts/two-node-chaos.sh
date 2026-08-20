@@ -1036,6 +1036,32 @@ systemctl is-active --quiet '${unit}.timer'
 "
 }
 
+disarm_reboot() {
+  local node="$1"
+  local unit="$2"
+  host_root_node "$node" "set -eu
+systemctl stop '${unit}.timer' '${unit}.service' >/dev/null 2>&1 || true
+systemctl reset-failed '${unit}.timer' '${unit}.service' >/dev/null 2>&1 || true
+! systemctl is-active --quiet '${unit}.timer'
+"
+}
+
+cleanup_stale_chaos_units() {
+  local node
+  for node in "${NODE_NAMES[@]}"; do
+    host_root_node "$node" 'set -eu
+mapfile -t units < <(systemctl list-units --all --plain --no-legend "hn-chaos-*.timer" "hn-chaos-*.service" | awk '\''{print $1}'\'')
+if ((${#units[@]} > 0)); then
+  systemctl stop "${units[@]}" >/dev/null 2>&1 || true
+  systemctl reset-failed "${units[@]}" >/dev/null 2>&1 || true
+fi
+' || {
+      log "failed to remove stale chaos recovery timers: node=$node"
+      return 1
+    }
+  done
+}
+
 fault_node() {
   local node="$1"
   local unit="$2"
@@ -1087,6 +1113,8 @@ run_baseline() {
   observer="$(select_jump)" || die "no direct observer is available"
   active_jump="$observer"
   log "baseline observer=$observer"
+  cleanup_stale_chaos_units \
+    || die "failed to remove stale chaos timers before baseline"
   document="$(fetch_nodes_json "$observer")" || die "cannot query Kubernetes nodes"
   ready_count="$(target_ready_count "$document")"
   control_planes="$(control_plane_ready_count "$document")"
@@ -1137,6 +1165,7 @@ run_pair() {
   local observer case_directory unit_prefix started_at started_epoch duration recovery_deadline attempt
   local fault_observed kubernetes kubernetes_services vpn pod_network patroni db_write oidc flow_api flow_normal flow_relay recovery
   local external_failures
+  local disarm_failed
 
   active_fault_a="$first"
   active_fault_b="$second"
@@ -1211,6 +1240,17 @@ run_pair() {
     recovery=PASS
   else
     recovery=FAIL
+  fi
+  if [[ "$recovery" == PASS ]]; then
+    disarm_failed=false
+    disarm_reboot "$first" "${unit_prefix}-a" \
+      >"$case_directory/disarm-${first}.log" 2>&1 || disarm_failed=true
+    disarm_reboot "$second" "${unit_prefix}-b" \
+      >"$case_directory/disarm-${second}.log" 2>&1 || disarm_failed=true
+    if [[ "$disarm_failed" == true ]]; then
+      log "case $order pair=$pair: failed to disarm an automatic recovery timer"
+      recovery=FAIL
+    fi
   fi
   stop_external_monitor
   external_failures="$(external_failure_count "$case_directory/external.tsv")"

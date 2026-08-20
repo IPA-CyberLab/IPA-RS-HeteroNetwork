@@ -15620,9 +15620,10 @@ async fn run_signal_registration_loop(
     relay_capability_reporter: Option<RelayCapabilityReporter>,
 ) {
     loop {
+        let cycle_started = Instant::now();
         let relay_capability =
             heartbeat_relay_capability(&client, relay_capability_reporter.as_ref()).await;
-        let request = match signal_node_upsert_request(
+        match signal_node_upsert_request(
             runtime.as_ref(),
             &identity,
             node.clone(),
@@ -15630,34 +15631,37 @@ async fn run_signal_registration_loop(
         )
         .await
         {
-            Ok(request) => request,
+            Ok(request) => {
+                let active_signal_urls = match runtime_signal_urls(runtime.as_ref(), &signal_urls) {
+                    Ok(urls) => urls,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to resolve current signal directory");
+                        signal_urls.clone()
+                    }
+                };
+                match send_signal_node_upsert_to_signal_services(
+                    &client,
+                    &active_signal_urls,
+                    request,
+                )
+                .await
+                {
+                    Ok(successes) => tracing::info!(
+                        node_id = %node.node_id,
+                        signal_services = successes,
+                        "registered agent node with signal services"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "failed to register agent node with signal service; will retry"
+                    ),
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, "failed to sign signal node upsert; will retry");
-                tokio::time::sleep(interval).await;
-                continue;
             }
-        };
-        let active_signal_urls = match runtime_signal_urls(runtime.as_ref(), &signal_urls) {
-            Ok(urls) => urls,
-            Err(error) => {
-                tracing::warn!(%error, "failed to resolve current signal directory");
-                signal_urls.clone()
-            }
-        };
-        match send_signal_node_upsert_to_signal_services(&client, &active_signal_urls, request)
-            .await
-        {
-            Ok(successes) => tracing::info!(
-                node_id = %node.node_id,
-                signal_services = successes,
-                "registered agent node with signal services"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                "failed to register agent node with signal service; will retry"
-            ),
         }
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(interval.saturating_sub(cycle_started.elapsed())).await;
     }
 }
 
@@ -15668,12 +15672,25 @@ async fn send_signal_node_upsert_to_signal_services(
 ) -> anyhow::Result<usize> {
     let mut successes = 0_usize;
     let mut errors = Vec::new();
-    for signal_url in signal_urls {
-        match send_signal_node_upsert(client, signal_url, request.clone()).await {
+    let concurrency = signal_urls.len().max(1);
+    let results = stream::iter(signal_urls.iter().cloned())
+        .map(|signal_url| {
+            let client = client.clone();
+            let request = request.clone();
+            async move {
+                let result = send_signal_node_upsert(&client, &signal_url, request).await;
+                (signal_url, result)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    for (signal_url, result) in results {
+        match result {
             Ok(response) => {
                 successes += 1;
                 tracing::debug!(
-                    signal_url,
+                    %signal_url,
                     node_id = %response.node.node_id,
                     "registered agent node with signal service"
                 );
@@ -16510,6 +16527,25 @@ async fn negotiate_signal_paths(
                 .then(|| observation.relay_node.clone())
                 .flatten()
         });
+        if let Some(failed_relay_node) = failed_relay_node.as_ref() {
+            let failed_session_is_active = active_relay_session(runtime, &peer.node_id)
+                .await
+                .is_some_and(|session| session.relay_node == *failed_relay_node);
+            if failed_session_is_active {
+                remove_relay_session_for_peer(
+                    runtime,
+                    options.relay_forwarder_supervisor.as_ref(),
+                    &peer.node_id,
+                    Some(PathState::Unreachable),
+                    "removed failed relay session before signal renegotiation",
+                )
+                .await;
+                runtime
+                    .remove_pending_direct_path_probe(&peer.node_id)
+                    .await;
+                runtime.clear_direct_path_probe_retry(&peer.node_id).await;
+            }
+        }
         let request = authenticated_signal_path_request(
             &identity,
             signal_path_request(&status, &peer),
