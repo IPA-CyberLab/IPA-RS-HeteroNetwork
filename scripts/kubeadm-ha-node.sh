@@ -1752,6 +1752,18 @@ reconcile_container_runtime() {
     return
   fi
 
+  # Slow control-plane disks can keep containerd's CRI busy while it restores
+  # static Pods after boot. systemd already retries a failed startup; restarting
+  # a merely busy runtime here discards that progress and extends recovery.
+  local uptime_seconds
+  uptime_seconds="$(cut -d. -f1 /proc/uptime)"
+  if [[ "$uptime_seconds" =~ ^[0-9]+$ ]] && ((uptime_seconds < 600)); then
+    rm -f "$failure_file"
+    printf 'containerd health probe deferred during boot recovery on %s (%ss/600s)\n' \
+      "$node_name" "$uptime_seconds" >&2
+    return
+  fi
+
   local failures=0
   if [[ -f "$failure_file" && ! -L "$failure_file" ]]; then
     read -r failures <"$failure_file" || failures=0

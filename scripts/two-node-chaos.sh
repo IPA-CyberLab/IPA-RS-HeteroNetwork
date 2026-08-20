@@ -793,12 +793,21 @@ exit \"\$status\"
 keycloak_oidc_probe() {
   local observer="$1"
   local internal='http://console.heteronetwork.internal:18079/realms/heteronetwork/.well-known/openid-configuration'
-  ssh_node "$observer" "curl -fsS --max-time 15 '$internal' | jq -e '.issuer | contains(\"/realms/heteronetwork\")' >/dev/null" \
-    || return 1
-  local code
-  code="$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' \
-    'https://heterocloud.mizuame.app/api/v1/auth/oidc/start' || true)"
-  [[ "$code" =~ ^30[12378]$ ]]
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if ssh_node "$observer" \
+      "curl -fsS --max-time 10 '$internal' | jq -e '.issuer | contains(\"/realms/heteronetwork\")' >/dev/null"; then
+      break
+    fi
+    ((attempt < 5)) || return 1
+    sleep 2
+  done
+
+  # Public records use a 60-second TTL. A resolver may retain the address of a
+  # failed ingress node until that TTL expires, so require a successful OIDC
+  # redirect after retrying through one complete cache lifetime.
+  baseline_endpoint_available redirect \
+    'https://heterocloud.mizuame.app/api/v1/auth/oidc/start'
 }
 
 external_baseline_probe() {
