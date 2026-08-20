@@ -29,7 +29,7 @@ spec:
                 requiredDuringSchedulingIgnoredDuringExecution:
                   - labelSelector:
                       matchLabels:
-                        app.kubernetes.io/name: envoy-gateway
+                        control-plane: envoy-gateway
                     topologyKey: kubernetes.io/hostname
             topologySpreadConstraints:
               - maxSkew: 1
@@ -37,7 +37,7 @@ spec:
                 whenUnsatisfiable: DoNotSchedule
                 labelSelector:
                   matchLabels:
-                    app.kubernetes.io/name: envoy-gateway
+                    control-plane: envoy-gateway
           envoyGateway:
             resources:
               requests:
