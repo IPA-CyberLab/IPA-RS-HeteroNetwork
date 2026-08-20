@@ -18,7 +18,9 @@ for process_name in prometheus grafana; do
     [[ "$process_id" =~ ^[0-9]+$ ]] || continue
     [[ -r "/proc/${process_id}/comm" ]] || continue
     [[ "$(<"/proc/${process_id}/comm")" == "$process_name" ]] || continue
-    ionice -c 3 -p "$process_id"
+    # Keep monitoring behind control-plane I/O without starving it completely
+    # when etcd is continuously flushing on slower disks.
+    ionice -c 2 -n 7 -p "$process_id"
     renice 10 -p "$process_id" >/dev/null
   done < <(pgrep -x "$process_name" || true)
 done
