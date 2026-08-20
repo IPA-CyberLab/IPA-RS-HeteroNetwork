@@ -1099,26 +1099,17 @@ units=(
 # Autopilot timers must not undo the injected outage before it is observed.
 # Runtime masks disappear automatically when the failsafe reboot occurs.
 systemctl mask --runtime "${units[@]}" >/dev/null 2>&1 || exit 20
-systemctl stop "${units[@]}" >/dev/null 2>&1 || true
-deadline=$((SECONDS + 90))
-while ((SECONDS < deadline)); do
-  active=false
-  for service in "${units[@]}"; do
-    if systemctl is-active --quiet "$service"; then
-      active=true
-      break
-    fi
-  done
-  [[ "$active" == false ]] && break
-  sleep 1
-done
+systemctl stop --no-block "${units[@]}" >/dev/null 2>&1 || true
+sleep 3
 for service in "${units[@]}"; do
-  systemctl is-active --quiet "$service" && exit 21
+  if systemctl is-active --quiet "$service"; then
+    systemctl kill --kill-whom=all --signal=KILL "$service" >/dev/null 2>&1 || true
+  fi
 done
+systemctl stop --no-block "${units[@]}" >/dev/null 2>&1 || true
+ip link set dev heteronetwork0 down || exit 21
 printf "FAULT_APPLIED\n" >"$1" || exit 22
 sync
-sleep 1
-ip link set dev heteronetwork0 down >/dev/null 2>&1
 exit 0
 '
   encoded="$(printf '%s' "$fault_script" | base64 -w0)"
