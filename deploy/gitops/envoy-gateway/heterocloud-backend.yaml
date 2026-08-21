@@ -22,6 +22,10 @@ metadata:
   name: heterocloud-api
   namespace: heterocloud
 spec:
+  # Force HTTP/1.1 on the TLS backend. Without the WSS app protocol, ALPN can
+  # select HTTP/2 and WebSocket upgrades fail before reaching HeteroCloud.
+  appProtocols:
+    - gateway.envoyproxy.io/wss
   endpoints:
     - fqdn:
         # A headless Service exposes each API Pod to Envoy independently. This
