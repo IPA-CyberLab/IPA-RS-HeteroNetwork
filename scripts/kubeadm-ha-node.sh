@@ -1854,6 +1854,14 @@ reconcile_container_runtime() {
 
   printf 'containerd failed three health probes on %s; restarting the runtime and kubelet\n' \
     "$node_name" >&2
+  local kubelet_stopped=true
+  restore_kubelet_after_runtime_recovery() {
+    if [[ "$kubelet_stopped" == "true" ]]; then
+      systemctl start kubelet.service >/dev/null 2>&1 || true
+    fi
+  }
+  trap restore_kubelet_after_runtime_recovery EXIT
+  trap 'exit 1' HUP INT TERM
   systemctl stop kubelet.service >/dev/null 2>&1 || true
   if ! timeout --kill-after=5s 30s systemctl restart containerd.service; then
     systemctl kill --kill-who=all --signal=KILL containerd.service >/dev/null 2>&1 || true
@@ -1861,6 +1869,8 @@ reconcile_container_runtime() {
     systemctl start containerd.service
   fi
   systemctl start kubelet.service
+  kubelet_stopped=false
+  trap - EXIT HUP INT TERM
 
   local attempt
   for ((attempt = 1; attempt <= 6; attempt++)); do
