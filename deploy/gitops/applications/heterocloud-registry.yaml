@@ -39,6 +39,8 @@ spec:
         existingSecretSecretKey: harbor-core-runtime
         core:
           replicas: 3
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
           existingSecret: harbor-core-runtime
           existingXsrfSecret: harbor-core-runtime
           existingXsrfSecretKey: CSRF_KEY
@@ -61,6 +63,8 @@ spec:
               whenUnsatisfiable: DoNotSchedule
         jobservice:
           replicas: 3
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
           existingSecret: harbor-jobservice-runtime
           existingSecretKey: JOBSERVICE_SECRET
           jobLoggers:
@@ -97,6 +101,8 @@ spec:
               whenUnsatisfiable: DoNotSchedule
         exporter:
           replicas: 2
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
           podDisruptionBudget:
             enabled: true
             minAvailable: 1
