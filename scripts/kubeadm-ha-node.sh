@@ -241,8 +241,9 @@ select_healthy_apiserver_etcd_backends() {
   local ca=/etc/kubernetes/pki/etcd/ca.crt
   local cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt
   local key=/etc/kubernetes/pki/etcd/healthcheck-client.key
-  local scores selected latency address count
-  local -a values
+  local manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
+  local scores selected_file selected latency address count current endpoint
+  local -a values current_endpoints
 
   if [[ ! -r "$ca" || ! -r "$cert" || ! -r "$key" ]]; then
     printf '%s\n' "$candidates"
@@ -269,11 +270,34 @@ select_healthy_apiserver_etcd_backends() {
     printf '%s\n' "$candidates"
     return
   fi
-  selected="$(sort -n -k1,1 "$scores" | awk -v limit="$MAX_APISERVER_ETCD_BACKENDS" '
-    NR <= limit { result = result (result == "" ? "" : ",") $2 }
-    END { print result }
-  ')"
-  rm -f "$scores"
+  selected_file="$(mktemp)"
+
+  # Keep the existing healthy set stable. Latency jitter must not rewrite the
+  # static Pod manifest and restart every API server on each timer tick.
+  if [[ -f "$manifest" ]]; then
+    current="$(sed -nE 's#^    - --etcd-servers=##p' "$manifest")"
+    IFS=, read -r -a current_endpoints <<<"$current"
+    for endpoint in "${current_endpoints[@]}"; do
+      address="${endpoint#https://}"
+      address="${address%:2379}"
+      if awk -v candidate="$address" '$2 == candidate { found = 1 } END { exit !found }' "$scores" \
+        && ! grep -Fx "$address" "$selected_file" >/dev/null; then
+        printf '%s\n' "$address" >>"$selected_file"
+      fi
+      count="$(wc -l <"$selected_file")"
+      ((count < MAX_APISERVER_ETCD_BACKENDS)) || break
+    done
+  fi
+
+  while read -r latency address; do
+    count="$(wc -l <"$selected_file")"
+    ((count < MAX_APISERVER_ETCD_BACKENDS)) || break
+    grep -Fx "$address" "$selected_file" >/dev/null \
+      || printf '%s\n' "$address" >>"$selected_file"
+  done < <(sort -n -k1,1 -k2,2 "$scores")
+
+  selected="$(paste -sd, "$selected_file")"
+  rm -f "$scores" "$selected_file"
   printf '%s\n' "$selected"
 }
 
