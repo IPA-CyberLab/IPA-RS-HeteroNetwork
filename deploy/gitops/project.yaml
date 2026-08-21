@@ -24,6 +24,8 @@ spec:
       server: https://kubernetes.default.svc
     - namespace: heterocloud-flash
       server: https://kubernetes.default.svc
+    - namespace: heterocloud-flash-workloads
+      server: https://kubernetes.default.svc
   clusterResourceWhitelist:
     - group: "*"
       kind: "*"
