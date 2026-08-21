@@ -1,0 +1,9 @@
+http://registry.heterocloud.mizuame.app {
+	redir https://registry.heterocloud.mizuame.app{uri} permanent
+}
+
+registry.heterocloud.mizuame.app {
+	handle {
+		import heterocloud_envoy /api/v2.0/health
+	}
+}
