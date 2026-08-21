@@ -40,7 +40,10 @@ spec:
       splitExternalLocalOriginErrors: true
   timeout:
     http:
-      requestTimeout: 25s
+      # Flash Web Shell sessions are server-bounded to 30 minutes. Keep the
+      # edge timeout slightly above that bound so upgraded connections are not
+      # terminated after the former 25-second API timeout.
+      requestTimeout: 31m
   rateLimit:
     # This per-proxy limit remains active when the global Redis-backed
     # limiter is unavailable. The global rule below still provides the
