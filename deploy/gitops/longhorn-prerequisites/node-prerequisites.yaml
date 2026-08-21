@@ -37,8 +37,14 @@ spec:
                 export DEBIAN_FRONTEND=noninteractive
                 exec 9>/run/lock/heterocloud-longhorn-prerequisites.lock
                 flock 9
-                apt-get update -qq
-                apt-get install -y --no-install-recommends open-iscsi nfs-common cryptsetup dmsetup
+                if ! command -v iscsiadm >/dev/null \
+                  || ! command -v mount.nfs >/dev/null \
+                  || ! command -v cryptsetup >/dev/null \
+                  || ! command -v dmsetup >/dev/null; then
+                  apt-get -o Acquire::ForceIPv4=true update -qq
+                  apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+                    open-iscsi nfs-common cryptsetup dmsetup
+                fi
                 systemctl enable --now iscsid
                 modprobe iscsi_tcp
               '
