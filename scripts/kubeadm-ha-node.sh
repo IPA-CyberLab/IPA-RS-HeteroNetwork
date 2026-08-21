@@ -18,6 +18,7 @@ readonly DEFAULT_AGENT_STATUS_URL="http://127.0.0.1:9780/v1/status"
 readonly DEFAULT_AGENT_PEERS_URL="http://127.0.0.1:9780/v1/peers"
 readonly MAX_AGENT_DIRECTORY_BYTES="16777216"
 readonly MAX_DISCOVERED_CONTROL_PLANES="9"
+readonly MAX_APISERVER_ETCD_BACKENDS="3"
 readonly KUBERNETES_CONTROL_PLANE_TAG="kubernetes-control-plane"
 readonly KUBERNETES_HA_TAG_PREFIX="kubernetes-ha-"
 readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
@@ -233,6 +234,47 @@ render_apiserver_etcd_servers() {
     rendered="${rendered:+${rendered},}https://${address}:2379"
   done < <(apiserver_etcd_addresses)
   printf '%s\n' "$rendered"
+}
+
+select_healthy_apiserver_etcd_backends() {
+  local candidates="$1"
+  local ca=/etc/kubernetes/pki/etcd/ca.crt
+  local cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt
+  local key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+  local scores selected latency address count
+  local -a values
+
+  if [[ ! -r "$ca" || ! -r "$cert" || ! -r "$key" ]]; then
+    printf '%s\n' "$candidates"
+    return
+  fi
+
+  scores="$(mktemp)"
+  IFS=, read -r -a values <<<"$candidates"
+  for address in "${values[@]}"; do
+    validate_ipv4 "$address"
+    if latency="$(curl --fail --silent --show-error \
+      --connect-timeout 1 --max-time 3 \
+      --cacert "$ca" --cert "$cert" --key "$key" \
+      --output /dev/null --write-out '%{time_total}' \
+      "https://${address}:2379/readyz" 2>/dev/null)" \
+      && [[ "$latency" =~ ^[0-9]+\.[0-9]+$ ]]; then
+      printf '%s %s\n' "$latency" "$address" >>"$scores"
+    fi
+  done
+
+  count="$(wc -l <"$scores")"
+  if ((count < 3)); then
+    rm -f "$scores"
+    printf '%s\n' "$candidates"
+    return
+  fi
+  selected="$(sort -n -k1,1 "$scores" | awk -v limit="$MAX_APISERVER_ETCD_BACKENDS" '
+    NR <= limit { result = result (result == "" ? "" : ",") $2 }
+    END { print result }
+  ')"
+  rm -f "$scores"
+  printf '%s\n' "$selected"
 }
 
 validate_common_config() {
@@ -1719,7 +1761,7 @@ reconcile_discovered_control_plane_backends() {
     || { [[ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]] \
       && ! grep -Eq '^    - --etcd-servers=https://127\.0\.0\.1:2379$' \
         /etc/kubernetes/manifests/kube-apiserver.yaml; }; then
-    apiserver_etcd_backends="$discovered"
+    apiserver_etcd_backends="$(select_healthy_apiserver_etcd_backends "$discovered")"
     reconcile_remote_etcd=true
   fi
   if backend_addresses | grep -Fx "$node_ip" >/dev/null; then
