@@ -29,6 +29,10 @@ const operationsConsoles = [
     label: "Prometheus",
     href: "http://prometheus.heteronetwork.internal:9090",
   },
+  {
+    label: "HeteroCloud 所有者",
+    href: "http://owner.heterocloud.internal:19443",
+  },
 ];
 
 function Metric({ label, value, detail }) {

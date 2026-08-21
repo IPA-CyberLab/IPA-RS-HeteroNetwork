@@ -1,0 +1,87 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: heterocloud-registry-redis
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://charts.bitnami.com/bitnami
+    chart: redis
+    targetRevision: 28.0.7
+    helm:
+      releaseName: harbor-redis
+      values: |
+        fullnameOverride: harbor-redis
+        architecture: replication
+        image:
+          digest: sha256:a97a9e3e409d77fe8566d049a337eff53ef2941eb9e40f105dd4ad6ca3417810
+        auth:
+          enabled: false
+        sentinel:
+          enabled: true
+          image:
+            digest: sha256:17cd4ac7fa3ec3c7b039cd8ac5f1aa39affabdf2aaa3bdebfe7de09f377f2337
+          masterSet: harbormaster
+          quorum: 2
+          downAfterMilliseconds: 2000
+          failoverTimeout: 10000
+          parallelSyncs: 2
+          automateClusterRecovery: true
+        replica:
+          replicaCount: 3
+          podAntiAffinityPreset: hard
+          persistence:
+            enabled: true
+            storageClass: longhorn
+            size: 8Gi
+          pdb:
+            create: true
+            minAvailable: 2
+        master:
+          persistence:
+            enabled: true
+            storageClass: longhorn
+            size: 8Gi
+        metrics:
+          enabled: true
+          image:
+            digest: sha256:8ee4e29f917d5165da41f606808a3b709c343ecaae76618c3f044e1c3c117602
+          serviceMonitor:
+            enabled: false
+        networkPolicy:
+          enabled: true
+          allowExternal: false
+          metrics:
+            allowExternal: true
+          extraIngress:
+            - from:
+                - podSelector:
+                    matchLabels:
+                      release: harbor
+              ports:
+                - port: 6379
+                  protocol: TCP
+                - port: 26379
+                  protocol: TCP
+        commonAnnotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9121"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-registry
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 20
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - CreateNamespace=true

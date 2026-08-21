@@ -263,6 +263,10 @@ test("Cloudscape console renders overview and hierarchical topology", async ({ p
     "href",
     "http://prometheus.heteronetwork.internal:9090",
   );
+  await expect(page.getByRole("link", { name: "HeteroCloud 所有者" })).toHaveAttribute(
+    "href",
+    "http://owner.heterocloud.internal:19443",
+  );
   await expect(page.getByRole("table").last().getByRole("row")).toHaveCount(6);
 
   await page.getByText("ノード", { exact: true }).first().click();

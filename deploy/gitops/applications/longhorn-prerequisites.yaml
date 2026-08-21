@@ -1,23 +1,19 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: heterocloud
+  name: longhorn-prerequisites
   namespace: argocd
   annotations:
-    argocd.argoproj.io/sync-wave: "0"
+    argocd.argoproj.io/sync-wave: "-3"
 spec:
   project: hetero-platform
   source:
-    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: v0.1.28
-    path: deploy/helm/heterocloud
-    helm:
-      releaseName: heterocloud
-      valueFiles:
-        - ../../environments/heteronet/values.yaml
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
+    targetRevision: master
+    path: deploy/gitops/longhorn-prerequisites
   destination:
     server: https://kubernetes.default.svc
-    namespace: heterocloud
+    namespace: kube-system
   syncPolicy:
     automated:
       enabled: true
@@ -30,5 +26,4 @@ spec:
         factor: 2
         maxDuration: 3m
     syncOptions:
-      - CreateNamespace=true
-      - RespectIgnoreDifferences=true
+      - ServerSideApply=true

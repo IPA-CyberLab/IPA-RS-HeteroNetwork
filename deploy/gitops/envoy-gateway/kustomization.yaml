@@ -19,5 +19,7 @@ resources:
   - heterocloud-health-route.yaml
   - flow-route.yaml
   - flow-health-route.yaml
+  - registry-route.yaml
+  - registry-backend-traffic-policy.yaml
   - rate-limit-patch-policy.yaml
   - ratelimit-metrics-service.yaml

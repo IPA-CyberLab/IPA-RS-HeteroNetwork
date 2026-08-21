@@ -1,0 +1,141 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: heterocloud-registry
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://helm.goharbor.io
+    chart: harbor
+    targetRevision: 1.19.2
+    helm:
+      releaseName: harbor
+      values: |
+        expose:
+          type: clusterIP
+          tls:
+            enabled: false
+          clusterIP:
+            name: harbor
+            ports:
+              httpPort: 80
+        externalURL: https://registry.heterocloud.mizuame.app
+        persistence:
+          enabled: true
+          resourcePolicy: keep
+          persistentVolumeClaim:
+            registry:
+              storageClass: longhorn
+              accessMode: ReadWriteMany
+              size: 200Gi
+          imageChartStorage:
+            type: filesystem
+            disableredirect: true
+        existingSecretAdminPassword: heterocloud-registry-admin
+        existingSecretAdminPasswordKey: HARBOR_ADMIN_PASSWORD
+        existingSecretSecretKey: harbor-core-runtime
+        core:
+          replicas: 3
+          existingSecret: harbor-core-runtime
+          existingXsrfSecret: harbor-core-runtime
+          existingXsrfSecretKey: CSRF_KEY
+          secretName: harbor-token
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: 2
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+        portal:
+          replicas: 3
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: 2
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+        jobservice:
+          replicas: 3
+          existingSecret: harbor-jobservice-runtime
+          existingSecretKey: JOBSERVICE_SECRET
+          jobLoggers:
+            - database
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: 2
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+        registry:
+          replicas: 3
+          existingSecret: harbor-registry-runtime
+          existingSecretKey: REGISTRY_HTTP_SECRET
+          credentials:
+            username: harbor_registry_user
+            existingSecret: harbor-registry-credentials
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: 2
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+        nginx:
+          replicas: 3
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: 2
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+        exporter:
+          replicas: 2
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: 1
+        trivy:
+          enabled: false
+        database:
+          type: external
+          external:
+            host: postgres.heteronetwork.internal
+            port: "25432"
+            username: heterocloud_registry
+            coreDatabase: heterocloud_registry
+            existingSecret: harbor-database
+            sslmode: require
+          maxIdleConns: 25
+          maxOpenConns: 150
+        redis:
+          type: external
+          external:
+            addr: harbor-redis-node-0.harbor-redis-headless.heterocloud-registry.svc.cluster.local:26379,harbor-redis-node-1.harbor-redis-headless.heterocloud-registry.svc.cluster.local:26379,harbor-redis-node-2.harbor-redis-headless.heterocloud-registry.svc.cluster.local:26379
+            sentinelMasterSet: harbormaster
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: false
+        logLevel: info
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-registry
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 20
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - CreateNamespace=true

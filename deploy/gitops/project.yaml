@@ -11,6 +11,9 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
     - docker.io/envoyproxy
+    - https://charts.longhorn.io
+    - https://charts.bitnami.com/bitnami
+    - https://helm.goharbor.io
   destinations:
     - namespace: kube-system
       server: https://kubernetes.default.svc
@@ -25,6 +28,10 @@ spec:
     - namespace: heterocloud-flash
       server: https://kubernetes.default.svc
     - namespace: heterocloud-flash-workloads
+      server: https://kubernetes.default.svc
+    - namespace: longhorn-system
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-registry
       server: https://kubernetes.default.svc
   clusterResourceWhitelist:
     - group: "*"

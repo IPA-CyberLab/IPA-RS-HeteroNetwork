@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: longhorn-node-prerequisites
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: longhorn-node-prerequisites
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: longhorn-node-prerequisites
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: longhorn-node-prerequisites
+    spec:
+      hostPID: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: install-host-packages
+          image: ubuntu:24.04
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - /bin/bash
+            - -ceu
+            - |
+              chroot /host /bin/bash -ceu '
+                test -f /etc/debian_version
+                export DEBIAN_FRONTEND=noninteractive
+                exec 9>/run/lock/heterocloud-longhorn-prerequisites.lock
+                flock 9
+                apt-get update -qq
+                apt-get install -y --no-install-recommends open-iscsi nfs-common cryptsetup dmsetup
+                systemctl enable --now iscsid
+                modprobe iscsi_tcp
+              '
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: Bidirectional
+      containers:
+        - name: ready
+          image: registry.k8s.io/pause:3.10
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory

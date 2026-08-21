@@ -1,0 +1,54 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: longhorn
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://charts.longhorn.io
+    chart: longhorn
+    targetRevision: 1.12.1
+    helm:
+      releaseName: longhorn
+      values: |
+        persistence:
+          defaultClass: true
+          defaultClassReplicaCount: 3
+          defaultDataLocality: disabled
+          reclaimPolicy: Retain
+        defaultSettings:
+          defaultReplicaCount: "3"
+          replicaAutoBalance: best-effort
+          storageMinimalAvailablePercentage: "15"
+          nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod
+          nodeDrainPolicy: block-if-contains-last-replica
+          orphanAutoDeletion: "true"
+        longhornUI:
+          replicas: 2
+        longhornManager:
+          priorityClass: system-node-critical
+        csi:
+          attacherReplicaCount: 3
+          provisionerReplicaCount: 3
+          resizerReplicaCount: 3
+          snapshotterReplicaCount: 3
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: longhorn-system
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 20
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

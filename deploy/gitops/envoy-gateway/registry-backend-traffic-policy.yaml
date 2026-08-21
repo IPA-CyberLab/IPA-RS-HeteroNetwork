@@ -1,0 +1,72 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: heterocloud-registry-transport
+  namespace: heterocloud-registry
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: heterocloud-registry-public
+  rateLimit:
+    local:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+    global:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+          shared: true
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+          shared: true
+  timeout:
+    http:
+      requestTimeout: 2h
+  healthCheck:
+    panicThreshold: 0
+    active:
+      type: HTTP
+      interval: 5s
+      timeout: 2s
+      healthyThreshold: 1
+      unhealthyThreshold: 2
+      http:
+        path: /api/v2.0/health
+        expectedStatuses:
+          - 200
+    passive:
+      interval: 5s
+      baseEjectionTime: 30s
+      consecutive5XxErrors: 3
+      consecutiveGatewayErrors: 2
+      consecutiveLocalOriginFailures: 1
+      maxEjectionPercent: 100
+      splitExternalLocalOriginErrors: true
