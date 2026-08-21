@@ -34,8 +34,9 @@ done
 
 fragment_digest="$({
   for fragment in "${fragments[@]}"; do
-    printf '%s\0' "$(basename "${fragment}")"
-    sha256sum "${fragment}"
+    printf '%s\0%s\n' \
+      "$(basename "${fragment}")" \
+      "$(sha256sum "${fragment}" | awk '{print $1}')"
   done
 } | sha256sum | awk '{print $1}')"
 temporary="$(mktemp "${extra_caddyfile}.XXXXXX")"
