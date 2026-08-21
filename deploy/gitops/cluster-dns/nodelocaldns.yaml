@@ -35,21 +35,6 @@ metadata:
   namespace: kube-system
 data:
   Corefile: |
-    heteronetwork.internal:53 {
-        errors
-        cache {
-            success 9984 30
-            denial 9984 5
-        }
-        reload
-        loop
-        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
-        forward . __PILLAR__CLUSTER__DNS__ {
-            force_tcp
-            max_concurrent 1000
-        }
-        prometheus :9253
-    }
     cluster.local:53 {
         errors
         cache {
@@ -65,6 +50,21 @@ data:
         }
         prometheus :9253
         health 169.254.20.10:8080
+    }
+    heteronetwork.internal:53 {
+        errors
+        cache {
+            success 9984 30
+            denial 9984 5
+        }
+        reload
+        loop
+        bind __PILLAR__LOCAL__DNS__ __PILLAR__DNS__SERVER__
+        forward . __PILLAR__CLUSTER__DNS__ {
+            force_tcp
+            max_concurrent 1000
+        }
+        prometheus :9253
     }
     in-addr.arpa:53 {
         errors
@@ -124,7 +124,7 @@ spec:
         k8s-app: node-local-dns
         kubernetes.io/cluster-service: "true"
       annotations:
-        heteronetwork.internal/config-revision: "2"
+        heteronetwork.internal/config-revision: "3"
         prometheus.io/port: "9253"
         prometheus.io/scrape: "true"
     spec:
