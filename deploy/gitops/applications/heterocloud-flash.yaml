@@ -22,6 +22,13 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: heterocloud-flash
+  ignoreDifferences:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      name: flashservices.flash.heterocloud.io
+      jsonPointers:
+        - /spec/names/categories
+        - /spec/versions/0/additionalPrinterColumns
   syncPolicy:
     automated:
       enabled: true
