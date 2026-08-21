@@ -1451,9 +1451,20 @@ configure_haproxy() {
 
 install_api_backend_autopilot() {
   require_root
-  local service_path timer_path service_temporary timer_temporary changed=0
+  local installed_script source_script service_path timer_path service_temporary timer_temporary changed=0
+  installed_script=/opt/heteronetwork/libexec/kubeadm-ha-node.sh
+  source_script="$(readlink -f -- "${BASH_SOURCE[0]}")"
   service_path=/etc/systemd/system/heteronetwork-kubeadm-backend-autopilot.service
   timer_path=/etc/systemd/system/heteronetwork-kubeadm-backend-autopilot.timer
+
+  if [[ "$source_script" != "$installed_script" ]]; then
+    [[ ! -L "$installed_script" ]] || die "refusing symlinked Kubernetes HA helper"
+    install -d -o root -g root -m 0755 "$(dirname -- "$installed_script")"
+    if [[ ! -f "$installed_script" ]] || ! cmp -s "$source_script" "$installed_script"; then
+      install -o root -g root -m 0755 "$source_script" "$installed_script"
+    fi
+  fi
+
   service_temporary="$(mktemp)"
   timer_temporary="$(mktemp)"
   render_api_backend_autopilot_service >"$service_temporary"

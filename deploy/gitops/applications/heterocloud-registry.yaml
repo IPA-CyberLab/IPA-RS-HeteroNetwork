@@ -105,7 +105,7 @@ spec:
         database:
           type: external
           external:
-            host: postgres.heteronetwork.internal
+            host: postgres-ha-connector.kube-system.svc.cluster.local
             port: "25432"
             username: heterocloud_registry
             coreDatabase: heterocloud_registry

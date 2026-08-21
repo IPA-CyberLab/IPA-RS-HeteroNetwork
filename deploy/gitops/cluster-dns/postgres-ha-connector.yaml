@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: postgres-ha-connector
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: postgres-ha-connector
+    app.kubernetes.io/part-of: heteronetwork
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-ha-connector
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-ha-connector
+        app.kubernetes.io/part-of: heteronetwork
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 99
+        runAsGroup: 99
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: haproxy
+          image: docker.io/library/haproxy:3.2.7-alpine@sha256:3b80483d47e1c7d1fc7eb4b9104f33d9a51259769be299eb675524dca2bc8157
+          imagePullPolicy: IfNotPresent
+          args:
+            - -f
+            - /usr/local/etc/haproxy/haproxy.cfg
+          ports:
+            - name: postgres
+              containerPort: 25433
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              host: 127.0.0.1
+              port: 25432
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          startupProbe:
+            tcpSocket:
+              host: 127.0.0.1
+              port: 25432
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/etc/haproxy
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: postgres-ha-connector
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-ha-connector
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: postgres-ha-connector
+    app.kubernetes.io/part-of: heteronetwork
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres-ha-connector
+  ports:
+    - name: postgres
+      port: 25432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-ha-connector
+  namespace: kube-system
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-ha-connector
