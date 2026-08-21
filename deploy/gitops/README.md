@@ -19,7 +19,7 @@ The script performs these idempotent reconciliations:
 4. installs the pinned Envoy Gateway chart and its three-replica global rate
    limit service;
 5. applies self-healing Argo CD Applications for cluster DNS, the Envoy
-   Gateway edge, HeteroCloud, and Flow.
+   Gateway edge, HeteroCloud, Flow, and the gVisor-backed Flash provider.
 
 The Argo CD chart is pinned by `ARGOCD_CHART_VERSION` (default `10.2.2`). Its
 three Web replicas run on the Kubernetes pod network. The separately managed

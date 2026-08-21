@@ -9,6 +9,7 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
     - docker.io/envoyproxy
   destinations:
     - namespace: kube-system
@@ -20,6 +21,8 @@ spec:
     - namespace: heterocloud
       server: https://kubernetes.default.svc
     - namespace: heterocloud-flow
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-flash
       server: https://kubernetes.default.svc
   clusterResourceWhitelist:
     - group: "*"
