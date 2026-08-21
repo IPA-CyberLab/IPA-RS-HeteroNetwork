@@ -52,6 +52,7 @@ kubectl -n "${ARGOCD_NAMESPACE}" patch service "${ARGOCD_RELEASE}-redis-ha" \
   --patch '{"spec":{"publishNotReadyAddresses":true}}'
 
 kubectl apply --server-side --field-manager=heteronetwork-bootstrap \
+  --force-conflicts \
   -f "${ROOT_DIR}/deploy/gitops/argocd-overlay-service.yaml" \
   -f "${ROOT_DIR}/deploy/gitops/project.yaml" \
   -f "${ROOT_DIR}/deploy/gitops/applications"
