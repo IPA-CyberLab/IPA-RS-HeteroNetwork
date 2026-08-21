@@ -15,6 +15,7 @@ data:
            lameduck 5s
         }
         ready
+        rewrite stop name exact postgres.heteronetwork.internal postgres-ha-connector.kube-system.svc.cluster.local answer auto
         kubernetes cluster.local in-addr.arpa ip6.arpa {
            pods insecure
            fallthrough in-addr.arpa ip6.arpa
