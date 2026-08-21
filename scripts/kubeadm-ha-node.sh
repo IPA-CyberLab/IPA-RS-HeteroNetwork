@@ -1757,10 +1757,7 @@ reconcile_discovered_control_plane_backends() {
   existing_preferred="$preferred_control_plane"
   discovered="$(discover_control_plane_addresses)"
   control_plane_backends="$discovered"
-  if [[ -n "$apiserver_etcd_backends" ]] \
-    || { [[ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]] \
-      && ! grep -Eq '^    - --etcd-servers=https://127\.0\.0\.1:2379$' \
-        /etc/kubernetes/manifests/kube-apiserver.yaml; }; then
+  if [[ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]]; then
     apiserver_etcd_backends="$(select_healthy_apiserver_etcd_backends "$discovered")"
     reconcile_remote_etcd=true
   fi
