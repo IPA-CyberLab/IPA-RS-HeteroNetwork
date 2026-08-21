@@ -19,6 +19,7 @@ readonly DEFAULT_AGENT_PEERS_URL="http://127.0.0.1:9780/v1/peers"
 readonly MAX_AGENT_DIRECTORY_BYTES="16777216"
 readonly MAX_DISCOVERED_CONTROL_PLANES="9"
 readonly MAX_APISERVER_ETCD_BACKENDS="3"
+readonly MIN_STABLE_APISERVER_ETCD_BACKENDS="2"
 readonly KUBERNETES_CONTROL_PLANE_TAG="kubernetes-control-plane"
 readonly KUBERNETES_HA_TAG_PREFIX="kubernetes-ha-"
 readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
@@ -243,7 +244,9 @@ select_healthy_apiserver_etcd_backends() {
   local key=/etc/kubernetes/pki/etcd/healthcheck-client.key
   local manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
   local scores selected_file selected latency address count current endpoint
+  local current_count=0 healthy_current_count=0 healthy_count=0
   local -a values current_endpoints
+  local -A candidate_set=() healthy_set=()
 
   if [[ ! -r "$ca" || ! -r "$cert" || ! -r "$key" ]]; then
     printf '%s\n' "$candidates"
@@ -254,6 +257,7 @@ select_healthy_apiserver_etcd_backends() {
   IFS=, read -r -a values <<<"$candidates"
   for address in "${values[@]}"; do
     validate_ipv4 "$address"
+    candidate_set["$address"]=1
     if latency="$(curl --fail --silent --show-error \
       --connect-timeout 1 --max-time 3 \
       --cacert "$ca" --cert "$cert" --key "$key" \
@@ -261,40 +265,67 @@ select_healthy_apiserver_etcd_backends() {
       "https://${address}:2379/readyz" 2>/dev/null)" \
       && [[ "$latency" =~ ^[0-9]+\.[0-9]+$ ]]; then
       printf '%s %s\n' "$latency" "$address" >>"$scores"
+      healthy_set["$address"]=1
     fi
   done
 
-  count="$(wc -l <"$scores")"
-  if ((count < 3)); then
-    rm -f "$scores"
-    printf '%s\n' "$candidates"
-    return
-  fi
+  healthy_count="$(wc -l <"$scores")"
   selected_file="$(mktemp)"
 
-  # Keep the existing healthy set stable. Latency jitter must not rewrite the
-  # static Pod manifest and restart every API server on each timer tick.
+  # Preserve a three-member set while at least two of its members are healthy.
+  # A single VPN probe timeout must not restart the API server. If fewer than
+  # two endpoints can be verified cluster-wide, retain the last known set
+  # because there is no confidently healthier replacement available.
   if [[ -f "$manifest" ]]; then
     current="$(sed -nE 's#^    - --etcd-servers=##p' "$manifest")"
     IFS=, read -r -a current_endpoints <<<"$current"
     for endpoint in "${current_endpoints[@]}"; do
       address="${endpoint#https://}"
       address="${address%:2379}"
-      if awk -v candidate="$address" '$2 == candidate { found = 1 } END { exit !found }' "$scores" \
+      if [[ -n "${candidate_set[$address]:-}" ]] \
         && ! grep -Fx "$address" "$selected_file" >/dev/null; then
         printf '%s\n' "$address" >>"$selected_file"
+        ((current_count += 1))
+        if [[ -n "${healthy_set[$address]:-}" ]]; then
+          ((healthy_current_count += 1))
+        fi
       fi
-      count="$(wc -l <"$selected_file")"
-      ((count < MAX_APISERVER_ETCD_BACKENDS)) || break
+      ((current_count < MAX_APISERVER_ETCD_BACKENDS)) || break
     done
+    if ((current_count == MAX_APISERVER_ETCD_BACKENDS)) \
+      && ((healthy_current_count >= MIN_STABLE_APISERVER_ETCD_BACKENDS \
+        || healthy_count < MIN_STABLE_APISERVER_ETCD_BACKENDS)); then
+      selected="$(paste -sd, "$selected_file")"
+      rm -f "$scores" "$selected_file"
+      printf '%s\n' "$selected"
+      return
+    fi
   fi
 
+  : >"$selected_file"
+  for endpoint in "${current_endpoints[@]}"; do
+    address="${endpoint#https://}"
+    address="${address%:2379}"
+    if [[ -n "${healthy_set[$address]:-}" ]] \
+      && ! grep -Fx "$address" "$selected_file" >/dev/null; then
+      printf '%s\n' "$address" >>"$selected_file"
+    fi
+    count="$(wc -l <"$selected_file")"
+    ((count < MAX_APISERVER_ETCD_BACKENDS)) || break
+  done
   while read -r latency address; do
     count="$(wc -l <"$selected_file")"
     ((count < MAX_APISERVER_ETCD_BACKENDS)) || break
     grep -Fx "$address" "$selected_file" >/dev/null \
       || printf '%s\n' "$address" >>"$selected_file"
   done < <(sort -n -k1,1 -k2,2 "$scores")
+
+  for address in "${values[@]}"; do
+    count="$(wc -l <"$selected_file")"
+    ((count < MAX_APISERVER_ETCD_BACKENDS)) || break
+    grep -Fx "$address" "$selected_file" >/dev/null \
+      || printf '%s\n' "$address" >>"$selected_file"
+  done
 
   selected="$(paste -sd, "$selected_file")"
   rm -f "$scores" "$selected_file"
