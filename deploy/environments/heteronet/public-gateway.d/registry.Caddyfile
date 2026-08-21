@@ -3,6 +3,8 @@ http://registry.heterocloud.mizuame.app {
 }
 
 registry.heterocloud.mizuame.app {
+	tls internal
+
 	handle {
 		import heterocloud_envoy /api/v2.0/health
 	}
