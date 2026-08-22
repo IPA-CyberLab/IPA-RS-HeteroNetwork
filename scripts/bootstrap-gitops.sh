@@ -79,4 +79,4 @@ printf '%s\n' \
   'Argo CD:    http://argocd.heteronetwork.internal:8088' \
   'Grafana:    http://grafana.heteronetwork.internal:13000' \
   'Prometheus: http://prometheus.heteronetwork.internal:9090' \
-  'Registry:   https://registry.heterocloud.mizuame.app'
+  'Flash Registry: https://registry.heterocloud.mizuame.app'
