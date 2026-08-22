@@ -141,16 +141,30 @@ kubectl -n "${FLASH_WORKLOAD_NAMESPACE}" create secret docker-registry heteroclo
   --dry-run=client -o yaml |
   kubectl apply --field-manager=heteronetwork-bootstrap -f - >/dev/null
 
-if ! kubectl -n "${REGISTRY_NAMESPACE}" get secret harbor-token >/dev/null 2>&1; then
+token_key="$(secret_value "${REGISTRY_NAMESPACE}" harbor-token tls.key)"
+token_key_header="${token_key%%$'\n'*}"
+token_secret_rotated=false
+if [[ ${token_key_header} != '-----BEGIN RSA PRIVATE KEY-----' ]]; then
   token_dir="$(mktemp -d /tmp/heterocloud-harbor-token.XXXXXX)"
   trap 'rm -rf -- "${token_dir}"' EXIT
-  openssl req -x509 -newkey rsa:4096 -sha256 -nodes -days 3650 \
+  openssl genrsa -traditional -out "${token_dir}/tls.key" 4096 >/dev/null 2>&1
+  openssl req -new -x509 -key "${token_dir}/tls.key" -sha256 -days 3650 \
     -subj '/CN=harbor-token' \
-    -keyout "${token_dir}/tls.key" \
     -out "${token_dir}/tls.crt" >/dev/null 2>&1
   kubectl -n "${REGISTRY_NAMESPACE}" create secret tls harbor-token \
     --cert="${token_dir}/tls.crt" \
-    --key="${token_dir}/tls.key" >/dev/null
+    --key="${token_dir}/tls.key" \
+    --dry-run=client -o yaml |
+    kubectl apply --field-manager=heteronetwork-bootstrap -f - >/dev/null
+  token_secret_rotated=true
+fi
+
+if [[ ${token_secret_rotated} == true ]]; then
+  for deployment in harbor-core harbor-registry; do
+    if kubectl -n "${REGISTRY_NAMESPACE}" get deployment "${deployment}" >/dev/null 2>&1; then
+      kubectl -n "${REGISTRY_NAMESPACE}" rollout restart "deployment/${deployment}" >/dev/null
+    fi
+  done
 fi
 
 printf '%s\n' \
