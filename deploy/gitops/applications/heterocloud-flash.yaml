@@ -9,13 +9,13 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
-    targetRevision: v0.1.15
+    targetRevision: v0.1.16
     path: deploy/helm/heterocloud-flash
     helm:
       releaseName: heterocloud-flash
       values: |
         image:
-          tag: 0.1.15
+          tag: 0.1.16
         providerAuth:
           publicKeysJson: |-
             {"heterocloud-provider-1":"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAs9HXnx9AwepDSdl/w+k2tAYieW3aU8PhlJoQBAFo9X4=\n-----END PUBLIC KEY-----\n"}
