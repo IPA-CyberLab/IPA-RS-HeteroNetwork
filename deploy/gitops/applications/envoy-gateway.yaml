@@ -103,7 +103,9 @@ spec:
               enableBackend: true
               enableEnvoyPatchPolicy: true
             rateLimit:
-              failClosed: true
+              # Route policies retain a local per-IP limit when the shared
+              # Redis-backed limiter is unavailable.
+              failClosed: false
               backend:
                 type: Redis
                 redis:

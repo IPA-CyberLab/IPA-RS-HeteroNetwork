@@ -52,7 +52,8 @@ rate-limit deployment has three replicas and a two-pod disruption budget. The
 rate-limit service uses a three-replica HAProxy Redis-primary proxy. Each
 proxy health-checks the Flow Redis nodes and accepts traffic only from the
 current `role:master` node, so Redis failover does not send writes to
-read-only replicas.
+read-only replicas. If the shared limiter cannot be reached, Envoy fails open
+while retaining the per-proxy 200 requests/second limit for each client IP.
 
 The GitOps overlay also creates the annotated `envoy-ratelimit-metrics`
 Service. It exposes the rate-limit service's Prometheus endpoint without
