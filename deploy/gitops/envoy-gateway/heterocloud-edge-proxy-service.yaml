@@ -6,8 +6,9 @@ metadata:
   labels:
     app.kubernetes.io/part-of: heterocloud-edge
 spec:
-  type: ClusterIP
-  internalTrafficPolicy: Local
+  # Gateway agents run on every public node, while Envoy replicas may be
+  # scheduled elsewhere. Keep cross-node forwarding available.
+  internalTrafficPolicy: Cluster
   selector:
     app.kubernetes.io/component: proxy
     app.kubernetes.io/managed-by: envoy-gateway
