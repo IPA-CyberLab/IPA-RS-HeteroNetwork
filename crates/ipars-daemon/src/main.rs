@@ -16295,6 +16295,22 @@ async fn set_direct_path_relay_forwarding(
     true
 }
 
+async fn ensure_relay_forwarder(
+    runtime: &AgentRuntime,
+    supervisor: &Arc<RelayForwarderSupervisor>,
+    session: RelaySessionState,
+    forwarding_enabled: bool,
+) -> anyhow::Result<SocketAddr> {
+    let peer = session.peer.clone();
+    let endpoint = supervisor.upsert(runtime, session).await?;
+    anyhow::ensure!(
+        set_direct_path_relay_forwarding(runtime, Some(supervisor), &peer, forwarding_enabled,)
+            .await,
+        "relay forwarder disappeared immediately after startup for peer {peer}"
+    );
+    Ok(endpoint)
+}
+
 fn direct_path_probe_retry_delay(options: &SignalPathNegotiationOptions) -> Duration {
     options
         .direct_path_probe_timeout
@@ -16929,19 +16945,22 @@ async fn negotiate_signal_paths(
                                     "admitted relay session"
                                 );
                                 runtime.upsert_relay_session(session.clone()).await;
-                                if !direct_path_probe_active {
-                                    if let Some(supervisor) =
-                                        options.relay_forwarder_supervisor.as_ref()
+                                if let Some(supervisor) =
+                                    options.relay_forwarder_supervisor.as_ref()
+                                {
+                                    if let Err(error) = ensure_relay_forwarder(
+                                        runtime,
+                                        supervisor,
+                                        session,
+                                        !pause_relay_forwarding,
+                                    )
+                                    .await
                                     {
-                                        if let Err(error) =
-                                            supervisor.upsert(runtime, session).await
-                                        {
-                                            tracing::warn!(
-                                                %error,
-                                                peer = %record.key.remote,
-                                                "failed to start relay forwarder"
-                                            );
-                                        }
+                                        tracing::warn!(
+                                            %error,
+                                            peer = %record.key.remote,
+                                            "failed to start relay forwarder"
+                                        );
                                     }
                                 }
                             }
@@ -16957,19 +16976,22 @@ async fn negotiate_signal_paths(
                                         expires_at = %session.expires_at,
                                         "failed relay admission renewal; retaining existing relay session"
                                     );
-                                    if !direct_path_probe_active {
-                                        if let Some(supervisor) =
-                                            options.relay_forwarder_supervisor.as_ref()
+                                    if let Some(supervisor) =
+                                        options.relay_forwarder_supervisor.as_ref()
+                                    {
+                                        if let Err(error) = ensure_relay_forwarder(
+                                            runtime,
+                                            supervisor,
+                                            session,
+                                            !pause_relay_forwarding,
+                                        )
+                                        .await
                                         {
-                                            if let Err(error) =
-                                                supervisor.upsert(runtime, session).await
-                                            {
-                                                tracing::warn!(
-                                                    %error,
-                                                    peer = %record.key.remote,
-                                                    "failed to ensure existing relay forwarder"
-                                                );
-                                            }
+                                            tracing::warn!(
+                                                %error,
+                                                peer = %record.key.remote,
+                                                "failed to ensure existing relay forwarder"
+                                            );
                                         }
                                     }
                                 } else {
@@ -17002,17 +17024,20 @@ async fn negotiate_signal_paths(
                         );
                         if let Some(session) = runtime.relay_session(&peer.node_id).await {
                             record.relay_node = Some(session.relay_node.clone());
-                            if !direct_path_probe_active {
-                                if let Some(supervisor) =
-                                    options.relay_forwarder_supervisor.as_ref()
+                            if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
+                                if let Err(error) = ensure_relay_forwarder(
+                                    runtime,
+                                    supervisor,
+                                    session,
+                                    !pause_relay_forwarding,
+                                )
+                                .await
                                 {
-                                    if let Err(error) = supervisor.upsert(runtime, session).await {
-                                        tracing::warn!(
-                                            %error,
-                                            peer = %record.key.remote,
-                                            "failed to ensure relay forwarder"
-                                        );
-                                    }
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to ensure relay forwarder"
+                                    );
                                 }
                             }
                         }
@@ -17029,17 +17054,20 @@ async fn negotiate_signal_paths(
                                 relay = %session.relay_node,
                                 "keeping existing relay path without fresh relay candidates"
                             );
-                            if !direct_path_probe_active {
-                                if let Some(supervisor) =
-                                    options.relay_forwarder_supervisor.as_ref()
+                            if let Some(supervisor) = options.relay_forwarder_supervisor.as_ref() {
+                                if let Err(error) = ensure_relay_forwarder(
+                                    runtime,
+                                    supervisor,
+                                    session,
+                                    !pause_relay_forwarding,
+                                )
+                                .await
                                 {
-                                    if let Err(error) = supervisor.upsert(runtime, session).await {
-                                        tracing::warn!(
-                                            %error,
-                                            peer = %record.key.remote,
-                                            "failed to ensure existing relay forwarder"
-                                        );
-                                    }
+                                    tracing::warn!(
+                                        %error,
+                                        peer = %record.key.remote,
+                                        "failed to ensure existing relay forwarder"
+                                    );
                                 }
                             }
                         }
@@ -34613,6 +34641,74 @@ exec sleep 60
             .context("renewed relay forwarder should exist")?;
         assert_eq!(active.session, renewed);
         drop(handles);
+        supervisor.shutdown_all(&runtime).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_fallback_starts_forwarder_while_direct_probe_is_pending() -> anyhow::Result<()> {
+        let runtime = AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ipars_types::ClusterPolicy::default(),
+        );
+        let supervisor = Arc::new(RelayForwarderSupervisor::new(RelayForwarderConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            wireguard_endpoint: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+            placement: RelayForwarderPlacement::CurrentProcess,
+            max_sessions: 1,
+            restart_backoff: Duration::ZERO,
+            crash_policy: test_crash_policy(),
+        }));
+        let peer = NodeId::from_string("peer-direct-fallback");
+        let now = Utc::now();
+        runtime
+            .upsert_pending_direct_path_probe(PendingDirectPathProbe {
+                selected_state: PathState::DirectPublic,
+                selected_candidate: candidate(peer.as_str(), EndpointCandidateKind::PublicUdp, 10),
+                started_at: now,
+                expires_at: now + ChronoDuration::seconds(120),
+                endpoint_observed_at: None,
+                baseline_rx_bytes: Some(0),
+                baseline_tx_bytes: Some(0),
+                baseline_latest_handshake_at: None,
+                baseline_relay_inbound_payload_bytes: None,
+                relay_forwarder_suspended: false,
+            })
+            .await?;
+        let session = RelaySessionState {
+            peer: peer.clone(),
+            relay_node: NodeId::from_string("relay-direct-fallback"),
+            relay_endpoint: SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            admitted_local_addr: SocketAddr::from(([127, 0, 0, 1], 40_001)),
+            admitted_peer_addr: SocketAddr::from(([127, 0, 0, 1], 40_002)),
+            session_id: "session-direct-fallback".to_string(),
+            session_token: "token-direct-fallback".to_string(),
+            expires_at: now + ChronoDuration::minutes(5),
+        };
+
+        let endpoint = ensure_relay_forwarder(&runtime, &supervisor, session.clone(), true).await?;
+
+        assert_eq!(
+            runtime.relay_forwarder_endpoints().await.get(&peer),
+            Some(&endpoint)
+        );
+        assert!(supervisor
+            .handles
+            .lock()
+            .await
+            .get(&peer)
+            .context("relay fallback forwarder")?
+            .forwarding_enabled
+            .load(Ordering::Relaxed));
+
+        ensure_relay_forwarder(&runtime, &supervisor, session, false).await?;
+        assert!(
+            runtime
+                .pending_direct_path_probe(&peer)
+                .await
+                .context("pending direct path probe")?
+                .relay_forwarder_suspended
+        );
         supervisor.shutdown_all(&runtime).await;
         Ok(())
     }
