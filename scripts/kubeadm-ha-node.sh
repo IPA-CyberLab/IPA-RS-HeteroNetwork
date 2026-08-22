@@ -1405,6 +1405,7 @@ EOF
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward = 1
+fs.inotify.max_user_instances = 1024
 EOF
   sysctl --system >/dev/null
 }
