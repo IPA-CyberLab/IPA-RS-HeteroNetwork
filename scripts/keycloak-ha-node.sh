@@ -305,6 +305,9 @@ RestartPreventExitStatus=143 SIGTERM
 TimeoutStartSec=180s
 TimeoutStopSec=45s
 LimitNOFILE=65536
+CPUWeight=200
+IOWeight=200
+MemoryLow=768M
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
@@ -676,13 +679,18 @@ defaults
     mode http
     option httplog
     option dontlog-normal
-    timeout connect 2s
+    timeout connect 1s
+    timeout queue 2s
     timeout client 2m
-    timeout server 2m
+    timeout server 15s
+    timeout check 2s
 
 frontend heteronetwork_keycloak_edge
     bind 127.0.0.1:${edge_listen_port}
     bind ${edge_vpn_listen_address}:${edge_listen_port}
+    monitor-uri /health/ready
+    acl keycloak_replicas_unavailable nbsrv(heteronetwork_keycloak_replicas) lt 1
+    monitor fail if keycloak_replicas_unavailable
     acl keycloak_realm_path path_beg /realms/
     acl keycloak_resources_path path_beg /resources/
     acl keycloak_robots_path path -i /robots.txt
@@ -690,7 +698,9 @@ frontend heteronetwork_keycloak_edge
     default_backend heteronetwork_keycloak_replicas
 
 backend heteronetwork_keycloak_replicas
-    balance roundrobin
+    balance leastconn
+    option redispatch
+    retries 2
     option httpchk
     http-check send meth GET uri ${edge_health_path} hdr Host localhost
     http-check expect status 200
@@ -699,7 +709,7 @@ EOF
   IFS=, read -r -a endpoints <<<"$edge_upstreams"
   for endpoint in "${endpoints[@]}"; do
     index=$((index + 1))
-    printf '    server replica_%s %s check inter 2s fall 2 rise 2\n' \
+    printf '    server replica_%s %s check inter 2s fall 2 rise 10 slowstart 30s\n' \
       "$index" "$endpoint"
   done
 }
