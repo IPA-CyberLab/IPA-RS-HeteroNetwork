@@ -698,9 +698,13 @@ frontend heteronetwork_keycloak_edge
     default_backend heteronetwork_keycloak_replicas
 
 backend heteronetwork_keycloak_replicas
+    acl l7_retry_safe_method method GET HEAD OPTIONS
+    http-request set-timeout server 5s if l7_retry_safe_method
+    http-request disable-l7-retry unless l7_retry_safe_method
     balance leastconn
-    option redispatch
+    option redispatch 1
     retries 2
+    retry-on conn-failure empty-response response-timeout 502 503 504
     option httpchk
     http-check send meth GET uri ${edge_health_path} hdr Host localhost
     http-check expect status 200
@@ -709,7 +713,7 @@ EOF
   IFS=, read -r -a endpoints <<<"$edge_upstreams"
   for endpoint in "${endpoints[@]}"; do
     index=$((index + 1))
-    printf '    server replica_%s %s check inter 2s fall 2 rise 10 slowstart 30s\n' \
+    printf '    server replica_%s %s check inter 2s fall 2 rise 30 slowstart 60s observe layer7 error-limit 1 on-error mark-down\n' \
       "$index" "$endpoint"
   done
 }
