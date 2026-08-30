@@ -9,7 +9,7 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: 486b112e7ec40d46945d4c11b3dfd888b8cfa6b5
+    targetRevision: de8e0a164573317e5f9a2c05fa94c49ad1fc21a6
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
