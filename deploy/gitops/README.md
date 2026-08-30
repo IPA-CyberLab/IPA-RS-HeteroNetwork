@@ -65,7 +65,9 @@ Cluster DNS is managed by the `cluster-dns` Application. It keeps three CoreDNS
 replicas on separate nodes with a two-pod disruption budget and runs the
 upstream Kubernetes NodeLocal DNSCache DaemonSet on every Linux node. The
 NodeLocal cache keeps normal Pod DNS traffic on the local node and forwards
-cache misses to the CoreDNS Service over TCP. The same Application runs a
+cache misses to the CoreDNS Service over TCP. CoreDNS forwards the
+`heteronetwork.internal` zone to all eligible HeteroNetwork DNS nodes, so Pods
+retain overlay service discovery when one DNS node fails. The same Application runs a
 privileged, capability-limited `kubernetes-service-route` DaemonSet. It pins
 host-originated Service traffic to each node's `cni0` source address so return
 traffic remains routable when Kubernetes nodes are spread across unrelated
