@@ -543,8 +543,11 @@ retry_pending_agent_restart() {
   if [[ -f "$agent_restart_pending_path" \
     && ! -L "$agent_restart_pending_path" ]]; then
     agent_restart_attempted=true
+    # This unit is ordered after the Agent. Waiting for its restart here would
+    # deadlock the systemd transaction until this oneshot exits.
     if systemctl daemon-reload >/dev/null 2>&1 \
-      && systemctl restart heteronetwork-agent.service >/dev/null 2>&1; then
+      && systemctl restart heteronetwork-agent.service --no-block \
+        >/dev/null 2>&1; then
       rm -f "$agent_restart_pending_path"
     else
       return 1

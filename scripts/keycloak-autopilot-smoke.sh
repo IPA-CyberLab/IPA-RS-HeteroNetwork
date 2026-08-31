@@ -421,6 +421,8 @@ assert_active heteronetwork-keycloak-edge-proxy.service
 [[ "$(count_systemctl_command restart heteronetwork-agent.service)" \
   == "$((agent_restarts_before_cleanup + 1))" ]] \
   || fail "Agent was not restarted after removing its legacy Keycloak route"
+grep -Fq 'restart heteronetwork-agent.service --no-block' "$systemctl_log" \
+  || fail "Agent restart can deadlock the ordered autopilot unit"
 first_request="$request_dir/1.json"
 [[ "$(reconcile_url_at 1)" \
   == "http://$vpn_ip:9781/v1/keycloak-autopilot/reconcile" ]] \
