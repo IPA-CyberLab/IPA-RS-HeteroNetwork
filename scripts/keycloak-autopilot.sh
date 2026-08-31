@@ -6,6 +6,7 @@ umask 077
 readonly KEYCLOAK_VERSION="26.6.4"
 readonly KEYCLOAK_ARCHIVE_SHA256="386b566bbea05527226e275c43e5cf6f218896ad2441ac4be5c39f1226772e8f"
 readonly AGENT_STATUS_URL="http://127.0.0.1:9780/v1/status"
+readonly AGENT_CONTROL_PLANE_GATEWAY_PORT="9781"
 readonly KEYCLOAK_READY_URL="http://127.0.0.1:19000/health/ready"
 readonly MAX_CONFIG_BYTES="65536"
 readonly MAX_SECRET_BYTES="4096"
@@ -221,6 +222,19 @@ read_agent_identity() {
   valid_identifier "$node_id" && valid_private_ipv4 "$vpn_ip"
 }
 
+prefer_local_control_plane_gateway() {
+  local local_gateway="http://${vpn_ip}:${AGENT_CONTROL_PLANE_GATEWAY_PORT}"
+  local configured_url
+  local -a preferred_urls=("$local_gateway")
+
+  for configured_url in "${control_plane_urls[@]}"; do
+    [[ "$configured_url" != "$local_gateway" ]] || continue
+    ((${#preferred_urls[@]} < MAX_CONTROL_PLANE_URLS)) || break
+    preferred_urls+=("$configured_url")
+  done
+  control_plane_urls=("${preferred_urls[@]}")
+}
+
 manifest_value() {
   local key="$1"
   awk -v key="$key" '
@@ -432,11 +446,9 @@ request_reconciliation() {
   attempts="$url_count"
   ((attempts <= MAX_CONTROL_PLANE_ATTEMPTS)) \
     || attempts="$MAX_CONTROL_PLANE_ATTEMPTS"
-  cursor="$(read_nonnegative_state_value "$control_plane_cursor_path" 0)"
-  if [[ ! "$cursor" =~ ^[0-9]{1,2}$ ]] \
-    || ((10#$cursor >= url_count)); then
-    cursor=0
-  fi
+  # The local Agent gateway already tracks the live Control Plane directory.
+  # Always try it first; enrollment-time URLs are bounded fallbacks only.
+  cursor=0
   for ((attempt = 0; attempt < attempts; attempt++)); do
     index="$(((10#$cursor + attempt) % url_count))"
     base="${control_plane_urls[$index]}"
@@ -682,6 +694,7 @@ reconcile_command() {
     expire_local_assignment_if_needed
     return
   fi
+  prefer_local_control_plane_gateway
 
   local eligible=false ready=false
   if replica_inputs_are_ready; then

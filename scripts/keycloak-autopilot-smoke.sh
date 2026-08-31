@@ -422,6 +422,9 @@ assert_active heteronetwork-keycloak-edge-proxy.service
   == "$((agent_restarts_before_cleanup + 1))" ]] \
   || fail "Agent was not restarted after removing its legacy Keycloak route"
 first_request="$request_dir/1.json"
+[[ "$(reconcile_url_at 1)" \
+  == "http://$vpn_ip:9781/v1/keycloak-autopilot/reconcile" ]] \
+  || fail "autopilot did not prefer the local Agent Control Plane gateway"
 jq -e \
   --arg node_id "$node_id" \
   --arg vpn_ip "$vpn_ip" '
@@ -694,6 +697,8 @@ grep -Fq 'readonly ACTIVATION_TIMEOUT_SECONDS="90"' "$autopilot" \
   || fail "autopilot activation window is not bounded"
 grep -Fq 'readonly MAX_CONTROL_PLANE_ATTEMPTS="$MAX_CONTROL_PLANE_URLS"' "$autopilot" \
   || fail "Control Plane retries do not cover the bounded directory"
+grep -Fq 'prefer_local_control_plane_gateway' "$autopilot" \
+  || fail "autopilot does not prefer the live local Agent gateway"
 grep -Fq "'max-time = 2'" "$autopilot" \
   || fail "a full Control Plane directory scan can outlive the assignment lease"
 grep -Fqx 'ReadWritePaths=-/opt/heteronetwork/keycloak-26.6.4/conf' \
