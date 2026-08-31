@@ -340,12 +340,27 @@ the wrapper uses the production `linux-command` agent backend by default:
 scripts/kind-k8s-smoke.sh
 ```
 
-The pinned [GitHub Actions CI workflow](.github/workflows/ci.yml) runs Rust 1.96.1 formatting,
+Run the non-destructive Keycloak HA end-to-end check from a joined Linux node.
+It follows repeated HeteroCloud OIDC redirects through the rendered login form,
+fetches the referenced CSS and JavaScript, creates a short-lived HeteroNetwork
+device authorization request, and validates both realms on every supplied replica:
+
+```bash
+HETERONETWORK_KEYCLOAK_E2E_BACKEND_URLS='http://10.250.0.1:18080,http://10.250.0.2:18080,http://10.250.0.3:18080,http://10.250.0.4:18080,http://10.250.0.5:18080' \
+HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS=5 \
+scripts/keycloak-ha-e2e.sh
+```
+
+Use `scripts/keycloak-ha-e2e.sh --public-only` outside the VPN. The two-node
+chaos suite runs the complete check against all surviving Keycloak candidates
+before fault injection, while degraded, and again after convergence.
+
+When a release is published, the pinned [GitHub Actions CI workflow](.github/workflows/ci.yml) runs Rust 1.96.1 formatting,
 strict workspace Clippy, all workspace tests, an all-target MSRV 1.88 check, 3/10/1000-node and
 multi-process daemon failover load smoke, a real five-process `ipars init --spawn-daemons`
 bootstrap readiness smoke with relay provisioning enabled by default, the privileged network-namespace suite with kernel
 WireGuard support, the live Docker Compose management and real two-container WireGuard suite, Helm lint/render coverage, and the disposable
-two-node kind integration suite on every `master` push and pull request. Workflow permissions are
+two-node kind integration suite before publishing release containers. Workflow permissions are
 read-only, checkout is pinned by commit, and the kind, kubectl, and Helm binaries used by the live
 Kubernetes job are versioned and SHA-256 verified.
 

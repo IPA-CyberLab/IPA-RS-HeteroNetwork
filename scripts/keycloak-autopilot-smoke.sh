@@ -138,6 +138,13 @@ case "$command_name" in
     unit="${1:-}"
     [[ ! -e "$HETERONETWORK_SMOKE_STATE/fail-${command_name}-${unit}" ]] \
       || exit 1
+    if [[ "$command_name" == "restart" \
+      && "$unit" == "heteronetwork-agent.service" \
+      && " $* " != *" --no-block "* ]]; then
+      # The real units order this oneshot after the Agent. A synchronous
+      # restart would wait for this process and deadlock the transaction.
+      exit 75
+    fi
     : >"$HETERONETWORK_SMOKE_STATE/active/$unit"
     if [[ "$unit" == "heteronetwork-keycloak.service" ]]; then
       : >"$HETERONETWORK_SMOKE_STATE/keycloak-ready"
@@ -210,6 +217,11 @@ case "$url" in
     ;;
   */v1/keycloak-autopilot/reconcile)
     [[ ! -e "$HETERONETWORK_SMOKE_STATE/api-down" ]] || exit 7
+    if [[ -f "$HETERONETWORK_SMOKE_STATE/unavailable-reconcile-urls" ]] \
+      && grep -Fqx "$url" \
+        "$HETERONETWORK_SMOKE_STATE/unavailable-reconcile-urls"; then
+      exit 7
+    fi
     [[ -f "$config" && "$(stat -c '%a' "$config")" == "600" ]] || exit 8
     grep -Fqx \
       "header = \"Authorization: Bearer ${HETERONETWORK_SMOKE_BEARER_TOKEN}\"" \
@@ -448,6 +460,32 @@ jq -e '.eligible == true and .ready == true' "$(latest_request)" >/dev/null \
 second_generation="$(jq -r '.generation' "$(latest_request)")"
 ((second_generation > first_generation)) \
   || fail "reconciliation generation did not increase"
+
+requests_before_selective_outage="$(count_reconcile_requests)"
+cat >"$fake_state/unavailable-reconcile-urls" <<EOF
+http://$vpn_ip:9781/v1/keycloak-autopilot/reconcile
+https://control-1.example.test/v1/keycloak-autopilot/reconcile
+https://control-2.example.test/v1/keycloak-autopilot/reconcile
+EOF
+run_autopilot reconcile
+rm -f "$fake_state/unavailable-reconcile-urls"
+[[ "$(count_reconcile_requests)" == "$((requests_before_selective_outage + 4))" ]] \
+  || fail "autopilot did not continue past stale Control Plane fallbacks"
+expected_fallback_urls=(
+  "http://$vpn_ip:9781/v1/keycloak-autopilot/reconcile"
+  "https://control-1.example.test/v1/keycloak-autopilot/reconcile"
+  "https://control-2.example.test/v1/keycloak-autopilot/reconcile"
+  "https://control-3.example.test/v1/keycloak-autopilot/reconcile"
+)
+for index in "${!expected_fallback_urls[@]}"; do
+  [[ "$(reconcile_url_at "$((requests_before_selective_outage + index + 1))")" \
+    == "${expected_fallback_urls[$index]}" ]] \
+    || fail "stale Control Plane fallback order is wrong"
+done
+assert_active heteronetwork-keycloak.service
+assert_active heteronetwork-keycloak-backchannel.service
+jq -e '.eligible == true and .ready == true' "$(latest_request)" >/dev/null \
+  || fail "a stale Control Plane fallback changed replica readiness"
 
 generation_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/generation"
 rm -f "$generation_path"

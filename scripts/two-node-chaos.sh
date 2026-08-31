@@ -4,6 +4,7 @@ set -uo pipefail
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly DEFAULT_FLOW_REPOSITORY="$(cd -- "${REPOSITORY_ROOT}/../IPA-RS-HeteroCloud-Flow" 2>/dev/null && pwd || true)"
+readonly KEYCLOAK_E2E_SCRIPT="${SCRIPT_DIR}/keycloak-ha-e2e.sh"
 readonly CONFIRMATION="two-node-fault"
 
 execute=false
@@ -226,6 +227,8 @@ done
   || die "Flow E2E script does not exist: $flow_repository/scripts/flow-e2e.mjs"
 [[ -f "$playwright_module/package.json" ]] \
   || die "Playwright module does not exist: $playwright_module"
+[[ -x "$KEYCLOAK_E2E_SCRIPT" ]] \
+  || die "Keycloak HA E2E script is not executable: $KEYCLOAK_E2E_SCRIPT"
 
 if [[ -n "$resume_dir" ]]; then
   output_dir="$resume_dir"
@@ -796,18 +799,44 @@ keycloak_oidc_probe() {
   local attempt
   for attempt in 1 2 3 4 5; do
     if ssh_node "$observer" \
-      "curl -fsS --max-time 10 '$internal' | jq -e '.issuer | contains(\"/realms/heteronetwork\")' >/dev/null"; then
+      "curl -fsS --max-time 10 http://console.heteronetwork.internal:18079/health/ready >/dev/null && curl -fsS --max-time 10 '$internal' | jq -e '.issuer == \"http://console.heteronetwork.internal:18079/realms/heteronetwork\"' >/dev/null"; then
       break
     fi
     ((attempt < 5)) || return 1
     sleep 2
   done
 
-  # Public records use a 60-second TTL. A resolver may retain the address of a
-  # failed ingress node until that TTL expires, so require a successful OIDC
-  # redirect after retrying through one complete cache lifetime.
-  baseline_endpoint_available redirect \
-    'https://heterocloud.mizuame.app/api/v1/auth/oidc/start'
+  # A 303 from the API is insufficient: the selected Keycloak edge can still
+  # have zero live replicas. Follow the redirect and require the login form.
+  "$KEYCLOAK_E2E_SCRIPT" \
+    --public-only \
+    --skip-assets \
+    --skip-registration \
+    --attempts 2 >/dev/null
+}
+
+keycloak_full_e2e_probe() {
+  local observer="$1"
+  local excluded_a="${2:-}"
+  local excluded_b="${3:-}"
+  local node backend_urls="" backend_count=0 encoded remote_command
+
+  for node in "${DATABASE_NODE_NAMES[@]}"; do
+    if [[ "$node" == "$excluded_a" || "$node" == "$excluded_b" ]]; then
+      continue
+    fi
+    [[ -z "$backend_urls" ]] || backend_urls+=,
+    backend_urls+="http://${VPN_ADDRESS[$node]}:18080"
+    backend_count=$((backend_count + 1))
+  done
+  ((backend_count >= 3)) \
+    || die "Keycloak E2E requires at least three surviving replica candidates"
+
+  encoded="$(base64 -w0 "$KEYCLOAK_E2E_SCRIPT")"
+  printf -v remote_command \
+    "printf '%%s' %q | base64 -d | env HETERONETWORK_KEYCLOAK_E2E_BACKEND_URLS=%q HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS=%q HETERONETWORK_KEYCLOAK_E2E_ATTEMPTS=5 bash -s" \
+    "$encoded" "$backend_urls" "$backend_count"
+  ssh_node "$observer" "$remote_command"
 }
 
 external_baseline_probe() {
@@ -1011,7 +1040,8 @@ start_external_monitor() {
       done <<'ENDPOINTS'
 flow-openapi|200|https://flow.heterocloud.mizuame.app/openapi.json
 heterocloud-console|200|https://heterocloud.mizuame.app/
-heterocloud-oidc|303|https://heterocloud.mizuame.app/api/v1/auth/oidc/start
+heterocloud-oidc-start|303|https://heterocloud.mizuame.app/api/v1/auth/oidc/start
+heterocloud-keycloak-discovery|200|https://heterocloud.mizuame.app/id/realms/heterocloud/.well-known/openid-configuration
 ENDPOINTS
       sleep 2
     done
@@ -1181,7 +1211,9 @@ run_baseline() {
   vpn_mesh baseline "${NODE_NAMES[@]}" || die "baseline VPN all-to-all mesh failed"
   pod_network_mesh baseline "${NODE_NAMES[@]}" \
     || die "baseline Pod-network all-to-all mesh failed; see $output_dir/baseline-pod-mesh.log"
-  keycloak_oidc_probe "$observer" || die "baseline Keycloak/OIDC probe failed"
+  keycloak_full_e2e_probe "$observer" \
+    >"$output_dir/baseline-keycloak-e2e.log" 2>&1 \
+    || die "baseline Keycloak/OIDC E2E failed; see $output_dir/baseline-keycloak-e2e.log"
   external_baseline_probe || die "baseline public endpoint probe failed"
   flow_api_write_probe || die "baseline Flow room creation failed"
   flow_e2e_probe all "$output_dir/baseline-flow-normal.log" \
@@ -1293,7 +1325,12 @@ run_pair() {
   fi
   patroni="$(status_word patroni_has_leader)"
   db_write="$(status_word database_write_probe)"
-  oidc="$(status_word keycloak_oidc_probe "$observer")"
+  if keycloak_full_e2e_probe "$observer" "$first" "$second" \
+    >"$case_directory/keycloak-e2e.log" 2>&1; then
+    oidc=PASS
+  else
+    oidc=FAIL
+  fi
   flow_api="$(status_word flow_api_write_probe)"
   flow_normal="$(status_word flow_e2e_probe all "$case_directory/flow-normal.log")"
   flow_relay="$(status_word flow_e2e_probe relay "$case_directory/flow-relay.log")"
@@ -1304,7 +1341,9 @@ run_pair() {
 
   recovery_deadline=$((SECONDS + recovery_timeout_seconds))
   if wait_for_full_recovery "$observer" "$recovery_deadline" \
-    && wait_for_data_plane_recovery "case-${order}-recovered" "$recovery_deadline"; then
+    && wait_for_data_plane_recovery "case-${order}-recovered" "$recovery_deadline" \
+    && keycloak_full_e2e_probe "$observer" \
+      >"$case_directory/recovered-keycloak-e2e.log" 2>&1; then
     recovery=PASS
   else
     recovery=FAIL

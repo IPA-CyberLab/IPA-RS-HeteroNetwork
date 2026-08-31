@@ -439,6 +439,24 @@ Inspect placement through the Web UI or
 node remains an inactive standby while its edge proxy continues forwarding to
 the selected replicas.
 
+After changing placement, ingress, Keycloak, or OIDC configuration, run the
+non-destructive HA E2E from a joined Linux node. A successful run requires the
+public authorization start response and its final login page, protected OIDC
+transaction cookie and PKCE parameters, login assets, private realm discovery,
+device authorization, and both realms on every listed direct replica:
+
+```bash
+HETERONETWORK_KEYCLOAK_E2E_BACKEND_URLS='http://10.250.0.1:18080,http://10.250.0.2:18080,http://10.250.0.3:18080,http://10.250.0.4:18080,http://10.250.0.5:18080' \
+HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS=5 \
+HETERONETWORK_KEYCLOAK_E2E_ATTEMPTS=10 \
+scripts/keycloak-ha-e2e.sh
+```
+
+The direct backend list must contain every currently selected replica; do not
+silently lower `HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS` to pass a degraded
+baseline. `scripts/two-node-chaos.sh` derives the surviving list for each fault
+pair and records complete Keycloak E2E output with that case.
+
 ### Restrict GitHub sign-in to one account
 
 Register a private GitHub App with no repository, organization, account, or
