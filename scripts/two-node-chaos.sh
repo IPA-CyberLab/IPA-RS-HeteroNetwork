@@ -5,6 +5,7 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly DEFAULT_FLOW_REPOSITORY="$(cd -- "${REPOSITORY_ROOT}/../IPA-RS-HeteroCloud-Flow" 2>/dev/null && pwd || true)"
 readonly KEYCLOAK_E2E_SCRIPT="${SCRIPT_DIR}/keycloak-ha-e2e.sh"
+readonly HETEROCLOUD_HA_E2E_SCRIPT="${SCRIPT_DIR}/heterocloud-ha-e2e.sh"
 readonly CONFIRMATION="two-node-fault"
 
 execute=false
@@ -229,6 +230,8 @@ done
   || die "Playwright module does not exist: $playwright_module"
 [[ -x "$KEYCLOAK_E2E_SCRIPT" ]] \
   || die "Keycloak HA E2E script is not executable: $KEYCLOAK_E2E_SCRIPT"
+[[ -x "$HETEROCLOUD_HA_E2E_SCRIPT" ]] \
+  || die "HeteroCloud HA E2E script is not executable: $HETEROCLOUD_HA_E2E_SCRIPT"
 
 if [[ -n "$resume_dir" ]]; then
   output_dir="$resume_dir"
@@ -839,6 +842,17 @@ keycloak_full_e2e_probe() {
   ssh_node "$observer" "$remote_command"
 }
 
+heterocloud_ha_e2e_probe() {
+  local observer="$1"
+  local encoded remote_command
+
+  encoded="$(base64 -w0 "$HETEROCLOUD_HA_E2E_SCRIPT")"
+  printf -v remote_command \
+    "printf '%%s' %q | base64 -d | env KUBECONFIG=/etc/kubernetes/admin.conf HETEROCLOUD_HA_E2E_EXPECTED_READY_NODES=%q HETEROCLOUD_HA_E2E_ATTEMPTS=10 HETEROCLOUD_HA_E2E_ORIGIN_ATTEMPTS=2 HETEROCLOUD_HA_E2E_MIN_ORIGINS=2 bash -s" \
+    "$encoded" "${#NODE_NAMES[@]}"
+  root_node "$observer" "$remote_command"
+}
+
 external_baseline_probe() {
   baseline_endpoint_available 200 'https://flow.heterocloud.mizuame.app/openapi.json' \
     && baseline_endpoint_available 200 'https://heterocloud.mizuame.app/' \
@@ -1214,6 +1228,9 @@ run_baseline() {
   keycloak_full_e2e_probe "$observer" \
     >"$output_dir/baseline-keycloak-e2e.log" 2>&1 \
     || die "baseline Keycloak/OIDC E2E failed; see $output_dir/baseline-keycloak-e2e.log"
+  heterocloud_ha_e2e_probe "$observer" \
+    >"$output_dir/baseline-heterocloud-ha-e2e.log" 2>&1 \
+    || die "baseline HeteroCloud HA E2E failed; see $output_dir/baseline-heterocloud-ha-e2e.log"
   external_baseline_probe || die "baseline public endpoint probe failed"
   flow_api_write_probe || die "baseline Flow room creation failed"
   flow_e2e_probe all "$output_dir/baseline-flow-normal.log" \
@@ -1343,7 +1360,9 @@ run_pair() {
   if wait_for_full_recovery "$observer" "$recovery_deadline" \
     && wait_for_data_plane_recovery "case-${order}-recovered" "$recovery_deadline" \
     && keycloak_full_e2e_probe "$observer" \
-      >"$case_directory/recovered-keycloak-e2e.log" 2>&1; then
+      >"$case_directory/recovered-keycloak-e2e.log" 2>&1 \
+    && heterocloud_ha_e2e_probe "$observer" \
+      >"$case_directory/recovered-heterocloud-ha-e2e.log" 2>&1; then
     recovery=PASS
   else
     recovery=FAIL
