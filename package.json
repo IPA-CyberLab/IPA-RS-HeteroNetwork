@@ -9,7 +9,8 @@
     "test": "npm run test:webui && npm run test:webconsole",
     "test:webui": "node --test webui/src/api.test.mjs webui/src/utils.test.mjs",
     "test:webconsole": "node --test webui/webconsole-route.test.mjs",
-    "test:webui:e2e": "playwright test --config webui/e2e/playwright.config.mjs"
+    "test:webui:e2e": "playwright test --config webui/e2e/playwright.config.mjs",
+    "test:heterocloud:e2e": "node scripts/heterocloud-browser-e2e.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",

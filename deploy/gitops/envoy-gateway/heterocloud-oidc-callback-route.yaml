@@ -1,0 +1,28 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: heterocloud-oidc-callback
+  namespace: heterocloud
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: heterocloud-edge
+      namespace: heterocloud-edge
+      sectionName: http
+  hostnames:
+    - heterocloud.mizuame.app
+    - cloud-a.heterocloud.mizuame.app
+    - cloud-b.heterocloud.mizuame.app
+    - cloud-c.heterocloud.mizuame.app
+    - cloud-d.heterocloud.mizuame.app
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/auth/oidc/
+      backendRefs:
+        - group: gateway.envoyproxy.io
+          kind: Backend
+          name: heterocloud-api
+          weight: 1

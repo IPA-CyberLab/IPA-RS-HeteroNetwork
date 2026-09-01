@@ -12,10 +12,12 @@ resources:
   - gateway.yaml
   - client-traffic-policy.yaml
   - backend-traffic-policy.yaml
+  - oidc-callback-backend-traffic-policy.yaml
   - flow-backend-traffic-policy.yaml
   - redis-primary-proxy.yaml
   - heterocloud-backend.yaml
   - heterocloud-route.yaml
+  - heterocloud-oidc-callback-route.yaml
   - heterocloud-health-route.yaml
   - flow-route.yaml
   - flow-health-route.yaml

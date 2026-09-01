@@ -457,6 +457,22 @@ silently lower `HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS` to pass a degraded
 baseline. `scripts/two-node-chaos.sh` derives the surviving list for each fault
 pair and records complete Keycloak E2E output with that case.
 
+The check above stops at the rendered login form. After an OIDC or edge timeout
+change, also run the credentialed Chromium check from a joined node without a
+published ingress address. It submits the Keycloak form, follows the one-time
+authorization-code callback, and verifies the resulting HeteroCloud session:
+
+```bash
+HETEROCLOUD_BROWSER_E2E_USERNAME='browser-e2e@example.invalid' \
+HETEROCLOUD_BROWSER_E2E_PASSWORD='<test-account-password>' \
+HETEROCLOUD_BROWSER_E2E_ATTEMPTS=20 \
+npm run test:heterocloud:e2e
+```
+
+Use a dedicated test account and inject its password from an operator-managed
+secret. The script never prints the credentials and writes failure screenshots
+under `artifacts/` by default.
+
 ### Restrict GitHub sign-in to one account
 
 Register a private GitHub App with no repository, organization, account, or

@@ -1,0 +1,81 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: heterocloud-oidc-callback
+  namespace: heterocloud
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: heterocloud-oidc-callback
+  # An authorization code is single-use. Retry only failures that happen
+  # before an API replica accepts the request, never a response timeout.
+  retry:
+    numRetries: 3
+    retryOn:
+      triggers:
+        - connect-failure
+        - reset-before-request
+        - refused-stream
+  healthCheck:
+    panicThreshold: 0
+    active:
+      type: HTTP
+      interval: 2s
+      timeout: 1s
+      healthyThreshold: 1
+      unhealthyThreshold: 1
+      http:
+        path: /api/v1/health/live
+        expectedStatuses:
+          - 200
+    passive:
+      interval: 1s
+      baseEjectionTime: 30s
+      consecutive5XxErrors: 2
+      consecutiveGatewayErrors: 2
+      consecutiveLocalOriginFailures: 1
+      maxEjectionPercent: 100
+      splitExternalLocalOriginErrors: true
+  timeout:
+    http:
+      requestTimeout: 30s
+  rateLimit:
+    local:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+    global:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+          shared: true
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 200
+            unit: Second
+          shared: true

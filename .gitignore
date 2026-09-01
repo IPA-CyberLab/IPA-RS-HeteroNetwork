@@ -2,7 +2,7 @@
 /node_modules/
 /playwright-report/
 /test-results/
-/artifacts/chaos/
+/artifacts/
 /core
 __pycache__/
 *.py[cod]
