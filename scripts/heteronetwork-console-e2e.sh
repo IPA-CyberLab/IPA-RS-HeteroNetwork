@@ -101,7 +101,9 @@ jq -e --arg issuer "$expected_verification_issuer" '
 ' "$device" >/dev/null || fail "device authorization response targets the wrong identity realm"
 
 verification_url="$(jq -er '.verification_uri_complete' "$device")"
-code="$(curl "${curl_common[@]}" --output "$work_dir/keycloak.html" \
+code="$(curl "${curl_common[@]}" --location --max-redirs 5 \
+  --cookie-jar "$work_dir/keycloak.cookies" \
+  --cookie "$work_dir/keycloak.cookies" --output "$work_dir/keycloak.html" \
   --write-out '%{http_code}' "$verification_url")" \
   || fail "owner Keycloak verification page is unavailable"
 [[ "$code" == 200 ]] || fail "owner Keycloak verification page returned HTTP $code"

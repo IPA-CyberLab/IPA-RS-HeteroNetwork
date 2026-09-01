@@ -300,6 +300,10 @@ without waiting for the 30-second background poll. The active gateway serves
 the authenticated console only on its VPN address at
 `http://console.heteronetwork.internal/ui/`; split DNS sends the complete
 `heteronetwork.internal` private zone into the tunnel.
+If another service already owns port 80, the rollout helper can install
+`deploy/lighttpd/99-heteronetwork-console.conf` and the matching Agent systemd
+drop-in. Lighttpd keeps serving every other Host and proxies only
+`console.heteronetwork.internal` to the loopback Agent UI.
 Control-only clients are intentionally absent from the normal node table; use
 `ipars_control_plane_clients` or `client_count` to observe their allocation.
 

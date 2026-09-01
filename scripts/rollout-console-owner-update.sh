@@ -38,12 +38,16 @@ readonly cli_source="$stage/target/release/ipars"
 readonly autopilot_source="$stage/scripts/public-services-autopilot.sh"
 readonly auth_reconciler_source="$stage/scripts/reconcile-owner-console-auth.sh"
 readonly e2e_source="$stage/scripts/heteronetwork-console-e2e.sh"
+readonly lighttpd_proxy_source="$stage/deploy/lighttpd/99-heteronetwork-console.conf"
+readonly agent_proxy_drop_in_source="$stage/deploy/systemd/heteronetwork-agent-overlay-proxy.conf"
 for source in \
   "$daemon_source" \
   "$cli_source" \
   "$autopilot_source" \
   "$auth_reconciler_source" \
-  "$e2e_source"; do
+  "$e2e_source" \
+  "$lighttpd_proxy_source" \
+  "$agent_proxy_drop_in_source"; do
   [[ -f "$source" && ! -L "$source" ]] || fail "archive is missing ${source#"$stage/"}"
 done
 [[ "$(sha256sum "$daemon_source" | awk '{print $1}')" == "$daemon_sha256" ]] \
@@ -63,6 +67,43 @@ install_atomically "$autopilot_source" "$install_root/libexec/public-services-au
 install_atomically "$auth_reconciler_source" "$install_root/libexec/reconcile-owner-console-auth.sh"
 install_atomically "$e2e_source" "$install_root/libexec/heteronetwork-console-e2e.sh"
 
+console_is_healthy() {
+  curl --fail --silent --show-error --max-time 2 \
+    --resolve "console.heteronetwork.internal:80:$vpn_ip" \
+    http://console.heteronetwork.internal/v1/web-ui/healthz >/dev/null 2>&1
+}
+
+configure_lighttpd_proxy() {
+  local lighttpd_config=/etc/lighttpd/conf-enabled/99-heteronetwork-console.conf
+  local agent_drop_in=/etc/systemd/system/heteronetwork-agent.service.d/60-overlay-http-proxy.conf
+  [[ "$(systemctl show lighttpd.service --property=LoadState --value 2>/dev/null)" == "loaded" ]] \
+    || return 1
+  systemctl is-active --quiet lighttpd.service || return 1
+  curl --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:9780/v1/web-ui/healthz >/dev/null 2>&1 || return 1
+
+  install -d -o root -g root -m 0755 \
+    /etc/lighttpd/conf-enabled \
+    /etc/systemd/system/heteronetwork-agent.service.d
+  install -o root -g root -m 0644 "$lighttpd_proxy_source" "$lighttpd_config"
+  install -o root -g root -m 0644 "$agent_proxy_drop_in_source" "$agent_drop_in"
+  if ! lighttpd -tt -f /etc/lighttpd/lighttpd.conf; then
+    rm -f "$lighttpd_config" "$agent_drop_in"
+    return 1
+  fi
+  systemctl daemon-reload
+  systemctl restart heteronetwork-agent.service
+  for _ in $(seq 1 30); do
+    if systemctl is-active --quiet heteronetwork-agent.service \
+      && curl --fail --silent --show-error --max-time 2 \
+        http://127.0.0.1:9780/v1/web-ui/healthz >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  systemctl restart lighttpd.service
+}
+
 systemctl restart heteronetwork-agent.service
 for _ in $(seq 1 30); do
   systemctl is-active --quiet heteronetwork-agent.service && break
@@ -71,7 +112,7 @@ done
 systemctl is-active --quiet heteronetwork-agent.service \
   || fail "Agent did not recover after the binary update"
 
-for _ in $(seq 1 45); do
+for _ in $(seq 1 10); do
   if curl --fail --silent --show-error --max-time 2 \
     http://127.0.0.1:9780/v1/web-ui/endpoints >/dev/null 2>&1; then
     break
@@ -85,16 +126,21 @@ curl --fail --silent --show-error --max-time 5 \
 HETERONETWORK_OWNER_EMAIL="${owner_email,,}" \
   "$install_root/libexec/reconcile-owner-console-auth.sh"
 
-for _ in $(seq 1 45); do
-  if curl --fail --silent --show-error --max-time 2 \
-    "http://$vpn_ip/v1/web-ui/healthz" >/dev/null 2>&1; then
+for _ in $(seq 1 10); do
+  if console_is_healthy; then
     break
   fi
   sleep 1
 done
-curl --fail --silent --show-error --max-time 5 \
-  "http://$vpn_ip/v1/web-ui/healthz" >/dev/null \
-  || fail "portless VPN console did not become healthy"
+if ! console_is_healthy; then
+  configure_lighttpd_proxy \
+    || fail "port 80 is occupied and no supported HTTP proxy could be configured"
+fi
+for _ in $(seq 1 20); do
+  console_is_healthy && break
+  sleep 1
+done
+console_is_healthy || fail "portless VPN console did not become healthy"
 [[ "$(sha256sum "$install_root/bin/iparsd" | awk '{print $1}')" == "$daemon_sha256" ]] \
   || fail "installed iparsd checksum changed"
 

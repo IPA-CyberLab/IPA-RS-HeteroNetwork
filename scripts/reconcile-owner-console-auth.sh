@@ -24,6 +24,7 @@ fail() {
   || fail "public-services autopilot is unavailable"
 command -v base64 >/dev/null || fail "base64 is required"
 command -v awk >/dev/null || fail "awk is required"
+command -v systemctl >/dev/null || fail "systemctl is required"
 
 bootstrap_uid="$(stat -c '%u' "$bootstrap_env")"
 bootstrap_mode="$(stat -c '%a' "$bootstrap_env")"
@@ -76,6 +77,11 @@ replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_DEVICE_VERIFICATION_ORIGIN_B64 
 replace_entry HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64 \
   "$(encode "${owner_email,,}")"
 
-"$autopilot"
+if [[ "$(systemctl show heteronetwork-public-services-autopilot.service \
+  --property=LoadState --value 2>/dev/null)" == "loaded" ]]; then
+  systemctl restart heteronetwork-public-services-autopilot.service
+else
+  "$autopilot"
+fi
 printf 'reconcile-owner-console-auth: configured %s for %s via %s\n' \
   "$client_id" "${owner_email,,}" "$verification_origin"
