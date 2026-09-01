@@ -682,7 +682,10 @@ defaults
     timeout connect 1s
     timeout queue 2s
     timeout client 2m
-    timeout server 15s
+    # Credential and authorization-code POSTs are single-use and cannot be
+    # replayed safely. Allow a pressured replica to recover while keeping
+    # idempotent discovery and asset requests on the shorter timeout below.
+    timeout server 30s
     timeout check 2s
 
 frontend heteronetwork_keycloak_edge
