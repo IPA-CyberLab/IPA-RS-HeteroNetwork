@@ -500,7 +500,8 @@ ConditionPathExists=/etc/heteronetwork/kubernetes/node.env
 [Service]
 Type=oneshot
 ExecStart=/opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-discovered-control-plane-backends
-TimeoutStartSec=180s
+ExecStopPost=-/opt/heteronetwork/libexec/kubeadm-ha-node.sh restore-kubelet-after-runtime-recovery
+TimeoutStartSec=300s
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -526,8 +527,8 @@ Description=Periodically reconcile HeteroNetwork Kubernetes API backends
 
 [Timer]
 OnBootSec=15s
-OnUnitInactiveSec=15s
-RandomizedDelaySec=2s
+OnUnitInactiveSec=30s
+RandomizedDelaySec=30s
 AccuracySec=1s
 Unit=heteronetwork-kubeadm-backend-autopilot.service
 
@@ -1849,11 +1850,31 @@ reconcile_discovered_control_plane_backends() {
 
 reconcile_container_runtime() {
   require_command ctr
+  require_command curl
   require_command timeout
   local failure_file="$state_dir/containerd-health-failures"
+  local recovery_marker="$state_dir/containerd-recovery-in-progress"
+  local max_failures=6
   if systemctl is-active --quiet containerd.service \
     && timeout --kill-after=2s 15s \
       ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
+    rm -f "$failure_file"
+    return
+  fi
+
+  # ctr can time out while the runtime and kubelet are still serving normally
+  # on I/O-bound control-plane nodes. Do not turn that transient slowdown into
+  # a simultaneous, destructive runtime restart across the HA cohort.
+  if systemctl is-active --quiet containerd.service \
+    && systemctl is-active --quiet kubelet.service \
+    && timeout --kill-after=2s 5s \
+      curl --fail --silent --show-error \
+        http://127.0.0.1:10248/healthz 2>/dev/null \
+      | grep -Fxq 'ok'; then
+    if [[ -f "$failure_file" ]]; then
+      printf 'containerd CLI probe is slow on %s but kubelet is healthy; preserving the runtime\n' \
+        "$node_name" >&2
+    fi
     rm -f "$failure_file"
     return
   fi
@@ -1877,31 +1898,27 @@ reconcile_container_runtime() {
   [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
   failures=$((failures + 1))
   printf '%s\n' "$failures" | install_from_stdin "$failure_file" 0600
-  if ((failures < 3)); then
-    printf 'containerd health probe failed on %s (%s/3); deferring recovery\n' \
-      "$node_name" "$failures" >&2
+  if ((failures < max_failures)); then
+    printf 'containerd and kubelet health probes failed on %s (%s/%s); deferring recovery\n' \
+      "$node_name" "$failures" "$max_failures" >&2
     return
   fi
   rm -f "$failure_file"
 
-  printf 'containerd failed three health probes on %s; restarting the runtime and kubelet\n' \
-    "$node_name" >&2
-  local kubelet_stopped=true
-  restore_kubelet_after_runtime_recovery() {
-    if [[ "$kubelet_stopped" == "true" ]]; then
-      systemctl start kubelet.service >/dev/null 2>&1 || true
-    fi
-  }
+  printf 'containerd and kubelet failed %s health probes on %s; restarting the runtime and kubelet\n' \
+    "$max_failures" "$node_name" >&2
+  printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    | install_from_stdin "$recovery_marker" 0600
   trap restore_kubelet_after_runtime_recovery EXIT
   trap 'exit 1' HUP INT TERM
   systemctl stop kubelet.service >/dev/null 2>&1 || true
-  if ! timeout --kill-after=5s 30s systemctl restart containerd.service; then
+  if ! timeout --kill-after=5s 120s systemctl restart containerd.service; then
     systemctl kill --kill-who=all --signal=KILL containerd.service >/dev/null 2>&1 || true
     systemctl reset-failed containerd.service >/dev/null 2>&1 || true
-    systemctl start containerd.service
+    timeout --kill-after=5s 120s systemctl start containerd.service
   fi
   systemctl start kubelet.service
-  kubelet_stopped=false
+  rm -f "$recovery_marker"
   trap - EXIT HUP INT TERM
 
   local attempt
@@ -1913,6 +1930,18 @@ reconcile_container_runtime() {
     sleep 2
   done
   die "containerd remained unresponsive after automatic recovery"
+}
+
+restore_kubelet_after_runtime_recovery() {
+  require_root
+  local recovery_marker="$state_dir/containerd-recovery-in-progress"
+  [[ ! -e "$recovery_marker" ]] && return 0
+  [[ -f "$recovery_marker" && ! -L "$recovery_marker" ]] \
+    || die "refusing invalid container runtime recovery marker"
+  systemctl start kubelet.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet kubelet.service; then
+    rm -f "$recovery_marker"
+  fi
 }
 
 install_api_backend_autopilot_command() {
@@ -2632,10 +2661,15 @@ self_test() {
     'ExecStart=/opt/heteronetwork/libexec/kubeadm-ha-node.sh reconcile-discovered-control-plane-backends' \
     <<<"$rendered"
   grep -Fq \
-    'ReadWritePaths=/etc/heteronetwork/kubernetes /etc/systemd/system' \
+    'ExecStopPost=-/opt/heteronetwork/libexec/kubeadm-ha-node.sh restore-kubelet-after-runtime-recovery' \
+    <<<"$rendered"
+  grep -Fq 'TimeoutStartSec=300s' <<<"$rendered"
+  grep -Fq \
+    'ReadWritePaths=/etc/heteronetwork/kubernetes /etc/kubernetes/manifests /etc/systemd/system' \
     <<<"$rendered"
   rendered="$(render_api_backend_autopilot_timer)"
-  grep -Fq 'OnUnitInactiveSec=15s' <<<"$rendered"
+  grep -Fq 'OnUnitInactiveSec=30s' <<<"$rendered"
+  grep -Fq 'RandomizedDelaySec=30s' <<<"$rendered"
   rendered="$(render_overlay_dns_helper)"
   grep -Fq 'resolvectl domain' <<<"$rendered"
   grep -Fq '"~$HETERONETWORK_OVERLAY_DNS_ZONE"' <<<"$rendered"
@@ -2789,6 +2823,7 @@ case "$command" in
   reconcile-control-plane-backends) reconcile_control_plane_backends ;;
   reconcile-discovered-control-plane-backends) reconcile_discovered_control_plane_backends ;;
   install-api-backend-autopilot) install_api_backend_autopilot_command ;;
+  restore-kubelet-after-runtime-recovery) restore_kubelet_after_runtime_recovery ;;
   reconcile-apiserver-etcd) reconcile_apiserver_etcd ;;
   reconcile-pod-routing) reconcile_pod_cidr_routing ;;
   install-flannel) install_flannel ;;
