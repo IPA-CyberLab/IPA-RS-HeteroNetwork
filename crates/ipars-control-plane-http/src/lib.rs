@@ -162,6 +162,7 @@ pub struct NodePublicServicesConfig {
     pub oidc_backchannel_base_url: Option<String>,
     pub oidc_backchannel_fallback_base_urls: Vec<String>,
     pub oidc_scopes: String,
+    pub oidc_device_verification_origin: Option<String>,
     pub oidc_required_email: Option<String>,
 }
 
@@ -795,6 +796,7 @@ pub struct WebUiAuthConfig {
     issuer_url: String,
     client_id: String,
     scopes: String,
+    device_verification_origin: String,
     required_email: Option<String>,
     public_url: Option<String>,
     authorization_endpoint: String,
@@ -946,11 +948,16 @@ impl WebUiAuthConfig {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| format!("failed to build OIDC HTTP client: {error}"))?;
+        let device_verification_origin = Url::parse(&issuer_url)
+            .map_err(|error| format!("issuer URL is invalid: {error}"))?
+            .origin()
+            .ascii_serialization();
         Ok(Self {
             provider,
             issuer_url: issuer_url.clone(),
             client_id,
             scopes,
+            device_verification_origin,
             required_email: None,
             public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
@@ -997,6 +1004,17 @@ impl WebUiAuthConfig {
             return Err("OIDC required email is invalid".to_string());
         }
         self.required_email = Some(email);
+        Ok(self)
+    }
+
+    pub fn with_device_verification_origin(mut self, origin: String) -> Result<Self, String> {
+        let origin = validate_web_auth_base_url(origin, "OIDC device verification origin")?;
+        let parsed = Url::parse(&origin)
+            .map_err(|error| format!("OIDC device verification origin is invalid: {error}"))?;
+        if parsed.path() != "/" {
+            return Err("OIDC device verification origin must not contain a path".to_string());
+        }
+        self.device_verification_origin = parsed.origin().ascii_serialization();
         Ok(self)
     }
 
@@ -1555,6 +1573,7 @@ impl WebUiAuthConfig {
             issuer_url: Some(self.issuer_url.clone()),
             client_id: Some(self.client_id.clone()),
             scopes: Some(self.scopes.clone()),
+            device_verification_origin: Some(self.device_verification_origin.clone()),
             authorization_endpoint: Some(self.authorization_endpoint.clone()),
             device_authorization_endpoint: self.device_authorization_endpoint.clone(),
             token_endpoint: Some(self.token_endpoint.clone()),
@@ -1789,6 +1808,7 @@ struct WebUiPublicConfig {
     issuer_url: Option<String>,
     client_id: Option<String>,
     scopes: Option<String>,
+    device_verification_origin: Option<String>,
     authorization_endpoint: Option<String>,
     device_authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
@@ -2372,6 +2392,7 @@ where
             issuer_url: None,
             client_id: None,
             scopes: None,
+            device_verification_origin: None,
             authorization_endpoint: None,
             device_authorization_endpoint: None,
             token_endpoint: None,
@@ -5241,6 +5262,7 @@ HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64={oidc_auth_base_url}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64={oidc_backchannel_base_url}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64={oidc_backchannel_fallback_base_urls}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64={oidc_scopes}
+HETERONETWORK_PUBLIC_SERVICES_OIDC_DEVICE_VERIFICATION_ORIGIN_B64={oidc_device_verification_origin}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64={oidc_required_email}
 HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64={control_plane_urls}
 HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN={database_autopilot_bearer_token}
@@ -5343,6 +5365,12 @@ fi
         oidc_backchannel_base_url = encode(&oidc_backchannel_base_url),
         oidc_backchannel_fallback_base_urls = encode(&oidc_backchannel_fallback_base_urls),
         oidc_scopes = encode(&config.oidc_scopes),
+        oidc_device_verification_origin = encode(
+            config
+                .oidc_device_verification_origin
+                .as_deref()
+                .unwrap_or_default(),
+        ),
         oidc_required_email = encode(config.oidc_required_email.as_deref().unwrap_or_default()),
         control_plane_urls = encode(&control_plane_urls),
         database_autopilot_bearer_token = database_autopilot_bearer_token,
@@ -9457,6 +9485,7 @@ mod tests {
                 "https://sso-b.example/realms/heteronetwork".to_string()
             ],
             oidc_scopes: "openid profile email".to_string(),
+            oidc_device_verification_origin: Some("https://identity.example".to_string()),
             oidc_required_email: Some("owner@example.com".to_string()),
         });
         let expected_sha256 = enrollment.daemon_binary.sha256.to_string();

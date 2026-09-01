@@ -582,6 +582,13 @@ valid_http_url() {
   esac
 }
 
+valid_http_origin() {
+  valid_http_url "$1" || return 1
+  case "$1" in
+    http://*/*|https://*/*) return 1 ;;
+  esac
+}
+
 valid_optional_email() {
   valid_email_value=$1
   [ -z "$valid_email_value" ] && return 0
@@ -692,6 +699,7 @@ load_bootstrap() {
     HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64 \
     HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64 \
     HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64 \
+    HETERONETWORK_PUBLIC_SERVICES_OIDC_DEVICE_VERIFICATION_ORIGIN_B64 \
     HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64 \
     HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 \
     HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN \
@@ -745,6 +753,9 @@ load_control_bootstrap() {
   oidc_backchannel_fallback_base_urls=$DECODED_VALUE
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64 || return 1
   oidc_scopes=$DECODED_VALUE
+  decode_config_value \
+    HETERONETWORK_PUBLIC_SERVICES_OIDC_DEVICE_VERIFICATION_ORIGIN_B64 || return 1
+  oidc_device_verification_origin=$DECODED_VALUE
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64 || return 1
   oidc_required_email=$DECODED_VALUE
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 || return 1
@@ -762,6 +773,9 @@ load_control_bootstrap() {
   valid_enrollment_trusted_issuer_keys "$enrollment_trusted_issuer_keys" || return 1
   valid_http_url "$oidc_issuer_url" || return 1
   valid_identifier "$oidc_client_id" || return 1
+  if [ -n "$oidc_device_verification_origin" ]; then
+    valid_http_origin "$oidc_device_verification_origin" || return 1
+  fi
   valid_optional_email "$oidc_required_email" || return 1
   case "$oidc_issuer_url" in
     "$managed_keycloak_overlay_origin"/realms/*)
@@ -1154,6 +1168,10 @@ EOF
     write_environment_entry HETERONETWORK_WEB_OIDC_ISSUER_URL "$oidc_issuer_url"
     write_environment_entry HETERONETWORK_WEB_OIDC_CLIENT_ID "$oidc_client_id"
     write_environment_entry HETERONETWORK_WEB_OIDC_SCOPES "$oidc_scopes"
+    if [ -n "$oidc_device_verification_origin" ]; then
+      write_environment_entry HETERONETWORK_WEB_OIDC_DEVICE_VERIFICATION_ORIGIN \
+        "$oidc_device_verification_origin"
+    fi
     if [ -n "$oidc_required_email" ]; then
       write_environment_entry HETERONETWORK_WEB_OIDC_REQUIRED_EMAIL \
         "$oidc_required_email"

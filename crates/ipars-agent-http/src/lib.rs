@@ -515,7 +515,7 @@ struct DeviceAuthorizationProviderResponse {
 struct DeviceLoginProvider {
     device_url: reqwest::Url,
     token_url: reqwest::Url,
-    issuer_origin: String,
+    verification_origin: String,
     host_header: HeaderValue,
     client_id: String,
     scopes: String,
@@ -595,11 +595,36 @@ fn device_login_provider(config: &Value) -> Result<DeviceLoginProvider, String> 
     {
         return Err("OIDC issuer must be an HTTP(S) URL without user information".to_string());
     }
+    let issuer_origin = issuer_url.origin().ascii_serialization();
+    let verification_origin = match config
+        .get("device_verification_origin")
+        .and_then(Value::as_str)
+    {
+        Some(origin) => {
+            if origin.is_empty() || origin.len() > 2048 || origin.contains(char::is_control) {
+                return Err("OIDC device verification origin is invalid".to_string());
+            }
+            let parsed = reqwest::Url::parse(origin)
+                .map_err(|_| "OIDC device verification origin is invalid".to_string())?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || parsed.username() != ""
+                || parsed.password().is_some()
+                || parsed.path() != "/"
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err("OIDC device verification origin is invalid".to_string());
+            }
+            parsed.origin().ascii_serialization()
+        }
+        None => issuer_origin.clone(),
+    };
     let host_header = oidc_host_header(&token_url)?;
     Ok(DeviceLoginProvider {
         device_url,
         token_url,
-        issuer_origin: issuer_url.origin().ascii_serialization(),
+        verification_origin,
         host_header,
         client_id: value("client_id")?,
         scopes: value("scopes")?,
@@ -900,7 +925,7 @@ async fn start_device_login(
         if !matches!(parsed.scheme(), "http" | "https")
             || parsed.username() != ""
             || parsed.password().is_some()
-            || parsed.origin().ascii_serialization() != selected_provider.issuer_origin
+            || parsed.origin().ascii_serialization() != selected_provider.verification_origin
         {
             return Err(AgentError::ControlPlaneClient(
                 "Keycloak returned a device verification URL on an unexpected origin".to_string(),
@@ -4693,6 +4718,7 @@ mod tests {
         base_url: String,
         config_delay: Duration,
         issuer_url: String,
+        allowed_verification_origin: Option<String>,
         verification_origin: String,
         device_authorization_form: Arc<tokio::sync::Mutex<Option<BTreeMap<String, String>>>>,
         device_authorization_failures_remaining: Arc<AtomicUsize>,
@@ -4703,7 +4729,7 @@ mod tests {
 
     async fn web_ui_test_config(State(state): State<WebUiTestBackend>) -> Json<Value> {
         tokio::time::sleep(state.config_delay).await;
-        Json(json!({
+        let mut config = json!({
             "cluster_id": "cluster-a",
             "enabled": true,
             "auth_enabled": true,
@@ -4719,7 +4745,11 @@ mod tests {
             "login_endpoint": "/ui/login",
             "node_enrollment_enabled": true,
             "client_enrollment_enabled": true
-        }))
+        });
+        if let Some(origin) = state.allowed_verification_origin {
+            config["device_verification_origin"] = Value::String(origin);
+        }
+        Json(config)
     }
 
     async fn web_ui_test_device_authorization(
@@ -4844,6 +4874,7 @@ mod tests {
         spawn_web_ui_test_backend_with_options(
             admin_status,
             issuer_url,
+            None,
             verification_origin,
             Duration::ZERO,
         )
@@ -4853,6 +4884,7 @@ mod tests {
     async fn spawn_web_ui_test_backend_with_options(
         admin_status: StatusCode,
         issuer_url: Option<&str>,
+        allowed_verification_origin: Option<&str>,
         verification_origin: Option<&str>,
         config_delay: Duration,
     ) -> Result<(String, WebUiTestBackend, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>>
@@ -4869,6 +4901,7 @@ mod tests {
             issuer_url: issuer_url
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{base_url}/realms/heteronetwork")),
+            allowed_verification_origin: allowed_verification_origin.map(str::to_string),
             verification_origin: verification_origin
                 .map(|origin| origin.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| base_url.clone()),
@@ -5699,10 +5732,31 @@ mod tests {
             Err(error) => panic!("split-origin provider should be valid: {error}"),
         };
         assert_eq!(
-            provider.issuer_origin,
+            provider.verification_origin,
             "http://console.heteronetwork.internal:18079"
         );
         assert_eq!(provider.token_url.origin(), provider.device_url.origin());
+
+        config["device_verification_origin"] =
+            Value::String("https://heterocloud.example".to_string());
+        let provider = device_login_provider(&config)
+            .unwrap_or_else(|error| panic!("public verification origin should be valid: {error}"));
+        assert_eq!(provider.verification_origin, "https://heterocloud.example");
+        for unsafe_origin in [
+            "https://user@heterocloud.example",
+            "https://heterocloud.example/id",
+            "ftp://heterocloud.example",
+        ] {
+            config["device_verification_origin"] = Value::String(unsafe_origin.to_string());
+            assert!(
+                device_login_provider(&config).is_err(),
+                "unsafe verification origin was accepted: {unsafe_origin}"
+            );
+        }
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("device_verification_origin");
 
         for unsafe_issuer in [
             "ftp://console.heteronetwork.internal/realms/heteronetwork",
@@ -5740,7 +5794,7 @@ mod tests {
             "http://10.250.0.6:18079/realms/heteronetwork/protocol/openid-connect/token"
         );
         assert_eq!(
-            provider.issuer_origin,
+            provider.verification_origin,
             "http://console.heteronetwork.internal:18079"
         );
         assert_eq!(provider.host_header, "10.250.0.6:18079");
@@ -5754,6 +5808,7 @@ mod tests {
         for _ in 0..4 {
             let (url, _, task) = spawn_web_ui_test_backend_with_options(
                 StatusCode::OK,
+                None,
                 None,
                 None,
                 Duration::from_millis(500),
@@ -5846,6 +5901,46 @@ mod tests {
             assert_eq!(poll.status(), expected_status);
         }
         assert_eq!(backend.device_token_calls.load(Ordering::SeqCst), 2);
+        backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_login_accepts_configured_public_verification_origin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical_origin = "http://console.heteronetwork.internal:18079";
+        let canonical_issuer = format!("{canonical_origin}/realms/heterocloud");
+        let public_origin = "https://heterocloud.example";
+        let (private_url, backend, backend_task) = spawn_web_ui_test_backend_with_options(
+            StatusCode::OK,
+            Some(&canonical_issuer),
+            Some(public_origin),
+            Some(public_origin),
+            Duration::ZERO,
+        )
+        .await?;
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = router(
+            AgentHttpState::with_control_plane_urls(runtime, vec![private_url])
+                .enable_local_web_ui(true),
+        );
+
+        let start = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/web-ui/auth/device")
+                    .header(header::HOST, "127.0.0.1:9780")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(start.status(), StatusCode::OK);
+        let start: Value = serde_json::from_slice(&to_bytes(start.into_body(), usize::MAX).await?)?;
+        assert_eq!(start["verification_uri"], format!("{public_origin}/verify"));
+        assert_eq!(backend.device_token_calls.load(Ordering::SeqCst), 0);
         backend_task.abort();
         Ok(())
     }

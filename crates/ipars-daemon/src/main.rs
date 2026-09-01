@@ -594,6 +594,8 @@ struct ControlPlaneArgs {
         default_value = "openid profile email"
     )]
     web_oidc_scopes: String,
+    #[arg(long, env = "HETERONETWORK_WEB_OIDC_DEVICE_VERIFICATION_ORIGIN")]
+    web_oidc_device_verification_origin: Option<String>,
     #[arg(long, env = "HETERONETWORK_WEB_OIDC_REQUIRED_EMAIL")]
     web_oidc_required_email: Option<String>,
     #[arg(long, env = "HETERONETWORK_CLUSTER_ID")]
@@ -4808,6 +4810,13 @@ where
         )
         .map_err(anyhow::Error::msg)
         .context("web UI OIDC configuration")?;
+        let auth = match args.web_oidc_device_verification_origin.clone() {
+            Some(origin) => auth
+                .with_device_verification_origin(origin)
+                .map_err(anyhow::Error::msg)
+                .context("web UI OIDC device verification configuration")?,
+            None => auth,
+        };
         let auth = match args.web_oidc_required_email.clone() {
             Some(email) => auth
                 .with_required_email(email)
@@ -5330,6 +5339,7 @@ fn control_plane_node_enrollment_config(
         oidc_backchannel_base_url: args.web_oidc_backchannel_base_url.clone(),
         oidc_backchannel_fallback_base_urls: args.web_oidc_backchannel_fallback_base_urls.clone(),
         oidc_scopes: args.web_oidc_scopes.clone(),
+        oidc_device_verification_origin: args.web_oidc_device_verification_origin.clone(),
         oidc_required_email: args.web_oidc_required_email.clone(),
     };
     NodeEnrollmentConfig::new(

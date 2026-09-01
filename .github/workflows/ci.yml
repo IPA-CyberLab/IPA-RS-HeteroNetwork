@@ -74,6 +74,7 @@ jobs:
           bash -n scripts/keycloak-ha-e2e.sh
           bash -n scripts/heteronetwork-console-e2e.sh
           bash -n scripts/reconcile-owner-console-auth.sh
+          bash -n scripts/rollout-console-owner-update.sh
           node --check scripts/keycloak-ha-e2e-smoke.mjs
           scripts/keycloak-autopilot-smoke.sh
           node scripts/keycloak-ha-e2e-smoke.mjs

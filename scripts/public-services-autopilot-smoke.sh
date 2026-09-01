@@ -183,6 +183,7 @@ HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64=$(b64 '')
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64=$(b64 http://127.0.0.1:18080/realms/heteronetwork)
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64=$(b64 '')
 HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64=$(b64 'openid profile email')
+HETERONETWORK_PUBLIC_SERVICES_OIDC_DEVICE_VERIFICATION_ORIGIN_B64=$(b64 'https://identity.example')
 HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64=$(b64 'owner@example.com')
 HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64=$(b64 'https://seed-a.example,https://seed-b.example')
 HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN=$database_autopilot_token
@@ -490,6 +491,8 @@ grep -q '^HETERONETWORK_WEB_PUBLIC_URL="http://10.250.0.4:19088"$' \
   "$services_env" || fail "automatic Web UI callback escaped the VPN"
 grep -Fqx 'HETERONETWORK_WEB_OIDC_REQUIRED_EMAIL="owner@example.com"' \
   "$services_env" || fail "OIDC owner identity constraint was not preserved"
+grep -Fqx 'HETERONETWORK_WEB_OIDC_DEVICE_VERIFICATION_ORIGIN="https://identity.example"' \
+  "$services_env" || fail "OIDC device verification origin was not preserved"
 grep -Fqx 'HETERONETWORK_NODE_ENROLLMENT_ENABLED="true"' "$services_env" ||
   fail "explicitly provisioned enrollment signer was not enabled"
 grep -Fqx \

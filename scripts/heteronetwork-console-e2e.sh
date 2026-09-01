@@ -5,6 +5,8 @@ readonly console_url="${HETERONETWORK_CONSOLE_E2E_URL:-http://console.heteronetw
 readonly owner_url="${HETERONETWORK_CONSOLE_E2E_OWNER_URL:-http://owner.heteronetwork.internal:21443}"
 readonly expected_issuer="${HETERONETWORK_CONSOLE_E2E_ISSUER:-http://console.heteronetwork.internal:18079/realms/heterocloud}"
 readonly expected_client_id="${HETERONETWORK_CONSOLE_E2E_CLIENT_ID:-ipars-web}"
+readonly expected_verification_origin="${HETERONETWORK_CONSOLE_E2E_VERIFICATION_ORIGIN:-https://heterocloud.mizuame.app}"
+readonly expected_verification_issuer="${HETERONETWORK_CONSOLE_E2E_VERIFICATION_ISSUER:-${expected_verification_origin}/id/realms/heterocloud}"
 readonly node_ips_csv="${HETERONETWORK_CONSOLE_E2E_NODE_IPS:-}"
 
 fail() {
@@ -42,7 +44,7 @@ probe_console_origin() {
     --dump-header "$headers" --output "$body" --write-out '%{http_code}' \
     "$console_url/")" || fail "$label console root request failed"
   [[ "$code" == 307 ]] || fail "$label console root returned HTTP $code"
-  grep -Eqi '^location: /ui/\r?$' "$headers" \
+  tr -d '\r' <"$headers" | grep -Fqix 'location: /ui/' \
     || fail "$label console root did not redirect to /ui/"
 
   code="$(curl "${curl_common[@]}" "${resolve[@]}" \
@@ -67,15 +69,18 @@ curl "${curl_common[@]}" --fail --output "$config" "$console_url/ui/config" \
   || fail "console auth configuration is unavailable"
 jq -e \
   --arg issuer "$expected_issuer" \
-  --arg client_id "$expected_client_id" '
+  --arg client_id "$expected_client_id" \
+  --arg verification_origin "$expected_verification_origin" '
     .auth_enabled == true
     and .provider == "keycloak"
     and .issuer_url == $issuer
     and .client_id == $client_id
+    and .device_verification_origin == $verification_origin
     and .device_login_endpoint == "/v1/web-ui/auth/device"
     and .device_login_poll_endpoint == "/v1/web-ui/auth/device/poll"
     and (.device_authorization_endpoint | startswith($issuer + "/protocol/openid-connect/auth/device"))
-  ' "$config" >/dev/null || fail "console does not use the HeteroCloud owner identity client"
+  ' "$config" >/dev/null \
+  || fail "console does not use the HeteroCloud owner identity client"
 
 device="$work_dir/device.json"
 for attempt in 1 2 3; do
@@ -88,7 +93,7 @@ for attempt in 1 2 3; do
   sleep 2
 done
 [[ "$code" == 200 ]] || fail "device authorization returned HTTP $code"
-jq -e --arg issuer "$expected_issuer" '
+jq -e --arg issuer "$expected_verification_issuer" '
   (.handle | type == "string" and length >= 32)
   and (.user_code | type == "string" and length > 0)
   and .verification_uri == ($issuer + "/device")
