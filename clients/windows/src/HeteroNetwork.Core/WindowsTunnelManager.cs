@@ -444,7 +444,7 @@ public sealed class WindowsTunnelManager
             ? $"[{profile.GatewayVpnIp}]"
             : profile.GatewayVpnIp;
         var uri = new Uri(
-            $"http://{host}:{HeteroNetworkConstants.OverlayWebUiPort}/v1/web-ui/healthz");
+            $"http://{host}/v1/web-ui/healthz");
         try
         {
             using var response = await client.GetAsync(

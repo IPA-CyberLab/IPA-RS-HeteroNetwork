@@ -582,6 +582,25 @@ valid_http_url() {
   esac
 }
 
+valid_optional_email() {
+  valid_email_value=$1
+  [ -z "$valid_email_value" ] && return 0
+  [ "${#valid_email_value}" -le 254 ] || return 1
+  case "$valid_email_value" in
+    *@*@*|@*|*@) return 1 ;;
+    *@*) ;;
+    *) return 1 ;;
+  esac
+  valid_email_local=${valid_email_value%@*}
+  valid_email_domain=${valid_email_value#*@}
+  case "$valid_email_local" in
+    *[!A-Za-z0-9._%+-]*|.*|*.) return 1 ;;
+  esac
+  case "$valid_email_domain" in
+    *[!A-Za-z0-9.-]*|.*|*.|-*|*-) return 1 ;;
+  esac
+}
+
 valid_url_csv() {
   valid_url_csv_value=$1
   valid_url_csv_allow_empty=$2
@@ -673,6 +692,7 @@ load_bootstrap() {
     HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64 \
     HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64 \
     HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64 \
+    HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64 \
     HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 \
     HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN \
     HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN \
@@ -725,6 +745,8 @@ load_control_bootstrap() {
   oidc_backchannel_fallback_base_urls=$DECODED_VALUE
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64 || return 1
   oidc_scopes=$DECODED_VALUE
+  decode_config_value HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64 || return 1
+  oidc_required_email=$DECODED_VALUE
   decode_config_value HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64 || return 1
   bootstrap_control_plane_urls=$DECODED_VALUE
 
@@ -740,6 +762,7 @@ load_control_bootstrap() {
   valid_enrollment_trusted_issuer_keys "$enrollment_trusted_issuer_keys" || return 1
   valid_http_url "$oidc_issuer_url" || return 1
   valid_identifier "$oidc_client_id" || return 1
+  valid_optional_email "$oidc_required_email" || return 1
   case "$oidc_issuer_url" in
     "$managed_keycloak_overlay_origin"/realms/*)
       managed_realm=${oidc_issuer_url#"$managed_keycloak_overlay_origin"/realms/}
@@ -1131,6 +1154,10 @@ EOF
     write_environment_entry HETERONETWORK_WEB_OIDC_ISSUER_URL "$oidc_issuer_url"
     write_environment_entry HETERONETWORK_WEB_OIDC_CLIENT_ID "$oidc_client_id"
     write_environment_entry HETERONETWORK_WEB_OIDC_SCOPES "$oidc_scopes"
+    if [ -n "$oidc_required_email" ]; then
+      write_environment_entry HETERONETWORK_WEB_OIDC_REQUIRED_EMAIL \
+        "$oidc_required_email"
+    fi
     if [ -n "$oidc_auth_base_url" ]; then
       write_environment_entry HETERONETWORK_WEB_OIDC_AUTH_BASE_URL "$oidc_auth_base_url"
     fi

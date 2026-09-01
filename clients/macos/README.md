@@ -43,7 +43,7 @@ Running the packet tunnel on a Mac still requires a signed Network Extension.
 3. Paste the returned `heteronetwork://import?...` profile into the macOS app
    and select **Import profile**.
 4. Approve the VPN configuration prompt and select **Connect**.
-5. Open `http://console.heteronetwork.internal:9781/ui/` from the app.
+5. Open `http://console.heteronetwork.internal/ui/` from the app.
 
 The Ed25519 identity and WireGuard private keys are generated on the Mac and
 stored as a pending, device-only Keychain item. The SSH registration request

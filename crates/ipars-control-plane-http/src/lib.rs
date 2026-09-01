@@ -162,6 +162,7 @@ pub struct NodePublicServicesConfig {
     pub oidc_backchannel_base_url: Option<String>,
     pub oidc_backchannel_fallback_base_urls: Vec<String>,
     pub oidc_scopes: String,
+    pub oidc_required_email: Option<String>,
 }
 
 macro_rules! prometheus_line {
@@ -794,6 +795,7 @@ pub struct WebUiAuthConfig {
     issuer_url: String,
     client_id: String,
     scopes: String,
+    required_email: Option<String>,
     public_url: Option<String>,
     authorization_endpoint: String,
     device_authorization_endpoint: Option<String>,
@@ -949,6 +951,7 @@ impl WebUiAuthConfig {
             issuer_url: issuer_url.clone(),
             client_id,
             scopes,
+            required_email: None,
             public_url: None,
             authorization_endpoint: endpoint_url(&auth_base_url, authorization_suffix),
             device_authorization_endpoint: device_authorization_suffix
@@ -975,6 +978,25 @@ impl WebUiAuthConfig {
             return Err("web public URL must be an origin without a path".to_string());
         }
         self.public_url = Some(public_url);
+        Ok(self)
+    }
+
+    pub fn with_required_email(mut self, email: String) -> Result<Self, String> {
+        let email = email.trim().to_ascii_lowercase();
+        let Some((local, domain)) = email.split_once('@') else {
+            return Err("OIDC required email must contain one @ separator".to_string());
+        };
+        if email.len() > 254
+            || local.is_empty()
+            || domain.is_empty()
+            || domain.contains('@')
+            || email.chars().any(|character| {
+                character.is_control() || character.is_whitespace() || character == ','
+            })
+        {
+            return Err("OIDC required email is invalid".to_string());
+        }
+        self.required_email = Some(email);
         Ok(self)
     }
 
@@ -1048,13 +1070,19 @@ impl WebUiAuthConfig {
                 };
             if serde_json::from_slice::<Value>(&body)
                 .ok()
-                .and_then(|claims| {
-                    claims
+                .is_some_and(|claims| {
+                    let subject_is_valid = claims
                         .get("sub")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
+                        .is_some_and(|subject| !subject.is_empty());
+                    let identity_is_allowed = self.required_email.as_ref().is_none_or(|required| {
+                        claims
+                            .get("email")
+                            .and_then(Value::as_str)
+                            .is_some_and(|email| email.eq_ignore_ascii_case(required))
+                    });
+                    subject_is_valid && identity_is_allowed
                 })
-                .is_some_and(|subject| !subject.is_empty())
             {
                 return AccessTokenValidation::Valid;
             }
@@ -5213,6 +5241,7 @@ HETERONETWORK_PUBLIC_SERVICES_OIDC_AUTH_BASE_URL_B64={oidc_auth_base_url}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_BASE_URL_B64={oidc_backchannel_base_url}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_BACKCHANNEL_FALLBACK_BASE_URLS_B64={oidc_backchannel_fallback_base_urls}
 HETERONETWORK_PUBLIC_SERVICES_OIDC_SCOPES_B64={oidc_scopes}
+HETERONETWORK_PUBLIC_SERVICES_OIDC_REQUIRED_EMAIL_B64={oidc_required_email}
 HETERONETWORK_PUBLIC_SERVICES_CONTROL_PLANE_URLS_B64={control_plane_urls}
 HETERONETWORK_PUBLIC_SERVICES_DATABASE_AUTOPILOT_BEARER_TOKEN={database_autopilot_bearer_token}
 HETERONETWORK_PUBLIC_SERVICES_KEYCLOAK_AUTOPILOT_BEARER_TOKEN={keycloak_autopilot_bearer_token}
@@ -5314,6 +5343,7 @@ fi
         oidc_backchannel_base_url = encode(&oidc_backchannel_base_url),
         oidc_backchannel_fallback_base_urls = encode(&oidc_backchannel_fallback_base_urls),
         oidc_scopes = encode(&config.oidc_scopes),
+        oidc_required_email = encode(config.oidc_required_email.as_deref().unwrap_or_default()),
         control_plane_urls = encode(&control_plane_urls),
         database_autopilot_bearer_token = database_autopilot_bearer_token,
         keycloak_autopilot_bearer_token = keycloak_autopilot_bearer_token,
@@ -7866,6 +7896,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oidc_management_access_is_limited_to_the_configured_owner_email(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/realms/heterocloud/protocol/openid-connect/userinfo",
+                get(|headers: HeaderMap| async move {
+                    let email = match headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        Some("Bearer owner-token") => Some("Owner@Example.com"),
+                        Some("Bearer other-token") => Some("other@example.com"),
+                        _ => None,
+                    };
+                    Json(match email {
+                        Some(email) => serde_json::json!({"sub": "user-a", "email": email}),
+                        None => serde_json::json!({"sub": "user-a"}),
+                    })
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "http://console.heteronetwork.internal:18079/realms/heterocloud".to_string(),
+            "ipars-web".to_string(),
+            None,
+            Some(format!("http://{address}/realms/heterocloud")),
+            "openid profile email".to_string(),
+        )?
+        .with_required_email("owner@example.com".to_string())?;
+
+        assert!(config.validate_access_token("owner-token").await);
+        assert!(!config.validate_access_token("other-token").await);
+        assert!(!config.validate_access_token("missing-email-token").await);
+        assert!(WebUiAuthConfig::new(
+            WebAuthProvider::Keycloak,
+            "https://issuer.example/realms/heterocloud".to_string(),
+            "ipars-web".to_string(),
+            None,
+            None,
+            "openid profile email".to_string(),
+        )?
+        .with_required_email("not-an-email".to_string())
+        .is_err());
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn oidc_validation_distinguishes_rejection_from_provider_outage(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
@@ -9375,6 +9457,7 @@ mod tests {
                 "https://sso-b.example/realms/heteronetwork".to_string()
             ],
             oidc_scopes: "openid profile email".to_string(),
+            oidc_required_email: Some("owner@example.com".to_string()),
         });
         let expected_sha256 = enrollment.daemon_binary.sha256.to_string();
         let enrollment_signing_key = enrollment.issuer.signing_key_b64().to_string();

@@ -302,7 +302,7 @@ public sealed class ClientRegistrationProtocolTests
     }
 
     [Theory]
-    [InlineData("https://console.heteronetwork.internal:9781")]
+    [InlineData("https://console.heteronetwork.internal")]
     [InlineData("http://163.220.236.51:19088")]
     [InlineData("http://10.249.0.4:19088")]
     [InlineData("http://[fd00::1]:19088")]

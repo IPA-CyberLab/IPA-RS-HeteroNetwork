@@ -154,7 +154,7 @@ internal static class TestData
             ManagementUrls = managementUrls ??
             [
                 "http://10.250.0.4:19088",
-                "http://console.heteronetwork.internal:9781",
+                "http://console.heteronetwork.internal",
             ],
             EncodedIssuedAt = Now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
             EncodedExpiresAt = (expiresAt ?? Now.AddMinutes(10))

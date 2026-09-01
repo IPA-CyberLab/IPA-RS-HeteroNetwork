@@ -57,7 +57,7 @@ const MAX_SERVICE_DIRECTORY_LEASE_SECONDS: i64 = 300;
 const MAX_CLIENT_REGISTRATION_LINK_BYTES: usize = 128 * 1024;
 const MAX_CLIENT_REGISTRATION_FUTURE_SKEW_SECONDS: i64 = 5 * 60;
 const DEFAULT_INSTALLED_AGENT_STATE_PATH: &str = "/var/lib/heteronetwork/agent.json";
-const PRIVATE_OVERLAY_CONSOLE_URL: &str = "http://console.heteronetwork.internal:9781";
+const PRIVATE_OVERLAY_CONSOLE_URL: &str = "http://console.heteronetwork.internal";
 const SANITIZED_INIT_DAEMON_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SANITIZED_INIT_DAEMON_LOCALE: &str = "C";
@@ -3877,7 +3877,7 @@ fn validate_and_sanitize_sponsored_client_response(
             IpAddr::V4(ip) => ip.to_string(),
             IpAddr::V6(ip) => format!("[{ip}]"),
         };
-        management_urls.push(format!("http://{host}:9781"));
+        management_urls.push(format!("http://{host}"));
     }
     let mut seen = BTreeSet::new();
     management_urls.retain(|url| seen.insert(url.clone()));

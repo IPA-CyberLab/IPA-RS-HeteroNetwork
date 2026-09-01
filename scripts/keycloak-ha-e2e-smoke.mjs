@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const checker = path.join(scriptDirectory, "keycloak-ha-e2e.sh");
 let baseUrl = "";
+let privateBaseUrl = "";
 let failureMode = "healthy";
 
 function discovery(issuer) {
@@ -26,7 +27,7 @@ function json(response, status, body) {
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, baseUrl);
   const publicIssuer = `${baseUrl}/id/realms/heterocloud`;
-  const privateIssuer = `${baseUrl}/realms/heteronetwork`;
+  const privateIssuer = `${privateBaseUrl}/realms/heterocloud`;
 
   if (url.pathname === "/api/v1/auth/oidc/start") {
     const target = new URL(`${publicIssuer}/protocol/openid-connect/auth`);
@@ -102,18 +103,19 @@ const server = http.createServer((request, response) => {
     return;
   }
 
-  if (url.pathname === "/realms/heteronetwork/.well-known/openid-configuration") {
+  if (url.pathname === "/realms/heterocloud/.well-known/openid-configuration") {
     if (failureMode === "backend" && request.headers["x-forwarded-host"]) {
       response.writeHead(503, { "content-type": "text/plain" });
       response.end("backend unavailable");
       return;
     }
-    json(response, 200, discovery(privateIssuer));
-    return;
-  }
-
-  if (url.pathname === "/realms/heterocloud/.well-known/openid-configuration") {
-    json(response, 200, discovery(publicIssuer));
+    const requestedHost =
+      request.headers["x-forwarded-host"] || request.headers.host || "";
+    json(
+      response,
+      200,
+      discovery(requestedHost.startsWith("localhost:") ? privateIssuer : publicIssuer),
+    );
     return;
   }
 
@@ -142,7 +144,7 @@ async function runChecker(extraArguments = []) {
     "--public-base-url",
     baseUrl,
     "--private-edge-url",
-    baseUrl,
+    privateBaseUrl,
     "--agent-gateway-url",
     baseUrl,
     "--backend-url",
@@ -180,6 +182,7 @@ await new Promise((resolve, reject) => {
 const address = server.address();
 assert(address && typeof address === "object");
 baseUrl = `http://127.0.0.1:${address.port}`;
+privateBaseUrl = `http://localhost:${address.port}`;
 
 try {
   const healthy = await runChecker();

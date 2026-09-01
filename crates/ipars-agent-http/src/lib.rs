@@ -372,11 +372,19 @@ pub fn overlay_web_ui_router(
     listen: std::net::SocketAddr,
     dns_name: &str,
 ) -> Router {
-    let ip_origin = match listen.ip() {
-        IpAddr::V4(ip) => format!("http://{ip}:{}", listen.port()),
-        IpAddr::V6(ip) => format!("http://[{ip}]:{}", listen.port()),
+    let ip_host = match listen.ip() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
     };
-    let dns_origin = format!("http://{dns_name}:{}", listen.port());
+    let origin = |host: &str| {
+        if listen.port() == 80 {
+            format!("http://{host}")
+        } else {
+            format!("http://{host}:{}", listen.port())
+        }
+    };
+    let ip_origin = origin(&ip_host);
+    let dns_origin = origin(dns_name);
     gateway_web_ui_routes()
         .route("/metrics", get(prometheus_metrics))
         .route_layer(middleware::from_fn_with_state(
@@ -5445,6 +5453,52 @@ mod tests {
         assert_eq!(agent_api.status(), StatusCode::NOT_FOUND);
         service_task.abort();
         control_plane_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlay_web_ui_accepts_the_canonical_portless_origin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Arc::new(AgentRuntime::new(
+            AgentNodeState::generate(Utc::now()),
+            ClusterPolicy::default(),
+        ));
+        let app = overlay_web_ui_router(
+            AgentHttpState::new(runtime),
+            "10.250.0.1:80".parse()?,
+            "console.heteronetwork.internal",
+        );
+
+        for host in [
+            "console.heteronetwork.internal",
+            "console.heteronetwork.internal:80",
+            "10.250.0.1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::HOST, host)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(
+                response.headers().get(header::LOCATION),
+                Some(&HeaderValue::from_static("/ui/"))
+            );
+        }
+
+        let legacy_port = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "console.heteronetwork.internal:9781")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(legacy_port.status(), StatusCode::FORBIDDEN);
         Ok(())
     }
 

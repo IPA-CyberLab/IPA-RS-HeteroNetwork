@@ -12,13 +12,13 @@ public enum HeteroNetworkConstants {
     public static let sessionSchemaVersion = 1
     public static let overlayDNSZone = "heteronetwork.internal"
     public static let overlayDNSName = "console.\(overlayDNSZone)"
-    public static let overlayWebUIPort = 9781
+    public static let overlayWebUIPort = 80
     public static let gatewayRefreshIntervalNanoseconds: UInt64 = 5_000_000_000
     public static let gatewayFailureThreshold = 2
     public static let gatewayFailureCooldown: TimeInterval = 60
 
     public static var overlayWebUIURL: URL {
-        URL(string: "http://\(overlayDNSName):\(overlayWebUIPort)/ui/")!
+        URL(string: "http://\(overlayDNSName)/ui/")!
     }
 
     public static var keychainAccessGroup: String? {

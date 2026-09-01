@@ -11,9 +11,9 @@ public static class HeteroNetworkConstants
     public const string OverlayDnsZone = "heteronetwork.internal";
     public const string OverlayDnsNamespace = "." + OverlayDnsZone;
     public const string OverlayDnsName = "console." + OverlayDnsZone;
-    public const int OverlayWebUiPort = 9781;
+    public const int OverlayWebUiPort = 80;
     public static readonly Uri OverlayWebUiUri =
-        new($"http://{OverlayDnsName}:{OverlayWebUiPort}/ui/");
+        new($"http://{OverlayDnsName}/ui/");
 }
 
 [JsonConverter(typeof(JsonStringEnumConverter<BootstrapEndpointKind>))]

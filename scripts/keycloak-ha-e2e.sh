@@ -5,14 +5,14 @@ umask 077
 
 public_base_url="${HETERONETWORK_KEYCLOAK_E2E_PUBLIC_BASE_URL:-https://heterocloud.mizuame.app}"
 private_edge_url="${HETERONETWORK_KEYCLOAK_E2E_PRIVATE_EDGE_URL:-http://console.heteronetwork.internal:18079}"
-agent_gateway_url="${HETERONETWORK_KEYCLOAK_E2E_AGENT_GATEWAY_URL:-http://console.heteronetwork.internal:9781}"
+agent_gateway_url="${HETERONETWORK_KEYCLOAK_E2E_AGENT_GATEWAY_URL:-http://console.heteronetwork.internal}"
 backend_urls_csv="${HETERONETWORK_KEYCLOAK_E2E_BACKEND_URLS:-}"
 attempts="${HETERONETWORK_KEYCLOAK_E2E_ATTEMPTS:-10}"
 required_backends="${HETERONETWORK_KEYCLOAK_E2E_REQUIRED_BACKENDS:-0}"
 connect_timeout_seconds="${HETERONETWORK_KEYCLOAK_E2E_CONNECT_TIMEOUT_SECONDS:-5}"
 request_timeout_seconds="${HETERONETWORK_KEYCLOAK_E2E_REQUEST_TIMEOUT_SECONDS:-20}"
 public_realm="${HETERONETWORK_KEYCLOAK_E2E_PUBLIC_REALM:-heterocloud}"
-private_realm="${HETERONETWORK_KEYCLOAK_E2E_PRIVATE_REALM:-heteronetwork}"
+private_realm="${HETERONETWORK_KEYCLOAK_E2E_PRIVATE_REALM:-heterocloud}"
 public_client_id="${HETERONETWORK_KEYCLOAK_E2E_PUBLIC_CLIENT_ID:-heterocloud-web}"
 public_keycloak_prefix="${HETERONETWORK_KEYCLOAK_E2E_PUBLIC_KEYCLOAK_PREFIX:-/id}"
 check_public=true

@@ -594,6 +594,8 @@ struct ControlPlaneArgs {
         default_value = "openid profile email"
     )]
     web_oidc_scopes: String,
+    #[arg(long, env = "HETERONETWORK_WEB_OIDC_REQUIRED_EMAIL")]
+    web_oidc_required_email: Option<String>,
     #[arg(long, env = "HETERONETWORK_CLUSTER_ID")]
     cluster_id: String,
     #[arg(long, env = "HETERONETWORK_VPN_POOL", default_value = "10.250.0.0/16")]
@@ -1017,7 +1019,7 @@ struct AgentArgs {
     #[arg(
         long,
         env = "HETERONETWORK_AGENT_OVERLAY_WEB_UI_PORT",
-        default_value_t = 9781
+        default_value_t = 80
     )]
     overlay_web_ui_port: u16,
     #[arg(
@@ -4806,6 +4808,13 @@ where
         )
         .map_err(anyhow::Error::msg)
         .context("web UI OIDC configuration")?;
+        let auth = match args.web_oidc_required_email.clone() {
+            Some(email) => auth
+                .with_required_email(email)
+                .map_err(anyhow::Error::msg)
+                .context("web UI OIDC required identity configuration")?,
+            None => auth,
+        };
         let auth = match args.web_public_url.clone() {
             Some(public_url) => auth
                 .with_public_url(public_url)
@@ -5321,6 +5330,7 @@ fn control_plane_node_enrollment_config(
         oidc_backchannel_base_url: args.web_oidc_backchannel_base_url.clone(),
         oidc_backchannel_fallback_base_urls: args.web_oidc_backchannel_fallback_base_urls.clone(),
         oidc_scopes: args.web_oidc_scopes.clone(),
+        oidc_required_email: args.web_oidc_required_email.clone(),
     };
     NodeEnrollmentConfig::new(
         issuer,
