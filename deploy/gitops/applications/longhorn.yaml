@@ -25,6 +25,7 @@ spec:
           defaultReplicaCount: "3"
           replicaAutoBalance: best-effort
           storageMinimalAvailablePercentage: "15"
+          storageReservedPercentageForDefaultDisk: "20"
           nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod
           nodeDrainPolicy: block-if-contains-last-replica
           orphanAutoDeletion: "true"
