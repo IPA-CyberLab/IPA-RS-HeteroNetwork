@@ -4,6 +4,10 @@ set -euo pipefail
 readonly NAMESPACE="${SYOUYU_NAMESPACE:-heterocloud-syouyu}"
 readonly SECRET_NAME="${SYOUYU_SECRET_NAME:-heterocloud-syouyu-secrets}"
 readonly CLOUD_NAMESPACE="${HETEROCLOUD_NAMESPACE:-heterocloud}"
+readonly CLOUD_ACCESS_SECRET_NAME="${HETEROCLOUD_SYOUYU_ACCESS_SECRET_NAME:-heterocloud-syouyu-access}"
+readonly CLOUD_ACCESS_SECRET_KEY="${HETEROCLOUD_SYOUYU_ACCESS_SECRET_KEY:-hmac-secret}"
+readonly CLOUD_API_DEPLOYMENT="${HETEROCLOUD_API_DEPLOYMENT:-heterocloud}"
+readonly CLOUD_OWNER_DEPLOYMENT="${HETEROCLOUD_OWNER_DEPLOYMENT:-heterocloud-owner-console}"
 readonly PROVIDER_SECRET_NAME="${HETEROCLOUD_PROVIDER_SECRET_NAME:-heterocloud-provider-signing}"
 readonly PROVIDER_PRIVATE_KEY_KEY="${HETEROCLOUD_PROVIDER_PRIVATE_KEY_KEY:-ed25519-private.pem}"
 readonly PROVIDER_KEY_ID="${HETEROCLOUD_PROVIDER_KEY_ID:-heterocloud-provider-1}"
@@ -18,7 +22,7 @@ readonly API_DEPLOYMENT="${SYOUYU_API_DEPLOYMENT:-heterocloud-syouyu-api}"
 readonly GARAGE_STATEFULSET="${SYOUYU_GARAGE_STATEFULSET:-heterocloud-syouyu-garage}"
 
 if [[ ${EUID} -ne 0 ]]; then
-  exec sudo --preserve-env=KUBECONFIG,SYOUYU_NAMESPACE,SYOUYU_SECRET_NAME,HETEROCLOUD_NAMESPACE,HETEROCLOUD_PROVIDER_SECRET_NAME,HETEROCLOUD_PROVIDER_PRIVATE_KEY_KEY,HETEROCLOUD_PROVIDER_KEY_ID,SYOUYU_DB_ROLE,SYOUYU_DB_NAME,SYOUYU_DB_BOOTSTRAP_HOST,SYOUYU_DB_SERVICE_HOST,SYOUYU_DB_PORT,SYOUYU_DB_SUPERUSER,POSTGRES_SUPERUSER_PASSWORD_FILE,SYOUYU_API_DEPLOYMENT,SYOUYU_GARAGE_STATEFULSET \
+  exec sudo --preserve-env=KUBECONFIG,SYOUYU_NAMESPACE,SYOUYU_SECRET_NAME,HETEROCLOUD_NAMESPACE,HETEROCLOUD_SYOUYU_ACCESS_SECRET_NAME,HETEROCLOUD_SYOUYU_ACCESS_SECRET_KEY,HETEROCLOUD_API_DEPLOYMENT,HETEROCLOUD_OWNER_DEPLOYMENT,HETEROCLOUD_PROVIDER_SECRET_NAME,HETEROCLOUD_PROVIDER_PRIVATE_KEY_KEY,HETEROCLOUD_PROVIDER_KEY_ID,SYOUYU_DB_ROLE,SYOUYU_DB_NAME,SYOUYU_DB_BOOTSTRAP_HOST,SYOUYU_DB_SERVICE_HOST,SYOUYU_DB_PORT,SYOUYU_DB_SUPERUSER,POSTGRES_SUPERUSER_PASSWORD_FILE,SYOUYU_API_DEPLOYMENT,SYOUYU_GARAGE_STATEFULSET \
     "${BASH_SOURCE[0]}" "$@"
 fi
 
@@ -38,6 +42,10 @@ done
   || fail "SYOUYU_NAMESPACE must be a Kubernetes DNS label"
 [[ ${SECRET_NAME} =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] \
   || fail "SYOUYU_SECRET_NAME must be a Kubernetes DNS subdomain"
+[[ ${CLOUD_ACCESS_SECRET_NAME} =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] \
+  || fail "HETEROCLOUD_SYOUYU_ACCESS_SECRET_NAME must be a Kubernetes DNS subdomain"
+[[ ${CLOUD_ACCESS_SECRET_KEY} =~ ^[-._a-zA-Z0-9]+$ ]] \
+  || fail "HETEROCLOUD_SYOUYU_ACCESS_SECRET_KEY is invalid"
 [[ ${DB_ROLE} =~ ^[A-Za-z_][A-Za-z0-9_]*$ && ${DB_NAME} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
   || fail "database role and name must be SQL identifiers"
 [[ ${DB_PORT} =~ ^[0-9]+$ ]] && ((DB_PORT >= 1 && DB_PORT <= 65535)) \
@@ -101,10 +109,14 @@ provider_public_keys_json="$(jq -cn \
   '{($kid): $public_key}')"
 
 existing_secret="$(secret_document "${NAMESPACE}" "${SECRET_NAME}")"
+cloud_access_secret="$(secret_document "${CLOUD_NAMESPACE}" "${CLOUD_ACCESS_SECRET_NAME}")"
 existing_database_url="$(secret_value_from_document "${existing_secret}" database-url)"
 database_password="$(secret_value_from_document "${existing_secret}" database-password)"
 receipt_encryption_key="$(secret_value_from_document "${existing_secret}" receipt-encryption-key-base64)"
 principal_context_hmac_secret="$(secret_value_from_document "${existing_secret}" principal-context-hmac-secret)"
+if [[ -z ${principal_context_hmac_secret} ]]; then
+  principal_context_hmac_secret="$(secret_value_from_document "${cloud_access_secret}" "${CLOUD_ACCESS_SECRET_KEY}")"
+fi
 garage_rpc_secret="$(secret_value_from_document "${existing_secret}" garage-rpc-secret)"
 garage_admin_token="$(secret_value_from_document "${existing_secret}" garage-admin-token)"
 garage_metrics_token="$(secret_value_from_document "${existing_secret}" garage-metrics-token)"
@@ -207,6 +219,11 @@ for key in garage-rpc-secret garage-admin-token garage-metrics-token; do
   fi
 done
 
+cloud_access_secret_changed=false
+if [[ "$(secret_value_from_document "${cloud_access_secret}" "${CLOUD_ACCESS_SECRET_KEY}")" != "${principal_context_hmac_secret}" ]]; then
+  cloud_access_secret_changed=true
+fi
+
 kubectl -n "${NAMESPACE}" create secret generic "${SECRET_NAME}" \
   --from-file="${runtime_directory}/database-url" \
   --from-file="${runtime_directory}/database-password" \
@@ -219,6 +236,11 @@ kubectl -n "${NAMESPACE}" create secret generic "${SECRET_NAME}" \
   --dry-run=client -o yaml |
   kubectl apply --field-manager=heteronetwork-bootstrap -f - >/dev/null
 
+kubectl -n "${CLOUD_NAMESPACE}" create secret generic "${CLOUD_ACCESS_SECRET_NAME}" \
+  --from-file="${CLOUD_ACCESS_SECRET_KEY}=${runtime_directory}/principal-context-hmac-secret" \
+  --dry-run=client -o yaml |
+  kubectl apply --field-manager=heteronetwork-bootstrap -f - >/dev/null
+
 if [[ ${runtime_secret_changed} == true ]] \
   && kubectl -n "${NAMESPACE}" get deployment "${API_DEPLOYMENT}" >/dev/null 2>&1; then
   kubectl -n "${NAMESPACE}" rollout restart "deployment/${API_DEPLOYMENT}" >/dev/null
@@ -227,8 +249,16 @@ if [[ ${garage_secret_changed} == true ]] \
   && kubectl -n "${NAMESPACE}" get statefulset "${GARAGE_STATEFULSET}" >/dev/null 2>&1; then
   kubectl -n "${NAMESPACE}" rollout restart "statefulset/${GARAGE_STATEFULSET}" >/dev/null
 fi
+if [[ ${cloud_access_secret_changed} == true ]]; then
+  for deployment in "${CLOUD_API_DEPLOYMENT}" "${CLOUD_OWNER_DEPLOYMENT}"; do
+    if kubectl -n "${CLOUD_NAMESPACE}" get deployment "${deployment}" >/dev/null 2>&1; then
+      kubectl -n "${CLOUD_NAMESPACE}" rollout restart "deployment/${deployment}" >/dev/null
+    fi
+  done
+fi
 
 printf '%s\n' \
   'Syouyu PostgreSQL role, database, and runtime Secret reconciled.' \
+  "Principal HMAC key was synchronized to ${CLOUD_NAMESPACE}/${CLOUD_ACCESS_SECRET_NAME}." \
   'Existing generated credentials were preserved.' \
   "Provider public key was derived from ${CLOUD_NAMESPACE}/${PROVIDER_SECRET_NAME}."
