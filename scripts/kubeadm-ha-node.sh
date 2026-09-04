@@ -26,6 +26,7 @@ readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
 readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly ETCD_HEARTBEAT_INTERVAL_MILLISECONDS="500"
 readonly ETCD_ELECTION_TIMEOUT_MILLISECONDS="5000"
+readonly ETCD_LIVENESS_FAILURE_THRESHOLD="30"
 readonly ETCD_STARTUP_FAILURE_THRESHOLD="180"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
@@ -1631,6 +1632,7 @@ reconcile_etcd_resources() {
   if ! awk \
     -v heartbeat="$ETCD_HEARTBEAT_INTERVAL_MILLISECONDS" \
     -v election="$ETCD_ELECTION_TIMEOUT_MILLISECONDS" \
+    -v liveness_threshold="$ETCD_LIVENESS_FAILURE_THRESHOLD" \
     -v startup_threshold="$ETCD_STARTUP_FAILURE_THRESHOLD" '
     BEGIN {
       resources = 0
@@ -1638,6 +1640,8 @@ reconcile_etcd_resources() {
       cpu = 0
       memory = 0
       peer_urls = 0
+      liveness_probes = 0
+      liveness_failures = 0
       startup_probes = 0
       startup_failures = 0
     }
@@ -1655,6 +1659,13 @@ reconcile_etcd_resources() {
     in_requests && /^        cpu:/ { cpu++; print "        cpu: 500m"; next }
     in_requests && /^        memory:/ { memory++; print "        memory: 512Mi"; next }
     in_resources && /^    [a-zA-Z]/ { in_resources = 0; in_requests = 0 }
+    /^    livenessProbe:$/ { liveness_probes++; in_liveness_probe = 1; print; next }
+    in_liveness_probe && /^      failureThreshold:/ {
+      liveness_failures++
+      print "      failureThreshold: " liveness_threshold
+      next
+    }
+    in_liveness_probe && /^    [a-zA-Z]/ { in_liveness_probe = 0 }
     /^    startupProbe:$/ { startup_probes++; in_startup_probe = 1; print; next }
     in_startup_probe && /^      failureThreshold:/ {
       startup_failures++
@@ -1665,6 +1676,7 @@ reconcile_etcd_resources() {
     { print }
     END {
       if (resources != 1 || requests != 1 || cpu != 1 || memory != 1 || peer_urls != 1 ||
+          liveness_probes != 1 || liveness_failures != 1 ||
           startup_probes != 1 || startup_failures != 1) exit 1
     }
   ' "$manifest" >"$temporary"; then
