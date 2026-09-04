@@ -102,11 +102,7 @@ spec:
 
         monitoring:
           serviceMonitor:
-            enabled: true
-            labels:
-              release: heterocloud-flow
-            interval: 30s
-            scrapeTimeout: 10s
+            enabled: false
 
         networkPolicy:
           enabled: true
