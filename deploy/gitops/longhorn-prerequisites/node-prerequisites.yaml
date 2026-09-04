@@ -47,6 +47,19 @@ spec:
                 fi
                 systemctl enable --now iscsid
                 modprobe iscsi_tcp
+                if command -v multipath >/dev/null 2>&1; then
+                  touch /etc/multipath.conf
+                  sed -i "/^# BEGIN HETEROCLOUD LONGHORN$/,/^# END HETEROCLOUD LONGHORN$/d" \
+                    /etc/multipath.conf
+                  printf "%s\n" \
+                    "# BEGIN HETEROCLOUD LONGHORN" \
+                    "blacklist {" \
+                    "    devnode \"^sd[a-z0-9]+\"" \
+                    "}" \
+                    "# END HETEROCLOUD LONGHORN" \
+                    >>/etc/multipath.conf
+                  systemctl restart multipathd.service
+                fi
               '
           volumeMounts:
             - name: host-root
