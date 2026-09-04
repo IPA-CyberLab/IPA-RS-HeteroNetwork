@@ -56,10 +56,10 @@ spec:
               size: 5Gi
             data:
               storageClass: longhorn-syouyu-local
-              size: 100Gi
+              size: 70Gi
           layout:
             enabled: true
-            capacityBytesPerNode: 90000000000
+            capacityBytesPerNode: 65000000000
             zoneRedundancy: maximum
             zones:
               - heteronet-storage-a
@@ -76,6 +76,17 @@ spec:
           scheduling:
             topologyKey: kubernetes.io/hostname
             antiAffinity: required
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: kubernetes.io/hostname
+                          operator: In
+                          values:
+                            - mizuame-nucboxg5
+                            - uc-k8sp1
+                            - uc-k8sp2
             topologySpread:
               enabled: true
               maxSkew: 1
