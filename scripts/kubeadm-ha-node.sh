@@ -26,6 +26,7 @@ readonly KUBELET_RESOLV_CONF="/etc/kubernetes/resolv.conf"
 readonly NODE_MONITOR_GRACE_PERIOD="20s"
 readonly ETCD_HEARTBEAT_INTERVAL_MILLISECONDS="500"
 readonly ETCD_ELECTION_TIMEOUT_MILLISECONDS="5000"
+readonly ETCD_STARTUP_FAILURE_THRESHOLD="180"
 readonly FLANNEL_VERSION="v0.28.4"
 readonly FLANNEL_VXLAN_IPV4_OVERHEAD="50"
 readonly MIN_IPV4_MTU="576"
@@ -1629,8 +1630,17 @@ reconcile_etcd_resources() {
   temporary="$(mktemp)"
   if ! awk \
     -v heartbeat="$ETCD_HEARTBEAT_INTERVAL_MILLISECONDS" \
-    -v election="$ETCD_ELECTION_TIMEOUT_MILLISECONDS" '
-    BEGIN { resources = 0; requests = 0; cpu = 0; memory = 0; peer_urls = 0 }
+    -v election="$ETCD_ELECTION_TIMEOUT_MILLISECONDS" \
+    -v startup_threshold="$ETCD_STARTUP_FAILURE_THRESHOLD" '
+    BEGIN {
+      resources = 0
+      requests = 0
+      cpu = 0
+      memory = 0
+      peer_urls = 0
+      startup_probes = 0
+      startup_failures = 0
+    }
     /^    - --heartbeat-interval=/ { next }
     /^    - --election-timeout=/ { next }
     /^    - --initial-advertise-peer-urls=/ {
@@ -1645,9 +1655,17 @@ reconcile_etcd_resources() {
     in_requests && /^        cpu:/ { cpu++; print "        cpu: 500m"; next }
     in_requests && /^        memory:/ { memory++; print "        memory: 512Mi"; next }
     in_resources && /^    [a-zA-Z]/ { in_resources = 0; in_requests = 0 }
+    /^    startupProbe:$/ { startup_probes++; in_startup_probe = 1; print; next }
+    in_startup_probe && /^      failureThreshold:/ {
+      startup_failures++
+      print "      failureThreshold: " startup_threshold
+      next
+    }
+    in_startup_probe && /^    [a-zA-Z]/ { in_startup_probe = 0 }
     { print }
     END {
-      if (resources != 1 || requests != 1 || cpu != 1 || memory != 1 || peer_urls != 1) exit 1
+      if (resources != 1 || requests != 1 || cpu != 1 || memory != 1 || peer_urls != 1 ||
+          startup_probes != 1 || startup_failures != 1) exit 1
     }
   ' "$manifest" >"$temporary"; then
     rm -f "$temporary"
