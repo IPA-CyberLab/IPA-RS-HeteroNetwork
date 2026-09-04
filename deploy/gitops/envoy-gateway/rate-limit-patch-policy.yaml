@@ -46,3 +46,15 @@ spec:
         op: add
         path: /default_filter_chain/filters/0/typed_config/http_filters/3/typed_config/failure_mode_deny
         value: false
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: heterocloud-edge/heterocloud-edge/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/http_filters/4/typed_config/timeout
+        value: 0.200s
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: heterocloud-edge/heterocloud-edge/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/http_filters/4/typed_config/failure_mode_deny
+        value: false

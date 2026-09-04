@@ -34,6 +34,7 @@ helm upgrade --install heteronetwork "${ROOT_DIR}/charts/ipars" \
 
 "${ROOT_DIR}/scripts/reconcile-flow-monitoring.sh"
 "${ROOT_DIR}/scripts/reconcile-harbor-runtime.sh"
+"${ROOT_DIR}/scripts/reconcile-syouyu-runtime.sh"
 
 helm repo add argo https://argoproj.github.io/argo-helm --force-update >/dev/null
 helm repo update argo >/dev/null
@@ -65,7 +66,7 @@ while IFS= read -r workload; do
   kubectl -n "${ARGOCD_NAMESPACE}" rollout status "${workload}" --timeout="${TIMEOUT}"
 done < <(kubectl -n "${ARGOCD_NAMESPACE}" get statefulset -o name)
 
-for application in longhorn-prerequisites longhorn heterocloud-registry-redis heterocloud-registry cluster-dns envoy-gateway heterocloud-edge heterocloud heterocloud-flow heterocloud-flash; do
+for application in longhorn-prerequisites longhorn heterocloud-registry-redis heterocloud-registry cluster-dns envoy-gateway heterocloud-syouyu heterocloud-edge heterocloud heterocloud-flow heterocloud-flash; do
   kubectl -n "${ARGOCD_NAMESPACE}" wait "application/${application}" \
     --for=jsonpath='{.status.sync.status}'=Synced \
     --timeout="${TIMEOUT}"
@@ -79,4 +80,5 @@ printf '%s\n' \
   'Argo CD:    http://argocd.heteronetwork.internal:8088' \
   'Grafana:    http://grafana.heteronetwork.internal:13000' \
   'Prometheus: http://prometheus.heteronetwork.internal:9090' \
+  'Syouyu S3:  https://s3.heterocloud.mizuame.app' \
   'Flash Registry: https://registry.heterocloud.mizuame.app'

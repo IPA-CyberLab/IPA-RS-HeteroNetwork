@@ -23,5 +23,7 @@ resources:
   - flow-health-route.yaml
   - registry-route.yaml
   - registry-backend-traffic-policy.yaml
+  - syouyu-route.yaml
+  - syouyu-backend-traffic-policy.yaml
   - rate-limit-patch-policy.yaml
   - ratelimit-metrics-service.yaml

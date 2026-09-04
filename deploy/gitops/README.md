@@ -15,11 +15,15 @@ The script performs these idempotent reconciliations:
 1. upgrades the HeteroNetwork chart and publishes the internal DNS zone;
 2. creates or repairs Grafana's PostgreSQL role, database, and Kubernetes
    Secret while preserving existing credentials;
-3. installs the pinned Argo CD Helm chart in HA mode; and
-4. installs the pinned Envoy Gateway chart and its three-replica global rate
-   limit service;
-5. applies self-healing Argo CD Applications for cluster DNS, the Envoy
-   Gateway edge, HeteroCloud, Flow, and the gVisor-backed Flash provider.
+3. creates or repairs Syouyu's PostgreSQL role, database, Garage credentials,
+   receipt-encryption key, and provider trust bundle without rotating existing
+   generated credentials;
+4. installs the pinned Argo CD Helm chart in HA mode;
+5. installs the pinned Envoy Gateway chart and its three-replica global rate
+   limit service; and
+6. applies self-healing Argo CD Applications for cluster DNS, the Envoy
+   Gateway edge, HeteroCloud, Flow, the gVisor-backed Flash provider, and the
+   Syouyu S3-compatible object-storage provider.
 
 The Argo CD chart is pinned by `ARGOCD_CHART_VERSION` (default `10.2.2`). Its
 three Web replicas run on the Kubernetes pod network. The separately managed
@@ -44,8 +48,8 @@ gateways may reach that Service. The generated public Envoy proxy runs with
 three replicas on public-ingress nodes and keeps two available during
 voluntary disruption. Flow's HTTP API, signaling, and LiveKit
 signaling Services are private ClusterIP backends. A Redis-backed Envoy global
-rate limit applies a shared 200 requests/second bucket per client IP to the
-HeteroCloud and HeteroCloud Flow HTTPRoutes; IPv4 and IPv6 limits are declared
+rate limit applies a shared per-client request bucket to the HeteroCloud,
+Flow, Registry, and Syouyu HTTPRoutes; IPv4 and IPv6 limits are declared
 separately. Route-level policies keep Envoy Gateway's rate-limit domain aligned
 with each route. The
 rate-limit deployment has three replicas and a two-pod disruption budget. The
@@ -54,6 +58,16 @@ proxy health-checks the Flow Redis nodes and accepts traffic only from the
 current `role:master` node, so Redis failover does not send writes to
 read-only replicas. If the shared limiter cannot be reached, Envoy fails open
 while retaining the per-proxy 200 requests/second limit for each client IP.
+
+Syouyu runs three API replicas and a three-member Garage cluster with a
+replication factor of three. Garage metadata and object data use Longhorn PVCs,
+and required anti-affinity plus topology spreading keeps the three members on
+different Kubernetes nodes. Its S3 Service remains private. The
+`s3.heterocloud.mizuame.app` HTTPRoute publishes only the path-style S3 endpoint
+through the shared Envoy edge, with ExternalDNS annotations, a two-hour request
+timeout for multipart transfers, and a shared per-client request limit. Runtime
+secrets are reconciled by `scripts/reconcile-syouyu-runtime.sh`; only the
+derived HeteroCloud provider public key is copied into Syouyu.
 
 The GitOps overlay also creates the annotated `envoy-ratelimit-metrics`
 Service. It exposes the rate-limit service's Prometheus endpoint without

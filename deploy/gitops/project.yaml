@@ -10,6 +10,7 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow.git
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash.git
+    - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
     - docker.io/envoyproxy
     - https://charts.longhorn.io
     - https://charts.bitnami.com/bitnami
@@ -28,6 +29,8 @@ spec:
     - namespace: heterocloud-flash
       server: https://kubernetes.default.svc
     - namespace: heterocloud-flash-workloads
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-syouyu
       server: https://kubernetes.default.svc
     - namespace: longhorn-system
       server: https://kubernetes.default.svc

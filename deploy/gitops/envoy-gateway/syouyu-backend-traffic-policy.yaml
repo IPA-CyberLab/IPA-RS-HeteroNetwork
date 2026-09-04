@@ -1,0 +1,62 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: heterocloud-syouyu-s3-transport
+  namespace: heterocloud-syouyu
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: heterocloud-syouyu-s3-public
+  timeout:
+    http:
+      requestTimeout: 2h
+  healthCheck:
+    panicThreshold: 0
+    passive:
+      interval: 5s
+      baseEjectionTime: 30s
+      consecutive5XxErrors: 3
+      consecutiveGatewayErrors: 2
+      consecutiveLocalOriginFailures: 1
+      maxEjectionPercent: 100
+      splitExternalLocalOriginErrors: true
+  rateLimit:
+    local:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 1000
+            unit: Second
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 1000
+            unit: Second
+    global:
+      rules:
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: 0.0.0.0/0
+                invert: false
+          limit:
+            requests: 1000
+            unit: Second
+          shared: true
+        - clientSelectors:
+            - sourceCIDR:
+                type: Distinct
+                value: ::/0
+                invert: false
+          limit:
+            requests: 1000
+            unit: Second
+          shared: true

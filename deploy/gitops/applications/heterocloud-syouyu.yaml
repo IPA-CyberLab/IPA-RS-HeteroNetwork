@@ -1,0 +1,149 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: heterocloud-syouyu
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
+    targetRevision: master
+    path: deploy/helm/heterocloud-syouyu
+    helm:
+      releaseName: heterocloud-syouyu
+      values: |
+        image:
+          tag: 0.1.0
+
+        secrets:
+          create: false
+          existingSecret: heterocloud-syouyu-secrets
+
+        api:
+          replicaCount: 3
+          scheduling:
+            antiAffinity: required
+            topologySpread:
+              enabled: true
+              maxSkew: 1
+              whenUnsatisfiable: DoNotSchedule
+
+        database:
+          port: 25432
+          maxConnections: 20
+
+        providerAuth:
+          issuer: heterocloud
+          audience: heterocloud-syouyu
+
+        principalAuth:
+          issuer: heterocloud
+          audience: heterocloud-syouyu-data
+          maxTokenTtlSeconds: 300
+
+        garage:
+          replicaCount: 3
+          config:
+            replicationFactor: 3
+            consistencyMode: consistent
+            region: heteronet-global
+            s3RootDomain: .s3.heterocloud.mizuame.app
+          persistence:
+            meta:
+              storageClass: longhorn
+              size: 5Gi
+            data:
+              storageClass: longhorn
+              size: 100Gi
+          layout:
+            enabled: true
+            capacityBytesPerNode: 90000000000
+            zoneRedundancy: maximum
+            zones:
+              - heteronet-storage-a
+              - heteronet-storage-b
+              - heteronet-storage-c
+            tags:
+              - syouyu
+              - longhorn
+          s3Service:
+            type: ClusterIP
+            publicEndpoint: https://s3.heterocloud.mizuame.app
+          gateway:
+            enabled: false
+          scheduling:
+            topologyKey: kubernetes.io/hostname
+            antiAffinity: required
+            topologySpread:
+              enabled: true
+              maxSkew: 1
+              whenUnsatisfiable: DoNotSchedule
+
+        pdb:
+          api:
+            enabled: true
+            minAvailable: 2
+          garage:
+            enabled: true
+            minAvailable: 2
+
+        monitoring:
+          serviceMonitor:
+            enabled: true
+            labels:
+              release: heterocloud-flow
+            interval: 30s
+            scrapeTimeout: 10s
+
+        networkPolicy:
+          enabled: true
+          apiIngress:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: heterocloud
+              podSelector:
+                matchLabels:
+                  app.kubernetes.io/component: worker
+            - ipBlock:
+                cidr: 10.250.0.0/24
+          monitoringIngress:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: heterocloud-flow
+            - ipBlock:
+                cidr: 10.250.0.0/24
+          s3IngressCidrs:
+            - 10.244.0.0/16
+            - 10.250.0.0/24
+          kubernetesApiCidrs:
+            - 10.96.0.0/12
+          kubernetesApiPorts:
+            - 443
+            - 6443
+            - 7443
+          database:
+            sameNamespace: false
+            podSelector: {}
+            peers: []
+            externalCidrs:
+              - 10.250.0.0/24
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-syouyu
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 20
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
