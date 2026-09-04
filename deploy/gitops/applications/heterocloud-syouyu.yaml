@@ -102,7 +102,7 @@ spec:
                           operator: In
                           values:
                             - mizuame-nucboxg5
-                            - uc-k8sv1
+                            - uc-k8sp1
                             - ichikawap1
             topologySpread:
               enabled: true
