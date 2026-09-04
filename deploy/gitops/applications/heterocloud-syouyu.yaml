@@ -25,6 +25,17 @@ spec:
           replicaCount: 3
           scheduling:
             antiAffinity: required
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: kubernetes.io/hostname
+                          operator: NotIn
+                          values:
+                            - mizuame-nucboxg5
+                            - uc-k8sp1
+                            - uc-k8sp2
             topologySpread:
               enabled: true
               maxSkew: 1
