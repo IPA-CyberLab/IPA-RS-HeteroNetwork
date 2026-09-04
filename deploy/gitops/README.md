@@ -60,9 +60,12 @@ read-only replicas. If the shared limiter cannot be reached, Envoy fails open
 while retaining the per-proxy 200 requests/second limit for each client IP.
 
 Syouyu runs three API replicas and a three-member Garage cluster with a
-replication factor of three. Garage metadata and object data use Longhorn PVCs,
-and required anti-affinity plus topology spreading keeps the three members on
-different Kubernetes nodes. Its S3 Service remains private. The
+replication factor of three. Garage metadata and object data use dedicated
+Longhorn strict-local PVCs with one block replica; Garage, rather than
+Longhorn, performs the three-way object replication. Delayed binding, required
+anti-affinity, and topology spreading keep the three members and their local
+volumes on different Kubernetes nodes without storing every object nine times.
+Its S3 Service remains private. The
 `s3.heterocloud.mizuame.app` HTTPRoute publishes only the path-style S3 endpoint
 through the shared Envoy edge, with ExternalDNS annotations, a two-hour request
 timeout for multipart transfers, and a shared per-client request limit. Runtime

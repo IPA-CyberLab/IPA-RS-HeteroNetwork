@@ -52,10 +52,10 @@ spec:
             s3RootDomain: .s3.heterocloud.mizuame.app
           persistence:
             meta:
-              storageClass: longhorn
+              storageClass: longhorn-syouyu-local
               size: 5Gi
             data:
-              storageClass: longhorn
+              storageClass: longhorn-syouyu-local
               size: 100Gi
           layout:
             enabled: true
