@@ -9,13 +9,13 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
-    targetRevision: v0.1.5
+    targetRevision: v0.1.6
     path: deploy/helm/heterocloud-syouyu
     helm:
       releaseName: heterocloud-syouyu
       values: |
         image:
-          tag: 0.1.5
+          tag: 0.1.6
 
         secrets:
           create: false
@@ -102,8 +102,8 @@ spec:
                           operator: In
                           values:
                             - mizuame-nucboxg5
-                            - uc-k8sp1
-                            - uc-k8sp2
+                            - uc-k8sv1
+                            - ichikawap1
             topologySpread:
               enabled: true
               maxSkew: 1
