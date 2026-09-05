@@ -13,6 +13,7 @@ spec:
     - https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Syouyu.git
     - docker.io/envoyproxy
     - https://charts.longhorn.io
+    - https://yandex-cloud.github.io/k8s-csi-s3/charts
     - https://charts.bitnami.com/bitnami
     - https://helm.goharbor.io
   destinations:
