@@ -22,7 +22,7 @@ spec:
           name: syouyu-flash-escape
           singleBucket: escape-019fbda8-persistent
           mounter: geesefs
-          mountOptions: "--memory-limit 2048 --dir-mode 0700 --file-mode 0600"
+          mountOptions: "--memory-limit 2048 --dir-mode 0700 --file-mode 0600 --list-type 2 --fsync-on-close"
           reclaimPolicy: Retain
         tolerations:
           all: true
