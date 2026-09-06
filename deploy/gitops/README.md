@@ -21,7 +21,9 @@ The script performs these idempotent reconciliations:
 4. installs the pinned Argo CD Helm chart in HA mode;
 5. installs the pinned Envoy Gateway chart and its three-replica global rate
    limit service; and
-6. applies self-healing Argo CD Applications for cluster DNS, the Envoy
+6. installs kube-router in firewall-only mode so the existing Flannel network
+   enforces Kubernetes NetworkPolicy resources without replacing the CNI; and
+7. applies self-healing Argo CD Applications for cluster DNS, the Envoy
    Gateway edge, HeteroCloud, Flow, the gVisor-backed Flash provider, and the
    Syouyu S3-compatible object-storage provider.
 
@@ -85,6 +87,16 @@ Service. It exposes the rate-limit service's Prometheus endpoint without
 modifying the Envoy Gateway-owned Service, so the existing Prometheus
 Kubernetes service discovery collects rate-limit counters after a fresh
 install as well as after reconciliation.
+
+The `network-policy-engine` Application runs the pinned kube-router release in
+firewall-only mode on every Linux node. Routing, CNI installation, and the
+Kubernetes service proxy remain owned by Flannel and kube-proxy. The engine
+uses default-deny while policies are being programmed, closing the short
+window in which a newly started tenant workload could otherwise communicate
+without its policy. Flash creates an ingress and egress policy for every
+service: undeclared inbound ports are closed, DNS remains available, and
+private, cluster, HeteroNetwork, and infrastructure ranges are denied unless a
+supported explicit tenant policy grants access.
 
 Cluster DNS is managed by the `cluster-dns` Application. It keeps three CoreDNS
 replicas on separate nodes with a two-pod disruption budget and runs the
