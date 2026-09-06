@@ -17,7 +17,10 @@ spec:
   retry:
     numRetries: 7
     perRetry:
-      timeout: 3s
+      # The Registry image listing fans out to Harbor. Let the API's own 10s
+      # upstream deadline return a controlled error instead of cutting valid
+      # requests off at the former 3s edge timeout.
+      timeout: 12s
   healthCheck:
     panicThreshold: 0
     active:
