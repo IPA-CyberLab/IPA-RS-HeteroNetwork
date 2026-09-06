@@ -72,6 +72,14 @@ timeout for multipart transfers, and a shared per-client request limit. Runtime
 secrets are reconciled by `scripts/reconcile-syouyu-runtime.sh`; only the
 derived HeteroCloud provider public key is copied into Syouyu.
 
+The escape Flash workload keeps its workspace on the Syouyu CSI mount and its
+live Codex databases on the low-latency persistent root volume. Run
+`scripts/start-escape-codex.sh` inside that workload to restore the newest
+valid S3 state snapshot when needed, resume the most recent chat in `tmux`, and
+start the incremental snapshot daemon. `scripts/codex-s3-state.sh` performs
+consistent SQLite online backups and stores immutable, integrity-checked
+archives instead of running SQLite directly on the S3 FUSE mount.
+
 The GitOps overlay also creates the annotated `envoy-ratelimit-metrics`
 Service. It exposes the rate-limit service's Prometheus endpoint without
 modifying the Envoy Gateway-owned Service, so the existing Prometheus
