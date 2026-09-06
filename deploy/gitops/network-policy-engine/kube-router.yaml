@@ -144,7 +144,6 @@ spec:
             - --run-firewall=true
             - --run-service-proxy=false
             - --run-loadbalancer=false
-            - --netpol-default-deny=true
             - --metrics-port=20246
             - --hostname-override=$(NODE_NAME)
             - --kubeconfig=/var/lib/kube-router/kubeconfig
