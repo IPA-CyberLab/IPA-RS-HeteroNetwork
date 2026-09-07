@@ -41,7 +41,9 @@ spec:
               whenUnsatisfiable: DoNotSchedule
 
         database:
-          port: 25432
+          # NetworkPolicy sees the connector's targetPort after Service DNAT.
+          # DATABASE_URL keeps the Service frontend port 25432.
+          port: 25433
           maxConnections: 20
 
         providerAuth:
