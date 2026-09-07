@@ -71,10 +71,11 @@ def main():
         if not cidr:
             failures.append(f"Node {name} has no PodCIDR")
             continue
-        # This deployment uses Flannel VXLAN: the subnet base is its host interface.
-        source = ipaddress.ip_network(cidr).network_address
-        if not allows_ip(policy.get("ingress", []), "from", source, 8080):
-            failures.append(f"Worker node {name} Flannel source {source}:8080 is not allowed")
+        # Flannel .0 serves direct Pod routes; cni0 .1 serves ClusterIP routes.
+        base = ipaddress.ip_network(cidr).network_address
+        for source in (base, base + 1):
+            if not allows_ip(policy.get("ingress", []), "from", source, 8080):
+                failures.append(f"Worker node {name} CNI source {source}:8080 is not allowed")
 
     api_slices = get("heterocloud-syouyu", "endpointslices", selector="kubernetes.io/service-name=heterocloud-syouyu-api")
     ready_api = sum(

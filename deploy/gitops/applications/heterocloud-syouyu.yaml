@@ -134,20 +134,32 @@ spec:
                   app.kubernetes.io/component: worker
             - ipBlock:
                 cidr: 10.250.0.0/24
-            # hostNetwork workers are SNATed to the Flannel device address
-            # across nodes. These /32s are node interfaces, not tenant Pod ranges.
+            # hostNetwork workers use Flannel (.0) for direct Pod routes and
+            # cni0 (.1) for Service routes. Trust only reserved node interfaces.
             - ipBlock:
                 cidr: 10.244.0.0/32 # uc-k8sp1
             - ipBlock:
+                cidr: 10.244.0.1/32
+            - ipBlock:
                 cidr: 10.244.1.0/32 # uc-k8sp2
+            - ipBlock:
+                cidr: 10.244.1.1/32
             - ipBlock:
                 cidr: 10.244.2.0/32 # uc-k8s3p
             - ipBlock:
+                cidr: 10.244.2.1/32
+            - ipBlock:
                 cidr: 10.244.3.0/32 # mizuame-nucboxg5
+            - ipBlock:
+                cidr: 10.244.3.1/32
             - ipBlock:
                 cidr: 10.244.5.0/32 # uc-k8sv1
             - ipBlock:
+                cidr: 10.244.5.1/32
+            - ipBlock:
                 cidr: 10.244.6.0/32 # ichikawap1
+            - ipBlock:
+                cidr: 10.244.6.1/32
           monitoringIngress:
             - namespaceSelector:
                 matchLabels:
