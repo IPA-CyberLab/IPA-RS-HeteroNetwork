@@ -20,8 +20,10 @@ import jwt
 
 
 def kube(*args):
+    server = os.environ.get("KUBERNETES_API_SERVER")
+    override = [f"--server={server}"] if server else []
     return json.loads(subprocess.check_output(
-        ["kubectl", "--request-timeout=15s", *args, "-o", "json"], timeout=20
+        ["kubectl", *override, "--request-timeout=15s", *args, "-o", "json"], timeout=20
     ))
 
 
