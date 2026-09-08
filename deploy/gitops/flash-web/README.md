@@ -1,13 +1,13 @@
 # Flash wildcard host TLS sync
 
-Review-only infrastructure. Nothing here has been deployed. The parent owns
-cert-manager installation/Application, AppProject destinations (`cert-manager`
-and `heterocloud-dns`), and `issuer.yaml` / `certificate.yaml` in this directory.
+The cert-manager Application installs the certificate controller. The
+AppProject permits `cert-manager` and `heterocloud-dns`. Issuance is declared
+in `issuer.yaml` / `certificate.yaml` in this directory.
 The Certificate must provision a DNS01-issued `kubernetes.io/tls` Secret named
 `flash-web-tls` in `heterocloud-dns`, with SAN `*.flash.heterocloud.mizuame.app`
 and an unencrypted private key. Kustomize intentionally requires those two
 parent files; this helper neither creates nor modifies them.
-The parent also owns `wildcard-route.yaml`, included here for the wildcard
+`wildcard-route.yaml` is included here for the wildcard
 fallback HTTPRoute and ExternalDNS publication from Gateway status addresses.
 No DNS addresses are hardcoded by this helper.
 
@@ -30,7 +30,7 @@ No DNS addresses are hardcoded by this helper.
   closed; no empty canonical extra file or snippet is synthesized.
 - The installer unit in `crates/ipars-control-plane-http/src/lib.rs` uses
   `User=heteronetwork-gateway` and `Group=heteronetwork-gateway`, confirmed by
-  the parent on live hosts. The numeric GID comes from each host's group file.
+  on the live gateway. The numeric GID comes from each host's group file.
   Cert directories are root:GID 0750; certificate and key files root:GID 0640.
   Confirm that Caddy can traverse `/etc/heteronetwork` on both hosts.
   If the host group is recreated/renumbered, restart the pod to refresh the
@@ -46,7 +46,8 @@ The loop polls the read-only projected Secret every 60 seconds. It pins one
 `..data` directory for paired reads across kubelet rotation, validates the
 wildcard SAN, hostname, key correspondence, PEM chain parsing, current validity,
 and at least one hour remaining. It does not perform public trust-chain or
-revocation validation; issuance/trust belongs to cert-manager and parent review.
+revocation validation; cert-manager issues the certificate and external probes
+verify its public trust chain.
 OpenSSL subprocess output, private keys and exception contents are never logged.
 
 Both files are fsynced into an immutable SHA-256 generation directory under
@@ -79,19 +80,19 @@ file must use the same lock for the full read/edit/rename transaction. An
 additional inode/metadata/content check detects concurrent edits before rename,
 but no atomic compare-and-replace exists against an uncooperative root writer.
 
-## Parent deployment review
+## Deployment review
 
-1. Supply/review the parent Certificate and Issuer, then render with
+1. Review the Certificate and Issuer, then render with
    `kubectl kustomize deploy/gitops/flash-web`. Review the generated ConfigMap,
    hostname allowlist, image and security context; do not apply until approved.
 2. On each host, verify the existing extra, snippet, group, directory traversal,
-   configured Agent extra path and service identity. Back up the canonical extra
-   securely. Verify issued Secret readiness without printing key material.
+   configured Agent extra path and service identity. Verify issued Secret
+   readiness without printing key material.
 3. Validate the candidate **complete Agent-rendered Caddyfile** with the host's
    `/opt/heteronetwork/bin/caddy validate --adapter caddyfile --config <candidate>`
    as `heteronetwork-gateway`, using readable staged certfiles. The extra alone
    is not the complete runtime configuration. Caddy syntax validation is a
-   parent predeployment gate, not implemented inside this Python container.
+   deployment gate, not implemented inside this Python container.
 4. After approved deployment, confirm readiness, Agent digest/reload success,
    HTTP redirect and HTTPS certificate/route on both nodes. Exercise a renewal
    and verify a new immutable path/digest without restarting Caddy or the Agent.
@@ -104,3 +105,13 @@ Local tests (temporary fixtures under `/run`, no cluster calls or live host edit
 ```sh
 sudo python3 -B scripts/test_flash_tls_sync.py
 ```
+
+External checks (certificate verification is never disabled):
+
+```sh
+python3 scripts/flash-web-preflight.py --host f-SERVICE-UUID.flash.heterocloud.mizuame.app
+```
+
+References: [cert-manager DNS01](https://cert-manager.io/docs/configuration/acme/dns01/),
+[Caddy TLS](https://caddyserver.com/docs/caddyfile/directives/tls),
+[Envoy direct responses](https://gateway.envoyproxy.io/v1.8/tasks/traffic/direct-response/).
