@@ -13,10 +13,11 @@ No DNS addresses are hardcoded by this helper.
 
 ## Scope and prerequisites
 
-- The DaemonSet requires the existing
+- The DaemonSet follows the existing
   `networking.heteronetwork.io/public-ingress=true` label (see
-  `../envoy-gateway/envoyproxy.yaml`) AND hostname `uc-k8s3p` or `ichikawap1`.
-  It does not label nodes or enable gateway roles. Expand only after review.
+  `../envoy-gateway/envoyproxy.yaml`), including recovered public gateways.
+  It does not label nodes or enable gateway roles. New gateways must have the
+  canonical extra configuration and reachable TCP80/443 before publication.
 - The only writable host mount is `/etc/heteronetwork` (Directory, not
   DirectoryOrCreate). `/etc/group` is separately mounted read-only. There is
   no host network/PID namespace, privileged mode, Kubernetes API token or RBAC.
@@ -84,7 +85,7 @@ but no atomic compare-and-replace exists against an uncooperative root writer.
 
 1. Review the Certificate and Issuer, then render with
    `kubectl kustomize deploy/gitops/flash-web`. Review the generated ConfigMap,
-   hostname allowlist, image and security context; do not apply until approved.
+   node selector, image and security context; do not apply until approved.
 2. On each host, verify the existing extra, snippet, group, directory traversal,
    configured Agent extra path and service identity. Verify issued Secret
    readiness without printing key material.

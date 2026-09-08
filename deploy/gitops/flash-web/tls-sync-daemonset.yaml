@@ -21,14 +21,6 @@ spec:
         kubernetes.io/os: linux
         # Established by deploy/gitops/envoy-gateway/envoyproxy.yaml.
         networking.heteronetwork.io/public-ingress: "true"
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values: [uc-k8s3p, ichikawap1]
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
