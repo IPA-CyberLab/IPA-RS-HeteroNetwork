@@ -17,7 +17,12 @@ spec:
     - https://charts.bitnami.com/bitnami
     - https://helm.goharbor.io
     - https://kubernetes-sigs.github.io/metrics-server/
+    - quay.io/jetstack/charts
   destinations:
+    - namespace: cert-manager
+      server: https://kubernetes.default.svc
+    - namespace: heterocloud-dns
+      server: https://kubernetes.default.svc
     - namespace: kube-system
       server: https://kubernetes.default.svc
     - namespace: envoy-gateway-system
