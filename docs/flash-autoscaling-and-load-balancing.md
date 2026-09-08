@@ -77,5 +77,23 @@ quota enforcement, or prove cross-Internet load-balancer reachability. Confirm
 owned resource and DNS cleanup after an interrupted run. Run it only after the
 new provider version is deployed.
 
+Use `--metric memory` for the memory-only trigger; the default CPU test also
+configures a high memory target to exercise a two-metric HPA. Each test caps
+replicas at two, CPU at 100m per Pod, RAM at 64 MiB (CPU) or 128 MiB (memory),
+and disk at 1 GiB per Pod. Both expose a small HTTP/UDP fixture, not a shell.
+While two replicas are ready, run the external client outside the cluster:
+
+```sh
+python3 scripts/flash-lb-probe.py --hostname <returned-domain> \
+  --port <assigned-port> --protocol tcp
+python3 scripts/flash-lb-probe.py --hostname <returned-domain> \
+  --port <assigned-port> --protocol udp
+```
+
+The probe checks ten fresh connections/flows per resolved ingress IP and
+requires replies from two distinct fixture Pods. Missing replies are failures,
+not silently retried or counted as success. This is a small functional test,
+not a throughput benchmark or general HA claim.
+
 The pre-existing two-node outage is independent of these features; this change
 does not restore unavailable control-plane nodes or claim complete cluster HA.

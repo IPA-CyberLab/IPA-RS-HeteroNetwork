@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Operator-only, bounded Flash provider autoscaling smoke test.
 
-Creates ONE disposable FlashService (at most 2 x 100m CPU / 64Mi RAM / 1Gi disk)
+Creates ONE disposable FlashService (at most 2 x 100m CPU / 128Mi RAM / 1Gi disk)
 and cleans it up in finally. Never targets an existing service. This exercises
 the CRD/controller/HPA, not HeteroCloud authentication or account quota checks.
 Run only after the matching Flash controller and Metrics Server are deployed.
@@ -32,6 +32,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--service-port", required=True, type=int)
     parser.add_argument("--timeout", type=int, default=720)
+    parser.add_argument("--metric", choices=("cpu", "memory"), default="cpu")
     args = parser.parse_args()
     if not 30000 <= args.service_port <= 32767 or not 60 <= args.timeout <= 1200:
         parser.error("service-port must be 30000..32767 and timeout 60..1200 seconds")
@@ -43,11 +44,27 @@ def main():
     name = f"flash-{identifier}"
     # Each replica burns <=100m for 150 seconds, then idles. HTTP serves only
     # the Pod hostname; it exposes no command or load-control API.
-    command = """import http.server, multiprocessing, socket, time
+    command = """import http.server, multiprocessing, socket, time, mmap, os, threading
 def load():
+    if os.environ['TEST_METRIC'] == 'memory':
+        allocation = mmap.mmap(-1, 64 * 1024 * 1024,
+                               flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        for offset in range(0, 64 * 1024 * 1024, 4096):
+            allocation[offset:offset + 4096] = b'x' * 4096
+        time.sleep(150)
+        allocation.close()
+        return
     end = time.monotonic() + 150
     while time.monotonic() < end:
         sum(i*i for i in range(10000))
+def udp():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', 8080))
+    expected = b'flash-e2e'.ljust(128, b'.')
+    while True:
+        data, peer = sock.recvfrom(256)
+        if data == expected:
+            sock.sendto(socket.gethostname().encode(), peer)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = (socket.gethostname() + '\\n').encode()
@@ -58,6 +75,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 if __name__ == '__main__':
     multiprocessing.Process(target=load).start()
+    threading.Thread(target=udp, daemon=True).start()
     http.server.HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
 """
     resource = {
@@ -70,16 +88,22 @@ if __name__ == '__main__':
             "desired_generation": 1,
             "workload": {
                 "region": "heteronet-global", "image": "python:3.12-alpine",
-                "replicas": 1, "cpu_millis": 100, "memory_mib": 64,
+                "replicas": 1, "cpu_millis": 100,
+                "memory_mib": 128 if args.metric == "memory" else 64,
                 "ephemeral_storage_gib": 1,
                 "autoscaling": {"min_replicas": 1, "max_replicas": 2,
-                                "target_cpu_utilization_percent": 30,
-                                "target_memory_utilization_percent": 90},
+                                **({"target_cpu_utilization_percent": 30,
+                                    "target_memory_utilization_percent": 90}
+                                   if args.metric == "cpu" else
+                                   {"target_memory_utilization_percent": 60})},
                 "ports": [{"name": "http", "protocol": "tcp", "container_port": 8080,
+                           "service_port": args.service_port},
+                          {"name": "udp", "protocol": "udp", "container_port": 8080,
                            "service_port": args.service_port}],
                 "exposure": {"type": "public", "traffic_mode": "forwarded",
                              "endpoint_mode": "load_balancer"},
                 "command": ["python3", "-u", "-c"], "args": [command],
+                "env": {"TEST_METRIC": args.metric},
             },
         },
     }
