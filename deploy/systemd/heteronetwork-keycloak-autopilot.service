@@ -32,7 +32,7 @@ ReadWritePaths=/etc/systemd/system
 # Edge-only nodes do not install the full Keycloak tree. A missing optional
 # path must not prevent them from reconciling their local HAProxy endpoint.
 ReadWritePaths=-/opt/heteronetwork/keycloak-26.6.4/conf
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true

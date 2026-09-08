@@ -244,10 +244,8 @@ local_control_plane_config_value() {
   ' "$local_control_plane_config"
 }
 
-discover_local_control_plane() {
-  local uid links mode size token
-  local_control_plane_url=""
-  local_control_plane_bearer_token=""
+secure_local_control_plane_config() {
+  local uid links mode size
   [[ -d "$public_services_dir" && ! -L "$public_services_dir" \
     && -f "$local_control_plane_config" && ! -L "$local_control_plane_config" ]] \
     || return 1
@@ -261,6 +259,13 @@ discover_local_control_plane() {
   # The promotion writer uses root:heteronetwork-services 0640, not root-only 0600.
   (( (8#$mode & 0400) != 0 && (8#$mode & 0037) == 0 \
     && 10#$size > 0 && 10#$size <= MAX_CONFIG_BYTES )) || return 1
+}
+
+discover_local_control_plane() {
+  local token
+  local_control_plane_url=""
+  local_control_plane_bearer_token=""
+  secure_local_control_plane_config || return 1
   # Exactly 64 lowercase hex digits, with at most one trailing newline.
   secure_root_file "$local_control_plane_token" 65 || return 1
   token="$(<"$local_control_plane_token")"
@@ -279,6 +284,27 @@ discover_local_control_plane() {
       "$token" "$cluster_id" "$node_id" | sha256sum | awk '{print $1}'
   )" || return 1
   [[ "$local_control_plane_bearer_token" =~ ^[a-f0-9]{64}$ ]] || return 1
+}
+
+read_local_control_plane_identity() {
+  local candidate_node candidate_listen candidate_ip addresses
+  secure_local_control_plane_config || return 1
+  candidate_node="$(local_control_plane_config_value HETERONETWORK_SERVICE_OWNER_NODE_ID)" || return 1
+  candidate_listen="$(local_control_plane_config_value HETERONETWORK_LISTEN)" || return 1
+  candidate_ip="${candidate_listen%:19088}"
+  valid_identifier "$candidate_node" && valid_private_ipv4 "$candidate_ip" \
+    && [[ "$candidate_listen" == "$candidate_ip:19088" ]] || return 1
+  addresses="$(ip -j address show 2>/dev/null)" || return 1
+  jq -e --arg ip "$candidate_ip" '
+    type == "array" and any(.[]; any(.addr_info[]?; .family == "inet" and .local == $ip))
+  ' <<<"$addresses" >/dev/null 2>&1 || return 1
+  node_id="$candidate_node"
+  vpn_ip="$candidate_ip"
+  # Reuse all promotion checks, including cluster, exact listener, active CP and node bearer.
+  if ! discover_local_control_plane; then
+    unset node_id vpn_ip
+    return 1
+  fi
 }
 
 prefer_local_control_plane_gateway() {
@@ -798,9 +824,12 @@ reconcile_command() {
     return
   }
   if ! read_agent_identity; then
-    log "local Agent identity is unavailable"
-    expire_local_assignment_if_needed
-    return
+    if ! read_local_control_plane_identity; then
+      log "local Agent identity is unavailable and no trusted local Control Plane identity is available"
+      expire_local_assignment_if_needed
+      return
+    fi
+    log "local Agent identity is unavailable; using validated local Control Plane identity"
   fi
   prefer_local_control_plane_gateway
 

@@ -31,6 +31,19 @@ def main():
              if endpoint.get("conditions", {}).get("ready") is True}
     ready.discard(None)
     require(len(ready) >= 2, "Fewer than two ready OIDC connector nodes")
+    connectors = kube("-n", "kube-system", "get", "pods", "-l",
+                      "app.kubernetes.io/name=keycloak-ha-connector")
+    for pod in connectors["items"]:
+        if pod["metadata"].get("deletionTimestamp") or not any(
+                condition["type"] == "Ready" and condition["status"] == "True"
+                for condition in pod.get("status", {}).get("conditions", [])):
+            continue
+        config_name = next(volume["configMap"]["name"]
+                           for volume in pod["spec"]["volumes"]
+                           if volume["name"] == "config")
+        config = kube("-n", "kube-system", "get", "configmap", config_name)
+        require('"${NODE_IP}:18080"' in config["data"]["haproxy.cfg"],
+                f"{pod['metadata']['name']} still routes through an edge proxy")
     for component in ("api", "owner-console"):
         pods = kube("-n", "heterocloud", "get", "pods", "-l",
                     f"app.kubernetes.io/component={component}")

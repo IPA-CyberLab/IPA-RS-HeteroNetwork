@@ -210,6 +210,7 @@ done
 case "$url" in
   http://127.0.0.1:9780/v1/status)
     [[ -e "$HETERONETWORK_SMOKE_STATE/active/heteronetwork-agent.service" ]]
+    [[ ! -e "$HETERONETWORK_SMOKE_STATE/agent-status-down" ]]
     cat "$HETERONETWORK_SMOKE_STATUS_FIXTURE"
     ;;
   http://127.0.0.1:19000/health/ready)
@@ -356,7 +357,16 @@ case "$command_name" in
 esac
 EOF
 
+cat >"$fake_bin/ip" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == '-j address show' ]] || exit 1
+[[ ! -e "$HETERONETWORK_SMOKE_STATE/ip-failure" ]] || exit 1
+cat "$HETERONETWORK_SMOKE_IP_FIXTURE"
+EOF
+
 chmod 0755 \
+  "$fake_bin/ip" \
   "$fake_bin/systemctl" \
   "$fake_bin/curl" \
   "$test_root/opt/heteronetwork/libexec/keycloak-ha-node.sh"
@@ -373,6 +383,7 @@ export HETERONETWORK_SMOKE_CURL_ARGV_LOG="$curl_argv_log"
 export HETERONETWORK_SMOKE_CURL_COUNTER="$curl_counter"
 export HETERONETWORK_SMOKE_REQUEST_DIR="$request_dir"
 export HETERONETWORK_SMOKE_STATUS_FIXTURE="$fixture_dir/status.json"
+export HETERONETWORK_SMOKE_IP_FIXTURE="$fixture_dir/ip.json"
 export HETERONETWORK_SMOKE_RESPONSE_FIXTURE="$fixture_dir/response.json"
 export HETERONETWORK_SMOKE_WITHDRAW_RESPONSE_FIXTURE="$fixture_dir/withdraw-response.json"
 export HETERONETWORK_SMOKE_BEARER_TOKEN="$bearer_token"
@@ -417,6 +428,8 @@ chmod 0600 \
 cat >"$fixture_dir/status.json" <<EOF
 {"node_id":"$node_id","vpn_ip":"$vpn_ip"}
 EOF
+printf '[{"ifname":"hnet0","addr_info":[{"family":"inet","local":"%s"}]}]\n' \
+  "$vpn_ip" >"$fixture_dir/ip.json"
 write_response "$fixture_dir/response.json" true "$node_id" "$vpn_ip"
 write_response \
   "$fixture_dir/withdraw-response.json" false node-keycloak-remote 10.250.0.22
@@ -596,6 +609,60 @@ assert_inactive heteronetwork-keycloak.service
 [[ ! -e "$probe_lease_path" ]] || fail "local discovery bypassed assignment lease expiry"
 run_autopilot reconcile
 assert_active heteronetwork-keycloak.service
+
+touch "$fake_state/agent-status-down"
+requests_before_identity_fallback="$(count_reconcile_requests)"
+deactivate_before_identity_fallback="$(count_helper_command deactivate)"
+activate_before_identity_fallback="$(count_helper_command activate)"
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$probe_lease_path"
+run_autopilot reconcile
+[[ "$(count_reconcile_requests)" == "$((requests_before_identity_fallback + 1))" \
+  && "$(reconcile_url_at "$((requests_before_identity_fallback + 1))")" == "$local_cp_url" ]] \
+  || fail "Agent status outage did not reconcile through the trusted local CP"
+[[ "$(<"$probe_lease_path")" -gt "$(date +%s)" ]] \
+  || fail "authenticated local CP did not renew the lease during Agent status outage"
+[[ "$(count_helper_command deactivate)" == "$deactivate_before_identity_fallback" \
+  && "$(count_helper_command activate)" == "$activate_before_identity_fallback" ]] \
+  || fail "Agent status fallback restarted a healthy Keycloak replica"
+jq -e --arg node "$node_id" --arg ip "$vpn_ip" \
+  '.node_id == $node and .vpn_ip == $ip and .ready == true' "$(latest_request)" >/dev/null \
+  || fail "local identity fallback reported the wrong identity or readiness"
+
+for invalid_identity in no_ip inactive ip_failure malformed_ip wrong_cluster invalid_token; do
+  case "$invalid_identity" in
+    no_ip) printf '[]\n' >"$fixture_dir/ip.json" ;;
+    inactive) rm -f "$fake_state/active/heteronetwork-control-plane.service" ;;
+    ip_failure) touch "$fake_state/ip-failure" ;;
+    malformed_ip) printf 'not-json\n' >"$fixture_dir/ip.json" ;;
+    wrong_cluster) sed -i 's/^HETERONETWORK_CLUSTER_ID=.*/HETERONETWORK_CLUSTER_ID="other-cluster"/' "$promoted_env" ;;
+    invalid_token) chmod 0600 "$promoted_token"; printf 'invalid\n' >"$promoted_token" ;;
+  esac
+  requests_before_invalid_identity="$(count_reconcile_requests)"
+  printf '%s\n' "$(( $(date +%s) - 1 ))" >"$probe_lease_path"
+  run_autopilot reconcile
+  [[ "$(count_reconcile_requests)" == "$requests_before_invalid_identity" ]] \
+    || fail "untrusted local identity attempted reconciliation: $invalid_identity"
+  assert_inactive heteronetwork-keycloak.service
+  [[ ! -e "$probe_lease_path" ]] || fail "invalid local identity bypassed lease expiry"
+  rm -f "$fake_state/ip-failure"
+  printf '[{"addr_info":[{"family":"inet","local":"%s"}]}]\n' "$vpn_ip" >"$fixture_dir/ip.json"
+  write_promoted_fixture
+  run_autopilot reconcile
+  assert_active heteronetwork-keycloak.service
+done
+
+for fallback_failure in api-down response-generation-mismatch; do
+  touch "$fake_state/$fallback_failure"
+  printf '%s\n' "$(( $(date +%s) - 1 ))" >"$probe_lease_path"
+  run_autopilot reconcile
+  assert_inactive heteronetwork-keycloak.service
+  [[ ! -e "$probe_lease_path" ]] \
+    || fail "local identity fallback bypassed authenticated reconciliation: $fallback_failure"
+  rm -f "$fake_state/$fallback_failure"
+  run_autopilot reconcile
+  assert_active heteronetwork-keycloak.service
+done
+rm -f "$fake_state/agent-status-down"
 
 for invalid_promotion in cluster node listen advertise duplicate executable writable world_read \
   directory_writable symlink hardlink token token_short token_long token_newlines token_mode inactive; do
