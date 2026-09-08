@@ -31,6 +31,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--service-id", type=uuid.UUID, required=True)
     parser.add_argument("--principal-id", type=uuid.UUID, required=True)
+    parser.add_argument("--status-only", action="store_true",
+                        help="Check signed live status without opening any diagnostic shell")
     args = parser.parse_args()
     instance = str(args.service_id)
     resource = kube("-n", "heterocloud-flash-workloads", "get", "flashservice", f"flash-{instance}")
@@ -66,6 +68,25 @@ def main():
                 connection = http.client.HTTPConnection(address, port, timeout=15)
                 query = urllib.parse.urlencode({"generation": spec["desired_generation"]})
                 path = f"/internal/v1/service-instances/{instance}"
+                if args.status_only:
+                    try:
+                        connection.request("GET", f"{path}?{query}", headers={
+                            "Authorization": f"Bearer {token('flash.status.get')}"
+                        })
+                        response = connection.getresponse()
+                        body = response.read(65537)
+                        if response.status != 200 or len(body) > 65536:
+                            raise SystemExit(f"{address}: live status HTTP {response.status}")
+                        status = json.loads(body)
+                        if status.get("observed_generation") != spec["desired_generation"]:
+                            raise SystemExit(f"{address}: stale observed generation")
+                        print(json.dumps({"endpoint": address, "status_http": 200,
+                                          "desired_replicas": status["desired_replicas"],
+                                          "ready_replicas": status["ready_replicas"]}))
+                        checked += 1
+                    finally:
+                        connection.close()
+                    continue
                 try:
                     connection.request("GET", f"{path}/containers?{query}", headers={"Authorization": f"Bearer {token('flash.containers.list')}"})
                     response = connection.getresponse()

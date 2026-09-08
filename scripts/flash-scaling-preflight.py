@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import subprocess
+import time
 import uuid
 
 
@@ -31,7 +32,11 @@ def require(condition, message):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--service-id", type=uuid.UUID)
+    parser.add_argument("--stable-for", type=int, default=0,
+                        help="Observe NetworkPolicy generation stability for 0..60 seconds")
     args = parser.parse_args()
+    if not 0 <= args.stable_for <= 60 or (args.stable_for and not args.service_id):
+        parser.error("stable-for requires a service-id and must be 0..60 seconds")
     api = kube("get", "apiservice", "v1beta1.metrics.k8s.io")
     require(any(c["type"] == "Available" and c["status"] == "True"
                 for c in api.get("status", {}).get("conditions", [])),
@@ -86,6 +91,16 @@ def main():
         actual = {entry[4][0] for entry in socket.getaddrinfo(hostname, None, socket.AF_INET)}
         require(actual == expected, f"DNS targets not converged: expected {sorted(expected)}, got {sorted(actual)}")
         print(json.dumps({"hostname": hostname, "addresses": sorted(actual)}))
+
+    if args.stable_for:
+        before = kube("-n", namespace, "get", "networkpolicy", name)["metadata"]
+        time.sleep(args.stable_for)
+        after = kube("-n", namespace, "get", "networkpolicy", name)["metadata"]
+        require(before["uid"] == after["uid"] and before["generation"] == after["generation"],
+                "NetworkPolicy spec did not remain stable during the observation")
+        print(json.dumps({"network_policy_generation": after["generation"],
+                          "stable_seconds": args.stable_for,
+                          "resource_version_unchanged": before["resourceVersion"] == after["resourceVersion"]}))
 
 
 if __name__ == "__main__":
