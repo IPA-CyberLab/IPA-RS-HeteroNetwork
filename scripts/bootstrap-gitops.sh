@@ -66,7 +66,7 @@ while IFS= read -r workload; do
   kubectl -n "${ARGOCD_NAMESPACE}" rollout status "${workload}" --timeout="${TIMEOUT}"
 done < <(kubectl -n "${ARGOCD_NAMESPACE}" get statefulset -o name)
 
-for application in longhorn-prerequisites longhorn heterocloud-registry-redis heterocloud-registry cluster-dns envoy-gateway heterocloud-syouyu heterocloud-edge heterocloud heterocloud-flow heterocloud-flash; do
+for application in metrics-server longhorn-prerequisites longhorn heterocloud-registry-redis heterocloud-registry cluster-dns envoy-gateway heterocloud-syouyu heterocloud-edge heterocloud heterocloud-flow heterocloud-flash; do
   kubectl -n "${ARGOCD_NAMESPACE}" wait "application/${application}" \
     --for=jsonpath='{.status.sync.status}'=Synced \
     --timeout="${TIMEOUT}"

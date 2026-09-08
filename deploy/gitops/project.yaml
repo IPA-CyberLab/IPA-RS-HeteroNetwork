@@ -16,6 +16,7 @@ spec:
     - https://yandex-cloud.github.io/k8s-csi-s3/charts
     - https://charts.bitnami.com/bitnami
     - https://helm.goharbor.io
+    - https://kubernetes-sigs.github.io/metrics-server/
   destinations:
     - namespace: kube-system
       server: https://kubernetes.default.svc
