@@ -41,6 +41,22 @@ proof of four independent healthy Keycloak server processes.
 
 ## Verification
 
+The autopilot fix also prefers an active, root-configured local control plane
+whose cluster, node and VPN listener match the local identity. It derives the
+node bearer using the existing control-plane protocol; the base secret is never
+sent as a bearer. That credential is scoped to the exact local endpoint, while
+configured remote fallbacks retain their enrollment credential. Failure logs
+include sanitized endpoint, HTTP status and curl exit code, not secrets or
+response bodies. The focused shell regression includes an independent SHA-256
+golden value, credential scope checks and secret-leak checks.
+
+The updated script was deployed to ichikawap1 and uc-k8s3p. Both automatically
+started their previously stopped Keycloak replicas, returned readiness HTTP
+200, and renewed assignment leases. Other nodes were not claimed as updated.
+SSH verification for uc-k8sv1 was not bypassed when its host key differed from
+the saved key; the separate Tailscale reauthorization prompt for the private
+worker was not bypassed either.
+
 Run from an operator host with VPN and Kubernetes access:
 
 ```sh
@@ -64,6 +80,8 @@ A later repeat on the coding host failed while resolving the public hostname
 for a CSS request, before an origin connection. Subsequent ten-attempt runs on
 both the coding host and ichikawap1 passed; the isolated client-side DNS failure
 is recorded rather than counted as a successful attempt.
+After the two replica recoveries, another ten-attempt public check passed and
+the internal metadata preflight passed with three ready connector nodes.
 
 Existing Flash Pod UIDs and restart counts were unchanged: nginx remained at
 zero and escape at its previously recorded one OOM restart. No tenant container
