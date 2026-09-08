@@ -1789,6 +1789,7 @@ install_kubernetes_packages() {
   printf 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/%s/deb/ /\n' "$kubernetes_minor" \
     | install_from_stdin /etc/apt/sources.list.d/kubernetes.list 0644
   apt-get update
+  apt-get install -y cri-tools
   local installed_version
   if installed_version="$(installed_kubernetes_toolchain_version)"; then
     printf 'preserving aligned Kubernetes toolchain %s\n' "$installed_version"
@@ -1878,21 +1879,36 @@ reconcile_discovered_control_plane_backends() {
     "$node_name" "$control_plane_backends"
 }
 
+container_runtime_healthy() {
+  local info
+  local -a cri=(crictl --runtime-endpoint unix:///run/containerd/containerd.sock --timeout 10s)
+  info="$(timeout --kill-after=2s 15s "${cri[@]}" info 2>/dev/null)" || return 1
+  jq -e 'any(.status.conditions[]?; .type == "RuntimeReady" and .status == true)' \
+    <<<"$info" >/dev/null 2>&1 || return 1
+  # A responsive version/Status RPC does not prove the PLEG list operations work.
+  timeout --kill-after=2s 15s "${cri[@]}" pods --quiet >/dev/null 2>&1 || return 1
+  timeout --kill-after=2s 15s "${cri[@]}" ps --quiet >/dev/null 2>&1
+}
+
 reconcile_container_runtime() {
-  require_command ctr
+  require_command jq
   require_command curl
   require_command timeout
+  if ! command -v crictl >/dev/null 2>&1; then
+    printf 'CRI health probe unavailable on %s: install cri-tools; preserving runtime and continuing API backend recovery\n' \
+      "$node_name" >&2
+    return
+  fi
   local failure_file="$state_dir/containerd-health-failures"
   local recovery_marker="$state_dir/containerd-recovery-in-progress"
   local max_failures=6
   if systemctl is-active --quiet containerd.service \
-    && timeout --kill-after=2s 15s \
-      ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
+    && container_runtime_healthy; then
     rm -f "$failure_file"
     return
   fi
 
-  # ctr can time out while the runtime and kubelet are still serving normally
+  # CRI can time out while the runtime and kubelet are still serving normally
   # on I/O-bound control-plane nodes. Do not turn that transient slowdown into
   # a simultaneous, destructive runtime restart across the HA cohort.
   if systemctl is-active --quiet containerd.service \
@@ -1902,7 +1918,7 @@ reconcile_container_runtime() {
         http://127.0.0.1:10248/healthz 2>/dev/null \
       | grep -Fxq 'ok'; then
     if [[ -f "$failure_file" ]]; then
-      printf 'containerd CLI probe is slow on %s but kubelet is healthy; preserving the runtime\n' \
+      printf 'containerd CRI probe is slow on %s but kubelet is healthy; preserving the runtime\n' \
         "$node_name" >&2
     fi
     rm -f "$failure_file"
@@ -1953,8 +1969,7 @@ reconcile_container_runtime() {
 
   local attempt
   for ((attempt = 1; attempt <= 6; attempt++)); do
-    if timeout --kill-after=2s 10s \
-      ctr --address /run/containerd/containerd.sock version >/dev/null 2>&1; then
+    if container_runtime_healthy; then
       return
     fi
     sleep 2
