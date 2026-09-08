@@ -487,6 +487,111 @@ assert_active heteronetwork-keycloak-backchannel.service
 jq -e '.eligible == true and .ready == true' "$(latest_request)" >/dev/null \
   || fail "a stale Control Plane fallback changed replica readiness"
 
+promoted_dir="$config_dir/public-services"
+promoted_env="$promoted_dir/services.env"
+promoted_token="$promoted_dir/keycloak-autopilot.token"
+local_cp_url="http://$vpn_ip:19088/v1/keycloak-autopilot/reconcile"
+write_promoted_fixture() {
+  mkdir -p "$promoted_dir"
+  chmod 0750 "$promoted_dir"
+  rm -f "$promoted_env" "$promoted_token"
+  cat >"$promoted_env" <<EOF
+HETERONETWORK_CLUSTER_ID="$cluster_id"
+HETERONETWORK_SERVICE_OWNER_NODE_ID="$node_id"
+HETERONETWORK_LISTEN="$vpn_ip:19088"
+HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://$vpn_ip:19088"
+EOF
+  printf '%s\n' "$bearer_token" >"$promoted_token"
+  chmod 0640 "$promoted_env"
+  chmod 0400 "$promoted_token"
+  touch "$fake_state/active/heteronetwork-control-plane.service"
+}
+
+write_promoted_fixture
+requests_before_local_cp="$(count_reconcile_requests)"
+{
+  printf 'http://%s:9781/v1/keycloak-autopilot/reconcile\n' "$vpn_ip"
+  for index in $(seq 1 16); do
+    printf 'https://control-%s.example.test/v1/keycloak-autopilot/reconcile\n' "$index"
+  done
+} >"$fake_state/unavailable-reconcile-urls"
+run_autopilot reconcile
+[[ "$(count_reconcile_requests)" == "$((requests_before_local_cp + 1))" \
+  && "$(reconcile_url_at "$((requests_before_local_cp + 1))")" == "$local_cp_url" ]] \
+  || fail "trusted local Control Plane did not recover with gateway and enrollment seeds down"
+assert_active heteronetwork-keycloak.service
+rm -f "$fake_state/unavailable-reconcile-urls"
+
+# The discovered local endpoint still uses bearer auth and the normal placement/lease checks.
+probe_lease_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/assignment-lease-deadline"
+lease_before_local_bad_response="$(<"$probe_lease_path")"
+touch "$fake_state/response-generation-mismatch"
+run_autopilot reconcile
+rm -f "$fake_state/response-generation-mismatch"
+[[ "$(<"$probe_lease_path")" == "$lease_before_local_bad_response" ]] \
+  || fail "local Control Plane response bypassed generation validation"
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$probe_lease_path"
+requests_before_local_outage="$(count_reconcile_requests)"
+touch "$fake_state/api-down"
+run_autopilot reconcile
+rm -f "$fake_state/api-down"
+[[ "$(count_reconcile_requests)" == "$((requests_before_local_outage + 16))" ]] \
+  || fail "local Control Plane discovery exceeded the bounded attempt budget"
+assert_inactive heteronetwork-keycloak.service
+[[ ! -e "$probe_lease_path" ]] || fail "local discovery bypassed assignment lease expiry"
+run_autopilot reconcile
+assert_active heteronetwork-keycloak.service
+
+for invalid_promotion in cluster node listen advertise duplicate executable writable world_read \
+  directory_writable symlink hardlink token token_mode inactive; do
+  write_promoted_fixture
+  case "$invalid_promotion" in
+    cluster) sed -i 's/^HETERONETWORK_CLUSTER_ID=.*/HETERONETWORK_CLUSTER_ID="other-cluster"/' "$promoted_env" ;;
+    node) sed -i 's/^HETERONETWORK_SERVICE_OWNER_NODE_ID=.*/HETERONETWORK_SERVICE_OWNER_NODE_ID="other-node"/' "$promoted_env" ;;
+    listen) sed -i 's/^HETERONETWORK_LISTEN=.*/HETERONETWORK_LISTEN="10.250.0.99:19088"/' "$promoted_env" ;;
+    advertise) sed -i 's|^HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL=.*|HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="https://untrusted.example.test"|' "$promoted_env" ;;
+    duplicate) printf 'HETERONETWORK_LISTEN="%s:19088"\n' "$vpn_ip" >>"$promoted_env" ;;
+    executable)
+      printf 'HETERONETWORK_LISTEN="$(touch %s)"\n' "$test_dir/must-not-execute" >>"$promoted_env"
+      ;;
+    writable) chmod 0660 "$promoted_env" ;;
+    world_read) chmod 0644 "$promoted_env" ;;
+    directory_writable) chmod 0770 "$promoted_dir" ;;
+    symlink) mv "$promoted_env" "$promoted_dir/linked.env"; ln -s linked.env "$promoted_env" ;;
+    hardlink) ln "$promoted_env" "$promoted_dir/linked.env" ;;
+    token) chmod 0600 "$promoted_token"; printf '%064d\n' 0 >"$promoted_token" ;;
+    token_mode) chmod 0640 "$promoted_token" ;;
+    inactive) rm -f "$fake_state/active/heteronetwork-control-plane.service" ;;
+  esac
+  requests_before_untrusted="$(count_reconcile_requests)"
+  run_autopilot reconcile
+  [[ "$(reconcile_url_at "$((requests_before_untrusted + 1))")" \
+    == "http://$vpn_ip:9781/v1/keycloak-autopilot/reconcile" ]] \
+    || fail "invalid local promotion was trusted: $invalid_promotion"
+  [[ "$(count_reconcile_requests)" == "$((requests_before_untrusted + 1))" ]] \
+    || fail "invalid local promotion changed legacy fallback behavior"
+  [[ ! -e "$test_dir/must-not-execute" ]] || fail "local CP discovery executed configuration"
+  rm -f "$promoted_dir/linked.env"
+done
+
+write_promoted_fixture
+cp "$config_dir/keycloak-autopilot.env" "$test_dir/original-keycloak.env"
+dedup_urls="$(b64 "http://$vpn_ip:19088") $(b64 "http://$vpn_ip:9781") $(b64 "https://control-1.example.test")"
+sed -i "s|^HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64=.*|HETERONETWORK_KEYCLOAK_CONTROL_PLANE_URLS_B64='$dedup_urls'|" \
+  "$config_dir/keycloak-autopilot.env"
+requests_before_dedup="$(count_reconcile_requests)"
+printf '%s\n' "$local_cp_url" "http://$vpn_ip:9781/v1/keycloak-autopilot/reconcile" \
+  >"$fake_state/unavailable-reconcile-urls"
+run_autopilot reconcile
+[[ "$(count_reconcile_requests)" == "$((requests_before_dedup + 3))" ]] \
+  || fail "local Control Plane and gateway candidates were not deduplicated"
+[[ "$(reconcile_url_at "$((requests_before_dedup + 3))")" \
+  == "https://control-1.example.test/v1/keycloak-autopilot/reconcile" ]] \
+  || fail "unavailable local candidates did not fall back to configured Control Planes"
+cp "$test_dir/original-keycloak.env" "$config_dir/keycloak-autopilot.env"
+rm -f "$fake_state/unavailable-reconcile-urls" "$promoted_env" "$promoted_token" \
+  "$fake_state/active/heteronetwork-control-plane.service"
+
 generation_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/generation"
 rm -f "$generation_path"
 run_autopilot reconcile

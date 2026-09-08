@@ -47,6 +47,9 @@ else
 fi
 
 readonly config_path="$filesystem_root/etc/heteronetwork/keycloak-autopilot.env"
+readonly public_services_dir="$filesystem_root/etc/heteronetwork/public-services"
+readonly local_control_plane_config="$public_services_dir/services.env"
+readonly local_control_plane_token="$public_services_dir/keycloak-autopilot.token"
 readonly state_dir="$filesystem_root/var/lib/heteronetwork-keycloak-autopilot"
 readonly runtime_dir="$filesystem_root/run/heteronetwork-keycloak-autopilot"
 readonly bundle_dir="$filesystem_root/etc/heteronetwork/postgres-autopilot/bundle"
@@ -222,13 +225,64 @@ read_agent_identity() {
   valid_identifier "$node_id" && valid_private_ipv4 "$vpn_ip"
 }
 
+local_control_plane_config_value() {
+  local key="$1"
+  # Read the promotion writer's literal systemd EnvironmentFile format, never source it.
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      count += 1
+      value = substr($0, length(key) + 2)
+    }
+    END {
+      if (count != 1 || value !~ /^"[^"\\]*"$/) exit 1
+      print substr(value, 2, length(value) - 2)
+    }
+  ' "$local_control_plane_config"
+}
+
+discover_local_control_plane() {
+  local uid links mode size
+  [[ -d "$public_services_dir" && ! -L "$public_services_dir" \
+    && -f "$local_control_plane_config" && ! -L "$local_control_plane_config" ]] \
+    || return 1
+  read -r uid mode < <(stat -c '%u %a' -- "$public_services_dir") || return 1
+  [[ "$uid" == "$expected_root_uid" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 0022) == 0 )) || return 1
+  read -r uid links mode size < <(stat -c '%u %h %a %s' -- "$local_control_plane_config") \
+    || return 1
+  [[ "$uid" == "$expected_root_uid" && "$links" == "1" \
+    && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  # The promotion writer uses root:heteronetwork-services 0640, not root-only 0600.
+  (( (8#$mode & 0400) != 0 && (8#$mode & 0037) == 0 \
+    && 10#$size > 0 && 10#$size <= MAX_CONFIG_BYTES )) || return 1
+  secure_root_file "$local_control_plane_token" "$MAX_SECRET_BYTES" || return 1
+  [[ "$(<"$local_control_plane_token")" == "$autopilot_bearer_token" ]] || return 1
+  [[ "$(local_control_plane_config_value HETERONETWORK_CLUSTER_ID)" == "$cluster_id" \
+    && "$(local_control_plane_config_value HETERONETWORK_SERVICE_OWNER_NODE_ID)" == "$node_id" \
+    && "$(local_control_plane_config_value HETERONETWORK_LISTEN)" == "$vpn_ip:19088" \
+    && "$(local_control_plane_config_value HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL)" == "http://$vpn_ip:19088" ]] \
+    || return 1
+  systemctl is-active --quiet heteronetwork-control-plane.service || return 1
+  printf 'http://%s:19088\n' "$vpn_ip"
+}
+
 prefer_local_control_plane_gateway() {
   local local_gateway="http://${vpn_ip}:${AGENT_CONTROL_PLANE_GATEWAY_PORT}"
-  local configured_url
-  local -a preferred_urls=("$local_gateway")
+  local configured_url local_control_plane existing duplicate
+  local -a preferred_urls=()
+
+  # An authenticated promoted local CP avoids stale enrollment seeds and a failed gateway.
+  if local_control_plane="$(discover_local_control_plane)"; then
+    preferred_urls+=("$local_control_plane")
+  fi
+  preferred_urls+=("$local_gateway")
 
   for configured_url in "${control_plane_urls[@]}"; do
-    [[ "$configured_url" != "$local_gateway" ]] || continue
+    duplicate=false
+    for existing in "${preferred_urls[@]}"; do
+      [[ "$configured_url" != "$existing" ]] || duplicate=true
+    done
+    [[ "$duplicate" == false ]] || continue
     ((${#preferred_urls[@]} < MAX_CONTROL_PLANE_URLS)) || break
     preferred_urls+=("$configured_url")
   done
@@ -446,8 +500,8 @@ request_reconciliation() {
   attempts="$url_count"
   ((attempts <= MAX_CONTROL_PLANE_ATTEMPTS)) \
     || attempts="$MAX_CONTROL_PLANE_ATTEMPTS"
-  # The local Agent gateway already tracks the live Control Plane directory.
-  # Always try it first; enrollment-time URLs are bounded fallbacks only.
+  # Prefer a trusted promoted local CP, then the Agent gateway's live directory.
+  # Enrollment-time URLs remain bounded fallbacks only.
   cursor=0
   for ((attempt = 0; attempt < attempts; attempt++)); do
     index="$(((10#$cursor + attempt) % url_count))"
