@@ -10,7 +10,10 @@ spec:
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
+      # Nodes without a healthy replica must not block updates on healthy nodes.
+      # No host ports are used, so old and new connectors can overlap safely.
+      maxUnavailable: 0
+      maxSurge: 100%
   template:
     metadata:
       labels:
