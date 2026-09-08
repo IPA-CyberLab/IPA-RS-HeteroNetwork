@@ -6,9 +6,14 @@ configMapGenerator:
     namespace: kube-system
     files:
       - haproxy.cfg=postgres-haproxy.cfg
+  - name: keycloak-ha-connector
+    namespace: kube-system
+    files:
+      - haproxy.cfg=keycloak-haproxy.cfg
 
 resources:
   - coredns.yaml
   - nodelocaldns.yaml
   - postgres-ha-connector.yaml
+  - keycloak-ha-connector.yaml
   - service-route.yaml
