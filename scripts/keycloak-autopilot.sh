@@ -272,7 +272,13 @@ discover_local_control_plane() {
     || return 1
   systemctl is-active --quiet heteronetwork-control-plane.service || return 1
   local_control_plane_url="http://$vpn_ip:19088"
-  local_control_plane_bearer_token="$token"
+  # Match derive_keycloak_node_bearer in the control-plane HTTP middleware.
+  # Keep the base secret on stdin, never in an external command's arguments.
+  local_control_plane_bearer_token="$(
+    printf 'heteronetwork-keycloak-autopilot-node-v1\0%s\0%s\0%s' \
+      "$token" "$cluster_id" "$node_id" | sha256sum | awk '{print $1}'
+  )" || return 1
+  [[ "$local_control_plane_bearer_token" =~ ^[a-f0-9]{64}$ ]] || return 1
 }
 
 prefer_local_control_plane_gateway() {
@@ -501,8 +507,21 @@ write_curl_config() {
   chmod 0600 "$target_file"
 }
 
+sanitized_control_plane_endpoint() {
+  local scheme="${1%%://*}" authority="${1#*://}"
+  authority="${authority%%[/?#]*}"
+  authority="${authority##*@}"
+  if [[ "$scheme" =~ ^https?$ && ${#authority} -le 261 \
+    && "$authority" =~ ^(\[[a-fA-F0-9:]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?$ ]]; then
+    printf '%s://%s' "$scheme" "$authority"
+  else
+    printf '%s' '[redacted-endpoint]'
+  fi
+}
+
 request_reconciliation() {
   local base cursor attempt attempts index url_count selected_curl_config
+  local http_status curl_exit credential_scope
   response_file="$(mktemp "$runtime_dir/response.XXXXXX")"
   curl_config_file="$(mktemp "$runtime_dir/curl.XXXXXX")"
   write_curl_config "$curl_config_file" "$autopilot_bearer_token"
@@ -522,21 +541,32 @@ request_reconciliation() {
     base="${control_plane_urls[$index]}"
     # The promotion credential is scoped to this exact validated local endpoint only.
     selected_curl_config="$curl_config_file"
+    credential_scope=fallback
     if [[ -n "$local_curl_config_file" && "$base" == "$local_control_plane_url" ]]; then
       selected_curl_config="$local_curl_config_file"
+      credential_scope=local
     fi
     candidate_response_file="$(mktemp "$runtime_dir/response-candidate.XXXXXX")"
-    if curl --config "$selected_curl_config" \
+    curl_exit=0
+    if http_status="$(curl --config "$selected_curl_config" \
       --header 'Content-Type: application/json' \
       --data-binary "@$request_file" \
       --output "$candidate_response_file" \
-      "${base}/v1/keycloak-autopilot/reconcile" 2>/dev/null; then
+      --write-out '%{http_code}' \
+      "${base}/v1/keycloak-autopilot/reconcile" 2>/dev/null)"; then
+      :
+    else
+      curl_exit=$?
+    fi
+    if [[ "$curl_exit" == 0 && "$http_status" =~ ^2[0-9]{2}$ ]]; then
       mv -f "$candidate_response_file" "$response_file"
       candidate_response_file=""
       write_state_value "$control_plane_cursor_path" \
         "$(((index + 1) % url_count))"
       return 0
     fi
+    [[ "$http_status" =~ ^[0-9]{3}$ ]] || http_status=unknown
+    log "Control Plane reconcile failed: endpoint=$(sanitized_control_plane_endpoint "$base") http_status=$http_status curl_exit=$curl_exit credential_scope=$credential_scope"
     rm -f "$candidate_response_file"
     candidate_response_file=""
   done

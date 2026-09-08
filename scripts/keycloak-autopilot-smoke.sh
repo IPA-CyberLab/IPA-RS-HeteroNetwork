@@ -21,6 +21,7 @@ curl_counter="$test_dir/curl-counter"
 
 readonly bearer_token="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 readonly promoted_bearer_token="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+readonly promoted_node_bearer_token="d1d9da9ce0d1e6fd2f371afd6dac4f1cb378871c125c9a1b943d4c5e68e49c0a"
 readonly database_secret="DatabaseSecret_DoNotPrint_729154"
 readonly bootstrap_secret="BootstrapSecret_DoNotPrint_418630"
 readonly cluster_id="cluster-keycloak-smoke"
@@ -181,6 +182,7 @@ url="${*: -1}"
 config=""
 data_binary=""
 output=""
+write_out=""
 while (($# > 0)); do
   case "$1" in
     --config)
@@ -193,6 +195,10 @@ while (($# > 0)); do
       ;;
     --output)
       output="$2"
+      shift 2
+      ;;
+    --write-out)
+      write_out="$2"
       shift 2
       ;;
     *)
@@ -217,19 +223,33 @@ case "$url" in
     printf '{"issuer":"https://console.example.test/realms/heteronetwork"}\n'
     ;;
   */v1/keycloak-autopilot/reconcile)
+    [[ "$write_out" == '%{http_code}' ]] || exit 13
     [[ -f "$config" && "$(stat -c '%a' "$config")" == "600" ]] || exit 8
     expected_token="$HETERONETWORK_SMOKE_BEARER_TOKEN"
     if [[ "$url" == "http://$HETERONETWORK_SMOKE_VPN_IP:19088/v1/keycloak-autopilot/reconcile" ]]; then
-      expected_token="$HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN"
+      expected_token="$HETERONETWORK_SMOKE_PROMOTED_NODE_BEARER_TOKEN"
     fi
     if ! grep -Fqx "header = \"Authorization: Bearer ${expected_token}\"" "$config"; then
       touch "$HETERONETWORK_SMOKE_STATE/credential-scope-mismatch"
       exit 9
     fi
-    [[ ! -e "$HETERONETWORK_SMOKE_STATE/api-down" ]] || exit 7
+    if [[ "$url" == "http://$HETERONETWORK_SMOKE_VPN_IP:19088/v1/keycloak-autopilot/reconcile" \
+      && -f "$HETERONETWORK_SMOKE_STATE/local-http-failure" ]]; then
+      printf '%s' "$HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN" >"$output"
+      printf '%s' "$HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN" >&2
+      status="$(<"$HETERONETWORK_SMOKE_STATE/local-http-failure")"
+      printf '%s' "$status"
+      [[ "$status" == 302 ]] && exit 0
+      exit 22
+    fi
+    if [[ -e "$HETERONETWORK_SMOKE_STATE/api-down" ]]; then
+      printf '000'
+      exit 7
+    fi
     if [[ -f "$HETERONETWORK_SMOKE_STATE/unavailable-reconcile-urls" ]] \
       && grep -Fqx "$url" \
         "$HETERONETWORK_SMOKE_STATE/unavailable-reconcile-urls"; then
+      printf '000'
       exit 7
     fi
     request="${data_binary#@}"
@@ -262,6 +282,7 @@ case "$url" in
         '.generation = $generation' \
         "$HETERONETWORK_SMOKE_RESPONSE_FIXTURE" >"$output"
     fi
+    printf '200'
     ;;
   *)
     exit 12
@@ -356,6 +377,7 @@ export HETERONETWORK_SMOKE_RESPONSE_FIXTURE="$fixture_dir/response.json"
 export HETERONETWORK_SMOKE_WITHDRAW_RESPONSE_FIXTURE="$fixture_dir/withdraw-response.json"
 export HETERONETWORK_SMOKE_BEARER_TOKEN="$bearer_token"
 export HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN="$promoted_bearer_token"
+export HETERONETWORK_SMOKE_PROMOTED_NODE_BEARER_TOKEN="$promoted_node_bearer_token"
 export HETERONETWORK_SMOKE_ARCHIVE_URL="$archive_url"
 export HETERONETWORK_SMOKE_VPN_IP="$vpn_ip"
 
@@ -529,6 +551,28 @@ run_autopilot reconcile
 assert_active heteronetwork-keycloak.service
 rm -f "$fake_state/unavailable-reconcile-urls"
 
+for status in 401 503 302; do
+  printf '%s' "$status" >"$fake_state/local-http-failure"
+  requests_before_http_failure="$(count_reconcile_requests)"
+  run_autopilot reconcile
+  [[ "$(count_reconcile_requests)" == "$((requests_before_http_failure + 2))" ]] \
+    || fail "local HTTP failure did not fall back to the gateway"
+  expected_exit=22
+  [[ "$status" != 302 ]] || expected_exit=0
+  grep -Fq "endpoint=http://$vpn_ip:19088 http_status=$status curl_exit=$expected_exit credential_scope=local" \
+    "$output_log" || fail "HTTP failure diagnostics were missing"
+done
+printf '401\n%s' "$promoted_bearer_token" >"$fake_state/local-http-failure"
+run_autopilot reconcile
+grep -Fq "endpoint=http://$vpn_ip:19088 http_status=unknown curl_exit=22 credential_scope=local" \
+  "$output_log" || fail "unexpected curl status output was not sanitized"
+rm -f "$fake_state/local-http-failure"
+
+sanitized_endpoint="$(bash -c 'source "$1" help >/dev/null; sanitized_control_plane_endpoint "$2"' \
+  _ "$autopilot" 'https://user:URLSecret@example.test:8443/private/PathSecret?token=QuerySecret#FragmentSecret')"
+[[ "$sanitized_endpoint" == 'https://example.test:8443' ]] \
+  || fail "endpoint sanitization retained credentials, path, query, or fragment"
+
 # The discovered local endpoint still uses bearer auth and the normal placement/lease checks.
 probe_lease_path="$test_root/var/lib/heteronetwork-keycloak-autopilot/assignment-lease-deadline"
 lease_before_local_bad_response="$(<"$probe_lease_path")"
@@ -544,6 +588,10 @@ run_autopilot reconcile
 rm -f "$fake_state/api-down"
 [[ "$(count_reconcile_requests)" == "$((requests_before_local_outage + 16))" ]] \
   || fail "local Control Plane discovery exceeded the bounded attempt budget"
+grep -Fq "endpoint=http://$vpn_ip:19088 http_status=000 curl_exit=7 credential_scope=local" \
+  "$output_log" || fail "local transport failure diagnostics were missing"
+grep -Fq "endpoint=https://control-1.example.test http_status=000 curl_exit=7 credential_scope=fallback" \
+  "$output_log" || fail "fallback transport failure diagnostics were missing"
 assert_inactive heteronetwork-keycloak.service
 [[ ! -e "$probe_lease_path" ]] || fail "local discovery bypassed assignment lease expiry"
 run_autopilot reconcile
@@ -960,7 +1008,7 @@ grep -Fq 'test("^[a-f0-9]{64}$")' "$autopilot" \
 
 [[ ! -e "$fake_state/credential-scope-mismatch" ]] \
   || fail "a Control Plane received a credential from the wrong scope"
-for secret in "$database_secret" "$bootstrap_secret" "$bearer_token" "$promoted_bearer_token"; do
+for secret in "$database_secret" "$bootstrap_secret" "$bearer_token" "$promoted_bearer_token" "$promoted_node_bearer_token"; do
   if grep -Fq "$secret" \
     "$output_log" "$helper_log" "$systemctl_log" "$curl_argv_log"; then
     fail "a secret was exposed in logs or process arguments"
