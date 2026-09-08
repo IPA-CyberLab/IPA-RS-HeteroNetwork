@@ -9,12 +9,17 @@ spec:
   project: hetero-platform
   source:
     repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud.git
-    targetRevision: v0.1.66
+    targetRevision: b3e033b9eaa56b83dba37019411b16de56baf67b
     path: deploy/helm/heterocloud
     helm:
       releaseName: heterocloud
       valueFiles:
         - ../../environments/heteronet/values.yaml
+      valuesObject:
+        hostAliases:
+          - ip: "10.96.180.79"
+            hostnames:
+              - console.heteronetwork.internal
   destination:
     server: https://kubernetes.default.svc
     namespace: heterocloud
