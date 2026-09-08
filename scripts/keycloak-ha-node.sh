@@ -716,7 +716,7 @@ EOF
   IFS=, read -r -a endpoints <<<"$edge_upstreams"
   for endpoint in "${endpoints[@]}"; do
     index=$((index + 1))
-    printf '    server replica_%s %s check inter 2s fall 2 rise 30 slowstart 60s observe layer7 error-limit 1 on-error mark-down\n' \
+    printf '    server replica_%s %s check inter 2s fall 2 rise 2 slowstart 10s observe layer7 error-limit 3 on-error mark-down\n' \
       "$index" "$endpoint"
   done
 }
