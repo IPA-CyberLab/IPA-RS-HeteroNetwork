@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flash-web
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: hetero-platform
+  source:
+    repoURL: https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork.git
+    targetRevision: master
+    path: deploy/gitops/flash-web
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: heterocloud-dns
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+    syncOptions:
+      - ServerSideApply=true

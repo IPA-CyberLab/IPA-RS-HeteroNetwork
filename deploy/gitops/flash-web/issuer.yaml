@@ -1,0 +1,19 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: flash-web-letsencrypt
+  namespace: heterocloud-dns
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: flash-web-acme-account
+    solvers:
+      - selector:
+          dnsZones:
+            - mizuame.app
+        dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: heterocloud-dns-provider
+              key: CF_API_TOKEN

@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: heterocloud-dns
+resources:
+  # Parent-owned cert-manager resources; supplied separately before rendering.
+  - issuer.yaml
+  - certificate.yaml
+  - wildcard-route.yaml
+  - tls-sync-daemonset.yaml
+configMapGenerator:
+  - name: flash-web-tls-sync
+    files:
+      - tls-sync.py

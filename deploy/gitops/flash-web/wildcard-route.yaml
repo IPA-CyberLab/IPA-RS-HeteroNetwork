@@ -1,0 +1,45 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: flash-web-unassigned
+  namespace: heterocloud-dns
+  labels:
+    dns.heterocloud.io/publish: "true"
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: '*.flash.heterocloud.mizuame.app'
+    external-dns.alpha.kubernetes.io/gateway-hostname-source: annotation-only
+    external-dns.alpha.kubernetes.io/ttl: "60"
+    external-dns.alpha.kubernetes.io/cloudflare-proxied: "false"
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: heterocloud-edge
+      namespace: heterocloud-edge
+      sectionName: http
+  hostnames:
+    - '*.flash.heterocloud.mizuame.app'
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: flash-web-not-found
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: flash-web-not-found
+  namespace: heterocloud-dns
+spec:
+  directResponse:
+    statusCode: 404
+    contentType: text/plain
+    body:
+      type: Inline
+      inline: "Not Found\n"

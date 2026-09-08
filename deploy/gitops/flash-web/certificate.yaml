@@ -1,0 +1,17 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: flash-web
+  namespace: heterocloud-dns
+spec:
+  secretName: flash-web-tls
+  dnsNames:
+    - '*.flash.heterocloud.mizuame.app'
+  issuerRef:
+    name: flash-web-letsencrypt
+    kind: Issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  renewBefore: 720h
