@@ -20,6 +20,7 @@ curl_argv_log="$test_dir/curl-argv.log"
 curl_counter="$test_dir/curl-counter"
 
 readonly bearer_token="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+readonly promoted_bearer_token="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 readonly database_secret="DatabaseSecret_DoNotPrint_729154"
 readonly bootstrap_secret="BootstrapSecret_DoNotPrint_418630"
 readonly cluster_id="cluster-keycloak-smoke"
@@ -216,16 +217,21 @@ case "$url" in
     printf '{"issuer":"https://console.example.test/realms/heteronetwork"}\n'
     ;;
   */v1/keycloak-autopilot/reconcile)
+    [[ -f "$config" && "$(stat -c '%a' "$config")" == "600" ]] || exit 8
+    expected_token="$HETERONETWORK_SMOKE_BEARER_TOKEN"
+    if [[ "$url" == "http://$HETERONETWORK_SMOKE_VPN_IP:19088/v1/keycloak-autopilot/reconcile" ]]; then
+      expected_token="$HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN"
+    fi
+    if ! grep -Fqx "header = \"Authorization: Bearer ${expected_token}\"" "$config"; then
+      touch "$HETERONETWORK_SMOKE_STATE/credential-scope-mismatch"
+      exit 9
+    fi
     [[ ! -e "$HETERONETWORK_SMOKE_STATE/api-down" ]] || exit 7
     if [[ -f "$HETERONETWORK_SMOKE_STATE/unavailable-reconcile-urls" ]] \
       && grep -Fqx "$url" \
         "$HETERONETWORK_SMOKE_STATE/unavailable-reconcile-urls"; then
       exit 7
     fi
-    [[ -f "$config" && "$(stat -c '%a' "$config")" == "600" ]] || exit 8
-    grep -Fqx \
-      "header = \"Authorization: Bearer ${HETERONETWORK_SMOKE_BEARER_TOKEN}\"" \
-      "$config" || exit 9
     request="${data_binary#@}"
     [[ "$request" != "$data_binary" && -f "$request" && -n "$output" ]] || exit 10
     jq -e \
@@ -349,6 +355,7 @@ export HETERONETWORK_SMOKE_STATUS_FIXTURE="$fixture_dir/status.json"
 export HETERONETWORK_SMOKE_RESPONSE_FIXTURE="$fixture_dir/response.json"
 export HETERONETWORK_SMOKE_WITHDRAW_RESPONSE_FIXTURE="$fixture_dir/withdraw-response.json"
 export HETERONETWORK_SMOKE_BEARER_TOKEN="$bearer_token"
+export HETERONETWORK_SMOKE_PROMOTED_BEARER_TOKEN="$promoted_bearer_token"
 export HETERONETWORK_SMOKE_ARCHIVE_URL="$archive_url"
 export HETERONETWORK_SMOKE_VPN_IP="$vpn_ip"
 
@@ -501,7 +508,7 @@ HETERONETWORK_SERVICE_OWNER_NODE_ID="$node_id"
 HETERONETWORK_LISTEN="$vpn_ip:19088"
 HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL="http://$vpn_ip:19088"
 EOF
-  printf '%s\n' "$bearer_token" >"$promoted_token"
+  printf '%s\n' "$promoted_bearer_token" >"$promoted_token"
   chmod 0640 "$promoted_env"
   chmod 0400 "$promoted_token"
   touch "$fake_state/active/heteronetwork-control-plane.service"
@@ -543,7 +550,7 @@ run_autopilot reconcile
 assert_active heteronetwork-keycloak.service
 
 for invalid_promotion in cluster node listen advertise duplicate executable writable world_read \
-  directory_writable symlink hardlink token token_mode inactive; do
+  directory_writable symlink hardlink token token_short token_long token_newlines token_mode inactive; do
   write_promoted_fixture
   case "$invalid_promotion" in
     cluster) sed -i 's/^HETERONETWORK_CLUSTER_ID=.*/HETERONETWORK_CLUSTER_ID="other-cluster"/' "$promoted_env" ;;
@@ -559,7 +566,10 @@ for invalid_promotion in cluster node listen advertise duplicate executable writ
     directory_writable) chmod 0770 "$promoted_dir" ;;
     symlink) mv "$promoted_env" "$promoted_dir/linked.env"; ln -s linked.env "$promoted_env" ;;
     hardlink) ln "$promoted_env" "$promoted_dir/linked.env" ;;
-    token) chmod 0600 "$promoted_token"; printf '%064d\n' 0 >"$promoted_token" ;;
+    token) chmod 0600 "$promoted_token"; printf '%s\n' 'not-a-hex-token' >"$promoted_token" ;;
+    token_short) chmod 0600 "$promoted_token"; printf '%063d\n' 0 >"$promoted_token" ;;
+    token_long) chmod 0600 "$promoted_token"; printf '%065d\n' 0 >"$promoted_token" ;;
+    token_newlines) chmod 0600 "$promoted_token"; printf '%s\n\n' "$promoted_bearer_token" >"$promoted_token" ;;
     token_mode) chmod 0640 "$promoted_token" ;;
     inactive) rm -f "$fake_state/active/heteronetwork-control-plane.service" ;;
   esac
@@ -948,7 +958,9 @@ fi
 grep -Fq 'test("^[a-f0-9]{64}$")' "$autopilot" \
   || fail "autopilot placement ID contract is not full SHA-256"
 
-for secret in "$database_secret" "$bootstrap_secret" "$bearer_token"; do
+[[ ! -e "$fake_state/credential-scope-mismatch" ]] \
+  || fail "a Control Plane received a credential from the wrong scope"
+for secret in "$database_secret" "$bootstrap_secret" "$bearer_token" "$promoted_bearer_token"; do
   if grep -Fq "$secret" \
     "$output_log" "$helper_log" "$systemctl_log" "$curl_argv_log"; then
     fail "a secret was exposed in logs or process arguments"

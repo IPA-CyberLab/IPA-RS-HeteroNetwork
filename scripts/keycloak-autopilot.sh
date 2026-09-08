@@ -69,6 +69,9 @@ request_file=""
 response_file=""
 candidate_response_file=""
 curl_config_file=""
+local_curl_config_file=""
+local_control_plane_url=""
+local_control_plane_bearer_token=""
 request_generation=""
 agent_restart_attempted=false
 
@@ -81,6 +84,7 @@ cleanup() {
   [[ -z "$response_file" ]] || rm -f "$response_file"
   [[ -z "$candidate_response_file" ]] || rm -f "$candidate_response_file"
   [[ -z "$curl_config_file" ]] || rm -f "$curl_config_file"
+  [[ -z "$local_curl_config_file" ]] || rm -f "$local_curl_config_file"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -241,7 +245,9 @@ local_control_plane_config_value() {
 }
 
 discover_local_control_plane() {
-  local uid links mode size
+  local uid links mode size token
+  local_control_plane_url=""
+  local_control_plane_bearer_token=""
   [[ -d "$public_services_dir" && ! -L "$public_services_dir" \
     && -f "$local_control_plane_config" && ! -L "$local_control_plane_config" ]] \
     || return 1
@@ -255,25 +261,28 @@ discover_local_control_plane() {
   # The promotion writer uses root:heteronetwork-services 0640, not root-only 0600.
   (( (8#$mode & 0400) != 0 && (8#$mode & 0037) == 0 \
     && 10#$size > 0 && 10#$size <= MAX_CONFIG_BYTES )) || return 1
-  secure_root_file "$local_control_plane_token" "$MAX_SECRET_BYTES" || return 1
-  [[ "$(<"$local_control_plane_token")" == "$autopilot_bearer_token" ]] || return 1
+  # Exactly 64 lowercase hex digits, with at most one trailing newline.
+  secure_root_file "$local_control_plane_token" 65 || return 1
+  token="$(<"$local_control_plane_token")"
+  [[ "$token" =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ "$(local_control_plane_config_value HETERONETWORK_CLUSTER_ID)" == "$cluster_id" \
     && "$(local_control_plane_config_value HETERONETWORK_SERVICE_OWNER_NODE_ID)" == "$node_id" \
     && "$(local_control_plane_config_value HETERONETWORK_LISTEN)" == "$vpn_ip:19088" \
     && "$(local_control_plane_config_value HETERONETWORK_ADVERTISE_CONTROL_PLANE_URL)" == "http://$vpn_ip:19088" ]] \
     || return 1
   systemctl is-active --quiet heteronetwork-control-plane.service || return 1
-  printf 'http://%s:19088\n' "$vpn_ip"
+  local_control_plane_url="http://$vpn_ip:19088"
+  local_control_plane_bearer_token="$token"
 }
 
 prefer_local_control_plane_gateway() {
   local local_gateway="http://${vpn_ip}:${AGENT_CONTROL_PLANE_GATEWAY_PORT}"
-  local configured_url local_control_plane existing duplicate
+  local configured_url existing duplicate
   local -a preferred_urls=()
 
   # An authenticated promoted local CP avoids stale enrollment seeds and a failed gateway.
-  if local_control_plane="$(discover_local_control_plane)"; then
-    preferred_urls+=("$local_control_plane")
+  if discover_local_control_plane; then
+    preferred_urls+=("$local_control_plane_url")
   fi
   preferred_urls+=("$local_gateway")
 
@@ -478,7 +487,7 @@ write_request() {
 }
 
 write_curl_config() {
-  curl_config_file="$(mktemp "$runtime_dir/curl.XXXXXX")"
+  local target_file="$1" bearer_token="$2"
   {
     printf '%s\n' \
       'fail' \
@@ -487,15 +496,20 @@ write_curl_config() {
       'connect-timeout = 1' \
       'max-time = 2' \
       "max-filesize = $MAX_RESPONSE_BYTES"
-    printf 'header = "Authorization: Bearer %s"\n' "$autopilot_bearer_token"
-  } >"$curl_config_file"
-  chmod 0600 "$curl_config_file"
+    printf 'header = "Authorization: Bearer %s"\n' "$bearer_token"
+  } >"$target_file"
+  chmod 0600 "$target_file"
 }
 
 request_reconciliation() {
-  local base cursor attempt attempts index url_count
+  local base cursor attempt attempts index url_count selected_curl_config
   response_file="$(mktemp "$runtime_dir/response.XXXXXX")"
-  write_curl_config
+  curl_config_file="$(mktemp "$runtime_dir/curl.XXXXXX")"
+  write_curl_config "$curl_config_file" "$autopilot_bearer_token"
+  if [[ -n "$local_control_plane_url" && -n "$local_control_plane_bearer_token" ]]; then
+    local_curl_config_file="$(mktemp "$runtime_dir/curl.local.XXXXXX")"
+    write_curl_config "$local_curl_config_file" "$local_control_plane_bearer_token"
+  fi
   url_count="${#control_plane_urls[@]}"
   attempts="$url_count"
   ((attempts <= MAX_CONTROL_PLANE_ATTEMPTS)) \
@@ -506,8 +520,13 @@ request_reconciliation() {
   for ((attempt = 0; attempt < attempts; attempt++)); do
     index="$(((10#$cursor + attempt) % url_count))"
     base="${control_plane_urls[$index]}"
+    # The promotion credential is scoped to this exact validated local endpoint only.
+    selected_curl_config="$curl_config_file"
+    if [[ -n "$local_curl_config_file" && "$base" == "$local_control_plane_url" ]]; then
+      selected_curl_config="$local_curl_config_file"
+    fi
     candidate_response_file="$(mktemp "$runtime_dir/response-candidate.XXXXXX")"
-    if curl --config "$curl_config_file" \
+    if curl --config "$selected_curl_config" \
       --header 'Content-Type: application/json' \
       --data-binary "@$request_file" \
       --output "$candidate_response_file" \
@@ -653,9 +672,11 @@ withdraw_after_failures() {
   enter_cooldown
   deactivate_local_replica
   rm -f "$request_file" "$response_file" "$curl_config_file"
+  [[ -z "$local_curl_config_file" ]] || rm -f "$local_curl_config_file"
   request_file=""
   response_file=""
   curl_config_file=""
+  local_curl_config_file=""
   write_request false false
   if ! request_reconciliation || ! validate_response; then
     log "candidate withdrawal could not be confirmed; local cooldown remains active"
