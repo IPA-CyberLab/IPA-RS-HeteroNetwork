@@ -76,6 +76,7 @@ agent_public_services_wants_drop_in_tmp=
 control_plane_enrollment_drop_in_tmp=
 node_enrollment_enabled=0
 reconcile_finished=0
+discovery_in_progress=0
 independent_services_ready=0
 independent_activation_deferred=0
 agent_public_services_wants_drop_in_changed=0
@@ -123,9 +124,15 @@ existing_public_services_are_staged() {
   [ -f "$udp_services_env" ] && [ ! -L "$udp_services_env" ] || return 1
 }
 
+existing_independent_services_are_staged() {
+  [ -f "$udp_services_env" ] && [ ! -L "$udp_services_env" ] || return 1
+  [ -f "$agent_udp_drop_in" ] && [ ! -L "$agent_udp_drop_in" ] || return 1
+}
+
 retain_existing_public_services() {
   retain_reason=$1
-  existing_public_services_are_staged || return 1
+  existing_independent_services_are_staged ||
+    existing_public_services_are_staged || return 1
   mkdir -p "$runtime_dir" || return 1
   chmod 0700 "$runtime_dir" || return 1
 
@@ -145,7 +152,8 @@ retain_existing_public_services() {
       systemctl start "$stun_service" >/dev/null 2>&1 ||
         log "unable to restore STUN while retaining promoted services"
     fi
-    if ! unit_is_active "$control_plane_service"; then
+    if existing_public_services_are_staged &&
+      ! unit_is_active "$control_plane_service"; then
       systemctl start "$control_plane_service" >/dev/null 2>&1 ||
         log "unable to restore Control Plane while retaining promoted services"
     fi
@@ -330,7 +338,10 @@ on_exit() {
   trap - EXIT HUP INT TERM
   set +e
   if [ "$reconcile_finished" -ne 1 ]; then
-    if [ "$independent_services_ready" -eq 1 ]; then
+    if [ "$discovery_in_progress" -eq 1 ] &&
+      retain_existing_public_services "discovery exited before reaching a stable state"; then
+      :
+    elif [ "$independent_services_ready" -eq 1 ]; then
       demote_control_services "control-service reconciliation exited before reaching a stable state"
     else
       demote_all "reconciliation exited before reaching a stable state"
@@ -1296,8 +1307,9 @@ for required_unit in "$agent_service" "$stun_service"; do
   fi
 done
 
+discovery_in_progress=1
 if ! unit_is_active "$agent_service"; then
-  if existing_public_services_are_staged; then
+  if existing_independent_services_are_staged || existing_public_services_are_staged; then
     log "Agent is inactive; attempting automatic restart from promoted configuration"
     systemctl start "$agent_service" >/dev/null 2>&1 || true
   fi
@@ -1314,6 +1326,10 @@ chmod 0700 "$runtime_dir"
 status_file=$(mktemp "$runtime_dir/status.XXXXXX")
 if ! curl --fail --silent --show-error --max-time 5 --max-filesize 1048576 \
   "$agent_status_url" >"$status_file"; then
+  if retain_existing_public_services "local Agent status is unavailable"; then
+    reconcile_finished=1
+    exit 0
+  fi
   demote_and_exit "local Agent status is unavailable"
 fi
 
@@ -1363,6 +1379,7 @@ if ! jq -e --argjson max_age "$classification_max_age_seconds" '
   demote_and_exit "direct-public NAT classification is absent, inconsistent, or stale"
 fi
 
+discovery_in_progress=0
 rm -f "$nat_loss_started_file"
 
 node_id=$(jq -er '.node_id' "$status_file") ||

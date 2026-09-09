@@ -36,6 +36,11 @@ last_argument=
 for last_argument do :; done
 case "$last_argument" in
   http://127.0.0.1:9780/v1/status)
+    if [ -e "$HETERONETWORK_SMOKE_STATE/status-interrupted" ]; then
+      kill -TERM "$PPID"
+      exit 7
+    fi
+    [ ! -e "$HETERONETWORK_SMOKE_STATE/status-unavailable" ] || exit 7
     cat "$HETERONETWORK_SMOKE_STATUS_FIXTURE"
     ;;
   http://127.0.0.1:9780/v1/web-ui/endpoints)
@@ -394,6 +399,63 @@ assert_vpn_services_only() {
   grep -q '^HETERONETWORK_ADVERTISE_RELAY_URL=' "$services_env" ||
     fail "UDP-only promotion did not advertise Relay"
 }
+
+if [ "${1:-}" = "--status-retention-only" ]; then
+  prepare_dependencies
+  reset_auto_services
+  fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  write_status public "$fresh_time"
+  run_reconciler
+  run_reconciler
+  : >"$fake_state/status-unavailable"
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+  assert_active heteronetwork-stun.service
+  [ -f "$services_env" ] || fail "status failure removed CP staging"
+  ! grep -Eq '^(stop|kill|restart) ' "$systemctl_log" || fail "status failure disrupted services"
+
+  # CP-only demotion must not make independent UDP staging ineligible for retention.
+  rm -f "$fake_state/status-unavailable" "$password_file"
+  run_reconciler
+  assert_control_demoted_independent_active
+  : >"$fake_state/status-unavailable"
+  run_reconciler
+  assert_control_demoted_independent_active
+  ! grep -Eq '^(stop|kill|restart) ' "$systemctl_log" || fail "partial staging was disrupted"
+  set_inactive heteronetwork-agent.service
+  run_reconciler
+  assert_active heteronetwork-agent.service
+  assert_control_demoted_independent_active
+
+  rm -f "$fake_state/status-unavailable"
+  : >"$fake_state/status-interrupted"
+  : >"$systemctl_log"
+  if sh "$autopilot" >>"$output_log" 2>&1; then
+    fail "discovery interruption unexpectedly succeeded"
+  fi
+  assert_control_demoted_independent_active
+  ! grep -Eq '^(stop|kill|restart) ' "$systemctl_log" || fail "exit trap disrupted independent services"
+  rm -f "$fake_state/status-interrupted"
+
+  reset_auto_services
+  : >"$fake_state/status-unavailable"
+  run_reconciler
+  assert_demoted
+  rm -f "$fake_state/status-unavailable"
+  write_status private "$fresh_time"
+  run_reconciler
+  assert_demoted
+  prepare_dependencies
+  fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  write_status public "$fresh_time"
+  run_reconciler
+  run_reconciler
+  run_reconciler
+  assert_active heteronetwork-control-plane.service
+  assert_active heteronetwork-stun.service
+  printf '%s\n' 'public-services autopilot status-retention smoke passed'
+  exit 0
+fi
 
 fresh_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 prepare_dependencies
