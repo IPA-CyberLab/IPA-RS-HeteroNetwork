@@ -4,7 +4,7 @@ metadata:
   name: heterocloud-public
   namespace: heterocloud
   labels:
-    dns.heterocloud.io/publish: "true"
+    dns.heterocloud.io/publish: "false"
   annotations:
     external-dns.alpha.kubernetes.io/hostname: heterocloud.mizuame.app
     external-dns.alpha.kubernetes.io/gateway-hostname-source: annotation-only

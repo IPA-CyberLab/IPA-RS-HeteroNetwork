@@ -6,6 +6,7 @@ configMapGenerator:
     files:
       - haproxy.cfg=haproxy.cfg
 resources:
+  - public-web-dns.yaml
   - gatewayclass.yaml
   - envoyproxy.yaml
   - heterocloud-edge-proxy-service.yaml

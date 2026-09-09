@@ -7,9 +7,11 @@ The Certificate must provision a DNS01-issued `kubernetes.io/tls` Secret named
 `flash-web-tls` in `heterocloud-dns`, with SAN `*.flash.heterocloud.mizuame.app`
 and an unencrypted private key. Kustomize intentionally requires those two
 parent files; this helper neither creates nor modifies them.
-`wildcard-route.yaml` is included here for the wildcard
-fallback HTTPRoute and ExternalDNS publication from Gateway status addresses.
-No DNS addresses are hardcoded by this helper.
+`wildcard-route.yaml` provides the wildcard fallback HTTPRoute, not DNS
+publication. `../envoy-gateway/public-web-dns.yaml` owns the public web DNS
+inventory independently of the internal Gateway's transient status addresses.
+Update that inventory when commissioning or decommissioning a host Caddy front
+door. The TLS sync helper itself does not manage DNS addresses.
 
 ## Scope and prerequisites
 

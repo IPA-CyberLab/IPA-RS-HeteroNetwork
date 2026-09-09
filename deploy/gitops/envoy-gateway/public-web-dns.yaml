@@ -1,0 +1,35 @@
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: heterocloud-web-gateways
+  namespace: heterocloud-dns
+  labels:
+    dns.heterocloud.io/publish: "true"
+spec:
+  # These are host Caddy front doors on 80/443, not the transient addresses
+  # of Envoy's internal 18081 LoadBalancer Service. Change this deployment
+  # inventory when a front door is commissioned or decommissioned.
+  endpoints:
+    - dnsName: heterocloud.mizuame.app
+      recordType: A
+      recordTTL: 60
+      targets: [163.220.236.53, 163.220.236.61]
+      providerSpecific:
+        - name: external-dns.alpha.kubernetes.io/cloudflare-proxied
+          value: "true"
+    - dnsName: flow.heterocloud.mizuame.app
+      recordType: A
+      recordTTL: 60
+      targets: [163.220.236.53, 163.220.236.61]
+    - dnsName: registry.heterocloud.mizuame.app
+      recordType: A
+      recordTTL: 60
+      targets: [163.220.236.53, 163.220.236.61]
+    - dnsName: s3.heterocloud.mizuame.app
+      recordType: A
+      recordTTL: 60
+      targets: [163.220.236.53, 163.220.236.61]
+    - dnsName: '*.flash.heterocloud.mizuame.app'
+      recordType: A
+      recordTTL: 60
+      targets: [163.220.236.53, 163.220.236.61]

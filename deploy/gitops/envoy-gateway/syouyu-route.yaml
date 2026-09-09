@@ -4,7 +4,7 @@ metadata:
   name: heterocloud-syouyu-s3-public
   namespace: heterocloud-syouyu
   labels:
-    dns.heterocloud.io/publish: "true"
+    dns.heterocloud.io/publish: "false"
   annotations:
     external-dns.alpha.kubernetes.io/hostname: s3.heterocloud.mizuame.app
     external-dns.alpha.kubernetes.io/gateway-hostname-source: annotation-only
