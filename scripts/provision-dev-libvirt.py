@@ -188,6 +188,8 @@ def domain_xml(p, name):
     child(root, "memory", p["memory_mib"], unit="MiB")
     child(root, "currentMemory", p["memory_mib"], unit="MiB")
     child(root, "vcpu", p["vcpu"], placement="static")
+    # The generic QEMU CPU can hide x86-64-v2 instructions required by UBI9.
+    child(root, "cpu", mode="host-model", check="full")
     child(child(root, "os"), "type", "hvm", arch="x86_64")
     features = child(root, "features")
     child(features, "acpi")

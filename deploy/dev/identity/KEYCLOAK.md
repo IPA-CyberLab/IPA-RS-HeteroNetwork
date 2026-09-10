@@ -90,3 +90,59 @@ server-side apply **dry-run** against DEV kube-system UID
 guest, node, API endpoint and CIDR guards. Nothing was applied or started.
 Admission success does not validate Secret existence, database TLS, image
 startup, readiness, DNS, browser authentication or HA.
+
+## Guarded Bootstrap
+
+`bootstrap-keycloak.py` adds an explicit live path for the exact reviewed bundle
+rendered with `https://id.dev.heterocloud.mizuame.app`. It pins the rendered
+bundle hash and protected foundation helper hash, repeats the actual DEV
+cluster/guest guards, requires three ready database instances, and performs a
+server dry-run before generating any state. It is not a general-purpose apply
+command and does not accept caller-supplied paths or arguments.
+
+Deliver the reviewed helper and rendered `keycloak.json` to the protected
+`/opt/heteronetwork-dev-identity` on DEV1. Verify their source hashes before
+execution. Then run the root-owned helper as root. The bootstrap is non-atomic;
+preserve all state if it stops and inspect the failing phase before retrying.
+
+Private material stays in root-only
+`/var/lib/heteronetwork-dev-identity-tls` on DEV1. It creates a fresh 365-day DEV
+CA, a 30-day server certificate, and a random temporary administrator password.
+The CA private key is never placed in a Kubernetes Secret. Only the server key
+and temporary administrator credentials are copied into the dedicated DEV
+namespace via stdin, never command arguments or printed output.
+
+A private manifest binds every generated file to the observed cluster UID and
+origin. Repeated runs verify that material and do not rotate it. Unknown/partial
+state, modified credentials, mismatched certificate keys, or certificates with
+less than a day remaining stop the operation. Secret creation is exclusive:
+existing matching DEV Secrets are retained, while different or foreign Secrets
+are rejected rather than overwritten. The helper does not reset users already
+in the database. Certificate renewal and temporary-admin retirement still need
+explicit lifecycle procedures; this bootstrap is not an automatic renewal loop.
+
+The DEV CA is not installed into system/browser trust stores. Verify the origin
+using its CA explicitly; do not disable TLS validation. DNS, external routing,
+realm/client creation and the real owner's subject mapping remain separate.
+The temporary administrator must never be substituted for that owner.
+
+On 2026-09-10 the actual bootstrap completed and applied all five resources to
+the guarded DEV cluster. This establishes Secret provisioning and apply only;
+the first rollout did not become Ready. All three containers exited with
+`Fatal glibc error: CPU does not support x86-64-v2` before Keycloak startup.
+No successful login, database TLS handshake or cache formation is claimed.
+
+The original DEV domain generator omitted a CPU model. It now requests
+`host-model` with full checking for new domains. Existing domain definitions and
+the provisioner's definition-hash journal still need a guarded migration and
+one-VM-at-a-time cold restart; changing the generator does not update live CPUs.
+Do not rerun fresh provisioning, regenerate disks/seeds, edit journal hashes to
+bypass validation, or stop all three etcd/PostgreSQL members together.
+
+Actual inactive XML inspection confirmed all three guests use
+`<cpu mode="custom" match="exact" check="none"><model fallback="forbid">qemu64</model></cpu>`.
+The physical host exposed `cx16`, `lahf_lm`, `popcnt`, `pni`, `ssse3`, `sse4_1`
+and `sse4_2`; none of those checked additional v2 flags was missing. This is
+evidence of a guest CPU exposure problem, not a successful post-migration check.
+The 180-second rollout observation terminated unsuccessfully. No VM CPU was
+changed, no VM was restarted, and no owner account was created in this step.

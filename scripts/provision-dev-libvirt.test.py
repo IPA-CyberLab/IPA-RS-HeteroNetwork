@@ -80,6 +80,7 @@ class DevPlanTests(unittest.TestCase):
         for name in self.p["vms"]:
             domain = ET.fromstring(dev.domain_xml(self.p, name))
             self.assertEqual(domain.findtext("memory"), "8192")
+            self.assertEqual(domain.find("cpu").attrib, {"mode": "host-model", "check": "full"})
             self.assertEqual(domain.findtext("on_reboot"), "restart")
             self.assertEqual(domain.find("devices/interface/source").get("network"), "hetero-dev")
             self.assertIsNone(domain.find("devices/filesystem"))

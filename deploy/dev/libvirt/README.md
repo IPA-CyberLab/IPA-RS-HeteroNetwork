@@ -12,6 +12,9 @@ The committed profile targets `ichikawap1`, `qemu:///system` only:
 - New network/pool `hetero-dev`, bridge `virbr-hdev`.
 - Storage `/var/lib/libvirt/hetero-dev`.
 - Guests `hetero-dev-1..3`: each 4 vCPU, 8192 MiB RAM, 40 GiB standalone disk.
+- CPU mode is `host-model`, with full compatibility checking. The physical host
+  must support instructions required by deployed images; this does not emulate
+  missing instructions or promise migration across unlike CPUs.
 - Total 12 vCPU, 24 GiB RAM, 120 GiB virtual disk.
 - Underlay `172.28.240.0/24`, gateway `172.28.240.1`, reservations `.11..13`.
 - Reserved overlay `10.251.0.0/24`, pods `172.29.0.0/16`, services `172.30.0.0/16`.
