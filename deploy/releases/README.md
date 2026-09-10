@@ -24,3 +24,14 @@ The selected version has not been activated on a VM. The initially empty `prod`
 selection does not describe, remove or replace the currently running production
 versions. Never promote solely because preparation or CI succeeded: verify the
 isolated dev deployment and application workflows first.
+
+## Flash Dev Selection
+
+Flash `0.1.30-dev.1` was selected at revision 2 from the successful
+[release run 34516628863](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/34516628863)
+and its published `flash-release-artifact.json`. The source commit is
+`e0cd20382c344b4e349f2f3327f0006b186fe913`; the final multi-architecture image
+digest is `sha256:cd4150194ff1133ec6faf04567110dab14e905cd436744b02a4892ee1809357b`.
+Verification and both architecture builds passed before the final image was
+published. This records a dev selection, not a deployed workload or production
+promotion.

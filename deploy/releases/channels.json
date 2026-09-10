@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 1,
+  "revision": 2,
   "dev": {
     "heteronetwork": {
       "schema_version": 1,
@@ -28,6 +28,13 @@
           }
         }
       }
+    },
+    "flash": {
+      "schema_version": 1,
+      "component": "flash",
+      "version": "0.1.30-dev.1",
+      "commit": "e0cd20382c344b4e349f2f3327f0006b186fe913",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash@sha256:cd4150194ff1133ec6faf04567110dab14e905cd436744b02a4892ee1809357b"
     }
   },
   "prod": {},
@@ -66,6 +73,21 @@
         }
       },
       "at": "2026-09-10T18:52:25.046Z"
+    },
+    {
+      "revision": 2,
+      "command": "stage",
+      "channel": "dev",
+      "component": "flash",
+      "before": null,
+      "after": {
+        "schema_version": 1,
+        "component": "flash",
+        "version": "0.1.30-dev.1",
+        "commit": "e0cd20382c344b4e349f2f3327f0006b186fe913",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash@sha256:cd4150194ff1133ec6faf04567110dab14e905cd436744b02a4892ee1809357b"
+      },
+      "at": "2026-09-10T18:57:53.799Z"
     }
   ]
 }
