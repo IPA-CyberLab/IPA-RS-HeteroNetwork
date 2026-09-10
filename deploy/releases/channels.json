@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 4,
+  "revision": 5,
   "dev": {
     "heteronetwork": {
       "schema_version": 1,
@@ -49,6 +49,18 @@
       "version": "0.1.7-dev.1",
       "commit": "a15d8ab0f60685b932ca8f6d2a9ed88e4f96d3a9",
       "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-syouyu@sha256:62ca98c5559828aef0ee614f29dde622b2b35afc075503a43ef30c982dccc3b0"
+    },
+    "flow": {
+      "schema_version": 1,
+      "component": "flow",
+      "version": "0.1.21-dev.3",
+      "commit": "d275340d5f07b6dd409fafd5b7ce825a84a613cf",
+      "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:f91b0da61573636e7437a2fe83df8ce2ae1d2c43342fa03408456dde1a1237aa",
+      "companions": {
+        "livekit": {
+          "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:e43e55f1cc91d0d9e3960b085a6379d847ea77effdc480dd71796384dc1f46a1"
+        }
+      }
     }
   },
   "prod": {},
@@ -132,6 +144,26 @@
         "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-syouyu@sha256:62ca98c5559828aef0ee614f29dde622b2b35afc075503a43ef30c982dccc3b0"
       },
       "at": "2026-09-10T19:07:17.693Z"
+    },
+    {
+      "revision": 5,
+      "command": "stage",
+      "channel": "dev",
+      "component": "flow",
+      "before": null,
+      "after": {
+        "schema_version": 1,
+        "component": "flow",
+        "version": "0.1.21-dev.3",
+        "commit": "d275340d5f07b6dd409fafd5b7ce825a84a613cf",
+        "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:f91b0da61573636e7437a2fe83df8ce2ae1d2c43342fa03408456dde1a1237aa",
+        "companions": {
+          "livekit": {
+            "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:e43e55f1cc91d0d9e3960b085a6379d847ea77effdc480dd71796384dc1f46a1"
+          }
+        }
+      },
+      "at": "2026-09-10T19:28:03.770Z"
     }
   ]
 }

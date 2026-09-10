@@ -48,3 +48,14 @@ Revisions 3 and 4 select the published artifacts from successful release runs:
 The downloaded release JSON supplied the image digests recorded in
 `channels.json`. Neither selection activates a service. Production remains
 unchanged; fresh dev deployment and end-to-end validation are still required.
+
+## Flow Dev Selection
+
+Revision 5 selects Flow `0.1.21-dev.3` from successful
+[release run 34519325435](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flow/actions/runs/34519325435),
+source commit `d275340d5f07b6dd409fafd5b7ce825a84a613cf`.
+The published `flow-release-artifact.json` binds both Flow and LiveKit image
+digests. Both image builds and the Rust, scheduling, monitoring and chart checks
+completed successfully. Earlier failed candidates were not selected or retagged.
+All five components now have dev selections; no production promotion or runtime
+deployment follows automatically from this catalog change.
