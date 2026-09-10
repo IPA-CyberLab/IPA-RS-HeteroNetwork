@@ -1,9 +1,10 @@
 # Local Sudo Quorum Approval
 
-Status: isolated single-use sudo privilege grant, local Unix service and standard
-approval-plugin prototype; separate exact-context research remains blocked on
-final-environment binding. None is deployed. No live host sudoers, sudo.conf, PAM,
-SSH or authentication changes. Disposable-container configuration is test-only.
+Status: version 2 issuance, local admission and release packaging are implemented
+and tested in isolation. Production voter/key provisioning and enforcement are
+not deployed. No live host sudoers, sudo.conf, PAM, SSH or authentication changes.
+Disposable-container configuration is test-only. The version 1 prototype and
+separate exact-context research below are not the version 2 deployment path.
 
 ## Explicit Privilege Grant Profile
 
@@ -144,8 +145,9 @@ version 2 policy pins an exact HTTPS issuer; an existing HTTP-only issuer must b
 addressed explicitly before deployment, not silently rewritten or accepted.
 
 These templates are not installed or enabled automatically. Version 2's local
-adapter exists as a separate isolated prototype described below. Recovery, release
-packaging, real-voter provisioning and rollout verification remain incomplete.
+adapter is described below. Inactive release packaging is available through
+[the artifact workflow](SUDO_QUORUM_V2_ARTIFACT.md); real-voter provisioning,
+operational recovery and rollout verification remain incomplete.
 Starting a signing service alone does not enforce sudo on a VM.
 
 The coordinator accepts a version 2 challenge already signed by the trusted local
@@ -241,7 +243,7 @@ Restart removes only trusted, unchanged socket entries whose connection is refus
 live listeners and unsafe paths are rejected. The initial upgrade MUST first stop
 nonlocking legacy servers and their automatic restarts: connection refusal cannot
 exclude a legacy process between bind and listen. Never delete the database or
-anchor to recover service. Approved local policy rotation, production packaging
+anchor to recover service. Approved local policy rotation, production activation
 and recovery rollout remain incomplete; do not deploy unattended enforcement yet.
 
 Kernel/physical/root/DB-owner control and a compromised signing majority remain
@@ -281,6 +283,14 @@ and owned resources were cleaned up. Image SHA256 was
 `1f54b42044c3e4c282a2f41f86f54e015f4e137cebb2b1b451869257255145f9`.
 The default cgroup-bounded CI execution and production rollout are not established
 by this local result.
+
+Separately, the default cgroup-bounded E2E passed in the successful dev4
+[release run 34521073321](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/34521073321).
+The published base and sudo companion archives were prepared and selected with
+full digest verification at channel revision 6; see
+[the release record](../deploy/releases/README.md#heteronetwork-dev4-selection).
+This is release and inactive-staging evidence, not real Keycloak integration,
+production DKG, VM enforcement or production availability evidence.
 
 ## Security Contract
 
