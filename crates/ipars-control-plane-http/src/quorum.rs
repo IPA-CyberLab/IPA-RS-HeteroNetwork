@@ -983,17 +983,12 @@ mod tests {
                 auth,
                 super::super::require_management_auth,
             ));
-        let pending = tokio::spawn(async move {
-            app.oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/admin/policy")
-                    .header("authorization", "Bearer owner-token")
-                    .body(Body::empty())
-                    .expect("test request"),
-            )
-            .await
-        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/admin/policy")
+            .header("authorization", "Bearer owner-token")
+            .body(Body::empty())?;
+        let pending = tokio::spawn(async move { app.oneshot(request).await });
         let started = timeout(Duration::from_secs(3), entered.notified()).await;
         if started.is_err() {
             pending.abort();
