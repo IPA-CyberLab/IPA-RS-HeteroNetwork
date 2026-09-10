@@ -463,8 +463,9 @@ pair and records complete Keycloak E2E output with that case.
 
 The check above stops at the rendered login form. After an OIDC or edge timeout
 change, also run the credentialed Chromium check from a joined node without a
-published ingress address. It submits the Keycloak form, follows the one-time
-authorization-code callback, and verifies the resulting HeteroCloud session:
+published ingress address. It starts at the homepage, follows the visible login
+link, submits the Keycloak form, follows the authorization-code callback, and
+verifies the authenticated HeteroCloud session before inspecting console pages:
 
 ```bash
 HETEROCLOUD_BROWSER_E2E_USERNAME='browser-e2e@example.invalid' \
@@ -473,9 +474,55 @@ HETEROCLOUD_BROWSER_E2E_ATTEMPTS=20 \
 npm run test:heterocloud:e2e
 ```
 
-Use a dedicated test account and inject its password from an operator-managed
-secret. The script never prints the credentials and writes failure screenshots
-under `artifacts/` by default.
+Use a dedicated tenant test account with organization membership and read access;
+owner-console accounts cannot cover tenant navigation. Inject credentials from an
+operator-managed secret; existing `E2E_USERNAME` / `E2E_PASSWORD` aliases also work.
+No signup, tenant create/update/delete, shell, or credential-generation actions
+are performed. Browser requests attempting non-read methods under `/api/` are blocked.
+
+Without credentials, explicitly run the real Chromium preflight:
+
+```bash
+npm run test:heterocloud:e2e -- --unauthenticated-diagnostic
+```
+
+This visits `/` and the rendered login flow only, never fills/submits credentials.
+A homepage 503 is a failure, not a successful login-form test. Exit codes are
+`0` for a complete authenticated sweep, `1` for failure, and `2` for a completed
+unauthenticated diagnostic: **not a full pass**. Missing credentials without the
+explicit diagnostic flag fail before browser navigation.
+
+Authenticated sweeps inspect Overview, organizations, projects, IAM principals /
+policies / bindings, Flow, Flash, Registry, Syouyu, audit and settings. Each route
+must render its expected heading and load the actual UI's HTTP-200 JSON read models
+after reload; merely rendering the application shell is insufficient. Existing
+Flow/Flash/Syouyu details are discovered from that account's list responses and
+visited read-only. Detail checks require the base service/bucket read model and
+rendered resource heading; they do not certify metrics, credential operations,
+provider health, or full backend functionality. Registry has no separate detail route. Detail navigation clicks
+visible links where available, otherwise opens the discovered detail URL (including
+resources outside the visible table page). Coverage follows the UI's selected
+organization, falling back to the first membership in the fresh context, not
+every organization. Empty detail lists or exceeding
+`HETEROCLOUD_BROWSER_E2E_MAX_DETAILS_PER_SERVICE` (default 20, maximum 100) are
+reported as incomplete rather than silently counted as full coverage.
+
+Console errors, JavaScript exceptions, request failures, and HTTP errors including
+API 4xx are captured. Only the expected pre-login session 401 is exempted and
+recorded separately. Waits use `HETEROCLOUD_BROWSER_E2E_TIMEOUT_MS` (default 30000,
+range 5000..120000); attempts remain bounded by the existing attempts setting.
+Start incident checks with `HETEROCLOUD_BROWSER_E2E_ATTEMPTS=1`.
+
+Reports include UTC start/end timestamps and explicit blocked/unexecuted route
+coverage when homepage, login, or session checks prevent authenticated navigation.
+Every run creates a private random subdirectory under `artifacts/`, overridable
+with `HETEROCLOUD_BROWSER_E2E_ARTIFACT_DIR`, with JSON evidence and screenshots.
+Directories are mode 0700 and files 0600. URLs omit query strings, fragments and
+userinfo, credential environment values are redacted from errors, and screenshot
+inputs/textareas/pre/code are masked. No response bodies, HAR, cookies, storage
+state or authentication traces are saved. Screenshots can still contain tenant
+names and account information: treat the entire directory as private and never
+commit it or attach it publicly without review.
 
 ### Restrict GitHub sign-in to one account
 
