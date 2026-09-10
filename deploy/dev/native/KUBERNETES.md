@@ -25,11 +25,17 @@ the release archive. Commit `2d6e6d1f` and helper SHA-256
 at this checkpoint. Init and Flannel installation have not run. This establishes
 host preparation only, not Kubernetes readiness or control-plane HA.
 
-Separate production caveat, reported read-only by the owner: `.10:19088` refused
+Separate read-only production inspection: `.10:19088` refused
 connections; agent status identified build `0.1.0`, revision `bed2a7a`, started
 at 20:54:25 UTC before this task, and `/v1/peers` returned 404, causing backend
 autopilot failure. This is not a production-health claim or a dev deployment
-result. No production changes or new remote checks accompanied this doc update.
+result. The `bed2a` source contains the route; `runtime.peer_map_snapshot`
+returning `PeerMapUnavailable` also maps to 404. Subsequent inspection confirmed
+the response body: `peer map has not been synced for node
+node-010adc8f711b1982b3f0d0870d54431e`. This establishes unsynced peer-map state,
+not why synchronization failed. Neither a missing route nor version
+incompatibility has been established. No production
+changes or new remote checks accompanied this doc update.
 
 ## Exact Dependencies
 
