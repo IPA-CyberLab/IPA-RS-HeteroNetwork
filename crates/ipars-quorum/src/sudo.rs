@@ -1,6 +1,8 @@
 //! Typed sudo-level privilege issuance, not exact-command or HTTP authorization.
 //! OIDC verification, trusted policy provisioning, local caller attestation, fresh
 //! clocks and atomic durable redemption are embedding responsibilities. No executor.
+pub mod local;
+
 use crate::{
     field, frost, hex_digest, valid_id, Error, Manifest, Result, Round1Response, SignerEngine,
 };
