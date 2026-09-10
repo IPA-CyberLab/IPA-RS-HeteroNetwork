@@ -42,6 +42,11 @@ jobs:
 
       - name: Validate native staging boundaries
         run: |
+          # The validator deliberately ignores inherited PATH and NODE_OPTIONS.
+          # Hosted runners keep Node outside the system path used on supported VMs.
+          if ! env -i PATH=/bin:/usr/bin node --version >/dev/null 2>&1; then
+            sudo install -m 0755 "$(node -p 'process.execPath')" /usr/bin/node
+          fi
           python3 scripts/native-release-stage.test.py
           node --check scripts/native-release-stage.catalog.mjs
 

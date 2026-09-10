@@ -5718,7 +5718,7 @@ mod tests {
     }
 
     #[test]
-    fn device_login_provider_requires_a_safe_canonical_issuer_origin() {
+    fn device_login_provider_requires_a_safe_canonical_issuer_origin() -> Result<(), &'static str> {
         let mut config = json!({
             "provider": "keycloak",
             "issuer_url": "http://console.heteronetwork.internal:18079/realms/heteronetwork",
@@ -5755,7 +5755,7 @@ mod tests {
         }
         config
             .as_object_mut()
-            .unwrap()
+            .ok_or("device login test configuration must be a JSON object")?
             .remove("device_verification_origin");
 
         for unsafe_issuer in [
@@ -5768,6 +5768,7 @@ mod tests {
                 "unsafe issuer was accepted: {unsafe_issuer}"
             );
         }
+        Ok(())
     }
 
     #[test]
