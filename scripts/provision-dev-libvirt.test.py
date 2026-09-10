@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks only: no libvirt/root operations, no guests or real SSH keys."""
 import copy
+import ast
 import contextlib
 import hashlib
 import importlib.util
@@ -184,7 +185,7 @@ class DevPlanTests(unittest.TestCase):
             runner.assert_not_called()
         result = subprocess.run([sys.executable, str(SCRIPT), "apply"], capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 1)
-        self.assertIn(b"Dev provisioner failed", result.stderr)
+        self.assertEqual(json.loads(result.stderr)["error"], "dev-provisioner-refused")
 
     def test_nonroot_apply_refuses_before_host_commands(self):
         with patch.object(dev.os, "geteuid", return_value=1000), patch.object(dev, "run") as runner:
@@ -315,6 +316,53 @@ class DevPlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "definition drift"):
                 dev.verify_resources(self.p, journal, allow_running=True)
 
+    def test_all_resource_definitions_use_inactive_xml(self):
+        with patch.object(dev, "run", return_value="<pool/>") as runner:
+            for kind, name in (("pool", self.p["name"]), ("network", self.p["name"]),
+                               ("domain", self.p["vms"][0])):
+                dev.resource_xml(self.p, kind, name)
+                self.assertEqual(runner.call_args.args[0][-1], "--inactive")
+
+    def test_pool_permissions_remain_significant_to_definition_hash(self):
+        original = dev.pool_xml(self.p)
+        changed = ET.fromstring(original)
+        permissions = ET.SubElement(changed.find("target"), "permissions")
+        ET.SubElement(permissions, "mode").text = "0700"
+        self.assertNotEqual(dev.definition_hash(original), dev.definition_hash(ET.tostring(changed, encoding="unicode")))
+
+    def test_only_exact_fixed_pool_root_permissions_are_normalized(self):
+        observed = json.loads((dev.ROOT / "deploy/dev/libvirt/testdata/libvirt-dir-pool-runtime.json").read_text())
+        self.assertEqual(dev.definition_hash(observed["current"]), observed["record"]["definition_sha256"])
+        original = dev.pool_xml(self.p)
+        root = ET.fromstring(original)
+        permissions = ET.SubElement(root.find("target"), "permissions")
+        for key, value in (("mode", "0700"), ("owner", "0"), ("group", "0")):
+            ET.SubElement(permissions, key).text = value
+        for mode in ("0700", "0711"):
+            permissions.find("mode").text = mode
+            self.assertEqual(dev.definition_hash(original), dev.definition_hash(ET.tostring(root, encoding="unicode")))
+        for path, value in (("target/permissions/mode", "0777"), ("target/permissions/mode", "0755"),
+                            ("target/permissions/owner", "1000"), ("target/permissions/group", "1000")):
+            changed = copy.deepcopy(root)
+            changed.find(path).text = value
+            self.assertNotEqual(dev.definition_hash(original), dev.definition_hash(ET.tostring(changed, encoding="unicode")))
+        for mutation in ("attribute", "extra", "text", "path", "uuid"):
+            changed = copy.deepcopy(root)
+            node = changed.find("target/permissions")
+            if mutation == "attribute":
+                node.set("unexpected", "yes")
+            elif mutation == "extra":
+                ET.SubElement(node, "label").text = "unexpected"
+            elif mutation == "text":
+                node.text = "unexpected"
+            elif mutation == "path":
+                changed.find("target/path").text = "/unrelated"
+            else:
+                changed.find("uuid").text = "unrelated"
+            with_permissions = dev.definition_hash(ET.tostring(changed, encoding="unicode"))
+            changed.find("target").remove(node)
+            self.assertNotEqual(with_permissions, dev.definition_hash(ET.tostring(changed, encoding="unicode")))
+
     def test_apply_fake_transport_order_idempotency_and_existing_preservation(self):
         # A complete simulated apply uses only this private temporary tree.
         # No libvirt, nft, SSH, qemu or key generation commands are executed.
@@ -407,7 +455,12 @@ class DevPlanTests(unittest.TestCase):
                      patch.object(dev, "preflight"), patch.object(dev, "root_directory", open_directory), \
                      patch.object(dev, "verify_image", return_value={"image_sha256": p["image_sha256"], "signers": ["TEST"]}), \
                      patch.object(dev, "run", transport):
-                    result = dev.apply(p, images)
+                    old_umask = os.umask(0o077)
+                    try:
+                        result = dev.apply(p, images)
+                    finally:
+                        os.umask(old_umask)
+                    self.assertEqual(Path(p["pool_path"]).stat().st_mode & 0o777, 0o711)
                     self.assertEqual(result["guests_boot_verified"], p["vms"])
                     mutations = [call for call in calls if call[0] in ("qemu-img", "cloud-localds", "ssh-keygen") or
                                  call[0] == "virsh" and call[3] in ("define", "net-define", "pool-define", "start", "net-start", "pool-start")]
@@ -415,7 +468,9 @@ class DevPlanTests(unittest.TestCase):
                     guard_index = next(i for i, call in enumerate(calls) if call[0] == "nft" and "--echo" in call)
                     self.assertTrue(all(i > guard_index for i, call in enumerate(calls) if call[0] == "virsh" and call[3] in ("start", "net-start")))
                     checkpoint = len(calls)
+                    os.chmod(p["pool_path"], 0o700)
                     dev.apply(p, images)
+                    self.assertEqual(Path(p["pool_path"]).stat().st_mode & 0o777, 0o711)
                     self.assertGreater(before, 0)
                     self.assertFalse(any(call[0] in ("qemu-img", "cloud-localds", "ssh-keygen") or call[0] == "virsh" and call[3] in
                         ("define", "net-define", "pool-define", "start", "net-start", "pool-start") for call in calls[checkpoint:]))
@@ -451,6 +506,40 @@ class DevPlanTests(unittest.TestCase):
         rule = next(entry["rule"] for entry in changed["nftables"] if "rule" in entry)
         rule["expr"][-1] = {"accept": None}
         self.assertNotEqual(dev.canonical_guard(batch), dev.canonical_guard(changed))
+
+    def test_reported_require_reasons_are_source_literals(self):
+        tree = ast.parse(SCRIPT.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "require":
+                self.assertIsInstance(node.args[1], ast.Constant)
+                self.assertIsInstance(node.args[1].value, str)
+
+    def test_failure_reports_never_include_external_exception_or_command_output(self):
+        secret = "TEST_SECRET_MUST_NOT_APPEAR"
+        errors = [ValueError(secret), OSError(13, secret, "/private/" + secret),
+                  subprocess.CalledProcessError(7, [secret], output=secret, stderr=secret),
+                  subprocess.TimeoutExpired([secret], 1, output=secret, stderr=secret),
+                  json.JSONDecodeError(secret, secret, 0)]
+        for error in errors:
+            self.assertNotIn(secret, json.dumps(dev.failure_report(error)))
+        try:
+            dev.run([sys.executable, "-c", "import sys; print('" + secret + "'); sys.exit(7)"])
+        except dev.CommandFailure as error:
+            report = dev.failure_report(error)
+            self.assertEqual(report["exit_code"], 7)
+            self.assertEqual(report["tool"], "external-command")
+            self.assertNotIn(secret, json.dumps(report))
+        else:
+            self.fail("Failed subprocess was accepted")
+
+    def test_cli_refusal_reports_fixed_stage_reason_and_nonzero(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), "apply"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        report = json.loads(result.stderr)
+        self.assertEqual(report["stage"], "main")
+        self.assertEqual(report["reason"], "Explicit --confirm-create hetero-dev is required")
+        self.assertIsInstance(report["line"], int)
 
     def test_l4_normalization_preserves_conflicts_order_and_predicates(self):
         tcp = dev.match(dev.meta("l4proto"), "tcp")

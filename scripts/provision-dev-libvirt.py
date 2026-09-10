@@ -31,9 +31,54 @@ BLOCKED = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
            "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4")
 
 
+class Refusal(ValueError):
+    """Only fixed source-literal require messages may be reported to the operator."""
+
+
+class CommandFailure(Refusal):
+    def __init__(self, tool, returncode):
+        super().__init__("Prerequisite or resource command failed; inspect local state")
+        self.tool = tool if tool in ("virsh", "nft", "qemu-img", "cloud-localds", "ssh-keygen",
+                                     "ssh", "gpgv", "hostname", "ip") else "external-command"
+        self.returncode = returncode
+
+
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise Refusal(message)
+
+
+def failure_report(error):
+    # Read code locations only, never frame locals, command arguments or raw
+    # exception text from parsers, operating system calls or subprocesses.
+    stage, line = "cli", None
+    frame = error.__traceback__
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        if code.co_filename == __file__ and code.co_name not in ("require", "run", "<module>"):
+            stage, line = code.co_name, frame.tb_lineno
+        frame = frame.tb_next
+    if isinstance(error, Refusal):
+        reason = str(error)
+    elif isinstance(error, KeyboardInterrupt):
+        reason = "Interrupted"
+    elif isinstance(error, OSError):
+        reason = "Operating system operation failed"
+    elif isinstance(error, subprocess.TimeoutExpired):
+        reason = "Command timeout"
+    elif isinstance(error, subprocess.SubprocessError):
+        reason = "Subprocess operation failed"
+    elif isinstance(error, (json.JSONDecodeError, ET.ParseError)):
+        reason = "Invalid structured input or command response"
+    else:
+        reason = "Invalid data or missing expected record"
+    report = {"error": "dev-provisioner-refused", "stage": stage, "line": line, "reason": reason,
+              "next_action": "Inspect owned journal and local state; do not blindly retry or clear pending"}
+    if isinstance(error, CommandFailure):
+        report.update(tool=error.tool, exit_code=error.returncode)
+    if isinstance(error, OSError):
+        report["errno"] = error.errno
+    return report
 
 
 def checked_path(path):
@@ -285,8 +330,9 @@ def run(arguments, input_data=None, timeout=20):
                     require(count <= 16 * 1024 * 1024, "Command output limit")
                     if key.fileobj is process.stdout:
                         output.extend(chunk)
-            require(process.wait(timeout=max(0.01, deadline - time.monotonic())) == 0,
-                    "Prerequisite or resource command failed; inspect local state")
+            returncode = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            if returncode != 0:
+                raise CommandFailure(arguments[0], returncode)
             return output.decode()
         finally:
             if process.poll() is None:
@@ -545,7 +591,7 @@ def verify_files(journal):
 
 def resource_xml(p, kind, name):
     commands = {"domain": ["dumpxml", name, "--inactive"], "network": ["net-dumpxml", name, "--inactive"],
-                "pool": ["pool-dumpxml", name]}
+                "pool": ["pool-dumpxml", name, "--inactive"]}
     return run(["virsh", "-c", p["connection"], *commands[kind]])
 
 
@@ -556,6 +602,23 @@ def definition_hash(text):
             element = root.find(field)
             if element is not None:
                 root.remove(element)
+        # Even --inactive dir-pool XML gains filesystem permissions at startup.
+        # Normalize only this fixed owned pool's exact observed root defaults;
+        # verify_resources independently checks the real directory and inode.
+        p = profile()
+        targets = root.findall("target")
+        if (root.attrib == {"type": "dir"} and root.findtext("name") == p["name"]
+                and root.findtext("uuid") == identity(p, "pool", p["name"])
+                and len(targets) == 1 and targets[0].findtext("path") == p["pool_path"]):
+            permissions = targets[0].findall("permissions")
+            if len(permissions) == 1:
+                node = permissions[0]
+                if (not node.attrib and not (node.text or "").strip() and not (node.tail or "").strip()
+                        and [field.tag for field in node] == ["mode", "owner", "group"]
+                        and all(not field.attrib and len(field) == 0 and not (field.tail or "").strip() for field in node)
+                        and node.findtext("mode") in ("0700", "0711")
+                        and node.findtext("owner") == "0" and node.findtext("group") == "0"):
+                    targets[0].remove(node)
     return hashlib.sha256(ET.canonicalize(ET.tostring(root, encoding="unicode"), strip_text=True).encode()).hexdigest()
 
 
@@ -570,6 +633,14 @@ def verify_resources(p, journal, allow_running=False):
     for key, record in journal["resources"].items():
         kind, name = key.split(":")
         require(name in (p["vms"] if kind == "domain" else [p["name"]]), "Unexpected journal resource")
+        if kind == "pool":
+            directory = root_directory(p["pool_path"])
+            try:
+                info = os.fstat(directory)
+                require([info.st_dev, info.st_ino] == journal.get("pool_directory"), "Owned pool directory replaced")
+                require(stat.S_IMODE(info.st_mode) in (0o700, 0o711), "Unexpected owned pool directory mode")
+            finally:
+                os.close(directory)
         text = resource_xml(p, kind, name)
         require(ET.fromstring(text).findtext("uuid") == record["uuid"] == identity(p, kind, name), "Resource UUID mismatch")
         require(definition_hash(text) == record["definition_sha256"], "Resource definition drift")
@@ -692,6 +763,8 @@ def recover_guard(p, expected_batch_sha256):
                 "journal": str(STATE / "journal.json")}
 
 
+
+
 def ensure_resource(p, journal, kind, name, text):
     key = kind + ":" + name
     if key in journal.value["resources"]:
@@ -772,6 +845,12 @@ def apply(p, image_directory):
             try:
                 journal.intent({"operation": "create-pool-directory", "path": str(target)})
                 os.mkdir(target.name, 0o711, dir_fd=parent)
+                created = os.open(target.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                try:
+                    os.fchmod(created, 0o711)
+                    os.fsync(created)
+                finally:
+                    os.close(created)
                 os.fsync(parent)
                 journal.value["pool_directory"] = inode(target)
                 journal.done()
@@ -779,6 +858,14 @@ def apply(p, image_directory):
                 os.close(parent)
         pool = root_directory(target)
         try:
+            info = os.fstat(pool)
+            require([info.st_dev, info.st_ino] == journal.value["pool_directory"], "Owned pool directory replaced")
+            require(stat.S_IMODE(info.st_mode) in (0o700, 0o711), "Unexpected owned pool directory mode")
+            if stat.S_IMODE(info.st_mode) != 0o711:
+                journal.intent({"operation": "normalize-owned-pool-mode", "mode": "0711"})
+                os.fchmod(pool, 0o711)
+                os.fsync(pool)
+                journal.done()
             base = target / "ubuntu-base.img"
             if str(base) not in journal.value["files"]:
                 journal.intent({"operation": "copy-verified-image", "path": str(base)})
@@ -974,7 +1061,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError, StopIteration, ET.ParseError, subprocess.SubprocessError, KeyboardInterrupt):
-        print("Dev provisioner failed a check or was interrupted. Apply may have journaled owned resources; "
-              "inspect local state before retrying. No existing resources are adopted or deleted.", file=sys.stderr)
+    except (ValueError, OSError, StopIteration, ET.ParseError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(json.dumps(failure_report(error)), file=sys.stderr)
         sys.exit(1)

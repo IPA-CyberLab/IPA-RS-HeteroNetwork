@@ -170,7 +170,7 @@ a separate reviewed action. Any mismatch requires investigation, not blind clear
 python3 scripts/provision-dev-libvirt.test.py
 ```
 
-25 tests cover policy modeling, XML/budgets, collisions, exclusive writes,
+31 tests cover policy modeling, XML/budgets, collisions, exclusive writes,
 durable intent, guard readback/drift, QCOW2 rejection, pinned bootstrap identity,
 bounded subprocesses, partial boot cleanup, and complete mocked first/warm/cold
 apply, real nft readback normalization and tightly gated guard recovery. They use
@@ -184,3 +184,26 @@ readback and boot, not a packet reachability matrix.
 After reviewed creation, separately verify DHCP/DNS, public egress, denied
 host/production destinations and IPv6 using only these guests. Kubernetes and
 application bootstrap remain separate.
+
+### Pool Metadata and Refusal Diagnostics
+
+The next apply reached pool/network start and domain 1 definition, then refused
+pool definition drift. Saved evidence in `testdata/libvirt-dir-pool-runtime.json`
+shows libvirt adds root/root `0700` directory permissions even to `--inactive`
+pool XML. Only the fixed pool name/UUID/path with an exact permissions node
+(mode `0700` or `0711`, owner/group `0`, no extra fields or attributes) is
+normalized. Unexpected modes, ownership and XML remain hash-significant.
+Directory verification independently requires root-owned protected ancestors,
+the journaled inode and mode `0700` or `0711`.
+
+Creation explicitly applies descriptor-based chmod `0711`, since umask `077`
+otherwise turns mkdir's requested `0711` into `0700`. Warm/cold apply similarly
+corrects only the verified owned `0700` directory to `0711`, with journal intent
+and fsync. There is no pool-definition rewrite, blanket permissions exclusion,
+pool recovery command or journal-hash replacement.
+
+CLI failures remain nonzero and now report JSON with code stage/line, a fixed
+refusal reason, and a whitelisted command tool/exit code or numeric OS errno
+where available. Raw subprocess output, command arguments, parser exception
+text and credential paths are not included. Source-literal reason checks and
+synthetic secret-bearing failure tests enforce this reporting boundary.

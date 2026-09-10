@@ -1,0 +1,9 @@
+{
+  "record": {
+    "definition_sha256": "0e0c6cc68353920ea2d97ba5373d8b43e33a1a1d1c12e99b01ba1b4cbcc128f4",
+    "uuid": "af08e887-48f4-5b07-a4be-da9998f504f5"
+  },
+  "current_hash": "d0d89343c9f6042bd6abbd8f4371941488c37aeb9fe7482492e40f1be405156e",
+  "current": "<pool type='dir'>\n  <name>hetero-dev</name>\n  <uuid>af08e887-48f4-5b07-a4be-da9998f504f5</uuid>\n  <capacity unit='bytes'>633526042624</capacity>\n  <allocation unit='bytes'>76001058816</allocation>\n  <available unit='bytes'>557524983808</available>\n  <source>\n  </source>\n  <target>\n    <path>/var/lib/libvirt/hetero-dev</path>\n    <permissions>\n      <mode>0700</mode>\n      <owner>0</owner>\n      <group>0</group>\n    </permissions>\n  </target>\n</pool>\n\n",
+  "requested": "<pool type=\"dir\">\n  <name>hetero-dev</name>\n  <uuid>af08e887-48f4-5b07-a4be-da9998f504f5</uuid>\n  <target>\n    <path>/var/lib/libvirt/hetero-dev</path>\n  </target>\n</pool>\n"
+}
