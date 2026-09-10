@@ -9162,12 +9162,23 @@ async fn run_agent(
     let stun_servers =
         runtime_stun_servers(runtime.as_ref(), &AgentStunDiscoveryConfig::from(&args)).await?;
     if !stun_servers.is_empty() {
-        if let Err(error) = classify_agent_startup_nat(
-            runtime.as_ref(),
-            args.stun_bind,
-            args.wireguard_listen_port,
-            args.mapped_public_ip,
-            &stun_servers,
+        if let Err(error) = classify_with_public_stun_fallback(
+            &AgentStunDiscoveryConfig::from(&args),
+            stun_servers.clone(),
+            |servers| {
+                let runtime = runtime.as_ref();
+                let args = &args;
+                async move {
+                    Ok(classify_agent_startup_nat(
+                        runtime,
+                        args.stun_bind,
+                        args.wireguard_listen_port,
+                        args.mapped_public_ip,
+                        &servers,
+                    )
+                    .await?)
+                }
+            },
         )
         .await
         {
@@ -14855,9 +14866,60 @@ async fn classify_nat_from_runtime_directory(
         !stun_servers.is_empty(),
         "runtime service directory has no usable STUN endpoint"
     );
-    Ok(runtime
-        .classify_nat_without_candidate_refresh(probe_bind, stun_servers)
-        .await?)
+    classify_with_public_stun_fallback(config, stun_servers, |servers| async move {
+        Ok(runtime
+            .classify_nat_without_candidate_refresh(probe_bind, servers)
+            .await?)
+    })
+    .await
+}
+
+async fn classify_with_public_stun_fallback<T, F, Fut>(
+    config: &AgentStunDiscoveryConfig,
+    primary: Vec<SocketAddr>,
+    mut classify: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut(Vec<SocketAddr>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let primary_error = match classify(primary.clone()).await {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    if !config.retain_public_fallback_for_gateway || config.disable_public_stun_fallback {
+        return Err(primary_error);
+    }
+    // Resolve only after failure, without directory/explicit endpoints taking precedence.
+    // Keep each attempt's existing bind handling and STUN protocol timeouts unchanged.
+    let fallback_config = AgentStunDiscoveryConfig {
+        explicit_servers: Vec::new(),
+        public_stun_urls: config.public_stun_urls.clone(),
+        disable_public_stun_fallback: false,
+        retain_public_fallback_for_gateway: true,
+    };
+    let mut fallback = tokio::time::timeout(
+        Duration::from_secs(10),
+        resolve_agent_stun_servers(&fallback_config, None, &[]),
+    )
+    .await
+    .context("public STUN fallback resolution timed out")
+    .and_then(std::convert::identity)
+    .with_context(|| format!("primary STUN classification failed: {primary_error:#}"))?;
+    fallback.retain(|server| !primary.contains(server));
+    if fallback.is_empty() {
+        return Err(primary_error);
+    }
+    tracing::warn!(
+        error = %primary_error,
+        stun_servers = fallback.len(),
+        "primary STUN classification failed; trying eligible public fallback"
+    );
+    let result = classify(fallback).await.with_context(|| {
+        format!("public STUN fallback failed after primary failure: {primary_error:#}")
+    })?;
+    tracing::info!("STUN classification recovered through public fallback");
+    Ok(result)
 }
 
 fn nat_discovery_refresh_interval(
@@ -22525,6 +22587,111 @@ fn database_kind(database_url: Option<&str>) -> DatabaseKind {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stun_classification_public_fallback_policy() -> anyhow::Result<()> {
+        let primary: std::net::SocketAddr = "192.0.2.1:3478".parse()?;
+        let fallback: std::net::SocketAddr = "1.1.1.1:3478".parse()?;
+        for (eligible, disabled, primary_ok, fallback_ok, expected_calls, success) in [
+            (true, false, false, true, 2, true),
+            (true, false, false, false, 2, false),
+            (true, true, false, true, 1, false),
+            (false, false, false, true, 1, false),
+            (true, false, true, true, 1, true),
+        ] {
+            let config = super::AgentStunDiscoveryConfig {
+                explicit_servers: vec![primary],
+                public_stun_urls: vec![format!("udp://{fallback}"), format!("udp://{fallback}")],
+                disable_public_stun_fallback: disabled,
+                retain_public_fallback_for_gateway: eligible,
+            };
+            let mut calls = Vec::new();
+            let result =
+                super::classify_with_public_stun_fallback(&config, vec![primary], |servers| {
+                    let ok = if calls.is_empty() {
+                        primary_ok
+                    } else {
+                        fallback_ok
+                    };
+                    calls.push(servers);
+                    std::future::ready(if ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("fixture UDP timeout"))
+                    })
+                })
+                .await;
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(calls.len(), expected_calls);
+            assert_eq!(calls[0], vec![primary]);
+            if expected_calls == 2 {
+                assert_eq!(calls[1], vec![fallback]);
+            }
+            if eligible && !disabled && !primary_ok && !fallback_ok {
+                assert!(format!(
+                    "{:#}",
+                    result
+                        .err()
+                        .ok_or_else(|| anyhow::anyhow!("expected failure"))?
+                )
+                .contains("primary failure"));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stun_classification_public_fallback_is_lazy() -> anyhow::Result<()> {
+        for (eligible, disabled, primary_ok) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let config = super::AgentStunDiscoveryConfig {
+                explicit_servers: Vec::new(),
+                public_stun_urls: vec!["invalid-fallback-must-not-be-resolved".to_string()],
+                disable_public_stun_fallback: disabled,
+                retain_public_fallback_for_gateway: eligible,
+            };
+            let result = super::classify_with_public_stun_fallback(
+                &config,
+                vec!["192.0.2.1:3478".parse()?],
+                |_| {
+                    std::future::ready(if primary_ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("primary-only"))
+                    })
+                },
+            )
+            .await;
+            match result {
+                Ok(()) => assert!(primary_ok),
+                Err(error) => assert_eq!(error.to_string(), "primary-only"),
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stun_classification_public_fallback_does_not_repeat_primary() -> anyhow::Result<()> {
+        let primary = "1.1.1.1:3478".parse()?;
+        let config = super::AgentStunDiscoveryConfig {
+            explicit_servers: Vec::new(),
+            public_stun_urls: vec!["udp://1.1.1.1:3478".to_string()],
+            disable_public_stun_fallback: false,
+            retain_public_fallback_for_gateway: true,
+        };
+        let mut calls = 0;
+        let result = super::classify_with_public_stun_fallback(&config, vec![primary], |_| {
+            calls += 1;
+            std::future::ready(Err::<(), _>(anyhow::anyhow!("fixture UDP timeout")))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        Ok(())
+    }
+
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 
     use async_trait::async_trait;
