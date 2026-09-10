@@ -1,0 +1,28 @@
+[package]
+name = "ipars-host-authorization-prototype"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately outside the daemon workspace and release graph.
+[workspace]
+
+[dependencies]
+ipars-quorum = { path = "../../crates/ipars-quorum" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
