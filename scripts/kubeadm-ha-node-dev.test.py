@@ -46,6 +46,20 @@ class DevProfileTests(unittest.TestCase):
                 self.run_shell(prefix + "printf '%s' " + shlex.quote(json.dumps(fixture))
                                + " | render_flannel_network", False)
 
+    def test_flannel_network_accepts_kubectl_json_stream(self):
+        fixture = self.flannel_fixture()
+        stream = "\n".join(json.dumps(item) for item in fixture["items"])
+        result = self.run_shell("printf '%s' " + shlex.quote(stream) + " | render_flannel_network")
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual["kind"], "List")
+        self.assertEqual(actual["apiVersion"], "v1")
+        self.assertEqual(len(actual["items"]), 2)
+        self.assertEqual(json.loads(actual["items"][0]["data"]["net-conf.json"])["Network"], "172.29.0.0/16")
+        self.assertEqual(actual["items"][1], fixture["items"][1])
+        self.run_shell("printf '%s' " + shlex.quote(stream + "\n" + json.dumps(fixture["items"][0]))
+                       + " | render_flannel_network", False)
+        self.run_shell("printf '' | render_flannel_network", False)
+
     def test_kubeadm_init_never_echoes_credentials_success_or_failure(self):
         for failure in ("none", "validate", "init"):
             with tempfile.TemporaryDirectory() as directory:

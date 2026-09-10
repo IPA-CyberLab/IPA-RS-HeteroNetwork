@@ -2406,9 +2406,11 @@ join_worker() {
 
 render_flannel_network() {
   validate_cidr_literal "$pod_cidr"
-  jq -e --arg network "$pod_cidr" '
+  jq -se --arg network "$pod_cidr" '
     def target: .kind == "ConfigMap" and .metadata.name == "kube-flannel-cfg"
       and .metadata.namespace == "kube-flannel";
+    (if length == 1 and .[0].kind == "List" then .[0]
+     else {apiVersion: "v1", kind: "List", items: .} end) |
     if .kind != "List" or (.items | type) != "array" then
       error("expected Kubernetes manifest List")
     elif ([.items[] | select(target)] | length) != 1 then
