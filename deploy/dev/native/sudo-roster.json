@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "ceremony_id": "hetero-dev-sudo-20260910-epoch-1",
+  "cluster_id": "02282a57-784b-4269-90a0-8fda47ee62ec",
+  "epoch": 1,
+  "members": [
+    {
+      "identifier": 1,
+      "node_id": "node-e52856163b2fb3a1d67fc03943cbdda2",
+      "endpoint": "http://10.251.0.1:8981"
+    },
+    {
+      "identifier": 2,
+      "node_id": "node-65bbb4982793bf94af58d9a2506c4fca",
+      "endpoint": "http://10.251.0.2:8981"
+    },
+    {
+      "identifier": 3,
+      "node_id": "node-dfdf53799602bd2aa9006121c33af69a",
+      "endpoint": "http://10.251.0.3:8981"
+    }
+  ]
+}
