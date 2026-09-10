@@ -25,7 +25,7 @@ COMPONENTS = {
 AUX = {
     "heterocloud": {"haproxy": ("ownerConsole.databaseProxy.image", "scalar")},
     "flow": {
-        "flow-livekit": ("livekit.image", "tag"), "coturn": ("coturn.image", "tag"),
+        "coturn": ("coturn.image", "tag"),
         "redis": ("redis.image", "digest"), "redis-sentinel": ("redis.sentinel.image", "digest"),
         "prometheus": ("monitoring.prometheus.image", "digest"),
         "prometheus-init": ("monitoring.prometheus.initImage", "digest"),
@@ -55,7 +55,18 @@ def artifact(value, component):
     require(re.fullmatch(r"[a-f0-9]{40}", value.get("commit", "")), "chart revision must be a full immutable commit")
     require(re.fullmatch(r"ghcr\.io/ipa-cyberlab/[a-z0-9._/-]+@sha256:[a-f0-9]{64}", value.get("image", "")),
             "release image must match the immutable channel artifact contract")
-    return {key: value[key] for key in ("schema_version", "component", "version", "commit", "image")}
+    result = {key: value[key] for key in ("schema_version", "component", "version", "commit", "image")}
+    if component == "flow":
+        companions = value.get("companions")
+        require(isinstance(companions, dict) and set(companions) == {"livekit"}
+                and isinstance(companions["livekit"], dict) and set(companions["livekit"]) == {"image"},
+                "Flow requires its LiveKit companion")
+        image = companions["livekit"]["image"]
+        require(isinstance(image, str) and re.fullmatch(
+            r"ghcr\.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:[a-f0-9]{64}", image),
+            "invalid Flow companion digest")
+        result["companions"] = {"livekit": {"image": image}}
+    return result
 
 
 def selected(state, channel):
@@ -175,6 +186,11 @@ def render(state, channel, site):
         source.update(repoURL=f"https://github.com/IPA-CyberLab/{repository}.git", targetRevision=pin["commit"], path="deploy/helm/" + app)
         parameters = {entry["name"]: entry["value"] for entry in source["helm"].get("parameters", [])}
         parameters.update(image_parameters("image", pin))
+        if component == "flow":
+            require("flow-livekit" not in site.get("auxiliary_images", {}),
+                    "LiveKit is selected by the Flow release, not an auxiliary override")
+            parameters.update(image_parameters("livekit.image", {
+                "image": pin["companions"]["livekit"]["image"], "version": pin["version"]}))
         for name, (prefix, mode) in AUX[component].items():
             if name in site.get("auxiliary_images", {}):
                 parameters.update(image_parameters(prefix, site["auxiliary_images"][name], mode))
@@ -245,7 +261,10 @@ def dev_project(site):
 
 def check_helm(applications, state, channel, site, repository_root, inspect_documents=None):
     """Validate local chart working trees, not remote catalog commit contents."""
-    allowed = {value["image"] for value in selected(state, channel).values()}
+    releases = selected(state, channel)
+    allowed = {value["image"] for value in releases.values()}
+    allowed.update(companion["image"] for value in releases.values()
+                   for companion in value.get("companions", {}).values())
     allowed.update(pin["image"] for pin in site.get("auxiliary_images", {}).values())
     counts = {}
     for app in applications:

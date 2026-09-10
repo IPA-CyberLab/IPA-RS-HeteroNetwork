@@ -91,7 +91,9 @@ are explicitly derived from this site, not chart production CIDR defaults.
 Public OIDC HTTPS egress remains enabled. The chart's namespace-based DNS policy
 is retained. This is not a general cross-cluster firewall generator.
 
-Auxiliary image bindings: `flow-livekit`, `coturn`, `garage`, `redis`,
+Flow LiveKit is taken from `companions.livekit.image` in the selected Flow
+release, not a site-specific override. Its digest is preserved through promotion.
+Auxiliary image bindings: `coturn`, `garage`, `redis`,
 `redis-sentinel`, `prometheus`, `prometheus-init`, `grafana`, `busybox`, `haproxy`.
 Optional dev infrastructure also needs `postgres` and `redis`, using official
 Postgres/Redis-compatible entrypoints. Disabled components do not need image

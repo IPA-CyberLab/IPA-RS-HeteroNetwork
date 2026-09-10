@@ -17,6 +17,17 @@ export function validateArtifact(value) {
     throw new Error('Invalid immutable release artifact');
   }
   const artifact = Object.fromEntries(['schema_version', 'component', 'version', 'commit', 'image'].map(k => [k, value[k]]));
+  if (value.component === 'flow') {
+    if (!object(value.companions) || Object.keys(value.companions).length !== 1 ||
+        !object(value.companions.livekit) || Object.keys(value.companions.livekit).length !== 1 ||
+        typeof value.companions.livekit.image !== 'string' ||
+        !/^ghcr\.io\/ipa-cyberlab\/ipa-rs-heterocloud-flow-livekit@sha256:[a-f0-9]{64}$/.test(value.companions.livekit.image)) {
+      throw new Error('Flow requires its immutable LiveKit companion image');
+    }
+    artifact.companions = {livekit: {image: value.companions.livekit.image}};
+  } else if (value.companions !== undefined) {
+    throw new Error('Unsupported companion images');
+  }
   if (value.native !== undefined) {
     if (value.component !== 'heteronetwork' ||
         !/^ghcr\.io\/ipa-cyberlab\/heteronetwork@sha256:[a-f0-9]{64}$/.test(value.image) ||

@@ -8,9 +8,13 @@ import render
 
 
 def pin(component):
-    return {"schema_version": 1, "component": component, "version": "1.2.3",
+    value = {"schema_version": 1, "component": component, "version": "1.2.3",
             "commit": "a" * 40,
             "image": "ghcr.io/ipa-cyberlab/" + component + "@sha256:" + "b" * 64}
+    if component == "flow":
+        value["companions"] = {"livekit": {"image":
+            "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:" + "c" * 64}}
+    return value
 
 
 def fixtures():
@@ -32,7 +36,7 @@ def fixtures():
             "storage_class": "dev-storage", "pod_cidrs": ["172.20.0.0/16"],
             "service_cidrs": ["172.21.0.0/16"], "dns_cidrs": ["172.21.0.10/32"],
             "auxiliary_images": {name: pin(name) for name in
-                                 ("postgres", "redis", "flow-livekit", "coturn", "garage")}}
+                                 ("postgres", "redis", "coturn", "garage")}}
     site["auxiliary_images"]["garage"]["version"] = "v2.3.0"
     return state, site
 
@@ -57,13 +61,30 @@ class RendererTests(unittest.TestCase):
             old_params = {p["name"]: p["value"] for p in original["spec"]["source"]["helm"].get("parameters", [])}
             new_params = {p["name"]: p["value"] for p in actual["spec"]["source"]["helm"]["parameters"]}
             for name, value in old_params.items():
-                if name not in ("image.repository", "image.tag"):
+                if name not in ("image.repository", "image.tag", "livekit.image.repository", "livekit.image.tag"):
                     self.assertEqual(new_params[name], value)
             actual["metadata"] = original["metadata"]
             actual["spec"]["source"]["targetRevision"] = original["spec"]["source"]["targetRevision"]
             actual["spec"]["source"]["helm"].pop("parameters")
             original["spec"]["source"]["helm"].pop("parameters", None)
             self.assertEqual(actual, original)
+
+    def test_flow_companion_is_release_bound_in_both_environments(self):
+        state, site = fixtures()
+        expected = state["dev"]["flow"]["companions"]["livekit"]["image"]
+        for channel, config in (("dev", site), ("prod", {})):
+            app = next(app for app in render.render(state, channel, config)
+                       if app["metadata"]["name"].startswith("heterocloud-flow"))
+            params = {p["name"]: p["value"] for p in app["spec"]["source"]["helm"]["parameters"]}
+            self.assertEqual(render.canonical_image(
+                params["livekit.image.repository"] + ":" + params["livekit.image.tag"]), expected)
+        site["auxiliary_images"]["flow-livekit"] = pin("livekit")
+        with self.assertRaisesRegex(ValueError, "auxiliary override"):
+            render.render(state, "dev", site)
+        state, site = fixtures()
+        state["prod"]["flow"]["companions"]["livekit"]["image"] = expected[:-64] + "d" * 64
+        with self.assertRaises(ValueError):
+            render.render(state, "prod", site)
 
     def test_dev_rejects_shared_cluster_or_oidc(self):
         state, site = fixtures()

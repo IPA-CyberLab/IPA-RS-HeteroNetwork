@@ -32,6 +32,15 @@ and `syouyu`. Releases from other repositories must supply the same schema befor
 being selected; this does not install release publishing workflows into those
 repositories.
 
+Flow artifacts also require `companions.livekit.image`, containing the digest-pinned
+`ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit` image published from the same
+release. The companion is part of selection, promotion and rollback identity.
+Changing only LiveKit still requires staging and approving a new complete Flow
+artifact. The GitOps renderer obtains LiveKit from this field in both environments;
+the former `auxiliary_images.flow-livekit` override is rejected. Other components
+do not accept companion fields. Primary-only historical Flow manifests must be
+replaced with publisher-verified complete manifests, not invented companion hashes.
+
 ```json
 {
   "schema_version": 1,

@@ -9,6 +9,34 @@ const artifact = {schema_version: 1, component: 'heteronetwork', version: '1.2.3
   commit: 'a'.repeat(40), image: `ghcr.io/ipa-cyberlab/heteronetwork@sha256:${'b'.repeat(64)}`};
 const empty = () => ({schema_version: 1, revision: 0, dev: {}, prod: {}, history: []});
 
+test('Flow promotion and rollback bind the LiveKit companion as well as the primary image', () => {
+  const flow = {...artifact, component: 'flow',
+    image: `ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow@sha256:${'b'.repeat(64)}`,
+    companions: {livekit: {image: `ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flow-livekit@sha256:${'c'.repeat(64)}`}}};
+  let state = transition(empty(), 'stage', flow, 0);
+  assert.deepEqual(state.dev.flow.companions, flow.companions);
+  const changed = structuredClone(flow);
+  changed.companions.livekit.image = changed.companions.livekit.image.replace(/c{64}$/, 'd'.repeat(64));
+  assert.throws(() => transition(state, 'promote', changed, 1));
+  state = transition(state, 'promote', flow, 1);
+  assert.throws(() => transition(state, 'rollback', changed, 2));
+  state = transition(state, 'stage', changed, 2);
+  assert.deepEqual(state.prod.flow.companions, flow.companions);
+  state = transition(state, 'promote', changed, 3);
+  state = transition(state, 'rollback', flow, 4);
+  assert.deepEqual(state.prod.flow.companions, flow.companions);
+  assert.deepEqual(state.dev.flow.companions, changed.companions);
+  const tampered = structuredClone(state);
+  tampered.history[0].after.companions = changed.companions;
+  assert.throws(() => transition(tampered, 'stage', changed, 5));
+  for (const companions of [undefined, {}, [], {livekit: {image: 'latest'}},
+    {livekit: {image: flow.image}}, {...flow.companions, unknown: {}},
+    {livekit: {...flow.companions.livekit, version: 'other'}}]) {
+    assert.throws(() => validateArtifact({...flow, companions}));
+  }
+  assert.throws(() => validateArtifact({...artifact, companions: flow.companions}));
+});
+
 test('production accepts only exact staged artifact; staging does not affect production', () => {
   assert.throws(() => transition(empty(), 'promote', artifact, 0));
   const dev = transition(empty(), 'stage', artifact, 0);
