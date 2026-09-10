@@ -191,6 +191,30 @@ Use `--response-out` on execution to retain an API response in a new private
 file. Response bodies are not printed because enrollment responses can contain
 credentials.
 
+## Membership Rotation
+
+After a fresh distributed ceremony produces the next manifest and each voter has
+its own new share, configure the two groups' signers with the locally trusted old
+anchor. Review both rosters and endpoints before sending owner authentication.
+
+```sh
+ipars quorum rotation-request --old-manifest old-manifest.json \
+  --new-manifest new-manifest.json --out transition.json
+ipars quorum rotation-issue --old-manifest old-manifest.json \
+  --request transition.json --oidc-token owner-oidc.token \
+  --vpn-cidr 10.250.0.0/16 --out rotation.json
+ipars quorum rotation-verify --old-manifest old-manifest.json --rotation rotation.json
+ipars quorum rotation-apply --old-manifest old-manifest.json --rotation rotation.json \
+  --control-plane-url http://10.250.0.10:19088 --vpn-cidr 10.250.0.0/16
+```
+
+The address is an example, not an automatically discovered deployment target.
+Verification is offline and does not apply the transition. Apply sends one POST
+and never retries it. If the result is uncertain, separately read the authenticated
+`GET /v1/admin/quorum/manifest` endpoint and compare the epoch/digest before issuing
+any new request. Do not rerun an ambiguous mutation blindly. The old local manifest
+is mandatory; do not download an untrusted replacement and treat it as an anchor.
+
 ## Verification And Deployment Status
 
 The initial September 10 implementation passed 50 focused tests: eight crypto tests,
