@@ -79,8 +79,73 @@ and no group/other write access. The output directory must not already exist.
 
 Each payload includes `INSTRUCTIONS.txt`. Install guest 1 first, then explicitly
 start it; start guests 2/3 after the CP is healthy. Required guest packages are
-Python 3, iproute2, iputils ping, systemd and WireGuard tools/support; this tool
-does not run apt.
+Python 3, iproute2, iputils ping, curl, systemd and WireGuard tools/support.
+The explicit `prerequisites` command below can install the fixed OS packages;
+`install` and `start` never install packages implicitly.
+
+## Explicit OS Prerequisites
+
+On the identity-matching fresh guest, before `install`, run the reviewed helper:
+
+```sh
+sudo /usr/bin/python3 /opt/heteronetwork-dev-bootstrap/bootstrap-dev-guest.py prerequisites \
+  --bundle /opt/heteronetwork-dev-bootstrap
+```
+
+This root-only command reuses bundle privacy, guest UUID/machine-ID/hostname/dev0
+and dev-artifact checks, verifies generated file hashes and the base archive
+digest, and refuses existing HN config, state, journal or units. It serializes
+prerequisite invocations by locking the bundle directory without writing it.
+Python 3 and `ip` must already exist to perform these checks. Only Debian/Ubuntu
+are accepted, using the fresh image's administrator-controlled distro apt
+configuration. No repository, signing key, sudoers or network configuration is
+added; inherited proxy/apt environment is cleared.
+
+The fixed packages are `python3`, `iproute2`, `iputils-ping`, `curl`, `systemd`
+and `wireguard-tools`. Apt metadata update must succeed; installation uses
+`--no-install-recommends --no-upgrade`, with bounded lock/network/process waits.
+There is no arbitrary package, URL or command parameter. Apt dependencies and
+normal package maintainer scripts still run as root. Existing installed target
+packages are not upgraded. A successful `wg --version` is checked afterward;
+this does not prove kernel WireGuard support or VPN health.
+
+Repeat before HN installation to recover an interrupted apt operation; no
+credentials are regenerated and no journal/reset operation is performed. Apt
+can leave partial package state on failure or timeout: inspect that state and
+any surviving package-manager lock before retrying, never delete its lock files.
+No HN service is started. After HN installation this fresh-only command refuses.
+
+### Existing Prepared Bundle Handoff
+
+The existing local staging tree
+`/home/coder/.cache/hetero-dev-observed-20260910/bootstrap` belongs to fresh cluster
+`02282a57-784b-4269-90a0-8fda47ee62ec`. **Do not rerun `stage` or modify that tree.**
+DEV1's missing `wg` is the prerequisite this command addresses; execution and
+guest delivery remain the deployment owner's responsibility after review.
+
+To use new source with an existing payload, deliver the reviewed
+`scripts/bootstrap-dev-guest.py` and its sibling `scripts/native-release-stage.py`
+to a **separate**, new root-owned directory such as
+`/opt/heteronetwork-dev-bootstrap-tools/<reviewed-full-source-commit>/` (0700).
+Use regular root-owned files, mode 0700 for the helper and 0600 for the imported
+module. Record the exact source commit and independently calculated SHA-256 of
+both files in the review handoff; verify the received bytes against those pins
+before executing. Refuse an existing differing tools directory rather than
+overwrite it. No issuer key, token or manifest regeneration is involved.
+
+Invoke that separate helper using its full trusted path:
+
+```sh
+sudo /usr/bin/python3 /opt/heteronetwork-dev-bootstrap-tools/<reviewed-full-source-commit>/bootstrap-dev-guest.py prerequisites \
+  --bundle /opt/heteronetwork-dev-bootstrap
+```
+
+The placeholder must be replaced by the reviewed source identity, not a guessed
+hash. The guest bundle remains byte-for-byte unchanged, including its older
+helper; no code writes to the existing local staging tree. This is an explicit
+source-pinned administration helper, **not** a binary/helper verified by the
+released dev4 native archive digest. Base-only artifact verification and the
+inactive/unverified sudo-companion boundary remain unchanged.
 
 ## Journal and Failure
 

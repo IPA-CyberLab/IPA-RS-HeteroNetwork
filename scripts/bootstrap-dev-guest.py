@@ -30,6 +30,7 @@ BIN = Path("/opt/heteronetwork/bin")
 JOURNAL = Path("/var/lib/heteronetwork-dev-bootstrap")
 UNITS = Path("/etc/systemd/system")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+PREREQUISITE_PACKAGES = ("python3", "iproute2", "iputils-ping", "curl", "systemd", "wireguard-tools")
 
 
 def require(condition, message):
@@ -231,10 +232,11 @@ def stage(artifact_path, archive_path, inventory_path, output):
             f"Dedicated {guest['name']} only; UUID {guest['product_uuid']}; machine ID {guest['machine_id']}.\n"
             "Transfer this entire directory through the approved provisioning/admin path, then make it root-owned and private.\n"
             "Do not transfer issuer.key or another guest's directory. Do not copy production configuration.\n"
-            "Required guest packages: python3, iproute2, iputils-ping, wireguard-tools, systemd; no package installation is performed here.\n"
+            "Required guest packages: python3, iproute2, iputils-ping, curl, wireguard-tools, systemd.\n"
             "Curie must place the payload at /opt/heteronetwork-dev-bootstrap (root:root, directory 0700),\n"
             "Curie's fresh devadmin already has temporary bootstrap NOPASSWD ALL inside this exclusive VM.\n"
             "This tool does not alter cloud-init, sudoers, SSH policy or administrator credentials.\n"
+            "  sudo /usr/bin/python3 /opt/heteronetwork-dev-bootstrap/bootstrap-dev-guest.py prerequisites --bundle /opt/heteronetwork-dev-bootstrap\n"
             "  sudo /usr/bin/python3 /opt/heteronetwork-dev-bootstrap/bootstrap-dev-guest.py install --bundle /opt/heteronetwork-dev-bootstrap\n"
             "  sudo /usr/bin/python3 /opt/heteronetwork-dev-bootstrap/bootstrap-dev-guest.py start --bundle /opt/heteronetwork-dev-bootstrap\n"
             "Start hetero-dev-1 first. CP uses private-underlay HTTP on port 8443, not TLS or CP HA.\n"
@@ -297,19 +299,63 @@ def wait_control_plane():
     raise ValueError("Dev control plane not healthy; enrollment was not attempted")
 
 
-def install(bundle, start=False):
-    require(os.geteuid() == 0, "Installation is local root-only")
+def checked_guest_bundle(bundle):
+    require(os.geteuid() == 0, "Guest operations are local root-only")
     bundle = private_path(Path(bundle))
+    private_path(bundle / "bootstrap.json")
     config_raw = read(bundle / "bootstrap.json")
     config = decode(config_raw)
     guest = config["guest"]
     require(config["schema_version"] == 1 and guest["name"] in NAMES, "Not a dev bootstrap bundle")
     validate_guest(guest)
     guest_identity(guest)
+    private_path(bundle / "artifact.json")
     artifact_raw = read(bundle / "artifact.json")
     require(digest(artifact_raw) == config["artifact_sha256"], "Artifact identity changed")
     manifest = decode(artifact_raw)
     require(manifest["component"] == "heteronetwork" and "-dev." in manifest["version"], "Not a dev artifact")
+    return bundle, config_raw, config, manifest
+
+
+def prerequisites(bundle):
+    bundle, _, config, manifest = checked_guest_bundle(bundle)
+    # Lock the directory inode without creating or changing any prepared files.
+    fd = os.open(bundle, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for path in (CONFIG, STATE, BIN.parent, JOURNAL):
+            require(not path.exists() and not path.is_symlink(), "Prerequisites require an uninstalled fresh dev guest")
+        for root in (UNITS, Path("/usr/lib/systemd/system"), Path("/lib/systemd/system")):
+            require(not list(root.glob("heteronetwork*")), "Existing HeteroNetwork units rejected")
+        for name, expected in config["files"].items():
+            require(re.fullmatch(r"[a-z0-9.-]+", name), "Unsafe bundle filename")
+            private_path(bundle / name)
+            require((bundle / name).stat().st_nlink == 1, "Hardlinked bundle file rejected")
+            require(digest(read(bundle / name)) == expected, "Bundle file changed")
+        module = native()
+        with module.source_file(str(bundle / "archive.tar.gz")) as source:
+            require(module.bounded_digest(source, module.MAX_ARCHIVE) == module.native(manifest)["sha256"], "Archive digest mismatch")
+        release = read("/usr/lib/os-release", 16384).decode()
+        ids = re.findall(r'^ID=(?:"([a-z]+)"|([a-z]+))$', release, re.MULTILINE)
+        require(len(ids) == 1 and (ids[0][0] or ids[0][1]) in ("ubuntu", "debian"), "Only distro Debian/Ubuntu apt is supported")
+        apt = ["/usr/bin/env", "-i", "PATH=" + ENV["PATH"], "LC_ALL=C",
+               "DEBIAN_FRONTEND=noninteractive", "/usr/bin/apt-get",
+               "-o", "DPkg::Lock::Timeout=60", "-o", "Acquire::Retries=0",
+               "-o", "Acquire::http::Timeout=30", "-o", "Acquire::https::Timeout=30"]
+        run([*apt, "-o", "APT::Update::Error-Mode=any", "update"], timeout=600)
+        run([*apt, "install", "--yes", "--no-install-recommends", "--no-upgrade",
+             *PREREQUISITE_PACKAGES], timeout=900)
+        run(["/usr/bin/wg", "--version"])
+        return {"phase": "prerequisites-installed", "node": config["guest"]["name"],
+                "packages": list(PREREQUISITE_PACKAGES), "hn_installed": False,
+                "vpn_verified": False, "sudo_installed": False}
+    finally:
+        os.close(fd)
+
+
+def install(bundle, start=False):
+    bundle, config_raw, config, manifest = checked_guest_bundle(bundle)
+    guest = config["guest"]
     binding = digest(config_raw)
     first = not JOURNAL.exists()
     if first:
@@ -498,7 +544,7 @@ def main():
     prepare = commands.add_parser("stage")
     for name in ("artifact", "archive", "inventory", "output"):
         prepare.add_argument("--" + name, required=True)
-    for name in ("install", "start"):
+    for name in ("prerequisites", "install", "start"):
         command = commands.add_parser(name)
         command.add_argument("--bundle", required=True)
     verify = commands.add_parser("verify-vpn")
@@ -509,6 +555,8 @@ def main():
         result = stage(args.artifact, args.archive, args.inventory, args.output)
     elif args.command == "verify-vpn":
         result = verify_vpn(args.bundle, args.roster)
+    elif args.command == "prerequisites":
+        result = prerequisites(args.bundle)
     else:
         result = install(args.bundle, start=args.command == "start")
     print(json.dumps(result))

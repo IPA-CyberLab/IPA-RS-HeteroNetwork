@@ -1,5 +1,6 @@
 """Offline only: synthetic archives are never executed; no services or guests touched."""
 import copy
+from contextlib import ExitStack
 import base64
 import gzip
 import importlib.util
@@ -33,6 +34,69 @@ CLUSTER = {"cluster_id": "11111111-1111-4111-8111-111111111111", "issuer_node_id
 
 
 class BootstrapTests(unittest.TestCase):
+    def prerequisite_fixture(self, stack):
+        artifact = self.archive()
+        with patch.object(b, "run", side_effect=lambda args, timeout=60: json.dumps(
+                CLUSTER if args[1] == "init" else {"test_only": True}).encode()):
+            self.stage()
+        bundle = self.root / "output" / b.NAMES[0]
+        raw = (bundle / "bootstrap.json").read_bytes()
+        stack.enter_context(patch.object(b, "checked_guest_bundle", return_value=(
+            bundle, raw, json.loads(raw), artifact)))
+        for name in ("CONFIG", "STATE", "BIN", "JOURNAL", "UNITS"):
+            stack.enter_context(patch.object(b, name, self.root / name / "absent"))
+        original_read = b.read
+        stack.enter_context(patch.object(b, "read", side_effect=lambda path, *args:
+            b'ID=ubuntu\n' if str(path) == "/usr/lib/os-release" else original_read(path, *args)))
+        return bundle
+
+    def test_prerequisites_repeat_preserves_bundle_and_uses_only_fixed_apt(self):
+        with ExitStack() as stack:
+            bundle = self.prerequisite_fixture(stack)
+            before = {p.name: p.read_bytes() for p in bundle.iterdir()}
+            run = stack.enter_context(patch.object(b, "run", return_value=b""))
+            for _ in range(2):
+                result = b.prerequisites(bundle)
+                self.assertFalse(result["hn_installed"])
+                self.assertFalse(result["vpn_verified"])
+            self.assertEqual(run.call_count, 6)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands[0][-1], "update")
+            self.assertIn("/usr/bin/apt-get", commands[1])
+            self.assertEqual(commands[1][-6:], list(b.PREREQUISITE_PACKAGES))
+            self.assertIn("--no-upgrade", commands[1])
+            self.assertEqual(commands[2], ["/usr/bin/wg", "--version"])
+            self.assertEqual(before, {p.name: p.read_bytes() for p in bundle.iterdir()})
+
+    def test_prerequisites_reject_installed_guest_and_changed_token_before_apt(self):
+        with ExitStack() as stack:
+            bundle = self.prerequisite_fixture(stack)
+            run = stack.enter_context(patch.object(b, "run"))
+            b.CONFIG.mkdir(parents=True)
+            with self.assertRaises(ValueError):
+                b.prerequisites(bundle)
+            b.CONFIG.rmdir()
+            (bundle / "agent-api.token").write_bytes(b"changed")
+            with self.assertRaises(ValueError):
+                b.prerequisites(bundle)
+            run.assert_not_called()
+
+    def test_prerequisites_identity_failure_never_calls_apt(self):
+        with patch.object(b, "checked_guest_bundle", side_effect=ValueError("Wrong machine ID")), \
+                patch.object(b, "run") as run:
+            with self.assertRaises(ValueError):
+                b.prerequisites(self.root)
+            run.assert_not_called()
+
+    def test_prerequisites_apt_failure_stops_without_install_or_enrollment(self):
+        with ExitStack() as stack:
+            bundle = self.prerequisite_fixture(stack)
+            run = stack.enter_context(patch.object(b, "run", side_effect=ValueError("apt failed")))
+            with self.assertRaises(ValueError):
+                b.prerequisites(bundle)
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse(b.JOURNAL.exists())
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="dev-bootstrap-test-", dir=Path.home()))
 
