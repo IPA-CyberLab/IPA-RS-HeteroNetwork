@@ -6,6 +6,8 @@ use ipars_quorum::sudo::{
 use std::future::Future;
 use std::sync::Arc;
 
+pub(super) mod local;
+
 #[derive(Debug, Args)]
 pub struct SudoIssueArgs {
     /// Locally trusted policy, including the frozen manifest and host attestation keys.
@@ -396,7 +398,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct Mock {
+    pub(super) struct Mock {
         policy: SudoPolicy,
         engines: Arc<Mutex<BTreeMap<u16, SignerEngine>>>,
         time: Arc<AtomicU64>,
@@ -457,7 +459,8 @@ mod tests {
         }
     }
 
-    fn fixture() -> anyhow::Result<(SudoPolicy, SudoChallenge, ed25519_dalek::SigningKey, Mock)> {
+    pub(super) fn fixture(
+    ) -> anyhow::Result<(SudoPolicy, SudoChallenge, ed25519_dalek::SigningKey, Mock)> {
         let (shares, public) = frost::keys::generate_with_dealer(
             3,
             2,

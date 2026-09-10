@@ -348,6 +348,8 @@ pub enum QuorumCommand {
     Issue(IssueArgs),
     /// Collect a frozen majority for a host-attested sudo grant; does not execute it.
     SudoIssue(sudo::SudoIssueArgs),
+    /// Submit approval for an existing root-local sudo-v2 invocation.
+    SudoApprove(sudo::local::SudoApproveArgs),
     /// Execute an approved request with requester proof of possession.
     Execute(ExecuteArgs),
     /// Prepare an exact old-to-new quorum manifest transition after a new DKG ceremony.
@@ -1263,6 +1265,7 @@ pub async fn run(command: QuorumCommand) -> anyhow::Result<()> {
         QuorumCommand::Request(args) => create_request(args)?,
         QuorumCommand::Issue(args) => issue(args).await?,
         QuorumCommand::SudoIssue(args) => sudo::issue(args).await?,
+        QuorumCommand::SudoApprove(args) => return sudo::local::approve(args).await,
         QuorumCommand::Execute(args) => return execute(args).await,
         QuorumCommand::RotationRequest(args) => create_rotation_request(args)?,
         QuorumCommand::RotationVerify(args) => return verify_rotation_file(args),
