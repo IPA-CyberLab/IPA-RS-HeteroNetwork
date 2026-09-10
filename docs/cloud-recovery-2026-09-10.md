@@ -64,6 +64,12 @@ Both temporary access contexts were revoked (204). Flash Web Shell executed
 `pwd` and disconnected without page errors. These checks do not constitute a
 new full WebRTC media/NAT traversal test.
 
+The committed `heterocloud-functional-e2e.mjs` was rerun after these checks and
+completed successfully at approximately 05:33 UTC, including the full idle
+expiry wait and cleanup verification. Three independent fresh-context browser
+sweeps also authenticated and passed 14/15 pages each, with only Syouyu failing.
+This does not turn the complete browser suite into a pass.
+
 Private browser reports and credentials are not committed. The existing escape
 Pod retained UID `08942b6b-7a5d-408d-9a88-16acfbe24b40`, Running, restart count 1
 from before this recovery. No tenant workload restart was requested.
