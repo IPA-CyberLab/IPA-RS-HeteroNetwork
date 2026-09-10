@@ -86,3 +86,31 @@ The downloaded artifact binds image digest
 This chart enforces HTTPS owner-console secure cookies; the dev overlay enables
 them and Helm verification checks the rendered arguments. This is a verified
 release selection, not a deployed HeteroCloud service or production promotion.
+
+## HeteroNetwork Dev.5 Selection
+
+Revision 8 selects `0.1.15-dev.5`, source
+`99ea82684a9c58c353f767db276b26f79c890f76`, after successful
+[release run 34534355196](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/34534355196).
+All ten verification jobs and the publisher completed successfully. Both native
+archives were downloaded from the prerelease; `prepare` verified the base files
+and sudo companion, then `select` verified the committed channel at revision 8.
+The artifact ID is
+`086f3bf5280ac44b59750e7ed82cde301311e5d2e76bb01c8c8fff0cd28ef00e`.
+The base archive SHA-256 is
+`3bccfbd20b8fac68e8ae93de22ee5967e12b964e038e604535e063b9184c4cf9`;
+the sudo archive SHA-256 is
+`c65766da4aba5a587fbb4230dfde85f0aa71388f72071eb2632f39d5cd842d8f`.
+
+This release includes the public STUN fallback and fresh-dev kubeadm fixes.
+Preparation reported `sudo_prepared: true`, `activation_performed: false`.
+The running dev agents have not been upgraded from dev.4 by this selection.
+Production shares, sudo enforcement and application rollout remain incomplete.
+
+A read-only inventory of ichikawap1 during this selection found the agent active
+and the local control plane inactive. Agent stop dependencies include control
+plane, overlay DNS, PostgreSQL bundle, signal and STUN, with kubelet outside the
+inspected unit scope. Collection exited 2 due to incomplete evidence, including
+unreviewed unit roles and an absent native Kubernetes controller binary. This is
+not authorization for an unattended agent restart. No live service or sudo
+configuration was changed by the inventory.

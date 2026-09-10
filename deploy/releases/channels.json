@@ -1,25 +1,25 @@
 {
   "schema_version": 1,
-  "revision": 7,
+  "revision": 8,
   "dev": {
     "heteronetwork": {
       "schema_version": 1,
       "component": "heteronetwork",
-      "version": "0.1.15-dev.4",
-      "commit": "c5f8502ae9f57f35726345f4c361651152deff1e",
-      "image": "ghcr.io/ipa-cyberlab/heteronetwork@sha256:2ddf7bbac9eed5c3fda6734c302c6a09f4d77969b208a03e5e9da59d369069d1",
+      "version": "0.1.15-dev.5",
+      "commit": "99ea82684a9c58c353f767db276b26f79c890f76",
+      "image": "ghcr.io/ipa-cyberlab/heteronetwork@sha256:6ef29f9ef07e1defac4ecdeb0cb86251f318f439b238f4977f1d1fcaa4973c48",
       "native": {
         "linux-amd64": {
-          "asset": "heteronetwork-0.1.15-dev.4-linux-amd64.tar.gz",
-          "sha256": "61c50a0e2825af70f1ec799fa162983d2e6c98f54a080e8d11047a0ddd4d0724",
+          "asset": "heteronetwork-0.1.15-dev.5-linux-amd64.tar.gz",
+          "sha256": "3bccfbd20b8fac68e8ae93de22ee5967e12b964e038e604535e063b9184c4cf9",
           "files": {
-            "bin/ipars": "0575a31cb3e51221595442bc5c8f27b7cf5b2096f257e2da01c4600303937ce6",
-            "bin/ipars-k8s-controller": "7f88a402fbf56745ebb6f581769951a2812d218336840ecaeb973c926a95b571",
-            "bin/iparsd": "a36bbdde0eb7a36eb179bfed36ec4246ac0ceaedaf01b550cd6325a69f0911ee",
+            "bin/ipars": "11a02f292963a864adae9f5fb883b624ecd106f2b5d5f2e0d146afee532fb3c4",
+            "bin/ipars-k8s-controller": "6f026680fe15d99a022be548692cf72dede9b33ebfd37dc9ff840904a4df1ca9",
+            "bin/iparsd": "5dfa7f6c37631612285f125f326adf986cf880230ba85c70950766493367e024",
             "libexec/keycloak-autopilot.sh": "07946bd45138d466ea94c170c5c28323c0039a32a78956c650174c5df349782b",
             "libexec/keycloak-ha-node.sh": "c94ed3366c3b627f4df4b5cf121b0d80a91325c72d448f91427234dc5e554857",
             "libexec/kubeadm-ha-autopilot.sh": "b4fd9571214cfe816402ba516f1361af3111aacbd62b93294fccdbc372516e0e",
-            "libexec/kubeadm-ha-node.sh": "d0899266234f66a4090e0db278aab2231099fd802a761e4732b8c08c8eb0144b",
+            "libexec/kubeadm-ha-node.sh": "2dddc699eeb2b728b8b9c0b56358d354b27fc4b1e8821bb32f63151dc67b57ea",
             "libexec/postgres-ha-autopilot.sh": "d5518f514de3bd083e432854b124e9ebfeb8de84c15a3158418bd86439616fce",
             "libexec/postgres-ha-node.sh": "d9a9d5195738f59f898a4ef139d81bf1fcb9f7c433a892b9432db8dd17f2b0ad",
             "libexec/public-services-autopilot.sh": "0f4d3bbcf9437ca1e8fe07d8cf86a9534434316988c1c103a8001523f1ab03fd",
@@ -30,9 +30,9 @@
       },
       "sudo_native": {
         "linux-amd64": {
-          "asset": "heteronetwork-0.1.15-dev.4-sudo-v2-linux-amd64.tar.gz",
-          "sha256": "02fd5af77ea1ab9e3b596e60e9ac38b9b0c6062388d3ee67b25e8d6875cbb97f",
-          "source_commit": "c5f8502ae9f57f35726345f4c361651152deff1e",
+          "asset": "heteronetwork-0.1.15-dev.5-sudo-v2-linux-amd64.tar.gz",
+          "sha256": "c65766da4aba5a587fbb4230dfde85f0aa71388f72071eb2632f39d5cd842d8f",
+          "source_commit": "99ea82684a9c58c353f767db276b26f79c890f76",
           "profile": "release",
           "plugin_header_sha256": "11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f",
           "files": {
@@ -298,6 +298,119 @@
         "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud@sha256:c3f189bbca05830da15d7a8a4c102246c7137fc3a5ab30d70c3cc329689db3f9"
       },
       "at": "2026-09-10T21:52:06.242Z"
+    },
+    {
+      "revision": 8,
+      "command": "stage",
+      "channel": "dev",
+      "component": "heteronetwork",
+      "before": {
+        "schema_version": 1,
+        "component": "heteronetwork",
+        "version": "0.1.15-dev.4",
+        "commit": "c5f8502ae9f57f35726345f4c361651152deff1e",
+        "image": "ghcr.io/ipa-cyberlab/heteronetwork@sha256:2ddf7bbac9eed5c3fda6734c302c6a09f4d77969b208a03e5e9da59d369069d1",
+        "native": {
+          "linux-amd64": {
+            "asset": "heteronetwork-0.1.15-dev.4-linux-amd64.tar.gz",
+            "sha256": "61c50a0e2825af70f1ec799fa162983d2e6c98f54a080e8d11047a0ddd4d0724",
+            "files": {
+              "bin/ipars": "0575a31cb3e51221595442bc5c8f27b7cf5b2096f257e2da01c4600303937ce6",
+              "bin/ipars-k8s-controller": "7f88a402fbf56745ebb6f581769951a2812d218336840ecaeb973c926a95b571",
+              "bin/iparsd": "a36bbdde0eb7a36eb179bfed36ec4246ac0ceaedaf01b550cd6325a69f0911ee",
+              "libexec/keycloak-autopilot.sh": "07946bd45138d466ea94c170c5c28323c0039a32a78956c650174c5df349782b",
+              "libexec/keycloak-ha-node.sh": "c94ed3366c3b627f4df4b5cf121b0d80a91325c72d448f91427234dc5e554857",
+              "libexec/kubeadm-ha-autopilot.sh": "b4fd9571214cfe816402ba516f1361af3111aacbd62b93294fccdbc372516e0e",
+              "libexec/kubeadm-ha-node.sh": "d0899266234f66a4090e0db278aab2231099fd802a761e4732b8c08c8eb0144b",
+              "libexec/postgres-ha-autopilot.sh": "d5518f514de3bd083e432854b124e9ebfeb8de84c15a3158418bd86439616fce",
+              "libexec/postgres-ha-node.sh": "d9a9d5195738f59f898a4ef139d81bf1fcb9f7c433a892b9432db8dd17f2b0ad",
+              "libexec/public-services-autopilot.sh": "0f4d3bbcf9437ca1e8fe07d8cf86a9534434316988c1c103a8001523f1ab03fd",
+              "libexec/public-services-bootstrap.sh": "c62facf2f0265cdc23f3f8e53ed44bbb0bcd3fc4dd16ac1109cb4809b1f94d07",
+              "libexec/reconcile-owner-console-auth.sh": "9aca468cde3dc5652fdcb600cb595734442cf71eb0ee11339797ce1cca69962e"
+            }
+          }
+        },
+        "sudo_native": {
+          "linux-amd64": {
+            "asset": "heteronetwork-0.1.15-dev.4-sudo-v2-linux-amd64.tar.gz",
+            "sha256": "02fd5af77ea1ab9e3b596e60e9ac38b9b0c6062388d3ee67b25e8d6875cbb97f",
+            "source_commit": "c5f8502ae9f57f35726345f4c361651152deff1e",
+            "profile": "release",
+            "plugin_header_sha256": "11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f",
+            "files": {
+              "NOT_ENABLED.txt": {
+                "sha256": "d815137ad65b8ba592e52391f9443210686c9bec83fb6a34f029568564b2c920",
+                "size": 573,
+                "mode": 420
+              },
+              "bin/local-sudo-v2": {
+                "sha256": "503f04017afb62c53e772b8cd3b8c24b90d6af70d3198b517f28277388e1ced0",
+                "size": 5493992,
+                "mode": 493
+              },
+              "lib/quorum_v2_gate.so": {
+                "sha256": "b835943bb34931f785518073814b666fa2eaf9d3ee3fdf7538706954ff9a2b7e",
+                "size": 21448,
+                "mode": 420
+              }
+            }
+          }
+        }
+      },
+      "after": {
+        "schema_version": 1,
+        "component": "heteronetwork",
+        "version": "0.1.15-dev.5",
+        "commit": "99ea82684a9c58c353f767db276b26f79c890f76",
+        "image": "ghcr.io/ipa-cyberlab/heteronetwork@sha256:6ef29f9ef07e1defac4ecdeb0cb86251f318f439b238f4977f1d1fcaa4973c48",
+        "native": {
+          "linux-amd64": {
+            "asset": "heteronetwork-0.1.15-dev.5-linux-amd64.tar.gz",
+            "sha256": "3bccfbd20b8fac68e8ae93de22ee5967e12b964e038e604535e063b9184c4cf9",
+            "files": {
+              "bin/ipars": "11a02f292963a864adae9f5fb883b624ecd106f2b5d5f2e0d146afee532fb3c4",
+              "bin/ipars-k8s-controller": "6f026680fe15d99a022be548692cf72dede9b33ebfd37dc9ff840904a4df1ca9",
+              "bin/iparsd": "5dfa7f6c37631612285f125f326adf986cf880230ba85c70950766493367e024",
+              "libexec/keycloak-autopilot.sh": "07946bd45138d466ea94c170c5c28323c0039a32a78956c650174c5df349782b",
+              "libexec/keycloak-ha-node.sh": "c94ed3366c3b627f4df4b5cf121b0d80a91325c72d448f91427234dc5e554857",
+              "libexec/kubeadm-ha-autopilot.sh": "b4fd9571214cfe816402ba516f1361af3111aacbd62b93294fccdbc372516e0e",
+              "libexec/kubeadm-ha-node.sh": "2dddc699eeb2b728b8b9c0b56358d354b27fc4b1e8821bb32f63151dc67b57ea",
+              "libexec/postgres-ha-autopilot.sh": "d5518f514de3bd083e432854b124e9ebfeb8de84c15a3158418bd86439616fce",
+              "libexec/postgres-ha-node.sh": "d9a9d5195738f59f898a4ef139d81bf1fcb9f7c433a892b9432db8dd17f2b0ad",
+              "libexec/public-services-autopilot.sh": "0f4d3bbcf9437ca1e8fe07d8cf86a9534434316988c1c103a8001523f1ab03fd",
+              "libexec/public-services-bootstrap.sh": "c62facf2f0265cdc23f3f8e53ed44bbb0bcd3fc4dd16ac1109cb4809b1f94d07",
+              "libexec/reconcile-owner-console-auth.sh": "9aca468cde3dc5652fdcb600cb595734442cf71eb0ee11339797ce1cca69962e"
+            }
+          }
+        },
+        "sudo_native": {
+          "linux-amd64": {
+            "asset": "heteronetwork-0.1.15-dev.5-sudo-v2-linux-amd64.tar.gz",
+            "sha256": "c65766da4aba5a587fbb4230dfde85f0aa71388f72071eb2632f39d5cd842d8f",
+            "source_commit": "99ea82684a9c58c353f767db276b26f79c890f76",
+            "profile": "release",
+            "plugin_header_sha256": "11234d6e47e6da95adcb3ace71dc93f1d94b759aeca4cd938d829c076adfb35f",
+            "files": {
+              "NOT_ENABLED.txt": {
+                "sha256": "d815137ad65b8ba592e52391f9443210686c9bec83fb6a34f029568564b2c920",
+                "size": 573,
+                "mode": 420
+              },
+              "bin/local-sudo-v2": {
+                "sha256": "503f04017afb62c53e772b8cd3b8c24b90d6af70d3198b517f28277388e1ced0",
+                "size": 5493992,
+                "mode": 493
+              },
+              "lib/quorum_v2_gate.so": {
+                "sha256": "b835943bb34931f785518073814b666fa2eaf9d3ee3fdf7538706954ff9a2b7e",
+                "size": 21448,
+                "mode": 420
+              }
+            }
+          }
+        }
+      },
+      "at": "2026-09-10T22:15:45.345Z"
     }
   ]
 }
