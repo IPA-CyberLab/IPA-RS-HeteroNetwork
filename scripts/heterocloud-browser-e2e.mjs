@@ -130,6 +130,18 @@ try {
       ).first();
       await usernameField.waitFor({ state: "visible", timeout: timeoutMs });
       await passwordField.waitFor({ state: "visible", timeout: timeoutMs });
+      const form = await submitButton.evaluate((button) => ({
+        action: button.hasAttribute("formaction") ? button.formAction : button.form?.action,
+        method: button.hasAttribute("formmethod") ? button.formMethod : button.form?.method,
+      }));
+      record.authSubmission = { formAction: form.action ? safeUrl(form.action) : null,
+        method: form.method ?? null, requests: [] };
+      const action = form.action ? new URL(form.action) : null;
+      if (!action || action.origin !== baseUrl.origin ||
+          action.pathname !== "/id/realms/heterocloud/login-actions/authenticate" ||
+          action.username || action.password || form.method?.toLowerCase() !== "post") {
+        throw new Error("Login form action must POST to the public HeteroCloud realm on the configured origin");
+      }
       if (diagnostic) {
         record.loginUrl = safeUrl(page.url());
         record.loginScreenshot = await capture(page, attempt, "login");
@@ -140,17 +152,42 @@ try {
       await usernameField.fill(username);
       await passwordField.fill(password);
 
+      const authRequests = new Map();
+      const isAuthenticationPost = (request) => {
+        const url = new URL(request.url());
+        return request.method() === "POST" && url.origin === action.origin && url.pathname === action.pathname;
+      };
+      page.on("request", (request) => {
+        if (!isAuthenticationPost(request)) return;
+        const started = Date.now();
+        const timing = { url: safeUrl(request.url()), startedAt: new Date(started).toISOString(),
+          status: null, responseElapsedMs: null, elapsedMs: null, failureCode: null };
+        authRequests.set(request, { started, timing });
+        record.authSubmission.requests.push(timing);
+      });
+      page.on("response", (response) => {
+        const tracked = authRequests.get(response.request());
+        if (!tracked) return;
+        tracked.timing.status = response.status();
+        tracked.timing.responseElapsedMs = Date.now() - tracked.started;
+      });
+      page.on("requestfinished", (request) => {
+        const tracked = authRequests.get(request);
+        if (tracked) tracked.timing.elapsedMs = Date.now() - tracked.started;
+      });
+      page.on("requestfailed", (request) => {
+        const tracked = authRequests.get(request);
+        if (!tracked) return;
+        tracked.timing.elapsedMs = Date.now() - tracked.started;
+        const code = request.failure()?.errorText ?? "unknown";
+        tracked.timing.failureCode = /^net::ERR_[A-Z0-9_]+$/.test(code) ? code : "nonstandard-network-error";
+      });
+      record.authSubmission.clickStartedAt = new Date().toISOString();
+
       // Attach rejection handlers to both operations immediately. Waiting for the
       // click first can leave the response timeout unhandled while navigation stalls.
       const [authenticationResponse] = await Promise.all([page.waitForResponse(
-        (response) => {
-          const request = response.request();
-          const url = new URL(response.url());
-          return (
-            request.method() === "POST" &&
-            url.pathname.includes("/realms/heterocloud/login-actions/authenticate")
-          );
-        },
+        (response) => isAuthenticationPost(response.request()),
         { timeout: timeoutMs },
       ), submitButton.click({ timeout: timeoutMs })]);
       if (authenticationResponse.status() >= 400) {
@@ -299,6 +336,14 @@ try {
       break;
     } finally {
       record.finishedAt = new Date().toISOString();
+      if (record.authSubmission) {
+        record.authSubmission.observedAt = record.finishedAt;
+        record.authSubmission.postStarted = record.authSubmission.requests.length > 0;
+        record.authSubmission.waitingForResponse = record.authSubmission.requests.some((request) => request.status === null && request.failureCode === null);
+        for (const request of record.authSubmission.requests) {
+          request.observedElapsedMs = Date.now() - Date.parse(request.startedAt);
+        }
+      }
       record.unexecutedPages = plannedRoutes.filter((route) => !record.pages.some((entry) => entry.route === route))
         .map((route) => ({ route, result: "blocked", reason: diagnostic
           ? "Unauthenticated diagnostic; credentials/session/service checks not performed"
