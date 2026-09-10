@@ -346,6 +346,263 @@ pub enum QuorumCommand {
     Issue(IssueArgs),
     /// Execute an approved request with requester proof of possession.
     Execute(ExecuteArgs),
+    /// Prepare an exact old-to-new quorum manifest transition after a new DKG ceremony.
+    RotationRequest(RotationRequestArgs),
+    /// Verify both frozen groups' signatures without applying the transition.
+    RotationVerify(RotationVerifyArgs),
+    /// Collect independent old and new group majorities for a frozen transition.
+    RotationIssue(RotationIssueArgs),
+    /// Apply a verified dual-majority transition once, without mutation retries.
+    RotationApply(RotationApplyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RotationIssueArgs {
+    #[arg(long)]
+    old_manifest: PathBuf,
+    #[arg(long)]
+    request: PathBuf,
+    #[arg(long)]
+    oidc_token: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
+    #[command(flatten)]
+    transport: TransportArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct RotationApplyArgs {
+    #[arg(long)]
+    old_manifest: PathBuf,
+    #[arg(long)]
+    rotation: PathBuf,
+    #[arg(long)]
+    control_plane_url: String,
+    #[command(flatten)]
+    transport: TransportArgs,
+}
+
+fn rotation_endpoints(
+    manifest: &Manifest,
+    transport: &TransportArgs,
+) -> anyhow::Result<Vec<(u16, Url, Url)>> {
+    manifest.validate()?;
+    manifest
+        .members
+        .iter()
+        .map(|member| {
+            let base = endpoint(&member.endpoint, transport)?;
+            Ok((
+                member.identifier,
+                exact_target(&base, "/v1/quorum/rotation/round1")?,
+                exact_target(&base, "/v1/quorum/rotation/round2")?,
+            ))
+        })
+        .collect()
+}
+
+async fn sign_rotation_group(
+    client: &reqwest::Client,
+    old: &Manifest,
+    group: &Manifest,
+    transition: &ipars_quorum::ManifestTransition,
+    endpoints: Vec<(u16, Url, Url)>,
+    oidc: &Zeroizing<String>,
+) -> anyhow::Result<Vec<u8>> {
+    use ipars_control_plane_http::quorum::{RotationRound1Request, RotationRound2Request};
+    transition.validate(old, now()?)?;
+    let threshold = usize::from(group.threshold());
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (identifier, first, second) in endpoints {
+        let client = client.clone();
+        let oidc = oidc.clone();
+        let request = RotationRound1Request {
+            transition: transition.clone(),
+        };
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await?;
+            let response: ipars_quorum::Round1Response =
+                post_round(&client, first, &oidc, &request).await?;
+            if response.identifier != identifier || response.session_id == [0; 32] {
+                bail!("rotation signer identity mismatch");
+            }
+            Ok::<_, anyhow::Error>((second, response))
+        });
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let mut selected = Vec::new();
+    while selected.len() < threshold {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(Ok(Ok(response)))) => selected.push(response),
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    if selected.len() != threshold {
+        bail!("rotation group majority unavailable; pending sessions expire automatically");
+    }
+    transition.validate(old, now()?)?;
+    let mut commitments = BTreeMap::new();
+    for (_, response) in &selected {
+        let id = frost::Identifier::try_from(response.identifier)?;
+        if commitments.insert(id, response.commitments).is_some() {
+            bail!("duplicate rotation signer commitment");
+        }
+    }
+    let package = frost::SigningPackage::new(commitments, &transition.signing_bytes()?);
+    let mut tasks = tokio::task::JoinSet::new();
+    // Exactly this selected threshold signs once. Failure requires fresh round-one nonces.
+    for (url, response) in selected {
+        let client = client.clone();
+        let oidc = oidc.clone();
+        let permits = permits.clone();
+        let request = RotationRound2Request {
+            session_id: response.session_id,
+            transition: transition.clone(),
+            signing_package: package.clone(),
+        };
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await?;
+            let result: Round2Response = post_round(&client, url.clone(), &oidc, &request).await?;
+            Ok::<_, anyhow::Error>((url, result, response.identifier))
+        });
+    }
+    let mut shares = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        if let Ok(Ok((_, response, identifier))) = result {
+            shares.insert(
+                frost::Identifier::try_from(identifier)?,
+                response.signature_share,
+            );
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    if shares.len() != threshold {
+        bail!("rotation round two failed; discard commitments and start fresh rounds");
+    }
+    transition.validate(old, now()?)?;
+    Ok(frost::aggregate(&package, &shares, &group.public_keys()?)?.serialize()?)
+}
+
+async fn issue_rotation(args: RotationIssueArgs) -> anyhow::Result<()> {
+    let old = load_manifest(&args.old_manifest)?;
+    let transition: ipars_quorum::ManifestTransition = read_json(&args.request, true)?;
+    transition.validate(&old, now()?)?;
+    let old_endpoints = rotation_endpoints(&old, &args.transport)?;
+    let new_endpoints = rotation_endpoints(&transition.new_manifest, &args.transport)?;
+    let oidc = oidc_token(&args.oidc_token)?;
+    let output = reserve_output(&args.out)?;
+    let client = http_client()?;
+    let old_signature =
+        sign_rotation_group(&client, &old, &old, &transition, old_endpoints, &oidc).await?;
+    let new_signature = sign_rotation_group(
+        &client,
+        &old,
+        &transition.new_manifest,
+        &transition,
+        new_endpoints,
+        &oidc,
+    )
+    .await?;
+    let rotation = ipars_quorum::ManifestRotation {
+        transition,
+        old_signature,
+        new_signature,
+    };
+    ipars_quorum::verify_rotation(&old, &rotation, now()?)?;
+    write_json(output, &rotation)
+}
+
+async fn apply_rotation(args: RotationApplyArgs) -> anyhow::Result<()> {
+    let old = load_manifest(&args.old_manifest)?;
+    let rotation: ipars_quorum::ManifestRotation = read_json(&args.rotation, true)?;
+    ipars_quorum::verify_rotation(&old, &rotation, now()?)?;
+    let target = exact_target(
+        &endpoint(&args.control_plane_url, &args.transport)?,
+        ipars_control_plane_http::quorum::ROTATION_PATH,
+    )?;
+    let client = http_client()?;
+    let response = client.post(target).json(&rotation).send().await.map_err(|_| anyhow::anyhow!(
+        "rotation outcome unknown; separately read GET /v1/admin/quorum/manifest before any new action; no automatic retry"))?;
+    let status = response.status();
+    let bytes = response_bytes(response).await.map_err(|_| anyhow::anyhow!(
+        "rotation response unavailable; separately read GET /v1/admin/quorum/manifest; no automatic retry"))?;
+    if status != reqwest::StatusCode::OK {
+        bail!("rotation returned HTTP {}; separately read GET /v1/admin/quorum/manifest; no automatic retry", status.as_u16());
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Applied {
+        applied: bool,
+    }
+    let result: Applied = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!(
+        "invalid rotation response; separately read GET /v1/admin/quorum/manifest; no automatic retry"))?;
+    if !result.applied {
+        bail!("rotation not confirmed; separately read active manifest");
+    }
+    println!(
+        "{}",
+        serde_json::json!({"applied":true,"epoch":rotation.transition.new_manifest.epoch})
+    );
+    Ok(())
+}
+
+#[derive(Debug, Args)]
+pub struct RotationRequestArgs {
+    #[arg(long)]
+    old_manifest: PathBuf,
+    #[arg(long)]
+    new_manifest: PathBuf,
+    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..=300))]
+    ttl_seconds: u64,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct RotationVerifyArgs {
+    #[arg(long)]
+    old_manifest: PathBuf,
+    #[arg(long)]
+    rotation: PathBuf,
+}
+
+fn create_rotation_request(args: RotationRequestArgs) -> anyhow::Result<()> {
+    let old = load_manifest(&args.old_manifest)?;
+    let new_manifest = load_manifest(&args.new_manifest)?;
+    let issued_at = now()?;
+    let mut request_id = [0; 32];
+    OsRng.fill_bytes(&mut request_id);
+    let transition = ipars_quorum::ManifestTransition {
+        old_manifest_digest: old.digest()?,
+        new_manifest,
+        request_id,
+        issued_at,
+        expires_at: issued_at
+            .checked_add(args.ttl_seconds)
+            .context("rotation expiry overflow")?,
+    };
+    transition.validate(&old, issued_at)?;
+    write_json(reserve_output(&args.out)?, &transition)
+}
+
+fn verify_rotation_file(args: RotationVerifyArgs) -> anyhow::Result<()> {
+    let old = load_manifest(&args.old_manifest)?;
+    let rotation: ipars_quorum::ManifestRotation = read_json(&args.rotation, true)?;
+    ipars_quorum::verify_rotation(&old, &rotation, now()?)?;
+    println!(
+        "{}",
+        serde_json::json!({"status": "verified", "applied": false,
+        "epoch": rotation.transition.new_manifest.epoch,
+        "manifest_digest": rotation.transition.new_manifest.digest()?})
+    );
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -619,6 +876,7 @@ fn endpoint(value: &str, transport: &TransportArgs) -> anyhow::Result<Url> {
 fn http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .no_proxy()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
@@ -1001,6 +1259,10 @@ pub async fn run(command: QuorumCommand) -> anyhow::Result<()> {
         QuorumCommand::Request(args) => create_request(args)?,
         QuorumCommand::Issue(args) => issue(args).await?,
         QuorumCommand::Execute(args) => return execute(args).await,
+        QuorumCommand::RotationRequest(args) => create_rotation_request(args)?,
+        QuorumCommand::RotationVerify(args) => return verify_rotation_file(args),
+        QuorumCommand::RotationIssue(args) => issue_rotation(args).await?,
+        QuorumCommand::RotationApply(args) => return apply_rotation(args).await,
     }
     println!(
         "{}",
@@ -1035,6 +1297,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn rotation_request_binds_new_epoch_and_rejects_unsigned_rotation() -> anyhow::Result<()> {
+        let scratch = Scratch::new()?;
+        let make_manifest = |epoch| -> anyhow::Result<Manifest> {
+            let (_, public) = frost::keys::generate_with_dealer(
+                3,
+                2,
+                frost::keys::IdentifierList::Default,
+                OsRng,
+            )?;
+            Ok(Manifest {
+                schema_version: SCHEMA_VERSION,
+                cluster_id: "rotation-cli-test".into(),
+                epoch,
+                members: (1..=3)
+                    .map(|identifier| Member {
+                        identifier,
+                        node_id: format!("node-{identifier}"),
+                        endpoint: format!("http://10.250.0.{identifier}:19790"),
+                    })
+                    .collect(),
+                public_key_package: public.serialize()?,
+            })
+        };
+        let old = make_manifest(1)?;
+        let new = make_manifest(2)?;
+        let old_path = scratch.0.join("old.json");
+        let new_path = scratch.0.join("new.json");
+        let out = scratch.0.join("request.json");
+        write_json(reserve_output(&old_path)?, &old)?;
+        write_json(reserve_output(&new_path)?, &new)?;
+        create_rotation_request(RotationRequestArgs {
+            old_manifest: old_path.clone(),
+            new_manifest: new_path,
+            ttl_seconds: 60,
+            out: out.clone(),
+        })?;
+        let transition: ipars_quorum::ManifestTransition = read_json(&out, true)?;
+        transition.validate(&old, now()?)?;
+        assert_eq!(transition.new_manifest, new);
+        assert_eq!(transition.expires_at - transition.issued_at, 60);
+        let rotation_path = scratch.0.join("rotation.json");
+        write_json(
+            reserve_output(&rotation_path)?,
+            &ipars_quorum::ManifestRotation {
+                transition,
+                old_signature: vec![],
+                new_signature: vec![],
+            },
+        )?;
+        assert!(verify_rotation_file(RotationVerifyArgs {
+            old_manifest: old_path,
+            rotation: rotation_path,
+        })
+        .is_err());
+        Ok(())
     }
 
     #[test]
@@ -1383,7 +1703,7 @@ mod tests {
             for (member, listener) in manifest.members.iter().zip(listeners) {
                 let id = frost::Identifier::try_from(member.identifier)?;
                 let key = frost::keys::KeyPackage::try_from(shares.get(&id).context("missing fixture key")?.clone())?;
-                let router = ipars_control_plane_http::quorum::signer_router(manifest.clone(), key, &member.node_id, auth.clone())
+                let router = ipars_control_plane_http::quorum::signer_router_with_rotation_anchor(manifest.clone(), key, &member.node_id, auth.clone(), manifest.clone())
                     .map_err(anyhow::Error::msg)?;
                 let server = servers.spawn(async move { axum::serve(listener, router).await });
                 if member.identifier == 3 {
@@ -1398,6 +1718,7 @@ mod tests {
             let plane = Arc::new(ControlPlane::new(ControlPlaneConfig::new(
                 ipars_types::ClusterId::from_string(&manifest.cluster_id), "100.64.0.0/24".parse()?), store));
             plane.bind_admin_quorum_manifest(manifest.epoch, &manifest.digest()?).await?;
+            plane.initialize_admin_quorum_manifest(manifest.clone()).await?;
             let join = Arc::new(ControlPlaneJoinService::new(plane.clone(), Arc::new(InMemoryTokenLedger::default()), IssuerKeyRing::default()));
             let state = ControlPlaneHttpState::new(plane.clone(), join)
                 .require_operator_api_bearer_token("unused-legacy-token".into())
@@ -1423,7 +1744,7 @@ mod tests {
             let transport = TransportArgs { allow_test_loopback: true, ..Default::default() };
             let token_path = scratch.0.join("token.json");
             issue(IssueArgs { manifest: manifest_path.clone(), request: request_path, requester_key: requester_path.clone(),
-                oidc_token: oidc_path, body: body_path.clone(), token_out: token_path.clone(), transport: transport.clone() }).await?;
+                oidc_token: oidc_path.clone(), body: body_path.clone(), token_out: token_path.clone(), transport: transport.clone() }).await?;
             assert_eq!(manifest.threshold(), 2);
             assert_eq!(manifest.members.len(), 3);
             assert_eq!(auth_calls.load(Ordering::SeqCst), 4, "both live signers must validate the owner in both rounds");
@@ -1445,13 +1766,85 @@ mod tests {
             assert_eq!(response["cluster_policy"]["allow_ipv6_direct"], false);
             assert!(!plane.current_cluster_policy().await?.allow_ipv6_direct);
             let replay_path = scratch.0.join("replay.json");
-            let replay = execute(ExecuteArgs { manifest: manifest_path, token: token_path, requester_key: requester_path,
-                body: body_path, control_plane_url: cp_url, response_out: Some(replay_path.clone()), transport }).await;
+            let replay = execute(ExecuteArgs { manifest: manifest_path.clone(), token: token_path, requester_key: requester_path,
+                body: body_path, control_plane_url: cp_url.clone(), response_out: Some(replay_path.clone()), transport: transport.clone() }).await;
             let error = replay.err().context("replayed capability was accepted")?;
             assert!(error.to_string().contains("HTTP 401"));
             let replay_body: serde_json::Value = read_json(&replay_path, true)?;
             assert!(replay_body.get("error").is_some());
             assert!(!plane.current_cluster_policy().await?.allow_ipv6_direct);
+
+            let mut listeners = Vec::new();
+            let mut members = Vec::new();
+            for identifier in 1..=3 {
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                members.push(Member { identifier, node_id: format!("new-node-{identifier}"),
+                    endpoint: format!("http://{}", listener.local_addr()?) });
+                listeners.push(listener);
+            }
+            let (shares, public) = frost::keys::generate_with_dealer(3, 2,
+                frost::keys::IdentifierList::Default, OsRng)?;
+            let new = Manifest { schema_version: SCHEMA_VERSION, cluster_id: manifest.cluster_id.clone(),
+                epoch: 2, members, public_key_package: public.serialize()? };
+            for (member, listener) in new.members.iter().zip(listeners) {
+                if member.identifier == 3 { drop(listener); continue; }
+                let id = frost::Identifier::try_from(member.identifier)?;
+                let key = frost::keys::KeyPackage::try_from(shares.get(&id).context("missing new key")?.clone())?;
+                let router = ipars_control_plane_http::quorum::signer_router_with_rotation_anchor(
+                    new.clone(), key, &member.node_id, auth.clone(), manifest.clone()).map_err(anyhow::Error::msg)?;
+                servers.spawn(async move { axum::serve(listener, router).await });
+            }
+            let timestamp = now()?;
+            let transition = ipars_quorum::ManifestTransition { old_manifest_digest: manifest.digest()?,
+                new_manifest: new.clone(), request_id: [91; 32], issued_at: timestamp, expires_at: timestamp + 180 };
+            let transition_path = scratch.0.join("transition.json");
+            let rotation_path = scratch.0.join("rotation.json");
+            let mut invalid = transition.clone();
+            invalid.new_manifest.members[2].endpoint = "http://public.example.test".into();
+            write_json(reserve_output(&transition_path)?, &invalid)?;
+            let before = auth_calls.load(Ordering::SeqCst);
+            let rejected = issue_rotation(RotationIssueArgs { old_manifest: manifest_path.clone(),
+                request: transition_path.clone(), oidc_token: scratch.0.join("missing-token"),
+                out: rotation_path.clone(), transport: transport.clone() }).await.err().context("invalid endpoint accepted")?;
+            assert!(rejected.to_string().contains("literal VPN IP"));
+            assert_eq!(auth_calls.load(Ordering::SeqCst), before);
+            assert!(!rotation_path.exists());
+            std::fs::remove_file(&transition_path)?;
+            write_json(reserve_output(&transition_path)?, &transition)?;
+            issue_rotation(RotationIssueArgs { old_manifest: manifest_path.clone(), request: transition_path,
+                oidc_token: oidc_path, out: rotation_path.clone(), transport: transport.clone() }).await?;
+            assert_eq!(auth_calls.load(Ordering::SeqCst) - before, 8);
+            assert_eq!(std::fs::metadata(&rotation_path)?.mode() & 0o777, 0o600);
+            let rotation: ipars_quorum::ManifestRotation = read_json(&rotation_path, true)?;
+            ipars_quorum::verify_rotation(&manifest, &rotation, now()?)?;
+            let mut tampered = rotation.clone();
+            tampered.transition.request_id[0] ^= 1;
+            let tampered_path = scratch.0.join("tampered.json");
+            write_json(reserve_output(&tampered_path)?, &tampered)?;
+            assert!(apply_rotation(RotationApplyArgs { old_manifest: manifest_path.clone(),
+                rotation: tampered_path, control_plane_url: cp_url.clone(), transport: transport.clone() }).await.is_err());
+            assert_eq!(plane.get_active_admin_quorum_manifest().await?.context("active manifest missing")?.epoch, 1);
+            let failed_posts = Arc::new(AtomicU64::new(0));
+            let calls = failed_posts.clone();
+            let failed_listener = TcpListener::bind("127.0.0.1:0").await?;
+            let failed_url = format!("http://{}", failed_listener.local_addr()?);
+            let failed_router = Router::new().route("/v1/admin/quorum/rotation", axum::routing::post(move || {
+                let calls = calls.clone();
+                async move { calls.fetch_add(1, Ordering::SeqCst); StatusCode::SERVICE_UNAVAILABLE }
+            }));
+            servers.spawn(async move { axum::serve(failed_listener, failed_router).await });
+            let failure = apply_rotation(RotationApplyArgs { old_manifest: manifest_path.clone(),
+                rotation: rotation_path.clone(), control_plane_url: failed_url, transport: transport.clone() }).await.err().context("503 accepted")?;
+            assert!(failure.to_string().contains("HTTP 503"));
+            assert_eq!(failed_posts.load(Ordering::SeqCst), 1, "mutation must never retry");
+            apply_rotation(RotationApplyArgs { old_manifest: manifest_path.clone(), rotation: rotation_path.clone(),
+                control_plane_url: cp_url.clone(), transport: transport.clone() }).await?;
+            let replay = apply_rotation(RotationApplyArgs { old_manifest: manifest_path, rotation: rotation_path,
+                control_plane_url: cp_url.clone(), transport }).await.err().context("rotation replay accepted")?;
+            assert!(replay.to_string().contains("no automatic retry"));
+            let active: Manifest = http_client()?.get(format!("{cp_url}/v1/admin/quorum/manifest"))
+                .bearer_auth("unused-legacy-token").send().await?.error_for_status()?.json().await?;
+            assert_eq!(active.digest()?, new.digest()?);
             Ok::<_, anyhow::Error>(())
         }).await;
         servers.abort_all();
