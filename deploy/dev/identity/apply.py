@@ -91,6 +91,7 @@ def guard():
             {f"hetero-dev-{i}" for i in range(1, 4)})
     for node in nodes:
         number = int(node["metadata"]["name"][-1])
+        require(node["spec"]["podCIDR"] == f"172.29.{number - 1}.0/24")
         require([a["address"] for a in node["status"]["addresses"] if a["type"] == "InternalIP"] ==
                 [f"10.251.0.{number}"])
         require(any(c["type"] == "Ready" and c["status"] == "True" for c in node["status"]["conditions"]))

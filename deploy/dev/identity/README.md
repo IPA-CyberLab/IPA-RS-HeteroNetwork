@@ -67,6 +67,13 @@ credentials remain in the dev namespace. NetworkPolicy permits only the scoped
 database/Keycloak/operator flows, dev DNS and observed Kubernetes API endpoints.
 No NodePort, public ingress or external database endpoint is created here.
 
+The webhook ingress allows the three node VPN IPs and each node's two reserved
+Flannel/CNI addresses (`172.29.0.0/31`, `172.29.1.0/31`, `172.29.2.0/31`) only on
+TCP 9443. Actual DEV1 route inspection found source `172.29.0.1` for a local Pod
+and `172.29.0.0` for remote Pods; VPN IP-only webhook policy would miss those
+host-originated flows. The apply guard pins the three per-node PodCIDRs too.
+These narrow ranges do not include the ordinary Pod allocation addresses.
+
 Ready replicas and a successful apply are not sufficient HA evidence. Verify
 the mounted ownership, generated claims, actual replication/synchronous settings,
 write/read behavior and controlled primary recovery before deploying Keycloak.

@@ -69,6 +69,9 @@ spec:
         - ipBlock: {cidr: 10.251.0.1/32}
         - ipBlock: {cidr: 10.251.0.2/32}
         - ipBlock: {cidr: 10.251.0.3/32}
+        - ipBlock: {cidr: 172.29.0.0/31}
+        - ipBlock: {cidr: 172.29.1.0/31}
+        - ipBlock: {cidr: 172.29.2.0/31}
       ports:
         - {protocol: TCP, port: 9443}
   egress:
