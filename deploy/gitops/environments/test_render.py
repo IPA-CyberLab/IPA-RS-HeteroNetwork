@@ -48,6 +48,23 @@ def fixtures():
 
 
 class RendererTests(unittest.TestCase):
+    def test_rendered_dev_owner_requires_secure_cookies(self):
+        _, site = fixtures()
+        owner = render.dev_values("heterocloud", site)["ownerConsole"]
+        self.assertIs(owner["secureCookie"], True)
+        args = ["--secure-cookie=true", "--public-origin=" + owner["origin"]]
+        def documents(arguments):
+            return [{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [
+                {"name": "owner-console", "args": arguments}]}}}}]
+        render.check_dev_owner_cookies(documents(args), owner)
+        for bad in ([], ["--secure-cookie=false", args[1]], args + ["--secure-cookie=false"],
+                    [args[0], "--public-origin=http://wrong.invalid"]):
+            with self.subTest(args=bad), self.assertRaises(ValueError):
+                render.check_dev_owner_cookies(documents(bad), owner)
+        for bad in ([], documents(args) * 2):
+            with self.assertRaises(ValueError):
+                render.check_dev_owner_cookies(bad, owner)
+
     def test_deterministic_selection_and_digest_preserved(self):
         state, site = fixtures()
         dev = render.render(state, "dev", site)

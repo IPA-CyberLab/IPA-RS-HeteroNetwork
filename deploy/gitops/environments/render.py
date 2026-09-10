@@ -314,6 +314,8 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
             check_checkout(repository, source["targetRevision"], source["path"])
             require(result.returncode == 0, f"Helm render failed for {app['metadata']['name']}: {result.stderr[-2000:]}")
             documents = list(yaml.safe_load_all(result.stdout))
+            if channel == "dev" and component == "heterocloud":
+                check_dev_owner_cookies(documents, helm["valuesObject"]["ownerConsole"])
             if inspect_documents:
                 inspect_documents(app, documents)
             counts[app["metadata"]["name"]] = sum(document is not None for document in documents)
@@ -321,6 +323,21 @@ def check_helm(applications, state, channel, site, repository_root, inspect_docu
                 for image in container_images(document):
                     require(canonical_image(image) in allowed, f"rendered image lacks a selected or auxiliary immutable pin: {image}")
     return counts
+
+
+def check_dev_owner_cookies(documents, owner):
+    if not owner["enabled"]:
+        return
+    containers = [container for document in documents
+                  if isinstance(document, dict) and document.get("kind") == "Deployment"
+                  for container in document.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+                  if container.get("name") == "owner-console"]
+    require(len(containers) == 1, "dev requires exactly one rendered owner console")
+    args = containers[0].get("args", [])
+    require([arg for arg in args if arg.startswith("--secure-cookie")] == ["--secure-cookie=true"],
+            "rendered dev HTTPS owner console must enable secure cookies")
+    require([arg for arg in args if arg.startswith("--public-origin")] == ["--public-origin=" + owner["origin"]],
+            "rendered dev owner origin differs from configured HTTPS origin")
 
 
 def container_images(value):
